@@ -1,11 +1,3 @@
-//! The Tailcat supervisor's contract, exercised against a fake helper.
-//!
-//! The helper here is a `/bin/sh` script that records every invocation and
-//! plays only the shapes these tests assert: the executable is hashed before
-//! anything runs, the argv carries the link port and nothing wider, a helper
-//! that dies or stops connecting is replaced, and node keys and `tc…`
-//! addresses stay out of diagnostics.
-
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -23,16 +15,11 @@ use sentinel_link::{
 };
 use sha2::{Digest, Sha256};
 
-/// Hex bodies of the node keys and the address the fake helper reports.
 const KEY: &str = "0123456789abcdeffedcba98765432100123456789abcdeffedcba9876543210";
 const OTHER: &str = "fedcba98765432100123456789abcdeffedcba98765432100123456789abcdef";
 const THIRD: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 const ADDRESS: &str = "tcabcdefghijklmnopqrstuvwxyz0123";
 
-/// A fake helper on disk: it appends `argv …` to a log, answers `--version`,
-/// `genkey` (a client key prints its node key, a server key its address, as
-/// upstream does) and `parse`, and runs whatever `body` adds for `serve`,
-/// `forward` and `ping`.
 struct Fake {
     dir: tempfile::TempDir,
     binary: PathBuf,
@@ -48,12 +35,10 @@ impl Fake {
         ))
     }
 
-    /// A fake whose `case "$1"` arms are exactly `cases`.
     fn script(cases: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("argv.log");
-        // Not "tailcat": that name is the key directory inside the data dir,
-        // which is this same temporary directory.
+        // Not "tailcat": that name is the key directory inside this same temp dir.
         let binary = dir.path().join("helper");
         let script = format!(
             "#!/bin/sh\nprintf 'argv %s\\n' \"$*\" >> \"{log}\"\ncase \"$1\" in\n{cases}esac\nexit 64\n",
@@ -68,7 +53,6 @@ impl Fake {
         self.dir.path()
     }
 
-    /// A configuration that accepts this fake as the helper.
     fn config(&self, listen_port: u16) -> TailcatConfig {
         TailcatConfig {
             enabled: true,
@@ -107,11 +91,6 @@ fn key(body: &str) -> NodeKey {
     NodeKey::parse(&format!("nodekey:{body}")).unwrap()
 }
 
-/// Polls `ready` until it holds. The deadline only bounds a hang — a passing
-/// test returns the moment the condition is true — and every condition here
-/// waits on real `/bin/sh` spawns, which a host short of memory has been
-/// seen to stall for over 10 s; 60 s keeps a stalled host from reading as a
-/// supervision bug without slowing a healthy run at all.
 fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
@@ -179,8 +158,7 @@ fn serve_carries_the_link_port_and_only_the_allowed_node_keys() {
     let address = server.wait_ready(Duration::from_secs(10)).unwrap();
     assert_eq!(address.expose(), ADDRESS);
     assert_eq!(server.port(), 7443);
-    // One comma-separated `--allow`: upstream keeps only the last of a
-    // repeated flag, which would admit one worker of the fleet.
+    // Comma-separated --allow: a repeated flag keeps only its last value upstream.
     assert_eq!(
         fake.calls("serve"),
         vec![format!(
@@ -190,15 +168,12 @@ fn serve_carries_the_link_port_and_only_the_allowed_node_keys() {
         )]
     );
 
-    // Credentials: a diagnostic that prints them prints nothing usable.
     assert!(!format!("{first}").contains(KEY));
     assert!(!format!("{first:?}").contains(KEY));
     assert!(!format!("{address:?}").contains(ADDRESS));
     assert!(!format!("{:?}", server.telemetry()).contains(ADDRESS));
     assert!(first.expose().ends_with(KEY));
 
-    // Enrolling another worker restarts serve with the wider list; the key is
-    // unchanged, so the address it serves stays the same.
     let third = key(THIRD);
     server.set_allow(&[first.clone(), second.clone(), third.clone()]);
     wait_until("serve with three keys", || fake.calls("serve").len() == 2);
@@ -246,8 +221,6 @@ fn forward_binds_loopback_and_health_needs_the_tunnel() {
     );
     assert!(forward.probe().is_ok(), "ping plus a loopback connect");
 
-    // The same shape, but ping cannot reach the controller: not healthy, and
-    // the failure is visible in telemetry rather than swallowed.
     let broken =
         Fake::write("  forward) printf 'forwarding\\n'; exec sleep 3600 ;;\n  ping) exit 1 ;;\n");
     let config = broken.config(port);
@@ -273,8 +246,6 @@ fn a_dead_helper_is_replaced_and_a_stalled_tunnel_is_not_trusted() {
     server.shutdown();
     assert!(server.telemetry().pid.is_none());
 
-    // A helper that is alive but whose tunnel stopped answering is replaced
-    // too: an open loopback port is not health.
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let stalled =
@@ -296,25 +267,15 @@ fn a_dead_helper_is_replaced_and_a_stalled_tunnel_is_not_trusted() {
     assert!(forward.telemetry().pid.is_none());
 }
 
-/// A probe's verdict is about the helper it probed. Here the first helper
-/// ends on its own while its probe is still in flight, and its successor
-/// starts before that probe fails: the failure must not kill the successor,
-/// which nothing has judged yet. Marker files order the events, so no
-/// timing decides the outcome; the successor is judged only after its own
-/// full interval (5 s), well after the check below.
 #[test]
 fn a_stale_probe_never_replaces_the_successor_it_did_not_probe() {
     let marks = tempfile::tempdir().unwrap();
     let m = marks.path().display();
-    // Waits (bounded, 20 s) until the marker `name` exists.
     let wait_for = |name: &str| {
         format!(
             "i=0; while [ ! -e \"{m}/{name}\" ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done"
         )
     };
-    // The first `forward` marks `a` and ends once a probe is in flight; the
-    // second marks `b` and stays up. `ping` marks `pinging` and fails only
-    // once `b` exists.
     let body = format!(
         concat!(
             "  forward) if [ ! -e \"{m}/a\" ]; then : > \"{m}/a\"; {until_pinging}; exit 0; fi;",
@@ -333,16 +294,11 @@ fn a_stale_probe_never_replaces_the_successor_it_did_not_probe() {
     let forward =
         tailcat::start_forward_every(&config, fake.path(), &controller, Duration::from_secs(5))
             .unwrap();
-    // The first probe starts; the first helper then ends; its successor
-    // starts, and only then does the probe fail.
     let deadline = Instant::now() + Duration::from_secs(30);
     while !marks.path().join("b").exists() {
         assert!(Instant::now() < deadline, "the successor never started");
         std::thread::sleep(Duration::from_millis(25));
     }
-    // The stale failure lands within a poll of the successor's start; give
-    // it far longer than that, yet far less than the successor's own
-    // interval.
     std::thread::sleep(Duration::from_millis(1_500));
     assert_eq!(
         fake.calls("forward").len(),
@@ -378,9 +334,6 @@ fn the_allow_list_ties_each_nodekey_to_a_worker() {
         worker: two
     }));
 
-    // Fail closed: a bare key, a bad worker id, a key named for two workers,
-    // a trailing field and a malformed key are all refused, naming only the
-    // line.
     for (text, line) in [
         (format!("nodekey:{KEY}\n"), 1),
         (
@@ -429,7 +382,6 @@ fn credentials_stay_out_of_debug_output() {
     assert!(!format!("{telemetry:?}").contains(ADDRESS));
 }
 
-/// Whether a process still runs (a zombie waiting for its reaper does not).
 fn alive(pid: u32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
         stat.rsplit_once(") ")
@@ -447,11 +399,7 @@ fn an_empty_allow_list_admits_no_peer_and_still_has_an_address() {
     let config = fake.config(7443);
     let server = tailcat::start_server(&config, fake.path(), &[]).unwrap();
     server.wait_ready(Duration::from_secs(10)).unwrap();
-    // Upstream serves every peer when `--allow` is absent; an empty list must
-    // say `none` explicitly.
     assert_eq!(fake.calls("serve"), vec![allow_none()]);
-    // A server key's genkey prints an address, not a key: the controller's
-    // node key is decoded from that address.
     assert_eq!(
         fs::read_to_string(tailcat::nodekey_file(fake.path(), Role::Controller))
             .unwrap()
@@ -459,7 +407,6 @@ fn an_empty_allow_list_admits_no_peer_and_still_has_an_address() {
         key(KEY).expose()
     );
 
-    // The address goes to an owner-only file, not to any output.
     let file = server.address_file();
     assert_eq!(
         file,
@@ -486,9 +433,6 @@ fn narrowing_or_emptying_the_list_replaces_the_helper_at_once() {
     });
     let old = server.telemetry().pid.unwrap();
 
-    // Revoking `second` narrows the list: the old child (still admitting
-    // `second`) is killed and the new one admits `first` only. A deliberate
-    // replacement is immediate — no back-off — and records no problem.
     let asked = Instant::now();
     server.set_allow(std::slice::from_ref(&first));
     wait_until("serve with the narrower list", || {
@@ -509,13 +453,11 @@ fn narrowing_or_emptying_the_list_replaces_the_helper_at_once() {
     });
     assert!(server.telemetry().problem.is_none());
 
-    // Emptying it closes every tunnel: the next helper admits nobody.
     let old = server.telemetry().pid.unwrap();
     server.set_allow(&[]);
     wait_until("serve with no peer", || fake.calls("serve").len() == 3);
     assert_eq!(fake.calls("serve")[2], allow_none());
     wait_until("the old helper to be gone", || !alive(old));
-    // A later non-empty list admits again.
     server.set_allow(std::slice::from_ref(&second));
     wait_until("serve with a key again", || fake.calls("serve").len() == 4);
     assert_eq!(
@@ -527,8 +469,6 @@ fn narrowing_or_emptying_the_list_replaces_the_helper_at_once() {
 
 #[test]
 fn back_off_resets_after_a_healthy_helper_and_never_delays_a_new_list() {
-    // Each helper reports readiness and then dies: every restart follows a
-    // healthy run, so the wait stays at the minimum instead of doubling.
     let flapping = Fake::write(
         "  serve) printf 'listening on tcabcdefghijklmnopqrstuvwxyz0123\\n'; sleep 0.2; exit 7 ;;\n",
     );
@@ -542,8 +482,6 @@ fn back_off_resets_after_a_healthy_helper_and_never_delays_a_new_list() {
     );
     server.shutdown();
 
-    // A helper that fails before readiness does back off — but a new allow
-    // list interrupts that wait instead of queueing behind it.
     let failing = Fake::write("  serve) exit 7 ;;\n");
     let server = tailcat::start_server(&failing.config(7443), failing.path(), &[]).unwrap();
     wait_until("three failed runs", || failing.calls("serve").len() >= 3);
@@ -577,8 +515,6 @@ fn the_probe_measures_the_path_without_touching_the_link_port() {
     assert_eq!(measured.path, Route::Relay);
     assert_eq!(measured.rtt, Some(Duration::from_micros(42_100)));
     assert_eq!(forward.telemetry().path, Route::Relay);
-    // Nothing reached the (stand-in) controller listener: a probe is a
-    // `ping`, not a stray connection counted as a rejected TLS handshake.
     assert_eq!(
         listener.accept().map(|_| ()).unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
@@ -594,7 +530,6 @@ fn the_probe_measures_the_path_without_touching_the_link_port() {
     assert_eq!(measured.rtt, Some(Duration::from_micros(740)));
     forward.shutdown();
 
-    // A ping that says nothing measurable leaves the path Unknown.
     let silent =
         Fake::write("  forward) printf 'forwarding\\n'; exec sleep 3600 ;;\n  ping) exit 0 ;;\n");
     let forward = tailcat::start_forward(&silent.config(port), silent.path(), &controller).unwrap();
@@ -618,8 +553,6 @@ fn the_helper_runs_with_only_its_home_in_the_environment() {
             .any(|line| line == format!("HOME={}", keydir.display())),
         "{env}"
     );
-    // The test process has PATH (and CARGO_* variables); none of it passes.
-    // Only TLS trust overrides do, and only when the operator set them.
     assert!(std::env::var_os("PATH").is_some());
     for line in env.lines() {
         let name = line.split('=').next().unwrap_or_default();
@@ -638,13 +571,11 @@ fn only_a_trusted_unchanged_helper_file_runs() {
     let fake = Fake::write(SERVE_FOREVER);
     let config = fake.config(7443);
 
-    // Writable by the group: refused before anything runs.
     fs::set_permissions(&fake.binary, fs::Permissions::from_mode(0o770)).unwrap();
     let error = tailcat::start_server(&config, fake.path(), &[]).unwrap_err();
     assert!(error.to_string().contains("writable"), "{error}");
     fs::set_permissions(&fake.binary, fs::Permissions::from_mode(0o700)).unwrap();
 
-    // A symlink to the right file is not followed.
     let link = fake.path().join("helper-link");
     std::os::unix::fs::symlink(&fake.binary, &link).unwrap();
     let mut linked = config.clone();
@@ -652,8 +583,6 @@ fn only_a_trusted_unchanged_helper_file_runs() {
     assert!(tailcat::start_server(&linked, fake.path(), &[]).is_err());
     assert!(!fake.log.exists(), "nothing ran");
 
-    // Replaced after a successful start: the next execution notices the new
-    // file identity, re-hashes it and refuses it.
     let server = tailcat::start_server(&config, fake.path(), &[]).unwrap();
     server.wait_ready(Duration::from_secs(10)).unwrap();
     let serves = fake.calls("serve").len();
@@ -673,13 +602,11 @@ fn only_a_trusted_unchanged_helper_file_runs() {
     server.shutdown();
 }
 
-/// When set, this test binary plays a Sentinel process that is SIGKILLed.
 const ORPHAN_ROLE: &str = "SENTINEL_TAILCAT_ORPHAN_DIR";
 
 #[test]
 fn a_killed_sentinel_takes_its_helper_with_it() {
     if let Some(dir) = std::env::var_os(ORPHAN_ROLE) {
-        // The child role: start a helper, report its pid, and wait to die.
         let dir = PathBuf::from(dir);
         let config = TailcatConfig {
             enabled: true,
@@ -716,7 +643,6 @@ fn a_killed_sentinel_takes_its_helper_with_it() {
     wait_until("the child's helper", || pid_file.exists());
     let helper: u32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
     assert!(alive(helper));
-    // SIGKILL: no destructor, no shutdown — only the kernel can clean up.
     sentinel.kill().unwrap();
     sentinel.wait().unwrap();
     wait_until("the orphaned helper to die", || !alive(helper));
@@ -755,20 +681,14 @@ fn a_lost_session_replaces_a_settled_helper_at_once_and_spares_a_young_one() {
     .unwrap();
     wait_until("the forward", || forward.telemetry().pid.is_some());
     let first = forward.telemetry().pid.unwrap();
-    // Too young to judge (the shipped settle time is 10 s): a controller
-    // still coming up must not make the worker kill a successor before it
-    // could connect.
     assert!(!forward.session_lost());
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(forward.telemetry().pid, Some(first));
-    // Settled: one lost session replaces it at once, as a decision (no
-    // back-off, no recorded problem)...
     let asked = Instant::now();
     assert!(forward.session_lost_after(Duration::from_millis(200)));
     wait_until("the replacement helper", || {
         forward.telemetry().pid.is_some_and(|pid| pid != first)
     });
-    // ...and its successor is young again.
     assert!(!forward.session_lost());
     assert!(
         asked.elapsed() < Duration::from_millis(900),
@@ -781,13 +701,8 @@ fn a_lost_session_replaces_a_settled_helper_at_once_and_spares_a_young_one() {
     forward.shutdown();
 }
 
-/// The address a controller's rotated key is served at.
 const ADDRESS2: &str = "tczyxwvutsrqponmlkjihgfedcba9876";
 
-/// A fake that tells its key pairs apart: the default keys are `KEY` (worker)
-/// and `ADDRESS`/`KEY` (controller), the rotated ones `OTHER` and
-/// `ADDRESS2`/`OTHER`. A worker's `ping` with the rotated key succeeds only
-/// once `$HOME/admitted` exists — the controller listing that key.
 fn rotating() -> Fake {
     Fake::script(&format!(
         concat!(
@@ -828,7 +743,6 @@ fn mode(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
-/// No node key or address, of either generation, in what a diagnostic prints.
 fn assert_no_credentials(printed: &str) {
     for secret in [KEY, OTHER, ADDRESS, ADDRESS2] {
         assert!(!printed.contains(secret), "{printed}");
@@ -856,8 +770,6 @@ fn a_worker_key_rotates_only_once_the_controller_admits_it() {
         fake.calls("forward") == vec![plain.clone()]
     });
 
-    // Staging generates a second key beside the active one and changes
-    // nothing that runs. A second stage returns the same key.
     let staged = tailcat::stage_rotation(&config, fake.path(), Role::Worker).unwrap();
     assert_eq!(staged, key(OTHER));
     assert!(
@@ -881,8 +793,6 @@ fn a_worker_key_rotates_only_once_the_controller_admits_it() {
         0o600
     );
 
-    // The controller does not list the new key yet: the commit is refused
-    // after a ping with that key, and the worker keeps its admitted key.
     let refused = tailcat::commit_rotation(&config, fake.path(), Role::Worker, Some(&controller))
         .unwrap_err();
     assert_no_credentials(&refused.to_string());
@@ -902,8 +812,6 @@ fn a_worker_key_rotates_only_once_the_controller_admits_it() {
         fake.calls("forward")
     );
 
-    // Listed: the commit switches, the record names the new key and the old
-    // private key is deleted through the helper.
     fs::write(fake.path().join("tailcat").join("admitted"), "").unwrap();
     let committed =
         tailcat::commit_rotation(&config, fake.path(), Role::Worker, Some(&controller)).unwrap();
@@ -920,8 +828,6 @@ fn a_worker_key_rotates_only_once_the_controller_admits_it() {
             .contains(&"argv genkey --delete --key=client-default".to_owned())
     );
 
-    // The running worker follows within a probe interval: its helper and
-    // its probes use the new key from then on.
     let rotated =
         format!("argv forward --bind=127.0.0.1 --key=client-rotated {ADDRESS} {port}:{port}");
     wait_until("the forward on the new key", || {
@@ -940,8 +846,6 @@ fn a_worker_key_rotates_only_once_the_controller_admits_it() {
     );
     assert_no_credentials(&format!("{:?}", forward.telemetry()));
 
-    // Nothing left to commit; a new rotation stages the other name, and
-    // abandoning it deletes that key and changes nothing in use.
     assert!(
         tailcat::commit_rotation(&config, fake.path(), Role::Worker, Some(&controller)).is_err()
     );
@@ -982,8 +886,6 @@ fn the_controller_serves_both_keys_until_its_rotation_commits() {
     assert_eq!(staged_file, keydir.join(tailcat::STAGED_ADDRESS_FILE));
     assert!(tailcat::commit_rotation(&config, fake.path(), Role::Controller, None).is_err());
 
-    // A staged key is served beside the active one once the controller
-    // reloads; abandoning it stops that helper and removes its address.
     tailcat::stage_rotation(&config, fake.path(), Role::Controller).unwrap();
     server.reload_keys().unwrap();
     wait_until("the staged address", || staged_file.exists());
@@ -998,7 +900,6 @@ fn the_controller_serves_both_keys_until_its_rotation_commits() {
         fake.calls("genkey")
             .contains(&"argv genkey --key=rotated --force --fixed-region".to_owned())
     );
-    // Not served yet, so no worker can have its address: no commit.
     let early = tailcat::commit_rotation(&config, fake.path(), Role::Controller, None).unwrap_err();
     assert!(early.to_string().contains("has not served"), "{early}");
 
@@ -1019,7 +920,6 @@ fn the_controller_serves_both_keys_until_its_rotation_commits() {
             && serves.contains(&format!("argv serve --allow={allow} --key=rotated 7443"))
     };
     assert!(both(worker.expose()), "{:?}", fake.calls("serve"));
-    // The active identity is untouched through the overlap.
     assert_eq!(server.address().unwrap().expose(), ADDRESS);
     assert_eq!(
         fs::read_to_string(keydir.join(tailcat::ADDRESS_FILE)).unwrap(),
@@ -1028,11 +928,8 @@ fn the_controller_serves_both_keys_until_its_rotation_commits() {
     assert_no_credentials(&format!("{:?}", server.staged_telemetry()));
     assert_no_credentials(&format!("{server:?}"));
 
-    // An allow-list change reaches both helpers; an unchanged reload
-    // restarts neither.
     let second = key(KEY);
     server.set_allow(&[worker.clone(), second.clone()]);
-    // Sorted: THIRD's body sorts before KEY's.
     let widened = format!("{},{}", worker.expose(), second.expose());
     wait_until("both helpers on the wider list", || both(&widened));
     std::thread::sleep(Duration::from_millis(300));
@@ -1045,8 +942,6 @@ fn the_controller_serves_both_keys_until_its_rotation_commits() {
         "a no-op reload restarted a helper"
     );
 
-    // Commit: the address file names the new address at once, the record
-    // the new key, and the old private key is deleted.
     let committed = tailcat::commit_rotation(&config, fake.path(), Role::Controller, None).unwrap();
     assert_eq!(committed.key, key(OTHER));
     assert!(committed.previous_deleted);
@@ -1064,9 +959,6 @@ fn the_controller_serves_both_keys_until_its_rotation_commits() {
             .contains(&"argv genkey --delete --key=default".to_owned())
     );
 
-    // The running controller switches: the helper already serving the new
-    // key becomes the main one without a restart (its workers keep their
-    // tunnel), and the old key's helper stops.
     let (old_main, promoted) = (
         server.telemetry().pid.unwrap(),
         server.staged_telemetry().unwrap().pid.unwrap(),
@@ -1089,8 +981,6 @@ fn the_controller_serves_both_keys_until_its_rotation_commits() {
     );
     assert!(!staged_file.exists());
 
-    // The promoted helper follows later allow-list changes, and a restart of
-    // it keeps serving the committed key.
     server.set_allow(std::slice::from_ref(&worker));
     wait_until("the promoted helper on the narrower list", || {
         fake.calls("serve").last()
@@ -1128,12 +1018,10 @@ fn the_allow_list_is_edited_per_worker_with_an_overlap_window() {
         worker: two,
     };
 
-    // An absent list is created owner-only.
     assert!(tailcat::admit(dir.path(), &old).unwrap());
     assert_eq!(mode(&path), 0o600);
     fs::write(&path, format!("# builders\n{} {one}", key(KEY).expose())).unwrap();
     assert!(!tailcat::admit(dir.path(), &old).unwrap(), "already listed");
-    // The worker's new key is listed beside its old one: both are admitted.
     assert!(tailcat::admit(dir.path(), &new).unwrap());
     assert!(tailcat::admit(dir.path(), &other).unwrap());
     let listed = tailcat::allow_list(dir.path()).unwrap();
@@ -1142,7 +1030,6 @@ fn the_allow_list_is_edited_per_worker_with_an_overlap_window() {
     }
     assert_eq!(mode(&path), 0o600);
 
-    // One key belongs to one worker; the refusal changes nothing.
     let before = fs::read_to_string(&path).unwrap();
     let taken = tailcat::admit(
         dir.path(),
@@ -1155,8 +1042,6 @@ fn the_allow_list_is_edited_per_worker_with_an_overlap_window() {
     assert_no_credentials(&taken.to_string());
     assert_eq!(fs::read_to_string(&path).unwrap(), before);
 
-    // Retiring keeps the named key as the worker's only one, and every
-    // other worker's line and every comment.
     assert_eq!(tailcat::retire(dir.path(), &new).unwrap(), 1);
     let listed = tailcat::allow_list(dir.path()).unwrap();
     assert_eq!(listed.len(), 2);
@@ -1167,7 +1052,6 @@ fn the_allow_list_is_edited_per_worker_with_an_overlap_window() {
             .starts_with("# builders\n")
     );
     assert_eq!(tailcat::retire(dir.path(), &new).unwrap(), 0);
-    // A key that is not listed for that worker cannot be the one kept.
     let unlisted = tailcat::retire(dir.path(), &old).unwrap_err();
     assert_no_credentials(&unlisted.to_string());
     assert_eq!(tailcat::allow_list(dir.path()).unwrap().len(), 2);
@@ -1193,10 +1077,6 @@ impl sentinel_link::session::Executor for Idle {
     fn log_refused(&self, _: sentinel_core::AttemptId) {}
 }
 
-/// The hand-off closes only what the helper carries: a worker on direct TLS
-/// over loopback (the same address family and host a tunnelled session
-/// comes from) keeps its session through a real change, and an unchanged
-/// list neither restarts the helper nor touches a session.
 #[test]
 fn a_hand_off_restarts_the_helper_only_on_a_change_and_spares_direct_tls() {
     use sentinel_link::{controller::Controller, identity::Identity, worker};
@@ -1257,8 +1137,6 @@ fn a_hand_off_restarts_the_helper_only_on_a_change_and_spares_direct_tls() {
             memory_bytes: 1 << 30,
         },
         profile: sentinel_protocol::negotiate::Profile {
-            // A profile-protocol worker states its scratch disk; zero offers none,
-            // and every job declares some.
             disk_bytes: 64 << 30,
             ..sentinel_protocol::negotiate::Profile::default()
         },
@@ -1281,12 +1159,10 @@ fn a_hand_off_restarts_the_helper_only_on_a_change_and_spares_direct_tls() {
     };
     wait_until("the direct session", || link.connected().len() == 1);
 
-    // Unchanged (a reordered duplicate of the same key): nothing happens.
     assert_eq!(link.hand_off(&server, &[key(KEY), key(KEY)]), None);
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(fake.calls("serve").len(), 1);
 
-    // Changed: the helper restarts, carrying nothing, so nothing is closed.
     let old = server.telemetry().pid.unwrap();
     let handoff = link.hand_off(&server, &[key(KEY), key(OTHER)]).unwrap();
     assert_eq!(
@@ -1312,12 +1188,6 @@ fn a_hand_off_restarts_the_helper_only_on_a_change_and_spares_direct_tls() {
     assert!(controller.shutdown(Duration::from_secs(5)));
 }
 
-/// A connection the helper carries that is not a session yet (here it has
-/// sent no TLS byte at all) is closed by the hand-off too, from its own
-/// thread: a `close_notify` alert and a FIN reach the helper's socket, and
-/// the helper closing its end in turn counts as the close delivered. The
-/// fake helper dials the link port itself, so it owns that connection the
-/// way the real one owns each tunnelled dial.
 #[test]
 fn a_hand_off_closes_a_carried_connection_still_in_its_handshake() {
     use sentinel_link::{controller::Controller, identity::Identity};
@@ -1338,8 +1208,6 @@ fn a_hand_off_closes_a_carried_connection_still_in_its_handshake() {
     let port = controller.local_addr().port();
     let link = controller.handle();
 
-    // Each helper dials the link port, reads until the controller's end and
-    // records what came, then exits, which closes its side.
     let received = state.path().join("received");
     let fake = Fake::write(&format!(
         "  serve) printf 'listening on {ADDRESS}\\n'; exec bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}; exec cat <&3 > \"$0.$$\"' {} ;;\n",
@@ -1351,7 +1219,6 @@ fn a_hand_off_closes_a_carried_connection_still_in_its_handshake() {
     let old = server.telemetry().pid.unwrap();
     let file = PathBuf::from(format!("{}.{old}", received.display()));
     wait_until("the helper's dial", || file.exists());
-    // Accepted and waiting for its ClientHello.
     std::thread::sleep(Duration::from_millis(300));
 
     let handoff = link.hand_off(&server, &[key(KEY), key(OTHER)]).unwrap();
@@ -1365,8 +1232,6 @@ fn a_hand_off_closes_a_carried_connection_still_in_its_handshake() {
         (1, 0, 1, 1),
         "{handoff:?}"
     );
-    // The close came before the helper was replaced, and it was a TLS
-    // close_notify alert (record type 21, level warning, description 0).
     let bytes = fs::read(&file).unwrap();
     assert_eq!(bytes.len(), 7, "{bytes:?}");
     assert_eq!((bytes[0], &bytes[5..]), (21, &[1u8, 0][..]), "{bytes:?}");

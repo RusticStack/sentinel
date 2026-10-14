@@ -1,15 +1,3 @@
-//! Control traffic stays alive when the bulk transport is stalled.
-//!
-//! A protocol-7 session has two connections with one identity. This suite
-//! proves the reason the split exists: with the controller deliberately not
-//! reading the bulk connection (so the worker's bulk writes block on TCP
-//! backpressure after the socket buffers fill), the control session still
-//! sends its heartbeat and receives its pong — and the stalled bulk traffic
-//! completes once the reader drains. A second case proves the fallback: a
-//! bulk-class message sent on the control connection (no second connection
-//! up) is served, not rejected, so an environment that blocks the second
-//! connection loses latency, never correctness.
-
 use std::{
     sync::{
         Arc, Mutex,
@@ -34,17 +22,9 @@ use sentinel_protocol::negotiate::{
     Arch, Capabilities, Hello, Profile, ProtocolVersion, negotiate,
 };
 
-/// 16 KiB frames. The flood is not a fixed size: the loopback socket buffers
-/// autotune (Linux defaults allow 4 MiB of send buffer and 32 MiB of receive
-/// buffer), so any fixed amount either fits on some kernel or wastes time on
-/// others. The flood writes until the writer blocks, whatever that takes.
+/// Socket buffers autotune, so the flood writes until the writer blocks, not a fixed amount.
 const FLOOD_BYTES: usize = 16 * 1024;
-/// The flood's counter must stand still this long, with its thread still
-/// running, before the writer counts as blocked. The flood loop never sleeps,
-/// so a writer that is not blocked moves the counter within microseconds.
 const STALL_QUIET: Duration = Duration::from_secs(1);
-/// Longer than the heartbeat interval (5 s) with slack for a loaded machine,
-/// shorter than the socket write timeout (15 s) that would end the stall.
 const PONG_WINDOW: Duration = Duration::from_secs(12);
 
 fn wait_until(mut done: impl FnMut() -> bool, limit: Duration) -> bool {
@@ -58,8 +38,6 @@ fn wait_until(mut done: impl FnMut() -> bool, limit: Duration) -> bool {
     done()
 }
 
-/// Admit every certificate and negotiate exactly what the hello offers; the
-/// suite tests transport priority, not admission.
 struct AnyAdmission;
 
 impl Admission for AnyAdmission {
@@ -81,8 +59,6 @@ impl Admission for AnyAdmission {
     }
 }
 
-/// Counts what actually crossed each connection, so the assertions are about
-/// observed traffic rather than timing guesses.
 #[derive(Default)]
 struct Counting {
     pings: AtomicU64,
@@ -119,8 +95,6 @@ impl SessionHandler for Counting {
     fn abandoned(&self, _worker: WorkerId, _attempt: AttemptId, _fence: Fence) {}
 }
 
-/// The worker end: nothing is held, offers are declined, and the reporter of
-/// the live session is kept so the test can speak over it.
 #[derive(Default)]
 struct TestExecutor {
     reporter: Mutex<Option<Reporter>>,
@@ -202,8 +176,6 @@ fn stalled_bulk_never_holds_up_the_control_beat() {
     let (listener, server, client) = deployment();
     let addr = listener.local_addr().unwrap();
     let handler = Arc::new(Counting::default());
-    // The bulk reader waits for this: the test keeps the stall open exactly
-    // as long as it needs to observe the control beat inside it.
     let drain = Arc::new(AtomicBool::new(false));
     let controller = {
         let handler = Arc::clone(&handler);
@@ -225,8 +197,6 @@ fn stalled_bulk_never_holds_up_the_control_beat() {
             let serving = thread::spawn(move || {
                 let _ = control.serve(&*control_handler);
             });
-            // The stall: nothing reads the bulk connection while the test
-            // floods it, so the worker's bulk writes block.
             while !drain.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(20));
             }
@@ -252,8 +222,6 @@ fn stalled_bulk_never_holds_up_the_control_beat() {
         capacity(),
     )
     .unwrap();
-    // Protocol 7: report the profile, then dial the bulk connection and read
-    // its answers on their own thread (log acknowledgements included).
     assert_eq!(
         link.negotiated.protocol,
         sentinel_protocol::negotiate::SUPPORTED_MAX
@@ -299,11 +267,6 @@ fn stalled_bulk_never_holds_up_the_control_beat() {
         .clone()
         .expect("reporter checked present");
 
-    // Flood the bulk connection until the controller drains it. Nothing
-    // reads it before then, so once the socket buffers are full the writer
-    // blocks inside a frame write. `sent` counts frames the socket took;
-    // `outcome` is 1 once the flood ended cleanly after the drain, 2 if a
-    // write failed.
     let sent = Arc::new(AtomicU64::new(0));
     let outcome = Arc::new(AtomicU64::new(0));
     let attempt = AttemptId::new();
@@ -329,8 +292,6 @@ fn stalled_bulk_never_holds_up_the_control_beat() {
         })
     };
 
-    // The stall: the counter stops while the flood is still running. This
-    // waits for the kernel's buffers to fill, however large they autotuned.
     let stalled_at = {
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut last = sent.load(Ordering::Acquire);
@@ -357,9 +318,6 @@ fn stalled_bulk_never_holds_up_the_control_beat() {
     };
     assert!(stalled_at > 0, "the bulk connection took no frames at all");
 
-    // The whole point: a beat completes while the bulk writer is blocked.
-    // The controller answers pings on the control connection only, so a
-    // later ping cannot have come from a bulk-powered session.
     let pings_before = handler.pings.load(Ordering::Acquire);
     assert!(
         wait_until(
@@ -377,8 +335,6 @@ fn stalled_bulk_never_holds_up_the_control_beat() {
         "the bulk writer must still have been blocked when the pong arrived"
     );
 
-    // Unblock the controller's bulk reader: the blocked write completes and
-    // the flood ends cleanly, with every frame the socket took acknowledged.
     drain.store(true, Ordering::Release);
     assert!(
         wait_until(
@@ -445,7 +401,6 @@ fn bulk_traffic_on_control_is_served_as_fallback() {
         sentinel_protocol::negotiate::SUPPORTED_MAX
     );
     link.send_profile(&Profile::default()).unwrap();
-    // No bulk connection is dialled: the session falls back to control.
     let closer = link.sender();
     let runner = {
         let executor = Arc::clone(&executor);
@@ -492,8 +447,6 @@ fn bulk_traffic_on_control_is_served_as_fallback() {
 
 #[test]
 fn host_id_is_stable_for_one_host() {
-    // The profile's host id must be the same for sibling worker processes on
-    // one machine; it is derived from the machine id, never random.
     let first = session::host_id();
     let second = session::host_id();
     assert_eq!(first, second);
@@ -501,18 +454,10 @@ fn host_id_is_stable_for_one_host() {
 
 #[test]
 fn session_error_is_printable() {
-    // Telemetry and diagnostics must never need the session to carry
-    // credentials; the error type stays printable without them.
     let error: Error = Error::Protocol("priority");
     assert!(format!("{error}").contains("priority"));
 }
 
-/// The control session joins its bulk thread before it returns, and the bulk
-/// thread's redial back-off (doubling towards 30 s) must not be an
-/// uninterruptible sleep: with the bulk dial failing, a lost control session
-/// could not begin reconnecting until it ended, longer than a lease once the
-/// back-off saturated. The wait watches the stop flag, so the session returns
-/// promptly whatever the back-off.
 #[test]
 fn a_failing_bulk_redial_never_delays_the_control_teardown() {
     let (listener, server, client) = deployment();
@@ -534,9 +479,6 @@ fn a_failing_bulk_redial_never_delays_the_control_teardown() {
             thread::spawn(move || {
                 let _ = control.serve(&*handler);
             });
-            // The first bulk connection is attached, then dropped; every
-            // redial after it is accepted at TCP and closed before TLS, so
-            // the worker's bulk thread keeps backing off.
             let (socket, _) = listener.accept().unwrap();
             let first = session::accept(socket, server, &AnyAdmission).unwrap();
             dials.fetch_add(1, Ordering::AcqRel);
@@ -582,8 +524,6 @@ fn a_failing_bulk_redial_never_delays_the_control_teardown() {
         })
     };
     let control = control_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    // The first bulk connection, then two failed redials: the bulk thread is
-    // now inside its third back-off, 4 s ± 25 %.
     assert!(
         wait_until(
             || dials.load(Ordering::Acquire) >= 3,
@@ -602,7 +542,6 @@ fn a_failing_bulk_redial_never_delays_the_control_teardown() {
         "the session returned {teardown:?} after the control connection closed"
     );
     handle.stop();
-    // Unblock the fake controller's accept loop.
     let _ = std::net::TcpStream::connect(addr);
     drop(controller);
 }

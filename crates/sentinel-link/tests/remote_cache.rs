@@ -1,15 +1,3 @@
-//! Remote cache end to end over real TLS against a running
-//! `Controller` and its on-disk store — the paths the in-memory fakes of
-//! `sentinel-cache/tests/remote.rs` cannot reach:
-//!
-//! - an offer sent after the attempt's terminal report is stored, and a
-//!   later attempt of the same repository hydrates it;
-//! - an offer from a worker that does not own the attempt is `denied`;
-//! - a fetch the worker abandons is cancelled on the controller, and the
-//!   next fetch of the same attempt gets a clean stream;
-//! - the worker's profile carries the executor's measured availability and
-//!   refreshes it as it changes.
-
 use std::{
     io::Cursor,
     sync::{Arc, Mutex, mpsc},
@@ -272,8 +260,6 @@ fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
     }
 }
 
-/// The cache boundary a manual run of the deployment's repository has on
-/// a protocol-8 worker: its tenant and repository, `unprotected` trust.
 fn upload(d: &Deployment, attempt: AttemptId, stream: &[u8]) -> Upload {
     Upload {
         attempt: *attempt.as_bytes(),
@@ -308,7 +294,6 @@ fn need(u: &Upload, attempt: AttemptId) -> Need {
     }
 }
 
-/// Collects a fetched stream; optionally stops after `stop_after` chunks.
 #[derive(Default)]
 struct Collect {
     grant: Option<Grant>,
@@ -343,11 +328,6 @@ fn next_attempt(d: &Deployment, offers: &mpsc::Receiver<Offer>) -> Offer {
     offers.recv_timeout(Duration::from_secs(10)).unwrap()
 }
 
-/// The worker offers after its terminal report released
-/// the attempt, and the controller stores it; a later attempt of the same
-/// repository fetches it byte for byte, a transfer the worker abandons is
-/// cancelled and the attempt's next fetch is clean, and another worker can
-/// never offer under an attempt it does not own.
 #[test]
 fn an_offer_after_the_terminal_report_is_stored_and_serves_the_next_attempt() {
     let d = deployment();
@@ -399,7 +379,6 @@ fn an_offer_after_the_terminal_report_is_stored_and_serves_the_next_attempt() {
         )
         .expect("an offer of a just-released attempt is stored");
 
-    // The next attempt of the repository hydrates exactly those bytes.
     holder.held.lock().unwrap().retain(|a| *a != first);
     let second = next_attempt(&d, &offers).attempt;
     let mut full = Collect::default();
@@ -412,9 +391,6 @@ fn an_offer_after_the_terminal_report_is_stored_and_serves_the_next_attempt() {
         .unwrap();
     assert_eq!(full.bytes, stream);
 
-    // Abandoned after one chunk: the controller is told, stops, and the
-    // next fetch of the same attempt is a clean, complete stream — none of
-    // the abandoned transfer's tail is routed into it.
     let mut cut = Collect {
         stop_after: Some(1),
         ..Collect::default()
@@ -436,7 +412,6 @@ fn an_offer_after_the_terminal_report_is_stored_and_serves_the_next_attempt() {
             &mut again,
         ) {
             Ok(()) => break again,
-            // Still draining the cancelled transfer's terminal.
             Err(Refusal::Busy) => {
                 assert!(started.elapsed() < Duration::from_secs(10), "never drained");
                 thread::sleep(Duration::from_millis(20));
@@ -446,7 +421,6 @@ fn an_offer_after_the_terminal_report_is_stored_and_serves_the_next_attempt() {
     };
     assert_eq!(clean.bytes, stream);
 
-    // A worker that does not own the attempt is refused.
     let denied_before = d
         .controller
         .stats()
@@ -472,9 +446,6 @@ fn an_offer_after_the_terminal_report_is_stored_and_serves_the_next_attempt() {
             > denied_before
     );
 
-    // Protocol 9: the offer names its digest only in its end
-    // marker — the worker reads the stream once and hashes it on the way
-    // out — and the controller stores it under the digest the bytes prove.
     assert!(remote.digest_at_end());
     let restream: Vec<u8> = (0..300_000u32).map(|i| (i % 239) as u8).collect();
     let mut late = upload(&d, first, &restream);
@@ -500,9 +471,6 @@ fn an_offer_after_the_terminal_report_is_stored_and_serves_the_next_attempt() {
     let _ = JobId::new();
 }
 
-/// The profile opens with the executor's measured availability —
-/// not an empty placeholder — and a protocol-8 session refreshes it when
-/// the executor's version moves; placement reads it from the worker row.
 #[test]
 fn the_profile_carries_and_refreshes_measured_availability() {
     let d = deployment();

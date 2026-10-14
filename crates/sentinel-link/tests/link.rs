@@ -1,10 +1,3 @@
-//! The link end to end over real TLS on loopback against a running
-//! `Controller`: enrollment and identity refusals; then dispatch — a queued
-//! job reaches a connected worker on the wake, not on a poll; offers are
-//! acknowledged and reserved; a decline or a missed acknowledgement lapses
-//! back to the queue under a higher fence; leases renew on the heartbeat;
-//! completion frees capacity and queues dependents; a worker reconnects.
-
 use std::{
     sync::{
         Arc, Mutex,
@@ -156,7 +149,6 @@ impl Deployment {
         )
     }
 
-    /// Create a run with every image resolved and wake the dispatcher.
     fn run(&self, yaml: &str) -> (RunId, Vec<JobId>) {
         let (tenant, repo, run) = (self.tenant, self.repo, RunId::new());
         let spec = RunSpec::new(
@@ -200,17 +192,14 @@ fn hello() -> Hello {
     }
 }
 
-/// A spec delivery: the attempt, its context (none when refused), the bytes.
 type SpecRecord = (AttemptId, Option<session::JobContext>, Vec<u8>);
 
-/// An executor that records what it is told and holds what it accepts.
 struct Recorder {
     offers: Mutex<mpsc::Sender<(Offer, Instant)>>,
     held: Mutex<Vec<AttemptId>>,
     stopped: Mutex<Vec<AttemptId>>,
     canceled: Mutex<Vec<AttemptId>>,
     renewed: AtomicI64,
-    /// Decline offers for these jobs once, to exercise the lapse path.
     decline_once: Mutex<Vec<JobId>>,
     reporter: Mutex<Option<session::Reporter>>,
     specs: Mutex<Vec<SpecRecord>>,
@@ -320,7 +309,6 @@ impl Executor for Recorder {
     }
 }
 
-/// A worker process: `worker::run` on its own thread with a stop handle.
 struct WorkerProcess {
     handle: Arc<worker::Handle>,
     events: Arc<Mutex<Vec<String>>>,
@@ -361,8 +349,6 @@ impl WorkerProcess {
             },
             capacity: CAPACITY,
             profile: sentinel_protocol::negotiate::Profile {
-                // A profile-protocol worker states its scratch disk; zero offers none,
-                // and every job declares some.
                 disk_bytes: 64 << 30,
                 ..sentinel_protocol::negotiate::Profile::default()
             },
@@ -406,13 +392,11 @@ impl WorkerProcess {
         let asked = Instant::now();
         self.handle.stop();
         let outcome = self.thread.take().unwrap().join().unwrap();
-        // Stopping closes the socket: no heartbeat interval has to elapse.
         assert!(asked.elapsed() < Duration::from_secs(2));
         outcome
     }
 }
 
-/// Wait until `predicate` holds, within ten seconds.
 fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !predicate() {
@@ -449,14 +433,12 @@ fn a_worker_enrolls_once_heartbeats_reconnects_and_is_refused_after_revocation()
     identity.save(&cert, &key).unwrap();
     let load = || Identity::load(&cert, &key).unwrap();
 
-    // Without the enrollment, an unknown certificate is refused.
     let refused = d.connect(load(), worker, None).unwrap_err();
     assert!(
         matches!(refused, Error::Rejected(Rejection::NotEnrolled)),
         "{refused}"
     );
 
-    // With it: welcomed, negotiated, capacity recorded, beats answered.
     let mut link = d.connect(load(), worker, Some(&secret)).unwrap();
     assert_eq!(link.worker, worker);
     assert_eq!(link.negotiated.protocol, ProtocolVersion(3));
@@ -485,7 +467,6 @@ fn a_worker_enrolls_once_heartbeats_reconnects_and_is_refused_after_revocation()
     drop(link);
     eventually("fleet removal", || d.controller().connected().is_empty());
 
-    // The enrollment is spent: presenting it again from another machine fails.
     let impostor = d
         .connect(
             Identity::generate("impostor").unwrap(),
@@ -497,13 +478,10 @@ fn a_worker_enrolls_once_heartbeats_reconnects_and_is_refused_after_revocation()
         matches!(impostor, Error::Rejected(Rejection::Enrollment)),
         "{impostor}"
     );
-    // The enrolled identity reconnects with no enrollment at all.
     let mut again = d.connect(load(), worker, None).unwrap();
     again.beat(&Idle).unwrap();
     drop(again);
 
-    // Revoked: the same certificate is refused from now on, and it cannot
-    // enroll again under the same identity with a fresh secret.
     d.store
         .writer()
         .write(move |tx| workers::revoke(tx, Authority::HostLocal, worker, UnixMillis::now()))
@@ -513,17 +491,12 @@ fn a_worker_enrolls_once_heartbeats_reconnects_and_is_refused_after_revocation()
     let fresh = d.enrollment(60_000);
     let refused = d.connect(load(), worker, Some(&fresh)).unwrap_err();
     assert!(matches!(refused, Error::Rejected(Rejection::Identity)));
-    // The client learns of a rejection from the reply bytes; the server-side
-    // counter updates as its accept call returns, a hair later.
     eventually("rejection count", || {
         d.controller().stats().rejected.load(Ordering::SeqCst) == 4
     });
     assert_eq!(d.controller().stats().admitted.load(Ordering::SeqCst), 2);
 }
 
-/// Certificate rotation overlap: a worker pinning the old and the new
-/// fingerprint reaches the controller on either, one pinning neither (or an
-/// empty or oversized set) does not.
 #[test]
 fn a_worker_pinning_a_set_of_fingerprints_accepts_any_of_them() {
     let d = deployment();
@@ -571,7 +544,6 @@ fn wrong_fingerprint_unsupported_version_and_expired_enrollment_are_refused_in_p
     )
     .unwrap_err();
     assert!(matches!(failure, Error::Tls(_) | Error::Io(_)), "{failure}");
-    // The enrollment was never presented, so it is still unspent.
     assert!(
         d.connect(
             Identity::generate("w2").unwrap(),
@@ -658,8 +630,6 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     process.wait_for("Connected", 1);
     eventually("fleet", || d.controller().connected() == vec![id]);
 
-    // Enqueue, wake: both ready jobs arrive well inside the reconciliation
-    // interval, so it was the wake that delivered them, not the poll.
     let woken = Instant::now();
     let (_, ids) = d.run(PIPELINE);
     let (build, lint, test) = (ids[0], ids[1], ids[2]);
@@ -676,11 +646,9 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     expected.sort();
     assert_eq!(placed, expected);
     assert_eq!(first.0.image_digest, DIGEST);
-    // `test` needs `build`: not offered, and the wait reason says why.
     assert!(offers.recv_timeout(Duration::from_millis(300)).is_err());
     assert_eq!(d.state(test), JobState::Blocked);
 
-    // Acknowledged on the controller: attempts marked, capacity reserved.
     eventually("acknowledgements", || {
         d.controller().stats().acknowledged.load(Ordering::SeqCst) == 2
     });
@@ -696,15 +664,12 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     );
     assert_eq!(d.state(build), JobState::Leased);
 
-    // The worker reports `build` done; capacity comes back and `test` is
-    // queued in the same transaction, then placed on the wake.
     let build_attempt = if first.0.job == build {
         &first.0
     } else {
         &second.0
     };
     let (attempt, fence) = (build_attempt.attempt, build_attempt.fence);
-    // The worker asks for the spec it will run and gets the stored bytes.
     let reporter = recorder.reporter.lock().unwrap().clone().unwrap();
     reporter.need_spec(attempt).unwrap();
     eventually("spec", || !recorder.specs.lock().unwrap().is_empty());
@@ -717,21 +682,13 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     assert_eq!(context.repo_name, "app");
     assert_eq!(context.sha, SHA);
     assert!(context.needs.is_empty() && !context.cancelled);
-    // Protocol 3's wire cannot carry the cache boundary: the worker reads
-    // no tenant and the pull-request trust class — the scope that can
-    // never touch protected state.
+    // Protocol 3 cannot carry the cache boundary, so it gets the pull-request trust class.
     assert_eq!(context.tenant, None);
     assert_eq!(context.trust, Trust::PullRequest);
-    // A spec for an attempt this worker does not hold is refused.
     reporter.need_spec(AttemptId::new()).unwrap();
     eventually("no spec", || recorder.specs.lock().unwrap().len() == 2);
     assert!(recorder.specs.lock().unwrap()[1].2.is_empty());
 
-    // Log frames of a held attempt are acknowledged only once stored and
-    // synced on the controller: what the acknowledgement covers is exactly
-    // what a reader sees. A resend is acknowledged again without a second
-    // copy; a jump is stored with its hole recorded; the end marker
-    // completes the log with the hole folded into the gaps.
     let (run, job) = (build_attempt.run, build_attempt.job);
     let text = |seq: u64, s: &str| Frame {
         seq,
@@ -747,8 +704,6 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     let tail = d.logs.tail(run, job, attempt, 0, 10, None).unwrap();
     assert_eq!(tail.frames.len(), 2);
     assert!(!tail.complete);
-    // The two frames may be acknowledged together or one by one, so count
-    // from what has been acknowledged, not from a fixed number.
     let acked = recorder.log_acks.lock().unwrap().len();
     reporter.log(attempt, &text(2, "two\n")).unwrap();
     eventually("duplicate acked", || {
@@ -766,7 +721,6 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     eventually("jump stored", || {
         recorder.log_acks.lock().unwrap().last() == Some(&(attempt, 9))
     });
-    // Frames for an attempt this worker does not hold are refused.
     let foreign = AttemptId::new();
     reporter.log(foreign, &text(1, "x")).unwrap();
     eventually("foreign refused", || {
@@ -776,8 +730,6 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
         d.logs.tail(run, job, foreign, 0, 10, None),
         Err(sentinel_store::Error::NotFound)
     ));
-    // An end below what was stored is refused; the end through the
-    // frontier completes the log and folds the hole into the gaps.
     reporter.log_end(attempt, 2, &[]).unwrap();
     eventually("short end refused", || {
         recorder.log_refusals.lock().unwrap().as_slice() == [foreign, attempt]
@@ -793,12 +745,8 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
         d.logs.tail(run, job, attempt, 0, 10, None).unwrap().gaps,
         vec![(3, 8)]
     );
-    // Protocol 3: the end is durable but no LogEndAck exists to send.
     assert!(recorder.log_ends.lock().unwrap().is_empty());
 
-    // The worker reports its progress over the wire; the terminal report
-    // frees the capacity, queues `test` and wakes the dispatcher — no
-    // `wake()` call from the test.
     recorder.release(attempt);
     for event in [
         Event::StepsStarted,
@@ -811,7 +759,6 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     eventually("terminal", || {
         d.state(build) == JobState::Terminal(Outcome::Passed)
     });
-    // A stale fence is refused without effect.
     reporter.report(attempt, Fence(0), Event::Passed).unwrap();
     eventually("stale report counted", || {
         d.controller().stats().stale_reports.load(Ordering::SeqCst) == 1
@@ -821,15 +768,12 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     assert!(third.1.duration_since(woken) < RECONCILE_INTERVAL / 2);
     assert_eq!(third.0.cpu_millis, 2_000);
 
-    // Leases renew on the heartbeat: the deadline the worker sees moves.
     let before = recorder.renewed.load(Ordering::SeqCst);
     eventually("renewal", || {
         recorder.renewed.load(Ordering::SeqCst) > before
     });
     assert!(recorder.stopped.lock().unwrap().is_empty());
 
-    // Cancellation is desired state on the controller and reaches the
-    // worker with its next beat, repeated until the worker reports.
     let (test_attempt, test_fence) = (third.0.attempt, third.0.fence);
     let tenant = d.tenant;
     assert_eq!(
@@ -855,8 +799,6 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     });
     recorder.release(test_attempt);
 
-    // A worker that restarted with `lint` in its leftovers abandons it:
-    // reconciled as an infrastructure failure under the right fence only.
     let (lint_attempt, lint_fence) = if first.0.job == lint {
         (first.0.attempt, first.0.fence)
     } else {
@@ -876,8 +818,6 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     assert_eq!(d.controller().stats().abandoned.load(Ordering::SeqCst), 1);
     recorder.release(lint_attempt);
 
-    // A clean stop says goodbye; the fleet forgets the worker; nothing is
-    // held any more.
     process.stop().unwrap();
     eventually("fleet removal", || d.controller().connected().is_empty());
     assert!(
@@ -912,14 +852,11 @@ jobs:
         Some(secret),
         Arc::clone(&recorder),
     );
-    // Work was waiting before the worker arrived: its arrival is a wake.
     let declined = offers.recv_timeout(Duration::from_secs(5)).unwrap().0;
     assert_eq!(declined.fence, Fence(1));
     eventually("lapse", || {
         d.controller().stats().lapsed.load(Ordering::SeqCst) == 1
     });
-    // Re-offered at the next reconciliation (not immediately: a refusing
-    // worker is bounded to one offer per interval), under fence 2.
     let again = offers
         .recv_timeout(RECONCILE_INTERVAL + Duration::from_secs(5))
         .unwrap()
@@ -960,15 +897,12 @@ jobs:
     });
     let first = d.store.read(|c| dispatch::held_by(c, id)).unwrap();
     assert_eq!((first.len(), first[0].acknowledged), (1, false));
-    // The worker reads nothing for longer than the ack timeout.
     thread::sleep(Duration::from_millis(
         dispatch::OFFER_ACK_MS as u64 + RECONCILE_INTERVAL.as_millis() as u64 + 500,
     ));
     eventually("lapse", || {
         d.controller().stats().lapsed.load(Ordering::SeqCst) >= 1
     });
-    // Now it reads: the stale offer is acknowledged late (ignored), the
-    // re-offer under fence 2 is acknowledged for real, the beat is answered.
     link.beat(&Idle).unwrap();
     eventually("fresh acknowledgement", || {
         d.store
@@ -1006,7 +940,6 @@ fn a_worker_reconnects_with_backoff_after_the_controller_restarts() {
     );
     process.wait_for("Disconnected", 1);
     process.wait_for("Backoff", 1);
-    // Same identity, same address: the worker's pin still holds.
     let identity = Identity::load(&d.identity_files.0, &d.identity_files.1).unwrap();
     d.controller = Some(
         Controller::start(
@@ -1020,7 +953,6 @@ fn a_worker_reconnects_with_backoff_after_the_controller_restarts() {
     );
     process.wait_for("Connected { worker: wrk_", 2);
     let events = process.events.lock().unwrap().clone();
-    // The second connection presented no enrollment.
     assert_eq!(
         events
             .iter()
@@ -1073,8 +1005,6 @@ fn artifact_publication_commits_and_refusals_are_terminal() {
     let reporter = recorder.reporter.lock().unwrap().clone().unwrap();
     assert!(reporter.artifacts());
 
-    // The happy path: begin is granted, the file streams in order, end is
-    // stored — and the row plus manifest are committed durably.
     reporter.artifact_begin(offer.attempt, "dist").unwrap();
     eventually("grant", || {
         recorder
@@ -1131,7 +1061,6 @@ fn artifact_publication_commits_and_refusals_are_terminal() {
         .unwrap();
     assert_eq!(body, b"data");
 
-    // Absent is recorded as absent; the second declared artifact.
     reporter.artifact_absent(offer.attempt, "cov", 0).unwrap();
     eventually("absent verdict", || {
         recorder
@@ -1151,8 +1080,6 @@ fn artifact_publication_commits_and_refusals_are_terminal() {
             .any(|r| r.name == "cov" && r.state == sentinel_store::artifacts::State::Absent)
     );
 
-    // Undeclared names and repeats of a finished record are terminal
-    // verdicts, not grants.
     reporter
         .artifact_begin(offer.attempt, "undeclared")
         .unwrap();
@@ -1231,8 +1158,7 @@ fn protocol5_acknowledges_the_durable_log_end() {
         recorder.log_acks.lock().unwrap().last() == Some(&(offer.attempt, 1))
     });
     reporter.log_end(offer.attempt, 1, &[]).unwrap();
-    // LogEndAck crosses the wire only after the end marker is durable — and
-    // the row that records it committed first.
+    // LogEndAck crosses the wire only after the end marker and its row are durable.
     eventually("end acknowledged", || {
         recorder.log_ends.lock().unwrap().as_slice() == [offer.attempt]
     });
@@ -1290,10 +1216,6 @@ fn protocol6_context_carries_the_tenant_and_derived_cache_trust() {
     let (_, context, bytes) = recorder.specs.lock().unwrap()[0].clone();
     assert_eq!(RunSpec::decode(&bytes).unwrap().pipeline.jobs.len(), 3);
     let context = context.unwrap();
-    // `Context2` reached the worker: the run's tenant, and the trust class
-    // the store derived from recorded provenance — this run has none, so
-    // it is `manual` and unprotected; a protocol-6 worker cannot
-    // carry that class and is given the pull-request scope instead.
     assert_eq!(context.tenant, Some(d.tenant));
     assert_eq!(context.trust, Trust::PullRequest);
     assert_eq!(context.event.name, "manual");
