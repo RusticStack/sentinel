@@ -87,7 +87,7 @@ sentinel admin invite create --data-dir <PATH> --tenant acme --role reader --ema
 sentinel admin mail status --data-dir <PATH>                                              # delivery on/off, outbox counts
 ```
 
-`--user` accepts a username, a `usr_` identifier or an address. `email-link` voids the account's earlier links and is audited as host-local. The controller records at every start whether it delivers mail (`mail_settings`), so a request queues a message only when a lane will drain it; the response tells the person which to expect (`"verification": "email"` or `"operator"`).
+`--user` accepts a username, a `usr_` identifier or an address. `email-link` voids the account's earlier links and is audited as host-local; it and `email-verify` take the authority of the database file, so neither may be exposed over HTTP. The controller records at every start whether it delivers mail (`mail_settings`), so a request queues a message only when a lane will drain it; the response tells the person which to expect (`"verification": "email"` or `"operator"`).
 
 ### Email invitations
 
