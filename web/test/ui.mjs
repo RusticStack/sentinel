@@ -1,11 +1,3 @@
-// The web interface in a real browser, against a seeded controller and
-// the built Nuxt server in front of it (crates/sentinel-api/tests/
-// web_browser.rs starts both and passes the config). Every check prints
-// PASS/FAIL; measurements go to <out>/ui-metrics.json and screenshots to
-// <out>/*.png. Exit status 1 when any check failed.
-//
-//   node web/test/ui.mjs <config.json>
-
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import net from "node:net";
@@ -14,10 +6,6 @@ import { launch } from "./cdp.mjs";
 
 const cfg = JSON.parse(readFileSync(process.argv[2], "utf8"));
 
-// The browser reaches the web interface through this relay (`cfg.base`
-// → `cfg.web`), so the test can cut the network for real: every open
-// connection — event streams included — is dropped and new ones refused
-// until it comes back.
 const relay = { sockets: new Set(), down: false };
 const relayServer = net.createServer((client) => {
   if (relay.down) { client.destroy(); return; }
@@ -54,7 +42,6 @@ async function scenario(name, fn) {
   }
 }
 
-/// The API as root, from the test (not the page), through the same origin.
 async function apiAs(auth, method, path, body) {
   const r = await fetch(cfg.base + path, {
     method, headers: { authorization: auth, "content-type": "application/json" },
@@ -80,7 +67,6 @@ async function go(page, path, ready, timeout = 20000) {
   try {
     await page.waitFor(ready, timeout, `${path} ready`);
   } catch (error) {
-    // Say what the page showed, so a timeout is a finding rather than a guess.
     const shown = await page.eval("JSON.stringify({ at: location.pathname, rows: [...document.querySelectorAll('main table tbody tr')].map((r) => r.textContent.replace(/\\s+/g, ' ').slice(0, 60)), alerts: [...document.querySelectorAll('[role=alert]')].map((a) => a.textContent.trim().slice(0, 120)), text: document.body.innerText.replace(/\\s+/g, ' ').slice(0, 400) })").catch(() => "(page unreadable)");
     throw new Error(`${error.message}; the page showed ${shown}`);
   }
@@ -88,11 +74,6 @@ async function go(page, path, ready, timeout = 20000) {
 
 const clickText = (selector, text) => `(() => { const el = [...document.querySelectorAll(${JSON.stringify(selector)})].find((e) => e.textContent.trim().includes(${JSON.stringify(text)})); if (!el) return false; el.click(); return true; })()`;
 
-
-/// WCAG contrast of every element's own visible text against the colour
-/// behind it (alpha-blended up the ancestors). SVG text, visually hidden
-/// text and disabled controls (exempt in WCAG) are skipped. Colours are
-/// normalised through a canvas, so `oklch()` values compare correctly.
 const CONTRAST = `(() => {
   const ctx = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
   const parse = (c) => {
@@ -161,7 +142,6 @@ async function axAudit(page, label, signedOut) {
   check(`${label}: one level-one heading`, h1 === 1, h1);
 }
 
-
 const browser = await launch();
 const page = await browser.newPage({ width: 1280, height: 860 });
 current = page;
@@ -184,8 +164,6 @@ const PAGES = {
   invitations: ["/t/acme/admin/invitations", "!!document.querySelector('#invite-h')"],
 };
 
-// Pages a signed-out visitor reaches: sign-up, the email links, the
-// forgot-password explanation.
 const PUBLIC_PAGES = {
   register: ["/register", "!!document.querySelector('#su-email')"],
   verify: ["/verify-email", "!!document.querySelector('#resend-email')"],
@@ -193,7 +171,6 @@ const PUBLIC_PAGES = {
   invitation: ["/invitations/accept", "document.querySelector('h1') && document.querySelector('h1').textContent.includes('invitation link')"],
 };
 
-/// The current RFC 6238 code (SHA-1, 6 digits, 30 s) for a base32 key.
 function totp(key) {
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
   let bits = "";
@@ -207,7 +184,6 @@ function totp(key) {
 }
 
 await scenario("public pages", async () => {
-  // Setup closed (the seed has an administrator): the wizard is gone for good.
   await go(page, "/setup", "location.pathname === '/login' && !!document.querySelector('#username')");
   check("the setup wizard is not reachable once setup is complete", true);
   for (const [name, [path, ready]] of Object.entries(PUBLIC_PAGES)) {
@@ -229,7 +205,6 @@ await scenario("public pages", async () => {
     await page.viewport(1280, 860);
   }
 
-  // Sign-up under the default invitation-only policy: refused, and why.
   await go(page, ...PUBLIC_PAGES.register);
   check("sign-up asks password managers for a new password",
     await page.eval("document.querySelector('#su-password').autocomplete === 'new-password' && document.querySelector('#su-again').autocomplete === 'new-password'"));
@@ -241,8 +216,6 @@ await scenario("public pages", async () => {
   check("a refused sign-up says the instance needs an invitation", true);
   check("the password fields are emptied after sending", await page.eval("document.querySelector('#su-password').value === '' && document.querySelector('#su-again').value === ''"));
 
-  // A verification link that cannot be used: the secret leaves the address
-  // bar before anything is sent, and the refusal offers a new link.
   await go(page, `/verify-email#token=${"ab".repeat(32)}`, "[...document.querySelectorAll('button')].some((b) => b.textContent.includes('Confirm my address'))");
   check("a verification link's secret is removed from the address bar", (await page.eval("location.hash")) === "");
   await page.clickText("button", "Confirm my address");
@@ -280,7 +253,6 @@ await scenario("pages", async () => {
     await axAudit(page, name);
     await page.screenshot(join(cfg.out, `${name}-1280.png`));
   }
-  // A client-side navigation moves focus to the new view's heading.
   await go(page, "/t/acme", PAGES.runs[1]);
   await page.eval(clickText("nav a", "Queue"));
   await page.waitFor("location.pathname === '/t/acme/queue' && document.activeElement && document.activeElement.tagName === 'H1'", 10000, "focus on heading");
@@ -288,9 +260,6 @@ await scenario("pages", async () => {
 });
 
 await scenario("hopping between live pages", async () => {
-  // Each live page holds one stream; leaving it must give the controller's
-  // parked wait back at once, or a person clicking through a few runs and
-  // logs would run out of their share and see "busy".
   for (let i = 0; i < 4; i++) {
     await go(page, PAGES.run[0], "document.querySelectorAll('.dag .node').length === 4");
     await sleep(400);
@@ -339,7 +308,6 @@ await scenario("keyboard", async () => {
   check("the first tab stop is the skip link", (await page.eval("document.activeElement.textContent.trim()")) === "Skip to content");
   await page.key("Enter");
   check("the skip link moves focus to the content", (await page.eval("document.activeElement.id")) === "main");
-  // Walk every tab stop from the top of the page.
   await page.eval("(() => { document.activeElement && document.activeElement.blur(); document.body.tabIndex = -1; document.body.focus(); document.body.removeAttribute('tabindex'); })()");
   const stops = [];
   for (let i = 0; i < 120; i++) {
@@ -361,11 +329,6 @@ await scenario("keyboard", async () => {
   await page.key("ArrowDown");
   check("log: arrow keys scroll by line", (await page.eval("document.querySelector('#log-view').scrollTop")) === 2 * lineH);
   await page.key("End");
-  // End may reveal the step's status row and grow the list by a row, the
-  // list re-measures the rows it has just drawn, and a niced, busy host
-  // renders them late: the key keeps working until the view has rested at
-  // the bottom for three samples in a row (0.3 s), for up to 4 s. One
-  // sample is not enough: a re-measure can move the end just after it.
   const atEnd = "(() => { const v = document.querySelector('#log-view'); return v.scrollTop + v.clientHeight >= v.scrollHeight - 1; })()";
   let rested = 0;
   for (let i = 0; i < 40 && rested < 3; i++) {
@@ -387,7 +350,6 @@ await scenario("keyboard", async () => {
 
 await scenario("runs and filters", async () => {
   await go(page, "/t/acme", PAGES.runs[1]);
-  // The filter form, as a person uses it: pick "Pull request", type, submit.
   await page.click("#f-kind");
   await page.waitFor("!!document.querySelector('[role=option]')", 5000, "filter options");
   await page.clickText("[role=option]", "Pull request");
@@ -499,12 +461,7 @@ await scenario("live log through a lost connection", async () => {
 });
 
 await scenario("an open run page through a busy controller", async () => {
-  // The same user's parked waits (on another, quiet run) take its whole
-  // share of subscribers before the page opens: the web server's wait for
-  // the page is refused as busy until they end.
   const { body: quiet } = await root("GET", `/api/v1/runs/${cfg.pr_run}/wait`);
-  // Long enough for a niced, busy host to open the page inside the spell
-  // (at 9 s it sometimes ended first); within the 25 s wait bound.
   const spellEnds = Date.now() + 20000;
   const hold = async () => {
     while (Date.now() < spellEnds - 100) {
@@ -515,8 +472,6 @@ await scenario("an open run page through a busy controller", async () => {
   await sleep(300);
   await go(page, PAGES.run[0], "document.querySelectorAll('.dag .node').length === 4");
   await page.waitFor("document.body.textContent.includes('Updates paused: controller busy')", Math.max(1000, spellEnds - Date.now() - 500), "busy notice");
-  // An alert with no text tells a person nothing (one sometimes lingers
-  // mid-render); only a worded one is an error shown. Empty ones are logged.
   const alerts = await page.eval("[...document.querySelectorAll('[role=alert]')].map((a) => a.textContent.trim().slice(0, 120)).filter((t) => t)");
   const empty = await page.eval("[...document.querySelectorAll('[role=alert]')].filter((a) => !a.textContent.trim()).map((a) => a.outerHTML.slice(0, 200))");
   if (empty.length) console.log("note: empty alert elements during the busy spell", JSON.stringify(empty));
@@ -536,8 +491,6 @@ await scenario("role changes during open sessions", async () => {
   const other = await browser.newPage({ width: 1280, height: 860 });
   current = other;
   await signIn(other, "dana");
-  // The jobs table is the first table; later tables (cache entries) load
-  // after hydration and add rows, so count the jobs table's rows only.
   await go(other, `/runs/${cfg.diamond}`, "document.querySelector('main table').querySelectorAll('tbody tr').length === 4");
   check("dana (operator) sees no tenant admin link", !(await other.eval(`[...document.querySelectorAll('nav a')].some((a) => a.textContent.includes('Tenant admin'))`)));
   await root("PUT", "/api/v1/tenants/acme/members/dana", { role: "reader" });
@@ -585,7 +538,6 @@ await scenario("storage policy", async () => {
   await page.click('[aria-label="Storage policy of app"]');
   await page.waitFor("!!document.querySelector('#repo-app-logs')", 8000, "policy form");
   await page.fill("#repo-app-logs", "2");
-  // A number field commits its value when it loses focus.
   await page.key("Tab");
   await page.clickText("[role=dialog] button", "Save");
   await page.waitFor("!document.querySelector('[role=dialog]')", 8000, "saved");
@@ -601,7 +553,6 @@ await scenario("organizations and invitations", async () => {
   check("the tenant list says each namespace's kind and membership source",
     (tenants.tenants || []).every((t) => ["personal", "organization"].includes(t.kind) && ["app", "github"].includes(t.membership)), tenants.tenants);
 
-  // Create an organization (root is a platform administrator, who may).
   await go(page, ...PAGES.organizations);
   await page.fill("#org-slug", "Bad Name");
   await page.key("Enter");
@@ -615,13 +566,11 @@ await scenario("organizations and invitations", async () => {
   check("an administrator sees the operator's domain rule, read-only",
     await page.eval("!!document.querySelector('#domains-h') && document.querySelector('main').textContent.includes('Read-only') && !document.querySelector('#domains-h').closest('section').querySelector('input')"));
 
-  // The switcher now lists it, grouped.
   await page.click('[aria-label="Active namespace"]');
   await page.waitFor("!!document.querySelector('[role=option]')", 5000, "namespace options");
   check("the namespace switcher groups organizations apart", await page.eval("[...document.querySelectorAll('[role=listbox] *')].some((e) => e.textContent.trim() === 'Organizations')"));
   await page.key("Escape");
 
-  // Invite by email; without mail delivery the one-time link is shown once.
   await go(page, "/t/web-team/admin/invitations", "!!document.querySelector('#inv-email')");
   await page.fill("#inv-email", "invitee@example.com");
   await page.key("Enter");
@@ -642,18 +591,12 @@ await scenario("organizations and invitations", async () => {
   await page.waitFor("[...document.querySelectorAll('main tr')].some((r) => r.textContent.includes('invitee@example.com') && r.textContent.includes('Revoked'))", 8000, "revoked");
   check("an invitation is revoked from the list", true);
 
-  // An invitation link that cannot be used, signed in: the secret leaves the
-  // address bar, and the refusal names no organization.
   await go(page, `/invitations/accept#token=sntl_${"cd".repeat(32)}`, "[...document.querySelectorAll('button')].some((b) => b.textContent.includes('Accept invitation'))");
   check("an invitation link's secret is removed from the address bar", (await page.eval("location.hash")) === "");
   await page.clickText("button", "Accept invitation");
   await page.waitFor("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('could not accept'))", 8000, "unusable invitation");
   check("an unusable invitation is said without naming an organization", !(await page.eval("document.querySelector('main').textContent.includes('acme')")));
 
-  // The end of a GitHub sign-in started from an invitation: the controller
-  // lands the browser on `/` with a full load. A signed-in person who
-  // already has tenants still goes back to the invitation, the parked
-  // secret is spent from storage and the return marker is gone.
   await page.eval(`(() => {
     document.cookie = "sentinel-return=%2Finvitations%2Faccept; Path=/; Max-Age=600; SameSite=Lax";
     sessionStorage.setItem("sentinel-invitation", JSON.stringify({ token: "sntl_${"cd".repeat(32)}", until: Date.now() + 600000 }));
@@ -668,15 +611,12 @@ await scenario("organizations and invitations", async () => {
   await go(page, "/", "location.pathname.startsWith('/t/')");
   check("without a pending return `/` opens a tenant again", true);
 
-  // A parked secret past its ten minutes is dropped on the next page load,
-  // wherever the tab is.
   await page.eval(`(() => { sessionStorage.setItem("sentinel-invitation", JSON.stringify({ token: "sntl_${"cd".repeat(32)}", until: Date.now() - 1 })); return true; })()`);
   await go(page, "/organizations", "!!document.querySelector('#org-slug')");
   check("an expired parked invitation secret is removed on the next load", (await page.eval("sessionStorage.getItem('sentinel-invitation')")) === null);
 });
 
-// Last: it enrolls a second factor for rui and changes rui's password,
-// which ends every session of that account.
+// Keep last: it changes rui's password, which ends every session of that account.
 await scenario("account security", async () => {
   const acct = await browser.newPage({ width: 390, height: 844 });
   current = acct;
@@ -688,7 +628,6 @@ await scenario("account security", async () => {
   check("enrollment shows a QR code and the key", true);
   check("the one-time-code field asks for autofill", await acct.eval("document.querySelector('#totp-confirm').autocomplete === 'one-time-code'"));
   const key = await acct.eval("document.querySelector('#totp-key').textContent");
-  // A wrong code first (one of the five a session may get wrong).
   const wrong = totp(key) === "000000" ? "111111" : "000000";
   await acct.fill("#totp-confirm", wrong);
   await acct.key("Enter");
@@ -720,7 +659,6 @@ await scenario("account security", async () => {
   await acct.fill("#pw-new", "a fresh password for rui");
   await acct.fill("#pw-again", "a fresh password for rui");
   await acct.key("Enter");
-  // Confirming the authenticator stepped the session up, so no dialog.
   await acct.waitFor("location.pathname === '/login' && document.body.textContent.includes('Password changed')", 15000, "signed out after the change");
   check("a password change signs out and says so", true);
   await acct.close();
