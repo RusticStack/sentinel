@@ -1,4 +1,3 @@
-//! Feasibility probes. Each subcommand prints one JSON line; durations are monotonic.
 use std::{
     fs,
     io::{Read, Write},
@@ -194,7 +193,6 @@ fn sqlite(args: SqliteArgs) -> Result<String, String> {
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
 
-    // Enqueue: one durable transaction per job, as a webhook-driven intake would do.
     let mut enqueue = Vec::with_capacity(args.jobs as usize);
     let mut insert = conn
         .prepare(
@@ -213,7 +211,6 @@ fn sqlite(args: SqliteArgs) -> Result<String, String> {
     }
     drop(insert);
 
-    // Backlog: batched inserts of newer, lower-priority ready rows.
     let t = Instant::now();
     {
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -233,7 +230,6 @@ fn sqlite(args: SqliteArgs) -> Result<String, String> {
     let backlog_ns = ns(t).max(1);
     let backlog_rows_per_s = args.backlog * 1_000_000_000 / backlog_ns;
 
-    // Dispatch: pick the best ready job and lease it, one transaction each.
     let mut dispatch = Vec::with_capacity(args.jobs as usize);
     let mut query = Vec::with_capacity(args.jobs as usize);
     let mut pick = conn
@@ -300,8 +296,7 @@ struct GenerateReport {
 fn generate(args: GenerateArgs) -> Result<String, String> {
     let t = Instant::now();
     if args.subvolume {
-        // A snapshot source must be a subvolume; creating one also proves
-        // the destination filesystem is btrfs before any work lands in it.
+        // Creating the subvolume first proves the destination is btrfs before any work lands in it.
         let out = std::process::Command::new("btrfs")
             .args(["subvolume", "create"])
             .arg(&args.dest)
@@ -329,8 +324,6 @@ fn generate(args: GenerateArgs) -> Result<String, String> {
         }
         fs::write(dir.join(format!("f{i}.bin")), &buf).map_err(|e| e.to_string())?;
     }
-    // A few large files: package archives and toolchain blobs, which are
-    // where reflink's per-byte advantage over copy actually shows.
     let mut large = vec![0u8; args.large_bytes as usize];
     for i in 0..args.large_files {
         for (j, b) in large.iter_mut().enumerate() {
@@ -356,8 +349,6 @@ struct CloneReport {
     mode: CloneMode,
     source: String,
     dest: String,
-    /// Why the mode cannot run here — a snapshot on a non-btrfs target.
-    /// The clone never ran; the timing fields are absent, not zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     unsupported: Option<String>,
     files: u64,
@@ -365,7 +356,6 @@ struct CloneReport {
     bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     clone_wall_ns: Option<u64>,
-    /// Wall rate for the comparison `docs/feasibility-probes.md` tabulates.
     #[serde(skip_serializing_if = "Option::is_none")]
     files_per_s: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -384,7 +374,6 @@ fn clone(args: CloneArgs) -> Result<String, String> {
     let mut per_file = Vec::new();
     let mut bytes = 0u64;
     let mut dirs = 0u64;
-    // One reusable buffer: allocating per file would dominate small-file copies.
     let mut buf = vec![0u8; 1 << 20];
     let t = Instant::now();
     clone_tree(
@@ -424,9 +413,6 @@ fn clone(args: CloneArgs) -> Result<String, String> {
     serde_json::to_string(&report).map_err(|e| e.to_string())
 }
 
-/// Whole-tree clone: `btrfs subvolume snapshot`. It works only on btrfs and
-/// only when the source is itself a subvolume, so the filesystem is checked
-/// first and the report says `unsupported` rather than guessing.
 fn snapshot(args: &CloneArgs) -> Result<String, String> {
     let fstype = fs_type(&args.source).or_else(|| fs_type(&args.dest));
     if fstype.as_deref() != Some("btrfs") {
@@ -449,8 +435,6 @@ fn snapshot(args: &CloneArgs) -> Result<String, String> {
         };
         return serde_json::to_string(&report).map_err(|e| e.to_string());
     }
-    // Count first, untimed: files/second needs the tree's size, and the
-    // walk is not what snapshot replaces.
     let (files, dirs, bytes) = count_tree(&args.source)?;
     let t = Instant::now();
     let out = std::process::Command::new("btrfs")
@@ -490,8 +474,6 @@ fn snapshot(args: &CloneArgs) -> Result<String, String> {
     serde_json::to_string(&report).map_err(|e| e.to_string())
 }
 
-/// The filesystem type `path` sits on: the longest matching mount point
-/// in `/proc/self/mounts` — Linux-only by nature, `None` elsewhere.
 #[cfg(target_os = "linux")]
 fn fs_type(path: &Path) -> Option<String> {
     let path = fs::canonicalize(path).ok()?;
@@ -503,8 +485,7 @@ fn fs_type(path: &Path) -> Option<String> {
         else {
             continue;
         };
-        // Mount points are octal-escaped; the only escape a path we mount
-        // can carry is space.
+        // Mount points are octal-escaped; the only escape a path we mount can carry is space.
         let point = point.replace("\\040", " ");
         if path.starts_with(&point) && best.as_ref().is_none_or(|(len, _)| point.len() > *len) {
             best = Some((point.len(), fstype.to_owned()));
@@ -518,8 +499,6 @@ fn fs_type(_path: &Path) -> Option<String> {
     None
 }
 
-/// Files, directories and bytes under `dir`, for modes that never walk the
-/// tree they clone.
 fn count_tree(dir: &Path) -> Result<(u64, u64, u64), String> {
     let (mut files, mut dirs, mut bytes) = (0, 0, 0);
     for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
@@ -566,7 +545,6 @@ fn clone_tree(
                 CloneMode::Reflink => reflink(&from, &to)?,
                 CloneMode::Copy => explicit_copy(&from, &to, buf)?,
                 CloneMode::FsCopy => fs::copy(&from, &to).map_err(|e| e.to_string())?,
-                // Whole-tree mode is handled in `snapshot` before any walk.
                 CloneMode::Snapshot => unreachable!("snapshot does not walk"),
             };
             per_file.push(ns(t));

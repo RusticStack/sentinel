@@ -1,5 +1,4 @@
-//! Bounded parsers for common test/compiler reports. Parsers return evidence
-//! only and never influence a fenced attempt transition.
+//! Parsers return evidence only and never influence a fenced attempt transition.
 
 use super::{
     Diagnostic, EvidenceReference, FailureClass, MAX_DIAGNOSTIC_LABEL_BYTES,
@@ -21,22 +20,13 @@ use std::{
     ops::Range,
 };
 
-/// Existing attempt logs are capped at 256 MiB. Parsers stop at that same
-/// bound even when called with a larger slice.
 pub const MAX_PARSER_INPUT_BYTES: usize = 256 << 20;
-/// Largest single JSON record or XML tag a parser decodes; longer ones are
-/// malformed without being parsed.
 pub const MAX_PARSER_RECORD_BYTES: usize = 64 << 10;
 const MAX_RECORD_BYTES: usize = MAX_PARSER_RECORD_BYTES;
 const MAX_PARSER_RECORDS: usize = 2_000_000;
 const MAX_TEST_OUTPUT_BYTES: usize = 4 << 10;
-/// JUnit documents nest `testsuites > testsuite > testcase > failure`, with
-/// room for nested suites and extensions; deeper input is malformed.
 const MAX_XML_DEPTH: usize = 64;
 
-/// One parser result is bounded by input bytes, record count and diagnostic
-/// count. A false complete means some input was malformed, over a limit, or
-/// omitted; it never means that the command passed or failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseResult {
     pub format: ReportFormat,
@@ -50,9 +40,6 @@ pub struct ParseResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedDiagnostic {
     pub diagnostic: Diagnostic,
-    /// Half-open byte range in the exact parser input. For Go and rustc this
-    /// can be mapped back to a step's stdout/stderr frames. For uploaded XML
-    /// it identifies the testcase in the uploaded report.
     pub input_range: Option<Range<u64>>,
 }
 
@@ -93,8 +80,6 @@ impl ParseResult {
     }
 }
 
-/// Parse Go test JSON output. Output is retained only as a fixed-size tail
-/// per active test; successful tests release their retained bytes immediately.
 pub fn parse_go_test_json(input: &[u8], step: StepReference) -> ParseResult {
     let mut result = ParseResult::new(ReportFormat::GoTestJson, input.len());
     let mut lines = JsonLines::new(input);
@@ -135,8 +120,7 @@ pub fn parse_go_test_json(input: &[u8], step: StepReference) -> ParseResult {
                 };
                 if let Some(existing) = output_by_test.get_mut(&key) {
                     if existing.package != package || existing.test != test {
-                        // A hash collision must never combine one test's
-                        // output with another test's diagnostic.
+                        // A hash collision must never mix one test's output into another test's diagnostic.
                         result.malformed();
                     } else {
                         existing.push(output.as_bytes(), line.start, line.end);
@@ -232,9 +216,6 @@ pub fn parse_go_test_json(input: &[u8], step: StepReference) -> ParseResult {
     result
 }
 
-/// Parse newline-delimited rustc compiler JSON. Records are scanned in place;
-/// source snippets and rendered duplicates are ignored so retained errors
-/// stay small.
 pub fn parse_rust_compiler_json(input: &[u8], step: StepReference) -> ParseResult {
     let mut result = ParseResult::new(ReportFormat::RustCompilerJson, input.len());
     let mut lines = JsonLines::new(input);
@@ -255,9 +236,6 @@ pub fn parse_rust_compiler_json(input: &[u8], step: StepReference) -> ParseResul
         };
         let record = match outer.reason.as_deref() {
             None => outer,
-            // Cargo: only `compiler-message` carries a diagnostic; artifact,
-            // build-script, timing and build-finished records are ordinary
-            // stream content, not malformed input.
             Some("compiler-message") => {
                 match outer
                     .message
@@ -291,8 +269,6 @@ pub fn parse_rust_compiler_json(input: &[u8], step: StepReference) -> ParseResul
             }
             Some("failure") => (Severity::Failure, Some(FailureClass::CommandFailed)),
             Some("warning") => (Severity::Warning, None),
-            // `failure-note` is rustc's "for more information, try
-            // `rustc --explain`" trailer, not a finding of its own.
             Some("note" | "help" | "failure-note") => continue,
             _ => {
                 result.malformed();
@@ -342,8 +318,6 @@ pub fn parse_rust_compiler_json(input: &[u8], step: StepReference) -> ParseResul
     result
 }
 
-/// Parse JUnit XML without building a document tree. DTDs are refused, tag
-/// payloads are capped, and only one testcase plus one failure body is kept.
 pub fn parse_junit_xml(input: &[u8], step: Option<StepReference>) -> ParseResult {
     let mut result = ParseResult::new(ReportFormat::JunitXml, input.len());
     let bounded = &input[..input.len().min(MAX_PARSER_INPUT_BYTES)];
@@ -373,8 +347,7 @@ pub fn parse_junit_xml(input: &[u8], step: Option<StepReference>) -> ParseResult
         events += 1;
         match event {
             Event::Eof => {
-                // quick-xml ends quietly with elements still open: a
-                // truncated or unbalanced document is not a complete one.
+                // quick-xml ends quietly with elements open; a truncated document is not complete.
                 if depth > 0 {
                     result.malformed();
                 }
@@ -385,8 +358,6 @@ pub fn parse_junit_xml(input: &[u8], step: Option<StepReference>) -> ParseResult
                 break;
             }
             Event::Start(_) if depth == MAX_XML_DEPTH => {
-                // The reader keeps every open name for end-tag checks, so
-                // nesting is bounded before it can grow with the input.
                 result.malformed();
                 break;
             }
@@ -487,8 +458,6 @@ pub fn parse_junit_xml(input: &[u8], step: Option<StepReference>) -> ParseResult
     result
 }
 
-/// Decode and validate the custom diagnostics body. The 1 MiB protocol body
-/// cap is checked before JSON deserialization allocates fields.
 pub fn parse_custom_json(input: &[u8]) -> Result<ReportInput, CustomInputError> {
     if input.len() > crate::limits::MAX_API_BODY_BYTES {
         return Err(CustomInputError::TooLarge);
@@ -501,11 +470,6 @@ pub fn parse_custom_json(input: &[u8]) -> Result<ReportInput, CustomInputError> 
     Ok(report)
 }
 
-/// Decode a custom report collected from an attempt's files. The document
-/// itself must be a strict [`ReportInput`] of the supported version under the
-/// 1 MiB body cap; within it, a diagnostic that fails its bounds is dropped
-/// and counted as malformed instead of voiding every other diagnostic, and
-/// diagnostics past [`MAX_REPORT_DIAGNOSTICS`] are counted as omitted.
 pub fn parse_custom_report(
     input: &[u8],
 ) -> Result<(super::Producer, ParseResult), CustomInputError> {
@@ -556,10 +520,6 @@ struct GoEvent<'a> {
     output: Option<Cow<'a, str>>,
 }
 
-/// One rustc JSON record, or cargo's `--message-format=json` envelope around
-/// one: cargo sets `reason` and nests the rustc diagnostic object under
-/// `message`, while bare rustc makes `message` the text. The field is kept
-/// as borrowed raw JSON so neither shape builds a value tree.
 #[derive(Deserialize)]
 struct RustEvent<'a> {
     #[serde(borrow)]
@@ -657,7 +617,6 @@ struct TestOutput {
     ring: [u8; MAX_TEST_OUTPUT_BYTES],
     ring_start: usize,
     ring_len: usize,
-    /// The last event ended mid-line.
     open_line: bool,
 }
 
@@ -674,12 +633,8 @@ impl TestOutput {
         }
     }
 
-    /// Append one `output` event. An event that did not end its line was
-    /// split by the producer (test2json flushes long or unfinished lines):
-    /// the next event is kept on its own line instead of being glued to it,
-    /// so the retained text never forms a byte sequence that the stored log
-    /// did not contain contiguously — a value the worker's byte redactor
-    /// could not see whole must not be reassembled here.
+    /// An unterminated event is followed by a line break, so retained text never joins
+    /// bytes the stored log did not hold contiguously: a split value must stay split.
     fn push(&mut self, bytes: &[u8], start: usize, end: usize) {
         if bytes.is_empty() {
             return;
@@ -776,15 +731,10 @@ fn normalized_relative_path(path: &str) -> Option<String> {
         .or_else(|| path.strip_prefix("workspace/"))
         .or_else(|| path.strip_prefix("./"))
         .unwrap_or(path);
-    // The contract's own path rule (relative, no control bytes, at most
-    // `MAX_DIAGNOSTIC_PATH_BYTES`): a location that would fail report
-    // validation is dropped here, so the diagnostic survives without it.
     super::validate_path(path).ok()?;
     Some(path.to_owned())
 }
 
-/// Skip leading ANSI CSI sequences (`ESC [ parameters final-byte`), the
-/// colour prefix test output commonly puts before `file.go:42:`.
 fn strip_leading_csi(mut line: &str) -> &str {
     while let Some(rest) = line.strip_prefix("\u{1b}[") {
         match rest.find(|ch: char| ('\u{40}'..='\u{7e}').contains(&ch)) {
@@ -837,9 +787,6 @@ struct JunitFailure {
 }
 
 impl JunitFailure {
-    /// Append failure body text; the body starts on its own line after a
-    /// `message` attribute instead of running into it. Returns whether the
-    /// text was cut at the message bound.
     fn append_body(&mut self, text: &str) -> bool {
         if !self.body_started && !text.is_empty() {
             self.body_started = true;
@@ -913,8 +860,6 @@ fn junit_tag(
             let is_error = name.as_ref() == "error";
             match junit_failure_attrs(tag) {
                 Ok((message, code)) => {
-                    // Only the retained (first) failure collects body text;
-                    // an omitted one must not run into its message.
                     *active_failure = false;
                     if let Some(case) = current {
                         if case.failure.is_none() {
@@ -1177,8 +1122,6 @@ mod tests {
 
     #[test]
     fn go_locations_with_colour_control_bytes_or_oversized_paths_never_void_the_report() {
-        // ANSI colour before the location must not become part of the path
-        // and fail validation of the whole report.
         let long = "d/".repeat(super::super::MAX_DIAGNOSTIC_PATH_BYTES / 2) + "x_test.go";
         let input = format!(
             concat!(
@@ -1212,9 +1155,6 @@ mod tests {
 
     #[test]
     fn cargo_message_format_json_yields_compiler_diagnostics_and_skips_other_records() {
-        // Real `cargo build --message-format=json` output (cargo 1.98.1,
-        // Linux): a dependency warning, its compiler-artifact record, an
-        // E0308 error, rustc's failure-note trailer and build-finished.
         let input = include_bytes!("testdata/cargo-build-message-format-json.jsonl");
         let parsed = parse_rust_compiler_json(input, step());
         assert_eq!(parsed.malformed_records, 0);
@@ -1236,8 +1176,6 @@ mod tests {
         );
         validates(&parsed);
 
-        // An envelope whose nested message is not a rustc diagnostic object
-        // is malformed; other cargo reasons are not.
         let odd = concat!(
             "{\"reason\":\"compiler-message\",\"message\":\"text\"}\n",
             "{\"reason\":\"build-script-executed\",\"package_id\":\"x\"}\n"
@@ -1249,9 +1187,6 @@ mod tests {
 
     #[test]
     fn go_output_split_mid_line_is_never_rejoined_into_one_value() {
-        // test2json split an unterminated write across two events;
-        // the stored log never holds the value contiguously, so neither may
-        // the diagnostic.
         let input = concat!(
             "{\"Action\":\"output\",\"Package\":\"p\",\"Test\":\"TestA\",\"Output\":\"token SECRETVA\"}\n",
             "{\"Action\":\"output\",\"Package\":\"p\",\"Test\":\"TestA\",\"Output\":\"LUE123 rejected\\n\"}\n",
@@ -1279,7 +1214,6 @@ mod tests {
         let parsed = parse_junit_xml(&nested, None);
         assert!(!parsed.complete);
         assert_eq!(parsed.malformed_records, 1);
-        // Parsing stopped at the depth bound instead of reading on.
         assert!(parsed.bytes_scanned <= (MAX_XML_DEPTH as u64 + 1) * 10);
 
         let balanced = br#"<testsuites><testsuite><testcase name="a"/></testsuite></testsuites>"#;
@@ -1307,7 +1241,6 @@ mod tests {
         assert_eq!(parsed.diagnostics[0].diagnostic.message, "kept");
         assert_eq!(parsed.malformed_records, 2);
         assert!(!parsed.complete);
-        // The document shape itself stays strict.
         let asserted = br#"{"schema_version":1,"producer":{"name":"a","version":null},"diagnostics":[],"freshness":"fresh"}"#;
         assert_eq!(
             parse_custom_report(asserted).unwrap_err(),

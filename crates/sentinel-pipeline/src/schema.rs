@@ -1,7 +1,3 @@
-//! Typed `.sentinel.yml` schema version 1 and its strict decoder. Every key
-//! is known, every value is typed and bounded, and every error names the
-//! path that produced it. Expressions (`${{ … }}`) are kept as opaque
-//! strings here; their grammar lives in the `expr` module.
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -27,7 +23,6 @@ pub const MAX_LABELS: usize = 8;
 pub const MAX_SECRETS: usize = 16;
 pub const MAX_RUN_BYTES: usize = 4096;
 pub const MAX_ID_BYTES: usize = 64;
-/// One day; nothing in CI legitimately runs longer without human review.
 pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 60 * 60;
 
@@ -35,13 +30,11 @@ pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 60 * 60;
 pub struct Pipeline {
     pub on: Triggers,
     pub concurrency: Option<Concurrency>,
-    /// Declaration order preserved; compilation sorts deterministically.
     pub jobs: Vec<(String, Job)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Concurrency {
-    /// Rendered at dispatch; may not reference `needs` or `hash_files`.
     pub group: Template,
     pub cancel_in_progress: bool,
 }
@@ -50,7 +43,6 @@ pub struct Concurrency {
 pub struct Job {
     pub image: String,
     pub needs: Vec<String>,
-    /// `if:` evaluated at schedule time once every dependency is terminal.
     pub condition: Option<Expr>,
     pub runs_on: RunsOn,
     pub resources: Resources,
@@ -60,18 +52,13 @@ pub struct Job {
     pub steps: Vec<Step>,
     pub cache: Vec<Cache>,
     pub artifacts: Vec<Artifact>,
-    /// Names of secrets the job needs. Values never appear in YAML: the
-    /// worker injects each as an environment variable of the same name only
-    /// if the repository has been granted that secret.
+    /// Values never appear in YAML; the worker injects a secret only if the repository was granted it.
     pub secrets: Vec<String>,
-    /// Optional declared secret containing the tenant's OCI `auth.json`.
-    /// It authorizes this job's image pull and is never exposed to a step.
+    /// Never exposed to a step: it authorizes only this job's image pull.
     pub registry_auth: Option<String>,
 }
 
 impl Job {
-    /// Whether preparing this job requires the negotiated secret-delivery
-    /// contract, including host-only registry authentication.
     pub fn requires_secret_delivery(&self) -> bool {
         self.registry_auth.is_some()
             || self
@@ -94,8 +81,6 @@ pub enum Arch {
     Arm64 = 1,
 }
 
-/// Explicit per-job allocation. Absent fields take the policy defaults so a
-/// compiled job always has a finite, enforceable budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resources {
     pub cpu_millis: u32,
@@ -107,13 +92,10 @@ pub struct Resources {
 pub struct Step {
     pub id: String,
     pub run: String,
-    /// `if:` evaluated by the worker before the step starts.
     pub condition: Option<Expr>,
     pub shell: Shell,
     pub env: Vec<(String, String)>,
-    /// Secret names exposed to this step as same-name environment variables.
     pub secrets: Vec<String>,
-    /// Secret names materialized as files below `/run/sentinel-secrets`.
     pub secret_files: Vec<SecretFile>,
     pub workdir: Option<String>,
     pub timeout_secs: Option<u64>,
@@ -122,28 +104,21 @@ pub struct Step {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretFile {
     pub name: String,
-    /// Normalized path relative to `/run/sentinel-secrets`.
     pub path: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Shell {
-    /// `/bin/sh -e -c`: fail on the first failing command.
     #[default]
     Sh = 0,
-    /// `bash -eo pipefail -c`; the image must provide bash.
     Bash = 1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cache {
     pub name: String,
-    /// Which validity rule this entry follows (docs/cache.md). A
-    /// `class`-less document compiles to `Dependencies`: the exact
-    /// materialization rule, the only one that is never wrong to assume.
     pub class: Class,
-    /// Rendered by the worker after checkout (`hash_files` allowed).
     pub key: Template,
     pub paths: Vec<String>,
 }
@@ -154,8 +129,6 @@ pub struct Artifact {
     pub paths: Vec<String>,
     pub when: ArtifactWhen,
     pub retain_secs: u64,
-    /// A required artifact that matches nothing or cannot be published is a
-    /// finalization failure; an optional one is recorded absent.
     pub required: bool,
 }
 
@@ -168,7 +141,6 @@ pub enum ArtifactWhen {
     Always = 2,
 }
 
-/// Resource policy: defaults for absent fields and inclusive bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourcePolicy {
     pub default: Resources,
@@ -198,7 +170,6 @@ impl ResourcePolicy {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchemaError {
-    /// Dotted path with `[i]` for sequence items, e.g. `jobs.test.steps[0].run`.
     pub path: String,
     pub kind: SchemaErrorKind,
 }
@@ -256,9 +227,7 @@ fn err(path: &str, kind: SchemaErrorKind) -> SchemaError {
     }
 }
 
-/// Mapping accessor that tracks which keys were consumed so unknown keys are
-/// reported after all known ones are decoded (one error per unknown key,
-/// deterministic: first unknown in document order).
+/// `seen` is a 64-bit set, so `Map::new` caps mappings at 64 entries.
 struct Map<'a> {
     path: &'a str,
     entries: &'a [(String, Node)],
@@ -373,8 +342,6 @@ fn string_list(path: &str, node: &Node, max: usize, item_max: usize) -> Result<V
     Ok(out)
 }
 
-/// Parse the `on:` policy. Two forms are accepted within schema 1:
-///
 /// ```yaml
 /// on: [push, tag]                    # every ref of those kinds
 /// on:
@@ -383,9 +350,6 @@ fn string_list(path: &str, node: &Node, max: usize, item_max: usize) -> Result<V
 ///   pull_request: {branches: [main]}
 ///   manual: true
 /// ```
-///
-/// In the mapping form every filter is optional, and an empty filter
-/// (`push: {}` or `push:`) means every branch of that kind.
 fn parse_triggers(path: &str, node: &Node) -> Result<Triggers> {
     let mut triggers = Triggers::default();
     match node {
@@ -488,9 +452,6 @@ impl RefKind {
     }
 }
 
-/// One kind's ref filter: `null`/`{}` admits every ref of the kind, and only
-/// the kind's own key (`branches` or `tags`) is accepted; the other is an
-/// unknown key, reported by `finish`.
 fn ref_filter(path: &str, node: &Node, kind: RefKind) -> Result<RefFilter> {
     let mut filter = RefFilter::default();
     let mut map = match node {
@@ -526,8 +487,6 @@ fn ref_filter(path: &str, node: &Node, kind: RefKind) -> Result<RefFilter> {
     Ok(filter)
 }
 
-/// Identifiers: `[a-z0-9][a-z0-9_-]*`, at most 64 bytes. Lowercase only so
-/// names are stable across filesystems and URLs without normalisation.
 pub fn valid_id(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
@@ -550,7 +509,6 @@ fn expect_id<'a>(path: &str, node: &'a Node) -> Result<&'a str> {
     Ok(s)
 }
 
-/// Durations: an integer followed by `s`, `m` or `h`, or a sum such as `1h30m`.
 pub fn parse_duration_secs(s: &str) -> Option<u64> {
     let mut total: u64 = 0;
     let mut num: u64 = 0;
@@ -582,7 +540,6 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
     Some(total)
 }
 
-/// Byte sizes: an integer followed by `MiB` or `GiB` (binary units only).
 pub fn parse_bytes(s: &str) -> Option<u64> {
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
     let n: u64 = num.parse().ok()?;
@@ -596,7 +553,6 @@ pub fn parse_bytes(s: &str) -> Option<u64> {
 
 fn condition(path: &str, node: &Node) -> Result<Expr> {
     let s = expect_str(path, node, crate::expr::MAX_EXPR_BYTES)?;
-    // Accept both `if: ${{ expr }}` and bare `if: expr`.
     let inner = s
         .trim()
         .strip_prefix("${{")
@@ -608,9 +564,7 @@ fn condition(path: &str, node: &Node) -> Result<Expr> {
             SchemaErrorKind::Invalid(format!("invalid expression {e}")),
         )
     })?;
-    // Typed once here: a condition that can fail with a type error at
-    // evaluation time (a comparison across types, `!` over a string, a
-    // non-boolean result) is rejected before it can run.
+    // Type errors are rejected here, so a condition can never fail with a type error at run time.
     e.check_condition()
         .map_err(|m| err(path, SchemaErrorKind::Invalid(m.into())))?;
     Ok(e)
@@ -695,9 +649,7 @@ fn resources(path: &str, node: Option<&Node>, policy: &ResourcePolicy) -> Result
         r.cpu_millis = match cpu {
             Node::Int(n) if *n > 0 && *n <= 1024 => (*n as u32) * 1000,
             Node::Str(s) => {
-                // Allow fractional cores as strings, e.g. "0.5". Plain ASCII
-                // digits only: `u32::from_str` would also accept a leading
-                // `+`, and a longer fraction would be silently truncated.
+                // Plain ASCII digits only: u32::from_str would accept a leading '+', and fractions must not truncate.
                 let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
                 let digits = |t: &str| t.bytes().all(|b| b.is_ascii_digit());
                 let w: u32 = Some(whole)
@@ -713,7 +665,6 @@ fn resources(path: &str, node: Option<&Node>, policy: &ResourcePolicy) -> Result
                 let f: u32 = if frac.is_empty() && !s.ends_with('.') {
                     0
                 } else if !frac.is_empty() && frac.len() <= 3 && digits(frac) {
-                    // Right-pad to millicores: "5" is 500, "05" is 50.
                     let value: u32 = frac.parse().unwrap_or(0);
                     value * 10u32.pow(3 - frac.len() as u32)
                 } else {
@@ -903,8 +854,6 @@ fn secret_names(path: &str, node: &Node) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// A path inside the job workspace: relative, normalised, no `..`, no
-/// backslashes, no NUL, at most 256 bytes.
 pub fn valid_relative_path(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 256
@@ -917,8 +866,6 @@ pub fn valid_relative_path(s: &str) -> bool {
             .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
-/// A cache path may also be absolute inside the container (tool caches live
-/// outside the workspace), but never a filesystem root or `..`.
 pub fn valid_cache_path(s: &str) -> bool {
     if let Some(rest) = s.strip_prefix('/') {
         !rest.is_empty() && valid_relative_path(rest)
@@ -1086,7 +1033,6 @@ fn runs_on(path: &str, node: &Node) -> Result<RunsOn> {
     Ok(RunsOn { arch, labels })
 }
 
-/// Image references: `name[:tag][@sha256:hex]`, printable ASCII, bounded.
 pub fn valid_image(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 256
@@ -1262,8 +1208,6 @@ fn job_env_has_name(env: &[(String, String)], name: &str) -> bool {
     env.iter().any(|(env_name, _)| env_name == name)
 }
 
-/// Decode a loaded document into the typed schema. Structural only: DAG
-/// validity and cross-job references are checked by the compiler.
 pub fn decode(root: &Node, policy: &ResourcePolicy) -> Result<Pipeline> {
     let mut map = Map::new("", root)?;
     match map.take("schema") {
@@ -1423,7 +1367,6 @@ mod tests {
                 "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    resources: {{ cpu: \"{cpu}\" }}\n    steps:\n      - id: s\n        run: echo\n"
             )
         };
-        // The two-character fraction is 4 bytes; byte 3 is inside the second char.
         assert!(crate::compile_str(&doc("1.éé")).is_err());
         assert!(crate::compile_str(&doc("0.€")).is_err());
         assert!(crate::compile_str(&doc("0.5")).is_ok());
@@ -1455,8 +1398,6 @@ jobs:
         ] {
             assert_eq!(cpu_millis(text).unwrap(), millis, "{text}");
         }
-        // A sign is not a digit; a longer fraction would be truncated, not
-        // honoured; an empty side is malformed.
         for text in [
             "+4", "0.+5", "0.5555", "0.2501", "1.", ".5", "-1", "0.5 ", "1_0",
         ] {
@@ -1473,7 +1414,6 @@ jobs:
 
     #[test]
     fn cache_class_parses_or_defaults() {
-        // Absent `class` is `dependencies`.
         let default =
             cache_of("      - name: c\n        key: k\n        paths: [target]\n").unwrap();
         assert_eq!(default.class, Class::Dependencies);
@@ -1488,7 +1428,6 @@ jobs:
             .unwrap();
             assert_eq!(c.class, class, "{word}");
         }
-        // Unknown values name what was accepted, not what was given.
         let error = cache_of(
             "      - name: c\n        class: everything\n        key: k\n        paths: [target]\n",
         )
@@ -1499,7 +1438,6 @@ jobs:
                 .contains("expected downloads, dependencies or compiler"),
             "{error}"
         );
-        // Wrong type, duplicate and unknown keys all still fail strictly.
         assert!(
             cache_of(
                 "      - name: c\n        class: 3\n        key: k\n        paths: [target]\n"

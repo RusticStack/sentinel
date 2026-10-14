@@ -1,8 +1,3 @@
-//! Every published recipe under fixtures/recipes must compile and follow the
-//! cache rules docs/recipes.md documents: class selection, `stem-<volatile>`
-//! keys that name a lockfile, `cc-<mode>-` compiler stems, and an environment
-//! declaration for every mounted tool store.
-
 use std::{fs, path::Path};
 
 use sentinel_pipeline::{
@@ -17,11 +12,8 @@ fn recipes_dir() -> std::path::PathBuf {
 }
 
 struct Expect {
-    /// Lockfile every cache key must hash.
     lockfile: &'static str,
-    /// (name, class, key stem, mounted path) for each declared entry.
     caches: &'static [(&'static str, Class, &'static str, &'static str)],
-    /// Env vars that must be declared on the job.
     env: &'static [&'static str],
 }
 
@@ -146,8 +138,6 @@ fn recipes() -> Vec<(String, String)> {
     out
 }
 
-/// The volatile component of a rendered key: the single hash_files call
-/// that must come last in the template.
 fn key_parts(job: &CompiledJob, cache: usize) -> (String, Vec<String>) {
     let t = &job.spec.cache[cache].key;
     let mut stem = String::new();
@@ -260,8 +250,6 @@ fn compiler_entries_use_cc_stems_and_mounts_are_wired() {
                     c.name
                 );
             }
-            // An absolute path is a mounted store: it must be reachable —
-            // either named by a job env var or referenced by a step.
             for path in &c.paths {
                 if !path.starts_with('/') {
                     continue;
@@ -301,8 +289,6 @@ fn fixture_trees_carry_the_lockfile_overlay_and_sources() {
         for sub in ["tree", "edit-source", "edit-dep"] {
             assert!(dir.join(sub).is_dir(), "{name}: missing {sub}/ overlay dir");
         }
-        // The lockfile itself is provisioned into each commit by
-        // bench/k07-recipes.sh.
         let _ = exp.lockfile;
         assert!(
             dir.join("tree").read_dir().unwrap().next().is_some(),

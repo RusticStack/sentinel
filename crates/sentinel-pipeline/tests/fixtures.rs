@@ -113,12 +113,10 @@ fn compilation_is_deterministic_and_order_is_canonical() {
     let names: Vec<&str> = a.jobs.iter().map(|j| j.name.as_str()).collect();
     assert_eq!(names, ["alpha", "beta", "gamma", "zeta"]);
     assert_eq!(a.jobs[3].needs, vec![0, 1]);
-    // Reordered declarations and reordered `needs`: same compiled pipeline, same digest.
     let reordered = "schema: 1\non: [pull_request]\njobs:\n  alpha:\n    image: busybox\n    steps: [{id: s, run: echo a}]\n  gamma:\n    needs: [alpha]\n    image: busybox\n    steps: [{id: s, run: echo g}]\n  beta:\n    needs: [alpha]\n    image: busybox\n    steps: [{id: s, run: echo b}]\n  zeta:\n    needs: [alpha, beta]\n    image: busybox\n    steps: [{id: s, run: echo z}]\n";
     let b = compile_str(reordered).unwrap();
     assert_eq!(a.digest, b.digest);
     assert_eq!(a.jobs.len(), b.jobs.len());
-    // Any semantic change moves the digest.
     let changed = text.replace("echo z", "echo zz");
     assert_ne!(compile_str(&changed).unwrap().digest, a.digest);
 }
