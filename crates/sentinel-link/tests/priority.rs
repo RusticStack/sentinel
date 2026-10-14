@@ -1,4 +1,4 @@
-//! Q05: control traffic stays alive when the bulk transport is stalled.
+//! Control traffic stays alive when the bulk transport is stalled.
 //!
 //! A protocol-7 session has two connections with one identity. This suite
 //! proves the reason the split exists: with the controller deliberately not
@@ -507,12 +507,12 @@ fn session_error_is_printable() {
     assert!(format!("{error}").contains("priority"));
 }
 
-/// P08-11: the control session joins its bulk thread before it returns, and
-/// the bulk thread's redial back-off (doubling towards 30 s) used to be one
-/// uninterruptible sleep. With the bulk dial failing, a lost control session
-/// could not even begin reconnecting until that sleep ended — longer than a
-/// lease once the back-off saturated. The wait now watches the stop flag:
-/// the session returns promptly whatever the back-off.
+/// The control session joins its bulk thread before it returns, and the bulk
+/// thread's redial back-off (doubling towards 30 s) must not be an
+/// uninterruptible sleep: with the bulk dial failing, a lost control session
+/// could not begin reconnecting until it ended, longer than a lease once the
+/// back-off saturated. The wait watches the stop flag, so the session returns
+/// promptly whatever the back-off.
 #[test]
 fn a_failing_bulk_redial_never_delays_the_control_teardown() {
     let (listener, server, client) = deployment();

@@ -1,4 +1,4 @@
-//! G01 across the link: a bound repository's access reaches a protocol-2
+//! Source delivery across the link: a bound repository's access reaches a protocol-2
 //! worker only with the spec of an attempt it acknowledged, and a protocol-1
 //! worker is refused instead of silently checking out without a credential.
 #![cfg(target_os = "linux")]
