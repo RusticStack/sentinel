@@ -676,6 +676,85 @@ mod tests {
     }
 
     #[test]
+    fn membership_events_carry_the_numeric_id_and_only_a_removal_acts() {
+        let organization = |action: &str| {
+            serde_json::json!({
+                "action": action,
+                "installation": {"id": 42},
+                "membership": {"user": {"id": 1001, "login": "someone"}},
+                "organization": {"id": 73},
+            })
+        };
+        for (action, removed) in [
+            ("member_removed", true),
+            ("member_added", false),
+            ("member_invited", false),
+        ] {
+            let parsed = parse_control(
+                "organization",
+                &serde_json::to_vec(&organization(action)).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(
+                    parsed,
+                    Control::Members { installation: 42, user: Some(1001), removed: r } if r == removed
+                ),
+                "{action}"
+            );
+        }
+        // Other organization actions are not membership.
+        assert!(
+            parse_control(
+                "organization",
+                &serde_json::to_vec(&organization("renamed")).unwrap()
+            )
+            .unwrap()
+            .is_none()
+        );
+        // Team membership and collaborator changes ask for a check, never act.
+        for event in ["membership", "member"] {
+            let body = serde_json::json!({
+                "action": "added",
+                "installation": {"id": 42},
+                "member": {"id": 2002},
+            });
+            assert!(matches!(
+                parse_control(event, &serde_json::to_vec(&body).unwrap())
+                    .unwrap()
+                    .unwrap(),
+                Control::Members {
+                    user: Some(2002),
+                    removed: false,
+                    ..
+                }
+            ));
+        }
+        // A team change may move anyone's access.
+        let team = serde_json::json!({"action": "edited", "installation": {"id": 42}});
+        assert!(matches!(
+            parse_control("team", &serde_json::to_vec(&team).unwrap())
+                .unwrap()
+                .unwrap(),
+            Control::Members {
+                user: None,
+                removed: false,
+                ..
+            }
+        ));
+        // The id is the numeric account id: a login in its place, a missing
+        // user, or a zero id is refused rather than guessed at.
+        for broken in [
+            serde_json::json!({"action":"member_removed","installation":{"id":42},"membership":{"user":{"login":"someone"}}}),
+            serde_json::json!({"action":"member_removed","installation":{"id":42},"membership":{"user":{"id":0}}}),
+            serde_json::json!({"action":"member_removed","installation":{"id":42}}),
+        ] {
+            assert!(parse_control("organization", &serde_json::to_vec(&broken).unwrap()).is_err());
+        }
+    }
+
+    #[test]
     fn the_control_receipt_digest_binds_event_and_body() {
         let body = br#"{"action":"rerequested"}"#;
         let digest = control_digest("check_run", body);
