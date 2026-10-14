@@ -34,7 +34,7 @@ fn file(path: &Path, limit: usize) -> Result<Vec<u8>, Error> {
     )
 }
 
-// Judged on the opened handle, not the path, so a link or a swapped file cannot pass.
+/// Judged on the opened handle, not the path, so a link or a swapped file cannot pass.
 /// Errors name `what` and the rule broken, never the path or any content.
 fn secret_input(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, Error> {
     use sentinel_auth::secret_file::{self, Refusal};
