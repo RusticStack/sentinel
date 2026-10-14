@@ -1,9 +1,8 @@
 # Sentinel — implementation plan
 
-Status: design and acceptance criteria. Parts 01–13 of the [backlog](TODO.md) are implemented — foundations, contracts, identity and authorization, durable execution, sources and GitHub feedback, storage, caches, fleet scheduling, OAuth CLI/MCP, scoped secret management through fenced job delivery, bounded structured diagnostics, the human web interface ([web interface](docs/web-ui.md)), and retention, optional S3, backup and operations. Same-hardware performance work (Part 14) and release (Part 15) remain open. See [TODO](TODO.md) for per-task evidence and the [Parts 01–02 audit](docs/parts-01-02-audit.md) for outstanding gates.
-Reviewed: 2026-09-26. Repository: `RusticStack/sentinel`.
+Status: design reference and acceptance criteria. [TODO.md](TODO.md) is the execution tracker: it records which parts are implemented, per-task evidence and open work. Part 14 (same-hardware optimization and pilots) and Part 15 (release) are not complete. Repository: `RusticStack/sentinel`.
 
-Development tracker: [TODO.md](TODO.md) splits this design into actionable parts, dependencies, first-slice work, and verification gates. Implementation progress is recorded there.
+Statements below are decisions, constraints and targets; where the code or a topical document under [`docs/`](docs/) differs, that document is the contract and this plan is stale.
 
 ## 1. Product contract
 
@@ -17,18 +16,18 @@ Build a fully open-source, self-hosted CI engine optimized for fast feedback on 
 - No Sentinel execution-minute pricing, license server, mandatory cloud account, or paid feature gates. Hardware, electricity, bandwidth, optional S3, and GitHub service limits still exist. Capacity and retention limits prevent unattended machines from filling up.
 - Near-immediate dispatch when an eligible worker has capacity; explicit explanations when it cannot start.
 - Human-readable web UI and bounded, structured, evidence-linked responses for coding agents.
-- New implementation and UI in `main`; preserve the old dashboard and its history in `legacy`.
+- The original dashboard and its history live on the `legacy` branch; `main` is the from-scratch implementation.
 - MIT licensing, public build instructions, protocol/schema documentation, dependency licenses, and reproducible benchmark recipes.
 
 **Performance is an engineering target, not a language guarantee.** Rust gives control over allocation, concurrency, memory, and I/O. It does not make compilation, slow disks, cold image pulls, or WAN links inherently faster. “Fastest on the market” is an ambition to validate with published measurements, not an initial product claim.
 
-## 2. Review of the original plan and repository
+## 2. Decisions against the original plan
 
-| Original assumption | Revised decision |
+| Original assumption | Decision |
 |---|---|
 | One queue, slots on one VPS | Durable event-driven fleet scheduler with resource reservations and fairness |
 | Reuse/fork the Fresh UI | New UI; old implementation is reference material |
-| Go or Rust; four mandatory processes | Rust workspace; server embeds storage; workers remain separate execution boundaries; the optional web interface is its own Node process (decided 2026-09-27) |
+| Go or Rust; four mandatory processes | Rust workspace; server embeds storage; workers remain separate execution boundaries; the optional web interface is its own Node process (owner decision, 2026-09-27) |
 | Dropping Actions guarantees speed | Measure dispatch, preparation, execution, transfer, and total feedback independently |
 | Cache is always a snapshot mount | Local CoW fast path plus ordinary-filesystem and remote-transfer paths |
 | Hardlink clone is a snapshot substitute | Never hardlink writable jobs into shared caches; writes corrupt other jobs |
@@ -38,16 +37,9 @@ Build a fully open-source, self-hosted CI engine optimized for fast feedback on 
 | SQLite/Postgres/store service undecided | Embedded SQLite metadata; Sentinel-owned file store; optional S3 adapter |
 | Fixed week estimates | Evidence-based milestones and release gates |
 
-### Existing Sentinel findings
+### Legacy dashboard
 
-Inspected `RusticStack/sentinel` at `ba6c583715c16fde498d646577c98bc60c221adb`: README, repository tree, `lib/github.ts`, `lib/realtime.ts`, and LICENSE.
-
-- Deno 2 / Fresh 2.3 monitoring dashboard with GitHub OAuth, an org membership gate, Deno KV sessions, system metrics, and optional Vigil SOC views.
-- `lib/github.ts` reads GitHub Actions runners/runs/jobs using a classic PAT. Runner data is cached for 15 seconds; runs/jobs for 30 seconds. Recent-run aggregation scans a bounded subset of repos.
-- `lib/realtime.ts` sends dashboard snapshots every 15 seconds. This is monitoring, not execution or scheduling.
-- Existing auth assumes one organization; personal installations need a new authorization model.
-- Preserve source/history/license. Reuse lessons about navigation and deployment, not a wholesale OAuth/UI port.
-- This source does not establish why the reported GitHub runner waits last hours. Labels, runner groups, concurrency, connectivity, and GitHub dispatch need separate evidence. Sentinel must expose these conditions rather than inherit opaque waits.
+The `legacy` branch holds a Deno 2 / Fresh monitoring dashboard (GitHub OAuth, one-organization membership gate, Deno KV sessions, Actions runner and run views polled every 15-30 s). It is monitoring, not execution or scheduling, and its single-organization auth does not fit personal namespaces, so only its navigation and deployment lessons carry over. It does not explain why GitHub-hosted runner waits last hours; Sentinel must expose labels, concurrency, connectivity and dispatch conditions rather than inherit opaque waits.
 
 ### Scope boundaries
 
@@ -76,19 +68,19 @@ One Rust workspace, initially one `sentinel` binary with subcommands:
 - `server`: API, generic Git and forge event intake, bounded source/pipeline resolution and opt-in ref polling, scheduler, GitHub synchronization, metadata/storage maintenance.
 - `sentinel-web` (optional, Node): the human web interface in front of the API ([web interface](docs/web-ui.md)).
 - `worker`: executor and local store; connects to server even on the same host.
-- Developer/operator CLI commands.
-- `mcp`: stdio adapter using the same API. Authenticated Streamable HTTP can be served by the server.
+- Developer, operator and agent CLI commands.
+- `mcp`: stdio adapter using the same API. Authenticated Streamable HTTP is served by the server.
 
 Keep roles in separate processes/OS identities. The web server never executes repository code. A smaller worker executable can follow if distribution measurements warrant it.
 
-Logical modules/crates: `core`, `pipeline`, `protocol`, `scheduler`, `github`, `store`, `executor`, `server`, `cli`, `mcp`; create crates when useful, not as empty scaffolding. `web/` holds the web interface (Nuxt); `fixtures/` and `benchmarks/` hold reproducible workloads.
+Crates are split by boundary and created when useful, not as empty scaffolding; the current set is in the [AGENTS.md](AGENTS.md#layout) layout table. `web/` holds the web interface (Nuxt); `fixtures/` and `bench/` hold reproducible workloads and records.
 
 ### Dependency policy
 
 - Use maintained Rust libraries for async networking, TLS, serialization, hashing, compression, and embedded SQLite. Pin and justify dependencies.
 - Required worker tooling: Git and a rootless OCI runtime. **Podman first**; Docker only after runtime conformance tests. Do not implement containers, cryptography, TLS, or Git transport ourselves.
 - Project tools (Go, Rust, Python, Java, Node, Bun, pnpm, Gradle, Bazel, compilers, browsers, builders) belong in project-selected versioned images/scripts. Cookbook profiles expose cache paths and diagnostics, not privileged plugins. Optional runtime capabilities must be justified across workloads; Lockwell's current Docker harness does not mandate VM lifecycle support in Sentinel.
-- No required Redis, Postgres, MinIO, Elasticsearch, Kubernetes, Deno, or message broker. The web interface is an optional Node process (`sentinel-web`, Nuxt): the project owner chose on 2026-09-27 a full-stack interface over build-time-only assets, for its components, server rendering and maintainability; the controller, CLI and MCP never need it. It holds no credential and no state.
+- No required Redis, Postgres, MinIO, Elasticsearch, Kubernetes, Deno, or message broker. The web interface is an optional Node process (`sentinel-web`, Nuxt): the owner chose a full-stack interface over build-time-only assets for its components, server rendering and maintainability; the controller, CLI and MCP never need it. It holds no credential and no state.
 - Build the application-specific storage layer ourselves; embed SQLite instead of inventing a database engine. Reconsider a custom engine only after profiling demonstrates a real bottleneck and a separate durability/recovery design exists.
 - Optional Tailcat helper/self-hosted DERP and optional S3 are explicit dependencies, not hidden cloud requirements.
 
@@ -132,7 +124,7 @@ Job states: `blocked -> queued -> leased -> preparing -> running -> finalizing -
 
 - Distinct attempt IDs and monotonic fencing generations; compare-and-set transitions reject stale completions and stale artifact/cache publication.
 - Delivery is at least once. Exactly-once arbitrary shell execution is not promised. Worker dedup prevents replaying an accepted offer during a healthy session.
-- Starting configurable defaults: 5-second heartbeat, 30-second lease, 5-second offer-ack timeout. Test suspension/loss/load. Worker deadlines use monotonic time with a guard margin before server expiry.
+- Defaults: 5-second heartbeat, 30-second lease, 5-second offer-ack timeout ([worker link](docs/worker-link.md)). Worker deadlines use monotonic time with a guard margin before server expiry.
 - Disconnect: spool and reconnect while lease is valid; terminate when renewal expires. Reconcile uncertain attempts before replacement. A paused process can resume late, so external side effects still require idempotency.
 - Bound infrastructure retries; side-effecting jobs must opt in. Do not automatically retry ordinary test failures or uncertain deployments.
 - Cancellation is durable desired state: block new starts, gracefully terminate, then kill the entire container/process group after a configured grace period.
@@ -162,9 +154,7 @@ Gate support on pinned-version tests: unattended restart, persistent identity, m
 
 ## 6. Pipeline specification
 
-`.sentinel.yml`, versioned strict schema, duplicate/unknown-key errors, bounded YAML size/depth/aliases, no custom tags, deterministic compiled DAG. **Proposed syntax** to finalize alongside schema in M1:
-
-The compact example is a single default pipeline. Named pipelines can later express independent triggers/inputs/concurrency/required status without copying Actions. Finalize syntax with compiler fixtures; none of Lockwell's six workflow names is a built-in Sentinel concept. Unsupported lanes keep their existing executor until adapted.
+`.sentinel.yml`, versioned strict schema, duplicate/unknown-key errors, bounded YAML size/depth/aliases, no custom tags, deterministic compiled DAG. The authoritative syntax and limits are in [pipeline schema](docs/pipeline-schema.md); this example shows the shape. It is a single default pipeline. Named pipelines can later express independent triggers/inputs/concurrency/required status without copying Actions; none of Lockwell's six workflow names is a built-in Sentinel concept, and unsupported lanes keep their existing executor until adapted.
 
 ```yaml
 schema: 1
@@ -203,7 +193,7 @@ jobs:
         retain: 7d
 ```
 
-Specify and test:
+The pipeline contract covers:
 
 - Push/PR/tag/manual events, branch/path filters, and explicit push/PR duplicate policy. `event.key` is stable per PR/ref and prevents unrelated cancellations.
 - Durable UTC cron schedules with unique scheduled-occurrence IDs, overlap policy, bounded missed-occurrence catch-up after downtime, and dispatch from a pinned default-branch revision. Manual inputs have validated boolean/enum/bounded-string/list types; pass values as data, not interpolated shell code.
@@ -219,7 +209,7 @@ Specify and test:
 - YAML references secret names, never values. It cannot grant itself privilege, host mounts, or a stronger trust pool.
 - Artifacts specify success/failure/always retention and explicit dependent-job inputs; finalize handoff schema before migrating workflows requiring it.
 - Resource defaults/maxima are server policy shown by validation. Every job has finite queue/execution timeouts.
-- Publish schema, expression reference, and short Rust/Node/Python cookbooks with releases. Schema-assisted generation does not imply automatic Actions compatibility.
+- Release schema, expression reference, and short Rust/Node/Python cookbooks ([recipes](docs/recipes.md)) alongside each version. Schema-assisted generation does not imply automatic Actions compatibility.
 
 ## 7. Execution and trust boundaries
 
@@ -259,7 +249,7 @@ Rust storage module and local worker data paths, not a mandatory storage service
 - Controller disk is default durable log/artifact destination. Workers retain spools until acknowledged. Local caches are disposable; remote replication optional.
 - Persist log completeness/finalization. Worker-disk loss may lose unacknowledged bytes; report gaps. Document/test the exact durability acknowledgement boundary.
 - Quotas per installation/repo/run plus global high/low watermarks and reserved metadata/spool space. Stop admission before disk exhaustion.
-- Proposed configurable defaults: logs 14 days, artifacts 7 days, byte-capped LRU caches. Define actual byte caps during hardware inventory.
+- Retention and byte caps are configurable policy with defaults of 14 days for logs and 90 days for artifacts (a pipeline's own `retain` can only shorten it), and byte-capped LRU caches ([retention](docs/retention.md)).
 - GC respects active readers/uploads/jobs/cache leases. Manifest deletion and object reclamation are separate stages; never delete mounted data.
 - Online SQLite backup plus consistent manifest/object snapshot, migrations, integrity checks, restore drills, and upgrade/rollback guide. Back up secret encryption keys separately and restore matching metadata/objects.
 
@@ -315,41 +305,17 @@ MCP labels logs/repository content as untrusted data, never agent instructions. 
 
 Shared versioned API/authorization, stable IDs, pagination, structured errors, request IDs, mutation idempotency, and resumable event cursors. Publish OpenAPI/schema artifacts. SSE is sufficient for browser updates; workers need bidirectional sessions.
 
-```text
-sentinel auth login
-sentinel auth login --device
-sentinel auth status --json
-sentinel context use <tenant>
-sentinel secret set REGISTRY_TOKEN --repo owner/repo --stdin
-sentinel secret list --repo owner/repo --json
-sentinel status --repo owner/repo --sha <sha> --json
-sentinel runs list
-sentinel run <id>
-sentinel wait <id> --timeout 10m --json
-sentinel failure <id> --max-bytes 8192 --json
-sentinel logs <id> --step test --follow
-sentinel logs <id> --search error --context 5 --max-bytes 8192
-sentinel dispatch --repo owner/repo --ref main
-sentinel rerun <id>
-sentinel cancel <id>
-sentinel pipeline validate
-sentinel pipeline explain
-sentinel workers list
-sentinel queue explain <job-id>
-sentinel cache list
-sentinel artifact get <run-id> <artifact-name>
-sentinel doctor
-```
+The CLI covers sign-in and profiles (`auth`, `context`), runs (`run`, `status`, `wait`, `job`, `log`), operations (`workers`, `queue`, `cache`, `artifact`, `secret`, `doctor`), offline `pipeline validate|explain`, and the host-local `admin` commands; the implemented command surface is in [CLI](docs/cli.md).
 
-CLI: human default, JSON/NDJSON, documented exit codes distinguishing failed run/pending/transport error. Bounded event-driven `wait` avoids agent polling loops. `doctor` diagnoses runtime/filesystem/cgroups/connectivity/disk/GitHub without credentials. Linux and Windows CLI; execution is Linux-only. macOS was dropped by decision on 2026-09-24.
+CLI: human default, JSON/NDJSON, documented exit codes distinguishing failed run/pending/transport error. Bounded event-driven `wait` avoids agent polling loops. `doctor` diagnoses runtime/filesystem/cgroups/connectivity/disk/GitHub without credentials. Linux and Windows CLI; execution is Linux-only; macOS is not supported.
 
-MCP read tools: `list_runs`, `get_run`, `wait_run`, `get_failure`, `get_logs`, `explain_queue`, `get_pipeline`, `validate_pipeline`; schema/cookbook/expressions as resources. Mutations: `dispatch`, `rerun`, `cancel` with scopes, idempotency, audit, and accurate MCP tool annotations. Secret creation/update is available to authorized agents through CLI secure input, with metadata-only MCP inspection; no need to put secret values into model tool arguments. See [OAuth and secrets contract](docs/auth-and-secrets.md).
+MCP exposes read tools for runs, failures, logs, queue explanations and pipelines, and mutations (dispatch, rerun, cancel) with scopes, idempotency, audit, and accurate tool annotations; the tool list is in [MCP](docs/mcp.md). Secret creation/update is available to authorized agents through CLI secure input, with metadata-only MCP inspection; no need to put secret values into model tool arguments. See [OAuth and secrets contract](docs/auth-and-secrets.md).
 
 Stdio uses the CLI's locally provisioned credential source; it does not run an HTTP OAuth handshake over stdio. Streamable HTTP implements MCP OAuth discovery, authorization code + PKCE, resource/audience validation, and supported client registration. CLI uses browser OAuth + PKCE or device authorization for headless hosts. Sentinel issues scoped tokens after GitHub/local sign-in; GitHub tokens are not Sentinel API tokens. Both transports share the API authorization layer.
 
-### New human UI
+### Human UI
 
-A Nuxt 4 server (Vue, TypeScript, Nuxt UI) beside the controller renders pages as the signed-in person, streams live run and log updates as server-sent events (the controller's long polls, held on the browser's behalf) and proxies the controller's routes as one origin. The stack was chosen after measuring the accessible live-log view four ways (U01): windowing is what matters, and the windowed renderings are within noise of each other ([web interface](docs/web-ui.md#stack-choice-u01)). Changed on 2026-09-27 from "lightweight build-time assets served by Rust" by the owner's decision.
+A Nuxt 4 server (Vue, TypeScript, Nuxt UI) beside the controller renders pages as the signed-in person, streams live run and log updates as server-sent events (the controller's long polls, held on the browser's behalf) and proxies the controller's routes as one origin. The stack was chosen after measuring the accessible live-log view four ways: windowing is what matters, and the windowed renderings are within noise of each other ([web interface](docs/web-ui.md#stack-choice-u01)).
 
 - Runs by installation/repo/branch/PR/SHA, queue/execute timings, cache effectiveness.
 - Failure summary first, file/test evidence links, job DAG, step timelines.
@@ -369,7 +335,7 @@ A Nuxt 4 server (Vue, TypeScript, Nuxt UI) beside the controller renders pages a
 **Authentication:** GitHub sign-in or local Sentinel accounts, with local administrative recovery so operators are not locked out during GitHub outages. Generic Git users need no GitHub identity; human sign-in is independent of repository access credentials. Local passwords use a maintained Argon2id implementation with rate limits, breached-attempt throttling, secure recovery, and no default password. Support TOTP plus hashed one-use recovery codes for local privileged accounts; require step-up for super-admin role/registration/auth-policy changes. External OIDC/SSO can follow through an auth-provider boundary; no mandatory identity server.
 
 - Bootstrap the first super admin with a local operator command or expiring single-use setup secret, not “first visitor wins.” Disable bootstrap after successful setup; provide audited host-local recovery and prevent removing the last active super admin.
-- GitHub identity is provider + immutable user ID. Do not auto-link accounts by email. Account linking requires authentication of both identities. Sign-in uses validated state/redirects and PKCE where supported; exact provider flow is verified at implementation.
+- GitHub identity is provider + immutable user ID. Do not auto-link accounts by email. Account linking requires authentication of both identities. Sign-in uses validated state/redirects and PKCE where supported; the flow is in [GitHub sign-in](docs/github-sign-in.md).
 - Opaque server-side sessions, Secure/HttpOnly/SameSite cookies, rotation on login/role change, idle/absolute expiry, logout-all, CSRF protection, and immediate account suspension checks.
 - CLI/browser login issues scoped, expiring tokens using a browser handoff bound to the initiating client. MCP and service accounts cannot inherit ambient super-admin authority. Hash opaque token secrets at rest; allow listing metadata, revocation, and last-used audit.
 - Implement the complete [OAuth and secret management contract](docs/auth-and-secrets.md): public CLI client/PKCE, device grant, refresh rotation/revocation, MCP metadata/audience/client compatibility, OS credential storage, scoped CLI secret writes/rotation, and job-time injection. Interactive login is reusable for humans/agents; noninteractive agents use explicit bounded service grants.
@@ -388,7 +354,7 @@ Account registration, tenant creation, GitHub App installation binding, and runn
 
 Super-admin control is an explicit platform privilege, not an org role. Do not expose stored secret values in any admin UI. Platform operators with host/database access remain trusted; tenant isolation is not a claim to hide data from the deployment owner. Audit elevated cross-tenant administrative access.
 
-A01's [implemented authorization contract](docs/authorization.md) keeps platform administration separate from repository data access: super admins need ordinary membership/grants for repository queries. Human tenant admins have own-tenant repository authority capped by credential scopes; readers/operators/service accounts need explicit repo grants. Service accounts are permanently tenant-bound and cannot administer identities. Membership is a live ceiling on grants; secret-write is independent of run permission. Client operations derive ownership through repository rows, not a selected tenant context.
+The [authorization contract](docs/authorization.md) keeps platform administration separate from repository data access: super admins need ordinary membership/grants for repository queries. Human tenant admins have own-tenant repository authority capped by credential scopes; readers/operators/service accounts need explicit repo grants. Service accounts are permanently tenant-bound and cannot administer identities. Membership is a live ceiling on grants; secret-write is independent of run permission. Client operations derive ownership through repository rows, not a selected tenant context.
 
 **Tenant boundaries:** require tenant scope for every lookup, search, event subscription, object download, cursor, mutation, secret, cache, checkout, and worker grant. UI context/CLI defaults are convenience only; server derives authorization from authenticated membership and resource ownership. No cross-tenant dedup visibility, signed-link reuse, queue-detail leakage, or guessed-ID access. Use tenant-partitioned object namespaces; short-lived download links bind tenant and object. Running session/event streams are reauthorized on membership changes.
 
@@ -398,19 +364,19 @@ Acceptance tests: at least two orgs and a personal namespace on one deployment; 
 
 ### Git sources and forge boundaries
 
-Part 05 implements three separate concerns: trigger adapters -> shared authorized source/pipeline resolution and durable run creation -> existing execution plus optional forge result publishing. GitHub's native PR feedback is required in this part; generic Git runs publish results through Sentinel UI/API. Dedicated Gitea, Forgejo and GitLab adapters are deferred, not prerequisites for their repositories to run.
+Three concerns stay separate: trigger adapters -> shared authorized source/pipeline resolution and durable run creation -> existing execution plus optional forge result publishing. GitHub's native PR feedback is required; generic Git runs publish results through Sentinel UI/API. Dedicated Gitea, Forgejo and GitLab adapters are deferred, not prerequisites for their repositories to run.
 
-- **Repository binding (G01):** a tenant-owned stable repository ID binds an administrator-approved clone URL, allowed refs, pipeline path and credential reference. Support self-hosted hostnames/ports, private CA trust and pinned SSH host trust. Restrict transports and destinations through deployment policy; event bodies and pipeline YAML cannot replace the bound remote or grant source access. Migrate existing bindings under the compatibility policy rather than encoding generic repositories as fake GitHub installations.
-- **Source credentials (G01):** public repositories, read-only HTTPS credentials and SSH deploy keys share a scoped source-access path with GitHub App tokens. Generic credentials may be long-lived; seal stored secrets with the existing key-outside-database mechanism, support rotation/revocation and revalidate live grants before issuing fetch access. Deliver credentials only to authorized source-resolution/checkout operations, outside immutable specs, URLs, logs and job environments, over the authenticated worker link under versioned protocol rules. Reuse existing sealed storage now; Part 10 supplies the broader secret-management UX later.
-- **Events (G02):** manual API calls, authenticated generic ref-update events, GitHub webhooks and G07 observations feed one bounded durable intake. The generic contract identifies the bound repository, stable delivery ID, ref and old/new object IDs; authenticate before accepting, scope deduplication to the connection/repository and persist before acknowledgement. A documented server-side `post-receive` hook/relay uses bounded durable retry and exposes delivery/overflow failures; it never waits for CI completion. Hook availability depends on host administration; native forge webhook payloads need translation and are not automatically compatible.
-- **Resolution (G03):** resolve the policy-selected pipeline revision and checkout revision through Git, pin both before compilation/admission, and fail explicitly when a revision is no longer fetchable. Preserve explicit manual pipeline submission as a distinct provenance mode. Bound subprocess time, output, fetched data and concurrent work; remote I/O never holds the database writer. Define branch/tag create/delete, annotated-tag peeling, force-push, duplicate/reordered events and overlap between intake methods. A commit ID alone is not a delivery identity: returning a ref to an earlier commit is a distinct transition. PR head/base/tested-merge provenance and trust policies belong to the GitHub adapter; Git refs alone do not prove PR metadata or trusted fork code.
-- **Polling (G07):** opt-in `git ls-remote` for selected refs, with per-host/concurrency/output/time budgets, jitter and backoff. Persist observations and resulting intake atomically, or through recoverable pending observations, so a crash cannot advance a cursor while losing work. Specify initial discovery and deletion behavior. Polling builds observed ref changes and can miss intermediate pushes; it is not an every-push delivery guarantee or the scheduler's dispatch clock. Prefer events for low latency and measure polling overhead independently.
-- **Feedback (G04–G06):** GitHub App authentication, webhook/PR semantics and Checks publishing remain adapter-specific. Reuse durable outbox delivery mechanics, but do not make a forge publisher mandatory for generic runs or block dispatch on external status updates. Git alone provides neither PR/MR lifecycle nor native merge-protection checks. Generic Git operation therefore has no native PR/MR feedback guarantee for other forges yet.
-- **Acceptance (G06, G08):** retain the real GitHub PR/required-check pilot and add self-hosted Gitea, Forgejo, GitLab and bare-repository fixtures exercised without provider APIs. Cover private HTTPS/SSH, manual/hook/poll intake, pinned pipeline/source, truthful outcomes, revocation, duplicate delivery, restart and tenant isolation. Report unavailable fixtures as blockers and distinguish trigger detection, source resolution, dispatch and external feedback latency.
+- **Repository binding:** a tenant-owned stable repository ID binds an administrator-approved clone URL, allowed refs, pipeline path and credential reference. Support self-hosted hostnames/ports, private CA trust and pinned SSH host trust. Restrict transports and destinations through deployment policy; event bodies and pipeline YAML cannot replace the bound remote or grant source access. Generic repositories are never encoded as fake GitHub installations.
+- **Source credentials:** public repositories, read-only HTTPS credentials and SSH deploy keys share a scoped source-access path with GitHub App tokens. Generic credentials may be long-lived; seal stored secrets with the existing key-outside-database mechanism, support rotation/revocation and revalidate live grants before issuing fetch access. Deliver credentials only to authorized source-resolution/checkout operations, outside immutable specs, URLs, logs and job environments, over the authenticated worker link under versioned protocol rules. Stored secrets use [sealed storage](docs/sealed-storage.md); scoped secret management is in [secrets](docs/secrets.md).
+- **Events:** manual API calls, authenticated generic ref-update events, GitHub webhooks and poll observations feed one bounded durable intake. The generic contract identifies the bound repository, stable delivery ID, ref and old/new object IDs; authenticate before accepting, scope deduplication to the connection/repository and persist before acknowledgement. A documented server-side `post-receive` hook/relay uses bounded durable retry and exposes delivery/overflow failures; it never waits for CI completion. Hook availability depends on host administration; native forge webhook payloads need translation and are not automatically compatible.
+- **Resolution:** resolve the policy-selected pipeline revision and checkout revision through Git, pin both before compilation/admission, and fail explicitly when a revision is no longer fetchable. Preserve explicit manual pipeline submission as a distinct provenance mode. Bound subprocess time, output, fetched data and concurrent work; remote I/O never holds the database writer. Define branch/tag create/delete, annotated-tag peeling, force-push, duplicate/reordered events and overlap between intake methods. A commit ID alone is not a delivery identity: returning a ref to an earlier commit is a distinct transition. PR head/base/tested-merge provenance and trust policies belong to the GitHub adapter; Git refs alone do not prove PR metadata or trusted fork code.
+- **Polling:** opt-in `git ls-remote` for selected refs, with per-host/concurrency/output/time budgets, jitter and backoff. Persist observations and resulting intake atomically, or through recoverable pending observations, so a crash cannot advance a cursor while losing work. Specify initial discovery and deletion behavior. Polling builds observed ref changes and can miss intermediate pushes; it is not an every-push delivery guarantee or the scheduler's dispatch clock. Prefer events for low latency and measure polling overhead independently.
+- **Feedback:** GitHub App authentication, webhook/PR semantics and Checks publishing remain adapter-specific. Reuse durable outbox delivery mechanics, but do not make a forge publisher mandatory for generic runs or block dispatch on external status updates. Git alone provides neither PR/MR lifecycle nor native merge-protection checks. Generic Git operation therefore has no native PR/MR feedback guarantee for other forges.
+- **Acceptance:** retain the real GitHub PR/required-check pilot and add self-hosted Gitea, Forgejo, GitLab and bare-repository fixtures exercised without provider APIs. Cover private HTTPS/SSH, manual/hook/poll intake, pinned pipeline/source, truthful outcomes, revocation, duplicate delivery, restart and tenant isolation. Report unavailable fixtures as blockers and distinguish trigger detection, source resolution, dispatch and external feedback latency.
 
 ### GitHub integration
 
-Native GitHub PR feedback is a required Part 05/M1 capability, alongside generic Git support. The adapter uses the shared source/intake/run path above.
+Native GitHub PR feedback is a required M1 capability, alongside generic Git support. The adapter uses the shared source/intake/run path above.
 
 - Org/personal GitHub App installations with selected repos. Store immutable IDs; handle install removal/suspension, repo access change/rename/transfer.
 - Base permissions: contents read, checks write, pull requests read, metadata read. Org members read only for org-membership policies; personal installations use owner/collaborator or explicit grants. Additional features request only necessary permissions.
@@ -461,11 +427,7 @@ Profile before custom allocators, mmap everywhere, io_uring, bespoke indexes, de
 
 ### M0 — Preserve legacy and validate design
 
-- Rename original `main` to `legacy`; new fresh-history `main` starts with plan/README/MIT/ignore rules and becomes default. Preserve original commit/history without force-push.
-- Inventory org/personal workflows: languages/images/services/matrices/artifacts/secrets/deployments/merge queues/required checks/cross-job inputs.
-- Capture actual-machine baselines and capabilities. Spike pinned Tailcat direct/relay, rootless cgroups, SQLite dispatch, cache cloning. Resolve schema/protocol through short ADRs.
-
-Gate: history verified, prerequisites and migration blockers documented, benchmark harness and core decisions agreed. No guessed calendar promises.
+Complete: the original `main` is preserved as `legacy`, and baselines and spikes (Tailcat direct/relay, rootless cgroups, SQLite dispatch, cache cloning) are recorded in [`bench/`](bench/) and [feasibility probes](docs/feasibility-probes.md). The remaining inputs are the open questions in section 14.
 
 ### M1 — Durable single-host vertical slice
 
@@ -512,14 +474,14 @@ Gate: migrated repos run entirely under Sentinel; org/personal installs and remo
 
 Adopted: purpose-built performance-first Rust CI engine; strict pipelines; preserved legacy/new UI; multi-org auth/super-admin registrations; OAuth CLI/MCP and scoped secret management; Linux-first rootless fleet; durable push scheduling; first-class local/compiler/image caches; SQLite/owned file storage; optional S3; pinned Tailcat/direct TLS; shared API; bounded diagnostics; same-hardware sub-minute PR ambition; MIT/no usage gate. Supporting many project tools does not mean a generic automation framework. Repository adaptation must not dictate fundamental runtime changes.
 
-Resolve through hardware/workflow evidence:
+Open questions, to resolve through hardware and workflow evidence:
 
 1. Actual worker CPU/RAM/filesystems/cgroups/RTT and relay host.
-2. Repos blocked by services, matrices, image publishing, deployments, merge queues, forks.
-3. Optimized cache backend. ~~Byte/retention defaults.~~ Resolved: sized from the data file system and measured on the reference host, with policy per tenant and repository ([retention](docs/retention.md)).
-4. ~~UI stack and measured binary/RSS limits.~~ Resolved: Nuxt web interface, measured in [web interface](docs/web-ui.md#running-it).
-5. Tailcat pin/upgrade policy, wire framing, bulk concurrency.
-6. ~~Key backup and recovery-point/recovery-time goals.~~ Resolved (R04): RPO ≤ 1 hour (the backup interval), RTO ≤ 15 minutes for up to 100 GiB, from a measured drill ([backup](docs/backup.md)). ~~S3-outage policy.~~ Resolved: a bounded backlog on the controller's disk, then admission closes for new artifacts and uploads until it drains; the optional cache is never replicated ([s3](docs/s3.md#degraded-durability-and-admission-r03)).
+2. Repositories blocked by services, matrices, image publishing, deployments, merge queues and forks.
+3. The optimized cache backend (btrfs/ZFS snapshots against reflinks and safe copies).
+4. Tailcat pin and upgrade policy, wire framing and bulk concurrency.
+
+Decided with evidence: retention and byte defaults ([retention](docs/retention.md)); the Nuxt web interface ([web interface](docs/web-ui.md)); backup recovery goals of RPO <= 1 hour and RTO <= 15 minutes for up to 100 GiB ([backup](docs/backup.md)); the S3-outage policy of a bounded backlog on the controller's disk, then closed admission for new artifacts and uploads ([s3](docs/s3.md#degraded-durability-and-admission-r03)).
 
 These gates do not defer scheduling correctness or multi-host design until after v1.
 
@@ -531,6 +493,5 @@ Inspected 2026-09-13; pin versions and recheck exact behavior during implementat
 - [Lockwell migration evidence and source inventory](docs/lockwell-migration.md): six workflows, Makefile, CI guide, Go module, CI contract tests, acceptance/chaos scripts, and production Compose reviewed through GitHub API on 2026-09-13.
 - [Blacksmith](https://www.blacksmith.sh/): vendor emphasizes fast hardware, colocated caches, persistent NVMe layers, microVM startup, and observability. Vendor claims are not independent benchmarks.
 - [Detailed performance research](docs/performance-research.md): Blacksmith technical docs/blogs, Depot architecture/cache/boot engineering, Bazel/Go cache semantics, and actual Lockwell job timestamps. [Auth research](docs/auth-and-secrets.md): native-app OAuth, device grant, and versioned MCP authorization specification.
-- [Tailcat README/source](https://github.com/tailscale/tailcat): Go CLI/library, account-free NAT transport, owned DERP, keys/forwarding, explicit instability; read through GitHub API. Integration is implemented and tested (Q06/Q07; [feasibility probes](docs/feasibility-probes.md#4-tailcat-unattended-connectivity)).
-- [GitHub branch rename](https://docs.github.com/en/rest/branches/branches#rename-a-branch): consulted through Context7; appropriate permissions required and completion may be asynchronous.
-- Implementation verification references to recheck at corresponding milestones: [Checks](https://docs.github.com/en/rest/checks/runs), [webhooks](https://docs.github.com/en/webhooks/webhook-events-and-payloads), [SQLite WAL](https://www.sqlite.org/wal.html), [backup](https://www.sqlite.org/backup.html), [Woodpecker](https://woodpecker-ci.org/docs/intro), [MCP specification](https://modelcontextprotocol.io/specification/latest). This plan is not an implementation conformance report.
+- [Tailcat README/source](https://github.com/tailscale/tailcat): Go CLI/library, account-free NAT transport, owned DERP, keys/forwarding, explicit instability; read through GitHub API. See [feasibility probes](docs/feasibility-probes.md#4-tailcat-unattended-connectivity).
+- Verification references to recheck when behavior matters: [Checks](https://docs.github.com/en/rest/checks/runs), [webhooks](https://docs.github.com/en/webhooks/webhook-events-and-payloads), [SQLite WAL](https://www.sqlite.org/wal.html), [backup](https://www.sqlite.org/backup.html), [Woodpecker](https://woodpecker-ci.org/docs/intro), [MCP specification](https://modelcontextprotocol.io/specification/latest). This plan is not an implementation conformance report.
