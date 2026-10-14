@@ -160,9 +160,7 @@ const DEFERRED_MAX_AGE: Duration = Duration::from_secs(300);
 enum Received {
     Applied,
     Copy,
-    Queued {
-        kept: bool,
-    },
+    Queued { kept: bool },
     Transient {
         error: sentinel_store::Error,
         kept: bool,
