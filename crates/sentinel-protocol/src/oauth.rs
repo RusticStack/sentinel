@@ -1,4 +1,4 @@
-//! The OAuth 2.0 wire contract (O01–O03): endpoint paths, the CLI client,
+//! The OAuth 2.0 wire contract: endpoint paths, the CLI client,
 //! authorization-server and protected-resource metadata (RFC 8414, RFC
 //! 9728), token and device-authorization responses, and the RFC 6749 error
 //! shape the `/oauth/*` endpoints answer with. `/api/v1/*` keeps
@@ -270,8 +270,8 @@ impl std::error::Error for OAuthError {}
 mod tests {
     use super::*;
 
-    /// P09S-4: a controller from before X06 publishes neither registration
-    /// member; a newer client must still read its document.
+    /// A controller that publishes neither registration member must still
+    /// be readable by a newer client.
     #[test]
     fn metadata_from_a_controller_before_client_registration_still_parses() {
         let older = r#"{"issuer":"https://ci.example","authorization_endpoint":"https://ci.example/oauth/authorize","token_endpoint":"https://ci.example/oauth/token","revocation_endpoint":"https://ci.example/oauth/revoke","device_authorization_endpoint":"https://ci.example/oauth/device_authorization","response_types_supported":["code"],"response_modes_supported":["query"],"grant_types_supported":["authorization_code"],"code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none"],"revocation_endpoint_auth_methods_supported":["none"],"scopes_supported":["runs:read"],"authorization_response_iss_parameter_supported":true}"#;

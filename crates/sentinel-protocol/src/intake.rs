@@ -1,4 +1,4 @@
-//! The generic ref-update event contract (G02).
+//! The generic ref-update event contract.
 //!
 //! One authenticated delivery is one ref transition: a stable delivery ID
 //! chosen by the sender, the full ref name, and the old and new object IDs.

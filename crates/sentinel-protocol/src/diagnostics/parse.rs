@@ -1177,8 +1177,8 @@ mod tests {
 
     #[test]
     fn go_locations_with_colour_control_bytes_or_oversized_paths_never_void_the_report() {
-        // The audit probe (P11D-1): ANSI colour before the location used to
-        // become part of the path and fail validation of the whole report.
+        // ANSI colour before the location must not become part of the path
+        // and fail validation of the whole report.
         let long = "d/".repeat(super::super::MAX_DIAGNOSTIC_PATH_BYTES / 2) + "x_test.go";
         let input = format!(
             concat!(
@@ -1249,7 +1249,7 @@ mod tests {
 
     #[test]
     fn go_output_split_mid_line_is_never_rejoined_into_one_value() {
-        // P11D-4: test2json split an unterminated write across two events;
+        // test2json split an unterminated write across two events;
         // the stored log never holds the value contiguously, so neither may
         // the diagnostic.
         let input = concat!(

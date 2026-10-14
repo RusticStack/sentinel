@@ -1,5 +1,5 @@
 //! What an attempt measured about itself, sent with its terminal report
-//! and stored beside the attempt (W04). Durations are monotonic
+//! and stored beside the attempt. Durations are monotonic
 //! nanoseconds measured on the worker; absent means not measured, never
 //! zero. Versioned by a leading format byte like the run spec.
 
@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 
 pub const SUMMARY_FORMAT: u8 = 3;
 /// Format 1 predates the separate fetch/materialize timings; it stays
-/// decodable forever, mapping onto the new shape with the added fields
+/// decodable forever, mapping onto the current shape with the added fields
 /// absent.
 const SUMMARY_FORMAT_V1: u8 = 1;
-/// Format 2 predates the cache/image availability records (K08); it stays
+/// Format 2 predates the cache/image availability records; it stays
 /// decodable through its own shadow struct, like format 1.
 const SUMMARY_FORMAT_V2: u8 = 2;
 /// A summary crosses the link inside one control frame with room to spare.
@@ -21,7 +21,7 @@ pub const MAX_SUMMARY_BYTES: usize = 32 * 1024;
 const _: () = assert!(MAX_SUMMARY_BYTES < crate::limits::MAX_CONTROL_MESSAGE_BYTES);
 /// Steps recorded per attempt; a job has at most this many steps anyway.
 pub const MAX_STEP_RECORDS: usize = 256;
-/// Cache records per attempt (K08). The schema caps a job at
+/// Cache records per attempt. The schema caps a job at
 /// `MAX_CACHES` (8) declarations; 16 leaves headroom for a spec built by
 /// hand while keeping the summary well under [`MAX_SUMMARY_BYTES`].
 pub const MAX_CACHE_RECORDS: usize = 16;
@@ -69,7 +69,7 @@ pub enum CheckoutRoute {
     MirrorFallback,
 }
 
-/// What one declared `cache:` entry did for the attempt (K08): the
+/// What one declared `cache:` entry did for the attempt: the
 /// restore's outcome and measured phases, then the commit's answer.
 /// Durations are `Option` — a phase that never ran is absent, never zero.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,7 +127,7 @@ pub struct AttemptSummary {
     pub checkout_materialize_ns: Option<u64>,
     pub checkout_route: Option<CheckoutRoute>,
     pub image_pull_ns: Option<u64>,
-    /// Format 3 (K08): `Some(true)` when the image was already in the
+    /// Format 3: `Some(true)` when the image was already in the
     /// worker's store — the `podman image exists` fast path, nothing
     /// downloaded — `Some(false)` when the pull fetched it, and `None`
     /// when preparation never reached the pull or the pull failed.
@@ -136,7 +136,7 @@ pub struct AttemptSummary {
     pub steps_ns: Option<u64>,
     pub finalize_ns: Option<u64>,
     pub steps: Vec<StepRecord>,
-    /// Format 3 (K08): one record per declared `cache:` entry, in
+    /// Format 3: one record per declared `cache:` entry, in
     /// declaration order, at most [`MAX_CACHE_RECORDS`].
     pub caches: Vec<CacheRecord>,
     /// One bounded line on why the attempt did not pass, or — with

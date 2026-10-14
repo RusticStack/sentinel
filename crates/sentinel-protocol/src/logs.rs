@@ -1,4 +1,4 @@
-//! Log frames and the on-disk record they are spooled and stored as (W05).
+//! Log frames and the on-disk record they are spooled and stored as.
 //!
 //! A frame is at most `MAX_LOG_FRAME_BYTES` of one stream of one step,
 //! numbered by a per-attempt sequence that starts at 1 and never skips.

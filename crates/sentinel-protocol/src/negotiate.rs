@@ -25,7 +25,7 @@ pub struct ProtocolVersion(pub u16);
 /// in `Context2`), `CacheCancel` for an abandoned transfer, and allows a
 /// later `Profile` on the same session as an availability refresh.
 /// Protocol 9 adds `Prefetch`, the controller's bounded hint of image
-/// references queued work needs (K05), and lets a cache offer state its
+/// references queued work needs, and lets a cache offer state its
 /// digest in the end marker instead of up front (the all-zero
 /// `Upload::digest`). Protocol 10 adds attempt-scoped secret bundle transfer.
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
