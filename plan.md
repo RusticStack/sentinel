@@ -376,7 +376,7 @@ A Nuxt 4 server (Vue, TypeScript, Nuxt UI) beside the controller renders pages a
 
 **Registration policy:** default `invite_only`; super admin may choose `closed` or `approval_required` per deployment. A successful GitHub login is authentication, not automatic admission. Pending accounts have no tenant data or worker access. Approvals/rejections, invitations, expiry, revocation, and suspensions are visible in the admin console/API and audited.
 
-Account registration, tenant creation, GitHub App installation binding, and runner enrollment are separate decisions. Allow existing members to sign in when registration is closed. Invitations bind to a verified identity (or authenticated acceptance with explicit admin approval), tenant, maximum role, expiry, and one-time nonce. Installing the App on GitHub alone cannot create an approved Sentinel tenant or allocate compute. Unknown installations remain unbound/inactive until an authorized binding exists. No mandatory SMTP: an admin can deliver a one-time invitation link out of band.
+Account registration, tenant creation, GitHub App installation binding, and runner enrollment are separate decisions. Allow existing members to sign in when registration is closed. Invitations bind to a verified identity (or authenticated acceptance with explicit admin approval), tenant, maximum role, expiry, and one-time nonce. Installing the App on GitHub alone cannot create an approved Sentinel tenant or allocate compute. Unknown installations remain unbound/inactive until an authorized binding exists. No mandatory email delivery (optional Resend): an admin can deliver a one-time invitation link out of band.
 
 | Role | Scope and powers |
 |---|---|

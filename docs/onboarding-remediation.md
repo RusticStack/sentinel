@@ -35,7 +35,7 @@ Test failures (20 in `test-cli`, 21 in `test-linux`), with the cause of each. Ea
 
 | Test | Cause | Fix |
 |---|---|---|
-| `sentinel-mail` `starttls_is_required_when_chosen_and_never_downgraded` | The test built its config on port 0, which `Config::new` now refuses; the port is replaced a line later | The test starts from port 1 |
+| `sentinel-mail` mail transport test | The test built its config on a port the client refuses | Removed with the mail transport it covered, which is now Resend only |
 | `sentinel-store::email_identity` (3 tests) | `recent_audit(conn, 200)`; the limit is 100 | The helper asks for 100 |
 | `sentinel::tenant_isolation` (2 tests) | `--json` was placed after the subcommand, but it belongs to `sentinel api`, before it | The helper moves a trailing `--json` in front of the subcommand |
 | `sentinel-api::tenant_isolation` (the camp setup, so nearly every test in the suite) | The camps' bearer tokens asked for `P::ALL`, which includes platform scope; the store refuses that for an account that is not a super admin. The two narrowed grants had the same flaw | Camp and narrowed tokens ask for repository plus tenant-admin permissions |
@@ -106,7 +106,7 @@ Fixed: everything not listed below.
 Deferred:
 
 - `SENTINEL_AUTO_JOIN_DOMAINS` parsing is not in this branch. `sentinel_api::Options::auto_join` is the hook and `service.rs` passes the default (empty), so the settings route's `auto_join.applies` is false everywhere until the auto-join branch supplies the rules. (The `domain-auto-join` branch below does supply them.)
-- The SMTP test makes a real outbound connection. It is bounded by one slot, the client's timeouts and the token gate, but the relay host and port come from the token holder, so it can reach any address (SSRF).
+- The wizard's mail test made a real outbound connection to a host and port the token holder chose (SSRF). Resolved: the test now sends only to the fixed Resend host.
 - The emailed `/verify-email` and `/invitations/accept` pages and the web wizard UI were not part of this backend task (the `onboarding-ui` branch adds them).
 - Migration number 52 was the next free one on this base; the integrator renumbers if another branch also takes it.
 - `sentinel-api` now depends on `sentinel-mail`, so `Cargo.lock` gained one edge and no new external crate.
@@ -121,7 +121,7 @@ Pending verification:
 Review notes:
 
 - (low) `sentinel-store/src/setup.rs:42`: the `TOKEN_TTL_MS` doc comment says `admin setup-token` issues a new token. No such command exists; only a controller restart issues one, as `admission.md` and `development.md` say. Fix the comment.
-- (low) `sentinel-api/src/routes/setup.rs` `smtp_test_with` (about line 262): the SMTP test connects to any host and port the token holder gives, including loopback and internal addresses (`tls=none` is allowed for loopback), and the failure `reason` relays part of the remote reply. A token-gated, one-slot SSRF and port-scan oracle, already deferred; the operator holds host access anyway. Consider refusing link-local and metadata ranges.
+- (low, resolved) the earlier mail test connected to any host and port the token holder gave. The test now goes only to the fixed Resend host and its `reason` carries only a status and an error name.
 - (low) `routes/setup.rs` `status` (about line 85) and `oauth/mod.rs` `Budget::Setup`: `GET /setup` runs an uncached store read per request while setup is open with no admission budget, and five wrong well-formed tokens from anyone lock setup for 5 minutes, which a client can keep up. Neither is a privilege issue; `admin bootstrap` is the documented escape, so worth a doc note.
 - (low) `sentinel-store/src/organizations.rs` `create_self_service`: self-service organizations can take slugs matching the login of a GitHub organization not yet bound to a tenant, which allows squatting. Moving `approved-users` deployments from personal-only to also allowing organizations widens what existing deployments grant; the compatibility entry documents the widening but not the squatting. Check it against installation binding.
 - (low) `sentinel/src/service.rs` `announce_setup` (about line 2125): the setup token is logged at warn level to the console and any log collector, by design and documented; it is dead after an hour or once setup closes. The Linux-only code now compiles and lints on the VPS.
@@ -190,7 +190,7 @@ Review notes:
 
 - (med) `web/app/pages/invitations/accept.vue:87-95,159` (depends on `web/app/pages/index.vue:6-14`): the GitHub sign-in round trip from the invitation page usually failed without telling anyone, because the server-side render of `index.vue` redirected to the first tenant before the client read `sentinel-return`, and the secret stayed in `sessionStorage` past its ten minutes. The branch's later commits (`a GitHub sign-in started from an invitation comes back to it`, the pending-return fallthrough and the round-trip browser checks) address this and the browser test now passes it; the review note is kept because the package's own record has not been re-read against those commits.
 - (low) `web/app/pages/setup.vue:52-63`: resuming survives only one refresh. On mount `Object.assign(draft, stored)` fires the deep watcher and `save()` writes step 0 over the stored step, so a second refresh before passing the token step loses the position and shows no "picking up where you left off" notice, against `docs/web-ui.md#first-run-setup`. Keep `resumeAt` in the stored step until the person passes it.
-- (low) `web/app/pages/setup.vue:178` (`smtpSnippet`): the copy-paste line `SENTINEL_SMTP_CREDENTIALS_FILE=/etc/sentinel/smtp-credentials  # owner-only: ...` has a trailing comment; systemd `EnvironmentFile` and `docker --env-file` do not strip it, so the value becomes the path plus the comment and the controller exits with code 2. Put the comment on its own line.
+- (low, superseded) the wizard's copy-paste environment lines must each stand on their own line without a trailing comment (systemd `EnvironmentFile` and `docker --env-file` do not strip one); the Email step now shows the Resend lines ([web interface](web-ui.md#first-run-setup)).
 - (low) `web/app/pages/forgot-password.vue:22`: the page tells the administrator to run `sentinel admin recover --username <NAME>`, but an account that signed up by email has a generated username (`registration.rs:1010`) the person does not know, and `recover` does not take an email address. The page should say the administrator must find the username first.
 - (low) `web/app/components/admin/Invitations.vue:96-105`: if `GET /tenants/{slug}/settings` fails (`settings` is null) the tab shows only its heading, with no form, explanation or retry, so a failed load looks like an empty feature. The brief requires an error state with a retry.
 - (low) `crates/sentinel-api/tests/setup.rs:365-369`: the new `github_sync` response field is tested only for its absence on an app-created organization. No API test checks it is present and correct on a GitHub-backed organization, or that `check_due` switches between a due row and a settled future row (`routes/setup.rs:440-455`).

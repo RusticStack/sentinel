@@ -33,7 +33,7 @@ The login identifier is a **username or a verified email address** (migration 50
 - The password, the lockout and the sessions are the account's, not the identifier's: signing in by username and by address are the same credential, and failures count against the same record. The API's per-client guard keys on the canonical address.
 - An account created by address (`POST /api/v1/register`) has a generated `user-…` username as well, so every local account keeps a username for host-local administration; it can sign in by either once its address is verified.
 - Changing the address keeps the old verified one as the identity until the new one is proved; verification never carries over to a different address ([admission](admission.md#email-identity-and-email-invitations)).
-- Without SMTP the operator mints the verification link on the host: `sentinel admin account email-link --user <name-or-address>`, so an operator is never locked out of a deployment that cannot send mail ([configuration](configuration.md#email-delivery)).
+- Without a Resend key and sender the operator mints the verification link on the host: `sentinel admin account email-link --user <name-or-address>`, so an operator is never locked out of a deployment that cannot send mail ([configuration](configuration.md#email-delivery)).
 
 ## Sessions
 

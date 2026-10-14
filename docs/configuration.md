@@ -98,13 +98,10 @@ dir = "/mnt/backup/sentinel"       # absolute, outside data_dir: another disk or
 interval_secs = 3600               # 300..604800 (default hourly: the metadata recovery point)
 keep = 24                          # newest backups kept (1..1000, default 24)
 
-# server only: optional SMTP delivery of email verification and invitation links ([admission](admission.md#email-identity-and-email-invitations)); absent = nothing is sent and `sentinel admin` mints links. Needs public_url. Each key has a SENTINEL_SMTP_* environment override (below)
+# server only: optional email delivery of verification and invitation links through Resend ([admission](admission.md#email-identity-and-email-invitations)); absent = nothing is sent and `sentinel admin` mints links. Needs public_url. Each key has an environment override (below)
 [mail]
-host = "smtp.example.com"          # relay host name or IP address
-port = 587                         # default: 587 (starttls), 465 (implicit), 25 (none)
-tls = "starttls"                   # "starttls" (default, never downgraded), "implicit", or "none" (a relay on this host only, no credentials)
-credentials_file = "/etc/sentinel/smtp"  # optional; absolute, owner-only: `username = …` and `password = …` lines
-from = "sentinel@example.com"      # the sender address
+api_key_file = "/etc/sentinel/resend-key"   # absolute, owner-only file holding the Resend API key
+from = "Sentinel <sentinel@example.com>"    # the sender: `addr@domain` or `Name <addr@domain>`, on a domain verified in Resend
 
 # server only: disk admission, quotas and retention ([retention](retention.md), [storage](storage.md#disk-admission-quotas-and-reclamation-d06))
 [storage]
@@ -202,19 +199,18 @@ Rotation leaves revocation unchanged. Every allow-list line names its worker, so
 
 ### Email delivery
 
-Verification links and email invitations ([admission](admission.md#email-identity-and-email-invitations)) are delivered by an optional SMTP relay, drained from a durable outbox by the controller's mail lane. Configure it in `[mail]` or in the environment of the controller; the environment wins key by key, so a container needs no configuration file for it:
+Verification links and email invitations ([admission](admission.md#email-identity-and-email-invitations)) are delivered through [Resend](https://resend.com)'s HTTP API, drained from a durable outbox by the controller's mail lane. Configure it in `[mail]` or in the environment of the controller; the environment wins key by key, so a container needs no configuration file for it:
 
 | Key | Environment | Meaning |
 |---|---|---|
-| `host` | `SENTINEL_SMTP_HOST` | The relay. Without a host nothing is delivered; any other key without one is a configuration error. |
-| `port` | `SENTINEL_SMTP_PORT` | 1–65535; default 587 for `starttls`, 465 for `implicit`, 25 for `none`. |
-| `tls` | `SENTINEL_SMTP_TLS` | `starttls` (default): the greeting is plaintext, `STARTTLS` is mandatory (a relay that does not offer it is refused, never used in plaintext) and plaintext already buffered when the upgrade starts is refused. `implicit`: TLS from the first byte. `none`: only for `localhost` or a loopback address, and never with credentials. Server certificates are checked against the bundled web PKI roots. |
-| `credentials_file` | `SENTINEL_SMTP_CREDENTIALS_FILE` | Absolute path to an owner-only regular file of at most 8 KiB with `username = …` and `password = …` lines, like the other secret files. The password is never in the configuration file, the environment or an error, and is sent only inside TLS (`AUTH PLAIN`, else `AUTH LOGIN`). |
-| `from` | `SENTINEL_SMTP_FROM` | The sender address, as `ci@example.com`; normalized like every address. Required with a host. |
+| `api_key_file` | `SENTINEL_RESEND_API_KEY_FILE` | Absolute path to an owner-only regular file of at most 4 KiB holding the Resend API key (one trailing newline allowed). It is opened once without following a link and judged on the open handle — owned by the service user, no group or other access — like the master key and the GitHub secrets. There is deliberately no setting that takes the key itself: it is never in the configuration file, the environment, a log or an error. |
+| `from` | `SENTINEL_EMAIL_FROM` | The sender: `ci@example.com` or `Sentinel <ci@example.com>` (a display name of at most 64 characters without `<>",;@:` or control characters; the address is normalized like every address). The domain must be verified in your Resend account. |
 
-The server role only: a worker's configuration with a `[mail]` section is refused. Delivery also needs `public_url` (links are built on it) and the master key (`admin key create`; it seals queued messages). Without a master key the controller starts, logs `mail_disabled` and queues nothing. A configuration that cannot work (an unreadable credentials file, a refused setting) stops the start with exit 2 and never echoes a value. Each connection carries one message with a 10 s connect timeout, 15 s per read or write, a 60 s session deadline, reply lines of at most 1 KiB, replies of at most 64 lines and messages of at most 32 KiB. The controller logs `mail_enabled` (host, port, whether authenticated), `mail_settled` and `mail_abandoned` with the message's `mal_` identifier, never an address or a link.
+Both or neither: one without the other is a configuration error, and neither means no mail. The server role only: a worker's configuration with a `[mail]` section is refused. Delivery also needs `public_url` (links are built on it) and the master key (`admin key create`; it seals queued messages). Without a master key the controller starts, logs `mail_disabled` and queues nothing (the first-run wizard's test message still works, since it needs only the Resend key). A configuration that cannot work (an unreadable or malformed key file, a refused sender) stops the start with exit 2 and never echoes a value.
 
-Without `[mail]` nothing is queued and a request that needs a link still succeeds. The operator mints links on the host (`sentinel admin account email-link`, `invite create --email`, `account email-verify`), and `sentinel admin mail status` reports whether the controller delivers mail and the outbox's counts ([admission](admission.md#email-identity-and-email-invitations)).
+The destination is fixed: `POST https://api.resend.com/emails`. No setting changes the host, and the client follows no redirect, ignores proxy environment variables, checks the certificate against the bundled web PKI roots, and bounds a request to 5 s to connect and 15 s in all and a reply to 16 KiB. The request is JSON `{from, to, subject, html, text}` with `Authorization: Bearer <key>` and an `Idempotency-Key` of `sentinel-mail-<outbox id>`, so a retry after a lost reply never sends a second message (Resend honors a key for 24 hours; a verification message lives 24 hours). A subject is at most 200 characters without control characters and a body at most 32 KiB. Replies are classified by status: `2xx` delivered; `429`, `5xx`, `408`, a `409` for a request still in flight and any network failure are retried by the outbox with its backoff (60 s doubling to 15 min, at most 8 attempts, never past the message's expiry), waiting at least the `Retry-After` the service sent (at most one hour); `401`/`403` (a key problem) and every other `4xx` (an invalid sender or recipient, `422`) are permanent: the message is given up with an audit row (`mail-abandoned`) and the operator fixes the key or sender and asks again. The controller logs `mail_enabled`, `mail_settled` and `mail_abandoned` with the message's `mal_` identifier, never an address, a link or the key; a failure reason carries only the status and Resend's error name.
+
+Without a Resend key and sender nothing is queued and a request that needs a link still succeeds. The operator mints links on the host (`sentinel admin account email-link`, `invite create --email`, `account email-verify`), and `sentinel admin mail status` reports whether the controller delivers mail and the outbox's counts ([admission](admission.md#email-identity-and-email-invitations)).
 
 ### Domain auto-join
 
