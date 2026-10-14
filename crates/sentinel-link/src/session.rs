@@ -4402,6 +4402,96 @@ mod tests {
         drop(peer);
     }
 
+    /// A server-side sender whose peer completes the handshake and then
+    /// never reads. The peer thread is returned so the test keeps it alive.
+    fn sender_to_a_peer_that_never_reads() -> (Sender, thread::JoinHandle<()>) {
+        let server_identity = crate::identity::Identity::generate("controller").unwrap();
+        let pin = server_identity.fingerprint();
+        let server = crate::tls::server_config(server_identity).unwrap();
+        let client =
+            crate::tls::client_config(crate::identity::Identity::generate("worker").unwrap(), pin)
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = thread::spawn(move || {
+            let socket = TcpStream::connect(addr).unwrap();
+            let mut conn = rustls::Connection::Client(
+                ClientConnection::new(client, ServerName::try_from("sentinel").unwrap()).unwrap(),
+            );
+            handshake(&mut conn, &socket, HEARTBEAT_DEADLINE, None).unwrap();
+            thread::sleep(Duration::from_secs(10));
+        });
+        let (socket, _) = listener.accept().unwrap();
+        let mut conn = rustls::Connection::Server(ServerConnection::new(server).unwrap());
+        handshake(&mut conn, &socket, HEARTBEAT_DEADLINE, None).unwrap();
+        (split(conn, socket).unwrap().0, peer)
+    }
+
+    /// Finding 4: a dispatcher push to a peer that stopped reading waits at
+    /// most the dispatch bound (not the 15 s write timeout), fails, and
+    /// tears the connection down so the next push fails at once.
+    #[test]
+    fn a_bounded_send_to_a_peer_that_never_reads_fails_fast_and_closes() {
+        let (tx, peer) = sender_to_a_peer_that_never_reads();
+        let big = vec![0u8; 48 * 1024];
+        let overall = Instant::now();
+        let (failed, took) = loop {
+            let started = Instant::now();
+            if let Err(error) = tx.send_bounded(
+                &ServerMessage::Spec {
+                    attempt: [1; 16],
+                    seq: 0,
+                    last: false,
+                    bytes: big.clone(),
+                },
+                DISPATCH_WRITE_BOUND,
+            ) {
+                break (error, started.elapsed());
+            }
+            assert!(overall.elapsed() < Duration::from_secs(10), "never blocked");
+        };
+        assert!(matches!(failed, Error::Lost | Error::Io(_)), "{failed}");
+        assert!(!is_busy(&failed));
+        // The bound is 250 ms; well under the 15 s heartbeat deadline.
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        let again = Instant::now();
+        let next = tx
+            .send_bounded(
+                &ServerMessage::NoSpec { attempt: [1; 16] },
+                DISPATCH_WRITE_BOUND,
+            )
+            .unwrap_err();
+        assert!(!is_busy(&next));
+        assert!(again.elapsed() < Duration::from_millis(200));
+        drop(peer);
+    }
+
+    /// Finding 4: while another thread holds the connection, a bounded send
+    /// is refused as busy without waiting and without closing; the push
+    /// works once the connection is free again.
+    #[test]
+    fn a_bounded_send_skips_a_busy_connection_without_closing_it() {
+        let (tx, _rx) = tls_pair();
+        let held = tx.0.conn.lock().unwrap();
+        assert!(!is_free(&tx));
+        let started = Instant::now();
+        let refused = tx
+            .send_bounded(
+                &ServerMessage::NoSpec { attempt: [2; 16] },
+                DISPATCH_WRITE_BOUND,
+            )
+            .unwrap_err();
+        assert!(is_busy(&refused), "{refused}");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        drop(held);
+        assert!(is_free(&tx));
+        tx.send_bounded(
+            &ServerMessage::NoSpec { attempt: [2; 16] },
+            DISPATCH_WRITE_BOUND,
+        )
+        .expect("busy must not have closed the connection");
+    }
+
     fn context(tenant: Option<TenantId>, trust: Trust) -> JobContext {
         JobContext {
             source: None,
