@@ -1,4 +1,4 @@
-//! Grant and service-account routes (O06): `GET /api/v1/grants`, `DELETE
+//! Grant and service-account routes: `GET /api/v1/grants`, `DELETE
 //! /api/v1/grants/{grt}`, and `/api/v1/tenants/{slug}/service-accounts…`
 //! (create, repository access, grant issue and listing). These answer
 //! `sentinel.error/1` like the rest of `/api/v1`.

@@ -1,4 +1,4 @@
-//! The OAuth 2.0 authorization server's HTTP surface (O01–O06).
+//! The OAuth 2.0 authorization server's HTTP surface.
 //!
 //! [`route`] runs before the `/api/v1` router and owns `/.well-known/*`,
 //! `/oauth/*`, `/device`, `/api/v1/grants*` and
