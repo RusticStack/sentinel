@@ -213,7 +213,7 @@ fn sqlite(args: SqliteArgs) -> Result<String, String> {
     }
     drop(insert);
 
-    // Backlog: batched inserts of older-but-lower-priority ready rows.
+    // Backlog: batched inserts of newer, lower-priority ready rows.
     let t = Instant::now();
     {
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -424,9 +424,8 @@ fn clone(args: CloneArgs) -> Result<String, String> {
     serde_json::to_string(&report).map_err(|e| e.to_string())
 }
 
-/// Whole-tree clone: `btrfs subvolume snapshot`. The mode's whole case is
-/// that one syscall replaces the walk — but it only exists on btrfs, and
-/// only when the source is itself a subvolume, so the filesystem decides
+/// Whole-tree clone: `btrfs subvolume snapshot`. It works only on btrfs and
+/// only when the source is itself a subvolume, so the filesystem is checked
 /// first and the report says `unsupported` rather than guessing.
 fn snapshot(args: &CloneArgs) -> Result<String, String> {
     let fstype = fs_type(&args.source).or_else(|| fs_type(&args.dest));
@@ -519,8 +518,8 @@ fn fs_type(_path: &Path) -> Option<String> {
     None
 }
 
-/// Files, directories and bytes under `dir` — the source's own measure,
-/// used where a mode never walks the tree it clones.
+/// Files, directories and bytes under `dir`, for modes that never walk the
+/// tree they clone.
 fn count_tree(dir: &Path) -> Result<(u64, u64, u64), String> {
     let (mut files, mut dirs, mut bytes) = (0, 0, 0);
     for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
