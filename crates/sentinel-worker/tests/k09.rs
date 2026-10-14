@@ -1,4 +1,4 @@
-//! K09 executor-level verification of what the cache layer alone cannot
+//! Executor-level verification of what the cache layer alone cannot
 //! see: a publication failure is a diagnostic on the attempt — a cache
 //! note and the summary's `publish: "failed"` — never the job's verdict,
 //! and a pull-request attempt can only ever create pull-request scope
@@ -283,7 +283,7 @@ fn a_pull_request_attempt_never_touches_protected_state() {
     assert!(pr.join(scope::CURRENT_NAME).exists());
 }
 
-/// P07-1: publication reads the job's writable views only after the
+/// Publication reads the job's writable views only after the
 /// container is gone — a background process a step left running (here a
 /// loop that keeps rewriting the cache view) can no longer touch the tree
 /// the walk reads. Proven at the moment of publication: the cache note is

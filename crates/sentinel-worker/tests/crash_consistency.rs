@@ -1,5 +1,5 @@
 //! Crash consistency of the worker's log spool and the controller's log
-//! store (P04-28): what an acknowledgement, a sync or a declared end
+//! store: what an acknowledgement, a sync or a declared end
 //! promises must survive a power loss at any point, and whatever a crash
 //! leaves must reopen and converge to the log an uninterrupted run
 //! produces.
@@ -52,8 +52,6 @@ use sentinel_core::{AttemptId, Fence, JobId, RunId};
 use sentinel_protocol::logs::{Frame, Stream};
 use sentinel_store::logs::{LogStore, Tail};
 use sentinel_worker::{recovery, spool::Spool};
-
-// ---------------------------------------------------------------- workload
 
 /// A fixed, valid (version 4) identifier from one byte.
 fn id(n: u8) -> [u8; 16] {
@@ -320,8 +318,6 @@ fn run_workload(root: &Path, ops: &[Op], mut done: impl FnMut(usize, &Outcome) -
         }
     }
 }
-
-// ------------------------------------------------------------ expectations
 
 /// The uninterrupted run: every outcome, and the final logs a reopen shows.
 struct Golden {
@@ -628,8 +624,6 @@ fn verify_store(root: &Path, p: &Promises, golden: &Golden, bad: &mut Vec<String
         }
     }
 }
-
-// ------------------------------------------------------ POSIX-strict model
 
 /// The traced workload: runs the plan under `$CRASH_ROOT`, writing each
 /// done operation's index to `$CRASH_JOURNAL` — the trace orders those
@@ -1386,8 +1380,6 @@ fn posix_crash_states() {
         failures[0]
     );
 }
-
-// ------------------------------------------------------------- dm-flakey
 
 struct Flakey {
     name: String,

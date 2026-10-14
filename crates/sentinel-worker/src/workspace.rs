@@ -27,7 +27,7 @@ pub struct Workspace {
 
 impl Workspace {
     /// Create `<root>/workspaces/<attempt>`, refusing if anything is already
-    /// there: a leftover is a reconciliation matter (W07), not a workspace.
+    /// there: a leftover is a reconciliation matter, not a workspace.
     pub fn create(root: &Path, attempt: AttemptId) -> Result<Workspace> {
         // The directory that holds every workspace is owner-only. The
         // attempt's own directory keeps the umask's mode: a container user
@@ -60,7 +60,7 @@ impl Workspace {
         remove_tree(&self.path)
     }
 
-    /// Attempt directories left behind by an earlier process, for W07.
+    /// Attempt directories left behind by an earlier process.
     pub fn leftovers(root: &Path) -> Result<Vec<AttemptId>> {
         let parent = root.join(WORKSPACES_DIR);
         let mut found = Vec::new();
@@ -203,7 +203,6 @@ mod tests {
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    /// A tree that is already gone is already removed.
     #[test]
     fn removing_nothing_succeeds() {
         let dir = tempfile::tempdir().unwrap();
