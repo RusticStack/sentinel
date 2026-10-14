@@ -16,7 +16,29 @@ an outsider learns nothing — for a local path or `file://` URL (other
 repositories, mirrors and workspaces on the worker host), `ssh://` or scp
 syntax (the worker account's own SSH identity and configuration), `git://`,
 plain `http://`, remote helpers (`ext::`) and userinfo. A bound repository's
-dispatch must name exactly its binding, as before. Independently, every Git
+dispatch must name exactly its binding, as before.
+
+**Manual destinations are public names.** Because the worker fetches an
+unbound remote from inside the deployment's network, the host must also be a
+public DNS name: an IP literal in any notation (`169.254.169.254`,
+`2130706433`, `0x7f.0.0.1`), a bare hostname (`metadata`) and private-use
+suffixes (`.local`, `.internal`, `.lan`, `.home`, `.corp`, `.localhost`, …)
+are refused at admission with the same `invalid_request`. The worker applies
+the policy itself, so a spec that bypassed the API meets it too: it resolves
+the name, refuses it unless **every** address is globally routable (not
+loopback, link-local, private, shared, multicast, reserved, or an IPv6 form
+embedding one), and then pins Git's connection to exactly those addresses
+(`http.curloptResolve`), so a second DNS answer cannot rebind the name after
+the check. The option needs Git 2.37; an older or unreadable Git refuses
+unbound remotes rather than fetch them unpinned. A deployment that really
+needs an internal manual destination lists its exact authorities,
+comma-separated, in `SENTINEL_MANUAL_DESTINATIONS` (for example
+`https://git.corp.internal:8443`) in **both** the controller's and the
+worker's environment; a listed authority skips the check and the pin. Every
+refusal or failure of an unbound remote surfaces as one message ("the manual
+remote was refused or could not be fetched") — never Git's own stderr — so
+neither the policy nor the worker's network is an oracle. A bound
+repository's verdicts keep Git's bounded excerpt. Independently, every Git
 fetch that carries no source access runs with `protocol.allow=never` plus
 only `https` and local paths (worker-local mirrors and tests use the
 latter), no redirects and no credential helper, so even a spec that bypassed
@@ -76,6 +98,16 @@ line. Errors carry one bounded, control-character-free line of Git/SSH output
 with the credential itself replaced before it can be interpolated.
 
 ## Checkout on the worker
+
+The controller issues an access that expires 60 s after issue, and that
+instant is on the controller's wall clock. A worker never compares it with its
+own clock (a worker minutes ahead would otherwise drop the link on every bound
+spec): on receipt it checks only the access's shape and restates the expiry as
+`now + 12 min` on its own clock — one checkout deadline (`CHECKOUT_TIMEOUT`,
+10 min) plus two minutes before the checkout starts — so the direct fallback
+after a mirror lock wait or timeout still holds a valid access. The access
+exists only in the attempt's in-memory context, bounded by the attempt's fence
+and lease, and is never persisted or re-sent.
 
 `checkout::checkout_authorized` validates the access object (expiry, exact
 remote, allowed ref) before starting Git, then:
@@ -233,8 +265,15 @@ under the `/api/v1` path policy. See [compatibility](compatibility.md).
   pinned host trust and a refused wrong host, both proving the private
   directory is removed and the key never reaches `.git/config`.
 - `crates/sentinel-link/tests/source_delivery.rs`: a bound source reaches a
-  protocol-2 worker with its credential only after acknowledgement, and a
+  protocol-2 worker with its credential only after acknowledgement, its
+  validity restated on the worker's clock to cover a whole checkout, and a
   protocol-1 worker receives `NoSpec` rather than running without it.
+- `crates/sentinel-store/tests/sources.rs`, `crates/sentinel-protocol`
+  (`source.rs` unit tests) and `crates/sentinel-git/tests/manual_destination.rs`:
+  manual remotes naming IP literals, bare hostnames or private suffixes are
+  refused at admission and at the worker with one message; address
+  classification, Git version parsing and the unreadable-`HOME` guarantee are
+  unit tested. Verified on the VPS only; pending until that pass.
 - `crates/sentinel-github` unit tests: installation identity, account type,
   suspension, permission validity, a read-only scoped token, lifetime bounds
   and redacted debug output.
