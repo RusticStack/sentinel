@@ -2144,7 +2144,10 @@ mod secret_runtime {
                 cpu_millis: 4_000,
                 memory_bytes: 1 << 30,
             },
-            profile: Profile::default(),
+            profile: Profile {
+                disk_bytes: 64 << 30,
+                ..Profile::default()
+            },
             transport: sentinel_link::session::TransportStats::default(),
             remote_cache: false,
         };
