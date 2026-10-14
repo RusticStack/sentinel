@@ -1,11 +1,11 @@
-# Sources: bindings, credentials and forge associations (G01)
+# Sources: bindings, credentials and forge associations
 
 A **repository** in Sentinel is a tenant-owned row. A **source binding** is
 what makes that repository executable and fetchable: an administrator-approved
 clone URL, the refs runs may use, the pipeline path, a credential reference,
 and — optionally — the forge installation the repository belongs to. A
-repository with no binding keeps working as the explicit manual mode that
-Part 04 exercised: a dispatch names its own remote and gets no credential.
+repository with no binding runs in manual mode: a dispatch names its own
+remote and gets no credential.
 
 The worker fetches a manual remote with its own process identity, outside
 any job container, so the remote a client may name there is narrow: an
@@ -16,7 +16,7 @@ an outsider learns nothing — for a local path or `file://` URL (other
 repositories, mirrors and workspaces on the worker host), `ssh://` or scp
 syntax (the worker account's own SSH identity and configuration), `git://`,
 plain `http://`, remote helpers (`ext::`) and userinfo. A bound repository's
-dispatch must name exactly its binding, as before.
+dispatch must name exactly its binding.
 
 **Manual destinations are public names.** Because the worker fetches an
 unbound remote from inside the deployment's network, the host must also be a
@@ -66,16 +66,15 @@ allowed for the binding.
 ## Credentials are sealed, delivered per attempt, and never persisted
 
 The credential reference is **not** a run-spec field. It is sealed with the
-existing key-outside-database mechanism ([second-factor seeds](local-authentication.md)
-use the same `master.key`) and its associated data binds the ciphertext to
+key-outside-database mechanism ([sealed storage](sealed-storage.md), the same
+`master.key` as [second-factor seeds](local-authentication.md)) and its associated data binds the ciphertext to
 *(tenant, repository, version)*: a row copied to another repository or tenant
 fails to open. The **version** advances on every bind, rotate and revoke, and
 mutations are compare-and-set, so two administrators cannot silently overwrite
 each other.
 
-`admin key create` already provisions `<data_dir>/master.key`; G01 adds no new
-key material, and a deployment that never binds a credential never needs it.
-A stolen database therefore yields no deploy token and no private key, and a
+`admin key create` provisions `<data_dir>/master.key`; a deployment that
+never binds a credential never needs it. A stolen database therefore yields no deploy token and no private key, and a
 rotated credential's ciphertext is replaced, not appended to.
 
 Delivery is scoped to one attempt:
@@ -115,7 +114,7 @@ remote, allowed ref) before starting Git, then:
 - **HTTPS with CA trust** writes the PEM roots to an owner-only file outside
   the workspace and passes `GIT_SSL_CAINFO`; an SSH transport additionally
   writes `known_hosts` and refuses unless it has one.
-- **HTTPS credentials** use the askpass helper as before.
+- **HTTPS credentials** use the askpass helper.
 - **SSH deploy keys** write the private key `0600` and an `GIT_SSH` wrapper
   that pins `ssh -F /dev/null`, `BatchMode`, `IdentitiesOnly`,
   `StrictHostKeyChecking=yes` and `UserKnownHostsFile` to the bound trust, so
@@ -157,7 +156,7 @@ SQLite. For an associated repository, the controller:
 
 Only then is the spec released. Installation lifecycle is a local snapshot
 refreshed from GitHub's API (`admin source refresh-installation`) and
-invalidated by `admin source remove-installation`; a webhook (G02) is a hint
+invalidated by `admin source remove-installation`; a webhook is a hint
 to refresh, never authority to revive an installation that was removed or
 transferred.
 
@@ -201,7 +200,7 @@ sentinel admin source revoke --data-dir "$DATA" --actor usr_... --repo rep_... -
 sentinel admin source hook-token --data-dir "$DATA" --actor usr_... --repo rep_...
 sentinel admin source hook-token --data-dir "$DATA" --actor usr_... --repo rep_... --revoke
 
-# Opt-in ref polling (G07); the first poll records a baseline and admits nothing
+# Opt-in ref polling; the first poll records a baseline and admits nothing
 sentinel admin source poll --data-dir "$DATA" --actor usr_... --repo rep_... \
   --interval 60s --refs 'refs/heads/main,refs/tags/v*'
 sentinel admin source poll --data-dir "$DATA" --actor usr_... --repo rep_... --disable
@@ -243,23 +242,22 @@ authority is the same filesystem access that already lets an operator open the
 database: `--actor` names the account the audit attributes the change to, and
 it is recorded verbatim, not re-authorized. The store also carries a
 credentialed path (`Authority::credential`) that rechecks administration of
-*that* tenant through the live authorization layer; the future API route uses
-it, and the store tests exercise both.
+*that* tenant through the live authorization layer; the store tests exercise
+both.
 
 Deploy credentials must be provisioned **read-only** at the Git provider.
 Sentinel stores and delivers them, and cannot make a write-capable token safe.
 
 ## Compatibility
 
-Migration 17 adds `source_bindings` and `source_audit` and extends
-`installations`; migration 18 adds `source_intake_tokens` and
-`webhook_deliveries` ([intake](intake.md)); migration 19 adds the resolved
-delivery states and per-run provenance ([intake](intake.md)). Existing
-repositories stay unbound and unbound legacy runs keep working. Protocol 2
-adds the `Source` message and protocol 3 the event context; workers negotiate
-`1..=3`, and anything below 3 is served `NoSpec`. The HTTP API gains
-`POST /api/v1/hooks/github` and `POST /api/v1/intake/{repo}`; both are additive
-under the `/api/v1` path policy. See [compatibility](compatibility.md).
+Migration 017 adds `source_bindings` and `source_audit` and extends
+`installations`; migration 018 adds `source_intake_tokens` and
+`webhook_deliveries` ([intake](intake.md)); migration 019 adds the resolved
+delivery states and per-run provenance ([intake](intake.md)). Repositories
+stay unbound until bound. Protocol 2 adds the `Source` message and protocol 3
+the event context; a worker below protocol 3 is served `NoSpec`. Intake uses
+`POST /api/v1/hooks/github` and `POST /api/v1/intake/{repo}`. See
+[compatibility](compatibility.md).
 
 ## Verification
 
@@ -284,12 +282,7 @@ under the `/api/v1` path policy. See [compatibility](compatibility.md).
   manual remotes naming IP literals, bare hostnames or private suffixes are
   refused at admission and at the worker with one message; address
   classification, Git version parsing and the unreadable-`HOME` guarantee are
-  unit tested. Verified on the VPS only; pending until that pass.
+  unit tested.
 - `crates/sentinel-github` unit tests: installation identity, account type,
   suspension, permission validity, a read-only scoped token, lifetime bounds
   and redacted debug output.
-
-A live GitHub App private-key round trip against github.com, a real
-self-hosted Gitea/Forgejo/GitLab HTTPS or SSH host, and idempotent
-installation lifecycle webhooks remain verification for G02 and G08 and a
-dedicated pilot; they are recorded as prerequisites, not simulated.

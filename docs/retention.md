@@ -1,4 +1,4 @@
-# Retention and quotas (R01)
+# Retention and quotas
 
 Every byte Sentinel stores is bounded twice: by **size** (a quota, a budget or a watermark) and, for evidence, by **age** (a retention). This page is the whole map. The disk admission gate, object reclamation and the orphan sweep it builds on are in [storage](storage.md#disk-admission-quotas-and-reclamation-d06).
 
@@ -36,15 +36,15 @@ Retention only narrows going down: a repository's effective retention is the sma
 
 ## Log expiry is decided in the database
 
-Before R01 the log sweep deleted attempt directories whose newest byte was older than one deployment-wide retention — an age read from the file system, with nothing in the database saying the log was gone. Now:
+A log's deadline and its removal are recorded in the database, not read from file ages:
 
-1. **Stamp.** Once an attempt is released, the maintenance pass reads its log's size from disk (off the writer) and stamps the row: `log_bytes` (added to the tenant's and repository's usage by trigger) and `log_expires_ms` — the release time plus the effective retention of its repository. Up to 16 batches of 256 per pass, oldest release first, so a backlog after an upgrade catches up quickly.
+1. **Stamp.** Once an attempt is released, the maintenance pass reads its log's size from disk (off the writer) and stamps the row: `log_bytes` (added to the tenant's and repository's usage by trigger) and `log_expires_ms` — the release time plus the effective retention of its repository. Up to 16 batches of 256 per pass, oldest release first,, so a backlog catches up quickly.
 2. **Expire.** Rows past their deadline (`attempts_log_expiry`) get `log_expired_ms` and `log_bytes = 0` in one transaction — the usage drops with it — re-checking the deadline, so a retention raised meanwhile keeps the log. The files are deleted after that commits.
 3. **Sweep.** The bounded directory walk (`LogStore::sweep_dirs`) deletes what the rows no longer account for: a directory whose row says expired (a crash between commit and delete) or that no attempt row names at all. Open writers are never touched.
 
 An expired log never comes back: the `attempt_update` trigger refuses to clear `log_expired_ms`, the worker link refuses late frames for it, and the API answers its page and search at once with `expired_ms` and no frames; the web interface says the log was removed by retention and when.
 
-**Changing a policy applies to what is stored.** Setting a tenant's or repository's policy re-stamps the unexpired logs it covers to their new deadline (release plus the new retention — shorter or longer) and shortens artifact deadlines past the new artifact retention. The policy row and the first 512 rows commit in one transaction (`retention::set`); the rest is re-applied by `retention::finish_reapply`, in keyset order by row id and one write per 512 of the tenant's rows (logs first, then artifacts) read through the keyed indexes `attempts_log_reapply` and `artifacts_reapply` (migration 49), so what other tenants hold is never scanned and a policy change on a large tenant never holds the writer for its size and each step is idempotent. The API and `sentinel admin tenant storage` run it before they answer; a crash between the set and the end of the re-stamping leaves the remaining rows on their previous deadlines until the policy is set again. A lowered retention therefore frees space on the next maintenance pass, not only for new runs. An artifact deadline is never extended: what a pipeline asked for is not recorded beyond its deadline.
+**Changing a policy applies to what is stored.** Setting a tenant's or repository's policy re-stamps the unexpired logs it covers to their new deadline (release plus the new retention — shorter or longer) and shortens artifact deadlines past the new artifact retention. The policy row and the first 512 rows commit in one transaction (`retention::set`); the rest is re-applied by `retention::finish_reapply`, in keyset order by row id and one write per 512 of the tenant's rows (logs first, then artifacts) read through the keyed indexes `attempts_log_reapply` and `artifacts_reapply` (migration 049), so what other tenants hold is never scanned, a policy change on a large tenant never holds the writer for its size, and each step is idempotent. The API and `sentinel admin tenant storage` run it before they answer; a crash between the set and the end of the re-stamping leaves the remaining rows on their previous deadlines until the policy is set again. A lowered retention therefore frees space on the next maintenance pass, not only for new runs. An artifact deadline is never extended: what a pipeline asked for is not recorded beyond its deadline.
 
 **The artifact cap is a trigger.** The controller writes the deployment's limits to `storage_defaults` at every start, and an `artifacts` insert trigger shortens a new row's `retain_until_ms` to the effective artifact retention — whatever code path inserts it (a captured artifact, a failed one, the terminal publication's missing ones).
 
@@ -63,15 +63,15 @@ Fixed sizes fit one disk badly: 1 GiB of reserve is plenty on 50 GB and a roundi
 | worker images (per store) | a fifth | 2–50 GiB |
 | controller remote cache store | a tenth | 1–50 GiB |
 
-The reference host (the verification VPS: 12 vCPU AMD EPYC 9645, 31 GiB, ext4 on a virtio disk) measures **1,080,795,422,720 bytes** (263,866,070 blocks of 4 KiB), which gives a 15.7 GiB reserve, closing at 31.5 GiB free above it and reopening at 63 GiB, a 2.0 GiB log floor, and 50 GiB for each worker and remote store — the same 50 GiB the stores had as constants before. On a 64 GiB disk the watermarks equal the old fixed 1/2/4 GiB; on 100 GiB a worker keeps 20 GiB of cache, 10 of mirrors and 20 of images, leaving half the disk to workspaces and spools. The worker stores together take at most half the disk by default.
+The reference host (the verification VPS: 12 vCPU AMD EPYC 9645, 31 GiB, ext4 on a virtio disk) measures **1,080,795,422,720 bytes** (263,866,070 blocks of 4 KiB), which gives a 15.7 GiB reserve, closing at 31.5 GiB free above it and reopening at 63 GiB, a 2.0 GiB log floor, and 50 GiB for each worker and remote store On 100 GiB a worker keeps 20 GiB of cache, 10 of mirrors and 20 of images, leaving half the disk to workspaces and spools. The worker stores together take at most half the disk by default.
 
 **The reserve grows with the metadata database.** The reserve in force is the configured (or sized) one or twice the database's size on disk (main file plus write-ahead log), whichever is larger: room for the WAL to grow to the database's size before a checkpoint and for the database itself to keep growing, measured on every maintenance pass. `GET /admin/storage` and `admin objects status` report it.
 
-Retention defaults (14 days of logs, 90 of artifacts) are policy, not hardware: they follow the plan's proposal for logs and cap the pipeline's own 7-day artifact default at a quarter year.
+Retention defaults (14 days of logs, 90 of artifacts) are policy, not hardware; 90 days caps what a pipeline's `retain` may ask for.
 
 ## Container images
 
-A worker's images live in its shared rootless store and one private store per tenant ([executor](executor.md)). Nothing removed them before R01. Now, at most once a minute after an attempt, each store over `image_budget_bytes` gives up images least recently pulled first:
+A worker's images live in its shared rootless store and one private store per tenant ([executor](executor.md)). At most once a minute after an attempt, each store over `image_budget_bytes` gives up images least recently pulled first:
 
 - only images no container uses (`podman images` reports the count; removal is never forced, so podman itself refuses one in use — `tests/podman.rs::an_image_a_container_holds_is_never_reclaimed` proves it against the real runtime);
 - never a digest pulled for use in the last ten minutes (an attempt pulls, then creates its container) or one being pulled;
