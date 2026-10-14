@@ -2140,6 +2140,8 @@ mod worker_role {
         let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
             return 0;
         };
+        // SAFETY: `statvfs` is a plain C struct of integers, for which the
+        // all-zero bit pattern is valid.
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         // SAFETY: `cpath` is a valid NUL-terminated path and `stat` is a
         // writable, properly aligned statvfs.

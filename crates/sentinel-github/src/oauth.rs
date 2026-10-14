@@ -226,8 +226,9 @@ impl fmt::Debug for LoginToken {
 impl Drop for LoginToken {
     fn drop(&mut self) {
         // Best effort: the allocation is overwritten before it is released.
+        // SAFETY: the bytes are only overwritten with ASCII spaces, which are
+        // valid UTF-8, so the string stays well-formed.
         let bytes = unsafe { self.0.as_bytes_mut() };
-        // SAFETY: ASCII spaces are valid UTF-8, so the string stays well-formed.
         bytes.fill(b' ');
         std::hint::black_box(bytes);
     }

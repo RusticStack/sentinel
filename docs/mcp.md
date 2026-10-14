@@ -3,7 +3,7 @@
 `sentinel mcp` runs the MCP stdio transport as a child process. It implements
 the `2025-11-25` protocol revision using newline-delimited UTF-8 JSON-RPC on
 stdin and stdout. Diagnostics go to stderr; stdout contains only MCP messages.
-The selected revision follows the project's [MCP authorization contract](auth-and-secrets.md#3-remote-mcp)
+The selected revision follows the project's [MCP authorization contract](auth-and-secrets.md#3-remote-mcp-oauth)
 and the official [lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle),
 [tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools),
 [resources](https://modelcontextprotocol.io/specification/2025-11-25/server/resources),

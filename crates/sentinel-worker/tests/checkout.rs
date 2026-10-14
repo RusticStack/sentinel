@@ -316,6 +316,7 @@ fn ssh_deploy_keys_use_pinned_host_trust_and_leave_no_private_files() {
     keygen(&deploy_key);
     // sshd refuses to run as a non-root user; the controller host is expected
     // to run the worker as a dedicated account in production.
+    // SAFETY: `geteuid` takes no arguments, has no preconditions and cannot fail.
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("SSH checkout verification requires root to run the sshd fixture");
         let _ = fs::remove_dir_all(&root);

@@ -483,7 +483,8 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
     assert_eq!(remaining[0]["run"], run);
 }
 
-/// A test-only RSA key; it authenticates nothing.
+/// A test-only RSA key, generated for this suite (the same one the checks
+/// suites use); it authenticates nothing.
 const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
 MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCn0jnG5Bokc3Af
 NRpzCYPskbFJvhtol1PCsuD1plfDG/Zl2UPU8U9Wv1d+kggr9b+yphtg4u2R1IXL
