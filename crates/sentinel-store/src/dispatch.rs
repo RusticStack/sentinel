@@ -1884,13 +1884,11 @@ pub fn renew(
 /// silently.
 fn due_coverage(
     tx: &Transaction<'_>,
-    tenant: TenantId,
-    run: RunId,
+    spec: &sentinel_pipeline::RunSpec,
     spec_index: u32,
     attempt: AttemptId,
     passed: bool,
 ) -> Result<(Vec<sentinel_pipeline::schema::Artifact>, bool)> {
-    let spec = runs::get_run_spec(tx, tenant, run)?;
     let job = spec
         .pipeline
         .jobs
@@ -1972,9 +1970,14 @@ pub fn finish(
     );
     let mut missing = Vec::new();
     let mut event = event;
+    // The run spec is decoded at most once per finish: coverage reads it
+    // here and dependents are decided from the same copy below.
+    let mut spec = None;
     if finishing {
+        let decoded = runs::get_run_spec(tx, tenant, run)?;
         let lost;
-        (missing, lost) = due_coverage(tx, tenant, run, index, attempt, event == Event::Passed)?;
+        (missing, lost) = due_coverage(tx, &decoded, index, attempt, event == Event::Passed)?;
+        spec = Some(decoded);
         if event == Event::Passed && lost {
             event = Event::Failed(FailureClass::Publication);
         }
@@ -2019,7 +2022,7 @@ pub fn finish(
             now,
         )?;
     }
-    release_dependents(tx, tenant, run, now)?;
+    release_dependents_with(tx, tenant, run, now, &mut spec)?;
     Ok(next)
 }
 
@@ -2785,12 +2788,28 @@ pub fn release_dependents(
     run: RunId,
     now: UnixMillis,
 ) -> Result<usize> {
+    release_dependents_with(tx, tenant, run, now, &mut None)
+}
+
+/// [`release_dependents`] for a caller that may already hold the run's
+/// decoded spec: `cached` is used when present and filled when this has to
+/// read it, so one transaction never decodes the same spec twice.
+fn release_dependents_with(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    run: RunId,
+    now: UnixMillis,
+    cached: &mut Option<sentinel_pipeline::RunSpec>,
+) -> Result<usize> {
     let mut states = runs::run_jobs(tx, tenant, run)?;
     if !states.iter().any(|(_, s)| *s == JobState::Blocked) {
         return Ok(0);
     }
-    let spec = runs::get_run_spec(tx, tenant, run)?;
-    let mut by_failure = failure_skips(&states, &spec)?;
+    if cached.is_none() {
+        *cached = Some(runs::get_run_spec(tx, tenant, run)?);
+    }
+    let spec = cached.as_ref().ok_or(Error::Corrupt("run_specs.spec"))?;
+    let mut by_failure = failure_skips(&states, spec)?;
     let mut facts: Option<RunFacts> = None;
     let mut released = 0;
     // Dependencies precede their dependents, and each decision is written
