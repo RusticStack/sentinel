@@ -1,8 +1,3 @@
-//! Frozen benchmark contracts (`sentinel.bench-contract/1`): what a
-//! representative check is, on which host, with which sources, images,
-//! tools, allocation and cold/warm/small-edit procedure. The runner measures
-//! a contract lane only when the host and inputs match the contract, and
-//! every record names the contract revision and digest it was taken under.
 use std::{collections::BTreeMap, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
@@ -71,7 +66,6 @@ pub struct Lane {
     pub run: String,
 }
 
-/// What a record says about the contract it was taken under.
 #[derive(Serialize)]
 pub struct Stamp {
     pub id: String,
@@ -129,8 +123,7 @@ impl Contract {
             .ok_or_else(|| format!("no condition `{id}` in contract {}", self.id))
     }
 
-    /// Replace `{root}` and `{commit:<source>}`. `{sample_nonce}` stays for
-    /// the runner to fill in before each run.
+    /// Replace `{root}` and `{commit:<source>}`; the runner fills `{sample_nonce}` in per sample.
     pub fn expand(&self, text: &str, root: &str) -> String {
         let mut out = text.replace("{root}", root);
         for source in &self.sources {
@@ -139,7 +132,6 @@ impl Contract {
         out
     }
 
-    /// The contract environment plus the lane's, expanded.
     pub fn env(&self, lane: &Lane, root: &str) -> BTreeMap<String, String> {
         let mut env: BTreeMap<String, String> = self
             .environment
@@ -153,8 +145,6 @@ impl Contract {
     }
 }
 
-/// Everything that differs from the contract, in words; empty means the
-/// host and inputs match and measuring may start.
 pub fn drift(
     contract: &Contract,
     host: &crate::Host,
@@ -226,13 +216,10 @@ pub fn drift(
     out
 }
 
-/// `some avg60` of `/proc/pressure/cpu`, in percent.
 pub fn cpu_pressure() -> Option<f64> {
     cpu_pressure_field("avg60=")
 }
 
-/// One average of the `some` line of `/proc/pressure/cpu` (`avg10=`,
-/// `avg60=`), in percent.
 pub fn cpu_pressure_field(key: &str) -> Option<f64> {
     let text = fs::read_to_string("/proc/pressure/cpu").ok()?;
     let some = text.lines().find(|l| l.starts_with("some"))?;
@@ -242,12 +229,10 @@ pub fn cpu_pressure_field(key: &str) -> Option<f64> {
         .ok()
 }
 
-/// A Podman memory size (`26g`, `512m`) as systemd reads it (`26G`, `512M`).
 pub fn systemd_memory(memory: &str) -> String {
     memory.to_ascii_uppercase()
 }
 
-/// `--cpus 10` as a systemd `CPUQuota` (`1000%`).
 pub fn cpu_quota(cpus: &str) -> Result<String, String> {
     let n: f64 = cpus
         .parse()
