@@ -1,4 +1,4 @@
-//! Consistent online backup, verification and restore (R04).
+//! Consistent online backup, verification and restore.
 //!
 //! A backup directory holds any number of backups sharing one copy of every
 //! immutable file:
@@ -27,7 +27,7 @@
 //! records which key ids the sealed values need; a restore refuses to
 //! finish without a key that opens them.
 //!
-//! Evicted objects (R02) live only in the external S3 copy; the backup
+//! Evicted objects live only in the external S3 copy; the backup
 //! records them as `remote`, and a restored controller with the same `[s3]`
 //! section fetches them back on read.
 
@@ -156,7 +156,7 @@ const LOCK: &str = ".lock";
 /// Take the exclusive writer lock on `target`, waiting for another process's
 /// create or prune to finish. The lock is held until the returned file is
 /// dropped. A file system without advisory locks (`Unsupported`) runs
-/// unlocked, as before: the host's own coordination is then all there is.
+/// unlocked: the host's own coordination is then all there is.
 fn lock_target(target: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .create(true)
@@ -316,7 +316,7 @@ pub struct Report {
     /// Objects whose local bytes did not match their digest: not stored.
     pub objects_corrupt: Vec<String>,
     /// Objects the database names but the data directory no longer holds:
-    /// not stored. The backup carries on without them (R07).
+    /// not stored. The backup carries on without them.
     pub objects_missing: Vec<String>,
     /// Staging directories an interrupted backup left, removed first.
     pub partials_removed: u64,
@@ -756,7 +756,7 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
         out.manifests += 1;
     }
     // Logs of attempts the snapshot keeps; a log directory's name is its
-    // attempt id (`logs/<run>/<job>/<attempt>/`), a pre-D04 flat log's is
+    // attempt id (`logs/<run>/<job>/<attempt>/`), an older flat log's is
     // `<attempt>.log`.
     let kept = kept_logs(&snapshot)?;
     drop(snapshot);
@@ -920,7 +920,7 @@ pub fn prune(target: &Path, keep: usize) -> Result<Pruned> {
     Ok(out)
 }
 
-/// What the API sees of the backup scheduler (R04).
+/// What the API sees of the backup scheduler.
 pub trait Control: Send + Sync {
     /// Start a backup now unless one is running; `false` when one is.
     fn trigger(&self) -> bool;

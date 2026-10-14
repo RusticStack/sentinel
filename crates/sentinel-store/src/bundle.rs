@@ -1,4 +1,4 @@
-//! The sanitized diagnostic bundle (R06): what a support request needs about
+//! The sanitized diagnostic bundle: what a support request needs about
 //! a deployment and nothing it must not carry.
 //!
 //! In it: versions and schema, SQLite's quick check, row counts by state,
