@@ -1,9 +1,3 @@
-//! The `cache/<scope>/<entry>/` half of the worker-local layout
-//! (docs/cache.md). Rendering is pure and total: a `Scope` can only be
-//! built from components that already pass validation, so a rendered path
-//! is always six single safe directory names — never a traversal, never a
-//! separator, never an empty segment.
-
 use std::path::{Path, PathBuf};
 
 use sentinel_core::{RepoId, TenantId};
@@ -14,8 +8,6 @@ use sentinel_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-/// The kernel half of the `os-arch` platform component. A second OS would
-/// render a different component, so it can never reuse a scope directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
@@ -31,7 +23,6 @@ impl Os {
     }
 }
 
-/// The `os-arch` scope component.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Platform {
     pub os: Os,
@@ -39,7 +30,6 @@ pub struct Platform {
 }
 
 impl Platform {
-    /// `linux-x86_64` — one directory name, always safe.
     pub fn component(self) -> String {
         let mut s = String::with_capacity(12);
         s.push_str(self.os.as_str());
@@ -49,11 +39,8 @@ impl Platform {
     }
 }
 
-/// Why a scope cannot be built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScopeError {
-    /// The cache name is not `valid_id`-shaped — the same rule the schema
-    /// enforces, so a compiled pipeline can never produce this.
     BadName,
 }
 
@@ -66,11 +53,7 @@ impl std::fmt::Display for ScopeError {
 }
 impl std::error::Error for ScopeError {}
 
-/// Every dimension that decides where an entry lives. The path leads with
-/// the repository — repo IDs are globally unique, so two tenants can never
-/// produce the same scope directory — and the manifest still records the
-/// tenant, so a directory moved under another tenant's tree can never
-/// serve.
+/// The tenant stays out of the path: the manifest records it, so a moved directory cannot serve another tenant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Scope {
     pub tenant: TenantId,
@@ -78,17 +61,11 @@ pub struct Scope {
     pub class: Class,
     pub trust: Trust,
     pub platform: Platform,
-    /// BLAKE3 digest of the toolchain descriptor (image digest, tool
-    /// versions — whatever pins "the toolchain"). The path shows the
-    /// first 8 bytes as 16 lowercase hex characters.
     pub toolchain: [u8; 32],
-    /// The pipeline's cache name.
     pub name: String,
 }
 
 impl Scope {
-    /// The name is re-checked against the schema's `valid_id` rule, not
-    /// trusted.
     pub fn new(
         tenant: TenantId,
         repo: RepoId,
@@ -112,13 +89,10 @@ impl Scope {
         })
     }
 
-    /// BLAKE3 of a toolchain descriptor, as `Scope::toolchain` wants it.
     pub fn toolchain_digest(descriptor: &[u8]) -> [u8; 32] {
         *blake3::hash(descriptor).as_bytes()
     }
 
-    /// The scope directory relative to the cache root:
-    /// `<repo>/<class>/<trust>/<os>-<arch>/<toolchain16>/<name>`.
     pub fn rel_path(&self) -> PathBuf {
         let mut p = PathBuf::from(self.repo.to_string());
         p.push(self.class.as_str());
@@ -129,19 +103,15 @@ impl Scope {
         p
     }
 
-    /// `<root>/<scope>`; the root is the worker's `data_dir/cache`.
     pub fn dir(&self, cache_root: &Path) -> PathBuf {
         cache_root.join(self.rel_path())
     }
 
-    /// `<root>/<scope>/<entry>` for a rendered key.
     pub fn entry_dir(&self, cache_root: &Path, key: &str) -> PathBuf {
         self.dir(cache_root).join(entry_name(key))
     }
 }
 
-/// The scope's toolchain component: the first 8 bytes of the descriptor
-/// digest as 16 lowercase hex characters.
 pub fn toolchain16(digest: &[u8; 32]) -> String {
     let mut s = String::with_capacity(16);
     for b in &digest[..8] {
@@ -151,10 +121,7 @@ pub fn toolchain16(digest: &[u8; 32]) -> String {
     s
 }
 
-/// The entry directory for a rendered key: a readable slug plus 8 bytes of
-/// the key's digest, so different keys can never share a directory — a
-/// slug collision (or, at 64 bits, an adversarial digest collision) only
-/// produces a `WrongKey` miss at manifest check time, never wrong content.
+/// The digest tail keeps distinct keys in distinct directories even when their slugs collide.
 pub fn entry_name(key: &str) -> String {
     let mut slug = String::with_capacity(48);
     for b in key.bytes() {
@@ -179,24 +146,14 @@ pub fn entry_name(key: &str) -> String {
     name
 }
 
-/// A generation directory: `gen-<unix_ms>-<rand>` — creation order in the
-/// name, an 8-hex random suffix so two generations sealed in the same
-/// millisecond never collide.
 pub fn gen_name(unix_ms: i64, rand: u32) -> String {
     format!("gen-{unix_ms}-{rand:08x}")
 }
 
-/// The manifest file inside a generation directory.
 pub const MANIFEST_NAME: &str = "manifest";
-/// The file listing inside a generation directory: the manifest carries only
-/// its count, bytes and digest so lookups never pay for it.
 pub const FILES_NAME: &str = "files";
-/// The entry's pointer to the live generation: a small file naming the
-/// `gen-*` directory, swapped atomically at publication.
 pub const CURRENT_NAME: &str = "current";
-/// Per-entry staging area for generations still being written.
 pub const WRITING_NAME: &str = "writing";
-/// Per-entry lease markers.
 pub const LEASE_NAME: &str = "lease";
 
 #[cfg(test)]
@@ -239,10 +196,7 @@ mod tests {
             f(&mut other);
             other.rel_path()
         };
-        // Repo IDs are globally unique and lead the path, so two tenants can
-        // never share a scope directory.
         assert_ne!(a.rel_path(), isolated(&|s| s.repo = RepoId::new()), "repo");
-        // The tenant is only recorded in the manifest boundary, not the path.
         assert_eq!(
             a.rel_path(),
             isolated(&|s| s.tenant = TenantId::new()),
@@ -350,7 +304,6 @@ mod tests {
             );
         }
         assert_eq!(entry_name("cargo-9f8e7d6c"), entry_name("cargo-9f8e7d6c"));
-        // Slug collisions are still distinct entries via the digest tail.
         assert_ne!(entry_name("a/b"), entry_name("a\\b"));
         let root = Path::new("/cache");
         let dir = s.entry_dir(root, "cargo-9f8e7d6c");
@@ -361,7 +314,6 @@ mod tests {
     fn generation_names_order_and_differ() {
         assert_eq!(gen_name(1_700_000_000_000, 1), "gen-1700000000000-00000001");
         assert_ne!(gen_name(1, 1), gen_name(1, 2));
-        // Equal-width millisecond stamps sort oldest-first in listings.
         assert!(gen_name(1_700_000_000_000, 9) < gen_name(1_700_000_000_001, 0));
     }
 }
