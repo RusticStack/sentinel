@@ -1,4 +1,4 @@
-//! O06 service-account grants: only an administrator of the principal's
+//! Service-account grants: only an administrator of the principal's
 //! tenant (or a platform administrator) issues them, within lifetime bounds,
 //! never with administrative scopes, confined to the tenant and its
 //! repositories; the refresh token is returned once and stored only as a

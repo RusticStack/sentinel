@@ -1,4 +1,4 @@
-//! A06 behavior: TOTP enrollment under a sealed seed, one-use recovery codes,
+//! TOTP enrollment under a sealed seed, one-use recovery codes,
 //! step-up gating privileged changes, and session administration that never
 //! exposes a credential.
 

@@ -1,4 +1,4 @@
-//! O02 token core: grants mint access/refresh pairs that authenticate into the
+//! Token core: grants mint access/refresh pairs that authenticate into the
 //! ordinary authorization layer; refresh rotation with lost-response recovery
 //! and replay revocation; holder revocation; cascading revocation; the
 //! database's own refusals; and bounded purging.
@@ -462,7 +462,7 @@ fn a_lost_response_recovers_once_and_the_abandoned_successor_is_a_replay() {
     // The response carrying `lost` never reached the client.
     let lost = refresh(&store, &first.refresh, None, at(1_000)).unwrap();
     // Recovery at the last instant of the grace window; everything after it
-    // happens later still, as a real client's clock would run (P09-18).
+    // happens later still, as a real client's clock would run.
     let t = 1_000 + ROTATION_GRACE_MS;
     let recovered = refresh(&store, &first.refresh, None, at(t)).unwrap();
     assert_eq!(recovered.grant, first.grant);

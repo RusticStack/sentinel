@@ -1,4 +1,4 @@
-//! O03 device authorization, durable half: pending requests with unique user
+//! Device authorization, durable half: pending requests with unique user
 //! codes, approval (with narrowing) or denial by an admitted account,
 //! one-time redemption, expiry, the pending cap, and admission re-checked
 //! at redemption.

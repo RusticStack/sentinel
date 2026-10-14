@@ -1,7 +1,6 @@
-//! Log search across every boundary a literal can straddle (O05
-//! follow-up): frames, a sealed segment, the byte-budget cut between two
-//! requests and an arbitrary `after`. Paged requests that pass the returned
-//! carry find exactly what one unbounded request finds — once each.
+//! Log search across every boundary a literal can straddle: frames, a sealed segment, the byte-budget cut between
+//! two requests and an arbitrary `after`. Paged requests that pass the returned carry find exactly what one
+//! unbounded request finds, once each.
 
 use sentinel_core::{AttemptId, JobId, RunId};
 use sentinel_protocol::logs::{FRAME_HEADER_BYTES, Frame, Stream};
@@ -169,7 +168,7 @@ fn a_literal_split_across_a_sealed_segment_is_found_once_single_or_paged() {
         .search(b"needle", last_of_seg0, SEARCH_SCAN_BYTES, Some(&carry))
         .unwrap();
     assert_eq!(summary(&second.matches), expected[..1]);
-    // Without the carry (an older client), the sealed segment is replayed
+    // Without the carry, the sealed segment is replayed
     // and the stdout split is still found.
     let legacy = log
         .search(b"needle", last_of_seg0, SEARCH_SCAN_BYTES, None)
