@@ -1,4 +1,4 @@
-//! O02 over real HTTP on loopback: authorization-server and protected-
+//! OAuth core over real HTTP on loopback: authorization-server and protected-
 //! resource metadata, OAuth access tokens on `/api/v1` with per-route
 //! scopes and `WWW-Authenticate` challenges, the `refresh_token` grant, RFC
 //! 7009 revocation, the RFC 6749 error shape, and unchanged sessions and
@@ -866,7 +866,7 @@ fn oauth_pages_carry_the_security_headers() {
     assert!(csp.contains("frame-ancestors 'none'") && !csp.contains("form-action"));
 }
 
-/// P09-2: one client flooding revocation (or device authorization) takes
+/// One client flooding revocation (or device authorization) takes
 /// its own budget, not everyone's; another client's refresh still goes
 /// through. Loopback is a proxy address, so `X-Forwarded-For` names the
 /// client here as a reverse proxy would.
@@ -919,7 +919,7 @@ fn a_flooding_client_cannot_stop_another_clients_refresh() {
     assert_eq!(device.status, 200, "{}", device.body);
 }
 
-/// P09-3: a store too busy to check a credential is `rate_limited`, never
+/// A store too busy to check a credential is `rate_limited`, never
 /// `401` — a `401` would make an OAuth client spend its refresh token.
 #[test]
 fn a_busy_store_is_rate_limited_not_unauthenticated() {
@@ -961,7 +961,7 @@ fn a_busy_store_is_rate_limited_not_unauthenticated() {
     assert_eq!(get(&d, "/api/v1/me", &auth).status, 200);
 }
 
-/// P09-4: with a path-carrying `public_url`, every URL handed out stays
+/// With a path-carrying `public_url`, every URL handed out stays
 /// inside the issuer, the RFC 8414 / 9728 well-known locations answer, and
 /// a proxy that forwards the prefix unstripped still reaches the routes.
 #[test]

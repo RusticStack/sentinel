@@ -4,7 +4,7 @@
 //! passed, a failed (with a gap in its log), a running and a blocked job,
 //! filterable push and pull-request runs, a run with a large log, a job the
 //! fleet cannot place, and a pending GitHub check. Shared by the web API
-//! tests and the real-browser test (U02–U06).
+//! tests and the real-browser test.
 
 #![allow(dead_code)]
 
