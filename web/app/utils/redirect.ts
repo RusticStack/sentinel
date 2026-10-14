@@ -21,6 +21,14 @@ export function sameOriginPath(value: unknown, fallback = "/"): string {
 export const RETURN_COOKIE = "sentinel-return";
 export const RETURN_SECONDS = 600;
 
+/// The page a pending return (the cookie's value) leads to, or `null` when
+/// there is none or it would be `/` itself under any query or fragment
+/// (following it would load the page that follows it again).
+export function pendingReturn(value: unknown): string | null {
+  const dest = sameOriginPath(value);
+  return new URL(dest, BASE).pathname === "/" ? null : dest;
+}
+
 /// The `document.cookie` assignment that records `path` (made same-origin
 /// first) as the pending return, or clears it when `path` is null.
 export function returnCookie(path: string | null, secure: boolean): string {

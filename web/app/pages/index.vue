@@ -7,10 +7,10 @@
 const session = useSession();
 const last = useCookie<string | null>("sentinel-tenant", { sameSite: "lax", maxAge: 60 * 60 * 24 * 365 });
 const back = useCookie<string | null>(RETURN_COOKIE, { sameSite: "lax", path: "/", maxAge: RETURN_SECONDS });
-const dest = sameOriginPath(back.value);
+const dest = pendingReturn(back.value);
 if (back.value != null) back.value = null;
 const target = session.tenants.value.find((t) => t.slug === last.value) ?? session.tenants.value[0];
-if (dest !== "/") await navigateTo(dest, { replace: true });
+if (dest) await navigateTo(dest, { replace: true });
 else if (target) await navigateTo(`/t/${target.slug}`, { replace: true });
 useHead({ title: "Sentinel" });
 </script>

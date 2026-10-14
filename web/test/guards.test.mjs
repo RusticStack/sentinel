@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { classifyProxyPath, clientAddress } from "../server/utils/guard.ts";
-import { RETURN_SECONDS, returnCookie, sameOriginPath } from "../app/utils/redirect.ts";
+import { pendingReturn, RETURN_SECONDS, returnCookie, sameOriginPath } from "../app/utils/redirect.ts";
 
 test("controller paths proxy and others pass", () => {
   assert.equal(classifyProxyPath("/api/v1/runs?x=1", "GET").kind, "proxy");
@@ -62,4 +62,13 @@ test("a pending return is a short-lived same-origin path cookie the server can r
   assert.match(returnCookie("/a;b=c d", false), /^sentinel-return=%2Fa%3Bb%3Dc%20d; /);
   // Clearing expires it at once.
   assert.match(returnCookie(null, false), /^sentinel-return=; Path=\/; Max-Age=0; /);
+});
+
+test("a pending return is followed only to a page other than `/`", () => {
+  assert.equal(pendingReturn("/invitations/accept"), "/invitations/accept");
+  assert.equal(pendingReturn("/t/acme/runs?a=1"), "/t/acme/runs?a=1");
+  // `/` under any query or fragment would load `/` again; another origin,
+  // garbage or nothing is no return at all.
+  for (const none of ["/", "/?x=1", "/#a", "//evil.com", "https://evil.com", "", null, undefined, true])
+    assert.equal(pendingReturn(none), null, String(none));
 });
