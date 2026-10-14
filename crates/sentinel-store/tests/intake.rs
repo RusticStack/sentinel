@@ -1,4 +1,4 @@
-//! G02/G03 store behavior: acceptance is deduplicated and bounded, hook
+//! Store behavior: acceptance is deduplicated and bounded, hook
 //! secrets are digest-only and rotatable, GitHub targets resolve only through
 //! a bound installation, resolution settles every case with an explicit reason
 //! under a bounded retry budget, and a ready delivery dispatches one immutable

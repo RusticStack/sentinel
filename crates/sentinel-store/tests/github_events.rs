@@ -1,4 +1,4 @@
-//! G05 store behavior: control-event receipts deduplicate and conflict on a
+//! Store behavior: control-event receipts deduplicate and conflict on a
 //! changed body, check rerequests resolve through durable publication
 //! identity and only requeue terminal, non-superseded runs, lifecycle events
 //! disable and revoke without waiting on the network, and the durable refresh

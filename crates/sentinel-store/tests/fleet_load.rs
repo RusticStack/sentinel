@@ -1,4 +1,4 @@
-//! Q09: store-level placement load — 100 worker identities and 10,000 queued
+//! Store-level placement load — 100 worker identities and 10,000 queued
 //! jobs, with capacity actually held.
 //!
 //! What it measures: the scheduler and the SQLite write path alone. No TLS
@@ -458,11 +458,9 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
     );
 }
 
-/// P08-8's measurement: `GET /queue`'s store work for a tenant with 5,000
-/// queued jobs and 20 connected 8-core workers, at the route's default and
-/// maximum page sizes. Before the fix the listing explained every waiting
-/// job before the route cut it (9.5 s here in the audit); now the page is
-/// cut in the query and only its jobs are explained.
+/// `GET /queue`'s store work for a tenant with 5,000 queued jobs and 20
+/// connected 8-core workers, at the route's default and maximum page sizes.
+/// The page is cut in the query and only its jobs are explained.
 #[test]
 #[ignore = "P08-8 listing cost: cargo test --release -p sentinel-store --test fleet_load -- --ignored --nocapture"]
 fn listing_a_five_thousand_job_queue_explains_only_the_page() {
