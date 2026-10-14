@@ -1,23 +1,11 @@
-//! The Checks API, as much of it as Sentinel needs: create one check run, update
-//! it, and find one we already created after an ambiguous timeout.
-//!
-//! Statuses and conclusions are GitHub's own text, validated here rather than
-//! by the database: a caller cannot publish an unknown conclusion. A refusal
-//! carries a short reason suitable for an operator; bodies are never echoed
-//! (they can quote the request).
-
 use serde_json::{Value, json};
 
 use crate::{Error, Result, http::Client};
 
-/// Longest check-run name GitHub accepts.
 pub const MAX_NAME: usize = 255;
-/// Longest output title we send.
 pub const MAX_TITLE: usize = 128;
-/// Longest output summary we send (GitHub allows 65,535; ours is one line).
 pub const MAX_SUMMARY: usize = 1024;
 
-/// `status` of a check run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Queued,
@@ -44,7 +32,6 @@ impl Status {
     }
 }
 
-/// `conclusion` of a completed check run, exactly GitHub's vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Conclusion {
     Success,
@@ -83,7 +70,6 @@ impl Conclusion {
     }
 }
 
-/// One check run to create or update.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Check {
     pub name: String,
@@ -94,37 +80,24 @@ pub struct Check {
     pub summary: String,
     pub external_id: String,
     pub details_url: Option<String>,
-    /// Used only when the status is `completed`.
     pub completed_at: Option<String>,
 }
 
-/// A check run GitHub accepted: the numeric id the update path needs, and
-/// the suite it landed in when the response carried one — that suite id is
-/// what a `check_suite` rerequest names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Published {
     pub check_run_id: i64,
     pub check_suite_id: Option<i64>,
 }
 
-/// The check suite of a check-run object, when present.
 fn suite_id(body: &Value) -> Option<i64> {
     body["check_suite"]["id"].as_i64().filter(|id| *id > 0)
 }
 
-/// Why a publication did not land. The caller decides what is retryable; this
-/// module never guesses on its behalf.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// The rate limit is spent; try again after this many milliseconds.
     RateLimited { retry_after_ms: i64 },
-    /// The token was refused (expired, or the installation lost the
-    /// permission). A fresh token may work; a fresh token that is refused
-    /// again will not.
     Unauthorized,
-    /// GitHub understood the request and said no: a bounded reason only.
     Refused { reason: String },
-    /// The request did not complete, or GitHub answered 5xx.
     Unavailable { reason: String },
 }
 
@@ -141,7 +114,6 @@ impl std::fmt::Display for Refusal {
     }
 }
 
-/// Bounds the payload before any request; a caller bug must not reach GitHub.
 fn validate(check: &Check) -> Result<()> {
     if !(1..=MAX_NAME).contains(&check.name.len())
         || check.title.is_empty()
@@ -194,7 +166,6 @@ fn valid_sha(sha: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Create one check run for `owner/name`.
 pub fn create(
     client: &Client,
     endpoint: &str,
@@ -234,7 +205,6 @@ pub fn create(
     }
 }
 
-/// Update the check run GitHub already knows.
 pub fn update(
     client: &Client,
     endpoint: &str,
@@ -270,35 +240,19 @@ pub fn update(
     }
 }
 
-/// What an adoption lookup is about: the commit, the check name and the
-/// `external_id` we set when we created it.
 pub struct Lookup<'a> {
     pub owner: &'a str,
     pub repo: &'a str,
     pub head_sha: &'a str,
     pub name: &'a str,
     pub external_id: &'a str,
-    /// The identity names exactly one create (it carries the generation), so
-    /// a match is ours whatever its status — including a run created already
-    /// `completed`. A legacy identity shared by every generation of a row
-    /// adopts only a live run.
     pub any_status: bool,
 }
 
-/// Runs per lookup page, pages per lookup, and the byte ceiling of one page.
-/// A check run object with its app and output is a few KiB; a page of 100 is
-/// comfortably inside 1 MiB, and ten pages cover a thousand reruns of one
-/// check on one commit.
 const FIND_PER_PAGE: usize = 100;
 const FIND_MAX_PAGES: usize = 10;
 const FIND_MAX_BODY: u64 = 1024 * 1024;
 
-/// Find a check run we already created for this commit and name, by the
-/// `external_id` we set. This is how an ambiguous create is reconciled: the
-/// request timed out, GitHub may or may not have made the run, so the retry
-/// looks before it writes. The listing is paged and every page is bounded,
-/// so a commit with many reruns neither overflows one answer nor hides the
-/// run we are looking for past the first page.
 pub fn find(
     client: &Client,
     endpoint: &str,
@@ -344,11 +298,8 @@ pub fn find(
     Ok(None)
 }
 
-/// Pick the adoptable run from a lookup list. With a per-create identity
-/// the exact match is the run that create made, whatever its status. With a
-/// legacy identity a `completed` match may be an older generation's run —
-/// immutable on GitHub, where a PATCH reopening it is silently ignored — so
-/// only a live run is adopted.
+/// A legacy identity is shared by every generation, and GitHub silently ignores a PATCH
+/// that reopens an older completed run, so only a live match is adopted.
 fn select(list: &[Value], external_id: &str, any_status: bool) -> Option<Published> {
     list.iter()
         .find(|run| {
@@ -366,8 +317,6 @@ fn select(list: &[Value], external_id: &str, any_status: bool) -> Option<Publish
         })
 }
 
-/// An RFC3339 UTC timestamp for `completed_at`; empty when the clock is
-/// outside what `time` can represent, which the payload validator refuses.
 pub fn timestamp(now_ms: i64) -> String {
     time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(now_ms) * 1_000_000)
         .ok()
@@ -378,9 +327,6 @@ pub fn timestamp(now_ms: i64) -> String {
         .unwrap_or_default()
 }
 
-/// The `owner/name` a GitHub HTTPS clone URL names, if it is one. The binding
-/// verified this URL against the repository's own `clone_url`, so the path is
-/// the repository's canonical name rather than a guess from user input.
 pub fn repository_path(remote: &str) -> Option<(String, String)> {
     let rest = remote.strip_prefix("https://github.com/")?;
     let rest = rest.strip_suffix(".git").unwrap_or(rest);
@@ -398,8 +344,6 @@ pub fn repository_path(remote: &str) -> Option<(String, String)> {
     (valid(owner) && valid(name)).then(|| (owner.to_owned(), name.to_owned()))
 }
 
-/// GitHub's rate-limit refusals are the one case a caller must schedule
-/// rather than refuse: prefer `Retry-After`, else the reset epoch.
 fn github_refusal(reply: &crate::http::Reply) -> Refusal {
     let now_ms = crate::now_ms();
     let retry_after_ms = reply
@@ -419,7 +363,6 @@ fn github_refusal(reply: &crate::http::Reply) -> Refusal {
     }
 }
 
-/// One bounded, control-free line from a GitHub error body.
 fn bounded_message(body: &Value) -> String {
     let text = body["message"].as_str().unwrap_or("invalid request");
     let bounded = text
@@ -429,8 +372,7 @@ fn bounded_message(body: &Value) -> String {
         .collect::<String>()
         .trim()
         .to_owned();
-    // An empty or control-only message must still leave a reason the store
-    // accepts (its column requires at least one character).
+    // The store's reason column rejects an empty string.
     if bounded.is_empty() {
         "invalid request".to_owned()
     } else {
@@ -438,8 +380,6 @@ fn bounded_message(body: &Value) -> String {
     }
 }
 
-/// Minimal percent-encoding for a query value: names may contain spaces and
-/// slashes from the job name charset.
 fn percent_encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
@@ -532,9 +472,6 @@ mod tests {
 
     #[test]
     fn a_legacy_identity_adopts_only_a_live_run() {
-        // A bare row identity is shared by every generation: a completed
-        // match may be an older generation's immutable run, so adoption
-        // passes it by.
         let ext = "sentinel:run_1:aggregate";
         let list = serde_json::json!([
             {"id": 7, "external_id": ext, "status": "completed",
@@ -555,8 +492,6 @@ mod tests {
 
     #[test]
     fn a_per_create_identity_adopts_its_run_whatever_its_status() {
-        // The create for generation 3 carried `…:3`: a completed run with
-        // exactly that identity is the one that create made.
         let ext = "sentinel:run_1:aggregate:3";
         let list = serde_json::json!([
             {"id": 6, "external_id": "sentinel:run_1:aggregate:1", "status": "completed"},

@@ -1,21 +1,4 @@
-//! A GitHub-shaped OAuth server on loopback, for tests only (feature `fake`).
-//!
-//! It answers the three endpoints the sign-in flow touches, the way github.com
-//! does, and keeps what a test needs to check the flow end to end:
-//!
-//! - `GET /login/oauth/authorize` plays the browser's GitHub session: with an
-//!   account signed in ([`FakeGithub::sign_in_as`]) it mints a single-use code
-//!   bound to the `redirect_uri` it was given and answers `302` back to it with
-//!   `code` and `state`; without one it answers `302` with
-//!   `error=access_denied`.
-//! - `POST /login/oauth/access_token` spends a code once, only with the right
-//!   client secret and the same `redirect_uri`, and returns a bearer token.
-//! - `GET /user` answers the token's account: numeric `id`, `login`, `name`
-//!   and an `email`, which a correct client must ignore.
-//!
-//! Every request line and body it receives is kept ([`FakeGithub::received`])
-//! so a test can check what reached "GitHub". Connections are served one at
-//! a time on one thread; dropping the fake stops it.
+//! `/user` returns an email so a test can check that a client ignores it: emails are not identities.
 
 use std::{
     collections::HashMap,
@@ -30,7 +13,6 @@ use std::{
 
 use crate::oauth::{Endpoints, decode};
 
-/// One GitHub account as `/user` describes it.
 #[derive(Clone, Debug)]
 pub struct Account {
     pub id: u64,
@@ -40,11 +22,8 @@ pub struct Account {
 
 #[derive(Default)]
 struct Inner {
-    /// Who the browser is signed in to GitHub as.
     browser: Option<Account>,
-    /// Unspent code -> (account, redirect URI it was issued for).
     codes: HashMap<String, (Account, String)>,
-    /// Issued token -> account.
     tokens: HashMap<String, Account>,
     received: Vec<String>,
 }
@@ -58,7 +37,6 @@ pub struct FakeGithub {
 }
 
 impl FakeGithub {
-    /// Start a fake that accepts `client_secret` at its token endpoint.
     pub fn start(client_secret: &str) -> FakeGithub {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local address").port();
@@ -88,7 +66,6 @@ impl FakeGithub {
         }
     }
 
-    /// `http://127.0.0.1:PORT`, the fake's base URL.
     pub fn base(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
@@ -97,18 +74,14 @@ impl FakeGithub {
         Endpoints::loopback(self.port)
     }
 
-    /// The client secret this fake accepts.
     pub fn client_secret(&self) -> &str {
         &self.secret
     }
 
-    /// Sign the "browser" in to GitHub as `account`; `None` signs it out.
     pub fn sign_in_as(&self, account: Option<Account>) {
         self.lock().browser = account;
     }
 
-    /// Mint a code for `account` directly, as if the browser had approved,
-    /// bound to `redirect_uri`.
     pub fn code_for(&self, account: Account, redirect_uri: &str) -> String {
         let code = format!("ghcode{:016x}", rand_u64());
         self.lock()
@@ -117,12 +90,10 @@ impl FakeGithub {
         code
     }
 
-    /// Every request received so far: request line, headers and body.
     pub fn received(&self) -> Vec<String> {
         self.lock().received.clone()
     }
 
-    /// Tokens this fake has issued, so a test can prove none leaked.
     pub fn issued_tokens(&self) -> Vec<String> {
         self.lock().tokens.keys().cloned().collect()
     }

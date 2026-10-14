@@ -1,11 +1,3 @@
-//! The whole GitHub sign-in path in one place: a browser is sent to GitHub, comes back
-//! with a code and a state, the code is exchanged for a verified account ID,
-//! and that ID decides whether a Sentinel session exists.
-//!
-//! `sentinel-github` cannot depend on `sentinel-store` (it is the provider
-//! adapter, not the identity store), so this test lives here and drives both
-//! crates the way the web route does.
-
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
@@ -29,7 +21,6 @@ fn at(ms: i64) -> UnixMillis {
     UnixMillis(ms)
 }
 
-/// A GitHub-shaped server answering the token and user endpoints once each.
 fn stub_github(account_id: u64) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -88,7 +79,6 @@ fn fixture(account_id: u64) -> Fixture {
     }
 }
 
-/// Everything a callback handler does, in order.
 fn callback(
     f: &Fixture,
     query: &str,
@@ -96,7 +86,6 @@ fn callback(
     now: UnixMillis,
 ) -> Result<Outcome, String> {
     let callback = oauth::callback(query).map_err(|e| e.to_string())?;
-    // The browser's half of the state, and the parameter, must agree.
     let presented = cookie::read(cookie::SIGN_IN_COOKIE, cookie_header)
         .ok_or_else(|| "no sign-in cookie".to_owned())?;
     let mut expected = String::new();
@@ -124,7 +113,6 @@ fn callback(
 #[test]
 fn a_linked_github_account_signs_in_end_to_end() {
     let f = fixture(4242);
-    // An operator admitted locally links their GitHub account while signed in.
     let user =
         local_auth::bootstrap(&f.store, "root", "Root", b"an operator password", at(0)).unwrap();
     let issued = f
@@ -150,7 +138,6 @@ fn a_linked_github_account_signs_in_end_to_end() {
     )
     .unwrap();
 
-    // Sign-in begins: state is minted, stored as a digest and set as a cookie.
     let state = sign_in::begin(&f.store, PROVIDER, Some("/runs"), at(10), 60_000).unwrap();
     let mut state_text = String::new();
     state.expose(&mut state_text);
@@ -188,8 +175,6 @@ fn a_callback_without_the_browsers_own_state_is_refused() {
     let mut state_text = String::new();
     state.expose(&mut state_text);
 
-    // A stolen or guessed `state` parameter with no matching cookie: the
-    // attacker's callback never reaches the exchange.
     let failure = callback(
         &f,
         &format!("code=the-code&state={state_text}"),
@@ -199,7 +184,6 @@ fn a_callback_without_the_browsers_own_state_is_refused() {
     .unwrap_err();
     assert_eq!(failure, "no sign-in cookie");
 
-    // A cookie that disagrees with the parameter is equally useless.
     let other = Secret::generate();
     let mut other_text = String::new();
     other.expose(&mut other_text);
@@ -212,7 +196,6 @@ fn a_callback_without_the_browsers_own_state_is_refused() {
     .unwrap_err();
     assert_eq!(failure, "state mismatch");
 
-    // The attempt is still pending: nothing was spent by the failed attempts.
     assert!(sign_in::consume(&f.store, PROVIDER, &state, at(30)).is_ok());
 }
 
