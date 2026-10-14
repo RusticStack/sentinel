@@ -1,5 +1,4 @@
-//! A job is admitted to execution only once
-//! its image digest and platform are durably resolved, written once.
+//! Admission waits for a durable, write-once image resolution.
 
 use sentinel_core::{Actor, Event, RepoId, RunId, TenantId, UnixMillis, WorkerId};
 use sentinel_pipeline::{
@@ -74,7 +73,6 @@ fn a_tag_only_image_is_not_executable_until_resolved_and_resolution_is_written_o
         f.store.read(|c| runs::resolved_image(c, f.tenant, f.job)),
         Err(Error::Unresolved)
     ));
-    // Ready, yet not admissible: the spec's existence is not readiness.
     assert!(matches!(try_lease(&f), Err(Error::Unresolved)));
     assert_eq!(
         f.store
@@ -115,7 +113,6 @@ fn a_tag_only_image_is_not_executable_until_resolved_and_resolution_is_written_o
     );
     try_lease(&f).unwrap();
 
-    // Once written, neither the API nor raw SQL can move it.
     let refused = f
         .store
         .writer()
@@ -184,7 +181,6 @@ fn a_digest_pinned_spec_prefills_the_digest_but_still_needs_a_platform() {
     let f = fixture(&format!("ghcr.io/o/i:v1@{DIGEST}"));
     assert!(matches!(try_lease(&f), Err(Error::Unresolved)));
     let (tenant, job) = (f.tenant, f.job);
-    // Resolution must agree with the pin.
     let refused = f
         .store
         .writer()

@@ -1,8 +1,3 @@
-//! Store behavior: control-event receipts deduplicate and conflict on a
-//! changed body, check rerequests resolve through durable publication
-//! identity and only requeue terminal, non-superseded runs, lifecycle events
-//! disable and revoke without waiting on the network, and the durable refresh
-//! queue fences stale settlements.
 use rusqlite::Connection;
 use sentinel_auth::sealed::Key;
 use sentinel_core::{
@@ -121,7 +116,6 @@ fn spec() -> RunSpec {
     .unwrap()
 }
 
-/// An event-driven run, recorded at `at` so provenance can supersede it.
 fn create_run(f: &mut Fixture, at: UnixMillis) -> (RunId, Vec<JobId>) {
     let (tenant, repo) = (f.tenant, f.repo);
     let run = RunId::new();
@@ -156,7 +150,6 @@ fn create_run(f: &mut Fixture, at: UnixMillis) -> (RunId, Vec<JobId>) {
     (run, jobs)
 }
 
-/// Drive every job to a terminal state the cheap way.
 fn finish(f: &mut Fixture, jobs: &[JobId]) {
     for job in jobs {
         let tx = f.conn.transaction().unwrap();
@@ -173,7 +166,6 @@ fn finish(f: &mut Fixture, jobs: &[JobId]) {
     }
 }
 
-/// The jobs' states in the caller's order.
 fn states(f: &Fixture, run: RunId, jobs: &[JobId]) -> Vec<JobState> {
     let all = runs::run_jobs(&f.conn, f.tenant, run).unwrap();
     jobs.iter()
@@ -231,11 +223,8 @@ fn a_receipt_replays_identically_and_a_changed_body_conflicts() {
     let (outcome, duplicate) = accept(&mut f, "d-1", 7, &event);
     assert_eq!(outcome, "installation_disabled");
     assert!(!duplicate);
-    // The same delivery and digest replays the recorded outcome.
     let replay = accept(&mut f, "d-1", 7, &event);
     assert_eq!(replay, (outcome, true));
-    // The same delivery under a different body is a conflict, not a second
-    // effect.
     let tx = f.conn.transaction().unwrap();
     assert!(matches!(
         github_events::accept(&tx, "d-1", &[9; 32], &event, NOW),
@@ -249,9 +238,6 @@ fn a_check_run_rerequest_requeues_the_terminal_run() {
     let mut f = fixture();
     let (run, jobs) = create_run(&mut f, NOW);
     finish(&mut f, &jobs);
-    // The publication must name the check run the rerequest points at: both
-    // the numeric handle and the external id, so a foreign id cannot aim the
-    // rerun at an unrelated run.
     let publication = checks::of_run(&f.conn, f.tenant, run)
         .unwrap()
         .into_iter()
@@ -274,8 +260,6 @@ fn a_check_run_rerequest_requeues_the_terminal_run() {
     );
     assert_eq!(outcome, "rerequested");
     assert!(!duplicate);
-    // The DAG reset is exact: the root job queues, its dependent blocks, and
-    // fresh check desired state is recorded for the lane.
     let states = states(&f, run, &jobs);
     assert_eq!(states, vec![JobState::Queued, JobState::Blocked]);
     let after = checks::of_run(&f.conn, f.tenant, run).unwrap();
@@ -285,14 +269,11 @@ fn a_check_run_rerequest_requeues_the_terminal_run() {
             .all(|row| row.seq > 1 && row.published_seq < row.seq),
         "{after:?}"
     );
-    // The completed check runs are immutable on the forge: the rerun's new
-    // generations carry no handle, so the publisher creates fresh runs.
+    // Completed check runs are immutable on GitHub: a rerun creates fresh runs without a handle.
     assert!(
         after.iter().all(|row| row.check_run_id.is_none()),
         "{after:?}"
     );
-    // A replayed delivery does not requeue a second time inside the same
-    // generation; the receipt answers what the first attempt did.
     let replay = accept(
         &mut f,
         "d-rerequest",
@@ -306,9 +287,6 @@ fn a_check_run_rerequest_requeues_the_terminal_run() {
         },
     );
     assert_eq!(replay, ("rerequested".to_owned(), true));
-    // A *new* rerequest of the old check run cannot aim the rerun again: the
-    // handle was cleared when the generation moved past `completed`, so the
-    // pair no longer resolves — and the run is active besides.
     let again = accept(
         &mut f,
         "d-rerequest-2",
@@ -324,8 +302,6 @@ fn a_check_run_rerequest_requeues_the_terminal_run() {
     assert_eq!(again.0, "unknown_check");
 }
 
-/// A check run created under its per-create identity (`…:<generation>`)
-/// is found by a rerequest naming that identity, as GitHub echoes it.
 #[test]
 fn a_rerequest_names_the_run_by_its_create_identity() {
     let mut f = fixture();
@@ -341,7 +317,6 @@ fn a_rerequest_names_the_run_by_its_create_identity() {
     checks::published(&tx, publication.id, publication.seq, 4242, Some(9001), NOW).unwrap();
     tx.commit().unwrap();
     let identity = checks::create_identity(&publication.external_id, publication.seq);
-    // A foreign suffix is not ours.
     let (outcome, _) = accept(
         &mut f,
         "d-foreign",
@@ -370,8 +345,6 @@ fn a_rerequest_names_the_run_by_its_create_identity() {
     assert_eq!(outcome, "rerequested");
 }
 
-/// Receipts are retired by age in bounded batches, never inside the replay
-/// window whatever retention was asked for.
 #[test]
 fn receipts_are_purged_by_age_but_never_inside_the_replay_window() {
     let mut f = fixture();
@@ -387,7 +360,6 @@ fn receipts_are_purged_by_age_but_never_inside_the_replay_window() {
             .query_row("SELECT count(*) FROM github_events", [], |r| r.get(0))
             .unwrap()
     };
-    // Everything is older than `before`, but still inside the window.
     let tx = f.conn.transaction().unwrap();
     let inside = UnixMillis(NOW.0 + 1_000);
     assert_eq!(
@@ -396,7 +368,6 @@ fn receipts_are_purged_by_age_but_never_inside_the_replay_window() {
     );
     tx.commit().unwrap();
     assert_eq!(receipts(&f), 3);
-    // Past the window: bounded by the batch limit, oldest first.
     let later = UnixMillis(NOW.0 + github_events::MIN_RECEIPT_RETENTION_MS + 1);
     let tx = f.conn.transaction().unwrap();
     assert_eq!(
@@ -414,7 +385,6 @@ fn receipts_are_purged_by_age_but_never_inside_the_replay_window() {
 #[test]
 fn a_check_suite_rerequest_resolves_by_suite_including_legacy_rows() {
     let mut f = fixture();
-    // One publication knows its suite; a legacy row does not. Both resolve.
     let (run, jobs) = create_run(&mut f, NOW);
     finish(&mut f, &jobs);
     let rows = checks::of_run(&f.conn, f.tenant, run).unwrap();
@@ -447,8 +417,6 @@ fn a_rerequest_never_touches_a_superseded_run() {
     let (old, old_jobs) = create_run(&mut f, NOW);
     let (_new, _new_jobs) = create_run(&mut f, UnixMillis(NOW.0 + 1));
     finish(&mut f, &old_jobs);
-    // The suite id matches every publication of both runs through legacy
-    // NULL rows; only the newest provenance may run again.
     let (outcome, _) = accept(
         &mut f,
         "d-stale",
@@ -474,7 +442,6 @@ fn a_rerequest_never_touches_a_superseded_run() {
 #[test]
 fn a_rerequest_refuses_unbound_and_revoked_targets() {
     let mut f = fixture();
-    // An installation this deployment does not know.
     let (outcome, _) = accept(
         &mut f,
         "d-unknown-installation",
@@ -488,7 +455,6 @@ fn a_rerequest_refuses_unbound_and_revoked_targets() {
         },
     );
     assert_eq!(outcome, "unbound_installation");
-    // A repository the installation does not grant here.
     let (outcome, _) = accept(
         &mut f,
         "d-unknown-repo",
@@ -502,7 +468,6 @@ fn a_rerequest_refuses_unbound_and_revoked_targets() {
         },
     );
     assert_eq!(outcome, "unbound_repository");
-    // A bound but revoked source: no rerun, no check writes.
     let (run, jobs) = create_run(&mut f, NOW);
     finish(&mut f, &jobs);
     let tx = f.conn.transaction().unwrap();
@@ -528,8 +493,6 @@ fn a_rerequest_refuses_unbound_and_revoked_targets() {
             suite: 1,
         },
     );
-    // A revoked binding resolves like an unbound one: `github_target` only
-    // ever sees active grants, and the second fence (`grant`) covers the race.
     assert_eq!(outcome, "unbound_repository");
     assert!(
         states(&f, run, &jobs)
@@ -552,13 +515,11 @@ fn installation_events_disable_issuance_and_schedule_a_refresh() {
     );
     assert_eq!(outcome, "installation_disabled");
     assert_eq!(installation_state(&f), (true, false));
-    // A durable refresh row exists for the reconcile lane.
     let work = github_events::due(&f.conn, NOW)
         .unwrap()
         .expect("a refresh");
     assert_eq!(work.kind, 0);
-    // A suspension lifted by a later event is not trusted on the webhook's
-    // word: issuance stays off until the authenticated refresh lands.
+    // A lifted suspension is untrusted until the authenticated refresh lands; a webhook alone cannot re-enable issuance.
     let (outcome, _) = accept(
         &mut f,
         "d-unsuspend",
@@ -570,7 +531,6 @@ fn installation_events_disable_issuance_and_schedule_a_refresh() {
     );
     assert_eq!(outcome, "refresh_pending");
     assert_eq!(installation_state(&f), (true, false));
-    // The refresh row was rescheduled: its sequence moved.
     let work = github_events::due(&f.conn, NOW)
         .unwrap()
         .expect("a refresh");
@@ -596,8 +556,6 @@ fn removed_repositories_revoke_bindings_and_clear_credentials() {
     assert!(revoked, "the binding is revoked");
     assert!(credential.is_empty(), "the sealed credential is destroyed");
     assert!(version > before.2, "the version moved");
-    // The reconcile lane owes both the installation pass and a re-verify of
-    // the surviving bindings.
     assert!(github_events::due(&f.conn, NOW).unwrap().is_some());
 }
 
@@ -606,7 +564,6 @@ fn a_repository_event_revokes_without_silently_following() {
     let mut f = fixture();
     for (delivery, outcome) in [
         ("d-renamed", "repository_rebind_required"),
-        // A second event for the same repository is still an acknowledgement.
         ("d-renamed-again", "repository_rebind_required"),
     ] {
         let (done, _) = accept(
@@ -630,7 +587,6 @@ fn refresh_rows_fence_stale_settlements_and_finish_gone_targets() {
     let tx = f.conn.transaction().unwrap();
     github_events::seed(&tx, NOW).unwrap();
     tx.commit().unwrap();
-    // Two rows: the installation pass and the repository pass.
     let first = github_events::due(&f.conn, NOW).unwrap().unwrap();
     let second = {
         let tx = f.conn.transaction().unwrap();
@@ -639,7 +595,6 @@ fn refresh_rows_fence_stale_settlements_and_finish_gone_targets() {
         github_events::due(&f.conn, NOW).unwrap().unwrap()
     };
     assert_ne!(first.id, second.id);
-    // A reschedule moves the sequence; the stale pass can no longer settle it.
     let tx = f.conn.transaction().unwrap();
     github_events::schedule(&tx, &second.id, second.kind, NOW).unwrap();
     tx.commit().unwrap();
@@ -649,10 +604,8 @@ fn refresh_rows_fence_stale_settlements_and_finish_gone_targets() {
     let tx = f.conn.transaction().unwrap();
     github_events::settled(&tx, &second, NOW, false).unwrap();
     tx.commit().unwrap();
-    // The row is still due: the stale settlement touched nothing.
     let still = github_events::due(&f.conn, NOW).unwrap().unwrap();
     assert_eq!(still.seq, fresh.seq);
-    // A finished row whose sequence moved is not deleted by the stale pass.
     let tx = f.conn.transaction().unwrap();
     github_events::finished(&tx, &second).unwrap();
     tx.commit().unwrap();
@@ -660,7 +613,6 @@ fn refresh_rows_fence_stale_settlements_and_finish_gone_targets() {
     let tx = f.conn.transaction().unwrap();
     github_events::finished(&tx, &fresh).unwrap();
     tx.commit().unwrap();
-    // The first row was parked minutes out; nothing is due any more.
     assert!(github_events::due(&f.conn, NOW).unwrap().is_none());
 }
 
@@ -670,7 +622,6 @@ fn a_confirmed_gone_installation_revokes_everything() {
     let tx = f.conn.transaction().unwrap();
     github_events::seed(&tx, NOW).unwrap();
     tx.commit().unwrap();
-    // The installation row, whichever order `due` returns the two rows in.
     let work = f
         .conn
         .query_row(
@@ -692,8 +643,6 @@ fn a_confirmed_gone_installation_revokes_everything() {
     assert_eq!(installation_state(&f), (true, false));
     let (revoked, credential, _) = binding_state(&f, f.repo);
     assert!(revoked && credential.is_empty());
-    // The installation row's refresh work is finished; the repository row
-    // remains until the lane sees its target is gone.
     let remaining = github_events::due(&f.conn, NOW).unwrap().unwrap();
     assert_eq!(remaining.kind, 1);
     assert!(
@@ -713,7 +662,6 @@ fn a_repository_refresh_verifies_or_revokes_under_the_sequence_fence() {
     let tx = f.conn.transaction().unwrap();
     github_events::seed(&tx, NOW).unwrap();
     tx.commit().unwrap();
-    // The repository row is the kind-1 refresh.
     let work = {
         let mut found = None;
         for _ in 0..4 {
@@ -734,7 +682,6 @@ fn a_repository_refresh_verifies_or_revokes_under_the_sequence_fence() {
     assert_eq!(target.forge_repo, GITHUB_REPO_ID);
     assert_eq!(target.remote, REMOTE);
     assert_eq!(target.installation_external, INSTALLATION);
-    // Verified: nothing revoked, the row is parked for the next period.
     let tx = f.conn.transaction().unwrap();
     github_events::apply_repository(&tx, &work, target.repo, target.version, false, NOW).unwrap();
     tx.commit().unwrap();
@@ -751,7 +698,6 @@ fn a_repository_refresh_verifies_or_revokes_under_the_sequence_fence() {
         parked > NOW.0 + 100_000,
         "the periodic pass is minutes away"
     );
-    // Changed or gone: the binding is revoked under the same fence.
     let tx = f.conn.transaction().unwrap();
     github_events::apply_repository(&tx, &work, target.repo, target.version, true, NOW).unwrap();
     tx.commit().unwrap();
@@ -782,7 +728,6 @@ fn a_revocation_never_lands_on_a_binding_that_changed_since_it_was_read() {
     let target = github_events::repo_target(&f.conn, &work.id)
         .unwrap()
         .expect("a bound repository");
-    // The binding is rebound (version moves) while GitHub is being asked.
     f.conn
         .execute(
             "UPDATE source_bindings SET version = version + 1 WHERE repo_id = ?1",
@@ -797,7 +742,6 @@ fn a_revocation_never_lands_on_a_binding_that_changed_since_it_was_read() {
         "the verdict was about the old binding, not the new one"
     );
 
-    // The installation pass is fenced the same way.
     let bound = github_events::bound_repositories(&f.conn, &target.installation).unwrap();
     assert_eq!(bound.len(), 1);
     let (repo, _, _, version) = bound[0].clone();
@@ -897,8 +841,6 @@ fn an_unreadable_binding_is_reported_as_corrupt_not_as_absent() {
 #[test]
 fn the_candidate_limit_bounds_a_rerequest() {
     let mut f = fixture();
-    // More terminal runs than the cap may resolve; the answer is an explicit
-    // bound, not an unbounded fan-out.
     for i in 0..66u32 {
         let (_run, jobs) = create_run(&mut f, UnixMillis(NOW.0 + i64::from(i) + 1));
         finish(&mut f, &jobs);

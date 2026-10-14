@@ -1,6 +1,3 @@
-//! Behavior: host-local bootstrap, local login, opaque sessions, expiry and
-//! revocation, CSRF/cookie policy, audited recovery and last-admin protection.
-
 use sentinel_auth::{cookie, secret::Secret};
 use sentinel_core::{
     UnixMillis, UserId,
@@ -25,7 +22,6 @@ fn at(ms: i64) -> UnixMillis {
     UnixMillis(ms)
 }
 
-/// An authority whose session proved a second factor just now.
 fn stepped(principal: Principal) -> local_auth::Authority {
     local_auth::Authority::Credential {
         principal,
@@ -144,9 +140,6 @@ fn only_the_right_password_issues_a_session_and_it_carries_platform_authority() 
     );
 }
 
-/// The audit record is append-only: guesses at names that do not exist, and
-/// attempts against a locked account, stop adding rows once a window holds a
-/// handful, while accepted logins are always recorded.
 #[test]
 fn credential_free_floods_cannot_grow_the_audit_trail_without_bound() {
     let (_dir, store) = store();
@@ -168,7 +161,6 @@ fn credential_free_floods_cannot_grow_the_audit_trail_without_bound() {
         "{rejected} rejections recorded"
     );
     assert!(events(&store).len() - before <= 5);
-    // A real login is still recorded after the flood.
     assert!(matches!(
         local_auth::login(&store, "root", PASSWORD, Policy::default(), at(6_000)).unwrap(),
         Login::Accepted(_)
@@ -220,12 +212,10 @@ fn sessions_expire_on_idle_and_absolute_deadlines_and_refresh_cannot_exceed_them
     assert_eq!(session.idle_deadline.0, 1_000);
     assert!(local_auth::refresh_due(&session, policy, at(900)));
     local_auth::refresh(&store, &issued.session, policy, at(900)).unwrap();
-    // Idle slid forward from the refreshing request, not from issuance.
     let session = store
         .read(|conn| local_auth::authenticate(conn, &issued.session, at(1_400)))
         .unwrap();
     assert_eq!(session.idle_deadline.0, 1_900);
-    // The absolute deadline is the ceiling: refreshing cannot pass it.
     local_auth::refresh(&store, &issued.session, policy, at(1_800)).unwrap();
     let session = store
         .read(|conn| local_auth::authenticate(conn, &issued.session, at(1_800)))
@@ -236,7 +226,6 @@ fn sessions_expire_on_idle_and_absolute_deadlines_and_refresh_cannot_exceed_them
         store.read(|conn| local_auth::authenticate(conn, &issued.session, at(2_500))),
         Err(Error::NotFound)
     ));
-    // Refreshing an expired session does not resurrect it.
     local_auth::refresh(&store, &issued.session, policy, at(2_600)).unwrap();
     assert!(matches!(
         store.read(|conn| local_auth::authenticate(conn, &issued.session, at(2_600))),
@@ -274,7 +263,6 @@ fn logout_and_logout_all_revoke_immediately_and_irreversibly() {
         store.read(|conn| local_auth::authenticate(conn, &second.session, at(2_500))),
         Err(Error::NotFound)
     ));
-    // A revoked session cannot be un-revoked by a raw update.
     let revive = store.writer().write(move |tx| {
         tx.execute("UPDATE sessions SET revoked_ms = NULL", [])?;
         Ok(())
@@ -303,7 +291,6 @@ fn repeated_failures_lock_the_account_and_a_correct_password_cannot_unlock_it() 
         panic!("expected a lockout");
     };
     assert_eq!(until.0, 60_002);
-    // The lockout is a window, not a permanent state.
     assert!(matches!(
         local_auth::login(&store, "root", PASSWORD, policy, at(60_003)).unwrap(),
         Login::Accepted(_)
@@ -311,8 +298,7 @@ fn repeated_failures_lock_the_account_and_a_correct_password_cannot_unlock_it() 
     assert!(events(&store).contains(&Event::LoginLocked));
 }
 
-/// A served lockout window is over: one typo afterwards is one failure, not
-/// a fresh lockout, so one request per window cannot keep an account locked.
+// One typo after an ended lockout window is one failure, not a new lockout.
 #[test]
 fn a_single_failure_after_an_ended_lockout_does_not_lock_again() {
     let (_dir, store) = store();
@@ -325,7 +311,6 @@ fn a_single_failure_after_an_ended_lockout_does_not_lock_again() {
     for attempt in 0..3 {
         local_auth::login(&store, "root", OTHER, policy, at(attempt)).unwrap();
     }
-    // The window (until 60 002) ends; one typo, then the right password.
     assert!(matches!(
         local_auth::login(&store, "root", OTHER, policy, at(70_000)).unwrap(),
         Login::Rejected
@@ -334,7 +319,6 @@ fn a_single_failure_after_an_ended_lockout_does_not_lock_again() {
         local_auth::login(&store, "root", PASSWORD, policy, at(70_001)).unwrap(),
         Login::Accepted(_)
     ));
-    // A full run of failures after an ended window still locks again.
     for attempt in 0..3 {
         local_auth::login(&store, "root", OTHER, policy, at(80_000 + attempt)).unwrap();
     }
@@ -479,8 +463,6 @@ fn the_last_active_super_admin_cannot_be_demoted_suspended_or_deleted() {
     });
     assert!(matches!(refused, Err(Error::Sqlite(_))));
 
-    // With a second active super admin, demotion is allowed and revokes the
-    // demoted account's sessions in the same transaction.
     let deputy = UserId::new();
     store
         .writer()
@@ -595,7 +577,6 @@ fn administration_requires_explicit_platform_scope_not_merely_a_session() {
         .write(move |tx| provisioning::insert_human(tx, target, "Target", false, at(2_200)))
         .unwrap();
 
-    // Same human, credential scope narrowed below platform administration.
     let narrowed = Principal::new(root, Permissions::REPOSITORY, None, None);
     let refused = store
         .writer()
@@ -694,13 +675,11 @@ fn the_cookie_and_csrf_policy_binds_a_state_change_to_its_own_session() {
     assert!(cookie::csrf_accepted(&session.csrf, Some(&csrf)));
     assert!(!cookie::csrf_accepted(&session.csrf, None));
 
-    // Another session's CSRF secret is not accepted for this one.
     let other =
         accept(local_auth::login(&store, "root", PASSWORD, Policy::default(), at(2_300)).unwrap());
     let mut other_csrf = String::new();
     other.csrf.expose(&mut other_csrf);
     assert!(!cookie::csrf_accepted(&session.csrf, Some(&other_csrf)));
-    // The session cookie value is not usable as its own CSRF secret.
     let mut cookie_value = String::new();
     issued.session.expose(&mut cookie_value);
     assert!(!cookie::csrf_accepted(&session.csrf, Some(&cookie_value)));

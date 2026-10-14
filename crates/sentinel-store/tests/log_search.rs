@@ -1,6 +1,4 @@
-//! Log search across every boundary a literal can straddle: frames, a sealed segment, the byte-budget cut between
-//! two requests and an arbitrary `after`. Paged requests that pass the returned carry find exactly what one
-//! unbounded request finds, once each.
+//! Carry-based paging finds each match exactly once across every boundary.
 
 use sentinel_core::{AttemptId, JobId, RunId};
 use sentinel_protocol::logs::{FRAME_HEADER_BYTES, Frame, Stream};
@@ -70,8 +68,6 @@ impl Log {
         )
     }
 
-    /// Page through the whole log under `budget`, passing each carry back
-    /// (or not), and return every match with the number of requests.
     fn paged(&self, needle: &[u8], budget: u64, with_carry: bool) -> (Vec<Match>, usize) {
         let (mut found, mut after, mut carry, mut requests) = (Vec::new(), 0, None, 0);
         loop {
@@ -99,11 +95,8 @@ fn summary(found: &[Match]) -> Vec<(u64, Stream, String)> {
         .collect()
 }
 
-/// A payload whose record is exactly 32 KiB, so a 4 MiB segment holds
-/// exactly 128 frames and the 4 MiB search budget covers exactly as many.
 const PAYLOAD: usize = (32 << 10) - FRAME_HEADER_BYTES;
 
-/// `PAYLOAD` bytes of filler lines, then `tail` (whose last line may stay open).
 fn frame_ending(head: &str, tail: &str) -> Vec<u8> {
     let mut out = head.as_bytes().to_vec();
     while out.len() + tail.len() < PAYLOAD {
@@ -119,16 +112,12 @@ fn frame_ending(head: &str, tail: &str) -> Vec<u8> {
 #[test]
 fn a_literal_split_across_a_sealed_segment_is_found_once_single_or_paged() {
     let mut log = Log::new();
-    // stderr opens a line early and finishes it three segments later.
     log.push(0, Stream::Stderr, frame_ending("", "warn: nee"));
-    // Frames 2..=128 fill segment 0 (128 records of 32 KiB); frame 128 ends
-    // with an open line holding the needle's first half.
     for _ in 2..128 {
         log.push(0, Stream::Stdout, frame_ending("", ""));
     }
     let last_of_seg0 = log.push(0, Stream::Stdout, frame_ending("", "error: nee"));
     assert_eq!(last_of_seg0, 128);
-    // Frame 129 opens segment 1 and finishes the line.
     log.push(0, Stream::Stdout, frame_ending("dle across the seal\n", ""));
     for _ in 130..=400 {
         log.push(0, Stream::Stdout, frame_ending("", ""));
@@ -153,30 +142,23 @@ fn a_literal_split_across_a_sealed_segment_is_found_once_single_or_paged() {
         (129, Stream::Stdout, "needle across the seal".to_owned()),
         (far, Stream::Stderr, "needle from far back".to_owned()),
     ];
-    // One unbounded request.
     let whole = log.search(b"needle", 0, u64::MAX, None).unwrap();
     assert_eq!(summary(&whole.matches), expected);
     assert!(whole.complete && whole.next_after.is_none() && whole.carry.is_none());
 
-    // The real 4 MiB budget stops the first request exactly at the seal.
     let first = log.search(b"needle", 0, SEARCH_SCAN_BYTES, None).unwrap();
     assert!(first.matches.is_empty());
     assert_eq!(first.next_after, Some(last_of_seg0));
-    // The next request resumes at the boundary and finds the split, once.
     let carry = first.carry.unwrap();
     let second = log
         .search(b"needle", last_of_seg0, SEARCH_SCAN_BYTES, Some(&carry))
         .unwrap();
     assert_eq!(summary(&second.matches), expected[..1]);
-    // Without the carry, the sealed segment is replayed
-    // and the stdout split is still found.
     let legacy = log
         .search(b"needle", last_of_seg0, SEARCH_SCAN_BYTES, None)
         .unwrap();
     assert_eq!(summary(&legacy.matches), expected[..1]);
 
-    // Paging under several budgets, carry passed back: identical to the
-    // single request — nothing missed, nothing twice.
     for frames in [128u64, 37] {
         let budget = frames * PAYLOAD as u64;
         let (found, requests) = log.paged(b"needle", budget, true);
@@ -191,16 +173,13 @@ fn the_budget_cut_landing_mid_needle_finds_it_once() {
     let frames: [(u32, Stream, &[u8]); 9] = [
         (0, Stream::Stdout, b"one nee"),
         (0, Stream::Stdout, b"dle split\n"),
-        // Three pieces, with a stderr frame between two of them.
         (0, Stream::Stdout, b"two n"),
         (0, Stream::Stderr, b"unrelated ne"),
         (0, Stream::Stdout, b"eed"),
         (0, Stream::Stdout, b"le three\n"),
-        // A line already reported must not be reported again when a second
-        // occurrence straddles the cut after it.
+        // A line already reported must not repeat when a later occurrence straddles the cut after it.
         (0, Stream::Stdout, b"needle then nee"),
         (0, Stream::Stdout, b"dle again, and needle\n"),
-        // A step change is not a continuation.
         (1, Stream::Stderr, b"edle is not a match\n"),
     ];
     for (step, stream, bytes) in frames {
@@ -213,20 +192,15 @@ fn the_budget_cut_landing_mid_needle_finds_it_once() {
     ];
     let whole = log.search(b"needle", 0, u64::MAX, None).unwrap();
     assert_eq!(summary(&whole.matches), expected);
-    // A one-byte budget scans exactly one frame per request: every gap
-    // between frames is a cut between requests.
     let (found, requests) = log.paged(b"needle", 1, true);
     assert_eq!(summary(&found), expected);
     assert_eq!(requests, frames.len());
-    // A budget that fits only the first frame cuts mid-needle.
     let first = log.search(b"needle", 0, 7, None).unwrap();
     assert_eq!((first.matches.len(), first.next_after), (0, Some(1)));
     let rest = log
         .search(b"needle", 1, u64::MAX, first.carry.as_deref())
         .unwrap();
     assert_eq!(summary(&rest.matches), expected);
-    // Resuming at any `after` without a carry rebuilds the same state from
-    // the segment (everything here is in one): no miss, no repeat.
     for after in 0..frames.len() as u64 {
         let page = log.search(b"needle", after, u64::MAX, None).unwrap();
         let want: Vec<_> = expected
@@ -255,17 +229,14 @@ fn the_scan_budget_is_a_hard_bound_and_a_carry_is_checked() {
             assert!(bytes_through(after, log.seq) <= SEARCH_SCAN_BYTES);
             break;
         };
-        // At most 4 MiB scanned, and the next frame would not have fit.
         assert!(bytes_through(after, next) <= SEARCH_SCAN_BYTES);
         assert!(bytes_through(after, next + 1) > SEARCH_SCAN_BYTES);
         after = next;
         carry = page.carry;
     }
-    // A frame larger than the budget still scans: every request progresses.
     let tiny = log.search(b"absent", 0, 1, None).unwrap();
     assert_eq!(tiny.next_after, Some(1));
 
-    // A carry belongs to its `after` and needle; anything else is refused.
     let carry = tiny.carry.unwrap();
     let refused: [(&[u8], u64, String); 6] = [
         (b"absent", 2, carry.clone()),

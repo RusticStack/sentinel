@@ -1,9 +1,3 @@
-//! Finalization behavior: terminal publication records the attempt's
-//! data status in the same transaction — `log_state` says whether the log's
-//! end marker was durable, every due artifact has a row (due-but-missing
-//! gets `failed`), and a reported `Passed` cannot stand over a required
-//! artifact that was never captured.
-
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
     AttemptId, Event, FailureClass, Fence, JobId, JobState, Outcome, PoolId, RepoId, RunId,
@@ -143,8 +137,6 @@ fn run(f: &Fixture, yaml: &str, now: UnixMillis) -> (RunId, Vec<JobId>) {
     (run, ids)
 }
 
-/// Lease, acknowledge and drive an attempt to `Finalizing` — the point a
-/// terminal report is legal from.
 fn held(f: &Fixture, w: WorkerId, now: UnixMillis) -> (JobId, AttemptId, Fence) {
     let pool = f.pool;
     let offer = f
@@ -241,13 +233,11 @@ fn a_durable_log_end_records_complete_and_survives_terminal_stamping() {
     let w = worker(&f, CAP);
     let (run, _ids) = run(&f, ONE_JOB, at(2_000));
     let (job, attempt, fence) = held(&f, w, at(2_100));
-    // Live attempts are pending until the marker lands.
     assert_eq!(log_state(&f, run, job), Some(LogState::Pending));
     f.logs.append(run, job, attempt, &frame(1)).unwrap();
     f.logs.append(run, job, attempt, &frame(2)).unwrap();
     f.logs.finish(run, job, attempt, 2, &[]).unwrap();
-    // The row is written before the worker is acknowledged — the controller
-    // calls `log_ended` in the same breath the marker becomes durable.
+    // The row commits before the worker is acknowledged; log_ended runs as the end marker becomes durable.
     f.store
         .writer()
         .write(move |tx| dispatch::log_ended(tx, attempt))
@@ -279,8 +269,6 @@ fn a_terminal_report_without_the_end_marker_is_incomplete_and_heals() {
     let w = worker(&f, CAP);
     let (run, _ids) = run(&f, ONE_JOB, at(2_000));
     let (job, attempt, fence) = held(&f, w, at(2_100));
-    // Frames arrived but the end never did when the report landed — the
-    // terminal stamp records that truthfully.
     f.logs.append(run, job, attempt, &frame(1)).unwrap();
     let logs = Arc::clone(&f.logs);
     let next = f
@@ -301,8 +289,6 @@ fn a_terminal_report_without_the_end_marker_is_incomplete_and_heals() {
         .unwrap();
     assert_eq!(next, JobState::Terminal(Outcome::Passed));
     assert_eq!(log_state(&f, run, job), Some(LogState::Incomplete));
-    // A retransmitted end on a reconnected worker still completes the record;
-    // the attempt is released but the log is evidence, not the verdict.
     f.logs.append(run, job, attempt, &frame(2)).unwrap();
     f.logs.finish(run, job, attempt, 2, &[]).unwrap();
     f.store
@@ -324,7 +310,6 @@ fn a_terminal_stamp_never_takes_back_a_completed_log() {
         .writer()
         .write(move |tx| dispatch::log_ended(tx, attempt))
         .unwrap();
-    // Even with the log store out of reach, the recorded `complete` stands.
     f.store
         .writer()
         .write(move |tx| {
@@ -332,7 +317,6 @@ fn a_terminal_stamp_never_takes_back_a_completed_log() {
         })
         .unwrap();
     assert_eq!(log_state(&f, run, job), Some(LogState::Complete));
-    // And raw SQL cannot regress the row.
     let regressed = f.store.writer().write(move |tx| {
         tx.execute(
             "UPDATE attempts SET log_state = 1 WHERE id = ?1",
@@ -357,8 +341,6 @@ fn a_passed_report_without_a_required_artifact_is_a_publication_failure() {
             dispatch::report(tx, w, attempt, fence, Event::Passed, None, at(2_500), None)
         })
         .unwrap();
-    // The worker's `Passed` cannot stand: the required artifact was due and
-    // nothing was settled for it.
     assert_eq!(next, JobState::Terminal(Outcome::InfraFailed));
     assert_eq!(
         f.store
@@ -367,7 +349,6 @@ fn a_passed_report_without_a_required_artifact_is_a_publication_failure() {
             .failure_class,
         Some(FailureClass::Publication)
     );
-    // The missing artifact is on record, not silently absent.
     assert_eq!(
         artifact_states(&f, run),
         vec![("dist".to_string(), artifacts::State::Failed)]
@@ -380,8 +361,6 @@ fn an_uncaptured_required_artifact_still_downgrades_the_report() {
     let w = worker(&f, CAP);
     let (run, _ids) = run(&f, REQUIRED_ARTIFACT, at(2_000));
     let (job, attempt, fence) = held(&f, w, at(2_100));
-    // The worker reported the artifact absent (or it broke mid-stream); a
-    // required declaration settles only as `captured`.
     let tenant = f.tenant;
     f.store
         .writer()
@@ -418,7 +397,6 @@ fn an_uncaptured_required_artifact_still_downgrades_the_report() {
             .failure_class,
         Some(FailureClass::Publication)
     );
-    // The recorded row was not duplicated or rewritten.
     assert_eq!(
         artifact_states(&f, run),
         vec![("dist".to_string(), artifacts::State::Absent)]
@@ -492,8 +470,6 @@ jobs:
             dispatch::report(tx, w, attempt, fence, Event::Passed, None, at(2_500), None)
         })
         .unwrap();
-    // `notes` was due-but-missing and optional: recorded `failed`, verdict
-    // unchanged. `crash` was not due under a pass: no row at all.
     assert_eq!(next, JobState::Terminal(Outcome::Passed));
     assert_eq!(
         artifact_states(&f, run),
@@ -522,9 +498,6 @@ jobs:
     let w = worker(&f, CAP);
     let (run, ids) = run(&f, yaml, at(2_000));
     let (build, extra) = (ids[0], ids[1]);
-    // The first job's worker abandons its attempt after a restart; the
-    // `always` artifact is due under any outcome, `dist` is not due under a
-    // non-pass.
     let pool = f.pool;
     let offer = f
         .store
@@ -550,8 +523,6 @@ jobs:
         vec![("report".to_string(), artifacts::State::Failed)]
     );
     assert_eq!(log_state(&f, run, offer.job), Some(LogState::Incomplete));
-    // The second job's attempt outlives its lease; the sweep's expiry goes
-    // through the same terminal stamping.
     let offer = f
         .store
         .writer()
@@ -575,8 +546,6 @@ jobs:
         .map(|(n, _)| n)
         .collect();
     assert_eq!(names, vec!["report".to_string(), "report".to_string()]);
-    // `build` was never released into the queue: its attempt's loss is the
-    // truth the run reports.
     assert_eq!(state(&f, build), JobState::Terminal(Outcome::InfraFailed));
 }
 
@@ -587,8 +556,7 @@ fn a_held_attempts_log_end_survives_a_stale_report() {
     let (run, _ids) = run(&f, ONE_JOB, at(2_000));
     let (job, attempt, fence) = held(&f, w, at(2_100));
     f.logs.finish(run, job, attempt, 0, &[]).unwrap();
-    // A stale report — wrong fence — neither finishes the job nor stains the
-    // log record; the machine fences it before the stamp runs.
+    // Fencing must run before the terminal stamp, or a stale report would stain the log record.
     let logs = Arc::clone(&f.logs);
     assert!(matches!(
         f.store.writer().write(move |tx| dispatch::report(
