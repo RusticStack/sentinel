@@ -1,30 +1,3 @@
-//! The OAuth 2.0 authorization server's durable state: clients,
-//! grants, rotating refresh tokens, short-lived access tokens, authorization
-//! codes and device requests. Migration 30 holds every table and trigger.
-//!
-//! A grant is one refresh-token family (a browser or device login) or one
-//! service-account grant. Its scopes, narrowing, audience and absolute expiry
-//! are fixed at issuance; only use and revocation move afterwards, and the
-//! database refuses anything else. Every token is an opaque [`Secret`] stored
-//! as its BLAKE3 digest, so validation is a primary-key probe and a database
-//! snapshot yields nothing presentable.
-//!
-//! Access tokens are validated by [`authenticate_access`]: ONE statement, a
-//! primary-key probe joined to the grant and the account, nothing written.
-//! Authority is the intersection of the token's scopes, the grant's, and the
-//! account's live state; repository and tenant decisions remain live checks
-//! in [`crate::auth`], exactly as for sessions and API credentials.
-//!
-//! Refresh tokens rotate on every use ([`refresh`]). A lost response is
-//! recovered once within [`ROTATION_GRACE_MS`]: presenting a just-rotated
-//! token again supersedes its one unused successor and mints another, and
-//! only while that successor is its only child. Every other reuse — a third
-//! presentation, one after the successor was used, one after the window —
-//! is a replay and revokes the whole grant.
-//!
-//! The authorization-code ([`code`]), device ([`device`]) and service-grant
-//! ([`service`]) flows build on [`insert_grant`] and [`mint`] in this module.
-
 pub mod code;
 pub mod device;
 pub mod service;
@@ -50,59 +23,31 @@ use crate::{
 const MINUTE_MS: i64 = 60 * 1000;
 const DAY_MS: i64 = 24 * 60 * MINUTE_MS;
 
-/// Life of an access token. Revocation is checked on every request anyway;
-/// the short life bounds what a leaked token is worth.
 pub const ACCESS_LIFETIME_MS: i64 = 10 * MINUTE_MS;
-/// Idle life of a refresh token, capped by its grant's absolute expiry.
 pub const REFRESH_IDLE_MS: i64 = 30 * DAY_MS;
-/// Absolute ceiling on any grant. The database enforces it too.
 pub const GRANT_MAX_MS: i64 = 90 * DAY_MS;
-/// Absolute life of a browser or device login grant.
 pub const LOGIN_GRANT_MS: i64 = GRANT_MAX_MS;
-/// Life of an authorization code.
 pub const CODE_LIFETIME_MS: i64 = 60 * 1000;
-/// Life of a device authorization request.
 pub const DEVICE_LIFETIME_MS: i64 = 10 * MINUTE_MS;
-/// Initial device polling interval.
 pub const DEVICE_INTERVAL_MS: i64 = 5 * 1000;
-/// How much each `slow_down` adds to a device's polling interval.
 pub const SLOW_DOWN_STEP_MS: i64 = 5 * 1000;
-/// How long after a rotation the previous refresh token may recover a lost
-/// response, once, if its successor was never used.
 pub const ROTATION_GRACE_MS: i64 = 60 * 1000;
-/// Default service-grant life; service grants have no idle expiry of their
-/// own (the refresh token lives as long as the grant).
 pub const SERVICE_DEFAULT_MS: i64 = 30 * DAY_MS;
-/// Service-grant lifetime bounds.
 pub const SERVICE_MIN_MS: i64 = 60 * MINUTE_MS;
 pub const SERVICE_MAX_MS: i64 = GRANT_MAX_MS;
-/// Unexpired pending device requests the deployment holds at once; beyond
-/// it a new request is refused with `slow_down`.
 pub const MAX_PENDING_DEVICE: usize = 1024;
-/// How long a rotated refresh token is kept so that presenting it again is
-/// recognized as a replay. Past it, the row is purged and a presentation is
-/// merely unknown.
 pub const ROTATED_RETENTION_MS: i64 = DAY_MS;
 
-/// Stored `revoked_reason` codes.
 pub mod reason {
-    /// The holder logged out or presented a token to the revocation endpoint.
     pub const LOGOUT: u8 = 1;
-    /// A rotated refresh token was presented again.
     pub const REFRESH_REPLAY: u8 = 2;
-    /// A spent authorization code was presented again.
     pub const CODE_REPLAY: u8 = 3;
-    /// The account was suspended or rejected, or its password changed or was reset.
     pub const ACCOUNT: u8 = 4;
-    /// The account's membership of the grant's tenant was removed.
     pub const MEMBERSHIP: u8 = 5;
-    /// The grant's tenant was suspended.
     pub const TENANT: u8 = 6;
-    /// Revoked by the grant's owner or an administrator.
     pub const ADMIN: u8 = 7;
 }
 
-/// How a grant came to exist. Stored as its integer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum GrantKind {
@@ -129,30 +74,20 @@ impl GrantKind {
     }
 }
 
-/// A registered, enabled client.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Client {
     pub id: String,
-    /// Identifier safe to show in consent and grant listings. For CIMD this
-    /// is the metadata URL; internal storage uses a fixed-size digest ID.
     pub display_id: String,
     pub name: String,
     pub first_party: bool,
-    /// May redirect to `http://127.0.0.1:PORT<redirect_path>` / `[::1]`.
     pub loopback: bool,
     pub redirect_path: Option<String>,
-    /// May use the device authorization flow.
     pub device: bool,
-    /// Ceiling on every grant issued to this client.
     pub max_scopes: Scopes,
-    /// OAuth resource this client may request.
     pub resource: Audience,
-    /// Registered by a third party (DCR or CIMD), not provisioned by this
-    /// deployment.
     pub registered: bool,
 }
 
-/// Terms of a client registered by [`register_client`].
 #[derive(Clone, Copy, Debug)]
 pub struct ClientSpec<'a> {
     pub id: &'a str,
@@ -164,14 +99,12 @@ pub struct ClientSpec<'a> {
     pub max_scopes: Scopes,
 }
 
-/// Which public MCP client registration path supplied the client metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpRegistrationKind {
     Dynamic,
     Metadata,
 }
 
-/// The bounded terms stored for one DCR or CIMD public client.
 #[derive(Clone, Copy, Debug)]
 pub struct McpClientSpec<'a> {
     pub id: &'a str,
@@ -181,44 +114,23 @@ pub struct McpClientSpec<'a> {
     pub metadata_url: Option<&'a str>,
 }
 
-/// Why a registration was refused.
 #[derive(Debug)]
 pub enum McpRegistrationError {
-    /// The deployment holds [`MAX_MCP_CLIENTS`] enabled registrations and
-    /// none is old and unused enough to evict.
     Capacity,
-    /// The registering address already holds
-    /// [`MAX_MCP_CLIENTS_PER_REGISTRANT`] enabled registrations.
     Registrant,
     Store(Error),
 }
 
-/// At most this many enabled externally registered clients may be stored
-/// per deployment. The database enforces it too.
 pub const MAX_MCP_CLIENTS: i64 = 512;
-/// Enabled registrations one address (IPv4 address or IPv6 /64) may hold.
 pub const MAX_MCP_CLIENTS_PER_REGISTRANT: i64 = 16;
-/// A registration that holds no grant and no code is deleted by maintenance
-/// once it is this old: a client that never completed a sign-in, or whose
-/// every grant ended and was purged.
 pub const UNUSED_CLIENT_TTL_MS: i64 = DAY_MS;
-/// At capacity, the oldest unused registration at least this old is evicted
-/// to make room, so a flood cannot lock onboarding out: a legitimate client
-/// has this long to finish its first sign-in before it can be displaced.
 pub const EVICTABLE_CLIENT_AGE_MS: i64 = 15 * MINUTE_MS;
 
-/// Which client registration mechanisms the deployment offers (instance
-/// policy). Stored as its integer in `deployment_policy`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ClientRegistration {
-    /// Neither: only provisioned clients (the CLI) exist.
     Off = 0,
-    /// Client ID Metadata Documents only. The default: the MCP 2025-11-25
-    /// authorization profile prefers CIMD, and Sentinel stores a CIMD
-    /// client only for a signed-in account.
     Metadata = 1,
-    /// CIMD and anonymous RFC 7591 Dynamic Client Registration.
     Open = 2,
 }
 
@@ -246,7 +158,6 @@ impl ClientRegistration {
     }
 }
 
-/// The deployment's client registration policy. One single-row read.
 pub fn client_registration(conn: &Connection) -> Result<ClientRegistration> {
     let code: i64 = conn
         .prepare_cached("SELECT oauth_client_registration FROM deployment_policy WHERE id = 1")?
@@ -261,10 +172,6 @@ pub fn client_registration(conn: &Connection) -> Result<ClientRegistration> {
     }
 }
 
-/// Change the client registration policy: platform administration with a
-/// recent step-up (host-local counts), audited. Turning a mechanism off
-/// stops new registrations through it; clients already registered keep
-/// working until disabled ([`set_client_disabled`]) or reclaimed.
 pub fn set_client_registration(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -292,22 +199,17 @@ pub fn set_client_registration(
     )
 }
 
-/// One DCR or CIMD registration, for operators.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredClient {
     pub id: String,
-    /// The metadata URL of a CIMD client.
     pub metadata_url: Option<String>,
     pub name: String,
     pub kind: McpRegistrationKind,
     pub created: UnixMillis,
     pub disabled: Option<UnixMillis>,
-    /// Grants neither revoked nor expired.
     pub live_grants: u32,
 }
 
-/// Every DCR/CIMD registration, oldest first. Bounded by the enabled cap
-/// plus the rows operators disabled.
 pub fn registered_clients(conn: &Connection, now: UnixMillis) -> Result<Vec<RegisteredClient>> {
     let mut statement = conn.prepare_cached(
         "SELECT c.client_id, c.metadata_url, c.name, c.registration_kind, c.created_ms,
@@ -348,13 +250,6 @@ pub fn registered_clients(conn: &Connection, now: UnixMillis) -> Result<Vec<Regi
     Ok(clients)
 }
 
-/// Disable (or re-enable) a DCR/CIMD client, named by its identifier or its
-/// CIMD URL. Disabling also revokes every live grant it holds, so its tokens
-/// stop at once, and returns how many; a disabled CIMD client stays disabled
-/// however often its document is presented. Re-enabling restores only the
-/// ability to ask again, within the enabled-registration bound (`Conflict`
-/// past it). Stepped-up platform administration or host-local; audited.
-/// Provisioned clients are `NotFound`: they are not managed here.
 pub fn set_client_disabled(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -414,8 +309,6 @@ pub fn set_client_disabled(
     Ok(u32::try_from(revoked).unwrap_or(u32::MAX))
 }
 
-/// The digest a registering address is stored as: a 16-byte BLAKE3
-/// prefix of the rate-limit key, never the address.
 pub fn registrant_digest(key: u128) -> [u8; 16] {
     let digest = blake3::hash(&key.to_be_bytes());
     let mut out = [0; 16];
@@ -423,8 +316,6 @@ pub fn registrant_digest(key: u128) -> [u8; 16] {
     out
 }
 
-/// "Client `c` holds nothing": no grant (live, or dead and awaiting purge)
-/// and no authorization code. Both are index searches (migration 43).
 macro_rules! client_unused {
     () => {
         "NOT EXISTS(SELECT 1 FROM oauth_grants g WHERE g.client_id = c.client_id)
@@ -432,8 +323,6 @@ macro_rules! client_unused {
     };
 }
 
-/// The oldest enabled registration that holds nothing and was created at or
-/// before `?1`: the one capacity eviction removes.
 const EVICTION_CANDIDATE: &str = concat!(
     "SELECT c.client_id FROM oauth_clients c
      WHERE c.registration_kind != 0 AND c.disabled_ms IS NULL AND c.created_ms <= ?1 AND ",
@@ -441,10 +330,7 @@ const EVICTION_CANDIDATE: &str = concat!(
     " ORDER BY c.registration_kind, c.created_ms LIMIT 1"
 );
 
-/// Registrations that hold nothing and were created at or before `?1`, at
-/// most `?2`. A disabled CIMD client is kept, or presenting its document
-/// again would register it afresh; a disabled DCR identifier is never
-/// issued again, so it goes.
+/// Keeps a disabled CIMD row: presenting its document again would register it afresh.
 const UNUSED_CLIENTS: &str = concat!(
     "SELECT c.client_id FROM oauth_clients c
      WHERE c.registration_kind != 0 AND c.created_ms <= ?1
@@ -480,8 +366,6 @@ fn grant_of(bytes: [u8; 16]) -> Result<GrantId> {
     GrantId::from_bytes(bytes).map_err(|_| Error::Corrupt("grant id"))
 }
 
-/// Trigger refusals (`RAISE(ABORT)`) and constraint violations on grant
-/// issuance are authorization answers, not faults.
 fn refused(error: rusqlite::Error) -> Error {
     match &error {
         rusqlite::Error::SqliteFailure(e, _)
@@ -493,7 +377,6 @@ fn refused(error: rusqlite::Error) -> Error {
     }
 }
 
-/// Look up an enabled client. Unknown and disabled clients are both `NotFound`.
 pub fn client(conn: &Connection, client_id: &str) -> Result<Client> {
     if client_id.is_empty() || client_id.len() > 64 {
         return Err(Error::NotFound);
@@ -534,10 +417,6 @@ pub fn client(conn: &Connection, client_id: &str) -> Result<Client> {
     })
 }
 
-/// Whether `uri` is a redirect this client may use: a loopback URI on the
-/// client's path (any port), an exact registered URI, or a registered
-/// loopback URI on any port (RFC 8252 §7.3, [`forms::loopback_redirect_key`]).
-/// No prefix, pattern or other normalization matching.
 pub fn redirect_allowed(conn: &Connection, client: &Client, uri: &str) -> Result<bool> {
     if client.loopback
         && let Some(path) = client.redirect_path.as_deref()
@@ -561,8 +440,6 @@ pub fn redirect_allowed(conn: &Connection, client: &Client, uri: &str) -> Result
     Ok(listed)
 }
 
-/// Register a client and its exact redirect URIs. Trusted: tests and
-/// host-local administration only; no route exposes it.
 pub fn register_client(store: &Store, spec: &ClientSpec<'_>, redirects: &[&str]) -> Result<()> {
     if spec.max_scopes.is_empty() || spec.name.chars().any(char::is_control) {
         return Err(Error::InvalidInput("client"));
@@ -593,10 +470,6 @@ pub fn register_client(store: &Store, spec: &ClientSpec<'_>, redirects: &[&str])
     })
 }
 
-/// Register a bounded public MCP OAuth client. DCR creates a new row; CIMD
-/// refreshes the metadata snapshot for its stable URL-derived ID. No user,
-/// grant, tenant or repository is created by either path. Same as
-/// [`register_mcp_client_from`] with no registrant.
 pub fn register_mcp_client(
     store: &Store,
     spec: &McpClientSpec<'_>,
@@ -605,17 +478,6 @@ pub fn register_mcp_client(
     register_mcp_client_from(store, spec, redirects, None, UnixMillis::now())
 }
 
-/// Register a client on behalf of `registrant` ([`registrant_digest`]).
-///
-/// Bounds, all in the one writer transaction: at most
-/// [`MAX_MCP_CLIENTS_PER_REGISTRANT`] enabled registrations per registrant
-/// (`Registrant`), and at most [`MAX_MCP_CLIENTS`] enabled registrations in
-/// all. At that cap the oldest registration that holds nothing and is at
-/// least [`EVICTABLE_CLIENT_AGE_MS`] old is deleted to make room; only when
-/// none qualifies is the answer `Capacity`. A client name equal to a
-/// provisioned client's (ignoring ASCII case) is `InvalidInput`: a third
-/// party cannot present itself as the Sentinel CLI. Registered loopback
-/// redirects are stored port-free ([`forms::loopback_redirect_key`]).
 pub fn register_mcp_client_from(
     store: &Store,
     spec: &McpClientSpec<'_>,
@@ -648,8 +510,6 @@ pub fn register_mcp_client_from(
             "MCP client redirects",
         )));
     }
-    // Stored forms: loopback URIs lose their port, so two registrations that
-    // differ only by port are one stored redirect.
     let mut stored: Vec<String> = Vec::with_capacity(redirects.len());
     for uri in redirects {
         let form = forms::loopback_redirect_key(uri).unwrap_or_else(|| (*uri).to_owned());
@@ -759,7 +619,6 @@ pub fn register_mcp_client_from(
     }
 }
 
-/// Delete one DCR/CIMD client that holds nothing, with its redirects.
 fn delete_client(tx: &Transaction<'_>, client: &str) -> Result<()> {
     tx.prepare_cached("DELETE FROM oauth_client_redirects WHERE client_id = ?1")?
         .execute([client])?;
@@ -768,9 +627,6 @@ fn delete_client(tx: &Transaction<'_>, client: &str) -> Result<()> {
     Ok(())
 }
 
-// The terms of a new grant. The database re-checks the account, the
-/// client's ceiling, platform/tenant-admin eligibility, service confinement
-/// and repository ownership at insert.
 #[derive(Clone, Copy, Debug)]
 pub struct NewGrant<'a> {
     pub user: UserId,
@@ -780,16 +636,11 @@ pub struct NewGrant<'a> {
     pub tenant: Option<TenantId>,
     pub repo: Option<RepoId>,
     pub audience: Audience,
-    /// Operator-facing label (service grants); `None` for logins.
     pub name: Option<&'a str>,
-    /// Absolute lifetime, 1 ms ..= [`GRANT_MAX_MS`].
     pub lifetime_ms: i64,
-    /// Who issued it when that is not `user` (service grants).
     pub created_by: Option<UserId>,
 }
 
-/// Insert a grant row. Callers authorize and audit; this validates shape and
-/// lets the insert trigger refuse ineligible terms (`Forbidden`).
 pub(crate) fn insert_grant(
     tx: &Transaction<'_>,
     g: &NewGrant<'_>,
@@ -833,8 +684,6 @@ pub(crate) fn insert_grant(
     Ok(id)
 }
 
-/// A freshly issued token pair. The secrets appear in text exactly once,
-/// in the response that carries them.
 #[derive(Debug)]
 pub struct Minted {
     pub grant: GrantId,
@@ -842,11 +691,9 @@ pub struct Minted {
     pub access_expires: UnixMillis,
     pub refresh: Secret,
     pub refresh_expires: UnixMillis,
-    /// The access token's scopes (the grant's, or a narrowing of them).
     pub scopes: Scopes,
 }
 
-/// The facts of a grant the token paths need.
 struct GrantTerms {
     id: GrantId,
     kind: GrantKind,
@@ -873,7 +720,6 @@ fn live_terms(tx: &Transaction<'_>, grant: GrantId, now: UnixMillis) -> Result<G
     })
 }
 
-/// Write one refresh/access pair of `generation` for a live grant.
 fn issue_pair(
     tx: &Transaction<'_>,
     grant: &GrantTerms,
@@ -923,8 +769,6 @@ fn issue_pair(
     })
 }
 
-/// The first token pair (generation 1) of a live grant, with `scopes` (the
-/// grant's own, or a narrowing of them).
 pub(crate) fn mint(
     tx: &Transaction<'_>,
     grant: GrantId,
@@ -938,23 +782,14 @@ pub(crate) fn mint(
     issue_pair(tx, &terms, 1, None, scopes, now)
 }
 
-/// A validated access token. `principal` is already intersected with what
-/// the account can still hold.
 #[derive(Clone, Copy, Debug)]
 pub struct Authenticated {
     pub grant: GrantId,
     pub principal: Principal,
-    /// Token scopes ∩ grant scopes.
     pub scopes: Scopes,
     pub expires: UnixMillis,
 }
 
-/// Validate a presented access token for `audience`. ONE statement: a
-/// primary-key probe on the token, the grant by its key, the account by its
-/// key. Expiry, revocation, audience, the account's live state and a
-/// service principal's home tenant are predicates of that statement; a
-/// wrong audience is indistinguishable from an unknown token. Platform
-/// administration is dropped unless the account still holds it.
 pub fn authenticate_access(
     conn: &Connection,
     presented: &Secret,
@@ -1008,7 +843,6 @@ const AUTHENTICATE_ACCESS: &str = "SELECT g.id, g.user_id, a.scopes & g.scopes, 
      AND g.revoked_ms IS NULL AND g.expires_ms > ?2 AND g.audience = 1 AND g.resource = ?3
      AND u.active = 1 AND (u.kind = 0 OR u.service_tenant_id = g.tenant_id)";
 
-/// Existing API clients may omit `resource`; an MCP grant never may.
 pub(crate) fn resource_matches(granted: Audience, requested: Option<Audience>) -> bool {
     match requested {
         Some(requested) => granted == requested,
@@ -1016,17 +850,10 @@ pub(crate) fn resource_matches(granted: Audience, requested: Option<Audience>) -
     }
 }
 
-/// Why a refresh produced no tokens.
 #[derive(Debug)]
 pub enum RefreshError {
-    /// Unknown, expired or revoked token or grant, another client's token,
-    /// or an inactive account. Nothing was written.
     Invalid,
-    /// A rotated or superseded token was presented again. The grant is now
-    /// revoked (reason 2) and the replay audited; report `invalid_grant`.
     Replay,
-    /// The requested narrowing is empty or wider than the grant. Nothing was
-    /// written; the presented token is still live.
     InvalidScope,
     Store(Error),
 }
@@ -1038,8 +865,6 @@ enum Refreshed {
     InvalidScope,
 }
 
-/// Rotate a refresh token in one writer transaction; see the module docs.
-/// `narrow` limits this access token's scopes; it never widens the grant.
 pub fn refresh(
     store: &Store,
     client_id: &str,
@@ -1133,8 +958,6 @@ fn rotate(
         scopes: decode_scopes(scopes)?,
         expires,
     };
-    // Which presentation this is: the live token, a lost-response retry of
-    // its parent, or a replay.
     let recovered_child = match rotated {
         None if !superseded => {
             if idle <= now.0 {
@@ -1143,9 +966,7 @@ fn rotate(
             None
         }
         Some(at) if !superseded && now.0.saturating_sub(at) <= ROTATION_GRACE_MS => {
-            // Recovery happens once: the presented token must have exactly
-            // one child, never used and never superseded. A superseded
-            // sibling means it was already recovered, so this is a replay.
+            // Recovery happens once: a superseded sibling means it already happened.
             let children: Vec<(i64, Option<i64>, bool)> = tx
                 .prepare_cached(RECOVERY_CHILDREN)?
                 .query_map(params![grant, generation], |r| {
@@ -1194,7 +1015,6 @@ fn rotate(
     Ok(Refreshed::Minted(minted))
 }
 
-/// Every child of one generation, superseded or not (see [`rotate`]).
 const RECOVERY_CHILDREN: &str = "SELECT generation, rotated_ms, superseded
      FROM oauth_refresh_tokens WHERE grant_id = ?1 AND parent = ?2";
 
@@ -1209,7 +1029,6 @@ fn replay(
     Ok(Refreshed::Replay)
 }
 
-/// Revoke one live grant row with `reason`. Returns whether it was live.
 pub(crate) fn revoke_row(
     tx: &Transaction<'_>,
     grant: GrantId,
@@ -1225,10 +1044,7 @@ pub(crate) fn revoke_row(
     Ok(changed == 1)
 }
 
-/// RFC 7009 revocation by the token's holder: a refresh or access token of
-/// `client_id` revokes its whole grant (reason 1). An unknown, malformed,
-/// already revoked or other client's token is not an error: the endpoint
-/// answers 200 either way, so nothing here confirms what exists.
+/// Unknown or foreign tokens are not errors, so the response never confirms what exists.
 pub fn revoke_presented(
     store: &Store,
     client_id: &str,
@@ -1283,10 +1099,6 @@ pub fn revoke_presented(
     })
 }
 
-/// Revoke one grant by its handle (reason 7). The grant's owner, a platform
-/// administrator, or — for a service principal's grant — an administrator of
-/// its home tenant may; anyone else sees `NotFound`. Revoking a revoked
-/// grant is `Ok`.
 pub fn revoke_grant(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -1328,11 +1140,6 @@ pub fn revoke_grant(
     Ok(())
 }
 
-/// Revoke every live grant of an account with `reason` (see [`reason`]).
-/// Called beside session revocation on suspension, rejection, password
-/// change and recovery; suspension and rejection also revoke the account's
-/// API credentials, while a password change and recovery leave them live
-/// (they do not depend on the password; see local-authentication.md).
 pub fn revoke_all_for_user(
     tx: &Transaction<'_>,
     user: UserId,
@@ -1348,7 +1155,6 @@ pub fn revoke_all_for_user(
     Ok(revoked)
 }
 
-/// Revoke every live grant narrowed to a suspended tenant (reason 6).
 pub(crate) fn revoke_for_tenant(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -1363,7 +1169,6 @@ pub(crate) fn revoke_for_tenant(
     Ok(revoked)
 }
 
-/// Revoke an account's live grants narrowed to a tenant it left (reason 5).
 pub(crate) fn revoke_for_membership(
     tx: &Transaction<'_>,
     user: UserId,
@@ -1384,7 +1189,6 @@ pub(crate) fn revoke_for_membership(
     Ok(revoked)
 }
 
-/// Metadata about one grant. Never carries a token or a digest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GrantRecord {
     pub id: GrantId,
@@ -1401,7 +1205,7 @@ pub struct GrantRecord {
     pub revoked: bool,
 }
 
-/// Columns [`grant_record`] decodes, in order; for sibling modules' queries.
+/// Column order must match raw_grant and grant_record.
 pub(crate) const GRANT_COLUMNS: &str = "id, user_id,
     COALESCE((SELECT metadata_url FROM oauth_clients
         WHERE oauth_clients.client_id = oauth_grants.client_id), oauth_grants.client_id),
@@ -1457,8 +1261,6 @@ pub(crate) fn grant_record(row: RawGrant) -> Result<GrantRecord> {
     })
 }
 
-/// One account's grants, newest first, at most 100. The account itself or a
-/// platform administrator may look; anyone else sees `NotFound`.
 pub fn grants(
     conn: &Connection,
     authority: Authority,
@@ -1481,8 +1283,6 @@ pub fn grants(
     rows.map(|row| grant_record(row?)).collect()
 }
 
-/// One grant of `user` as metadata: what a token that may see only its own
-/// grant is shown. Another account's grant, and an absent one, are `NotFound`.
 pub fn own_grant(conn: &Connection, user: UserId, grant: GrantId) -> Result<GrantRecord> {
     let row = conn
         .prepare_cached(&format!(
@@ -1494,16 +1294,6 @@ pub fn own_grant(conn: &Connection, user: UserId, grant: GrantId) -> Result<Gran
     grant_record(row)
 }
 
-/// Revoke the live service grants `minter` issued at or after `since` (reason
-/// [`reason::ACCOUNT`]), and record one audit row with the count when there
-/// were any. Called when the minter's sessions are revoked: `since` is the
-/// start of the oldest of them, so a credential a hijacked session minted
-/// does not survive the response to the hijack. Grants older than every
-/// revoked session are untouched.
-///
-/// The walk is the live-grant range of `oauth_grants_by_expiry` filtered by
-/// kind, minter and age; it runs only when sessions are revoked, and the
-/// table holds live grants plus a bounded revoked tail.
 pub(crate) fn revoke_minted_since(
     tx: &Transaction<'_>,
     minter: UserId,
@@ -1532,9 +1322,6 @@ pub(crate) fn revoke_minted_since(
     Ok(revoked)
 }
 
-/// Issue a grant and its first token pair without an authorization decision.
-/// Tests and host-local provisioning only; no route reaches it. The insert
-/// trigger still refuses ineligible terms (`Forbidden`).
 pub fn issue_grant_trusted(store: &Store, g: NewGrant<'_>, now: UnixMillis) -> Result<Minted> {
     let client = g.client_id.to_owned();
     let name = g.name.map(str::to_owned);
@@ -1558,14 +1345,6 @@ pub fn issue_grant_trusted(store: &Store, g: NewGrant<'_>, now: UnixMillis) -> R
     })
 }
 
-/// Delete OAuth rows that can no longer do anything, at most `limit` per
-/// category per call, in one bounded writer transaction: expired codes,
-/// device requests and access tokens; refresh tokens past their idle expiry
-/// or rotated more than [`ROTATED_RETENTION_MS`] ago; and expired or revoked
-/// grants with everything that references them; and DCR/CIMD registrations
-/// older than [`UNUSED_CLIENT_TTL_MS`] that hold no grant or code.
-/// Maintenance only: every validation already checks expiry and revocation
-/// itself.
 pub fn purge_expired(store: &Store, now: UnixMillis, limit: u32) -> Result<usize> {
     store.writer().write(move |tx| {
         let mut removed = 0;
@@ -1602,7 +1381,6 @@ pub fn purge_expired(store: &Store, now: UnixMillis, limit: u32) -> Result<usize
             )?
             .query_map(params![now.0, limit], |r| r.get(0))?
             .collect::<std::result::Result<_, _>>()?;
-        // Expired and revoked overlap; each grant is deleted once.
         dead.sort_unstable();
         dead.dedup();
         for grant in dead {
@@ -1616,8 +1394,6 @@ pub fn purge_expired(store: &Store, now: UnixMillis, limit: u32) -> Result<usize
                 removed += tx.prepare_cached(sql)?.execute([grant])?;
             }
         }
-        // After the grants: a client whose last grant was just purged is
-        // unused now, not on the next tick.
         let unused: Vec<String> = tx
             .prepare_cached(UNUSED_CLIENTS)?
             .query_map(
@@ -1646,8 +1422,6 @@ mod tests {
             .collect()
     }
 
-    /// Access-token validation runs on every OAuth request: it must stay a
-    /// primary-key probe plus two key joins, never a scan or a sort.
     #[test]
     fn access_token_validation_is_three_key_searches() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1662,9 +1436,6 @@ mod tests {
         );
     }
 
-    /// Registration reclamation walks only the partial registration index
-    /// (at most the enabled cap plus disabled rows, never every client or
-    /// grant), and "holds nothing" is two key searches per candidate.
     #[test]
     fn registration_reclamation_reads_only_registrations_and_key_searches() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1694,7 +1465,6 @@ mod tests {
         }
     }
 
-    /// Revocation cascades and the replay lookup use indexes, not scans.
     #[test]
     fn revocation_and_rotation_lookups_are_index_searches() {
         let mut conn = Connection::open_in_memory().unwrap();

@@ -1,14 +1,3 @@
-//! The authorization-code flow's durable half: consent choices, code
-//! issuance on approval, and the single-use, PKCE-bound exchange.
-//!
-//! Consent itself is stateless: nothing is written until the account
-//! approves, and then only the code row. [`approve`] re-checks every term in
-//! ONE statement inside the writer transaction (account, client ceiling and
-//! redirect, platform eligibility, tenant membership, repository ownership).
-//! [`exchange`] consumes the code in the same statement that reads it, so
-//! every presentation after the first — successful or not — is a replay; a
-//! replay of a code that produced a grant revokes that grant (reason 3).
-
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::{
     oauth::{self as forms, pkce},
@@ -28,32 +17,23 @@ use crate::{
     local_auth::{Event, audit},
 };
 
-/// At most this many tenants are offered on the consent page.
 pub const MAX_CONSENT_CHOICES: u32 = 100;
 
-/// A tenant the consenting account may narrow a grant to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsentChoice {
     pub tenant: TenantId,
     pub slug: String,
     pub role: Role,
-    /// The account's personal namespace, not an organization.
     pub personal: bool,
-    /// Membership is GitHub's to confirm (`membership_source = 1`).
     pub github_backed: bool,
 }
 
-/// The consent page's tenant choices. The kind and membership source come
-/// from the tenant row the join already reads.
 const CONSENT_CHOICES: &str = "SELECT m.tenant_id, t.slug, m.role, t.kind, t.membership_source
      FROM memberships m
      JOIN tenants t ON t.id = m.tenant_id
      WHERE m.user_id = ?1 AND t.active = 1
      ORDER BY t.slug LIMIT ?2";
 
-/// The account's memberships of active tenants, by slug, at most
-/// [`MAX_CONSENT_CHOICES`]. One index range on `memberships_by_user`; the
-/// slug order is a sort over that one account's memberships, not a table.
 pub fn consent_choices(conn: &Connection, user: UserId) -> Result<Vec<ConsentChoice>> {
     let mut stmt = conn.prepare_cached(CONSENT_CHOICES)?;
     let rows = stmt.query_map(params![user.as_bytes(), MAX_CONSENT_CHOICES], |r| {
@@ -84,9 +64,6 @@ pub fn consent_choices(conn: &Connection, user: UserId) -> Result<Vec<ConsentCho
     Ok(out)
 }
 
-/// Resolves a repository name for [`repo_named`]: only in an active tenant
-/// the account is a member of, and only a repository it can see (a tenant
-/// admin sees all of them, another member the ones granted to it).
 const REPO_NAMED: &str = "SELECT r.id FROM repos r
      JOIN tenants t ON t.id = r.tenant_id AND t.active = 1
      JOIN memberships m ON m.tenant_id = r.tenant_id AND m.user_id = ?3
@@ -94,12 +71,6 @@ const REPO_NAMED: &str = "SELECT r.id FROM repos r
      AND (m.role = 3 OR EXISTS(SELECT 1 FROM repo_grants g
          WHERE g.tenant_id = r.tenant_id AND g.user_id = m.user_id AND g.repo_id = r.id))";
 
-/// The repository `name` of `tenant`, for narrowing `user`'s grant on the
-/// consent page. `NotFound` alike when the tenant has no such repository,
-/// when `user` is not a member of the tenant, and when `user` cannot see
-/// the repository, so the page never reveals what another tenant holds.
-/// Key probes on `UNIQUE(tenant_id, name)` and the membership key;
-/// [`approve`] re-checks ownership anyway.
 pub fn repo_named(conn: &Connection, user: UserId, tenant: TenantId, name: &str) -> Result<RepoId> {
     let bytes = conn
         .prepare_cached(REPO_NAMED)?
@@ -111,7 +82,6 @@ pub fn repo_named(conn: &Connection, user: UserId, tenant: TenantId, name: &str)
     RepoId::from_bytes(bytes).map_err(|_| Error::Corrupt("repo_id"))
 }
 
-/// What the account approved on the consent page.
 #[derive(Clone, Copy, Debug)]
 pub struct Approval<'a> {
     pub client_id: &'a str,
@@ -124,10 +94,6 @@ pub struct Approval<'a> {
     pub audience: Audience,
 }
 
-/// Every eligibility fact of an approval, in one statement: the account
-/// (active human, super admin), membership of an active tenant, repository
-/// ownership, and the client's ceiling and redirect rules. No row means the
-/// client is unknown or disabled, or the account does not exist.
 const APPROVAL_TERMS: &str = "SELECT u.active = 1 AND u.kind = 0, u.super_admin,
         ?3 IS NULL OR EXISTS(SELECT 1 FROM memberships m JOIN tenants t ON t.id = m.tenant_id
             WHERE m.tenant_id = ?3 AND m.user_id = u.id AND t.active = 1),
@@ -138,14 +104,6 @@ const APPROVAL_TERMS: &str = "SELECT u.active = 1 AND u.kind = 0, u.super_admin,
      FROM users u JOIN oauth_clients c ON c.client_id = ?2 AND c.disabled_ms IS NULL
      WHERE u.id = ?1";
 
-/// Record an approved request and return its authorization code, valid for
-/// [`CODE_LIFETIME_MS`]. Refusals: `NotFound` (unknown or disabled client,
-/// unknown account), `Forbidden` (inactive or non-human account,
-/// `platform:admin` without being a super admin, a tenant that is not an
-/// active membership, a repository outside the tenant), `InvalidInput`
-/// (empty or out-of-ceiling scopes, a redirect the client may not use, a
-/// malformed challenge). Nothing is audited here; the exchange audits the
-/// grant it issues.
 pub fn approve(store: &Store, a: &Approval<'_>, now: UnixMillis) -> Result<Secret> {
     if !pkce::challenge_valid(a.code_challenge) {
         return Err(Error::InvalidInput("code_challenge"));
@@ -159,7 +117,6 @@ pub fn approve(store: &Store, a: &Approval<'_>, now: UnixMillis) -> Result<Secre
     if a.repo.is_some() && a.tenant.is_none() {
         return Err(Error::InvalidInput("repository scope without its tenant"));
     }
-    // One owned buffer for the three strings the writer closure needs.
     let split = a.client_id.len();
     let challenge_at = split + a.redirect_uri.len();
     let mut text = String::with_capacity(challenge_at + pkce::CHALLENGE_LEN);
@@ -172,7 +129,6 @@ pub fn approve(store: &Store, a: &Approval<'_>, now: UnixMillis) -> Result<Secre
     store.writer().write(move |tx| {
         let (client_id, rest) = text.split_at(split);
         let (redirect_uri, challenge) = rest.split_at(challenge_at - split);
-        // A registered loopback redirect matches on any port (RFC 8252 §7.3).
         let loopback_key = forms::loopback_redirect_key(redirect_uri);
         let terms = tx
             .prepare_cached(APPROVAL_TERMS)?
@@ -236,8 +192,6 @@ pub fn approve(store: &Store, a: &Approval<'_>, now: UnixMillis) -> Result<Secre
     Ok(code)
 }
 
-/// Record that the account declined a client's request (audited as
-/// `OAuthConsentDenied`; nothing else is written).
 pub fn deny(store: &Store, client_id: &str, user: UserId) -> Result<()> {
     let client_id = client_id.to_owned();
     store.writer().write(move |tx| {
@@ -252,14 +206,9 @@ pub fn deny(store: &Store, client_id: &str, user: UserId) -> Result<()> {
     })
 }
 
-/// Why an exchange produced no tokens.
 #[derive(Debug)]
 pub enum CodeError {
-    /// Unknown, expired, another client's, wrong redirect or wrong verifier,
-    /// or the account can no longer hold a grant. A known code is spent.
     Invalid,
-    /// A spent code was presented again; its grant (if it produced one) is
-    /// revoked (reason 3) and the replay audited.
     Replay,
     Store(Error),
 }
@@ -270,9 +219,6 @@ enum Exchanged {
     Replay,
 }
 
-/// Exchange a code for the first token pair of a new grant (kind 1, life
-/// [`LOGIN_GRANT_MS`]). The code is consumed by the lookup itself, so any
-/// failure after it is found still spends it.
 pub fn exchange(
     store: &Store,
     client_id: &str,
@@ -311,8 +257,7 @@ pub fn exchange(
     }
 }
 
-/// Consume-and-read in one statement: only the first presentation of a
-/// code gets a row back.
+/// Consume and read in one statement: only the first presentation gets a row.
 const CONSUME: &str = "UPDATE oauth_codes SET consumed_ms = ?2
      WHERE code_digest = ?1 AND consumed_ms IS NULL
      RETURNING client_id = ?3 AND redirect_uri = ?4 AND expires_ms > ?2,
@@ -370,8 +315,7 @@ fn redeem(
         lifetime_ms: LOGIN_GRANT_MS,
         created_by: None,
     };
-    // The account may have been suspended since approval: the grant
-    // trigger refuses it, and the spent code stays spent.
+    // Suspended since approval: the insert trigger refuses it; the code stays spent.
     let grant = match insert_grant(tx, &grant, now) {
         Ok(grant) => grant,
         Err(Error::Forbidden) => return Ok(Exchanged::Invalid),
@@ -391,8 +335,6 @@ fn redeem(
     Ok(Exchanged::Minted(minted))
 }
 
-/// The code was not consumed by this presentation: unknown, or spent. A
-/// spent code revokes the grant it produced and is audited.
 fn replayed(tx: &Transaction<'_>, digest: Digest, now: UnixMillis) -> Result<Exchanged> {
     let row = tx
         .prepare_cached("SELECT user_id, grant_id FROM oauth_codes WHERE code_digest = ?1")?
@@ -418,7 +360,6 @@ fn replayed(tx: &Transaction<'_>, digest: Digest, now: UnixMillis) -> Result<Exc
     Ok(Exchanged::Replay)
 }
 
-/// Equal length and bytes, in time independent of where they differ.
 fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -443,8 +384,6 @@ mod tests {
             .collect()
     }
 
-    /// Approval, consumption and the consent/replay lookups are key searches,
-    /// never table scans.
     #[test]
     fn code_statements_are_key_searches() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -454,8 +393,6 @@ mod tests {
             super::CONSUME,
             "SELECT user_id, grant_id FROM oauth_codes WHERE code_digest = ?1",
             super::REPO_NAMED,
-            // The statement that runs, ORDER BY and LIMIT included: its sort
-            // is over one account's memberships, found by index search.
             super::CONSENT_CHOICES,
         ] {
             let plans = plans(&conn, sql);

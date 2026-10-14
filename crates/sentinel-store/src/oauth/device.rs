@@ -1,19 +1,3 @@
-//! The device authorization flow's durable half (RFC 8628): pending
-//! requests, approval or denial by a signed-in account, and one-time
-//! redemption.
-//!
-//! A request is one `oauth_device_codes` row keyed by the device code's
-//! digest, with a unique user code. Migration 30 moves its status only
-//! pending → approved | denied and approved → redeemed, lets the approver
-//! narrow the scopes once, and writes every decision term once. Polling is a
-//! single primary-key read; only the poll that finds an approved request
-//! writes, and it issues the grant, its first token pair and the redemption
-//! in one transaction, so a request yields tokens at most once.
-//!
-//! Admission applies as it does to browser login: the approver must be an
-//! active account when deciding, and the grant's insert trigger re-checks it
-//! at redemption. An approver suspended in between redeems nothing.
-
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::{oauth as forms, secret::Secret};
 use sentinel_core::{
@@ -30,20 +14,13 @@ use crate::{
     local_auth::{Event, audit},
 };
 
-/// Stored `oauth_device_codes.status` values.
 const PENDING: u8 = 0;
 const APPROVED: u8 = 1;
 const DENIED: u8 = 2;
 const REDEEMED: u8 = 3;
 
-/// Fresh user codes tried when one collides with an existing row. A
-/// collision needs one of the at most [`MAX_PENDING_DEVICE`] live codes (or
-/// an unpurged expired one) out of 20^8; several in a row mean something
-/// else is wrong.
 const USER_CODE_ATTEMPTS: usize = 8;
 
-/// A new pending request: the device code (for the polling client only)
-/// and the canonical user code (8 characters, no dash).
 #[derive(Debug)]
 pub struct DeviceStart {
     pub device: Secret,
@@ -52,13 +29,6 @@ pub struct DeviceStart {
     pub interval_ms: i64,
 }
 
-/// Open a pending device request for a device-capable client.
-///
-/// `NotFound`: unknown or disabled client. `Forbidden`: the client may not
-/// use the device flow. `InvalidInput("scope")`: empty or beyond the
-/// client's ceiling. `QuotaExceeded`: the deployment already holds
-/// [`MAX_PENDING_DEVICE`] unexpired pending requests (the endpoint answers
-/// `429 slow_down`).
 pub fn begin(
     store: &Store,
     client_id: &str,
@@ -75,8 +45,6 @@ pub fn begin(
         if scopes.is_empty() || !client.max_scopes.contains(scopes) {
             return Err(Error::InvalidInput("scope"));
         }
-        // Counted through the partial index on pending rows, and never past
-        // the cap: the cost is bounded whatever the table holds.
         let pending: i64 = tx
             .prepare_cached(
                 "SELECT COUNT(*) FROM (SELECT 1 FROM oauth_device_codes
@@ -118,7 +86,6 @@ pub fn begin(
     })
 }
 
-/// What the approval page shows for a pending user code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceView {
     pub client_name: String,
@@ -126,9 +93,6 @@ pub struct DeviceView {
     pub expires: UnixMillis,
 }
 
-/// Look up a pending, unexpired request by its canonical user code (see
-/// `sentinel_auth::oauth::normalize_user_code`). Anything else — unknown,
-/// decided, redeemed, expired — is `NotFound`.
 pub fn view(conn: &Connection, user_code: &str, now: UnixMillis) -> Result<DeviceView> {
     let (name, scopes, expires) = conn
         .prepare_cached(
@@ -152,12 +116,8 @@ pub fn view(conn: &Connection, user_code: &str, now: UnixMillis) -> Result<Devic
     })
 }
 
-/// The signed-in account's answer.
 #[derive(Clone, Copy, Debug)]
 pub enum Decision {
-    /// Approve with `scopes` (the request's, or a narrowing of them),
-    /// optionally narrowed to one tenant the account is a member of and one
-    /// repository of that tenant.
     Approve {
         scopes: Scopes,
         tenant: Option<TenantId>,
@@ -166,13 +126,6 @@ pub enum Decision {
     Deny,
 }
 
-/// Record `user`'s decision on a pending request, in one transaction.
-///
-/// `NotFound`: no pending, unexpired request has this user code (the page
-/// counts it as a wrong code). `Forbidden`: the account is not an active
-/// person, asks for `platform:admin` without being a super admin, or
-/// narrows to a tenant it is not an active member of or a repository
-/// outside that tenant. `InvalidInput("scope")`: empty or wider than asked.
 pub fn decide(
     store: &Store,
     user_code: &str,
@@ -203,8 +156,7 @@ fn decide_in(
         })
         .optional()?
         .ok_or(Error::NotFound)?;
-    // Only an active, admitted person decides: pending, rejected and
-    // suspended accounts are inactive, service principals never sign in.
+    // Only an active person decides: service principals never sign in.
     let super_admin: bool = tx
         .prepare_cached("SELECT super_admin FROM users WHERE id = ?1 AND kind = 0 AND active = 1")?
         .query_row([user.as_bytes()], |r| r.get(0))
@@ -275,25 +227,14 @@ fn decide_in(
     audit(tx, event, Some(user), Some(user), false, None)
 }
 
-/// What a poll finds.
 #[derive(Debug)]
 pub enum Poll {
-    /// Not decided yet (`authorization_pending`).
     Pending,
-    /// Denied, or approved by an account that can no longer hold a grant
-    /// (`access_denied`).
     Denied,
-    /// Undecided or unredeemed past its expiry (`expired_token`).
     Expired,
-    /// The grant, issued now and never again.
     Issued(Minted),
 }
 
-/// Poll a request by its device code. A read unless the request is approved;
-/// then one writer transaction issues the grant (kind device, the approved
-/// terms, [`LOGIN_GRANT_MS`]), mints its first pair and marks the request
-/// redeemed. `NotFound`: unknown device code, another client's, or already
-/// redeemed (the endpoint answers `invalid_grant`).
 pub fn poll(
     store: &Store,
     client_id: &str,
@@ -312,7 +253,6 @@ pub fn poll(
         .write(move |tx| redeem(tx, &digest, &client_id, resource, now))
 }
 
-/// Status and expiry of a device request of `client_id`.
 fn state(conn: &Connection, digest: &[u8; 32], client_id: &str) -> Result<(u8, i64)> {
     conn.prepare_cached(
         "SELECT status, expires_ms FROM oauth_device_codes
@@ -323,9 +263,6 @@ fn state(conn: &Connection, digest: &[u8; 32], client_id: &str) -> Result<(u8, i
     .ok_or(Error::NotFound)
 }
 
-/// The answer a status gives without writing; `None` for an approved,
-/// unexpired request, which must be redeemed. A redeemed request is
-/// `NotFound`, like an unknown one.
 fn classify(status: u8, expires: i64, now: UnixMillis) -> Result<Option<Poll>> {
     Ok(match status {
         DENIED => Some(Poll::Denied),
@@ -344,8 +281,7 @@ fn redeem(
     requested_resource: Option<Audience>,
     now: UnixMillis,
 ) -> Result<Poll> {
-    // Re-read in the writing transaction: a concurrent poll may have
-    // redeemed it since the snapshot above.
+    // Re-read here: a concurrent poll may have redeemed the request.
     let row = tx
         .prepare_cached(
             "SELECT status, expires_ms, scopes, resource, user_id, tenant_id, repo_id
@@ -389,9 +325,7 @@ fn redeem(
     };
     const REDEEM: &str =
         "UPDATE oauth_device_codes SET status = 3, grant_id = ?2 WHERE device_digest = ?1";
-    // The insert trigger re-checks the approver's admission, the platform
-    // bit, the repository's tenant and the client: an approver suspended
-    // since approving gets nothing, and the request is spent.
+    // The insert trigger refuses a suspended approver; the request is still spent.
     let id = match insert_grant(tx, &grant, now) {
         Ok(id) => id,
         Err(Error::Forbidden) => {
@@ -419,8 +353,6 @@ fn redeem(
 mod tests {
     use rusqlite::Connection;
 
-    /// The pending cap, the page's user-code lookup and the poll are index
-    /// searches; none scans the table.
     #[test]
     fn device_lookups_are_index_searches() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -441,7 +373,6 @@ mod tests {
                 .unwrap()
                 .map(|r| r.unwrap())
                 .collect();
-            // Scanning the bounded subquery's own rows is fine; a table is not.
             assert!(
                 plans
                     .iter()
