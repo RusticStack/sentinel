@@ -109,8 +109,7 @@ fn a_sign_in_destination_must_be_a_same_site_path() {
             "{target} accepted"
         );
     }
-    // An OAuth page's whole query fits (migration 37); past the bound the API
-    // and the database both refuse.
+    // An OAuth page's whole query fits; past the bound the API and the database both refuse.
     let long = format!("/oauth/authorize?{}", "a".repeat(2048 - 17));
     let state = sign_in::begin(&store, GITHUB, Some(&long), at(1_000), 60_000).unwrap();
     assert_eq!(
