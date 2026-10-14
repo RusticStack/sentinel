@@ -537,11 +537,19 @@ mod tests {
     #[test]
     fn the_webhook_secret_file_is_judged_on_its_open_handle() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_webhook_secret(dir.path()).unwrap().is_none());
+        assert!(
+            load_webhook_secret(dir.path())
+                .map_err(|e| e.message)
+                .unwrap()
+                .is_none()
+        );
         let path = dir.path().join("github-webhook.json");
         let body = r#"{"secret":"a-webhook-secret-value"}"#;
         write(&path, body, 0o600);
-        let secret = load_webhook_secret(dir.path()).unwrap().unwrap();
+        let secret = load_webhook_secret(dir.path())
+            .map_err(|e| e.message)
+            .unwrap()
+            .unwrap();
         assert_eq!(&*secret, b"a-webhook-secret-value");
         // Group- or world-readable: refused, and the value is not echoed.
         write(&path, body, 0o640);

@@ -441,7 +441,7 @@ enum Role {
         /// What that store may hold; `None` sizes it from the disk.
         remote_cache_budget: Option<u64>,
     },
-    Worker(Option<WorkerLink>),
+    Worker(Option<Box<WorkerLink>>),
 }
 
 struct Config {
@@ -788,7 +788,7 @@ impl Config {
                     ));
                 }
             };
-            Role::Worker(link)
+            Role::Worker(link.map(Box::new))
         };
         #[cfg(feature = "server")]
         let storage = match (&role, file.storage) {
