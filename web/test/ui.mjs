@@ -9,6 +9,7 @@
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import net from "node:net";
+import { createHmac } from "node:crypto";
 import { launch } from "./cdp.mjs";
 
 const cfg = JSON.parse(readFileSync(process.argv[2], "utf8"));
@@ -172,7 +173,22 @@ const PAGES = {
   platform: ["/platform/tenants", "document.querySelectorAll('main table tbody tr').length >= 2"],
   storage: ["/t/acme/admin/storage", "document.querySelectorAll('main table tbody tr').length >= 1"],
   disk: ["/platform/storage", "document.body.textContent.includes('Metadata database')"],
+  account: ["/account", "!!document.querySelector('#mfa-h') && !!document.querySelector('#password-h')"],
+  service: ["/t/acme/admin/service-accounts", "!!document.querySelector('#sa-new-h')"],
 };
+
+/// The current RFC 6238 code (SHA-1, 6 digits, 30 s) for a base32 key.
+function totp(key) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = "";
+  for (const c of key.replace(/[\s=]/g, "").toUpperCase()) bits += alphabet.indexOf(c).toString(2).padStart(5, "0");
+  const secret = Buffer.from(bits.match(/.{8}/g).map((b) => parseInt(b, 2)));
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30000)));
+  const mac = createHmac("sha1", secret).update(counter).digest();
+  const at = mac[19] & 15;
+  return String((mac.readUInt32BE(at) & 0x7fffffff) % 1e6).padStart(6, "0");
+}
 
 await scenario("sign-in", async () => {
   const started = Date.now();
@@ -505,6 +521,58 @@ await scenario("storage policy", async () => {
   check("a repository's log retention is set from the storage page", app.policy.log_retention_ms === 2 * 86_400_000, app.policy);
   await go(page, ...PAGES.disk);
   check("the deployment's disk and stored bytes are shown", await page.eval("document.body.textContent.includes('Stored by tenants') && document.body.textContent.includes('Data filesystem')"));
+});
+
+// Last: it enrolls a second factor for rui and changes rui's password,
+// which ends every session of that account.
+await scenario("account security", async () => {
+  const acct = await browser.newPage({ width: 390, height: 844 });
+  current = acct;
+  await signIn(acct, "rui");
+  await go(acct, ...PAGES.account);
+  await acct.fill("#enroll-password", cfg.password);
+  await acct.key("Enter");
+  await acct.waitFor("!!document.querySelector('main svg[role=img] path') && !!document.querySelector('#totp-key')", 10000, "QR code and key");
+  check("enrollment shows a QR code and the key", true);
+  check("the one-time-code field asks for autofill", await acct.eval("document.querySelector('#totp-confirm').autocomplete === 'one-time-code'"));
+  const key = await acct.eval("document.querySelector('#totp-key').textContent");
+  // A wrong code first (one of the five a session may get wrong).
+  const wrong = totp(key) === "000000" ? "111111" : "000000";
+  await acct.fill("#totp-confirm", wrong);
+  await acct.key("Enter");
+  await acct.waitFor("[...document.querySelectorAll('main [role=alert]')].some((a) => a.textContent.includes('not accepted'))", 8000, "wrong code refused");
+  check("a wrong confirmation code is refused and said, and the setup stays open", await acct.eval("!!document.querySelector('#totp-key')"));
+  await acct.fill("#totp-confirm", totp(key));
+  await acct.key("Enter");
+  const codesShown = `[...document.querySelectorAll('[role=dialog] li')].length === 10`;
+  await acct.waitFor(codesShown, 10000, "recovery codes");
+  check("ten recovery codes are shown once, in a dialog", true);
+  const first = await acct.eval("document.querySelector('[role=dialog] li').textContent.trim()");
+  check("the dialog closes only after the codes are saved",
+    await acct.eval(`[...document.querySelectorAll('[role=dialog] button')].find((b) => b.textContent.trim() === 'Done').disabled`));
+  await acct.click("[role=dialog] [role=checkbox]");
+  await acct.clickText("[role=dialog] button", "Done");
+  await acct.waitFor("!document.querySelector('[role=dialog]')", 8000, "codes dialog closed");
+  check("the codes leave the page once saved", !(await acct.eval(`document.body.textContent.includes(${JSON.stringify(first)})`)));
+  await acct.waitFor("document.querySelector('main').textContent.includes('10 of 10 left')", 8000, "enrolled state");
+  check("the page shows the authenticator on and the codes left", true);
+  const overflow = await acct.eval(OVERFLOW);
+  check("the account page fits a phone", overflow.scroll <= overflow.width, overflow);
+  await acct.fill("#pw-current", "not the password");
+  await acct.fill("#pw-new", "a fresh password for rui");
+  await acct.fill("#pw-again", "a fresh password for rui");
+  await acct.key("Enter");
+  await acct.waitFor("[...document.querySelectorAll('main [role=alert]')].some((a) => a.textContent.includes('current password was not accepted'))", 8000, "wrong current password");
+  check("a wrong current password is refused and said, and the session stays", await acct.eval("location.pathname === '/account'"));
+  await acct.fill("#pw-current", cfg.password);
+  await acct.fill("#pw-new", "a fresh password for rui");
+  await acct.fill("#pw-again", "a fresh password for rui");
+  await acct.key("Enter");
+  // Confirming the authenticator stepped the session up, so no dialog.
+  await acct.waitFor("location.pathname === '/login' && document.body.textContent.includes('Password changed')", 15000, "signed out after the change");
+  check("a password change signs out and says so", true);
+  await acct.close();
+  current = page;
 });
 
 const scriptErrors = page.errors.filter((e) => !e.startsWith("network:"));

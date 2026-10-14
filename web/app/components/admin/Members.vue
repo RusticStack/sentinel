@@ -3,6 +3,7 @@ const props = defineProps<{ slug: string }>();
 const api = useApi();
 const act = useAct();
 const session = useSession();
+const { ready, withReason } = useOverride(() => props.slug);
 const ROLES = [{ label: "Reader", value: "reader" }, { label: "Operator", value: "operator" }, { label: "Admin", value: "admin" }];
 
 const { data, refresh } = await useAsyncData(`members-${props.slug}`, () => api<{ members: any[]; next: string | null }>(`/api/v1/tenants/${props.slug}/members?limit=100`));
@@ -11,12 +12,14 @@ const role = ref("reader");
 const confirmRemove = ref<any | null>(null);
 
 async function setRole(m: any, next: string) {
-  const done = await act(`Role of ${m.username || m.display_name}`, () => api(`/api/v1/tenants/${props.slug}/members/${m.user}`, { method: "PUT", body: { role: next } }));
+  if (!ready()) return;
+  const done = await act(`Role of ${m.username || m.display_name}`, () => api(`/api/v1/tenants/${props.slug}/members/${m.user}`, { method: "PUT", body: withReason({ role: next }) }));
   await refresh();
   if (done) await session.refreshTenants();
 }
 async function add() {
-  if (await act(`Add ${who.value}`, () => api(`/api/v1/tenants/${props.slug}/members/${encodeURIComponent(who.value)}`, { method: "PUT", body: { role: role.value } }))) {
+  if (!ready()) return;
+  if (await act(`Add ${who.value}`, () => api(`/api/v1/tenants/${props.slug}/members/${encodeURIComponent(who.value)}`, { method: "PUT", body: withReason({ role: role.value }) }))) {
     who.value = "";
     await refresh();
   }
