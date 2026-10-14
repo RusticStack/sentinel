@@ -1,4 +1,4 @@
-//! W01/W02 end to end over real TLS on loopback against a running
+//! The link end to end over real TLS on loopback against a running
 //! `Controller`: enrollment and identity refusals; then dispatch — a queued
 //! job reaches a connected worker on the wake, not on a poll; offers are
 //! acknowledged and reserved; a decline or a missed acknowledgement lapses
@@ -696,9 +696,8 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     );
     assert_eq!(d.state(build), JobState::Leased);
 
-    // The worker reports `build` done (W03's executor will do this through
-    // its own messages); capacity comes back and `test` is queued in the
-    // same transaction, then placed on the wake.
+    // The worker reports `build` done; capacity comes back and `test` is
+    // queued in the same transaction, then placed on the wake.
     let build_attempt = if first.0.job == build {
         &first.0
     } else {
@@ -1293,7 +1292,7 @@ fn protocol6_context_carries_the_tenant_and_derived_cache_trust() {
     let context = context.unwrap();
     // `Context2` reached the worker: the run's tenant, and the trust class
     // the store derived from recorded provenance — this run has none, so
-    // it is `manual` and unprotected (P07-2); a protocol-6 worker cannot
+    // it is `manual` and unprotected; a protocol-6 worker cannot
     // carry that class and is given the pull-request scope instead.
     assert_eq!(context.tenant, Some(d.tenant));
     assert_eq!(context.trust, Trust::PullRequest);

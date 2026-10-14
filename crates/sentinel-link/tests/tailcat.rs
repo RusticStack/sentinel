@@ -1,4 +1,4 @@
-//! Q06: the Tailcat supervisor's contract, exercised against a fake helper.
+//! The Tailcat supervisor's contract, exercised against a fake helper.
 //!
 //! The helper here is a `/bin/sh` script that records every invocation and
 //! plays only the shapes these tests assert: the executable is hashed before

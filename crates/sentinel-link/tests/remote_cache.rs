@@ -1,14 +1,14 @@
-//! Q08 remote cache end to end over real TLS against a running
+//! Remote cache end to end over real TLS against a running
 //! `Controller` and its on-disk store — the paths the in-memory fakes of
 //! `sentinel-cache/tests/remote.rs` cannot reach:
 //!
 //! - an offer sent after the attempt's terminal report is stored, and a
-//!   later attempt of the same repository hydrates it (P07-7 / P08-C1);
+//!   later attempt of the same repository hydrates it;
 //! - an offer from a worker that does not own the attempt is `denied`;
 //! - a fetch the worker abandons is cancelled on the controller, and the
-//!   next fetch of the same attempt gets a clean stream (P08-C2/C3);
+//!   next fetch of the same attempt gets a clean stream;
 //! - the worker's profile carries the executor's measured availability and
-//!   refreshes it as it changes (P07-6).
+//!   refreshes it as it changes.
 
 use std::{
     io::Cursor,
@@ -343,7 +343,7 @@ fn next_attempt(d: &Deployment, offers: &mpsc::Receiver<Offer>) -> Offer {
     offers.recv_timeout(Duration::from_secs(10)).unwrap()
 }
 
-/// P07-7 / P08-C1: the worker offers after its terminal report released
+/// The worker offers after its terminal report released
 /// the attempt, and the controller stores it; a later attempt of the same
 /// repository fetches it byte for byte, a transfer the worker abandons is
 /// cancelled and the attempt's next fetch is clean, and another worker can
@@ -472,7 +472,7 @@ fn an_offer_after_the_terminal_report_is_stored_and_serves_the_next_attempt() {
             > denied_before
     );
 
-    // Protocol 9 (P08-C8): the offer names its digest only in its end
+    // Protocol 9: the offer names its digest only in its end
     // marker — the worker reads the stream once and hashes it on the way
     // out — and the controller stores it under the digest the bytes prove.
     assert!(remote.digest_at_end());
@@ -500,7 +500,7 @@ fn an_offer_after_the_terminal_report_is_stored_and_serves_the_next_attempt() {
     let _ = JobId::new();
 }
 
-/// P07-6: the profile opens with the executor's measured availability —
+/// The profile opens with the executor's measured availability —
 /// not an empty placeholder — and a protocol-8 session refreshes it when
 /// the executor's version moves; placement reads it from the worker row.
 #[test]
