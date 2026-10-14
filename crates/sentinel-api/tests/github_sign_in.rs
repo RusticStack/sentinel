@@ -1,18 +1,3 @@
-//! GitHub web sign-in over real HTTP on loopback, through the browser
-//! pages, against the GitHub-shaped fake
-//! (`sentinel_github::fake`), with this test playing the browser — a cookie
-//! jar, following the pages' links and the `303`s the way a browser does.
-//!
-//! Covered: a GitHub-only account (admitted by an identity-bound invitation)
-//! approving an OAuth consent and a device code and landing back on the exact
-//! page it came from; replayed, foreign and cookie-less state refused without
-//! spending anything; open redirects in `return_to` refused before any state
-//! exists; a pending account and a local account that merely shares the
-//! GitHub login getting no session and no link; the cookies' attributes and
-//! the fixation-safe replacement of a prior session; the per-client limit on
-//! the start route; no GitHub code or token, and no Sentinel code, in any
-//! page; and a deployment without GitHub configured offering no button.
-
 use std::sync::Arc;
 
 use sentinel_auth::oauth::pkce;
@@ -36,7 +21,6 @@ use serde_json::{Value, json};
 const PASSWORD: &str = "correct horse battery staple";
 const SECRET: &str = "fake-client-secret-0123456789";
 const REDIRECT: &str = "http://127.0.0.1:49152/callback";
-/// The GitHub account admitted by invitation, and one nobody linked.
 const OCTO: u64 = 4242;
 
 fn octo_github() -> Account {
@@ -65,9 +49,6 @@ impl Drop for Deployment {
     }
 }
 
-/// `root` (password) administering `acme` with repository `app`; `octo`, an
-/// account that exists only through GitHub, admitted as an operator of
-/// `acme` by an invitation bound to GitHub account [`OCTO`].
 fn deployment(configured: bool) -> (Deployment, UserId) {
     let dir = tempfile::tempdir().unwrap();
     let store =
@@ -203,22 +184,13 @@ impl Reply {
     }
 }
 
-/// A browser: a cookie jar (name -> value), and everything it was served.
-///
-/// It keeps the cookie rules the sign-in depends on: a `SameSite=Strict`
-/// cookie is not sent on a navigation whose redirect chain came from another
-/// site (GitHub's redirect back to the callback), and is sent on a
-/// navigation a Sentinel page starts; every request to Sentinel carries the
-/// `Sec-Fetch-Site` label a browser gives it.
+/// Mimics the browser SameSite=Strict and Sec-Fetch-Site rules that the sign-in depends on.
 #[derive(Default)]
 struct Browser {
     jar: Vec<(String, String)>,
-    /// Names of the jar's `SameSite=Strict` cookies.
     strict: Vec<String>,
-    /// The next request is a cross-site navigation.
     cross_site: bool,
     seen: Vec<String>,
-    /// The fake GitHub's base URL, whose answers are not Sentinel's pages.
     github: String,
 }
 
@@ -315,8 +287,6 @@ impl Browser {
         for set in reply.set_cookies() {
             self.accept(set);
         }
-        // What the browser was shown by Sentinel (GitHub's own redirect
-        // back carries its code, as it must).
         if !url.starts_with(&self.github) {
             self.seen
                 .push(format!("{:?}\n{}", reply.headers, reply.text));
@@ -328,7 +298,6 @@ impl Browser {
         self.request("GET", url, None, &[])
     }
 
-    /// Store one `Set-Cookie`, remembering whether it is `SameSite=Strict`.
     fn accept(&mut self, set: &str) {
         let pair = set.split(';').next().unwrap();
         let (name, value) = pair.split_once('=').unwrap();
@@ -342,15 +311,11 @@ impl Browser {
         }
     }
 
-    /// GitHub's redirect back: a cross-site navigation to the callback.
     fn cross_site_get(&mut self, url: &str) -> Reply {
         self.cross_site = true;
         self.get(url)
     }
 
-    /// GitHub's redirect back to the callback, then — when the callback
-    /// answers its page — the same-origin hop that page starts. Returns the
-    /// last answer.
     fn callback(&mut self, url: &str) -> Reply {
         let back = self.cross_site_get(url);
         if back.status != 200 {
@@ -371,7 +336,6 @@ fn unescape(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// The "Sign in with GitHub" link of a sign-in page.
 fn github_link(page: &Reply) -> String {
     let at = page
         .text
@@ -381,15 +345,11 @@ fn github_link(page: &Reply) -> String {
     unescape(page.text[at..].split('"').next().unwrap())
 }
 
-/// The destination of the page a successful callback answers.
 fn continue_target(page: &Reply) -> String {
     let at = page.text.find("url=").expect("a refresh") + 4;
     unescape(page.text[at..].split('"').next().unwrap())
 }
 
-/// From a sign-in page to signed in: the GitHub link, GitHub (the fake,
-/// signed in as whoever it is told), the callback. Returns the callback's
-/// answer.
 fn through_github(d: &Deployment, browser: &mut Browser, sign_in_page: &Reply) -> Reply {
     let start = browser.get(&github_link(sign_in_page));
     assert_eq!(start.status, 303, "{}", start.text);
@@ -456,8 +416,6 @@ fn sessions_of(d: &Deployment, user: UserId) -> i64 {
         .unwrap()
 }
 
-/// Nothing the browser was served holds a GitHub code or token, the client
-/// secret, or a Sentinel authorization code or token.
 fn assert_nothing_leaked(d: &Deployment, browser: &Browser) {
     let tokens = d.github.issued_tokens();
     assert!(!tokens.is_empty());
@@ -472,8 +430,6 @@ fn assert_nothing_leaked(d: &Deployment, browser: &Browser) {
             "{page}"
         );
     }
-    // Every GitHub code went only to the fake and the callback URL: none is
-    // repeated in a page Sentinel rendered.
     for request in d.github.received() {
         if let Some(code) = request
             .split("code=")
@@ -502,7 +458,6 @@ fn a_github_only_account_approves_an_oauth_consent_and_lands_where_it_started() 
         page.text.contains("sentinel-sign-in"),
         "the password form stays"
     );
-    // The page's CSP is unchanged, and has no form-action to block anything.
     let csp = page.header("content-security-policy").unwrap();
     assert!(csp.starts_with("default-src 'none'") && !csp.contains("form-action"));
     assert_eq!(
@@ -515,8 +470,6 @@ fn a_github_only_account_approves_an_oauth_consent_and_lands_where_it_started() 
         )
     );
 
-    // Start: a Lax, host-only sign-in cookie and a 303 to GitHub with no
-    // scope and this deployment's exact callback.
     let start = browser.get(&github_link(&page));
     assert_eq!(start.status, 303);
     let set = start.set_cookies();
@@ -545,8 +498,6 @@ fn a_github_only_account_approves_an_oauth_consent_and_lands_where_it_started() 
     let at_github = browser.get(&to_github);
     let back = at_github.header("location").unwrap().to_owned();
 
-    // The callback: a session like password login's, the sign-in cookie
-    // cleared, and a page that continues to the exact authorize request.
     let done = browser.callback(&back);
     assert_eq!(done.status, 200, "{}", done.text);
     let set = done.set_cookies();
@@ -577,11 +528,8 @@ fn a_github_only_account_approves_an_oauth_consent_and_lands_where_it_started() 
     assert_eq!(done.header("x-frame-options"), Some("DENY"));
     assert_eq!(sessions_of(&d, octo), 1);
 
-    // Back on the consent page, signed in: its form token is minted now,
-    // from the new session. Approve, and the client gets its code.
     let consent = browser.get(&format!("{}{}", d.base, continue_target(&done)));
     assert_eq!(consent.status, 200, "{}", consent.text);
-    // An account without a password has no username; the page says "you".
     assert!(
         consent.text.contains("as <strong>you</strong>"),
         "{}",
@@ -637,8 +585,6 @@ fn a_github_only_account_approves_an_oauth_consent_and_lands_where_it_started() 
         &[("authorization", &format!("Bearer {access}"))],
     );
     assert_eq!(runs.status, 200, "{}", runs.text);
-    // The token response is the client's, not a page; drop it before the
-    // leak scan of what a browser was shown.
     browser
         .seen
         .retain(|page| !page.contains("\"access_token\""));
@@ -646,7 +592,6 @@ fn a_github_only_account_approves_an_oauth_consent_and_lands_where_it_started() 
         assert!(!page.contains(&code) || page.contains("location"), "{page}");
     }
     assert_nothing_leaked(&d, &browser);
-    // What reached GitHub: the secret only in the token request body.
     let received = d.github.received();
     assert!(
         received
@@ -731,7 +676,6 @@ fn replayed_foreign_and_cookie_less_states_are_refused_without_spending_anything
     d.github.sign_in_as(Some(octo_github()));
     let start = format!("{}/auth/github/start?return_to=%2Fdevice", d.base);
 
-    // Two sign-ins in two browsers, both at GitHub.
     let (mut a, mut b) = (Browser::new(&d), Browser::new(&d));
     let to_github = a.get(&start).header("location").unwrap().to_owned();
     let callback_a = a.get(&to_github).header("location").unwrap().to_owned();
@@ -739,8 +683,6 @@ fn replayed_foreign_and_cookie_less_states_are_refused_without_spending_anything
     let callback_b = b.get(&to_github).header("location").unwrap().to_owned();
     assert_eq!(count(&d, "SELECT count(*) FROM sign_in_states"), 2);
 
-    // B's callback in A's browser (a foreign state), and with no cookie at
-    // all (a stolen callback URL): refused, nothing spent, no session.
     let foreign = a.cross_site_get(&callback_b);
     assert_eq!(foreign.status, 400);
     assert!(
@@ -761,12 +703,10 @@ fn replayed_foreign_and_cookie_less_states_are_refused_without_spending_anything
     );
     assert_eq!(sessions_of(&d, octo), 0);
 
-    // Each browser's own callback works once.
     assert_eq!(a.callback(&callback_a).status, 200);
     assert_eq!(b.callback(&callback_b).status, 200);
     assert_eq!(sessions_of(&d, octo), 2);
 
-    // Replayed with the same cookie (put back): the state is spent.
     let state = callback_a.split("state=").nth(1).unwrap().to_owned();
     let mut replay = Browser::new(&d);
     replay
@@ -782,7 +722,6 @@ fn replayed_foreign_and_cookie_less_states_are_refused_without_spending_anything
     );
     assert_eq!(sessions_of(&d, octo), 2);
 
-    // A GitHub denial ends the attempt without a session.
     d.github.sign_in_as(None);
     let mut c = Browser::new(&d);
     let to_github = c.get(&start).header("location").unwrap().to_owned();
@@ -814,7 +753,6 @@ fn return_to_accepts_only_the_sign_in_pages() {
         assert!(reply.set_cookies().is_empty(), "{bad}");
     }
     assert_eq!(count(&d, "SELECT count(*) FROM sign_in_states"), 0);
-    // No return_to is the first page.
     let reply = Browser::new(&d).get(&format!("{}/auth/github/start", d.base));
     assert_eq!(reply.status, 303);
     assert_eq!(
@@ -829,7 +767,6 @@ fn return_to_accepts_only_the_sign_in_pages() {
 #[test]
 fn pending_and_merely_matching_accounts_get_no_session_and_no_link() {
     let (d, _) = deployment(true);
-    // A pending GitHub applicant, under approval-required registration.
     d.store
         .writer()
         .write(|tx| {
@@ -859,8 +796,6 @@ fn pending_and_merely_matching_accounts_get_no_session_and_no_link() {
         Admission::Pending(user) => user,
         other => panic!("{other:?}"),
     };
-    // A local account whose username, display name and (on GitHub) email all
-    // match GitHub account 7777's — which nobody linked.
     let now = UnixMillis::now();
     let phc = sentinel_auth::password::hash(PASSWORD.as_bytes()).unwrap();
     let local = UserId::new();
@@ -924,7 +859,6 @@ fn a_github_sign_in_replaces_the_browsers_previous_session() {
     d.github.sign_in_as(Some(octo_github()));
     let base = d.base.clone();
     let mut browser = Browser::new(&d);
-    // A password session in this browser first (JSON login).
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .http_status_as_error(false)
@@ -957,7 +891,6 @@ fn a_github_sign_in_replaces_the_browsers_previous_session() {
     browser.accept(&cookie);
     assert_eq!(sessions_of(&d, d.root), 1);
 
-    // The web interface learns that GitHub sign-in is offered from health.
     let health = browser.get(&format!("{base}/api/v1/health"));
     assert!(
         health.text.contains("\"github_sign_in\":true"),
@@ -976,15 +909,12 @@ fn a_github_sign_in_replaces_the_browsers_previous_session() {
         },
     );
     assert_eq!(done.status, 200, "{}", done.text);
-    // The old session is revoked; the new cookie is a different secret.
     assert_eq!(sessions_of(&d, d.root), 0);
     assert_eq!(sessions_of(&d, octo), 1);
     assert_ne!(
         browser.cookie("__Host-sentinel_session"),
         Some(value.as_str())
     );
-    // The web interface gets its CSRF secret through local storage, and the
-    // secret works as the header for this session.
     assert_eq!(continue_target(&done), "/");
     let needle = "localStorage.setItem(\"sentinel-csrf\", \"";
     let at = done.text.find(needle).unwrap() + needle.len();
@@ -999,12 +929,7 @@ fn a_github_sign_in_replaces_the_browsers_previous_session() {
     assert_eq!(sessions_of(&d, octo), 0);
 }
 
-/// The previous session is revoked in a real browser. GitHub's
-/// redirect back is cross-site, so the Strict session cookie is not sent to
-/// the callback, which therefore issues and revokes nothing; the same-origin
-/// hop its page starts does carry it, and that hop ends the old session and
-/// issues the new one together. Another site cannot make that hop for the
-/// browser, another browser cannot take its hand-off, and it happens once.
+/// SameSite=Strict cookies are not sent on GitHub redirect back, so the same-origin hop does the hand-off.
 #[test]
 fn the_same_origin_hop_revokes_the_session_the_callback_could_not_see() {
     let (d, octo) = deployment(true);
@@ -1043,8 +968,6 @@ fn the_same_origin_hop_revokes_the_session_the_callback_could_not_see() {
         .header("location")
         .unwrap()
         .to_owned();
-    // The callback: the Strict cookie stays home, nothing is issued or
-    // revoked, and the page moves on to the finish hop.
     let page = browser.cross_site_get(&back);
     assert_eq!(page.status, 200, "{}", page.text);
     assert!(page.set_cookies().is_empty(), "{:?}", page.set_cookies());
@@ -1053,8 +976,6 @@ fn the_same_origin_hop_revokes_the_session_the_callback_could_not_see() {
     assert_eq!(sessions_of(&d, octo), 0);
     let finish = format!("{base}/auth/github/finish");
 
-    // Another site navigating the browser there is refused, and spends
-    // nothing; a browser without this sign-in cookie has no hand-off.
     let forged = browser.cross_site_get(&finish);
     assert_eq!(forged.status, 403, "{}", forged.text);
     assert_eq!(Browser::new(&d).get(&finish).status, 400);
@@ -1066,7 +987,6 @@ fn the_same_origin_hop_revokes_the_session_the_callback_could_not_see() {
     assert_eq!(sessions_of(&d, d.root), 1);
     assert_eq!(sessions_of(&d, octo), 0);
 
-    // The real hop: the old session is revoked, the new one issued.
     let done = browser.get(&finish);
     assert_eq!(done.status, 200, "{}", done.text);
     assert_eq!(continue_target(&done), "/");
@@ -1074,13 +994,10 @@ fn the_same_origin_hop_revokes_the_session_the_callback_could_not_see() {
     assert_eq!(sessions_of(&d, octo), 1);
     assert!(browser.cookie("__Host-sentinel_signin").is_none());
 
-    // Once only.
     assert_eq!(browser.get(&finish).status, 400);
     assert_eq!(sessions_of(&d, octo), 1);
 }
 
-/// A browser signed in with a password: its jar holds the session cookie.
-/// Also returns the CSRF secret the login handed over.
 fn signed_in(d: &Deployment, username: &str) -> (Browser, String) {
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
@@ -1110,7 +1027,6 @@ fn signed_in(d: &Deployment, username: &str) -> (Browser, String) {
     (browser, body["csrf"].as_str().unwrap().to_owned())
 }
 
-/// A JSON `POST` from the browser's own pages: cookies and the CSRF header.
 fn api_post(
     d: &Deployment,
     browser: &Browser,
@@ -1135,9 +1051,6 @@ fn api_post(
     (status, serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
-/// Begin linking from a signed-in, stepped-up browser and carry it through
-/// GitHub and back; returns the answer to the same-origin hop (or the
-/// callback's, when that did not move on).
 fn link_through_github(d: &Deployment, browser: &mut Browser, csrf: &str) -> Reply {
     let started = browser.request(
         "POST",
@@ -1175,8 +1088,6 @@ fn a_signed_in_account_links_github_through_its_own_session_after_a_step_up() {
     let (mut browser, csrf) = signed_in(&d, "root");
     let link = format!("{}/api/v1/identities/github/link", d.base);
 
-    // Without a fresh step-up the start asks for one and creates nothing; a
-    // session's CSRF header is required like any mutation.
     let cold = browser.request("POST", &link, Some("{}"), &[("x-sentinel-csrf", &csrf)]);
     assert_eq!(cold.status, 403, "{}", cold.text);
     assert_eq!(cold.json()["details"]["step_up"], true);
@@ -1197,8 +1108,6 @@ fn a_signed_in_account_links_github_through_its_own_session_after_a_step_up() {
     assert_eq!(done.status, 200, "{}", done.text);
     assert!(done.text.contains("GitHub is linked"), "{}", done.text);
 
-    // Linked to this account, this session untouched, the sign-in cookie
-    // spent, and the hop completes once.
     assert_eq!(linked_subjects(&d, d.root), ["github:9001"]);
     assert_eq!(sessions_of(&d, d.root), 1);
     assert!(browser.cookie("__Host-sentinel_signin").is_none());
@@ -1274,8 +1183,6 @@ fn a_link_completes_only_in_the_session_that_began_it() {
     let page = browser.cross_site_get(&back);
     assert_eq!(page.status, 200, "{}", page.text);
 
-    // The hop arrives with a different session of the same account (or none
-    // at all): nothing is linked, and the attempt is spent either way.
     let (other, _) = signed_in(&d, "root");
     let (name, value) = other.jar[0].clone();
     browser.jar.retain(|(k, _)| *k != name);
@@ -1291,8 +1198,6 @@ fn a_link_completes_only_in_the_session_that_began_it() {
     );
 }
 
-/// The page a finished GitHub sign-in answers for the first page carries the
-/// session's CSRF secret for the interface to keep.
 fn csrf_from(page: &Reply) -> String {
     let at = page
         .text
@@ -1332,8 +1237,6 @@ fn a_github_only_account_enrolls_a_second_factor_and_can_then_step_up() {
         (Some(false), Some(false)),
         "{state}"
     );
-    // No password to change, and the refusal is the same one a wrong
-    // password gets.
     let (status, body) = api_post(
         &d,
         &browser,
@@ -1346,7 +1249,6 @@ fn a_github_only_account_enrolls_a_second_factor_and_can_then_step_up() {
         (403, Some("password change refused"))
     );
 
-    // The sign-in just made is its proof: enrollment needs no password.
     let (status, body) = api_post(&d, &browser, "/api/v1/mfa/enroll", json!({}), &csrf);
     assert_eq!(status, 200, "{body}");
     let uri = body["provisioning_uri"].as_str().unwrap();
@@ -1369,8 +1271,6 @@ fn a_github_only_account_enrolls_a_second_factor_and_can_then_step_up() {
     assert_eq!(status, 200, "{body}");
     let recovery = body["recovery_codes"][0].as_str().unwrap().to_owned();
 
-    // A later GitHub sign-in is a cold session; the recovery code steps it
-    // up.
     let (later, later_csrf) = sign_in(&d);
     let (status, body) = api_post(
         &d,
@@ -1400,7 +1300,6 @@ fn the_start_route_is_limited_per_client() {
     }
     assert!(statuses[..10].iter().all(|s| *s == 303), "{statuses:?}");
     assert!(statuses.contains(&429), "{statuses:?}");
-    // Refusals created no state.
     assert_eq!(
         count(&d, "SELECT count(*) FROM sign_in_states") as usize,
         statuses.iter().filter(|s| **s == 303).count()

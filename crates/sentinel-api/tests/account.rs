@@ -1,9 +1,3 @@
-//! An account's own security over real HTTP: enrolling a second
-//! factor, recovery codes and changing the password, with the proof rules
-//! that gate them — a bearer credential never, a session without CSRF never,
-//! the password before a first factor, a step-up before a reissue, and one
-//! `forbidden` for every wrong proof.
-
 #[path = "support/web_fixture.rs"]
 mod fixture;
 
@@ -11,7 +5,6 @@ use fixture::{Fixture, PASSWORD, call};
 use sentinel_auth::mfa::{Seed, check};
 use serde_json::{Value, json};
 
-/// A browser session for `username`: (cookie header, CSRF secret).
 fn session_with(f: &Fixture, username: &str, password: &str) -> Option<(String, String)> {
     let (status, headers, body) = call(
         &f.base,
@@ -56,8 +49,6 @@ fn post(f: &Fixture, path: &str, body: Value, s: &(String, String)) -> (u16, Val
     (status, body)
 }
 
-/// What the authenticator app does: read the seed from the URI and show the
-/// code for now.
 fn code_from(uri: &str) -> String {
     let start = uri.find("secret=").unwrap() + "secret=".len();
     let end = uri[start..].find('&').map_or(uri.len(), |e| start + e);
@@ -68,14 +59,11 @@ fn code_from(uri: &str) -> String {
         .as_secs();
     (0..1_000_000u32)
         .map(|n| format!("{n:06}"))
-        // The code of the current step only: the search is slow on a loaded
-        // host, and a code of the previous step would lapse while it ran.
+        // Only the current step: a previous-step code could lapse while a slow host searches.
         .find(|code| check(&seed, code, seconds) == Some(seconds / 30))
         .expect("some code matches")
 }
 
-/// Enroll through the routes: (the seed's URI, the recovery codes). The
-/// session that confirmed it is stepped up.
 fn enroll(f: &Fixture, s: &(String, String)) -> (String, Vec<String>) {
     let (status, body) = post(f, "/api/v1/mfa/enroll", json!({ "password": PASSWORD }), s);
     assert_eq!(status, 200, "{body}");
@@ -107,8 +95,6 @@ fn enrollment_needs_a_browser_session_with_csrf_and_the_password() {
     let f = Fixture::new(1);
     let root = session(&f, "root");
 
-    // A bearer token — platform admin or not — never enrolls, and a session
-    // without its CSRF header is refused before anything is read.
     let (status, _, body) = call(
         &f.base,
         "POST",
@@ -126,8 +112,6 @@ fn enrollment_needs_a_browser_session_with_csrf_and_the_password() {
     );
     assert_eq!(status, 403);
 
-    // A password account must present its password: none is a bad request,
-    // a wrong one one `forbidden`, and neither writes anything.
     let (status, _) = post(&f, "/api/v1/mfa/enroll", json!({}), &root);
     assert_eq!(status, 400);
     let (status, body) = post(
@@ -156,7 +140,6 @@ fn enrollment_needs_a_browser_session_with_csrf_and_the_password() {
             .starts_with("otpauth://totp/Sentinel:root?"),
         "{body}"
     );
-    // Nothing about authentication changed yet: pending, not enrolled.
     let state = security(&f, &root);
     assert_eq!(
         (
@@ -166,7 +149,6 @@ fn enrollment_needs_a_browser_session_with_csrf_and_the_password() {
         ),
         (Some(true), Some(false), Some(true))
     );
-    // The seed appears nowhere in the account's state.
     assert!(!state.to_string().contains("secret="));
 }
 
@@ -175,7 +157,6 @@ fn a_wrong_code_confirms_nothing_and_a_confirmed_code_cannot_step_up_again() {
     let f = Fixture::new(1);
     let root = session(&f, "root");
 
-    // Nothing begun: nothing to confirm.
     let (status, _) = post(
         &f,
         "/api/v1/mfa/enroll/confirm",
@@ -230,16 +211,12 @@ fn a_wrong_code_confirms_nothing_and_a_confirmed_code_cannot_step_up_again() {
         ),
         (Some(true), Some(false), Some(10))
     );
-    // Confirming stamped this session...
     let (_, _, me) = send(&f, "GET", "/api/v1/me", None, &root);
     assert_eq!(
         (me["stepped_up"].as_bool(), me["mfa"].as_bool()),
         (Some(true), Some(true))
     );
 
-    // ...but the confirmed code's time step is spent: replayed as a step-up
-    // from another session it is refused, and a second enrollment is a
-    // conflict rather than a quiet replacement.
     let other = session(&f, "root");
     let (status, _) = post(
         &f,
@@ -263,7 +240,6 @@ fn recovery_codes_are_reissued_only_after_a_step_up_and_the_old_set_dies() {
     let first = session(&f, "root");
     let (_, codes) = enroll(&f, &first);
 
-    // A fresh sign-in has not stepped up: the refusal asks for it.
     let other = session(&f, "root");
     let (status, body) = post(&f, "/api/v1/mfa/recovery-codes", json!({}), &other);
     assert_eq!(
@@ -271,7 +247,6 @@ fn recovery_codes_are_reissued_only_after_a_step_up_and_the_old_set_dies() {
         (403, Some(true)),
         "{body}"
     );
-    // Bearer credentials cannot, whatever they carry.
     let (status, _, _) = call(
         &f.base,
         "POST",
@@ -281,7 +256,6 @@ fn recovery_codes_are_reissued_only_after_a_step_up_and_the_old_set_dies() {
     );
     assert_eq!(status, 400);
 
-    // A recovery code steps up (spending it); then the reissue works.
     let (status, body) = post(
         &f,
         "/api/v1/step-up",
@@ -300,7 +274,6 @@ fn recovery_codes_are_reissued_only_after_a_step_up_and_the_old_set_dies() {
     assert_eq!(fresh.len(), 10);
     assert_eq!(security(&f, &other)["mfa"]["recovery_codes_remaining"], 10);
 
-    // The old set is gone: an unspent old code no longer steps anyone up.
     let third = session(&f, "root");
     let (status, _) = post(
         &f,
@@ -324,7 +297,6 @@ fn a_password_change_needs_the_current_password_and_ends_every_session() {
     let (one, two) = (session(&f, "root"), session(&f, "root"));
     let new_password = "a different long passphrase";
 
-    // Wrong current password: one `forbidden`, nothing changed.
     let (status, body) = post(
         &f,
         "/api/v1/password",
@@ -336,8 +308,6 @@ fn a_password_change_needs_the_current_password_and_ends_every_session() {
         (403, Some("password change refused"))
     );
     assert!(session_with(&f, "root", PASSWORD).is_some());
-    // A password that cannot be accepted is a bad request, and changes
-    // nothing either; bearer credentials cannot change passwords.
     let (status, _) = post(
         &f,
         "/api/v1/password",
@@ -363,7 +333,6 @@ fn a_password_change_needs_the_current_password_and_ends_every_session() {
     );
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["signed_out"], true);
-    // The cookie is cleared, and neither session works any more.
     assert!(
         headers
             .iter()
@@ -393,7 +362,6 @@ fn five_wrong_current_passwords_revoke_the_session() {
     }
     let (status, _, _) = send(&f, "GET", "/api/v1/me", None, &s);
     assert_eq!(status, 401);
-    // The password itself is untouched.
     assert!(session_with(&f, "root", PASSWORD).is_some());
 }
 
@@ -423,11 +391,9 @@ fn five_wrong_confirmation_codes_revoke_the_session_and_the_enrollment_survives(
         );
         assert_eq!(status, 403);
     }
-    // The cookie that kept guessing is no longer a session at all.
     let (status, _, _) = send(&f, "GET", "/api/v1/me", None, &s);
     assert_eq!(status, 401);
 
-    // The person signs in again and confirms the same enrollment.
     let again = session(&f, "root");
     let state = security(&f, &again);
     assert_eq!(state["mfa"]["pending"], true);
@@ -446,8 +412,6 @@ fn with_a_second_factor_a_password_change_asks_for_the_step_up_first() {
     let first = session(&f, "root");
     let (_, codes) = enroll(&f, &first);
 
-    // The password is the weaker proof: even the right one is asked to
-    // step up before it is judged, and a wrong one is no different.
     let cold = session(&f, "root");
     for current in [PASSWORD, "not it"] {
         let (status, body) = post(
