@@ -104,7 +104,7 @@ pub(crate) fn store_error(e: StoreError) -> ApiError {
             err(ErrorCode::RateLimited, "controller busy; retry")
         }
         // The write is still queued or running and may yet commit: an
-        // identical unkeyed retry could apply it twice (P02-1).
+        // identical unkeyed retry could apply it twice.
         StoreError::WriteAmbiguous => err(
             ErrorCode::OutcomeUnknown,
             "the write may still commit; re-read before retrying",
@@ -441,7 +441,7 @@ pub(crate) fn route(
         }
         ("GET", ["api", "v1", "version"]) => {
             // Any authenticated caller: what an operator or a CLI needs to
-            // judge skew (R05), and nothing the unauthenticated need.
+            // judge skew, and nothing the unauthenticated need.
             identify(state, request, false)?;
             let schema: i64 = state
                 .store
@@ -468,7 +468,7 @@ pub(crate) fn route(
         ("GET", ["api", "v1", "health"]) => {
             ok(json!({ "ok": true, "github_sign_in": state.github.is_some() }))
         }
-        // Public readiness (R06): can this controller serve — not shutting
+        // Public readiness: can this controller serve — not shutting
         // down, the store reading and committing — and what is degraded
         // while it does. Codes only, nothing about tenants or data.
         ("GET", ["api", "v1", "ready"]) => ready(state),
@@ -756,7 +756,7 @@ pub(crate) fn route(
             // set, so the explanation must use the same set.
             let connected = state.controller.connected();
             // The limit goes into the query: only the jobs shown are read and
-            // explained, and `total` is an index count (P08-8).
+            // explained, and `total` is an index count.
             let page = state
                 .store
                 .read(|c| {
@@ -766,7 +766,7 @@ pub(crate) fn route(
                 })
                 .map_err(store_error)?;
             // While disk admission is closed nothing is placed at all
-            // (D06, R03): a job nothing else holds is waiting on storage,
+            // a job nothing else holds is waiting on storage,
             // not ready.
             let storage = state.objects.admission().filter(|a| !a.is_open()).map(|a| {
                 if a.backlog_full() {
@@ -1144,7 +1144,7 @@ fn worker_drain(state: &State, request: &mut Request, worker: &str, drain: bool)
     ok(json!({ "worker": worker.to_string(), "draining": drain }))
 }
 
-/// A connected worker's transport telemetry (Q07), as it last reported it.
+/// A connected worker's transport telemetry, as it last reported it.
 /// Unmeasured fields are absent, never zero: `path` is `unknown` until a
 /// probe measured it, `rtt_ns` and `helper_version` are left out until set.
 /// Nothing here is a credential: no address or key is ever reported.
@@ -1182,8 +1182,8 @@ fn queued_json(row: &dispatch::QueuedJob) -> Value {
 }
 
 /// The scheduler's reason as a code plus whatever says what is missing, each
-/// quantity as its own numeric field. Every reason the store has today is
-/// named here. The enum belongs to the store and is non-exhaustive, so a
+/// quantity as its own numeric field. Every reason the store has is named
+/// here. The enum belongs to the store and is non-exhaustive, so a
 /// reason added there before this match names it falls to the guard, which
 /// still reports its own name and fields instead of an "unknown" the client
 /// cannot act on.
@@ -1616,7 +1616,7 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
         .transpose()?;
     let wait = query_param(query, "wait").is_some_and(|v| v == "1" || v == "true");
     let (tenant, run, job) = attempt_log(state, who.principal, attempt)?;
-    // Retention removed this log (R01): say so instead of an empty page
+    // Retention removed this log: say so instead of an empty page
     // that looks like a log still to come.
     if let Some(expired) = state
         .store
@@ -1661,7 +1661,7 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
             .logs
             .tail_page(run, job, attempt, after, page, step)
             .or_else(|e| match e {
-                // A pre-D04 flat log file is the only fallback.
+                // Fall back to a flat log file from before per-attempt storage.
                 StoreError::NotFound => state.logs.tail_legacy_page(attempt, after, page, step),
                 e => Err(e),
             })
@@ -1878,7 +1878,7 @@ fn run_wait(state: &State, request: &mut Request, run: &str, query: &str) -> Rou
     drop(parked);
     // The answer's version and `finished` are taken again from the same
     // snapshot as the view, so a rerun committing after the loop's last
-    // check can never pair `finished: true` with a live run (P09C-7).
+    // check can never pair `finished: true` with a live run.
     let (current, view) = state
         .store
         .read(|c| {
@@ -1985,7 +1985,7 @@ fn stream_name(stream: sentinel_protocol::logs::Stream) -> &'static str {
     }
 }
 
-/// `GET /attempts/{att}/summary`: the cache records (K08) the attempt's
+/// `GET /attempts/{att}/summary`: the cache records the attempt's
 /// terminal report carried, or `{present:false}` before there is one.
 fn attempt_summary(state: &State, request: &Request, attempt: &str) -> Route {
     let who = identify(state, request, false)?;
@@ -2382,7 +2382,7 @@ mod tests {
                 (ErrorCode::RateLimited, 429, true)
             );
         }
-        // P02-1: the write may still commit, so no blind retry is invited.
+        // The write may still commit, so no blind retry is invited.
         let e = store_error(StoreError::WriteAmbiguous);
         assert_eq!(
             (e.code, e.http_status(), e.retryable),
