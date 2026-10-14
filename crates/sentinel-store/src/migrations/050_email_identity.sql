@@ -39,7 +39,10 @@ CREATE TABLE email_verifications(
     token_digest BLOB PRIMARY KEY NOT NULL CHECK(length(token_digest) = 32),
     user_id BLOB NOT NULL REFERENCES users(id),
     email TEXT NOT NULL CHECK(length(email) BETWEEN 3 AND 254),
-    invitation BLOB REFERENCES invitations(id),
+    -- Deliberately not a foreign key: spent and expired invitations are
+    -- purged on their own schedule, and a token that outlives its
+    -- invitation simply redeems nothing.
+    invitation BLOB CHECK(invitation IS NULL OR length(invitation) = 16),
     created_ms INTEGER NOT NULL,
     expires_ms INTEGER NOT NULL CHECK(expires_ms > created_ms),
     used_ms INTEGER
