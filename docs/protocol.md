@@ -44,7 +44,7 @@ The fingerprint is not cryptographic: only the caller can collide it, against th
 
 Each event stream (run events, an attempt's log frames, a tenant's audit feed) is numbered by a dense per-stream `Seq` assigned by the writer in commit order, so resuming is one indexed range scan. A `Cursor` is an opaque fixed-size token: 42 bytes (version, tenant, stream kind, stream ID, sequence) encoded as `c1` plus 84 lowercase hex characters. Parsing takes the caller's tenant and rejects a cursor issued for another tenant; that rejection is reported to the client as `invalid_cursor`, indistinguishable from a malformed one. Pages report `next` (absent when exhausted) separately from `complete`, which tells log readers whether upstream truncation or gaps occurred.
 
-**Not yet on the wire.** The `Cursor` type is defined and tested here, but no `/api/v1` route emits or accepts one today: the log routes page by a plain frame sequence (`after=<seq>`) and the run list by the last run's ID (`before=run_…`, answered as `next`). Those parameters are route-level query syntax, not the versioned `c1` contract; a route that adopts `Cursor` will say so in [API](api.md) and [compatibility](compatibility.md).
+**On the wire.** The attempt-log route (`GET /attempts/{id}/logs`) and the failure-context route accept `cursor` and the log route answers its `next` as a `c1` cursor, bound to the tenant and attempt ([API](api.md#routes)); the plain frame sequence (`after=<seq>`) remains an alternative position. The run list still pages by the last run's ID (`before=run_…`, answered as `next`), which is route-level query syntax, not the versioned `c1` contract; a route that adopts `Cursor` will say so in [API](api.md) and [compatibility](compatibility.md).
 
 ## Size limits
 
