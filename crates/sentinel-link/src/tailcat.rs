@@ -1,4 +1,4 @@
-//! The pinned Tailcat helper (Q06): an optional, NAT-traversing transport for
+//! The pinned Tailcat helper: an optional, NAT-traversing transport for
 //! exactly one endpoint — this deployment's Sentinel link port.
 //!
 //! Tailcat's upstream is Go, so the adapter is a **pinned helper process**, not
@@ -157,9 +157,9 @@ pub enum Role {
 
 /// The `[tailcat]` section of a server or worker configuration file.
 ///
-/// The defaults keep an operator who writes a section but forgets a field
-/// honest: `enabled` and `binary` have to be stated, the digest defaults to
-/// the pinned build, and `listen_port` defaults to the link port.
+/// `enabled` defaults to false and `binary` to a bare `tailcat` that
+/// validation rejects (it must be absolute), so both have to be stated; the
+/// digest defaults to the pinned build and `listen_port` to the link port.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TailcatConfig {
@@ -501,9 +501,9 @@ pub fn staged_rotation(data_dir: &Path, role: Role) -> Result<Option<NodeKey>> {
 /// within one probe interval, restarting its helper on the new key, and the
 /// controller within one allow-list tick ([`Server::reload_keys`]), keeping
 /// the helper that already serves the new key and stopping the old one. The
-/// old private key is then deleted
-/// through the helper; `Committed::previous_deleted` says whether that
-/// worked. A commit interrupted after the switch finishes on a retry.
+/// old private key is then deleted through the helper;
+/// `Committed::previous_deleted` says whether that worked. A commit
+/// interrupted after the switch finishes on a retry.
 pub fn commit_rotation(
     config: &TailcatConfig,
     data_dir: &Path,
@@ -1111,13 +1111,12 @@ impl Forward {
     ///
     /// The controller's helper restarts on every allow-list change, and a
     /// session it carried ends without a close reaching the worker. The same
-    /// forward then took 0.9-30.4 s after the lost session to carry a new
-    /// one (live suite, sixteen changes), where a fresh helper carried one in
-    /// 1.0-1.4 s. `tailcat ping` cannot see the difference (it is a fresh
-    /// process each time), so the lost session is the signal. A young helper
-    /// is spared so that a controller which is down does not make the worker
-    /// kill each successor before it could connect; the probe still judges
-    /// it.
+    /// forward then took 0.9-30.4 s to carry a new session in the live suite,
+    /// where a fresh helper took 1.0-1.4 s. `tailcat ping` cannot see the
+    /// difference (it is a fresh process each time), so the lost session is
+    /// the signal. A young helper is spared so that a controller which is
+    /// down does not make the worker kill each successor before it could
+    /// connect; the probe still judges it.
     pub fn session_lost(&self) -> bool {
         self.session_lost_after(SESSION_SETTLE)
     }
@@ -1129,8 +1128,8 @@ impl Forward {
     /// whatever its age (a close is authenticated, so a controller that is
     /// down cannot trigger it). Not at once, though: the worker's own end
     /// of the connection must first get through, or the controller never
-    /// learns its close was delivered. Live, killing the forward in the same
-    /// millisecond left the controller unanswered on most changes. The
+    /// learns its close was delivered (killing the forward in the same
+    /// millisecond left the controller unanswered on most live changes). The
     /// replacement therefore waits [`CLOSE_GRACE`], well inside the worker's
     /// shortest back-off, on a thread of its own.
     pub fn session_closed(&self) {
@@ -2510,7 +2509,7 @@ fn refuses(arg: &str) -> Option<&'static str> {
 /// helper carries. Read from `/proc` once per allow-list change: each
 /// helper's descriptors give its socket inodes, and the TCP tables map an
 /// inode to its addresses. Sorted. Unreadable entries count as not carried,
-/// so a failure here only means a session is cut as it was before.
+/// so a failure here only means a session is cut without a hand-off.
 #[cfg(target_os = "linux")]
 fn carried_connections(pids: &[u32], port: u16) -> Vec<SocketAddr> {
     let mut inodes = Vec::new();
