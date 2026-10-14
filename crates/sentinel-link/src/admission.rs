@@ -1,11 +1,3 @@
-//! Pre-authentication limits of the controller's listener: who may hold the
-//! small pool of connections that have proved nothing yet, how fast an
-//! unknown certificate may try enrollment secrets, and how many sessions the
-//! process's descriptor limit can carry.
-//!
-//! Everything here is decided from the peer's address and counters alone,
-//! before TLS or the store is involved, and every table is bounded.
-
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv6Addr},
@@ -13,23 +5,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Connections one unknown source may have in their handshake at once. A
-/// handshake takes milliseconds; eight is a worker (it holds two at most)
-/// behind a retrying proxy, and an attacker address takes at most a
-/// thirty-second of the default pool.
 pub const PENDING_PER_SOURCE: usize = 8;
-/// The same for a source that has authenticated a worker before: a site
-/// whose whole fleet reconnects through one NAT address after a restart.
 pub const PENDING_PER_KNOWN_SOURCE: usize = 64;
-/// How long an authenticated source stays known.
 const KNOWN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-/// Known sources remembered; a full table of live entries forgets nobody
-/// but admits no new one until some expire.
 const KNOWN_MAX: usize = 4096;
 
-/// IPv6 sources are accounted by their /64: the unit a host or an attacker
-/// controls, so rotating the low bits of an address buys nothing. IPv4-mapped
-/// addresses count as the IPv4 address they carry.
+/// IPv6 is counted per /64: the unit an attacker controls, so rotating low bits buys nothing.
 pub fn source_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -44,15 +25,6 @@ pub fn source_key(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// The pool of connections still in their handshake and hello.
-///
-/// Two limits beyond the pool's size. A source is held to a few slots, so no
-/// single address can fill the pool. And the last quarter of the pool is a
-/// reserve only sources that have authenticated a worker may use: a flood
-/// from addresses never seen before cannot take it, so a known worker's
-/// reconnect still finds a slot while the flood lasts. Loopback (the only
-/// address a Tailcat helper carries peers from) is exempt from the
-/// per-source share, since many workers legitimately share it.
 #[derive(Default)]
 pub struct Pending {
     book: Mutex<Book>,
@@ -66,7 +38,6 @@ struct Book {
 }
 
 impl Pending {
-    /// Take a slot for a connection from `ip`, or refuse it.
     pub fn enter(&self, ip: IpAddr, max_pending: usize, now: Instant) -> bool {
         let loopback = ip.is_loopback();
         let key = source_key(ip);
@@ -98,7 +69,6 @@ impl Pending {
         true
     }
 
-    /// Give the slot back: the handshake and hello ended, whichever way.
     pub fn leave(&self, ip: IpAddr) {
         let key = source_key(ip);
         let mut book = self.book.lock().unwrap_or_else(|p| p.into_inner());
@@ -111,7 +81,6 @@ impl Pending {
         }
     }
 
-    /// `ip` just authenticated a worker: it may use the reserve.
     pub fn vouch(&self, ip: IpAddr, now: Instant) {
         let key = source_key(ip);
         let mut book = self.book.lock().unwrap_or_else(|p| p.into_inner());
@@ -125,14 +94,12 @@ impl Pending {
         book.known.insert(key, now);
     }
 
-    /// Connections in their handshake right now.
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.book.lock().unwrap_or_else(|p| p.into_inner()).total
     }
 }
 
-/// A token bucket in thousandths of a token, so refills are integers.
 #[derive(Clone, Copy)]
 struct Bucket {
     milli: u64,
@@ -155,21 +122,13 @@ impl Bucket {
     }
 }
 
-/// Enrollment attempts per source: five at once, then one every 12 s.
 const ENROLL_SOURCE_BURST: u64 = 5;
 const ENROLL_SOURCE_EVERY: Duration = Duration::from_secs(12);
-/// Enrollment attempts from everywhere together: twenty at once, then one
-/// every 3 s (twenty a minute). A refused secret commits an audit row on the
-/// single writer, so this caps what unauthenticated peers can write to the
-/// audit log however many addresses they use, at the price of an operator's
-/// real enrollment waiting out a flood (the worker retries on its back-off).
+/// Each refused secret writes an audit row on the single writer, so this bounds those writes.
 const ENROLL_GLOBAL_BURST: u64 = 20;
 const ENROLL_GLOBAL_EVERY: Duration = Duration::from_secs(3);
-/// Sources with a bucket; past it only a source whose bucket has refilled
-/// completely is forgotten, and a table still full refuses new sources.
 const ENROLL_SOURCES_MAX: usize = 4096;
 
-/// Rate limit on enrollment-secret attempts by unknown certificates.
 pub struct Enrollments {
     state: Mutex<EnrollState>,
 }
@@ -189,8 +148,6 @@ impl Enrollments {
         }
     }
 
-    /// Whether `ip` may present an enrollment secret now; spends a token of
-    /// its own bucket and of the global one when it may.
     pub fn allow(&self, ip: IpAddr, now: Instant) -> bool {
         let key = source_key(ip);
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -224,19 +181,12 @@ impl Enrollments {
     }
 }
 
-/// Descriptors each session holds: the socket and its clone for the reading
-/// half.
 #[cfg(unix)]
 const FDS_PER_SESSION: usize = 2;
-/// Descriptors kept for everything that is not a session: the store, the
-/// listeners, log and object files, helper pipes.
 #[cfg(unix)]
 const FD_HEADROOM: usize = 256;
 
-/// How many sessions the process's descriptor limit can carry, at most
-/// `wanted`. Raises the soft limit toward the hard one first (a session
-/// needs `FDS_PER_SESSION` descriptors, so the common soft limit of 1024
-/// would otherwise stop the controller at about 380 sessions with `EMFILE`).
+/// Raise the soft descriptor limit first: a common 1024 soft limit would stop the controller at about 380 sessions with EMFILE.
 #[cfg(unix)]
 pub fn session_cap(wanted: usize) -> usize {
     let mut limit = libc::rlimit {
@@ -271,18 +221,10 @@ pub fn session_cap(wanted: usize) -> usize {
     wanted
 }
 
-/// How long the acceptor sleeps after `failures` accept errors in a row that
-/// are not one peer's doing (descriptor or memory exhaustion): doubling from
-/// 10 ms to 250 ms, so a full descriptor table costs a few wakeups a second
-/// rather than a spinning core, and the backlog drains the moment a
-/// descriptor frees.
 pub fn accept_backoff(failures: u32) -> Duration {
     Duration::from_millis(10u64 << failures.min(5)).min(Duration::from_millis(250))
 }
 
-/// Whether an accept error belongs to the one connection it concerns (the
-/// peer gave up between the SYN and the accept) and says nothing about the
-/// process's own resources.
 pub fn accept_error_is_peer_local(error: &std::io::Error) -> bool {
     use std::io::ErrorKind::{ConnectionAborted, ConnectionReset, Interrupted};
     matches!(
@@ -317,7 +259,6 @@ mod tests {
         let pending = Pending::default();
         let now = Instant::now();
         pending.vouch(ip(200), now);
-        // 192 slots for strangers, spread so no per-source share trips.
         let mut taken = 0;
         'fill: for host in 1..=60u8 {
             for _ in 0..PENDING_PER_SOURCE {
@@ -365,7 +306,6 @@ mod tests {
         assert!(!limiter.allow(ip(1), start), "the source is spent");
         assert!(limiter.allow(ip(2), start), "another source is not");
         assert!(limiter.allow(ip(1), start + ENROLL_SOURCE_EVERY));
-        // Many sources together still share the global budget.
         let limiter = Enrollments::new(start);
         let allowed = (1..=100u8).filter(|n| limiter.allow(ip(*n), start)).count();
         assert_eq!(allowed as u64, ENROLL_GLOBAL_BURST);
