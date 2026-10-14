@@ -1,8 +1,5 @@
-//! Trusted controller row operations, not client authorization. Client entry
-//! points must use `crate::auth`. Tenant-owned operations take `TenantId`
-//! and includes it in the predicate, so a guessed ID from another tenant is
-//! indistinguishable from a missing row. Transitions are compare-and-set on
-//! `(state_code, fence)` using the pure state machine from `sentinel-core`.
+//! Trusted controller operations, not client authorization: client entry points must use `crate::auth`.
+//! Tenant-owned rows are read with the tenant in the predicate, so a foreign ID looks like a missing row.
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{
     Actor, AttemptId, AttemptTimestamps, Event, FailureClass, Fence, JobId, JobState, RepoId,
@@ -49,7 +46,6 @@ pub fn insert_run(
     source_sha: &str,
     now: UnixMillis,
 ) -> Result<()> {
-    // The repo must belong to the tenant; the subquery makes a foreign repo a constraint failure.
     let n = tx.execute(
         "INSERT INTO runs(id, tenant_id, repo_id, source_sha, created_ms)
          SELECT ?1, ?2, id, ?4, ?5 FROM repos WHERE id = ?3 AND tenant_id = ?2",
@@ -67,8 +63,6 @@ pub fn insert_run(
     Ok(())
 }
 
-/// Insert a compiled job in `Blocked`. `created_seq` orders jobs of equal
-/// priority; callers pass a monotonic per-run or global sequence.
 pub fn insert_job(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -107,8 +101,6 @@ pub struct JobRow {
 }
 
 fn read_job(conn: &Connection, tenant: TenantId, job: JobId) -> Result<JobRow> {
-    // Cached: every job transition reads the row, inside the writer
-    // transaction; re-preparing the statement each time is pure overhead.
     conn.prepare_cached(
         "SELECT state_code, fence, cancel_requested, failure_class,
                 queued_ms, leased_ms, preparing_ms, running_ms, finalizing_ms, terminal_ms
@@ -155,10 +147,6 @@ pub fn get_job(conn: &Connection, tenant: TenantId, job: JobId) -> Result<JobRow
     read_job(conn, tenant, job)
 }
 
-/// Apply `event` to the job as `actor`. The row is read, the pure machine
-/// decides, and the `UPDATE` is guarded by the state and fence that were
-/// read: if anything changed in between the update touches zero rows and
-/// `Conflict` is returned, so retrying from a fresh read is always safe.
 pub fn transition(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -171,9 +159,6 @@ pub fn transition(
     transition_from(tx, tenant, job, &row, actor, event, now)
 }
 
-/// [`transition`] for a caller that read the job row in this transaction and
-/// changed nothing since: the update stays guarded by the state and fence of
-/// that row, so a stale row still ends in `Conflict`, never a wrong write.
 fn transition_from(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -189,8 +174,6 @@ fn transition_from(
         cancel_requested: row.cancel_requested,
     };
     let next = control.apply(actor, event)?;
-    // Static SQL per entered state keeps the statement cache small and avoids
-    // formatting on the hot path.
     let sql = match next {
         JobState::Queued => UPDATE_QUEUED,
         JobState::Leased => UPDATE_LEASED,
@@ -224,9 +207,7 @@ fn transition_from(
     if changed != 1 {
         return Err(Error::Conflict);
     }
-    // One funnel for every job state change: the Checks outbox row (when the
-    // repository has a forge association) is coalesced here, so no path can
-    // move a job without its check following.
+    // Every job state change passes here, so its Checks outbox row cannot be skipped.
     crate::checks::record_job(tx, tenant, job, now)?;
     Ok(next)
 }
@@ -249,8 +230,6 @@ const UPDATE_RUNNING: &str = update_sql!("running_ms");
 const UPDATE_FINALIZING: &str = update_sql!("finalizing_ms");
 const UPDATE_TERMINAL: &str = update_sql!("terminal_ms");
 
-/// Durable cancel desired state. Returns whether the job was still unstarted,
-/// in which case the caller also applies `Event::CancelBeforeStart`.
 pub fn request_cancel(tx: &Transaction<'_>, tenant: TenantId, job: JobId) -> Result<bool> {
     let n = tx.execute(
         "UPDATE jobs SET cancel_requested = 1 WHERE id = ?1 AND tenant_id = ?2",
@@ -263,9 +242,6 @@ pub fn request_cancel(tx: &Transaction<'_>, tenant: TenantId, job: JobId) -> Res
     Ok(matches!(row.state, JobState::Blocked | JobState::Queued))
 }
 
-/// The dispatcher's pick: the best ready job across all tenants (fairness
-/// between tenants is a scheduler concern layered above this query). Uses
-/// the partial index only; no table scan.
 pub fn pick_ready(conn: &Connection) -> Result<Option<(TenantId, JobId)>> {
     conn.query_row(
         "SELECT tenant_id, id FROM jobs WHERE state_code = ?1
@@ -283,15 +259,6 @@ pub fn pick_ready(conn: &Connection) -> Result<Option<(TenantId, JobId)>> {
     .transpose()
 }
 
-/// Lease the job to `worker` with the next fence in one transaction: the
-/// attempt row — which is also the resource reservation, copied from the job
-/// — and the `Leased` transition commit together or not at all. Whether the
-/// worker has room is [`crate::dispatch::place`]'s check, made in the same
-/// transaction; this is the durable half.
-///
-/// Executable admission: a job whose image digest and platform are not yet
-/// durably resolved is refused with `Unresolved`. Its spec may exist; its
-/// existence is not readiness.
 pub fn lease(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -325,21 +292,14 @@ pub fn lease(
     lease_reserved(tx, tenant, job, worker, &reservation, lease_until, now)
 }
 
-/// What an attempt reserves, as placement already read it from the job row.
 #[derive(Clone, Copy, Debug)]
 pub struct Reservation {
     pub cpu_millis: i64,
     pub memory_bytes: i64,
     pub disk_bytes: i64,
-    /// The job's repository (`jobs.repo_id`), kept on the attempt so held
-    /// resources per repository are an index-only sum.
     pub repo: Option<[u8; 16]>,
 }
 
-/// [`lease`] for a caller that read the job's resources and proved its image
-/// resolved in the same transaction — placement's candidate scan — so neither
-/// is read again. The state machine still decides the edge, and the fence is
-/// the job's current one plus one.
 pub fn lease_reserved(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -382,13 +342,10 @@ pub fn lease_reserved(
     Ok((attempt, fence))
 }
 
-/// Derived run state from its job rows (indexed by `run_id`).
 pub fn run_state(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunState> {
     let mut stmt =
         conn.prepare_cached("SELECT state_code FROM jobs WHERE run_id = ?1 AND tenant_id = ?2")?;
     let mut rows = stmt.query(params![run.as_bytes(), tenant.as_bytes()])?;
-    // The fold reads straight off the cursor; a failed read or an undecodable
-    // code ends it and is reported instead of the truncated answer.
     let mut fault = None;
     let state = aggregate(std::iter::from_fn(|| match rows.next() {
         Ok(Some(row)) => match row

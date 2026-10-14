@@ -1,23 +1,5 @@
-//! GitHub-backed organization membership.
-//!
-//! A tenant is *app-managed* (invitation or administrator) or *GitHub-backed*
-//! (`tenants.membership_source = 1`). In a GitHub-backed tenant a person is a
-//! member only while GitHub says the **linked, verified GitHub account** (the
-//! immutable numeric id in `external_identities`, never a login name) belongs
-//! to the organization the tenant's installation is bound to. Rows derived
-//! from GitHub carry `synced_ms`, the time GitHub last confirmed them; a row
-//! whose confirmation is older than the grace period is removed by the lane.
-//!
-//! This module holds every decision that touches the database; the network
-//! half is the lane in `sentinel-checks`, which only *observes* GitHub and
-//! hands the observation to [`apply`]. A webhook is a hint ([`hint`]) except
-//! for a signed `member_removed`, which revokes at once and also asks for a
-//! check so a stale or replayed removal heals itself ([`member_removed`]).
-//!
-//! Authorization queries never read `synced_ms`: derived rows are ordinary
-//! memberships and repository grants, so nothing on the request path changed
-//! and a removal is effective on the next query. Long-lived readers see the
-//! tenant's authorization epoch move in the same transaction.
+//! Derived membership rests on the immutable GitHub id and lapses unless GitHub confirms it in the grace period.
+//! A webhook is only a hint, except a signed member_removed, which revokes at once.
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{
     RepoId, TenantId, UnixMillis, UserId,
@@ -30,26 +12,16 @@ use crate::{
     local_auth::{Event, audit},
 };
 
-/// The provider key of the linked identity a derived membership rests on.
 pub const PROVIDER: &str = "github";
 
-/// Repositories whose permission one step of the walk asks GitHub about. A
-/// member of a large installation is checked in several bounded steps.
 pub const REPOS_PER_STEP: u32 = 25;
 
-/// An on-demand request ([`enqueue_user`]) for a pair checked more recently
-/// than this does nothing: sign-in spam cannot become a stream of GitHub
-/// requests. A signed webhook is exempt.
 pub const MIN_ON_DEMAND_GAP_MS: i64 = 60_000;
 
-/// Most tenants one sign-in schedules a check for.
 const MAX_TENANTS_PER_SIGN_IN: i64 = 256;
 
-/// A candidate with no membership is dropped after this many failed checks;
-/// the next sign-in or signed event asks again.
 const MAX_CANDIDATE_ATTEMPTS: u32 = 5;
 
-/// GitHub's two organization roles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrgRole {
     Owner,
@@ -57,10 +29,6 @@ pub enum OrgRole {
 }
 
 impl OrgRole {
-    /// The Sentinel role GitHub's answer maps to: an organization owner
-    /// administers the tenant; any other member is an operator, the ceiling
-    /// under which the repository permissions derived from GitHub apply (a
-    /// reader ceiling would make GitHub's `write` meaningless).
     pub const fn role(self) -> Role {
         match self {
             OrgRole::Owner => Role::TenantAdmin,
@@ -69,10 +37,6 @@ impl OrgRole {
     }
 }
 
-/// What GitHub said about a person's membership. `Unknown` is an answer that
-/// proves nothing (rate limit, server error, missing App permission, an
-/// identity mismatch): it keeps what exists for the grace period and grants
-/// nothing new.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Membership {
     Active(OrgRole),
@@ -80,29 +44,13 @@ pub enum Membership {
     Unknown,
 }
 
-/// What GitHub said about a person's permission on one repository.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepoAccess {
-    /// The bits derived from the answer; [`Permissions::NONE`] is a verified
-    /// "no access".
     Known(Permissions),
     Unknown,
 }
 
-/// The Sentinel repository permission bits for a GitHub repository role, never
-/// above what the person holds there:
-///
-/// | GitHub role | Sentinel bits |
-/// |---|---|
-/// | `admin` | read, run, write secrets |
-/// | `maintain`, `write` | read, run |
-/// | `triage`, `read` | read |
-/// | `none`, anything else | none |
-///
-/// An unrecognized role (a custom role GitHub added later) maps to none: a
-/// guess is never an authorization.
 pub const fn repo_permissions(role: &str) -> Permissions {
-    // `const fn` cannot compare `&str` with `==`; compare the bytes.
     const fn is(role: &str, expected: &str) -> bool {
         let (a, b) = (role.as_bytes(), expected.as_bytes());
         if a.len() != b.len() {
@@ -130,7 +78,6 @@ pub const fn repo_permissions(role: &str) -> Permissions {
     }
 }
 
-/// Whether the tenant's membership comes from GitHub.
 pub fn is_github_backed(conn: &Connection, tenant: TenantId) -> Result<bool> {
     Ok(conn
         .prepare_cached("SELECT membership_source = 1 FROM tenants WHERE id = ?1")?
@@ -139,11 +86,6 @@ pub fn is_github_backed(conn: &Connection, tenant: TenantId) -> Result<bool> {
         .unwrap_or(false))
 }
 
-/// Refuse a manual membership change in a GitHub-backed tenant. `human` names
-/// the person the change is about: service accounts are always managed here
-/// (they have no GitHub identity); `None` means a change to the tenant as a
-/// whole (an invitation to it). The refusal is `Forbidden`: policy, not a
-/// race.
 pub(crate) fn require_app_managed(
     conn: &Connection,
     tenant: TenantId,
@@ -165,11 +107,6 @@ pub(crate) fn require_app_managed(
     }
 }
 
-/// Make a tenant GitHub-backed (or app-managed again). Needs administration
-/// of the tenant with fresh step-up ([`Authority::require_tenant_access_change`],
-/// strict), and — because the change removes every member GitHub does not
-/// confirm — a converting administrator who is a member must already have a
-/// linked GitHub account, so the change cannot lock the person making it out.
 pub fn set_backing(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -197,8 +134,6 @@ pub fn set_backing(
     apply_backing(tx, tenant, github, Some(principal.user), false, now)
 }
 
-/// [`set_backing`] for the host-local operator, who holds the database file's
-/// authority and has no principal to attribute.
 pub fn set_backing_trusted(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -225,8 +160,6 @@ fn apply_backing(
         if kind != 0 {
             return Err(Error::InvalidInput("organization"));
         }
-        // Verified, not assumed: the installation snapshot must have proved
-        // the account an organization.
         let organization: bool = tx
             .prepare_cached(
                 "SELECT EXISTS(SELECT 1 FROM installations WHERE tenant_id = ?1 AND provider = ?2
@@ -243,9 +176,6 @@ fn apply_backing(
             "UPDATE tenants SET membership_source = 1 WHERE id = ?1",
             [tenant.as_bytes()],
         )?;
-        // Existing human members start their grace clock now: they are
-        // verified against GitHub in the next passes and removed if nothing
-        // confirms them. Service accounts stay app-managed.
         tx.execute(
             "UPDATE memberships SET synced_ms = ?2 WHERE tenant_id = ?1 AND synced_ms IS NULL
              AND user_id IN (SELECT id FROM users WHERE kind = 0)",
@@ -272,8 +202,6 @@ fn apply_backing(
             "UPDATE tenants SET membership_source = 0 WHERE id = ?1",
             [tenant.as_bytes()],
         )?;
-        // What GitHub granted stays as ordinary, now locally managed access:
-        // an administrator decides what happens to it from here.
         tx.execute(
             "UPDATE memberships SET synced_ms = NULL WHERE tenant_id = ?1 AND synced_ms IS NOT NULL",
             [tenant.as_bytes()],
@@ -298,9 +226,6 @@ fn apply_backing(
     )
 }
 
-/// Return a tenant to app-managed membership when its last organization
-/// installation is released (called from the unbind path, in its
-/// transaction).
 pub(crate) fn installation_released(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -319,15 +244,9 @@ pub(crate) fn installation_released(
     apply_backing(tx, tenant, false, actor, false, now)
 }
 
-/// How stale a derived membership's last confirmation may be before a member
-/// opening the tenant asks for a fresh check ([`touch`]).
 pub const OPEN_TTL_MS: i64 = 5 * 60 * 1000;
 
-/// Whether a request for this pair arrived after the pass read its row: a
-/// signed webhook, a sign-in or an administrator bumped `seq`, or the row is
-/// gone (an unlink, a conversion back). A superseded pass writes nothing — its
-/// observation may predate the event that superseded it, so applying it could
-/// undo a removal — and the row it left behind is due again at once.
+/// A pass superseded by a later request writes nothing: its observation may predate that request.
 fn superseded(tx: &Transaction<'_>, check: &Check) -> Result<bool> {
     let current: Option<i64> = tx
         .prepare_cached(
@@ -341,10 +260,6 @@ fn superseded(tx: &Transaction<'_>, check: &Check) -> Result<bool> {
     Ok(current != Some(check.seq))
 }
 
-/// Ask for a check of one person in every GitHub-backed tenant, as a sign-in
-/// or a new link does. Nothing is queued for a person with no linked GitHub
-/// account, and a pair checked within [`MIN_ON_DEMAND_GAP_MS`] is left alone.
-/// Bounded; the request path never waits for GitHub.
 pub fn enqueue_user(tx: &Transaction<'_>, user: UserId, now: UnixMillis) -> Result<usize> {
     Ok(tx
         .prepare_cached(
@@ -367,10 +282,6 @@ pub fn enqueue_user(tx: &Transaction<'_>, user: UserId, now: UnixMillis) -> Resu
         ])?)
 }
 
-/// The rate-limited request a member opening a GitHub-backed tenant makes:
-/// schedule one check when the membership's last confirmation is older than
-/// `ttl_ms`. A read tells whether anything is owed, so the common case writes
-/// nothing.
 pub fn touch(
     conn: &Connection,
     tenant: TenantId,
@@ -395,8 +306,6 @@ pub fn touch(
     Ok(stale)
 }
 
-/// Queue one pair for an immediate check (signed webhook, administrator).
-/// A tenant that is not GitHub-backed queues nothing.
 fn enqueue_pair(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -413,7 +322,6 @@ fn enqueue_pair(
     Ok(())
 }
 
-/// The Sentinel account a GitHub numeric id is linked to, if any.
 fn linked_user(conn: &Connection, github_id: u64) -> Result<Option<UserId>> {
     conn.prepare_cached(
         "SELECT user_id FROM external_identities WHERE provider = ?1 AND subject = ?2",
@@ -426,9 +334,6 @@ fn linked_user(conn: &Connection, github_id: u64) -> Result<Option<UserId>> {
     .transpose()
 }
 
-/// A signed event says something changed about one person (`Some`) or about
-/// the whole organization (`None`: a team or repository access change).
-/// Positive information is a hint only: it schedules a check, never grants.
 pub fn hint(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -452,10 +357,6 @@ pub fn hint(
     Ok(())
 }
 
-/// A signed `member_removed`: revoke the derived access of the linked account
-/// immediately, then ask for a check. If the removal was stale or replayed,
-/// the check restores whatever GitHub still confirms; if it was current, the
-/// check finds nothing to restore. Returns whether access was removed.
 pub fn member_removed(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -473,12 +374,6 @@ pub fn member_removed(
     Ok(removed)
 }
 
-/// Delete one person's membership of a GitHub-backed tenant and everything
-/// that hung on it: repository grants cascade, credentials narrowed to the
-/// tenant and OAuth grants for it are revoked, and the tenant's authorization
-/// epoch moves, all in the caller's transaction. The caller has established
-/// that the tenant is GitHub-backed. Skips the keep-an-administrator rule on
-/// purpose: GitHub, not Sentinel, decides who administers the organization.
 fn remove_derived(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -512,10 +407,6 @@ fn remove_derived(
     Ok(true)
 }
 
-/// A person's GitHub link was removed: every derived membership of theirs
-/// ends in the same transaction as the unlink, and nothing remains queued for
-/// them. Leaving one organization is not this: that is [`apply`] with
-/// [`Membership::Absent`], which touches only that tenant.
 pub(crate) fn identity_unlinked(
     tx: &Transaction<'_>,
     user: UserId,
@@ -542,8 +433,6 @@ pub(crate) fn identity_unlinked(
     Ok(removed)
 }
 
-/// Enqueue every derived member of a GitHub-backed tenant that has no queue
-/// row: at start, so a lost queue never means an unverified member.
 pub fn seed(tx: &Transaction<'_>, now: UnixMillis) -> Result<()> {
     tx.execute(
         "INSERT OR IGNORE INTO github_member_checks(tenant_id, user_id, next_ms)
@@ -555,14 +444,12 @@ pub fn seed(tx: &Transaction<'_>, now: UnixMillis) -> Result<()> {
     Ok(())
 }
 
-/// One due pair, with the fence its outcome is written under.
 #[derive(Clone, Copy, Debug)]
 pub struct Check {
     pub tenant: TenantId,
     pub user: UserId,
     pub seq: i64,
     pub attempts: u32,
-    /// The last repository whose permission an earlier step settled.
     pub cursor: Option<RepoId>,
 }
 
@@ -591,36 +478,24 @@ pub fn due(conn: &Connection, now: UnixMillis) -> Result<Option<Check>> {
     .transpose()
 }
 
-/// A repository the walk asks about: bound to the tenant's installation and
-/// live, with the approved remote the owner/name comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetRepo {
     pub repo: RepoId,
     pub remote: String,
 }
 
-/// What a pass needs before it talks to GitHub.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
-    /// The installation's GitHub id, for minting a token.
     pub installation: u64,
-    /// The organization's immutable GitHub account id.
     pub org_id: u64,
-    /// The organization's current login, for URL paths only.
     pub org_login: String,
-    /// Suspended or permission-invalid: GitHub cannot be asked.
     pub unusable: bool,
-    /// The numeric id of the person's linked GitHub account.
     pub github_id: Option<u64>,
-    /// The person's current Sentinel role in the tenant, when a member.
     pub member: Option<Role>,
     pub repos: Vec<TargetRepo>,
-    /// More repositories follow `repos`.
     pub more: bool,
 }
 
-/// Read what a pass needs. `None` means the tenant is no longer GitHub-backed
-/// by a verified organization installation: the caller drops the row.
 pub fn target(conn: &Connection, check: &Check) -> Result<Option<Target>> {
     type Install = (String, i64, String, bool);
     let install: Option<Install> = conn
@@ -704,18 +579,12 @@ pub fn target(conn: &Connection, check: &Check) -> Result<Option<Target>> {
     }))
 }
 
-/// How the lane paces what it writes.
 #[derive(Clone, Copy, Debug)]
 pub struct Timing {
-    /// The interval between confirmations of a settled member.
     pub recheck_ms: i64,
-    /// How long an unconfirmed member keeps access.
     pub grace_ms: i64,
 }
 
-/// What a pass observed. `repos` holds only repositories whose answer was
-/// settled, in repository-id order; `complete` is false when the walk stopped
-/// at an unknown answer.
 #[derive(Clone, Debug)]
 pub struct Observed {
     pub github_id: Option<u64>,
@@ -724,20 +593,6 @@ pub struct Observed {
     pub complete: bool,
 }
 
-/// Commit one pass. Every decision is made here, inside the writer
-/// transaction, from the observation and the rows as they are now:
-///
-/// - the identity is read again and must still be the one observed, so a
-///   relink or unlink while the request was on the wire discards the answer;
-/// - `Active` creates or updates the membership, maps owner to administrator
-///   and member to operator (a demotion follows GitHub), and derives the
-///   person's repository grants from what GitHub reported, never above it;
-/// - `Absent` (and a missing link past its grace) removes the membership with
-///   everything that hung on it;
-/// - `Unknown` keeps what exists until the grace period since the last
-///   confirmation is over, grants nothing, and retries under back-off.
-///
-/// Returns a bounded outcome label for diagnostics: no ids, logins or tokens.
 pub fn apply(
     tx: &Transaction<'_>,
     check: &Check,
@@ -761,8 +616,6 @@ pub fn apply(
         .optional()?;
     let linked = linked.and_then(|s| s.parse::<u64>().ok());
     if linked != observed.github_id {
-        // The link changed while the request was out: that answer is about
-        // somebody else. Ask again at once; nothing is applied.
         reschedule(tx, check, now.0, check.attempts, check.cursor)?;
         return Ok("identity changed");
     }
@@ -776,8 +629,6 @@ pub fn apply(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    // A human membership the tenant held before it was converted, or one a
-    // trusted tool wrote since: its grace clock starts when it is first seen.
     if let Some((_, None)) = existing {
         tx.execute(
             "UPDATE memberships SET synced_ms = ?3 WHERE tenant_id = ?1 AND user_id = ?2",
@@ -788,7 +639,6 @@ pub fn apply(
     let expired = now.0.saturating_sub(last_confirmed) >= timing.grace_ms;
 
     if observed.github_id.is_none() {
-        // No linked GitHub account: nothing can confirm this person.
         return match existing {
             None => {
                 drop_row(tx, check)?;
@@ -906,8 +756,6 @@ pub fn apply(
             if changed {
                 crate::tenancy::bump_epoch(tx, check.tenant)?;
             }
-            // The walk continues while repositories remain or an answer was
-            // unknown; a finished walk waits out the recheck interval.
             let cursor = observed
                 .repos
                 .last()
@@ -925,8 +773,6 @@ pub fn apply(
     }
 }
 
-/// Derive the person's repository grants from the observation and sweep the
-/// ones GitHub no longer stands behind. Returns whether any grant changed.
 fn settle_grants(
     tx: &Transaction<'_>,
     check: &Check,
@@ -937,8 +783,6 @@ fn settle_grants(
 ) -> Result<bool> {
     let mut changed = 0;
     if role == Role::TenantAdmin {
-        // An administrator reaches every repository of the tenant already; a
-        // derived grant beside that would only outlive a demotion.
         changed += tx.execute(
             "DELETE FROM repo_grants WHERE tenant_id = ?1 AND user_id = ?2 AND synced_ms IS NOT NULL",
             params![check.tenant.as_bytes(), check.user.as_bytes()],
@@ -974,8 +818,6 @@ fn settle_grants(
                 )
                 .optional()?;
             if current == Some(i64::from(bits.bits())) {
-                // Unchanged: only the confirmation time moves, and moving it
-                // is not a change of anyone's access.
                 tx.execute(
                     "UPDATE repo_grants SET synced_ms = ?4
                      WHERE tenant_id = ?1 AND user_id = ?2 AND repo_id = ?3",
@@ -988,8 +830,6 @@ fn settle_grants(
                 )?;
                 continue;
             }
-            // Only a repository bound to the installation can be granted; the
-            // composite foreign key also refuses another tenant's.
             changed += tx.execute(
                 "INSERT INTO repo_grants(tenant_id, user_id, repo_id, permissions, synced_ms)
                  SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS(
@@ -1008,8 +848,6 @@ fn settle_grants(
             )?;
         }
     }
-    // A repository no longer on the installation's list (its binding was
-    // revoked), and a grant GitHub has not confirmed within the grace period.
     changed += tx.execute(
         "DELETE FROM repo_grants WHERE tenant_id = ?1 AND user_id = ?2 AND synced_ms IS NOT NULL
          AND (synced_ms <= ?3 OR repo_id NOT IN (
@@ -1032,8 +870,6 @@ const fn role_label(role: Role) -> &'static str {
     }
 }
 
-/// Drop a pair whose target no longer exists (the tenant stopped being
-/// GitHub-backed), fenced by the sequence the pass read.
 pub fn finish(tx: &Transaction<'_>, check: &Check) -> Result<()> {
     drop_row(tx, check)
 }
@@ -1046,8 +882,6 @@ fn drop_row(tx: &Transaction<'_>, check: &Check) -> Result<()> {
     Ok(())
 }
 
-/// Park the row at `next_ms` under the fence; a request that arrived while the
-/// pass ran bumped `seq`, so this does nothing and the row stays due.
 fn reschedule(
     tx: &Transaction<'_>,
     check: &Check,
@@ -1089,8 +923,6 @@ fn retry(tx: &Transaction<'_>, check: &Check, now: UnixMillis) -> Result<()> {
     retry_at(tx, check, now, check.cursor)
 }
 
-/// A failed or unknown pass: count it, back off (doubling to five minutes),
-/// and keep the walk's place.
 fn retry_at(
     tx: &Transaction<'_>,
     check: &Check,
@@ -1107,9 +939,6 @@ fn retry_at(
     )
 }
 
-/// The lane could not even ask (no token, GitHub unreachable): the same as an
-/// unknown answer, without an identity to compare. Kept separate so the lane
-/// does not have to fabricate an observation.
 pub fn unreachable(
     tx: &Transaction<'_>,
     check: &Check,
@@ -1152,8 +981,6 @@ pub fn unreachable(
         }
         None => {}
     }
-    // Honour GitHub's own "later" within a bound; never retry sooner than the
-    // ordinary back-off.
     let attempts = check.attempts.saturating_add(1);
     let wait = crate::checks::backoff_ms(attempts).max(
         retry_after_ms
@@ -1170,16 +997,12 @@ pub fn unreachable(
     Ok("kept: unreachable")
 }
 
-/// One member as the members list shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Source {
-    /// The membership was derived from GitHub.
     pub github: bool,
-    /// When GitHub last confirmed it.
     pub synced: Option<UnixMillis>,
 }
 
-/// Where one membership comes from; `None` when the person is not a member.
 pub fn source(conn: &Connection, tenant: TenantId, user: UserId) -> Result<Option<Source>> {
     Ok(conn
         .prepare_cached("SELECT synced_ms FROM memberships WHERE tenant_id = ?1 AND user_id = ?2")?

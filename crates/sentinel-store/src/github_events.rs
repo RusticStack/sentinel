@@ -1,5 +1,4 @@
-//! Authenticated GitHub control events. Receipt, revocation and rerequest commit
-//! together; network refreshes never run on the writer.
+//! Receipt, revocation and rerequest commit together; network refreshes never run on the writer.
 use crate::{Error, Result, checks, intake, runs, sources_forge};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{InstallationId, JobState, RepoId, RunId, UnixMillis};
@@ -25,9 +24,6 @@ pub enum Event {
         installation: u64,
         repository: u64,
     },
-    /// Organization membership or access changed ([`crate::github_members`]):
-    /// `user` is the numeric GitHub account id concerned, `None` for the whole
-    /// organization; `removed` is a signed `member_removed`.
     Members {
         installation: u64,
         user: Option<u64>,
@@ -35,8 +31,6 @@ pub enum Event {
     },
 }
 
-/// Only the signature-verified adapter calls this. Positive events enqueue a
-/// fresh API snapshot; webhook bodies never confer grants.
 pub fn accept(
     tx: &Transaction<'_>,
     delivery: &str,
@@ -120,7 +114,6 @@ pub fn accept(
             Event::Repository { repository, .. } => {
                 let repository =
                     i64::try_from(*repository).map_err(|_| Error::InvalidInput("repository"))?;
-                // Approved remotes never silently follow a rename or transfer.
                 tx.execute("UPDATE source_bindings SET revoked=1,credential=x'',version=version+1 WHERE installation_id=?1 AND forge_repo_id=?2 AND revoked=0",params![id.as_bytes(),repository])?;
                 "repository_rebind_required".into()
             }
@@ -136,9 +129,6 @@ pub fn accept(
     Ok((outcome, false))
 }
 
-/// A membership event for a bound installation. Only a tenant that is
-/// GitHub-backed by *this* installation is touched; everything positive is a
-/// hint that schedules a check, and a signed removal also revokes at once.
 fn members(
     tx: &Transaction<'_>,
     installation: InstallationId,
@@ -176,15 +166,8 @@ fn members(
     }
 }
 
-/// Receipts younger than this are kept whatever retention an operator asks
-/// for: a receipt is what makes a replayed control event (a signed
-/// `repository` rename that revokes a binding, say) a recorded no-op, and
-/// GitHub redelivers for days, not weeks.
 pub const MIN_RECEIPT_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
-/// Delete control-event receipts older than `before` (and never younger than
-/// [`MIN_RECEIPT_RETENTION_MS`] before `now`), oldest first, at most `limit`
-/// rows. Receipts are the only unbounded table control events write.
 pub fn purge_receipts(
     tx: &Transaction<'_>,
     before: UnixMillis,
@@ -259,11 +242,7 @@ fn rerequest(
         if jobs.len() != spec.pipeline.jobs.len() {
             return Err(Error::Corrupt("run jobs"));
         }
-        // A full immutable DAG rerun preserves attempts, fences and image pins.
-        // Each reset is compare-and-set on the terminal state just read, so a
-        // job that moved in between is never overwritten.
-        // The reset jobs queue on the deadline clock their queue timeout is
-        // decided against, not the caller's wall-clock `now`.
+        // Queued on the steady clock that queue timeouts are judged against, not `now`.
         let queued = UnixMillis::steady();
         for ((job, seen), compiled) in jobs.iter().zip(&spec.pipeline.jobs) {
             let ready = compiled.needs.is_empty() && compiled.spec.condition.is_none();
@@ -274,20 +253,13 @@ fn rerequest(
             };
             let reset = tx.execute("UPDATE jobs SET state_code=?1,cancel_requested=0,failure_class=NULL,queued_ms=?2,leased_ms=NULL,preparing_ms=NULL,running_ms=NULL,finalizing_ms=NULL,terminal_ms=NULL WHERE id=?3 AND state_code=?4",params![crate::codec::encode_state(state),if ready{Some(queued.0)}else{None},job.as_bytes(),crate::codec::encode_state(*seen)])?;
             if reset != 1 {
-                // The single writer read these states in this very
-                // transaction: a miss means the row is not what it was.
                 return Err(Error::Corrupt("run job state"));
             }
         }
-        // The rerequest starts the cancelled run over: its run-level flag
-        // goes with the jobs' (docs/checks.md), or the run could never
-        // fetch its source again.
         tx.execute(
             "UPDATE runs SET cancel_requested=0 WHERE id=?1 AND tenant_id=?2",
             params![run.as_bytes(), tenant.as_bytes()],
         )?;
-        // Jobs with an `if` were blocked above; decide them against the
-        // event the run already carries.
         crate::dispatch::release_dependents(tx, tenant, run, now)?;
         checks::record_run(tx, tenant, run, now)?;
         reran = true;
@@ -323,16 +295,10 @@ pub struct Refresh {
 pub fn due(conn: &Connection, now: UnixMillis) -> Result<Option<Refresh>> {
     Ok(conn.query_row("SELECT id,kind,seq,attempts FROM github_refresh WHERE next_ms<=?1 ORDER BY next_ms,id LIMIT 1",[now.0],|r|Ok(Refresh{id:r.get(0)?,kind:r.get(1)?,seq:r.get(2)?,attempts:r.get(3)?})).optional()?)
 }
-/// Failed passes after which a row is quarantined: it waits an hour between
-/// attempts instead of the five-minute back-off ceiling.
 pub const QUARANTINE_AFTER: u32 = 12;
 const QUARANTINE_MS: i64 = 60 * 60 * 1000;
 
-/// Park the row under the sequence fence. `retry` counts a failed pass and
-/// backs off (doubling to five minutes, then an hour once the row has failed
-/// [`QUARANTINE_AFTER`] times); otherwise the attempts reset and the row owes
-/// the next periodic pass. Every outcome moves `next_ms` into the future: a
-/// row is never left due, so a poison row cannot spin the lane.
+/// Every outcome moves `next_ms` forward, so a poison row cannot spin the lane.
 pub fn settled(tx: &Transaction<'_>, work: &Refresh, now: UnixMillis, retry: bool) -> Result<()> {
     let attempts = if retry {
         work.attempts.saturating_add(1)
@@ -353,9 +319,6 @@ pub fn settled(tx: &Transaction<'_>, work: &Refresh, now: UnixMillis, retry: boo
     Ok(())
 }
 
-/// What a kind-0 refresh needs before the network call: the installation's
-/// external id and the lifecycle version the snapshot must be applied
-/// against, read at pick time so a newer webhook lands first.
 pub struct InstallTarget {
     pub external: u64,
     pub expected: u64,
@@ -374,20 +337,13 @@ pub fn install_target(conn: &Connection, id: &[u8; 16]) -> Result<Option<Install
     .transpose()
 }
 
-/// What a kind-1 refresh needs before the network call: the binding under the
-/// repository, the installation it trusts and the identity GitHub must still
-/// report for the binding to stay valid.
 pub struct RepoTarget {
     pub repo: RepoId,
     pub forge_repo: u64,
     pub remote: String,
-    /// The installation row id, for scheduling a kind-0 pass when the
-    /// installation itself answers "access refused".
     pub installation: [u8; 16],
     pub installation_external: u64,
     pub account: u64,
-    /// The binding's version when it was read: a revocation computed from this
-    /// read applies only while the binding still has it.
     pub version: i64,
 }
 
@@ -414,11 +370,6 @@ pub fn repo_target(conn: &Connection, id: &[u8; 16]) -> Result<Option<RepoTarget
     .transpose()
 }
 
-/// The repositories one installation's bindings name, with the approved
-/// remote each must still match, and the version each binding had when read:
-/// (repo, forge repository id, remote, version). Read this *before* asking
-/// GitHub for the repository list, so a binding created in between is never
-/// judged against a list that predates it.
 pub fn bound_repositories(
     conn: &Connection,
     installation: &[u8; 16],
@@ -447,21 +398,11 @@ pub fn bound_repositories(
     Ok(out)
 }
 
-/// One binding revoked: the row stays, its credential is destroyed and the
-/// version moves so a sealed copy can never be re-opened for new work. The
-/// revocation is fenced on the `version` the verdict was computed from: a
-/// binding that was changed or re-created since keeps its new state, and the
-/// next periodic pass judges it afresh.
 fn revoke_binding(tx: &Transaction<'_>, repo: RepoId, version: i64) -> Result<()> {
     tx.execute("UPDATE source_bindings SET revoked=1,credential=x'',version=version+1 WHERE repo_id=?1 AND version=?2 AND revoked=0",params![repo.as_bytes(),version])?;
     Ok(())
 }
 
-/// Apply an authenticated installation snapshot, then revoke every binding
-/// the reconcile lane proved GitHub no longer grants or names differently.
-/// `sources_forge::refresh` fences the snapshot on the lifecycle version read
-/// at pick time; `Conflict` means a newer event landed — the caller retries
-/// the whole pass rather than writing a stale truth.
 pub fn apply_installation(
     tx: &Transaction<'_>,
     work: &Refresh,
@@ -476,9 +417,6 @@ pub fn apply_installation(
     settled(tx, work, now, false)
 }
 
-/// The installation is confirmed gone — the API answered 404, the one answer
-/// that revokes. Disable issuance and revoke every binding that trusted it;
-/// a reinstalled App is a new installation identity, never this one.
 pub fn installation_gone(tx: &Transaction<'_>, work: &Refresh, id: &[u8; 16]) -> Result<()> {
     let id = InstallationId::from_bytes(*id).map_err(|_| Error::Corrupt("installation"))?;
     sources_forge::remove(tx, id)?;
@@ -486,8 +424,6 @@ pub fn installation_gone(tx: &Transaction<'_>, work: &Refresh, id: &[u8; 16]) ->
     finished(tx, work)
 }
 
-/// Settle a repository check: revoke the binding when GitHub disowned,
-/// renamed or archived it, then park the row for the next periodic pass.
 pub fn apply_repository(
     tx: &Transaction<'_>,
     work: &Refresh,
@@ -502,8 +438,6 @@ pub fn apply_repository(
     settled(tx, work, now, false)
 }
 
-/// Drop a refresh row whose target no longer exists. Guarded by `seq` like
-/// [`settled`]: a rescheduled row is never deleted under a stale pass.
 pub fn finished(tx: &Transaction<'_>, work: &Refresh) -> Result<()> {
     tx.execute(
         "DELETE FROM github_refresh WHERE id=?1 AND seq=?2",
