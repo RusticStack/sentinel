@@ -127,8 +127,8 @@ struct FileConfig {
     // Server: optional Resend delivery of verification and invitation mail;
     // `SENTINEL_RESEND_API_KEY_FILE` and `SENTINEL_EMAIL_FROM` override these keys.
     mail: Option<MailFile>,
-    // Worker: the controller's `tc…` address, as written to its `<data_dir>/tailcat/address`
-    //. Required to dial a controller through the helper.
+    // Worker: the controller's `tc…` address, as written to its `<data_dir>/tailcat/address`.
+    // Required to dial a controller through the helper.
     tailcat_address: Option<String>,
 }
 

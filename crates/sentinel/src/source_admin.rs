@@ -3,9 +3,9 @@
 //! Repository binding has two legitimate authorities: an authenticated tenant
 //! administrator through the same live authorization layer as every other
 //! client operation, and the controller's own host — the operator who can
-//! already open the database. The CLI is the second; the future API route is
-//! the first. A host-local operation still records which account it is
-//! attributed to.
+//! already open the database. The CLI is the second; the API route
+//! `POST /tenants/{slug}/repos` is the first. A host-local
+//! operation still records which account it is attributed to.
 use crate::{
     admin::{self, Error},
     cli::{SourceArgs, SourceCommand},
