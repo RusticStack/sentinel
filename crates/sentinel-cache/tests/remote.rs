@@ -1,14 +1,3 @@
-//! Remote cache hydration: cold transfer through an in-memory
-//! controller, resume from an interrupted transfer, refusal of corrupt or
-//! wrong-scope bytes, and the rule that a local hit never networks.
-//!
-//! The fake controller implements the worker-side `Remote` seam exactly
-//! as the link does — it receives `Need`s, serves `Grant`/`Chunk`s and
-//! stores `Upload`s — so what these cases exercise is the real driver:
-//! `restore::restore_remote` on a local miss, the staging generation under
-//! `writing/`, the stream and listing verification, and the atomic
-//! promotion the store then serves locally.
-
 use std::{
     collections::HashMap,
     fs,
@@ -78,8 +67,6 @@ fn entry_of(root: &Path, scope: &Scope) -> PathBuf {
     scope.entry_dir(root, attach::entry_key(scope.class, KEY))
 }
 
-/// Build one sealed generation directly on disk — the same shape publish
-/// writes — and return its directory name.
 fn seal_generation(
     root: &Path,
     scope: &Scope,
@@ -133,13 +120,7 @@ fn attached_for(scope: &Scope) -> Attached {
     }
 }
 
-/// A policy whose deadline no test run reaches. The restore-cost bound is
-/// wall-clock: it projects the remaining time from the rate measured so far
-/// (resume hashing and staging fsyncs included), so under a loaded machine a
-/// real 5 s budget aborted resumes these tests expect to finish. Behavior
-/// tests do not depend on the clock; the budget itself is proven
-/// deterministically by
-/// `a_transfer_past_its_deadline_keeps_its_partial_for_the_next_attempt`.
+/// Deadline far past any run, so the wall-clock restore budget never aborts these behavior tests.
 fn policy<'a>(source: &'a dyn Remote) -> remote::Policy<'a> {
     remote::Policy {
         source,
@@ -156,29 +137,17 @@ fn entry_id(repo: [u8; 16], name: &str, key: &str) -> String {
     format!("{hex}/{name}/{key}")
 }
 
-/// An in-memory controller: offers store canonical streams, fetches serve
-/// them, and the interrupt/corrupt knobs stage the failures.
 #[derive(Default)]
 struct Fake {
     bundles: Mutex<HashMap<String, Vec<u8>>>,
-    /// Cut this fetch short after this many bytes were served.
     interrupt: Mutex<Option<u64>>,
-    /// Flip one byte in the next chunk at this offset within the chunk.
     corrupt: Mutex<Option<usize>>,
-    /// Answer the next fetch `busy` before serving anything.
     busy: Mutex<bool>,
     fetches: AtomicUsize,
     offers: AtomicUsize,
-    /// Per fetch: the offset served from and the bytes served.
     transfers: Mutex<Vec<(u64, u64)>>,
-    /// Behave like a protocol-9 controller: take an offer's digest at its
-    /// end, hashing the bytes as they arrive.
     at_end: bool,
-    /// The digest each offer's `Upload` carried.
     offered: Mutex<Vec<[u8; 32]>>,
-    /// After the first chunk of the next fetch, hold the rest until the
-    /// fetch's deadline has passed: a link too slow for the budget, made
-    /// deterministic.
     outlast: Mutex<bool>,
 }
 
@@ -192,8 +161,6 @@ impl Fake {
             .cloned()
     }
 
-    /// Re-key a stored bundle under another entry — how a wrong-scope
-    /// bundle ends up offered for the entry under test.
     fn move_bundle(&self, from: &Scope, to: &Scope) {
         let from = entry_id(*from.repo.as_bytes(), &from.name, KEY);
         let to = entry_id(*to.repo.as_bytes(), &to.name, KEY);
@@ -321,7 +288,6 @@ impl Remote for Fake {
     }
 }
 
-/// A transport that must never be reached: any call is a test failure.
 struct NeverCalled;
 
 impl Remote for NeverCalled {
@@ -333,8 +299,6 @@ impl Remote for NeverCalled {
     }
 }
 
-/// Offer `generation` through the worker-side driver, exactly as an
-/// attempt's finalization does.
 fn offer(fake: &Fake, root: &Path, scope: &Scope, generation: &str) -> [u8; 32] {
     let attached = attached_for(scope);
     remote::offer_generation(
@@ -349,9 +313,6 @@ fn offer(fake: &Fake, root: &Path, scope: &Scope, generation: &str) -> [u8; 32] 
     .expect("offer")
 }
 
-/// The stream prefix a staging generation holds: the raw head while it is
-/// still arriving, else the head, the generation's `manifest` and `files`,
-/// and every payload byte staged so far.
 fn staged_bytes(stage: &Path) -> u64 {
     let prefix = stage.join("prefix.part");
     if prefix.exists() {
@@ -410,8 +371,6 @@ fn cold_hydration_serves_the_job_and_installs_a_local_copy() {
         .generation
         .clone()
         .expect("the served hit names a generation");
-    // The name is this worker's own: the sealed time from the manifest
-    // plus a fresh random tail, exactly as a publication derives it.
     assert!(installed.starts_with("gen-1500000-"), "{installed}");
     assert_eq!(
         cold.stats.remote_from, None,
@@ -422,15 +381,12 @@ fn cold_hydration_serves_the_job_and_installs_a_local_copy() {
     assert!(cold.lease.is_some(), "the promoted generation stays pinned");
     assert_eq!(fake.fetches.load(Ordering::SeqCst), 1);
 
-    // The job's view is the payload, byte for byte.
     assert_eq!(fs::read(ws1.join("vendor/lib")).unwrap(), b"payload-one");
     assert_eq!(
         fs::read(ws1.join("vendor/sub/tool")).unwrap(),
         b"tool-bytes"
     );
 
-    // It was installed: `current` names a generation under the entry and
-    // the store's own lookup serves it.
     let entry = entry_of(&root_b, &scope);
     let current = fs::read_to_string(entry.join(scope::CURRENT_NAME)).unwrap();
     assert_eq!(current.trim(), installed);
@@ -444,7 +400,6 @@ fn cold_hydration_serves_the_job_and_installs_a_local_copy() {
     );
     assert!(matches!(stored, Outcome::Hit(_)), "{stored:?}");
 
-    // A later attempt hits locally: the transport is never consulted.
     let warm = hydrate(&root_b, &ws2, &scope, &NeverCalled);
     assert!(
         matches!(warm.outcome, Outcome::Hit(_)),
@@ -455,8 +410,6 @@ fn cold_hydration_serves_the_job_and_installs_a_local_copy() {
     assert_eq!(fake.fetches.load(Ordering::SeqCst), 1);
     assert_eq!(fake.offers.load(Ordering::SeqCst), 1);
 
-    // The offered bytes are the canonical stream of exactly this
-    // generation: its digest and length are what the controller stored.
     let stream = fake.stored(&scope).unwrap();
     assert_eq!(blake3::hash(&stream).as_bytes(), &digest);
     let dir = entry_of(&root_a, &scope).join(&generation);
@@ -475,7 +428,6 @@ fn an_interrupted_transfer_resumes_from_its_partial() {
     let scope = test_scope(Trust::Protected);
     fs::create_dir_all(&root_b).unwrap();
 
-    // A payload big enough to need several chunks.
     let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
     let generation = seal_generation(
         &root_a,
@@ -486,8 +438,6 @@ fn an_interrupted_transfer_resumes_from_its_partial() {
     let fake = Fake::default();
     offer(&fake, &root_a, &scope, &generation);
 
-    // First attempt: cut after ~16 KiB — past the head, mirror and parts
-    // of the payload, so the partial is a real stream prefix.
     *fake.interrupt.lock().unwrap_or_else(|p| p.into_inner()) = Some(16 * 1024);
     let cut = hydrate(&root_b, &ws, &scope, &fake);
     assert_eq!(
@@ -497,7 +447,6 @@ fn an_interrupted_transfer_resumes_from_its_partial() {
         cut.outcome
     );
 
-    // The partial survived, shorter than the whole stream.
     let part = entry_of(&root_b, &scope)
         .join(scope::WRITING_NAME)
         .join("remote.stage");
@@ -505,8 +454,6 @@ fn an_interrupted_transfer_resumes_from_its_partial() {
     let total = fake.stored(&scope).unwrap().len() as u64;
     assert!(partial > 0 && partial < total, "{partial} of {total}");
 
-    // Second attempt resumes exactly where the first stopped: nothing
-    // before that offset is sent again.
     let resumed = hydrate(&root_b, &ws, &scope, &fake);
     assert!(
         matches!(resumed.outcome, Outcome::Hit(_)),
@@ -551,8 +498,6 @@ fn a_corrupt_chunk_is_a_miss_and_never_serves() {
     let fake = Fake::default();
     offer(&fake, &root_a, &scope, &generation);
 
-    // One flipped byte in the first chunk: the running digest catches it
-    // at that chunk.
     *fake.corrupt.lock().unwrap_or_else(|p| p.into_inner()) = Some(10);
     let refused = hydrate(&root_b, &ws, &scope, &fake);
     assert_eq!(
@@ -562,8 +507,6 @@ fn a_corrupt_chunk_is_a_miss_and_never_serves() {
         refused.outcome
     );
 
-    // Nothing of the transfer is visible: no view, no pointer, and the
-    // partial that can never verify was dropped rather than kept.
     assert!(!ws.join("vendor/blob").exists());
     let entry = entry_of(&root_b, &scope);
     assert!(!entry.join(scope::CURRENT_NAME).exists());
@@ -582,7 +525,6 @@ fn a_bundle_sealed_for_another_scope_never_serves() {
     let (root_a, root_b) = (temp.path().join("a"), temp.path().join("b"));
     let ws = temp.path().join("ws");
     let scope = test_scope(Trust::Protected);
-    // The same entry identity, sealed under the other trust class.
     let mut foreign = test_scope(Trust::PullRequest);
     foreign.tenant = scope.tenant;
     foreign.repo = scope.repo;
@@ -596,8 +538,6 @@ fn a_bundle_sealed_for_another_scope_never_serves() {
     );
     let fake = Fake::default();
     offer(&fake, &root_a, &foreign, &generation);
-    // The bundle is served for *this* entry, as a peer holding the same
-    // repo/key but the wrong trust boundary would be.
     fake.move_bundle(&foreign, &scope);
 
     let refused = hydrate(&root_b, &ws, &scope, &fake);
@@ -618,9 +558,6 @@ fn a_bundle_sealed_for_another_scope_never_serves() {
     );
 }
 
-/// The head is checked against the request as soon as it is whole,
-/// so a bundle for another scope is refused after its first chunk instead
-/// of after its whole payload crossed the link and landed on disk.
 #[test]
 fn a_foreign_head_stops_the_transfer_before_its_payload() {
     let temp = tempfile::tempdir().unwrap();
@@ -677,7 +614,6 @@ fn a_controller_without_the_bundle_leaves_the_local_miss() {
         "gen-1500000-0000abd1",
     );
     let fake = Fake::default();
-    // Offered under a *different* repo, so this entry has no bundle.
     offer(&fake, &root_a, &other, &generation);
     let missed = hydrate(&root_b, &ws, &scope, &fake);
     assert_eq!(
@@ -698,8 +634,6 @@ fn a_controller_without_the_bundle_leaves_the_local_miss() {
     );
 }
 
-/// A transfer refused for now (`busy`) keeps the valid partial an
-/// earlier attempt left; the next attempt resumes it.
 #[test]
 fn a_busy_answer_keeps_a_valid_partial() {
     let temp = tempfile::tempdir().unwrap();
@@ -732,11 +666,6 @@ fn a_busy_answer_keeps_a_valid_partial() {
     assert_eq!(resumed.stats.remote_from, Some(partial));
 }
 
-/// The restore-cost bound: a transfer still running when the job's
-/// hydration deadline passes stops at the next chunk as a miss, keeps what
-/// it staged, and the next attempt (with budget) resumes it. The fake holds
-/// the second chunk until the deadline has passed, so this is decided by
-/// the clock only in the direction the test asserts.
 #[test]
 fn a_transfer_past_its_deadline_keeps_its_partial_for_the_next_attempt() {
     let temp = tempfile::tempdir().unwrap();
@@ -779,9 +708,6 @@ fn a_transfer_past_its_deadline_keeps_its_partial_for_the_next_attempt() {
     assert_eq!(resumed.stats.remote_from, Some(partial));
 }
 
-/// Hydrations share the job's one deadline — a policy whose
-/// deadline already passed never reaches the transport, so N caches can
-/// never cost N budgets.
 #[test]
 fn a_spent_job_deadline_never_networks() {
     let temp = tempfile::tempdir().unwrap();
@@ -822,7 +748,6 @@ fn upload_for(scope: &Scope, stream: &[u8]) -> Upload {
     )
 }
 
-/// Receive `stream` into the controller store exactly as a session does.
 fn receive(store: &Path, scope: &Scope, stream: &[u8]) {
     let upload = upload_for(scope, stream);
     let mut receiving = remote::Receiving::begin(store, &upload)
@@ -844,9 +769,6 @@ fn bundles(entry: &Path) -> Vec<String> {
     names
 }
 
-/// A second generation supersedes the first — the entry keeps one
-/// bundle — and the store sweep removes stale upload staging and evicts
-/// whole entries least recently served first under its budget.
 #[test]
 fn the_controller_store_keeps_one_bundle_per_entry_and_a_byte_budget() {
     let temp = tempfile::tempdir().unwrap();
@@ -861,7 +783,6 @@ fn the_controller_store_keeps_one_bundle_per_entry_and_a_byte_budget() {
         .plan();
     assert_eq!(served.digest, *blake3::hash(&[2u8; 3000]).as_bytes());
 
-    // A second entry, served more recently than the first.
     let other = test_scope(Trust::Protected);
     receive(&store, &other, &[3u8; 5000]);
     let past = std::time::SystemTime::now() - Duration::from_secs(3600);
@@ -871,7 +792,6 @@ fn the_controller_store_keeps_one_bundle_per_entry_and_a_byte_budget() {
         .unwrap()
         .set_modified(past)
         .unwrap();
-    // An abandoned upload's staging from long ago.
     fs::create_dir_all(entry.join(scope::WRITING_NAME)).unwrap();
     let stale = entry.join(scope::WRITING_NAME).join("dead.part");
     fs::write(&stale, b"half").unwrap();
@@ -886,8 +806,6 @@ fn the_controller_store_keeps_one_bundle_per_entry_and_a_byte_budget() {
     assert_eq!(swept.bytes, 5000);
 }
 
-/// An upload abandoned mid-stream removes its staging file and
-/// releases the entry, so the next offer is not `busy`.
 #[test]
 fn an_abandoned_upload_leaves_nothing_behind() {
     let temp = tempfile::tempdir().unwrap();
@@ -910,10 +828,6 @@ fn an_abandoned_upload_leaves_nothing_behind() {
     assert_eq!(bundles(&entry_of(&store, &scope)).len(), 1);
 }
 
-/// An upload is verified as it lands — a stream whose bytes do not
-/// hash to the offered digest is refused at its end without a re-read, and
-/// a serve reproduces the stored stream through one reused chunk buffer,
-/// resuming only from a proven prefix.
 #[test]
 fn uploads_verify_as_they_land_and_serves_resume_only_proven_prefixes() {
     let temp = tempfile::tempdir().unwrap();
@@ -952,11 +866,6 @@ fn uploads_verify_as_they_land_and_serves_resume_only_proven_prefixes() {
     }
 }
 
-/// Protocol 9: a controller that takes the digest at the end gets
-/// an upload naming `DIGEST_AT_END`, and the digest it stores is the same
-/// content address the digest-first path computes — the stream is read
-/// once instead of hashed in a pass of its own first. The stored bundle
-/// then hydrates like any other.
 #[test]
 fn an_offer_to_a_protocol_9_controller_states_its_digest_at_the_end() {
     let temp = tempfile::tempdir().unwrap();
@@ -986,10 +895,6 @@ fn an_offer_to_a_protocol_9_controller_states_its_digest_at_the_end() {
     assert_eq!(fs::read(ws.join("vendor/lib")).unwrap(), b"payload-one");
 }
 
-/// The controller's half of a digest-at-end offer: staged under the
-/// attempt, promoted under the digest the end names once the running hash
-/// proves it, and refused — leaving nothing — when the end names a digest
-/// the bytes do not hash to, or names none.
 #[test]
 fn the_store_takes_a_digest_at_the_end_only_when_the_bytes_prove_it() {
     let temp = tempfile::tempdir().unwrap();

@@ -1,8 +1,3 @@
-//! Reclamation: leases pin entries, stale staging is collected, retention
-//! keeps `current` plus one spare, and the byte budget evicts oldest-first.
-//! Runs through `gc::sweep_at` so the clock can move without waiting out
-//! `MAX_TTL`.
-
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -46,8 +41,6 @@ fn now_ms() -> i64 {
     UnixMillis::now().0
 }
 
-/// A sealed generation whose manifest claims `bytes` of payload (what the
-/// sweep accounts), plus one real file so the tree is not empty.
 fn make_gen(entry: &Path, scope: &Scope, key: &str, name: &str, bytes: u64) -> PathBuf {
     let dir = entry.join(name);
     fs::create_dir_all(dir.join("payload/0")).unwrap();
@@ -93,8 +86,6 @@ fn set_current(entry: &Path, name: &str) {
     fs::write(entry.join(scope::CURRENT_NAME), name).unwrap();
 }
 
-/// `sweep_at` with the clock pushed past `MAX_TTL`, so anything mtime-bound
-/// reads stale.
 fn far_future() -> i64 {
     now_ms() + (2 * lease::MAX_TTL.as_millis() as i64)
 }
@@ -110,7 +101,6 @@ fn an_active_lease_keeps_every_generation() {
     make_gen(&entry, &scope, "deps-aa", "gen-300-00000003", 100);
     set_current(&entry, "gen-300-00000003");
 
-    // A pin covers the whole entry, even the oldest non-current generation.
     let pin = Lease::acquire(&entry, "reader-1", lease::DEFAULT_TTL).unwrap();
     let stats = sweep_at(
         &root,
@@ -122,7 +112,6 @@ fn an_active_lease_keeps_every_generation() {
     assert_eq!(stats.leases_active, 1);
     assert_eq!(stats.generations_removed, 0);
     assert_eq!(gens(&entry).len(), 3);
-    // A pinned entry still reports its occupancy.
     assert_eq!(stats.generations_seen, 3);
     assert_eq!(stats.payload_bytes, 300);
     pin.release().unwrap();
@@ -139,8 +128,6 @@ fn an_expired_lease_lets_old_generations_go() {
     make_gen(&entry, &scope, "deps-aa", "gen-300-00000003", 100);
     set_current(&entry, "gen-300-00000003");
 
-    // The body declares the marker expired, so its fresh mtime cannot
-    // keep it alive.
     let lease_dir = entry.join(scope::LEASE_NAME);
     fs::create_dir_all(&lease_dir).unwrap();
     fs::write(lease_dir.join("l-dead"), b"1 dead-reader").unwrap();
@@ -152,7 +139,6 @@ fn an_expired_lease_lets_old_generations_go() {
         now_ms(),
     );
     assert_eq!(stats.leases_expired, 1);
-    // current + the one spare stay; the oldest goes.
     assert_eq!(
         gens(&entry),
         ["gen-200-00000002".to_owned(), "gen-300-00000003".to_owned()]
@@ -179,7 +165,6 @@ fn retention_keeps_current_plus_one_spare_oldest_first() {
     {
         make_gen(&entry, &scope, "deps-aa", name, 10 + i as u64);
     }
-    // `current` names the second-oldest; the newest stays as the spare.
     set_current(&entry, "gen-2-00000002");
     let stats = sweep_at(
         &root,
@@ -193,7 +178,6 @@ fn retention_keeps_current_plus_one_spare_oldest_first() {
         ["gen-2-00000002".to_owned(), "gen-4-00000004".to_owned()]
     );
     assert_eq!(stats.bytes_freed, 10 + 12);
-    // Occupancy counts what the pass saw, before its own removals.
     assert_eq!(stats.generations_seen, 4);
     assert_eq!(stats.payload_bytes, 10 + 11 + 12 + 13);
 }
@@ -207,7 +191,6 @@ fn over_budget_evicts_oldest_first_across_entries() {
     let e1 = entry(&root, &s1, "deps-aa");
     let e2 = entry(&root, &s2, "vendor-bb");
 
-    // e1: current 600 + spare 600.  e2: current 600 + spare 600.
     make_gen(&e1, &s1, "deps-aa", "gen-100-00000001", 600);
     make_gen(&e1, &s1, "deps-aa", "gen-300-00000003", 600);
     set_current(&e1, "gen-300-00000003");
@@ -215,15 +198,12 @@ fn over_budget_evicts_oldest_first_across_entries() {
     make_gen(&e2, &s2, "vendor-bb", "gen-400-00000004", 600);
     set_current(&e2, "gen-400-00000004");
 
-    // Total 2400 over a budget of 1200: both spares go and the currents fit.
     let stats = sweep_at(&root, 1200, gc::DEFAULT_PASS_WORK, now_ms());
     assert_eq!(gens(&e1), ["gen-300-00000003".to_owned()]);
     assert_eq!(gens(&e2), ["gen-400-00000004".to_owned()]);
     assert_eq!(stats.generations_removed, 2);
     assert_eq!(stats.bytes_freed, 1200);
 
-    // A tighter budget evicts spares first, then whole entries least
-    // recently used first: e2 was used before e1, so it goes.
     make_gen(&e1, &s1, "deps-aa", "gen-500-00000005", 600);
     set_current(&e1, "gen-500-00000005");
     age_current(&e2, 3_600_000);
@@ -235,7 +215,6 @@ fn over_budget_evicts_oldest_first_across_entries() {
     assert_eq!(stats.estimated_bytes, 600);
 }
 
-/// Move `current`'s mtime `ms` into the past: its last use.
 fn age_current(entry: &Path, ms: u64) {
     let file = fs::OpenOptions::new()
         .write(true)
@@ -245,8 +224,6 @@ fn age_current(entry: &Path, ms: u64) {
         .unwrap();
 }
 
-/// Idle currents are reclaimable: over a tiny budget every unpinned entry
-/// goes, and one idle past `IDLE_TTL` goes even under budget.
 #[test]
 fn budget_evicts_idle_currents_lru_and_ttl_removes_idle_entries() {
     let tmp = tempfile::tempdir().unwrap();
@@ -268,7 +245,6 @@ fn budget_evicts_idle_currents_lru_and_ttl_removes_idle_entries() {
     assert!(entries[0].exists(), "a leased current survives the budget");
     drop(pin);
 
-    // Idle past the TTL: removed under budget, with its empty scope dirs.
     age_current(&entries[0], gc::IDLE_TTL.as_millis() as u64 + 1000);
     let stats = sweep_at(
         &root,
@@ -285,9 +261,6 @@ fn budget_evicts_idle_currents_lru_and_ttl_removes_idle_entries() {
     );
 }
 
-/// With a cursor, passes truncated by the work bound resume where the
-/// previous one stopped, together visit every entry, and each still
-/// enforces the budget.
 #[test]
 fn truncated_passes_cover_every_entry_and_still_enforce_the_budget() {
     let tmp = tempfile::tempdir().unwrap();
@@ -313,8 +286,6 @@ fn truncated_passes_cover_every_entry_and_still_enforce_the_budget() {
     }
     assert!(passes > 1, "the bound must have truncated at least once");
     assert!(seen >= 20, "successive passes covered every entry: {seen}");
-    // The full cycle measured 200 bytes; a truncated pass evicts from the
-    // part it saw.
     let stats = gc::resume_at(&root, 150, 40, now_ms(), &mut cursor);
     assert!(stats.truncated);
     assert!(
@@ -332,13 +303,10 @@ fn stale_staging_is_removed_but_a_fresh_one_stays() {
     make_gen(&entry, &scope, "deps-aa", "gen-100-00000001", 100);
     set_current(&entry, "gen-100-00000001");
 
-    // A crashed writer's remains: staging dir and a dead lock marker.
     let writing = entry.join(scope::WRITING_NAME);
     fs::create_dir_all(writing.join("gen-999-00000009")).unwrap();
     fs::write(writing.join(lease::WRITE_LOCK_NAME), b"1 dead-writer").unwrap();
 
-    // Too fresh to reap: a writer between `create_dir_all` and its marker
-    // must not lose its staging.
     let stats = sweep_at(
         &root,
         gc::DEFAULT_BUDGET_BYTES,
@@ -348,7 +316,6 @@ fn stale_staging_is_removed_but_a_fresh_one_stays() {
     assert_eq!(stats.writing_removed, 0);
     assert!(writing.exists());
 
-    // Past the lease bound the dead writer's tree is collected.
     let stats = sweep_at(
         &root,
         gc::DEFAULT_BUDGET_BYTES,
@@ -367,7 +334,6 @@ fn a_corrupt_current_is_noted_never_panics_and_never_served() {
     let entry = entry(&root, &scope, "deps-aa");
     make_gen(&entry, &scope, "deps-aa", "gen-100-00000001", 100);
     make_gen(&entry, &scope, "deps-aa", "gen-200-00000002", 100);
-    // The pointer names a generation that does not exist.
     set_current(&entry, "gen-9-00000009");
 
     let stats = sweep_at(
@@ -377,10 +343,8 @@ fn a_corrupt_current_is_noted_never_panics_and_never_served() {
         now_ms(),
     );
     assert_eq!(stats.stale_current, 1);
-    // With nothing current to keep, retention still leaves the newest.
     assert_eq!(gens(&entry), ["gen-200-00000002".to_owned()]);
 
-    // Garbage bytes in the pointer read the same way — no panic.
     fs::write(entry.join(scope::CURRENT_NAME), b"\xff\xfe not a name").unwrap();
     let stats = sweep_at(
         &root,
@@ -396,7 +360,6 @@ fn a_corrupt_current_is_noted_never_panics_and_never_served() {
 fn the_work_bound_stops_a_pass_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("cache");
-    // More scope directories than the bound visits.
     for i in 0..20 {
         let scope = test_scope(&format!("cache{i:02}"));
         let entry = entry(&root, &scope, "k");
@@ -405,7 +368,6 @@ fn the_work_bound_stops_a_pass_cleanly() {
     }
     let stats = sweep_at(&root, gc::DEFAULT_BUDGET_BYTES, 5, now_ms());
     assert!(stats.truncated);
-    // A later full pass still completes the work.
     let full = sweep_at(
         &root,
         gc::DEFAULT_BUDGET_BYTES,
@@ -437,14 +399,12 @@ fn a_reader_mid_clone_keeps_its_generation_through_budget_eviction() {
     make_gen(&entry, &scope, "deps-aa", "gen-200-00000002", 600);
     set_current(&entry, "gen-200-00000002");
 
-    // The pin protects the non-current spare too.
     let pin = Lease::acquire(&entry, "reader-2", Duration::from_secs(60)).unwrap();
     let stats = sweep_at(&root, 10, gc::DEFAULT_PASS_WORK, now_ms());
     assert_eq!(stats.generations_removed, 0);
     assert_eq!(gens(&entry).len(), 2);
     pin.release().unwrap();
 
-    // Released and still over budget: the spare and then the whole entry go.
     let stats = sweep_at(&root, 10, gc::DEFAULT_PASS_WORK, now_ms());
     assert_eq!(stats.generations_removed, 2);
     assert_eq!(stats.entries_removed, 1);
