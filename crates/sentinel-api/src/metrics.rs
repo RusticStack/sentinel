@@ -1,11 +1,4 @@
-//! Scrapeable metrics: `GET /metrics` in the Prometheus text
-//! exposition format, and the request counters the HTTP layer keeps.
-//!
-//! Everything here is either an atomic the hot paths already bump or an
-//! indexed count the store answers from a partial index; a scrape costs a
-//! handful of short reads, never a table scan. A value that cannot be
-//! measured (a platform without `/proc`, a feature not configured) is
-//! absent, never zero.
+//! A value that cannot be measured is absent from the output, never zero.
 
 use std::{
     fmt::Write as _,
@@ -15,20 +8,14 @@ use std::{
 
 use crate::State;
 
-/// Upper bounds of the request-duration histogram, in seconds.
 const BUCKETS: [f64; 10] = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0];
 
-/// What the HTTP layer counts per request.
 #[derive(Default)]
 pub(crate) struct Requests {
-    /// By status class: 1xx … 5xx.
     by_class: [AtomicU64; 5],
-    /// Not cumulative: each request lands in the first bucket whose bound it
-    /// is within, `+Inf` last; `render` accumulates.
+    /// Per-bucket, not cumulative; `render` sums them into the cumulative buckets Prometheus expects.
     buckets: [AtomicU64; BUCKETS.len() + 1],
     micros: AtomicU64,
-    /// Refusals worth watching for: a wrong or missing credential, a
-    /// credential without the right, the admission budgets.
     pub unauthenticated: AtomicU64,
     pub forbidden: AtomicU64,
     pub rate_limited: AtomicU64,
@@ -60,7 +47,6 @@ impl Requests {
         }
     }
 
-    /// The counters as JSON, for the diagnostic bundle.
     pub(crate) fn snapshot(&self) -> serde_json::Value {
         let n = |a: &AtomicU64| a.load(Relaxed);
         let total: u64 = self.by_class.iter().map(n).sum();
@@ -79,7 +65,6 @@ impl Requests {
     }
 }
 
-/// The exposition text being written.
 struct Out(String);
 
 impl Out {
@@ -106,7 +91,6 @@ fn label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-/// The process's own figures ([`sentinel_core::process`]).
 fn process(out: &mut Out) {
     let f = sentinel_core::process::figures();
     if let Some(v) = f.resident_bytes {
@@ -236,7 +220,6 @@ pub(crate) fn render(state: &State) -> String {
         state.subscribers.held(),
     );
 
-    // Queue and fleet, from partial indexes.
     let queue = state.store.read(|c| {
         let count =
             |sql: &str| -> sentinel_store::Result<i64> { Ok(c.query_row(sql, [], |r| r.get(0))?) };
@@ -293,7 +276,6 @@ pub(crate) fn render(state: &State) -> String {
         out.value("sentinel_workers", "state=\"draining\"", draining);
     }
 
-    // The worker link's own counters.
     let s = state.controller.stats();
     out.family(
         "sentinel_link_events_total",
@@ -344,7 +326,6 @@ pub(crate) fn render(state: &State) -> String {
         state.logs.open_writers(),
     );
 
-    // Disk and storage.
     if let Some(a) = state.objects.admission() {
         out.one(
             "sentinel_storage_free_bytes",
@@ -438,7 +419,6 @@ pub(crate) fn render(state: &State) -> String {
         );
     }
 
-    // GitHub check publication, from its partial indexes.
     if let Ok((pending, refused, oldest)) = state.store.read(|c| {
         Ok((
             c.query_row(
