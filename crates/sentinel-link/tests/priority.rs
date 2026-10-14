@@ -553,6 +553,7 @@ fn a_failing_bulk_redial_never_delays_the_control_teardown() {
     let config = sentinel_link::worker::Config {
         controller: addr,
         server: sentinel_auth::secret::Digest([0; 32]),
+        also_pinned: Vec::new(),
         worker: worker_id,
         name: "bulk-backoff".into(),
         hello: hello(),

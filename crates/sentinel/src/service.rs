@@ -84,6 +84,9 @@ struct FileConfig {
     // Worker: which controller to reach and how to trust it.
     controller: Option<String>,
     controller_fingerprint: Option<String>,
+    // Worker: further controller fingerprints trusted during a certificate
+    // rotation (at most three beside `controller_fingerprint`).
+    controller_fingerprint_also: Option<Vec<String>>,
     worker_name: Option<String>,
     enrollment_file: Option<PathBuf>,
     cpu_millis: Option<u64>,
@@ -391,6 +394,8 @@ impl StorageFile {
 struct WorkerLink {
     controller: SocketAddr,
     fingerprint: [u8; 32],
+    /// Rotation overlap: fingerprints trusted beside `fingerprint`.
+    also_fingerprints: Vec<[u8; 32]>,
     name: String,
     enrollment_file: Option<PathBuf>,
     cpu_millis: Option<u64>,
@@ -523,6 +528,7 @@ impl Config {
         let role = if role == "server" {
             if file.controller.is_some()
                 || file.controller_fingerprint.is_some()
+                || file.controller_fingerprint_also.is_some()
                 || file.worker_name.is_some()
                 || file.enrollment_file.is_some()
                 || file.cpu_millis.is_some()
@@ -539,7 +545,7 @@ impl Config {
                 || file.metrics_listen.is_some()
             {
                 return Err(Error::config(
-                    "controller, controller_fingerprint, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, disk_bytes, spool_reserve_bytes, spool_quota_bytes, cache_budget_bytes, mirror_budget_bytes, image_budget_bytes, tailcat_address and metrics_listen apply to the worker role only",
+                    "controller, controller_fingerprint, controller_fingerprint_also, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, disk_bytes, spool_reserve_bytes, spool_quota_bytes, cache_budget_bytes, mirror_budget_bytes, image_budget_bytes, tailcat_address and metrics_listen apply to the worker role only",
                 ));
             }
             let listen: SocketAddr = file
@@ -626,7 +632,8 @@ impl Config {
             }
             let link = match (file.controller, file.controller_fingerprint) {
                 (None, None) => {
-                    if file.worker_name.is_some()
+                    if file.controller_fingerprint_also.is_some()
+                        || file.worker_name.is_some()
                         || file.enrollment_file.is_some()
                         || file.cpu_millis.is_some()
                         || file.memory_bytes.is_some()
@@ -657,6 +664,21 @@ impl Config {
                             "controller_fingerprint must be the 64 lower-case hex characters the controller printed",
                         )
                     })?;
+                    let also = file.controller_fingerprint_also.unwrap_or_default();
+                    if also.len() >= sentinel_link::tls::MAX_PINS {
+                        return Err(Error::config(
+                            "controller_fingerprint_also lists too many fingerprints (at most 3)",
+                        ));
+                    }
+                    let also_fingerprints = also
+                        .iter()
+                        .map(|text| parse_hex32(text))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            Error::config(
+                                "controller_fingerprint_also entries must be 64 lower-case hex characters",
+                            )
+                        })?;
                     let name = file.worker_name.unwrap_or_else(|| "worker".to_owned());
                     if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
                         return Err(Error::config(
@@ -731,6 +753,7 @@ impl Config {
                     Some(WorkerLink {
                         controller,
                         fingerprint,
+                        also_fingerprints,
                         name,
                         enrollment_file: file.enrollment_file,
                         cpu_millis: file.cpu_millis,
@@ -2282,6 +2305,11 @@ mod worker_role {
         let settings = sentinel_link::worker::Config {
             controller,
             server: sentinel_auth::secret::Digest(link.fingerprint),
+            also_pinned: link
+                .also_fingerprints
+                .iter()
+                .map(|f| sentinel_auth::secret::Digest(*f))
+                .collect(),
             worker,
             name: link.name.clone(),
             hello: sentinel_protocol::negotiate::Hello {

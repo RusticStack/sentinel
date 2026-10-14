@@ -17,7 +17,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
@@ -44,7 +44,7 @@ use sentinel_store::{
 };
 
 use crate::{
-    Error, Result,
+    Error, Result, admission,
     identity::Identity,
     session::{
         self, Accepted, Admission, Admitted, ArtifactCode, ArtifactReply, Beat, BulkSession,
@@ -65,12 +65,18 @@ const _: () = assert!(
     "a hint must fit the wire bound"
 );
 /// Sessions accepted at once; beyond this a connection is closed unserved.
+/// Lower when the process's descriptor limit cannot carry this many (two
+/// descriptors each; see [`admission::session_cap`]).
 pub const MAX_SESSIONS: usize = 1024;
 /// Connections that have not finished their handshake and hello yet. A
-/// separate cap: peers that have proved nothing can hold at most this many
-/// slots (each for at most the handshake deadline), so three quarters of
-/// [`MAX_SESSIONS`] always stay for authenticated workers, while a fleet
-/// reconnecting at once after a controller restart still gets through.
+/// separate cap, with two refinements ([`admission::Pending`]): one source
+/// address may hold only a few of the slots, and the last quarter is a
+/// reserve for sources that have authenticated a worker before, so a flood
+/// of unknown addresses, each held for at most the handshake deadline,
+/// cannot lock the known fleet's reconnects out. The decision is made before
+/// TLS, from the address alone, and the known set lives in memory: after a
+/// controller restart every source is a stranger until its worker has
+/// authenticated once.
 pub const MAX_PENDING: usize = 256;
 /// Spec resolutions running at once. Each may make GitHub round trips to
 /// mint a source token, so they run off the session threads, bounded.
@@ -138,6 +144,9 @@ pub struct Stats {
     /// Connections closed unserved because the session or pre-admission
     /// cap was full.
     pub shed: AtomicU64,
+    /// Enrollment-secret attempts by unknown certificates answered
+    /// `Unavailable` because the per-source or overall budget was spent.
+    pub enrollment_limited: AtomicU64,
     /// Spec requests handed back to the queue: offers declined and
     /// acknowledged attempts whose spec never reached their worker.
     pub handed_back: AtomicU64,
@@ -380,8 +389,12 @@ struct Inner {
     wake: (Mutex<bool>, Condvar),
     stop: AtomicBool,
     sessions: AtomicUsize,
-    /// Connections still in their handshake or hello.
-    pending: AtomicUsize,
+    /// Sessions the descriptor limit can carry, at most [`MAX_SESSIONS`].
+    session_cap: usize,
+    /// Connections still in their handshake or hello, by source.
+    pending: admission::Pending,
+    /// Enrollment-secret attempts by unknown certificates, rate limited.
+    enrollments: admission::Enrollments,
     /// Those of them from loopback, by the peer's (canonical) address: the
     /// only ones a Tailcat helper can carry, so the only ones a hand-off may
     /// have to close before they are sessions. A remote peer costs nothing
@@ -609,10 +622,16 @@ impl Inner {
         };
         // Handshake and hello are over, one way or the other: the slot of
         // the pre-admission cap is free again.
-        self.pending.fetch_sub(1, Ordering::AcqRel);
+        self.pending.leave(addr.ip());
         let mut session = match outcome {
-            Ok(Accepted::Control(session)) => session,
+            Ok(Accepted::Control(session)) => {
+                // Authenticated: this source may use the reserve of the
+                // pre-admission pool when it reconnects.
+                self.pending.vouch(addr.ip(), Instant::now());
+                session
+            }
             Ok(Accepted::Bulk(bulk)) => {
+                self.pending.vouch(addr.ip(), Instant::now());
                 self.leave(arrival.as_ref());
                 self.serve_bulk(bulk);
                 return;
@@ -953,6 +972,11 @@ impl Inner {
             .iter()
             .map(|(w, p)| (*w, Arc::clone(p)))
             .collect();
+        // The dispatcher is one thread: a peer whose connection another
+        // thread is mid-write on (a spec stream to a slow reader) is left
+        // for the next pass, never waited for, so one stuck peer cannot
+        // hold every other worker's offers.
+        peers.retain(|(_, p)| session::is_free(&p.sender));
         if peers.is_empty() {
             return;
         }
@@ -1060,9 +1084,12 @@ impl Inner {
                     image_platform: placed.image.platform,
                     job_index: placed.job_index,
                 };
-                if session::offer(&peer.sender, &offer).is_err() {
-                    // The session is gone: give the attempt back at once
-                    // rather than letting the ack timeout find it.
+                if let Err(sent) = session::offer(&peer.sender, &offer) {
+                    // The session is gone (or, when `busy`, was taken by
+                    // another writer between the check and the send): give
+                    // the attempt back at once rather than letting the ack
+                    // timeout find it.
+                    let busy = session::is_busy(&sent);
                     let attempt = offer.attempt;
                     match self
                         .write_store(move |tx| dispatch::lapse(tx, attempt, UnixMillis::now()))
@@ -1071,7 +1098,9 @@ impl Inner {
                         Err(e) if Self::benign(&e) => {}
                         Err(e) => self.failed(false, "lapse", &e),
                     }
-                    peer.sender.close();
+                    if !busy {
+                        peer.sender.close();
+                    }
                     done.push(i);
                     continue;
                 }
@@ -1655,6 +1684,20 @@ impl Admission for Inner {
         enrollment: Option<&Secret>,
         capacity: Capacity,
     ) -> std::result::Result<Admitted, Rejection> {
+        self.admit_from(None, fingerprint, worker, name, hello, enrollment, capacity)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_from(
+        &self,
+        source: Option<IpAddr>,
+        fingerprint: &Digest,
+        worker: WorkerId,
+        name: &str,
+        hello: &Hello,
+        enrollment: Option<&Secret>,
+        capacity: Capacity,
+    ) -> std::result::Result<Admitted, Rejection> {
         let negotiated = sentinel_protocol::negotiate::negotiate(hello).map_err(Rejection::from)?;
         // The disk half of the capacity only arrives with the protocol-7
         // profile, after the welcome. Defer the capacity write entirely for
@@ -1713,6 +1756,19 @@ impl Admission for Inner {
         let Some(secret) = enrollment else {
             return Err(Rejection::NotEnrolled);
         };
+        // An unknown certificate presenting a secret reaches the single
+        // writer, where a refused secret commits an audit row. Budget those
+        // attempts per source and overall before they get there; the answer
+        // is the retryable `Unavailable`, so a real enrollment that hit the
+        // budget succeeds on the worker's next back-off.
+        if let Some(source) = source
+            && !self.enrollments.allow(source, Instant::now())
+        {
+            self.stats
+                .enrollment_limited
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(Rejection::Unavailable);
+        }
         let (secret, fingerprint, name) = (
             Secret::parse(&{
                 let mut t = String::new();
@@ -2826,7 +2882,9 @@ impl Controller {
             wake: (Mutex::new(false), Condvar::new()),
             stop: AtomicBool::new(false),
             sessions: AtomicUsize::new(0),
-            pending: AtomicUsize::new(0),
+            session_cap: admission::session_cap(MAX_SESSIONS),
+            pending: admission::Pending::default(),
+            enrollments: admission::Enrollments::new(Instant::now()),
             arrivals: Mutex::new(Vec::new()),
             arrived: AtomicU64::new(0),
             max_pending: AtomicUsize::new(MAX_PENDING),
@@ -2953,27 +3011,46 @@ impl Controller {
 }
 
 fn accept_loop(inner: &Arc<Inner>, listener: &TcpListener) {
+    // Accept errors in a row that are about the process, not one peer
+    // (descriptor or memory exhaustion): the acceptor sleeps between them
+    // instead of spinning on a listener that keeps failing at once.
+    let mut failures = 0u32;
     loop {
         let accepted = listener.accept();
         if inner.stop.load(Ordering::Acquire) {
             return;
         }
-        let Ok((socket, addr)) = accepted else {
-            continue;
+        let (socket, addr) = match accepted {
+            Ok(accepted) => {
+                failures = 0;
+                accepted
+            }
+            Err(error) => {
+                if !admission::accept_error_is_peer_local(&error) {
+                    thread::sleep(admission::accept_backoff(failures));
+                    failures = failures.saturating_add(1);
+                }
+                continue;
+            }
         };
+        let ip = canonical(addr).ip();
         // Two caps: every session, and — much smaller — connections that
         // have not authenticated yet, each also bounded by the handshake
-        // deadline. Peers that prove nothing can never hold the slots the
-        // enrolled fleet reconnects into.
-        if inner.sessions.load(Ordering::Acquire) >= MAX_SESSIONS
-            || inner.pending.load(Ordering::Acquire) >= inner.max_pending.load(Ordering::Relaxed)
+        // deadline, per source, with a reserve for sources that have
+        // authenticated before. Peers that prove nothing can never hold the
+        // slots the enrolled fleet reconnects into.
+        if inner.sessions.load(Ordering::Acquire) >= inner.session_cap
+            || !inner.pending.enter(
+                ip,
+                inner.max_pending.load(Ordering::Relaxed),
+                Instant::now(),
+            )
         {
             inner.stats.shed.fetch_add(1, Ordering::Relaxed);
             drop(socket);
             continue;
         }
         inner.sessions.fetch_add(1, Ordering::AcqRel);
-        inner.pending.fetch_add(1, Ordering::AcqRel);
         let session = Arc::clone(inner);
         let spawned = thread::Builder::new()
             .name("sentinel-link-session".into())
@@ -2982,7 +3059,7 @@ fn accept_loop(inner: &Arc<Inner>, listener: &TcpListener) {
                 session.sessions.fetch_sub(1, Ordering::AcqRel);
             });
         if spawned.is_err() {
-            inner.pending.fetch_sub(1, Ordering::AcqRel);
+            inner.pending.leave(ip);
             inner.sessions.fetch_sub(1, Ordering::AcqRel);
         }
     }

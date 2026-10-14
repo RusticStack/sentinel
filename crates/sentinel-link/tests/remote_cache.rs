@@ -213,6 +213,7 @@ impl WorkerProcess {
         let config = worker::Config {
             controller: d.controller.local_addr(),
             server: d.controller.fingerprint(),
+            also_pinned: Vec::new(),
             worker: id,
             name: "builder".into(),
             hello: Hello {

@@ -306,6 +306,57 @@ mod linux {
         assert!(!data.exists());
     }
 
+    /// A certificate rotation lists the next controller fingerprints beside
+    /// the current one: well-formed, bounded, and only with a controller.
+    #[test]
+    fn rotation_fingerprints_are_bounded_worker_link_settings() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("config.toml");
+        let data = temp.path().join("data");
+        let link = format!(
+            "controller = '127.0.0.1:7443'\ncontroller_fingerprint = '{}'\n",
+            "ab".repeat(32)
+        );
+        let also = |count: usize| {
+            let items: Vec<String> = (0..count)
+                .map(|_| format!("'{}'", "cd".repeat(32)))
+                .collect();
+            format!("controller_fingerprint_also = [{}]\n", items.join(", "))
+        };
+        let check = |role: &str, body: &str| {
+            fs::write(&file, format!("data_dir = '{}'\n{body}", data.display())).unwrap();
+            invoke(&[role, "--config", file.to_str().unwrap(), "--check"])
+                .status
+                .code()
+        };
+        if cfg!(feature = "server") {
+            assert_eq!(check("server", &also(1)), Some(2));
+        }
+        if cfg!(feature = "worker") {
+            assert_eq!(check("worker", &also(1)), Some(2), "needs a controller");
+            assert_eq!(
+                check("worker", &format!("{link}{also}", also = also(1))),
+                Some(0)
+            );
+            assert_eq!(
+                check("worker", &format!("{link}{also}", also = also(3))),
+                Some(0)
+            );
+            assert_eq!(
+                check("worker", &format!("{link}{also}", also = also(4))),
+                Some(2)
+            );
+            assert_eq!(
+                check(
+                    "worker",
+                    &format!("{link}controller_fingerprint_also = ['not-hex']\n")
+                ),
+                Some(2)
+            );
+        }
+        assert!(!data.exists());
+    }
+
     #[test]
     fn malformed_oversized_and_missing_configuration_fail_without_echoing_input() {
         let temp = tempdir().unwrap();

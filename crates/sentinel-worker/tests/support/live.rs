@@ -211,6 +211,7 @@ impl Live {
             let config = worker::Config {
                 controller: controller.local_addr(),
                 server: controller.fingerprint(),
+                also_pinned: Vec::new(),
                 worker: worker_id,
                 name: "builder-1".into(),
                 hello: Hello {
