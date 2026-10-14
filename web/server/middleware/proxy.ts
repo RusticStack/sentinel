@@ -1,6 +1,3 @@
-// Everything the controller serves itself passes through to it unchanged,
-// cookies and redirects included, so the browser sees one origin. Request
-// bodies are streamed under a hard cap, never buffered whole.
 export default defineEventHandler(async (event) => {
   const verdict = classifyProxyPath(event.path, event.method);
   if (verdict.kind === "pass") return;
@@ -26,8 +23,7 @@ export default defineEventHandler(async (event) => {
       fetchOptions: options,
     });
   } catch {
-    // An aborted or oversized upload fails the whole request; it is never
-    // relayed as a shorter body. Nothing of the error is echoed.
+    // Never relay a truncated body: an aborted or oversized upload must fail whole.
     if (exceeded.value) throw createError({ statusCode: 413, statusMessage: "Payload Too Large" });
     throw createError({ statusCode: 502, statusMessage: "Bad Gateway" });
   }

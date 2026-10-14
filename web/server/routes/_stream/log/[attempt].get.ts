@@ -1,20 +1,10 @@
-// A live attempt log for the browser as server-sent events: this process
-// follows the controller's log (`GET /attempts/{id}/logs?step&after&wait=1`)
-// step by step and pushes each page of frames as it lands. Every event's
-// id is `step:seq`, so a browser that lost the stream reconnects with
-// `Last-Event-ID` and resumes exactly after the last frame it got —
-// nothing repeats, nothing is skipped.
-//
-// Events: `frames` ({frames, gaps}), `step_done` ({step}), `complete`
-// ({gaps}), `status` (busy|reconnecting|live), `refused` (the controller's
-// error; the stream ends).
+// Event ids are `step:seq`, so Last-Event-ID resumes exactly after the last frame received.
 export default defineEventHandler(async (event) => {
   const attempt = getRouterParam(event, "attempt") || "";
   if (!ATTEMPT_ID.test(attempt)) throw createError({ statusCode: 400, statusMessage: "malformed attempt id" });
   const query = getQuery(event);
   let step = Number(query.step ?? 0);
   let after = Number(query.after ?? 0);
-  // A reconnect resumes from the last event the browser received.
   const last = getRequestHeader(event, "last-event-id");
   if (last && /^\d+:\d+$/.test(last)) {
     const [s, a] = last.split(":").map(Number);

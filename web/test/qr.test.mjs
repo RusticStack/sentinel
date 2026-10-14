@@ -1,5 +1,4 @@
-// The authenticator QR encoder and seed extraction, run with
-// `node --test test/*.test.mjs` on the verification VPS.
+// Run with node --test on the verification VPS.
 import assert from "node:assert/strict";
 import test from "node:test";
 import { encodeQr, formatBits, rsRemainder, totpSecret } from "../app/utils/qr.ts";
@@ -12,7 +11,6 @@ test("Reed-Solomon codewords match the standard's HELLO WORLD 1-M example", () =
 });
 
 test("format bits are the standard's level M codewords", () => {
-  // ISO/IEC 18004 table C.1, level M, masks 0..7.
   const expected = [0x5412, 0x5125, 0x5e7c, 0x5b4b, 0x45f9, 0x40ce, 0x4f97, 0x4aa0];
   for (let mask = 0; mask < 8; mask++) assert.equal(formatBits(mask), expected[mask], `mask ${mask}`);
 });
@@ -32,8 +30,6 @@ function finderAt(qr, ox, oy) {
 test("an otpauth URI encodes as a well-formed symbol of the smallest version", () => {
   const qr = encodeQr(URI);
   assert.ok(qr);
-  // 119 bytes plus the header at level M need version 7 (124 data
-  // codewords; version 6 has 108).
   assert.equal(qr.version, 7);
   assert.equal(qr.size, 45);
   assert.ok(finderAt(qr, 0, 0) && finderAt(qr, qr.size - 7, 0) && finderAt(qr, 0, qr.size - 7), "finder patterns");
@@ -42,7 +38,6 @@ test("an otpauth URI encodes as a well-formed symbol of the smallest version", (
     assert.equal(at(qr, 6, i), i % 2 === 0, `vertical timing ${i}`);
   }
   assert.ok(at(qr, 8, qr.size - 8), "dark module");
-  // Both copies of the format information name level M and the chosen mask.
   const bits = formatBits(qr.mask);
   const first = [];
   for (let i = 0; i <= 5; i++) first.push(at(qr, 8, i));

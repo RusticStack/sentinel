@@ -1,11 +1,8 @@
-// The controller's API documents the interface reads (docs/api.md).
-
 export type Role = "reader" | "operator" | "admin";
 
 export interface Me {
   user: string;
   username: string | null;
-  /** The account's email, verified or not; absent from older controllers. */
   email?: string | null;
   email_verified?: boolean;
   super_admin: boolean;
@@ -15,17 +12,11 @@ export interface Me {
   mfa: boolean;
 }
 
-/** A personal namespace (one account's own) or an organization. */
 export type NamespaceKind = "personal" | "organization";
-/** Where an organization's membership comes from: Sentinel (invitations,
- *  administrators, the operator's domain rules) or GitHub. */
 export type MembershipSource = "app" | "github";
 
-/** A namespace the caller belongs to (`GET /tenants`); `kind` and
- *  `membership` are absent from older controllers. */
 export interface TenantChoice { slug: string; role: Role; kind?: NamespaceKind; membership?: MembershipSource }
 
-/** `GET /tenants/{slug}/settings`. */
 export interface NamespaceSettings {
   slug: string;
   kind: NamespaceKind;
@@ -33,13 +24,11 @@ export interface NamespaceSettings {
   github_installation: boolean;
   role: Role | null;
   created_ms: number;
-  /** The caller's own standing, for a GitHub-backed organization. */
   github_sync?: { confirmed_ms: number | null; check_due: boolean; unanswered: number };
   /** Administrators only: the operator's read-only domain rule. */
   auto_join?: { applies: boolean; domains: string[] };
 }
 
-/** An invitation as metadata (`GET /tenants/{slug}/invitations`); never a secret. */
 export interface Invitation {
   id: string;
   email: string | null;
@@ -48,7 +37,6 @@ export interface Invitation {
   state: "pending" | "redeemed" | "revoked" | "expired";
 }
 
-/** `GET /me/security`: what the account page shows, metadata only. */
 export interface Security {
   password: boolean;
   mfa: { enrolled: boolean; pending: boolean; recovery_codes_remaining: number };
@@ -56,7 +44,6 @@ export interface Security {
   github_link: boolean;
 }
 
-/** A tenant member (`GET /tenants/{slug}/members`). */
 export interface Member {
   user: string;
   display_name: string;
@@ -64,19 +51,15 @@ export interface Member {
   kind: "person" | "service";
   role: Role;
   active: boolean;
-  /** `github` when the membership is derived from the person's linked GitHub account. */
   source?: "app" | "github";
-  /** When GitHub last confirmed a derived membership. */
   synced_ms?: number | null;
 }
 
-/** An OAuth grant as metadata (never a token). */
 export interface Grant {
   id: string;
   user: string;
   client_id: string;
   kind: string;
-  /** Space-separated scope names. */
   scope: string;
   tenant: string | null;
   repo: string | null;
@@ -154,11 +137,9 @@ export interface LogPage {
   next_after: number | null;
   next: string;
   step_done: boolean;
-  /** Set when retention removed this log: when it did. */
   expired_ms?: number;
 }
 
-/** Scheduled backups. */
 export interface Backups {
   configured: boolean;
   scheduler?: {
@@ -220,7 +201,6 @@ export interface DeploymentStorage {
   log_retention_ms: number;
   artifact_retention_ms: number;
   run_artifact_bytes: number;
-  /** The external S3 copy, when configured. */
   s3: {
     state: "healthy" | "degraded" | "unknown";
     backlog_bytes: number;
@@ -250,7 +230,6 @@ export interface Worker {
   id: string;
   name: string;
   arch: string;
-  /** The negotiated worker protocol and the software it announced. */
   protocol: number;
   software: string | null;
   connected: boolean;

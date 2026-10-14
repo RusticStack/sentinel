@@ -1,7 +1,4 @@
-// The onboarding helpers: link secrets from fragments, password guidance at
-// the controller's bounds, organization names, the wizard's stored draft
-// and a member's GitHub standing. Run with `node --test test/*.test.mjs` on
-// the verification VPS (Node 22.18+ strips the TypeScript types).
+// Run with node --test on Node 22.18+, which strips the TypeScript types.
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -14,7 +11,6 @@ const HEX = "0123456789abcdef".repeat(4);
 test("a link's secret is taken from the fragment only when it is exactly one well-formed token", () => {
   assert.equal(fragmentToken(`#token=${HEX}`, "verification"), HEX);
   assert.equal(fragmentToken(`#token=sntl_${HEX}`, "invitation"), `sntl_${HEX}`);
-  // The wrong kind, a short or padded value, two tokens, no fragment.
   assert.equal(fragmentToken(`#token=sntl_${HEX}`, "verification"), null);
   assert.equal(fragmentToken(`#token=${HEX}`, "invitation"), null);
   assert.equal(fragmentToken(`#token=${HEX.slice(1)}`, "verification"), null);
@@ -30,8 +26,6 @@ test("an invitation parked for GitHub sign-in comes back only within its ten min
   const parked = stashInvitation(token, now);
   assert.equal(unstashInvitation(parked, now + 1), token);
   assert.equal(unstashInvitation(parked, now + INVITATION_STASH_MS - 1), token);
-  // Expired, absent, malformed, the wrong kind of secret, or dated further
-  // ahead than a stash can be (a forged or clock-skewed entry).
   assert.equal(unstashInvitation(parked, now + INVITATION_STASH_MS), null);
   assert.equal(unstashInvitation(null, now), null);
   assert.equal(unstashInvitation("{not json", now), null);
@@ -49,7 +43,6 @@ test("a setup token is 64 hex digits, surrounding spaces forgiven", () => {
 test("password guidance follows the controller's byte bounds and refuses only spacing", () => {
   assert.equal(passwordAdvice("short").acceptable, false);
   assert.equal(passwordAdvice(" ".repeat(20)).acceptable, false);
-  // Twelve bytes, not twelve characters: four 3-byte characters are enough.
   assert.equal(passwordAdvice("€€€€").acceptable, true);
   assert.equal(passwordAdvice("x".repeat(257)).acceptable, false);
   assert.equal(passwordAdvice("a".repeat(256)).acceptable, true);
@@ -57,7 +50,6 @@ test("password guidance follows the controller's byte bounds and refuses only sp
   assert.ok(weak.score <= 1 && weak.hints.length > 0, JSON.stringify(weak));
   const strong = passwordAdvice("correct Horse battery 9 staple");
   assert.ok(strong.acceptable && strong.score >= 3, JSON.stringify(strong));
-  // Leaning on the address costs a step.
   const named = passwordAdvice("adalovelace-rules-2026", ["ada.lovelace@example.com"]);
   assert.ok(named.hints.some((h) => h.includes("address")), JSON.stringify(named));
 });
