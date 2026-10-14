@@ -1,8 +1,3 @@
-//! Bounded OAuth client registration and Client ID Metadata Document support.
-//!
-//! Registered OAuth clients are not Sentinel users. Remote MCP registrations
-//! are public clients, limited to MCP scopes and exact redirect URIs.
-
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -89,9 +84,6 @@ impl MetadataCache {
     }
 }
 
-/// Turn an externally presented CIMD URL into its stable, fixed-size database
-/// key. Other OAuth client identifiers already have the database's 64-byte
-/// bound and pass through unchanged.
 pub(crate) fn internal_id(client_id: &str) -> Option<Cow<'_, str>> {
     if client_id.starts_with("https://") {
         let url = metadata_url(client_id)?;
@@ -207,17 +199,8 @@ fn parse_scope(value: Option<&str>) -> Option<Scopes> {
     }
 }
 
-/// What every registered client is actually given, whatever it declared
-/// (RFC 7591 §3.2.1 lets the server replace requested values): the code
-/// grant, and refresh tokens, which every code exchange returns.
 const EFFECTIVE_GRANT_TYPES: [&str; 2] = [GRANT_AUTHORIZATION_CODE, GRANT_REFRESH_TOKEN];
 
-/// Whether declared registration metadata describes a public
-/// authorization-code client. Omitted `grant_types` is RFC 7591's default
-/// (`authorization_code`). A declared list must include the code grant and
-/// may name only grants this server advertises; one it will not issue to a
-/// registered client (the device grant) is intersected away rather than
-/// refused, because clients commonly echo `grant_types_supported`.
 fn validate_protocol_fields(
     grant_types: Option<&[String]>,
     response_types: Option<&[String]>,
@@ -249,10 +232,6 @@ fn validate_protocol_fields(
     })
 }
 
-/// A redirect URI a registration may declare: an HTTPS URI on a domain, or
-/// an HTTP loopback URI (`127.0.0.1`, `[::1]` or `localhost`, any port;
-/// RFC 8252 §7.3/§8.3) in the exact shape [`forms::loopback_redirect_key`]
-/// stores and matches. No userinfo, query or fragment.
 fn valid_redirect_uri(value: &str) -> bool {
     if value.is_empty() || value.len() > 512 {
         return false;
@@ -263,9 +242,8 @@ fn valid_redirect_uri(value: &str) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
     };
-    // The parser strips tabs and line breaks and lowercases the host: only
-    // the canonical spelling is stored, so what is matched later and what
-    // is put in a `Location` header is exactly what was validated.
+    // The parser strips tabs and line breaks and lowercases the host, so only
+    // the canonical spelling may be stored: it must be what was validated.
     if url.as_str() != value
         || url.username() != ""
         || url.password().is_some()
@@ -302,9 +280,6 @@ impl Resolver for PublicResolver {
         if addresses.is_empty() || addresses.iter().any(|addr| !public_ip(addr.ip())) {
             return Err(ureq::Error::HostNotFound);
         }
-        // Return the vetted socket addresses themselves. The connector does
-        // not perform another DNS lookup, preventing rebinding between check
-        // and connect.
         Ok(addresses)
     }
 }
@@ -339,8 +314,6 @@ fn public_ipv4(ip: Ipv4Addr) -> bool {
 
 fn public_ipv6(ip: Ipv6Addr) -> bool {
     let [a, b, ..] = ip.segments();
-    // Permit only global-unicast 2000::/3, excluding protocol assignments,
-    // documentation and 6to4. This also rejects mapped IPv4 addresses.
     a & 0xe000 == 0x2000
         && !(a == 0x2001 && b < 0x0200)
         && !(a == 0x2001 && b == 0x0db8)
@@ -350,13 +323,8 @@ fn public_ipv6(ip: Ipv6Addr) -> bool {
         && !ip.is_loopback()
 }
 
-/// Whole-request bound of one metadata fetch, DNS included. A fetch holds a
-/// handler permit this long at most, under the metadata fetch
-/// [`crate::OUTBOUND`] budget; a request past the budget is told to retry.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The one metadata agent: its TLS configuration and root store are built
-/// once, and it may reuse a connection to the same host.
 fn metadata_agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
@@ -465,7 +433,6 @@ fn metadata_scopes(metadata: &ClientMetadata, url: &str) -> Option<Scopes> {
     parse_scope(metadata.scope.as_deref())
 }
 
-/// A busy page that tells the browser when to try again.
 fn busy(message: &str) -> Reply {
     let mut reply = super::html::error_page(503, message);
     if let Reply::Html(_, _, headers) = &mut reply {
@@ -478,15 +445,6 @@ fn registrant(state: &State, request: &Request) -> [u8; 16] {
     grants::registrant_digest(super::client_of(state, request))
 }
 
-/// Resolve a normal registered id locally or fetch and validate a CIMD URL.
-/// The cache only avoids repeated network reads; disabled clients and current
-/// database policy are checked on every request.
-///
-/// Callers fetch only for a signed-in account ([`super::code`]): an
-/// anonymous request never makes this server call out. A fetch also passes
-/// the per-client metadata budget and takes a [`crate::OUTBOUND`] slot, so
-/// however many accounts ask at once, at most that many handler permits
-/// wait on third-party hosts.
 pub(crate) fn resolve(
     state: &State,
     request: &Request,
@@ -508,9 +466,8 @@ pub(crate) fn resolve(
                 }
                 other => super::store_failure(other),
             })?;
-        // A CIMD client is only ever addressed by its metadata URL: its
-        // internal `c_…` key would skip the document's freshness check and
-        // keep serving withdrawn redirects.
+        // A CIMD client is addressed only by its metadata URL: the internal
+        // `c_` key would skip the freshness check and keep serving withdrawn redirects.
         if client.display_id != client.id {
             return Err(super::html::error_page(
                 400,
@@ -622,8 +579,6 @@ fn registration_error(code: OAuthErrorCode, description: &str) -> Route {
     Ok(error(code, description))
 }
 
-/// RFC 7591 Dynamic Client Registration for public MCP clients only, while
-/// the deployment's policy allows it.
 pub(crate) fn register(state: &State, request: &mut Request) -> Route {
     if let Err(reply) = admit(state, request, Budget::Registration) {
         return Ok(reply);
@@ -843,7 +798,6 @@ mod tests {
             "https://client.example/callback?next=other",
             "https://client.example/callback#fragment",
             "file:///tmp/callback",
-            // The URL parser would strip these or rewrite the host.
             "https://client.example/call\tback",
             "https://client.example/call\nback",
             "https://client.example/callback\r",
@@ -897,8 +851,6 @@ mod tests {
         );
     }
 
-    /// RFC 7591 defaults and echoed advertised grants are
-    /// accepted; anything not a public code-flow client is still refused.
     #[test]
     fn registered_clients_must_declare_only_supported_grants_and_responses() {
         let owned = |values: &[&str]| values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();

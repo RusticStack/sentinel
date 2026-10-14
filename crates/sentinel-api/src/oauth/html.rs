@@ -1,15 +1,7 @@
-//! Server-rendered pages for the browser half of OAuth (consent, device
-//! approval): one escaped page shell, an embedded sign-in form that uses the
-//! ordinary password login, and the security headers every HTML reply
-//! carries (added by the response layer for each `Reply::Html`).
-//!
-//! The CSP deliberately has no `form-action`: Chrome enforces it on the
-//! redirect a form submission follows, which would block the consent
-//! page's `303` to the CLI's loopback listener.
-
 use crate::{http::Header, routes::Reply};
 
-/// Sent with every `Reply::Html`.
+// The CSP must not add `form-action`: Chrome enforces it on the redirect that follows a
+// form submission, which would block the consent page's 303 to the CLI's loopback listener.
 pub(crate) const SECURITY_HEADERS: [(&str, &str); 4] = [
     (
         "content-security-policy",
@@ -20,8 +12,6 @@ pub(crate) const SECURITY_HEADERS: [(&str, &str); 4] = [
     ("cache-control", "no-store"),
 ];
 
-/// Append `text` with HTML metacharacters escaped; safe in element content
-/// and in double- or single-quoted attribute values.
 pub(crate) fn escape_into(out: &mut String, text: &str) {
     for ch in text.chars() {
         match ch {
@@ -54,8 +44,6 @@ const HEAD: &str = r#"<!doctype html>
 </style>
 "#;
 
-/// A complete page: `title` is escaped here; `body` is trusted markup the
-/// caller built with [`escape`] around every dynamic value.
 pub(crate) fn document(title: &str, body: &str) -> String {
     let mut out = String::with_capacity(HEAD.len() + body.len() + 128);
     out.push_str(HEAD);
@@ -69,13 +57,10 @@ pub(crate) fn document(title: &str, body: &str) -> String {
     out
 }
 
-/// An HTML reply of `status` (security headers are added on the way out).
 pub(crate) fn page(status: u16, title: &str, body: &str) -> Reply {
     Reply::Html(status, document(title, body), Vec::new())
 }
 
-/// A page stating an error in plain words. Never a redirect: used when the
-/// client or redirect URI cannot be trusted with one.
 pub(crate) fn error_page(status: u16, message: &str) -> Reply {
     let mut body = String::from("<p>");
     escape_into(&mut body, message);
@@ -83,9 +68,6 @@ pub(crate) fn error_page(status: u16, message: &str) -> Reply {
     page(status, "Sentinel", &body)
 }
 
-/// `303 See Other` to `location`, with an empty body. A location that
-/// cannot be a header value (it carries a line break) is never sent: the
-/// answer is an error page, so no input can reach a panic here.
 pub(crate) fn redirect(location: &str) -> Reply {
     match Header::from_bytes(b"location", location.as_bytes()) {
         Some(header) => Reply::Html(303, String::new(), vec![header]),
@@ -93,12 +75,6 @@ pub(crate) fn redirect(location: &str) -> Reply {
     }
 }
 
-/// The embedded sign-in form: a password login through `POST
-/// {issuer}/api/v1/login` (which sets the session cookie), then a reload of
-/// the same page so the request is re-evaluated with the session. Nothing
-/// about the pending request is stored; the URL carries it. The login URL
-/// comes from the issuer, so a path-carrying `public_url` posts inside its
-/// own mount rather than at the host's root.
 const SIGN_IN_HEAD: &str = r#"<form id="sentinel-sign-in">
   <input id="sentinel-username" placeholder="username" autocomplete="username" required>
   <input id="sentinel-password" type="password" placeholder="password" autocomplete="current-password" required>
@@ -128,13 +104,6 @@ const SIGN_IN_TAIL: &str = r#", {
 };
 </script>"#;
 
-/// A page asking the visitor to sign in first, with `message` explaining
-/// why; the form posts to `login_url` (`OAuthState::login_url`). With
-/// `github` (the start URL, and the issuer-relative path of this page with
-/// its query), a "Sign in with GitHub" link sits next to the form and
-/// returns the browser here, parameters intact. It is a plain `GET` link, so
-/// the page's CSP (which has no `form-action` and governs no navigation)
-/// does not stand in the way of the redirect to GitHub.
 pub(crate) fn sign_in_page(
     login_url: &str,
     github: Option<(&str, &str)>,
@@ -156,9 +125,6 @@ pub(crate) fn sign_in_page(
     page(200, title, &body)
 }
 
-/// Append `text` as a double-quoted JavaScript string literal that is also
-/// safe inside a `<script>` element: quotes, backslashes, `<`, `>` and `&`
-/// and every control character are escaped.
 fn script_string_into(out: &mut String, text: &str) {
     out.push('"');
     for ch in text.chars() {
