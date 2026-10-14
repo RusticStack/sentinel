@@ -918,7 +918,7 @@ fn summarize(samples: &[Sample]) -> Summary {
 
 /// The commit and dirty state of the checkout this runner was built from,
 /// asked of `git` there rather than in the working directory, so a runner
-/// started elsewhere (as the F05 baseline was) still names its source.
+/// started elsewhere still names its source.
 fn source_revision() -> Result<Source, String> {
     let dir = env!("CARGO_MANIFEST_DIR");
     let git_commit = command_line(&["git", "-C", dir, "rev-parse", "HEAD"]).ok_or_else(|| {

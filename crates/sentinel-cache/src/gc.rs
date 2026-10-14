@@ -1,4 +1,4 @@
-//! K03 — reclamation: a bounded pass over the cache tree that sweeps
+//! Reclamation: a bounded pass over the cache tree that sweeps
 //! expired lease markers, removes staging a dead writer left in
 //! `writing/`, keeps at most `current` plus one spare generation per
 //! entry, removes entries nobody has used for [`IDLE_TTL`], and — while
@@ -8,8 +8,8 @@
 //! A lease pins its whole entry: while any marker under `<entry>/lease/`
 //! is live, nothing inside that entry is collected — a reader mid-clone
 //! or a writer mid-publish is never undercut, and an entry with a live
-//! staging writer is never removed whole. Otherwise nothing is exempt
-//! (P07-3): a `current` nobody reads is disk, not state, so the budget is
+//! staging writer is never removed whole. Otherwise nothing is exempt:
+//! a `current` nobody reads is disk, not state, so the budget is
 //! a real bound. Last use is `current`'s mtime — publication writes it,
 //! and every restore hit touches it.
 //!
@@ -17,7 +17,7 @@
 //! directory entry enumerated and every tree removed counts, and hitting
 //! the bound stops the pass cleanly — `truncated` is set. A [`Cursor`]
 //! kept by the caller makes successive bounded passes cover the whole
-//! tree (P07-4): each resumes after the last entry the previous one
+//! tree: each resumes after the last entry the previous one
 //! finished, in name order, and wraps at the end. The budget is enforced
 //! on every pass, truncated or not, against the larger of what this cycle
 //! has seen and what the last complete cycle measured. Removal failures
@@ -33,10 +33,8 @@ use std::{
 
 use crate::{lease, manifest, scope};
 
-/// The byte budget a `cache/` root holds before a pass evicts
-/// (docs/cache.md). A fixed ceiling, not a config key: the worker's data
-/// dir has no size knob today, and 50 GiB keeps a warm worker under any
-/// plausible checkout-plus-cache pressure.
+/// The default byte budget a `cache/` root holds before a pass evicts
+/// (docs/cache.md); callers pass the budget they enforce.
 pub const DEFAULT_BUDGET_BYTES: u64 = 50 << 30;
 
 /// Directory entries one pass visits at most — the same order as the
@@ -59,7 +57,7 @@ const MAX_CURRENT_BYTES: u64 = 256;
 const ENTRY_DEPTH: u32 = 7;
 
 /// What one pass did — and what it saw, for the worker's diagnostics and
-/// the availability snapshot (K08).
+/// the availability snapshot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GcStats {
     /// Entry directories visited.
@@ -622,7 +620,7 @@ impl Gc {
     /// keeps its generation. Returns the estimated total after eviction.
     fn enforce_budget(&mut self, budget_bytes: u64, mut total: u64) -> u64 {
         // Eviction has its own allowance, the size of a walk's: a pass the
-        // walk bound truncated still enforces the budget (P07-4), and the
+        // walk bound truncated still enforces the budget, and the
         // eviction itself stays bounded.
         let walked_out = std::mem::replace(&mut self.stats.truncated, false);
         self.max_work = self.work.saturating_add(self.max_work);
