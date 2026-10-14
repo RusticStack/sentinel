@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""B02: turn the bench branch's GitHub Actions runs into raw records.
+
+    python bench/b02-github-collect.py > bench/b02-github-runner.jsonl
+
+One JSON line per run of the sentinel-bench-b02 workflow: its commit
+message, which carries the condition, the run's and job's timestamps, and
+every step's. GitHub's timestamps have one-second resolution. The first run
+of the branch primed the runner (setup-go's download) and is marked
+`warmup`. A summary per condition goes to stderr.
+"""
 import json
 import subprocess
 import sys

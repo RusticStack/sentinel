@@ -27,7 +27,7 @@ for caps in "1 256m" "10 26g"; do
   noop --runtime podman --image "$BUSYBOX" --cpus "$1" --memory "$2"
 done
 
-lane() {
+lane() { # lane <runtime> <lane> <condition>
   settle
   local extra=()
   [ "$1" = scoped ] && extra=(--path-prepend "$HOME/b01-$1/toolchain/go/bin")

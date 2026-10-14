@@ -8,7 +8,7 @@ JAVA_SDK=37c921f6390ff85a8f2e4034a62482cab7c54020
 C="$ROOT/controller" W="$ROOT/worker"
 ident=(-c user.name=sentinel-bench -c user.email=bench@sentinel.invalid)
 
-event() {
+event() { # event <log> <event> [nth]: that record's JSON, waiting up to 60 s
   local n=${3:-1}
   for _ in $(seq 1 600); do
     line=$(grep "\"event\":\"$2\"" "$1" 2>/dev/null | sed -n "${n}p" || true)
@@ -26,7 +26,7 @@ start_worker() {
   echo $! > "$ROOT/worker.pgid"
   event "$ROOT/worker.log" link_connected >/dev/null
 }
-stop_group() {
+stop_group() { # stop_group <pgid file>
   [ -f "$1" ] || return 0
   kill -TERM -- "-$(cat "$1")" 2>/dev/null || true
   for _ in $(seq 1 100); do kill -0 -- "-$(cat "$1")" 2>/dev/null || break; sleep 0.1; done

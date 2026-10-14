@@ -6,7 +6,7 @@ C="$ROOT/controller" W="$ROOT/worker"
 IMAGE=docker.io/library/golang:1.27.1-trixie@sha256:7bffdb405cd12940d2980daa49a86ef575ed4525a17ee7d0c9562547357ab46a
 ident=(-c user.name=sentinel-bench -c user.email=bench@sentinel.invalid)
 
-event() {
+event() { # event <log> <event>: the first such record, waiting up to 60 s
   for _ in $(seq 1 600); do
     line=$(grep -m1 "\"event\":\"$2\"" "$1" 2>/dev/null || true)
     [ -n "$line" ] && { printf '%s' "$line"; return; }
@@ -24,7 +24,7 @@ stop_group() {
   rm -f "$1"
 }
 
-pipeline() {
+pipeline() { # pipeline <job body>: a one-job pipeline on the warm image
   printf 'schema: 1\non: [push]\njobs:\n  probe:\n    image: %s\n    resources: { cpu: 1, memory: 512MiB }\n    timeout: 20m\n%s\n' "$IMAGE" "$1"
 }
 
@@ -35,7 +35,7 @@ setup)
     git init -q -b main work
     echo "B03 latency fixture" > work/README
     git -C work add README && git "${ident[@]}" -C work commit -q -m base
-    branch() {
+    branch() { # branch <name> <job body>
       git -C work checkout -q -B "$1" main
       pipeline "$2" > work/.sentinel.yml
       git -C work add .sentinel.yml && git "${ident[@]}" -C work commit -q -m "$1"

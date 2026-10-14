@@ -52,7 +52,7 @@ class Deployment:
                               capture_output=True, text=True).stdout.strip()
 
     def push(self, branch):
-            self.git("checkout", "-q", branch)
+        self.git("checkout", "-q", branch)
         old = subprocess.run(["git", "-C", self.bare, "rev-parse", f"refs/heads/{branch}"],
                              check=True, capture_output=True, text=True).stdout.strip()
         self.git("commit", "-q", "--allow-empty", "-m", f"b03 {branch}")
