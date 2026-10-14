@@ -313,10 +313,10 @@ impl Mirrors {
                 materialize_ns: elapsed_ns(materialize_started),
             }),
             Err(e) => {
-                // Only damage to the store itself marks it for a rebuild
-                //: a deadline, a full workspace or a checkout error
-                // on a healthy store says nothing about the mirror, and a
-                // rebuild would refetch the whole history for nothing.
+                // Only damage to the store itself marks it for a rebuild: a
+                // deadline, a full workspace or a checkout error on a healthy
+                // store says nothing about the mirror, and a rebuild would
+                // refetch the whole history for nothing.
                 let damaged = !matches!(e, Error::Timeout(_) | Error::TooLarge(_))
                     && !self.healthy(&dir, Instant::now() + Duration::from_secs(30));
                 let e = if damaged {
