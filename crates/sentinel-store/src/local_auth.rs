@@ -1,15 +1,5 @@
-//! Local login: host-local first-admin bootstrap, password credentials, opaque
-//! sessions with idle/absolute expiry and revocation, and audited recovery.
-//!
-//! Ordering rule for every operation here: Argon2id verification costs ~19 MiB
-//! and tens of milliseconds, so it runs on the caller's thread and never inside
-//! the single durable writer. The writer transaction rechecks the credential it
-//! verified against, so a password change or lockout that commits during that
-//! window cannot be overtaken by an in-flight login.
-//!
-//! Authority is host-local where it says so: `bootstrap` and `recover` are
-//! reachable only by a process that can already open this database file. No
-//! route may expose them, and there is no unauthenticated network path to them.
+//! Argon2id runs on the caller's thread, never inside the writer: the writer transaction rechecks the
+//! verified credential, so a password change or lockout committed in between cannot be overtaken.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::{
@@ -25,21 +15,13 @@ pub use crate::auth::Authority;
 
 use crate::{Error, Result, Store};
 
-/// Session lifetimes and login throttling. Absolute expiry bounds a stolen
-/// cookie; idle expiry bounds an abandoned browser; the lockout bounds online
-/// guessing without giving an attacker a way to lock an operator out forever.
 #[derive(Clone, Copy, Debug)]
 pub struct Policy {
     pub idle_ms: i64,
     pub absolute_ms: i64,
-    /// Consecutive failures before the account stops accepting passwords.
     pub max_failures: i64,
     pub lockout_ms: i64,
-    /// How much of the idle window must be spent before a request pays for a
-    /// write to slide the deadline. Without it every request takes the writer.
     pub refresh_after_ms: i64,
-    /// How long a proven second factor keeps a session eligible for privileged
-    /// changes. Short: it bounds what a hijacked, stepped-up session can do.
     pub step_up_ms: i64,
 }
 
@@ -56,8 +38,7 @@ impl Default for Policy {
     }
 }
 
-/// Audited authentication and account-administration events. The numbers are
-/// persisted and stable. No record carries a password, digest or cookie value.
+/// Persisted as these codes: never renumber or reuse one. No audit row carries a secret.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Event {
@@ -117,41 +98,19 @@ pub enum Event {
     OAuthDeviceDenied = 54,
     ServiceGrantIssued = 55,
     ServiceAccountCreated = 56,
-    /// A platform administrator who is not an administrator of the tenant
-    /// changed its access under platform scope; the detail is their reason.
     PlatformOverride = 57,
-    /// A tenant administrator added an account that was not yet a member. The
-    /// person did not accept anything, so the addition is recorded on its own
-    /// in addition to the role change.
     MemberAdded = 58,
-    /// A verification link was minted for an address (queued for delivery or
-    /// issued by the host-local CLI). The address is never recorded.
     EmailVerificationRequested = 59,
-    /// An account proved control of its address.
     EmailVerified = 60,
-    /// The mail lane gave up on a message; the detail is its kind and reason.
     MailAbandoned = 61,
-    /// GitHub confirmed a linked account as a member of a GitHub-backed
-    /// organization and Sentinel added or promoted the membership. The detail
-    /// names the tenant and the role; no GitHub login or id is recorded.
     GithubMemberJoined = 70,
-    /// GitHub's answer changed a derived role (an owner demoted, a member
-    /// made an owner).
     GithubMemberRoleChanged = 71,
-    /// Derived access ended: GitHub no longer lists the member, the GitHub
-    /// link was removed, or an unconfirmed row outlived its grace period.
     GithubMemberRemoved = 72,
-    /// A tenant's membership source was changed by an administrator.
     TenantBackingChanged = 73,
-    /// A verified address in a domain the operator listed in
-    /// `SENTINEL_AUTO_JOIN_DOMAINS` joined an app-created organization (or
-    /// created it, as its administrator). The detail names the organization
-    /// and the role; the address is never recorded.
     DomainAutoJoined = 74,
 }
 
 impl Event {
-    /// The event's stable name, as the CLI and the API print it.
     pub const fn name(self) -> &'static str {
         match self {
             Event::Bootstrap => "bootstrap",
@@ -296,8 +255,6 @@ impl Event {
     }
 }
 
-/// The credentials handed to the browser exactly once. `session` goes into the
-/// `__Host-` cookie; `csrf` goes into the page, to be echoed in a header.
 #[derive(Debug)]
 pub struct Issued {
     pub user: UserId,
@@ -306,44 +263,30 @@ pub struct Issued {
     pub max_age_secs: u32,
 }
 
-/// Why a login did not produce a session. Callers render one response for every
-/// non-accepted outcome; the distinction exists for audit, not for the user.
 pub enum Login {
     Accepted(Issued),
     Rejected,
     Locked { until: UnixMillis },
 }
 
-/// A validated session. Not a capability: membership, grants and the account's
-/// live state are still checked per query through [`crate::auth`].
 #[derive(Clone, Copy, Debug)]
 pub struct Session {
-    /// Absent only for a session issued before migration 9.
     pub id: Option<SessionId>,
     pub user: UserId,
     pub super_admin: bool,
     pub csrf: Digest,
     pub idle_deadline: UnixMillis,
     pub absolute_deadline: UnixMillis,
-    /// When the session was issued (the sign-in that made it).
     pub created: UnixMillis,
-    /// When this session last proved a second factor, if ever.
     pub stepped_up: Option<UnixMillis>,
 }
 
 impl Session {
-    /// Whether a second factor was proven recently enough for privileged
-    /// changes. Freshness only; authority is still checked live.
     pub fn stepped_up_within(&self, policy: Policy, now: UnixMillis) -> bool {
         self.stepped_up
             .is_some_and(|at| at <= now && now.0.saturating_sub(at.0) < policy.step_up_ms)
     }
 
-    /// Whether this session was issued within the step-up window: a person
-    /// who has just signed in has just proven themselves, which is the only
-    /// proof an account with neither a password nor a second factor (GitHub
-    /// only) can give before enrolling its first factor. Judged against the
-    /// recorded creation time, which no policy change can move.
     pub fn signed_in_within(&self, policy: Policy, now: UnixMillis) -> bool {
         self.created <= now && now.0.saturating_sub(self.created.0) < policy.step_up_ms
     }
@@ -356,10 +299,6 @@ impl Session {
         }
     }
 
-    /// A browser session acts as its human, not above them: repository bits plus
-    /// tenant administration, which `auth` still verifies against live
-    /// membership per tenant. Platform administration is present only for an
-    /// actual super admin.
     pub fn principal(&self) -> Principal {
         let mut permissions = Permissions::REPOSITORY.union(Permissions::TENANT_ADMIN);
         if self.super_admin {
@@ -369,9 +308,7 @@ impl Session {
     }
 }
 
-/// Canonical login name: 1-63 bytes of lower-case ASCII letters, digits, `.`,
-/// `-` or `_`, starting alphanumeric. Case is rejected, never folded, so two
-/// spellings can never resolve to one account.
+/// Case is rejected, never folded, so two spellings can never name one account.
 pub fn username(value: &str) -> Result<&str> {
     let bytes = value.as_bytes();
     let acceptable = matches!(bytes.len(), 1..=63)
@@ -386,8 +323,6 @@ pub fn username(value: &str) -> Result<&str> {
     }
 }
 
-/// Audit detail is bounded metadata (a login name, never a secret). Truncate on
-/// a character boundary so a non-ASCII attempt cannot panic the writer.
 fn bounded_detail(detail: &str) -> &str {
     match detail
         .char_indices()
@@ -422,16 +357,9 @@ pub(crate) fn audit(
     Ok(())
 }
 
-/// Rows of one kind a rejected-login flood may add per [`FLOOD_WINDOW_MS`].
 const FLOOD_ROWS: i64 = 5;
 const FLOOD_WINDOW_MS: i64 = 10_000;
 
-/// [`audit`] for events anyone can cause without a credential (a guess at a
-/// name that does not exist, a request against a locked account): the
-/// record is append-only, so an unbounded flood would be unbounded growth.
-/// Once [`FLOOD_ROWS`] rows of this event and subject exist inside the
-/// window, the attempt is not recorded; the first of every window always is,
-/// so spraying stays visible without being able to fill the disk.
 fn audit_flood(
     tx: &Transaction<'_>,
     event: Event,
@@ -456,9 +384,6 @@ fn audit_flood(
     Ok(())
 }
 
-/// Record one flood-limited event, entering the single writer only while
-/// the window still has room (a cheap indexed read decides): a flood past
-/// the cap costs a reader, not a write transaction.
 fn record_flood(
     store: &Store,
     event: Event,
@@ -489,9 +414,6 @@ fn record_flood(
     Ok(())
 }
 
-/// Host-local admission of the first super admin. Refuses once the latch is set
-/// or any active super admin already exists: "first visitor wins" is not a
-/// bootstrap. The user, its credential and the latch are one commit.
 pub fn bootstrap(
     store: &Store,
     login_name: &str,
@@ -500,8 +422,6 @@ pub fn bootstrap(
     now: UnixMillis,
 ) -> Result<UserId> {
     let login_name = username(login_name)?.to_owned();
-    // Refuse an already-bootstrapped deployment without paying for a hash; the
-    // transaction below is what actually decides.
     if store.read(bootstrap_complete)? {
         return Err(Error::Forbidden);
     }
@@ -518,7 +438,6 @@ pub fn bootstrap(
             "INSERT INTO bootstrap(id, completed_ms, user_id) VALUES (1, ?1, ?2)",
             params![now.0, user.as_bytes()],
         )?;
-        // The latch is closed for the wizard too: its token dies with it.
         tx.execute("DELETE FROM setup_token", [])?;
         audit(
             tx,
@@ -542,7 +461,6 @@ pub(crate) fn bootstrap_complete(conn: &Connection) -> Result<bool> {
     Ok(complete)
 }
 
-/// The local login name of an account, if it has one. One primary-key probe.
 pub fn username_of(conn: &Connection, user: UserId) -> Result<Option<String>> {
     Ok(conn
         .prepare_cached("SELECT username FROM local_credentials WHERE user_id = ?1")?
@@ -550,13 +468,10 @@ pub fn username_of(conn: &Connection, user: UserId) -> Result<Option<String>> {
         .optional()?)
 }
 
-/// Whether the host-local bootstrap command is still available.
 pub fn bootstrap_available(conn: &Connection) -> Result<bool> {
     bootstrap_complete(conn).map(|done| !done)
 }
 
-/// Trusted internal: the caller decides whether this account may exist.
-/// [`bootstrap`] and [`crate::registration`] are the only writers.
 pub(crate) fn insert_credential(
     tx: &Transaction<'_>,
     user: UserId,
@@ -577,8 +492,6 @@ struct Candidate {
     locked_until: i64,
 }
 
-/// One indexed lookup of everything verification needs. Returns `None` for an
-/// unknown, service-owned or deactivated account alike.
 fn candidate(conn: &Connection, login_name: &str) -> Result<Option<Candidate>> {
     let row = conn
         .prepare_cached(
@@ -604,8 +517,6 @@ fn candidate(conn: &Connection, login_name: &str) -> Result<Option<Candidate>> {
     }))
 }
 
-/// [`candidate`] for an address (canonical): the active account that
-/// verified it. An unverified claim identifies nobody.
 fn candidate_by_email(conn: &Connection, email: &str) -> Result<Option<Candidate>> {
     let row = conn
         .prepare_cached(
@@ -632,9 +543,6 @@ fn candidate_by_email(conn: &Connection, email: &str) -> Result<Option<Candidate
     }))
 }
 
-/// Verify a password and, on success, issue a fresh opaque session. An unknown
-/// user costs the same work as a wrong password. `login_name` is a username or
-/// a verified email address.
 pub fn login(
     store: &Store,
     login_name: &str,
@@ -642,13 +550,6 @@ pub fn login(
     policy: Policy,
     now: UnixMillis,
 ) -> Result<Login> {
-    // An attempt against an unknown or malformed name is still recorded, with no
-    // subject: password spraying is visible in the audit trail, and the caller
-    // cannot tell the outcomes apart from the response or from the time taken.
-    //
-    // The identifier is a username, or — when it holds an `@`, which no
-    // username can — an email address, which signs in only once verified.
-    // An address is personal data, so a rejected attempt never records it.
     let (found, detail) = if login_name.contains('@') {
         let found = match crate::email::normalize(login_name) {
             Ok(email) => store.read(|conn| candidate_by_email(conn, &email))?,
@@ -678,8 +579,6 @@ pub fn login(
     }
 
     let verdict = password::verify(&candidate.phc, password_bytes);
-    // Rehash outside the transaction too: a parameter upgrade must not add
-    // tens of milliseconds of Argon2 to the writer's critical section.
     let upgraded = (verdict == Verdict::Accepted && password::needs_rehash(&candidate.phc))
         .then(|| password::hash(password_bytes).ok())
         .flatten();
@@ -688,10 +587,6 @@ pub fn login(
 
     if verdict != Verdict::Accepted {
         store.writer().write(move |tx| {
-            // Count the failure only against the record that was actually
-            // tested. A lockout window that has ended starts the count again
-            // at this failure: the window is served, not a standing debt that
-            // one typo afterwards turns into a fresh lockout.
             let locked: Option<i64> = tx
                 .prepare_cached(
                     "UPDATE local_credentials SET
@@ -733,8 +628,6 @@ pub fn login(
             )?
             .query_row([user.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        // The credential changed, the account was suspended, or a concurrent
-        // attempt locked it while this password was being hashed.
         match current {
             Some((phc, locked_until)) if phc == verified && locked_until <= now.0 => {}
             _ => return Err(Error::Conflict),
@@ -764,13 +657,6 @@ pub fn login(
     }
 }
 
-/// Mint and record one session for an already-authenticated account.
-///
-/// This is the only way a session comes into existence: the password path calls
-/// it, and so does external sign-in ([`crate::sign_in`]). Callers must have
-/// established identity first — this function authenticates nobody. The insert
-/// trigger still refuses a suspended or non-human account, so a race with
-/// suspension fails the transaction instead of issuing a usable cookie.
 pub fn issue_session(
     tx: &Transaction<'_>,
     user: UserId,
@@ -793,25 +679,16 @@ pub fn issue_session(
             SessionId::new().as_bytes()
         ],
     )?;
-    // A sign-in re-checks the person against every GitHub-backed organization
-    // (one bounded statement; the lane asks GitHub, this request never does).
     crate::github_members::enqueue_user(tx, user, now)?;
-    // An address verified before its domain was listed joins now.
     crate::auto_join::apply(tx, user, now)?;
     Ok(Issued {
         user,
         session,
         csrf,
-        // The cookie lives as long as the session can: the idle deadline
-        // slides server-side (see `refresh`), which a fixed idle-length
-        // Max-Age would cut short. Expiry is still the server's decision.
         max_age_secs: (policy.absolute_ms / 1000).clamp(0, i64::from(u32::MAX)) as u32,
     })
 }
 
-/// Validate a presented cookie value. One primary-key probe; expiry, revocation
-/// and the account's live state are predicates of that same statement, so a
-/// suspended user's cookie stops working without a sweep having to run first.
 pub fn authenticate(conn: &Connection, presented: &Secret, now: UnixMillis) -> Result<Session> {
     let digest = presented.digest();
     let row = conn
@@ -852,15 +729,11 @@ pub fn authenticate(conn: &Connection, presented: &Secret, now: UnixMillis) -> R
     })
 }
 
-/// True when this session has spent enough of its idle window to be worth one
-/// write. A session already pinned to its absolute deadline never is.
 pub fn refresh_due(session: &Session, policy: Policy, now: UnixMillis) -> bool {
     session.idle_deadline.0.saturating_sub(now.0) <= policy.idle_ms - policy.refresh_after_ms
         && session.idle_deadline < session.absolute_deadline
 }
 
-/// Slide the idle deadline, never past the absolute one, and never for a
-/// revoked or already-expired session.
 pub fn refresh(store: &Store, presented: &Secret, policy: Policy, now: UnixMillis) -> Result<()> {
     let digest = presented.digest();
     store.writer().write(move |tx| {
@@ -873,7 +746,6 @@ pub fn refresh(store: &Store, presented: &Secret, policy: Policy, now: UnixMilli
     })
 }
 
-/// Revoke one session. Idempotent, and safe to call for an unknown secret.
 pub fn logout(store: &Store, presented: &Secret, now: UnixMillis) -> Result<()> {
     let digest = presented.digest();
     store.writer().write(move |tx| {
@@ -892,16 +764,6 @@ pub fn logout(store: &Store, presented: &Secret, now: UnixMillis) -> Result<()> 
     })
 }
 
-/// Revoke every live session of one account: the caller's logout-all, and the
-/// rotation a password change, role change or suspension must perform.
-///
-/// A session that is no longer trusted may have left credentials behind that
-/// outlive it, so in the same transaction the service grants this account
-/// minted since its oldest live session began are revoked too
-/// ([`crate::oauth::revoke_minted_since`]). The window starts at the oldest
-/// session not individually revoked, expired ones included: a hijacked session
-/// that has gone idle may still have minted a credential. A session revoked by
-/// name closed its own window then ([`revoke_session`]).
 pub fn revoke_all(tx: &Transaction<'_>, user: UserId, now: UnixMillis) -> Result<usize> {
     let since: Option<i64> = tx
         .prepare_cached(
@@ -918,7 +780,6 @@ pub fn revoke_all(tx: &Transaction<'_>, user: UserId, now: UnixMillis) -> Result
     Ok(revoked)
 }
 
-/// Logout everywhere for the authenticated account, including this session.
 pub fn logout_all(store: &Store, session: &Session, now: UnixMillis) -> Result<usize> {
     let user = session.user;
     store.writer().write(move |tx| {
@@ -928,16 +789,6 @@ pub fn logout_all(store: &Store, session: &Session, now: UnixMillis) -> Result<u
     })
 }
 
-/// Self-service password change. Requires the current password, then revokes
-/// every session (the caller's included) and every OAuth grant of the account:
-/// a password change must not leave old cookies or tokens working.
-///
-/// `presented` is the caller's session cookie. An account with a confirmed
-/// second factor also needs a fresh step-up: the password alone is the weaker
-/// proof and must not stand in for the factor, as it cannot for a step-up. A
-/// wrong current password returns `false`, is audited, and counts against the
-/// session like any wrong proof of presence (five revoke it); an account with
-/// no local credential is `NotFound`.
 pub fn change_password(
     store: &Store,
     presented: &Secret,
@@ -994,11 +845,6 @@ pub fn change_password(
     })
 }
 
-/// Host-local recovery: reset a local password, clear the login and
-/// second-factor lockouts and revoke the account's sessions and OAuth grants.
-/// Authorized by access to the database file itself, so a locked-out
-/// operator is never permanently shut out, and every use is
-/// recorded as host-local in the audit table.
 pub fn recover(
     store: &Store,
     login_name: &str,
@@ -1019,8 +865,6 @@ pub fn recover(
         let user = UserId::from_bytes(user).map_err(|_| Error::Corrupt("user_id"))?;
         revoke_all(tx, user, now)?;
         crate::oauth::revoke_all_for_user(tx, user, crate::oauth::reason::ACCOUNT, now)?;
-        // The operator is recovering the account: a second-factor lockout
-        // goes with the password lockout.
         crate::mfa::clear_factor_lockout(tx, user)?;
         audit(
             tx,
@@ -1034,10 +878,6 @@ pub fn recover(
     })
 }
 
-/// Provision a local credential for an existing human account. Trusted
-/// administration, not a registration route.
-/// Giving an account a password changes how it can authenticate, so it needs
-/// the same recent step-up as any other change to authentication.
 pub fn provision_credential(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -1050,9 +890,6 @@ pub fn provision_credential(
     insert_credential(tx, target, username(login_name)?, phc, now)
 }
 
-/// Grant or revoke platform administration. The database also refuses to empty
-/// the super-admin set, so this cannot lock the deployment out even if a future
-/// caller forgets the check.
 pub fn set_super_admin(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -1068,7 +905,6 @@ pub fn set_super_admin(
     if changed == 0 {
         return Err(Error::NotFound);
     }
-    // A demoted admin's live sessions must stop carrying platform authority.
     revoke_all(tx, target, now)?;
     let event = if super_admin {
         Event::SuperAdminGranted
@@ -1085,8 +921,6 @@ pub fn set_super_admin(
     )
 }
 
-/// Activate or suspend an account. Deactivation revokes sessions and API
-/// credentials in the same transaction; it does not wait for their deadlines.
 pub fn set_active(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -1103,7 +937,6 @@ pub fn set_active(
         return Err(Error::NotFound);
     }
     if !active {
-        // Suspension takes every credential with it, not only browser sessions.
         revoke_all(tx, target, now)?;
         crate::tokens::revoke_all_for_user(tx, target, now)?;
         crate::oauth::revoke_all_for_user(tx, target, crate::oauth::reason::ACCOUNT, now)?;
@@ -1123,8 +956,6 @@ pub fn set_active(
     )
 }
 
-/// One session as an account (or an administrator) may see it. No digest, no
-/// cookie value: nothing here can be presented.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SessionRecord {
     pub id: Option<SessionId>,
@@ -1144,8 +975,6 @@ fn may_administer(conn: &Connection, authority: Authority, user: UserId) -> Resu
         .map_err(|_| Error::NotFound)
 }
 
-/// An account's sessions, newest first, at most 100. The account itself or a
-/// platform admin may look.
 pub fn sessions(
     conn: &Connection,
     authority: Authority,
@@ -1189,16 +1018,6 @@ pub fn sessions(
     .collect()
 }
 
-/// Revoke one named session of an account: its own, or a platform admin's
-/// decision. Immediate and audited; a session issued before migration 9 has no
-/// name and is reached by `logout_all` or `revoke_all` instead.
-///
-/// A grant records who minted it, not through which session, so the service
-/// grants the account minted from this session's creation until now are
-/// revoked in the same transaction: the response to a hijacked session must
-/// not leave its minted credential behind. Grants minted by the account's
-/// other sessions in that span are revoked too, and are reissued after a
-/// step-up.
 pub fn revoke_session(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -1232,8 +1051,6 @@ pub fn revoke_session(
     )
 }
 
-/// Host-local revocation of every session of an account, for an operator
-/// responding to a report without a session of their own.
 pub fn revoke_all_host_local(store: &Store, user: UserId, now: UnixMillis) -> Result<usize> {
     store.writer().write(move |tx| {
         let revoked = revoke_all(tx, user, now)?;
@@ -1242,8 +1059,6 @@ pub fn revoke_all_host_local(store: &Store, user: UserId, now: UnixMillis) -> Re
     })
 }
 
-/// Delete sessions that can no longer authenticate anybody. Bounded per call so
-/// maintenance cannot hold the writer while a large table is swept.
 pub fn purge_expired(store: &Store, now: UnixMillis, limit: u32) -> Result<usize> {
     store.writer().write(move |tx| {
         let removed = tx.execute(
@@ -1268,13 +1083,10 @@ pub struct AuditRecord {
     pub detail: Option<String>,
 }
 
-/// Most recent records first. At most 100 per call.
 pub fn recent_audit(conn: &Connection, limit: u16) -> Result<Vec<AuditRecord>> {
     audit_page(conn, None, limit)
 }
 
-/// Records strictly older than sequence `before` (the newest without one),
-/// newest first, at most 100: a keyset page down the primary key.
 pub fn audit_page(conn: &Connection, before: Option<i64>, limit: u16) -> Result<Vec<AuditRecord>> {
     if !(1..=100).contains(&limit) {
         return Err(Error::InvalidInput("page size"));
@@ -1319,8 +1131,6 @@ pub fn audit_page(conn: &Connection, before: Option<i64>, limit: u16) -> Result<
 mod tests {
     use rusqlite::Connection;
 
-    /// Session validation runs on every authenticated request. It must stay a
-    /// primary-key probe plus one key join, never a scan or a temporary sort.
     #[test]
     fn session_validation_and_credential_lookup_are_index_searches() {
         let mut conn = Connection::open_in_memory().unwrap();

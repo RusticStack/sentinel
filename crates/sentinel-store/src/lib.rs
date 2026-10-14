@@ -1,16 +1,3 @@
-//! Local SQLite metadata store.
-//!
-//! One process owns the database. All writes go through a single dedicated
-//! thread that holds the only write connection ([`Writer`]); callers submit a
-//! closure and block for the result, which is returned only after `COMMIT`
-//! has completed with `synchronous=FULL`. Reads use separate WAL snapshots.
-//! Controller primitives are tenant-scoped; client operations in [`auth`]
-//! additionally enforce live identity, scope, memberships and repository grants.
-//!
-//! Chosen after measuring redb and SQLite on the same dispatch workload: both
-//! are fsync-bound at ~0.5 ms per durable commit; SQLite adds constraints,
-//! indexes, migrations and ad-hoc queries at no extra cost.
-
 pub mod artifacts;
 pub mod auth;
 pub mod auto_join;
@@ -67,62 +54,31 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The connection type read closures receive; re-exported for the same reason.
 pub use rusqlite::Connection;
-/// The transaction type writer closures receive; re-exported so callers
-/// outside this crate can name it without depending on rusqlite.
 pub use rusqlite::Transaction;
 use rusqlite::{OpenFlags, TransactionBehavior};
 
 #[derive(Debug)]
 pub enum Error {
     Sqlite(rusqlite::Error),
-    /// Compare-and-set failed: the row changed between read and write.
     Conflict,
-    /// Row does not exist for this tenant (also returned for other tenants' rows).
     NotFound,
     Forbidden,
-    /// Allowed in principle, but the session must first prove presence with a
-    /// second factor. Distinct from `Forbidden` so a client can prompt.
     StepUpRequired,
     InvalidInput(&'static str),
-    /// The state machine rejected the event.
     Transition(sentinel_core::TransitionError),
-    /// Persisted value could not be decoded; the database is corrupt or newer.
     Corrupt(&'static str),
-    /// A run specification could not be built or encoded.
     Spec(sentinel_pipeline::run::SpecError),
-    /// Writer queue is full or the writer has stopped. Nothing was attempted.
     WriterUnavailable,
-    /// The writer accepted the work but did not answer within [`WRITE_WAIT`].
-    /// The transaction may still commit later: treat the outcome as unknown
-    /// and re-read before retrying anything that is not idempotent.
     WriteAmbiguous,
-    /// The closure panicked. Its transaction was rolled back and the writer
-    /// keeps serving; the caller's own invariants are what to check.
     WriterPanicked,
-    /// Every reader is busy and none freed up within [`READ_ADMISSION`].
-    /// Back-pressure, not corruption: retry later or shed the request.
     Overloaded,
-    /// Another process holds this database. One controller owns the metadata
-    /// store; a second one is a deployment error, never a peer.
     AlreadyOwned,
-    /// A job cannot be admitted to execution because its image digest and
-    /// platform have not been durably resolved.
     Unresolved,
-    /// A discretionary write was refused: free space is below the
-    /// watermarks or the admission charge would not fit.
     StorageFull,
-    /// A write was refused because the tenant reached its storage quota.
-    /// Not transient: bytes must be reclaimed or the quota raised.
     QuotaExceeded,
-    /// An idempotency key was reused for a different request:
-    /// a client bug, distinct from a stale compare-and-set `Conflict`.
     IdempotencyMismatch,
     Io(std::io::Error),
-    /// A migration failed: the database stayed at `reached`, the last
-    /// version that committed; `snapshot` is the copy taken before the
-    /// first pending migration, to roll back to.
     MigrationFailed {
         from: u32,
         reached: u32,
@@ -180,12 +136,6 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Error {
-    /// Whether the failure says nothing about the request itself: the writer
-    /// or a reader was unavailable, slow or busy, so the same call may succeed
-    /// later (a `WriteAmbiguous` one may even have committed, which a retry of
-    /// a fenced transition then finds as `NotFound`/`Conflict`). Everything
-    /// else is a verdict on the row — stale, refused or corrupt — and retrying
-    /// it changes nothing.
     pub fn is_transient(&self) -> bool {
         match self {
             Self::WriterUnavailable | Self::WriteAmbiguous | Self::Overloaded => true,
@@ -197,8 +147,6 @@ impl Error {
         }
     }
 
-    /// The variant's name and nothing else: safe to log, because it carries
-    /// no payload — no SQL text, no path, no value from a row.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Sqlite(_) => "sqlite",
@@ -243,8 +191,7 @@ impl From<sentinel_core::TransitionError> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Durability of acknowledged writes. `Full` is the only setting for state
-/// transitions; `Normal` exists for replayable data and tests.
+/// Only Full is safe for state transitions; Normal is for replayable data and tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Durability {
     Full,
@@ -266,15 +213,6 @@ fn configure(conn: &Connection, durability: Durability) -> Result<()> {
     register_functions(conn)
 }
 
-/// Register the SQL functions placement's statements call. Every connection
-/// the store opens has them; a connection opened elsewhere (a test's
-/// in-memory schema) must call this before preparing a placement query.
-///
-/// `sentinel_labels_subset(job, worker)`: whether every label in the job's
-/// encoded label blob is in the worker's — the same sorted,
-/// newline-separated encoding [`dispatch::encode_labels`] writes, compared by
-/// one merge walk over the borrowed blobs, no allocation. Deterministic, so
-/// SQLite may evaluate it once per distinct argument pair.
 pub fn register_functions(conn: &Connection) -> Result<()> {
     use rusqlite::functions::FunctionFlags;
     conn.create_scalar_function(
@@ -290,14 +228,6 @@ pub fn register_functions(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Apply pending migrations. Idempotent; each version commits separately.
-///
-/// A database newer than this build (a rollback) is opened as it is —
-/// nothing migrated, nothing undone — only when every migration this build
-/// does not know declares it readable by this build's schema
-/// (`schema_migrations.readable_by`); otherwise it is refused as
-/// `unsupported database version`. Returns the database's version, which is
-/// then above [`schema::LATEST`].
 pub fn migrate(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -327,8 +257,6 @@ pub fn migrate(conn: &mut Connection) -> Result<u32> {
         if version <= current {
             continue;
         }
-        // The list is contiguous (a compile-time check in `schema`), so the
-        // next entry to apply is always the one right after the database.
         if version != current + 1 {
             return Err(Error::Corrupt("migration order"));
         }
@@ -351,23 +279,8 @@ pub fn migrate(conn: &mut Connection) -> Result<u32> {
     Ok(current)
 }
 
-/// A queued write: it runs on the writer thread with the connection and the
-/// commit notifier, which it bumps once its work has committed.
 type Job = Box<dyn FnOnce(&mut Connection, &Changes) + Send>;
 
-/// The commit notifier: a generation counter the writer thread bumps after
-/// every successful write that changed at least one row, and a parking place for readers
-/// that want to know when the database may have changed (the long
-/// polls). A generation says only "something committed"; the waiter
-/// re-reads whatever it cares about.
-///
-/// Hot-path cost on the writer: one atomic add and one atomic load per
-/// commit. The lock and `notify_all` are taken only while someone is
-/// parked. No wakeup is lost: a waiter registers in `waiters` *before* it
-/// reads the generation under the lock, and the writer reads `waiters`
-/// *after* bumping the generation (all `SeqCst`), so either the writer sees
-/// the waiter and notifies under the lock, or the waiter's read already
-/// sees the new generation and never parks.
 #[derive(Debug, Default)]
 pub struct Changes {
     generation: AtomicU64,
@@ -377,15 +290,12 @@ pub struct Changes {
 }
 
 impl Changes {
-    /// The current generation. It only grows, by one per completed write.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
     }
 
-    /// Park until the generation differs from `seen` or `deadline` passes,
-    /// and return the generation then (equal to `seen` on timeout). Returns
-    /// at once when it already differs; spurious wakeups are absorbed here.
     pub fn wait_past(&self, seen: u64, deadline: Instant) -> u64 {
+        // Register before reading the generation: committed() checks waiters after bumping it, so no wakeup is lost.
         self.waiters.fetch_add(1, Ordering::SeqCst);
         let mut guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let generation = loop {
@@ -408,61 +318,36 @@ impl Changes {
         generation
     }
 
-    /// Wake every parked waiter without a commit, for a thread that must stop
-    /// waiting (its owner is shutting it down). The generation moves like a
-    /// commit's, which is harmless: a generation says only "re-read".
     pub fn nudge(&self) {
         self.committed();
     }
 
-    /// The writer's side, once a write has committed.
     #[inline]
     fn committed(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         if self.waiters.load(Ordering::SeqCst) != 0 {
-            // Taking the lock orders this notify after any waiter's check:
-            // a waiter is either not yet checking (and will see the new
-            // generation) or parked in `wait_timeout` (and is woken).
             let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
             self.cv.notify_all();
         }
     }
 }
 
-/// Readers admitted at once. Each holds a WAL snapshot and a file descriptor;
-/// beyond this many, a request waits briefly and is then shed rather than
-/// opening connections without bound.
 pub const READER_LIMIT: usize = 8;
-/// How long a read waits for a pooled reader before reporting `Overloaded`.
 pub const READ_ADMISSION: Duration = Duration::from_secs(2);
-/// How long a caller waits for the writer's answer before reporting the
-/// outcome as ambiguous. Long enough for a slow fsync, short enough that a
-/// stalled disk surfaces as a bounded error rather than a hung request.
 pub const WRITE_WAIT: Duration = Duration::from_secs(10);
 
-/// Bounded writer queue: enough for a burst of webhook intake, small enough
-/// that a stalled disk surfaces as `WriterUnavailable` within milliseconds.
 pub const WRITER_QUEUE: usize = 256;
 
-/// The controller's metadata database inside its data directory. One file name
-/// for every role and tool, so a host-local command cannot open a second,
-/// accidentally empty database beside the real one.
 pub const METADATA_FILE: &str = "metadata.sqlite";
 
-/// The sealing key for values that must be recoverable (TOTP seeds). Lives
-/// beside the database by default, but it is the operator's secret: keep it
-/// out of database backups, and treat losing it as losing every sealed value.
 pub const MASTER_KEY_FILE: &str = "master.key";
 
-/// The ownership lock beside the database. Advisory, held open for the life of
-/// the process, released by the OS on exit — including a crash.
 fn lock_path(db: &Path) -> PathBuf {
     let mut name = db.as_os_str().to_owned();
     name.push(".lock");
     PathBuf::from(name)
 }
 
-/// The single write path. Dropping it stops the thread after queued work.
 pub struct Writer {
     sender: SyncSender<Job>,
     thread: Option<thread::JoinHandle<()>>,
@@ -496,10 +381,6 @@ impl Writer {
         }
     }
 
-    /// Run `f` inside one `BEGIN IMMEDIATE` transaction on the writer thread and
-    /// block until it has committed (or rolled back). Returns
-    /// [`Error::WriterUnavailable`] immediately if the bounded queue is full:
-    /// callers must apply back-pressure rather than pile up requests.
     pub fn write<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -513,14 +394,6 @@ impl Writer {
         })
     }
 
-    /// Run `f` on the writer thread outside any transaction (checkpoints,
-    /// maintenance). Same queue and back-pressure as `write`.
-    ///
-    /// A panic inside `f` is caught on the writer thread: the transaction it
-    /// was in unwinds and rolls back, the caller gets `WriterPanicked`, and
-    /// the writer keeps serving everybody else. Waiting is bounded by
-    /// [`WRITE_WAIT`]; past it the answer is `WriteAmbiguous`, which is the
-    /// truth — the work is still queued or running and may yet commit.
     pub fn raw<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -531,14 +404,10 @@ impl Writer {
             let before = conn.total_changes();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn)))
                 .unwrap_or(Err(Error::WriterPanicked));
-            // Before the reply, so a caller whose write succeeded never
-            // observes the generation that preceded it. A write that changed
-            // no row is not news: bumping the generation for it would wake
-            // every change watcher to re-read what it already has.
+            // Notify before the reply: a caller must never see a generation older than its own write.
             if result.is_ok() && conn.total_changes() != before {
                 changes.committed();
             }
-            // A caller that stopped waiting is not an error for the writer.
             let _ = reply.send(result);
         });
         match self.sender.try_send(job) {
@@ -553,9 +422,6 @@ impl Writer {
         }
     }
 
-    /// Close the queue and wait up to `timeout` for accepted work to finish.
-    /// Returns whether it did. A stalled writer is left to finish on its own
-    /// rather than joined forever; nothing accepted is discarded either way.
     fn drain(&mut self, timeout: Duration) -> bool {
         let (dead, _) = mpsc::sync_channel(0);
         drop(std::mem::replace(&mut self.sender, dead));
@@ -575,46 +441,31 @@ impl Writer {
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        // Accepted work is durable intent: give it the same bound as a write.
         self.drain(WRITE_WAIT);
     }
 }
 
-/// Idle read connections plus how many exist in total, so admission is
-/// bounded by connections opened, not by connections currently idle.
 struct Readers {
     idle: Vec<Connection>,
     open: usize,
 }
 
-/// Handle to one database: the writer plus a bounded pool of read connections.
 pub struct Store {
     path: PathBuf,
     durability: Durability,
     writer: Writer,
     readers: Mutex<Readers>,
     freed: Condvar,
-    /// Held for the life of the store. One controller owns the metadata
-    /// database; the lock is what makes a second one fail at startup instead
-    /// of at the first conflicting write.
     _owner: std::fs::File,
 }
 
-/// Whether an orderly shutdown finished its accepted work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shutdown {
     Drained,
-    /// Work was still running when the bound expired. It was not discarded;
-    /// the process should report the stall rather than claim a clean stop.
     Stalled,
 }
 
 impl Store {
-    /// Write a consistent copy of the database to `dest` with
-    /// `VACUUM INTO` on a connection of its own: in WAL mode that is one
-    /// read transaction on the source, so the writer and every reader keep
-    /// going while it runs, and the copy is the database at one instant.
-    /// `dest` must not exist.
     pub fn snapshot_into(&self, dest: &Path) -> Result<()> {
         let dest = dest
             .to_str()
@@ -629,8 +480,6 @@ impl Store {
         Ok(())
     }
 
-    /// Bytes the metadata database occupies on disk now: the main file and
-    /// its write-ahead log.
     pub fn metadata_bytes(&self) -> u64 {
         let mut wal = self.path.clone().into_os_string();
         wal.push("-wal");
@@ -641,11 +490,6 @@ impl Store {
             .sum()
     }
 
-    /// Open or create the database at `path`, apply migrations, start the writer.
-    ///
-    /// Fails with [`Error::AlreadyOwned`] if another live process holds the
-    /// database: SQLite serializes writes, but it does not make two
-    /// controllers one scheduler.
     pub fn open(path: impl AsRef<Path>, durability: Durability) -> Result<Store> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent()
@@ -690,17 +534,10 @@ impl Store {
         &self.writer
     }
 
-    /// The commit notifier: bumped after every successful write.
     pub fn changes(&self) -> &Changes {
         &self.writer.changes
     }
 
-    /// Run a read-only closure on a pooled connection using committed WAL
-    /// snapshots. At most [`READER_LIMIT`] connections exist; a caller that
-    /// finds them all busy waits up to [`READ_ADMISSION`] and is then shed
-    /// with `Overloaded`. A panic inside the closure still returns the
-    /// connection — a borrowed `Transaction` drops (and rolls back) with
-    /// the unwind — so one bad read can never shrink the pool.
     pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self.admit()?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&conn)));
@@ -753,9 +590,6 @@ impl Store {
         Ok(c)
     }
 
-    /// Stop accepting writes and wait up to `timeout` for accepted ones to
-    /// finish, then release ownership. Consumes the store, so no request can
-    /// observe a half-stopped handle.
     pub fn shutdown(self, timeout: Duration) -> Shutdown {
         let Store {
             mut writer, _owner, ..
@@ -763,29 +597,18 @@ impl Store {
         if writer.drain(timeout) {
             return Shutdown::Drained;
         }
-        // The writer thread is still this process's, and so is the database:
-        // keep the lock until the process exits rather than inviting a second
-        // controller in underneath unfinished work. Leaking one descriptor and
-        // one handle is the cost of not lying about ownership.
+        // Keep the lock: unfinished work still runs here, and a second controller must not open the database beneath it.
         std::mem::forget(_owner);
         std::mem::forget(writer);
         Shutdown::Stalled
     }
 
-    /// Fold the WAL back into the main file; call at quiet moments and on
-    /// shutdown. The writer thread is held for at most [`CHECKPOINT_BUDGET`]
-    /// of waiting on readers (the connection's own 5 s busy wait would let one
-    /// long read stall every write behind it) plus the copy of what no reader
-    /// needs, which the WAL's own size bounds. When a reader kept part of the
-    /// log, the work done stays done and the answer is
-    /// [`Checkpointed::Partial`]: call again at the next quiet moment.
     pub fn checkpoint(&self) -> Result<Checkpointed> {
         self.writer.raw(|conn| {
             conn.busy_timeout(CHECKPOINT_BUDGET)?;
             let outcome = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
                 r.get::<_, i64>(0)
             });
-            // Whatever the checkpoint did, later writes get their usual wait.
             conn.busy_timeout(BUSY_TIMEOUT)?;
             match outcome {
                 Ok(0) => Ok(Checkpointed::Complete),
@@ -804,16 +627,11 @@ impl Store {
     }
 }
 
-/// How long a checkpoint may wait for readers while it holds the writer.
 pub const CHECKPOINT_BUDGET: Duration = Duration::from_millis(200);
 
-/// What a checkpoint achieved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Checkpointed {
-    /// The WAL was folded into the main file and truncated.
     Complete,
-    /// A reader still needed part of the log within the budget: everything no
-    /// reader needed was folded, the rest waits for a later call.
     Partial,
 }
 
@@ -821,8 +639,6 @@ pub enum Checkpointed {
 mod transient_tests {
     use super::Error;
 
-    /// Only failures that say nothing about the request are retryable: a
-    /// verdict on the row (stale, refused, corrupt) never becomes one.
     #[test]
     fn only_unavailability_is_transient() {
         for error in [
