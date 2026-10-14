@@ -231,17 +231,7 @@ pub struct Settings {
 pub fn settings(conn: &Connection, principal: Principal, slug: &str) -> Result<Settings> {
     let tenant = crate::auth::member_tenant_by_slug(conn, principal, slug)?;
     // Both left joins are primary-key probes of the caller's own rows.
-    let (slug, kind, source, created_ms, role, bound, confirmed, failures, next): (
-        String,
-        i64,
-        i64,
-        i64,
-        Option<i64>,
-        bool,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-    ) = conn
+    let (mut settings, role) = conn
         .prepare_cached(
             "SELECT t.slug, t.kind, t.membership_source, t.created_ms, m.role,
                     EXISTS(SELECT 1 FROM installations i
@@ -253,38 +243,31 @@ pub fn settings(conn: &Connection, principal: Principal, slug: &str) -> Result<S
              WHERE t.id = ?1",
         )?
         .query_row(params![tenant.as_bytes(), principal.user.as_bytes()], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-                r.get(8)?,
-            ))
+            let settings = Settings {
+                tenant,
+                slug: r.get(0)?,
+                personal: r.get::<_, i64>(1)? == 1,
+                github_backed: r.get::<_, i64>(2)? == 1,
+                created_ms: r.get(3)?,
+                role: None,
+                installation_bound: r.get(5)?,
+                github_confirmed_ms: r.get(6)?,
+                github_check_failures: r
+                    .get::<_, Option<i64>>(7)?
+                    .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+                github_check_next_ms: r.get(8)?,
+            };
+            Ok((settings, r.get::<_, Option<i64>>(4)?))
         })?;
-    Ok(Settings {
-        github_confirmed_ms: confirmed,
-        github_check_next_ms: next,
-        github_check_failures: failures.map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
-        tenant,
-        slug,
-        personal: kind == 1,
-        github_backed: source == 1,
-        installation_bound: bound,
-        role: match role {
-            None => None,
-            Some(1) => Some(Role::Reader),
-            Some(2) => Some(Role::Operator),
-            Some(3) => Some(Role::TenantAdmin),
-            Some(_) => return Err(Error::Corrupt("memberships.role")),
-        },
-        created_ms,
-    })
+    settings.role = match role {
+        None => None,
+        Some(1) => Some(Role::Reader),
+        Some(2) => Some(Role::Operator),
+        Some(3) => Some(Role::TenantAdmin),
+        Some(_) => return Err(Error::Corrupt("memberships.role")),
+    };
+    Ok(settings)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
