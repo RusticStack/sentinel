@@ -1,4 +1,4 @@
-//! An account's own security over real HTTP (A06): enrolling a second
+//! An account's own security over real HTTP: enrolling a second
 //! factor, recovery codes and changing the password, with the proof rules
 //! that gate them — a bearer credential never, a session without CSRF never,
 //! the password before a first factor, a step-up before a reissue, and one

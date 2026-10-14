@@ -1,4 +1,4 @@
-//! `GET /attempts/{att}/failure` (X03): one bounded failure view. The
+//! `GET /attempts/{att}/failure`: one bounded failure view. The
 //! worker's fenced attempt outcome is the verdict; parsed reports and log
 //! excerpts are evidence attached to it and never feed a transition.
 //!
@@ -457,7 +457,7 @@ fn failure_log_page(
 }
 
 /// The newest page of `step` (of the whole log without one) through the
-/// sparse index. `None` for a pre-D04 flat log, which has no index; its
+/// sparse index. `None` for a flat log, which has no index; its
 /// excerpt stays on the scan page and pages forward with the cursor.
 fn newest_log_page(
     state: &State,
@@ -693,7 +693,7 @@ fn log_reports(out: &mut Reports, frames: &[Frame], after: u64, scope: LogScope)
 /// Which parser a stream needs, from its first recognizable record. Lines
 /// longer than a parser record are skipped unparsed, and a probe decodes
 /// into a borrowed shape that ignores every other field, so detection
-/// allocates nothing per value however large the line (P11D-7).
+/// allocates nothing per value however large the line.
 fn detect_diagnostic_format(input: &[u8]) -> Option<ReportFormat> {
     #[derive(Deserialize)]
     struct Probe<'a> {

@@ -1,4 +1,4 @@
-//! Secret routes (S02–S04): metadata reads, raw-byte versioned writes, env
+//! Secret routes: metadata reads, raw-byte versioned writes, env
 //! imports, repository allowlists, bindings and single-version revocation.
 //!
 //! Every handler validates its path, query, headers and body shape before
@@ -6,11 +6,11 @@
 //! the membership-checked [`authz::member_tenant_by_slug`] inside the same
 //! store transaction that authorizes and performs the operation. A foreign
 //! tenant or repository is therefore the same `not_found` as a missing one
-//! on every route (P10S-3), and a write costs one writer transaction, not a
-//! read followed by a write (P10C-11).
+//! on every route, and a write costs one writer transaction, not a
+//! read followed by a write.
 //!
-//! Stored retry fingerprints are keyed MACs under a subkey of the master key
-//! (P10S-1): a copy of the database cannot confirm a guessed value.
+//! Stored retry fingerprints are keyed MACs under a subkey of the master key:
+//! a copy of the database cannot confirm a guessed value.
 
 use std::sync::Arc;
 
@@ -105,8 +105,8 @@ fn secret_body(request: &mut Request, limit: usize) -> Result<WipeBytes, ApiErro
 }
 
 /// The query parameters a secret route reads, percent-decoded once
-/// (`form_urlencoded`), so `repo=org%2Fapp` names the repository `org/app`
-/// (P10C-6). A repeated parameter is refused rather than guessed at.
+/// (`form_urlencoded`), so `repo=org%2Fapp` names the repository `org/app`.
+/// A repeated parameter is refused rather than guessed at.
 #[derive(Default)]
 struct Params {
     repo: Option<String>,
