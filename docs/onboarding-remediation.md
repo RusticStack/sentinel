@@ -2,7 +2,45 @@
 
 The state of the onboarding and tenancy work after its final verification pass, one section per work package, as recorded by each package's implementer and reviewer. It continues [audit remediation](audit-remediation.md) and uses the same words: **fixed** (changed on the branch; whether it ran is under verification), **deferred** (not changed, with the reason), **review note** (a reviewer's remaining concern, not fixed unless said so) and **pending** (needs a run that has not happened). Anything a package lists under neither deferred nor review notes was fixed by its branch.
 
-## Verification
+## Release candidate: Resend-only email and the wizard's mail test
+
+Branch `release-candidate` (from `fix/resend-ui`: the audit remediation, the onboarding and tenancy work, Resend-only email and the wizard update), checked 2026-10-14.
+
+What changed since the onboarding pass: mail is delivered only through the Resend HTTP API. The SMTP transport and its `[mail]` keys and `SENTINEL_SMTP_*` variables are removed; the controller reads a Resend key from an owner-only file (`SENTINEL_RESEND_API_KEY_FILE`) and a sender (`SENTINEL_EMAIL_FROM`), `GET /api/v1/setup` gains `mail_configured` (false once setup is closed), and `POST /api/v1/setup/smtp-test` is replaced by `POST /api/v1/setup/mail-test {token, to}`. The wizard's email step sends that test and, when mail is not configured, shows the two environment lines. The contract is in [compatibility](compatibility.md), [API](api.md), [configuration](configuration.md) and [web interface](web-ui.md).
+
+| Check | Where | Result |
+|---|---|---|
+| `cargo fmt-check` | workstation | passed (before and after the fixes) |
+| `cargo lint` | workstation | passed (before and after the fixes) |
+| `pnpm -C web typecheck` | workstation | exit 0, zero `error TS` lines (the same Vue language tools `vue-router/volar` plugin-resolution warning) before and after the fixes |
+| `cargo lint-linux` | verification VPS, `nice -n 19 ionice -c3`, `CARGO_BUILD_JOBS=6`, the separate clone `/srv/sentinel-af` shipped as git bundles, nothing pushed, every `crates/**/*.rs` touched first so the workspace crates rebuild | first pass on the unfixed branch failed (one lint error, below); clean on the final tree |
+| `cargo test-cli` | same | unfixed branch: 1,586 run, 1,585 passed, 1 failed, 21 skipped. Final tree: **1,586 passed, 21 skipped** (0 failed) in 116 s |
+| `cargo test-linux` | same | unfixed branch: 1,632 run, 1,630 passed, 2 failed, 21 skipped. Final tree: **1,632 passed, 21 skipped** (0 failed) in 121 s |
+| `pnpm -C web test:unit` | same, pnpm 12.3.4 and Node 22.22.1 from `/srv/sentinel-runs` (user-local, nothing global) | 22 of 22 passed |
+| `pnpm -C web build` | same | passed (Nuxt 4 / Nitro build completes in about a minute; the stall seen on the workstation did not occur) |
+| Web browser test | same, `SENTINEL_BROWSER=/opt/chrome-headless-shell/as-root` | final tree: **229 of 229 checks** (the test passes). Before the CSP fixes: 227 of 229, the two `no script errors` checks |
+
+Unlike the previous pass, the final `test-cli` and `test-linux` runs are clean full runs of the final tree, started after the sources were touched, and the web unit, build and browser runs are of the same tree. Host load at the start was low (CPU pressure `some avg10` about 1 to 2); an earlier probe saw a load average of 135 from other services' Nuxt builds, and no result here comes from that period except the first, failing, lint run.
+
+### Fixed in this pass
+
+| Finding | Cause | Fix |
+|---|---|---|
+| `cargo lint-linux`: `clippy::type_complexity` on `start_mail` (Linux-only, so the workstation could not show it) | The return type was a nested `Result<(Option<Box<Lane>>, Option<Arc<Resend>>), Error>` | A named `MailStart` type |
+| `sentinel-api::tenant_isolation setup_and_registration_say_the_same_thing_to_everyone` | The test pinned the closed setup answer to `{"open": false}`; the Resend work added `mail_configured` (always present, false once closed), as the documented contract says | The test expects `{"open": false, "mail_configured": false}`: still exactly those two keys, so nothing else about the instance may appear |
+| `sentinel::service::tests::a_bad_email_setting_is_refused_without_echoing_it` (server build only) | The assertion "the refusal does not contain the bad sender" is false for `@example.com`: the fixed refusal sentence itself shows `addr@example.com` | The test asserts the refusal is exactly one of the two fixed sentences, which is the no-echo property without the substring accident |
+| Browser checks `no script errors so far` and `no uncaught script errors` (open since `audit-fixes-final`): `Applying inline style violates ... style-src` | Found with a throw-away instrumented copy of the browser driver (hooks on style-element creation and the `securitypolicyviolation` event, on the VPS only, not committed): three libraries add `<style>` elements in the browser. (1) `@nuxt/icon` in its default CSS mode appends one for each icon first drawn after load (its hash was in the policy only for icons the server rendered). (2) `@nuxtjs/color-mode` with `disableTransition: true`, which Nuxt UI sets, appends `*{transition:none!important}` whenever the colour mode is applied. (3) vaul-vue (bundled by Nuxt UI) appends its constant 5 KB drawer stylesheet when its module loads (seen on `/t/acme` and run pages) | (1) `icon.mode: "svg"`: inline `<svg>`, no style element. (2) `colorMode.disableTransition: false`. (3) A fresh random nonce per response, in `style-src` only, in the `csp-nonce` meta tag that vaul-vue reads (`server/plugins/csp.ts`); scripts get no nonce. `style-src` still has no `unsafe-inline`. Documented in [web interface](web-ui.md) |
+
+### Flaky tests
+
+None of them failed in the two clean full runs of the final tree. In isolation on the VPS, five runs each, all passed: `sentinel-link::tailcat back_off_resets_after_a_healthy_helper_and_never_delays_a_new_list` (7.5 s each), `sentinel-store::bounds a_stalled_write_is_reported_as_ambiguous_not_as_failed` (11.4 s) and `sentinel-store::local_auth credential_free_floods_cannot_grow_the_audit_trail_without_bound` (6 s). The browser test's `role changes during open sessions` passed in all five browser runs of this pass (it timed out once in three runs on the onboarding tree, under heavier host load). No race was reproduced, so nothing was changed in code or tests; all four are timing-bound by design and stay on the watch list for a contended host. Nothing was weakened or deleted.
+
+### Still pending
+
+- The GitHub App, step-up and revoke items listed under the packages below, which need real services or HTTP clients this environment does not have.
+- A real Resend delivery: the tests use a fake endpoint; no key was available, so `POST /setup/mail-test` and the outbox have not sent a message through `api.resend.com`.
+
+## Onboarding pass verification
 
 Branch `onboarding-final` (from `onboarding-c`), checked 2026-10-14.
 
@@ -51,7 +89,7 @@ Three more failed only in the loaded `test-linux` run and passed in every re-run
 
 ### Open after this pass
 
-- **The web interface logs Content-Security-Policy violations.** Both browser checks `no script errors so far` and `no uncaught script errors` fail with `Applying inline style violates ... style-src 'self' 'sha256-...'`: something at run time adds a `<style>` that `web/server/plugins/csp.ts` did not hash. It is not new: the same two checks fail on `audit-fixes-final`. The source was not found; no onboarding page contains a `<style>` or `useHead` style. Deferred.
+- **The web interface logs Content-Security-Policy violations.** Both browser checks `no script errors so far` and `no uncaught script errors` fail with `Applying inline style violates ... style-src 'self' 'sha256-...'`: something at run time adds a `<style>` that `web/server/plugins/csp.ts` did not hash. It is not new: the same two checks fail on `audit-fixes-final`. The source was not found; no onboarding page contains a `<style>` or `useHead` style. Deferred. **Fixed in the release candidate** (icons, colour-mode and drawer style elements; see above).
 - **A timing flake in the browser test.** In one of three browser runs on the onboarding tree `role changes during open sessions` timed out waiting for a run page right after the busy-controller spell; the other two passed it. Not changed.
 - The VPS `pnpm` and Node setup above lives under `/srv/sentinel-runs`, not in the host's global tools; `docs/development.md` still describes the global install as pending.
 
