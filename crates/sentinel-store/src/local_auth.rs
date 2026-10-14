@@ -285,6 +285,8 @@ pub struct Session {
     pub csrf: Digest,
     pub idle_deadline: UnixMillis,
     pub absolute_deadline: UnixMillis,
+    /// When the session was issued (the sign-in that made it).
+    pub created: UnixMillis,
     /// When this session last proved a second factor, if ever.
     pub stepped_up: Option<UnixMillis>,
 }
@@ -295,6 +297,15 @@ impl Session {
     pub fn stepped_up_within(&self, policy: Policy, now: UnixMillis) -> bool {
         self.stepped_up
             .is_some_and(|at| at <= now && now.0.saturating_sub(at.0) < policy.step_up_ms)
+    }
+
+    /// Whether this session was issued within the step-up window: a person
+    /// who has just signed in has just proven themselves, which is the only
+    /// proof an account with neither a password nor a second factor (GitHub
+    /// only) can give before enrolling its first factor. Judged against the
+    /// recorded creation time, which no policy change can move.
+    pub fn signed_in_within(&self, policy: Policy, now: UnixMillis) -> bool {
+        self.created <= now && now.0.saturating_sub(self.created.0) < policy.step_up_ms
     }
 
     pub fn require_step_up(&self, policy: Policy, now: UnixMillis) -> Result<()> {
@@ -721,7 +732,7 @@ pub fn authenticate(conn: &Connection, presented: &Secret, now: UnixMillis) -> R
     let row = conn
         .prepare_cached(
             "SELECT s.user_id, s.csrf_digest, s.idle_deadline_ms, s.absolute_deadline_ms,
-                    u.super_admin, s.id, s.stepped_up_ms
+                    u.super_admin, s.id, s.stepped_up_ms, s.created_ms
              FROM sessions s JOIN users u ON u.id = s.user_id
              WHERE s.token_digest = ?1 AND s.revoked_ms IS NULL
              AND s.idle_deadline_ms > ?2 AND s.absolute_deadline_ms > ?2
@@ -736,6 +747,7 @@ pub fn authenticate(conn: &Connection, presented: &Secret, now: UnixMillis) -> R
                 r.get::<_, bool>(4)?,
                 r.get::<_, Option<[u8; 16]>>(5)?,
                 r.get::<_, Option<i64>>(6)?,
+                r.get::<_, i64>(7)?,
             ))
         })
         .optional()?
@@ -750,6 +762,7 @@ pub fn authenticate(conn: &Connection, presented: &Secret, now: UnixMillis) -> R
         csrf: Digest(row.1),
         idle_deadline: UnixMillis(row.2),
         absolute_deadline: UnixMillis(row.3),
+        created: UnixMillis(row.7),
         stepped_up: row.6.map(UnixMillis),
     })
 }
@@ -830,27 +843,46 @@ pub fn logout_all(store: &Store, session: &Session, now: UnixMillis) -> Result<u
     })
 }
 
-/// Self-service password change. Requires the current password, then rotates
-/// every session: a password change must not leave old cookies working.
+/// Self-service password change. Requires the current password, then revokes
+/// every session (the caller's included) and every OAuth grant of the account:
+/// a password change must not leave old cookies or tokens working.
+///
+/// `presented` is the caller's session cookie. An account with a confirmed
+/// second factor also needs a fresh step-up: the password alone is the weaker
+/// proof and must not stand in for the factor, as it cannot for a step-up. A
+/// wrong current password returns `false`, is audited, and counts against the
+/// session like any wrong proof of presence (five revoke it); an account with
+/// no local credential is `NotFound`.
 pub fn change_password(
     store: &Store,
+    presented: &Secret,
     session: &Session,
+    policy: Policy,
     current: &[u8],
     new: &[u8],
     now: UnixMillis,
 ) -> Result<bool> {
     let user = session.user;
-    let stored = store.read(|conn| {
-        conn.prepare_cached("SELECT phc FROM local_credentials WHERE user_id = ?1")?
-            .query_row([user.as_bytes()], |r| r.get::<_, String>(0))
-            .optional()
-            .map_err(Error::from)
+    let (enrolled, stored) = store.read(|conn| {
+        conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM mfa_totp
+                WHERE user_id = ?1 AND confirmed_ms IS NOT NULL),
+                (SELECT phc FROM local_credentials WHERE user_id = ?1)",
+        )?
+        .query_row([user.as_bytes()], |r| {
+            Ok((r.get::<_, bool>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .map_err(Error::from)
     })?;
     let Some(stored) = stored else {
         password::spend_equal_work(current);
         return Err(Error::NotFound);
     };
+    if enrolled {
+        session.require_step_up(policy, now)?;
+    }
     if password::verify(&stored, current) != Verdict::Accepted {
+        crate::mfa::refuse_password(store, presented.digest().0, user, now)?;
         return Ok(false);
     }
     let phc = password::hash(new).map_err(|_| Error::InvalidInput("password"))?;

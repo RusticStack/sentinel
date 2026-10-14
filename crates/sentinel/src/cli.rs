@@ -745,6 +745,34 @@ pub enum MfaCommand {
         #[arg(long)]
         user: String,
     },
+    /// Begin enrolling an authenticator app for an account, from the host:
+    /// the otpauth:// URI (it carries the seed) is the only thing on stdout,
+    /// once. Nothing changes until `confirm`; needs <data-dir>/master.key
+    Enroll {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+    },
+    /// Confirm an enrollment begun with `enroll` using a current code from
+    /// the app; the ten recovery codes are printed on stdout once
+    Confirm {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+        /// The six-digit code the app shows now
+        #[arg(long)]
+        code: String,
+    },
+    /// Replace an enrolled account's recovery codes: the old set stops
+    /// working and the new ten are printed on stdout once
+    Codes {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+    },
 }
 
 #[derive(Args)]

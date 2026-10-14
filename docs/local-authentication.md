@@ -43,6 +43,16 @@ Opaque 256-bit secrets from the OS CSPRNG, stored only as their BLAKE3 digest. A
 - The HTTP API ([API](api.md)) uses exactly these bytes and this decision on every route: login, logout, every session mutation, and the OAuth consent and device pages (which add a form token and an `Origin` check).
 - Login itself is guarded against login CSRF — a cross-site page signing the victim into the attacker's account. `POST /api/v1/login` accepts only `content-type: application/json`, which a cross-site form cannot send (an `enctype="text/plain"` body can be shaped to parse as JSON) and a cross-site `fetch` cannot send without a CORS preflight the server never grants; and a present `Origin` must be the issuer's origin.
 
+## Changing a password
+
+`POST /api/v1/password {current, new}` ([API](api.md)) is the self-service change, for a browser session with its CSRF header. The rules:
+
+- The **current password** is always required. A wrong one (or an account that has no local password) is one `forbidden`, audited as a failed proof (`step-up-failed`) and counted against the **session**: five revoke it. It is never counted against the account's second factor, so a stolen cookie cannot lock the real factor out by guessing.
+- With a **second factor enrolled**, a fresh [step-up](step-up.md) is also required, asked for (`details.step_up`) before the password is judged: the password alone is the weaker proof.
+- On success the hash is replaced only if it is still the one that was verified (a concurrent change is `conflict`), the login lockout is cleared, and **every** session and OAuth grant of the account is revoked in the same transaction — this session included. The response clears the cookie; the person signs in again with the new password. API credentials do not depend on the password and stay live. `password-changed` is audited.
+- The request draws on the sign-in admission budget before any hash. A new password outside 12–256 bytes, or only spacing, is `invalid_request`.
+- Setting a first password for a GitHub-only account is `provision_credential`, a step-up change, not this route. Host-locally, `sentinel admin recover` is the password change: it resets the password, clears both lockouts and revokes sessions and grants.
+
 ## Recovery and the last super admin
 
 `sentinel admin recover --data-dir <PATH> --username <NAME>` resets a local password, clears the login lockout and the second-factor lockout ([step-up](step-up.md)) and revokes the account's sessions and OAuth grants (API credentials do not depend on the password and stay live), so an operator locked out — or stranded by a GitHub outage — is never permanently shut out. Every use is recorded as host-local in the audit table.

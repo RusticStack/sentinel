@@ -400,12 +400,42 @@ fn changing_a_password_requires_the_current_one_and_rotates_every_session() {
         .read(|conn| local_auth::authenticate(conn, &issued.session, at(2_100)))
         .unwrap();
 
-    assert!(!local_auth::change_password(&store, &session, OTHER, OTHER, at(2_200)).unwrap());
+    assert!(
+        !local_auth::change_password(
+            &store,
+            &issued.session,
+            &session,
+            Policy::default(),
+            OTHER,
+            OTHER,
+            at(2_200)
+        )
+        .unwrap()
+    );
     assert!(matches!(
-        local_auth::change_password(&store, &session, PASSWORD, b"short", at(2_300)),
+        local_auth::change_password(
+            &store,
+            &issued.session,
+            &session,
+            Policy::default(),
+            PASSWORD,
+            b"short",
+            at(2_300)
+        ),
         Err(Error::InvalidInput("password"))
     ));
-    assert!(local_auth::change_password(&store, &session, PASSWORD, OTHER, at(2_400)).unwrap());
+    assert!(
+        local_auth::change_password(
+            &store,
+            &issued.session,
+            &session,
+            Policy::default(),
+            PASSWORD,
+            OTHER,
+            at(2_400)
+        )
+        .unwrap()
+    );
 
     assert!(matches!(
         store.read(|conn| local_auth::authenticate(conn, &issued.session, at(2_500))),

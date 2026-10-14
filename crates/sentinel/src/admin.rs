@@ -1258,10 +1258,85 @@ fn reseal(data: &DataDir, retire: bool, backup: Option<&std::path::Path>) -> Res
     Ok(())
 }
 
-/// Enrollment needs the person and their device, so it has no host-local form.
-/// Removal does: it is the recovery path for a lost device, and is audited.
+/// Load the deployment's master key, which seals every TOTP seed.
+fn master_key(data: &DataDir) -> Result<sentinel_auth::sealed::Key, Error> {
+    let path = data.data_dir.join(MASTER_KEY_FILE);
+    sentinel_auth::sealed::Key::load(&path).map_err(|_| {
+        fail(format!(
+            "cannot load {}; create it with `sentinel admin key create`",
+            path.display()
+        ))
+    })
+}
+
+/// Enrollment and reissue run at the host for the operator who is sitting
+/// with the person and their device (a GitHub-only super admin on a headless
+/// deployment, say): authorized by the database file like removal, audited as
+/// host-local, with every secret on stdout alone and only once. Removal is the
+/// recovery path for a lost device.
 fn second_factor(args: &MfaArgs, now: UnixMillis) -> Result<(), Error> {
     match &args.command {
+        MfaCommand::Enroll { data, user } => {
+            let store = open(data, true)?;
+            let key = master_key(data)?;
+            let user = resolve_user(&store, user)?;
+            let label = store
+                .read(|conn| local_auth::username_of(conn, user))
+                .map_err(|error| fail(format!("cannot read the account: {error}")))?
+                .unwrap_or_else(|| user.to_string());
+            let enrollment =
+                mfa::begin_enrollment_host_local(&store, &key, user, "Sentinel", &label, now)
+                    .map_err(|error| match error {
+                        sentinel_store::Error::Conflict => fail(
+                            "that account already has a second factor; remove it with `sentinel admin mfa disable` first",
+                        ),
+                        sentinel_store::Error::NotFound => {
+                            fail("that account is not an active human account")
+                        }
+                        other => fail(format!("cannot begin enrollment: {other}")),
+                    })?;
+            eprintln!(
+                "add this to the authenticator app, then run `sentinel admin mfa confirm` with a code from it; it is shown once"
+            );
+            sentinel::outln!("{}", enrollment.provisioning_uri);
+        }
+        MfaCommand::Confirm { data, user, code } => {
+            let store = open(data, true)?;
+            let key = master_key(data)?;
+            let user = resolve_user(&store, user)?;
+            let codes = mfa::confirm_enrollment_host_local(&store, &key, user, code, now).map_err(
+                |error| match error {
+                    sentinel_store::Error::Forbidden => {
+                        fail("that code is not valid now; use the one the app shows at this moment")
+                    }
+                    sentinel_store::Error::NotFound => {
+                        fail("no enrollment is waiting; run `sentinel admin mfa enroll` first")
+                    }
+                    other => fail(format!("cannot confirm enrollment: {other}")),
+                },
+            )?;
+            eprintln!("second factor enrolled for {user}; the recovery codes are shown once");
+            for code in &codes {
+                sentinel::outln!("{}", code.expose());
+            }
+        }
+        MfaCommand::Codes { data, user } => {
+            let store = open(data, true)?;
+            let user = resolve_user(&store, user)?;
+            let codes =
+                mfa::reissue_recovery_codes_host_local(&store, user, now).map_err(|error| {
+                    match error {
+                        sentinel_store::Error::NotFound => {
+                            fail("that account has no second factor")
+                        }
+                        other => fail(format!("cannot reissue recovery codes: {other}")),
+                    }
+                })?;
+            eprintln!("recovery codes replaced for {user}; the new set is shown once");
+            for code in &codes {
+                sentinel::outln!("{}", code.expose());
+            }
+        }
         MfaCommand::Status { data, user } => {
             let store = open(data, true)?;
             let user = resolve_user(&store, user)?;

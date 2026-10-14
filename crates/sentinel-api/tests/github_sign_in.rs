@@ -74,6 +74,9 @@ fn deployment(configured: bool) -> (Deployment, UserId) {
         Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
     let logs = Arc::new(LogStore::open(dir.path().join("logs")).unwrap());
     let objects = Arc::new(Objects::open(dir.path()).unwrap());
+    let key_path = dir.path().join("master.key");
+    sentinel_auth::sealed::Key::create(&key_path).unwrap();
+    let key = Arc::new(sentinel_auth::sealed::Key::load(&key_path).unwrap());
     let now = UnixMillis::now();
     let root = local_auth::bootstrap(&store, "root", "Root", PASSWORD.as_bytes(), now).unwrap();
     let (tenant, repo) = (TenantId::new(), RepoId::new());
@@ -147,7 +150,7 @@ fn deployment(configured: bool) -> (Deployment, UserId) {
         logs,
         objects,
         controller: controller.handle(),
-        secret_key: None,
+        secret_key: Some(key),
         sessions: local_auth::Policy::default(),
         github_webhook_secret: None,
         intake: None,
@@ -1074,6 +1077,317 @@ fn the_same_origin_hop_revokes_the_session_the_callback_could_not_see() {
     // Once only.
     assert_eq!(browser.get(&finish).status, 400);
     assert_eq!(sessions_of(&d, octo), 1);
+}
+
+/// A browser signed in with a password: its jar holds the session cookie.
+/// Also returns the CSRF secret the login handed over.
+fn signed_in(d: &Deployment, username: &str) -> (Browser, String) {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let mut login = agent
+        .post(&format!("{}/api/v1/login", d.base))
+        .header("content-type", "application/json")
+        .send(
+            json!({"username": username, "password": PASSWORD})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(login.status().as_u16(), 200);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body: Value = serde_json::from_str(&login.body_mut().read_to_string().unwrap()).unwrap();
+    let mut browser = Browser::new(d);
+    browser.accept(&cookie);
+    (browser, body["csrf"].as_str().unwrap().to_owned())
+}
+
+/// A JSON `POST` from the browser's own pages: cookies and the CSRF header.
+fn api_post(
+    d: &Deployment,
+    browser: &Browser,
+    path: &str,
+    body: Value,
+    csrf: &str,
+) -> (u16, Value) {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let mut response = agent
+        .post(&format!("{}{path}", d.base))
+        .header("content-type", "application/json")
+        .header("cookie", &browser.cookie_header(false))
+        .header("x-sentinel-csrf", csrf)
+        .send(body.to_string().as_bytes())
+        .unwrap();
+    let status = response.status().as_u16();
+    let text = response.body_mut().read_to_string().unwrap_or_default();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+/// Begin linking from a signed-in, stepped-up browser and carry it through
+/// GitHub and back; returns the answer to the same-origin hop (or the
+/// callback's, when that did not move on).
+fn link_through_github(d: &Deployment, browser: &mut Browser, csrf: &str) -> Reply {
+    let started = browser.request(
+        "POST",
+        &format!("{}/api/v1/identities/github/link", d.base),
+        Some("{}"),
+        &[("x-sentinel-csrf", csrf)],
+    );
+    assert_eq!(started.status, 200, "{}", started.text);
+    let authorize = started.json()["authorize_url"].as_str().unwrap().to_owned();
+    assert!(authorize.starts_with(&d.github.base()), "{authorize}");
+    assert!(browser.cookie("__Host-sentinel_signin").is_some());
+    let at_github = browser.get(&authorize);
+    assert_eq!(at_github.status, 302);
+    let back = at_github.header("location").unwrap().to_owned();
+    browser.callback(&back)
+}
+
+fn linked_subjects(d: &Deployment, user: UserId) -> Vec<String> {
+    d.store
+        .read(|c| sentinel_store::sign_in::identities(c, Authority::HostLocal, user))
+        .unwrap()
+        .into_iter()
+        .map(|i| format!("{}:{}", i.provider, i.subject))
+        .collect()
+}
+
+#[test]
+fn a_signed_in_account_links_github_through_its_own_session_after_a_step_up() {
+    let (d, _octo) = deployment(true);
+    d.github.sign_in_as(Some(Account {
+        id: 9001,
+        login: "root-gh".into(),
+        email: "root@example.com".into(),
+    }));
+    let (mut browser, csrf) = signed_in(&d, "root");
+    let link = format!("{}/api/v1/identities/github/link", d.base);
+
+    // Without a fresh step-up the start asks for one and creates nothing; a
+    // session's CSRF header is required like any mutation.
+    let cold = browser.request("POST", &link, Some("{}"), &[("x-sentinel-csrf", &csrf)]);
+    assert_eq!(cold.status, 403, "{}", cold.text);
+    assert_eq!(cold.json()["details"]["step_up"], true);
+    assert!(browser.cookie("__Host-sentinel_signin").is_none());
+    assert_eq!(browser.request("POST", &link, Some("{}"), &[]).status, 403);
+    let anonymous = Browser::new(&d).request("POST", &link, Some("{}"), &[]);
+    assert_eq!(anonymous.status, 401);
+
+    let (status, body) = api_post(
+        &d,
+        &browser,
+        "/api/v1/step-up",
+        json!({ "method": "password", "code": PASSWORD }),
+        &csrf,
+    );
+    assert_eq!(status, 200, "{body}");
+    let done = link_through_github(&d, &mut browser, &csrf);
+    assert_eq!(done.status, 200, "{}", done.text);
+    assert!(done.text.contains("GitHub is linked"), "{}", done.text);
+
+    // Linked to this account, this session untouched, the sign-in cookie
+    // spent, and the hop completes once.
+    assert_eq!(linked_subjects(&d, d.root), ["github:9001"]);
+    assert_eq!(sessions_of(&d, d.root), 1);
+    assert!(browser.cookie("__Host-sentinel_signin").is_none());
+    assert_eq!(
+        browser
+            .get(&format!("{}/auth/github/finish", d.base))
+            .status,
+        400
+    );
+    let security = browser.get(&format!("{}/api/v1/me/security", d.base));
+    assert_eq!(
+        security.json()["identities"][0]["provider"],
+        "github",
+        "{}",
+        security.text
+    );
+    assert!(
+        security.json()["identities"][0].get("subject").is_none(),
+        "no subject is shown"
+    );
+    assert_nothing_leaked(&d, &browser);
+}
+
+#[test]
+fn an_identity_already_linked_elsewhere_is_never_taken() {
+    let (d, octo) = deployment(true);
+    d.github.sign_in_as(Some(octo_github()));
+    let (mut browser, csrf) = signed_in(&d, "root");
+    let (status, _) = api_post(
+        &d,
+        &browser,
+        "/api/v1/step-up",
+        json!({ "method": "password", "code": PASSWORD }),
+        &csrf,
+    );
+    assert_eq!(status, 200);
+
+    let done = link_through_github(&d, &mut browser, &csrf);
+    assert_eq!(done.status, 409, "{}", done.text);
+    assert!(linked_subjects(&d, d.root).is_empty());
+    assert_eq!(linked_subjects(&d, octo), ["github:4242"]);
+}
+
+#[test]
+fn a_link_completes_only_in_the_session_that_began_it() {
+    let (d, _) = deployment(true);
+    d.github.sign_in_as(Some(Account {
+        id: 9002,
+        login: "root-gh".into(),
+        email: "root@example.com".into(),
+    }));
+    let (mut browser, csrf) = signed_in(&d, "root");
+    let (status, _) = api_post(
+        &d,
+        &browser,
+        "/api/v1/step-up",
+        json!({ "method": "password", "code": PASSWORD }),
+        &csrf,
+    );
+    assert_eq!(status, 200);
+    let started = browser.request(
+        "POST",
+        &format!("{}/api/v1/identities/github/link", d.base),
+        Some("{}"),
+        &[("x-sentinel-csrf", &csrf)],
+    );
+    let authorize = started.json()["authorize_url"].as_str().unwrap().to_owned();
+    let back = browser
+        .get(&authorize)
+        .header("location")
+        .unwrap()
+        .to_owned();
+    let page = browser.cross_site_get(&back);
+    assert_eq!(page.status, 200, "{}", page.text);
+
+    // The hop arrives with a different session of the same account (or none
+    // at all): nothing is linked, and the attempt is spent either way.
+    let (other, _) = signed_in(&d, "root");
+    let (name, value) = other.jar[0].clone();
+    browser.jar.retain(|(k, _)| *k != name);
+    browser.jar.push((name, value));
+    let hop = browser.get(&format!("{}/auth/github/finish", d.base));
+    assert_eq!(hop.status, 403, "{}", hop.text);
+    assert!(linked_subjects(&d, d.root).is_empty());
+    assert_eq!(
+        browser
+            .get(&format!("{}/auth/github/finish", d.base))
+            .status,
+        400
+    );
+}
+
+/// The page a finished GitHub sign-in answers for the first page carries the
+/// session's CSRF secret for the interface to keep.
+fn csrf_from(page: &Reply) -> String {
+    let at = page
+        .text
+        .find("sentinel-csrf\", \"")
+        .expect("a CSRF secret")
+        + 17;
+    page.text[at..].split('"').next().unwrap().to_owned()
+}
+
+#[test]
+fn a_github_only_account_enrolls_a_second_factor_and_can_then_step_up() {
+    let (d, _octo) = deployment(true);
+    d.github.sign_in_as(Some(octo_github()));
+    let sign_in = |d: &Deployment| -> (Browser, String) {
+        let mut browser = Browser::new(d);
+        let start = browser.get(&format!("{}/auth/github/start?return_to=%2F", d.base));
+        let to_github = start.header("location").unwrap().to_owned();
+        let back = browser
+            .get(&to_github)
+            .header("location")
+            .unwrap()
+            .to_owned();
+        let done = browser.callback(&back);
+        assert_eq!(done.status, 200, "{}", done.text);
+        let csrf = csrf_from(&done);
+        (browser, csrf)
+    };
+    let (mut browser, csrf) = sign_in(&d);
+    let state = browser
+        .get(&format!("{}/api/v1/me/security", d.base))
+        .json();
+    assert_eq!(
+        (
+            state["password"].as_bool(),
+            state["mfa"]["enrolled"].as_bool()
+        ),
+        (Some(false), Some(false)),
+        "{state}"
+    );
+    // No password to change, and the refusal is the same one a wrong
+    // password gets.
+    let (status, body) = api_post(
+        &d,
+        &browser,
+        "/api/v1/password",
+        json!({ "current": PASSWORD, "new": "some other long passphrase" }),
+        &csrf,
+    );
+    assert_eq!(
+        (status, body["message"].as_str()),
+        (403, Some("password change refused"))
+    );
+
+    // The sign-in just made is its proof: enrollment needs no password.
+    let (status, body) = api_post(&d, &browser, "/api/v1/mfa/enroll", json!({}), &csrf);
+    assert_eq!(status, 200, "{body}");
+    let uri = body["provisioning_uri"].as_str().unwrap();
+    assert!(uri.starts_with("otpauth://totp/"), "{uri}");
+    let start = uri.find("secret=").unwrap() + 7;
+    let end = uri[start..].find('&').map_or(uri.len(), |e| start + e);
+    let seed = sentinel_auth::mfa::Seed::from_base32(&uri[start..end]).unwrap();
+    let seconds = UnixMillis::now().0 as u64 / 1000;
+    let code = (0..1_000_000u32)
+        .map(|n| format!("{n:06}"))
+        .find(|c| sentinel_auth::mfa::check(&seed, c, seconds).is_some())
+        .unwrap();
+    let (status, body) = api_post(
+        &d,
+        &browser,
+        "/api/v1/mfa/enroll/confirm",
+        json!({ "code": code }),
+        &csrf,
+    );
+    assert_eq!(status, 200, "{body}");
+    let recovery = body["recovery_codes"][0].as_str().unwrap().to_owned();
+
+    // A later GitHub sign-in is a cold session; the recovery code steps it
+    // up, which a GitHub-only account could not do before.
+    let (later, later_csrf) = sign_in(&d);
+    let (status, body) = api_post(
+        &d,
+        &later,
+        "/api/v1/step-up",
+        json!({ "method": "password", "code": PASSWORD }),
+        &later_csrf,
+    );
+    assert_eq!(status, 403, "{body}");
+    let (status, body) = api_post(
+        &d,
+        &later,
+        "/api/v1/step-up",
+        json!({ "method": "recovery", "code": recovery }),
+        &later_csrf,
+    );
+    assert_eq!(status, 200, "{body}");
 }
 
 #[test]

@@ -67,7 +67,32 @@ pub fn begin_enrollment(
     account: &str,
     now: UnixMillis,
 ) -> Result<Enrollment> {
-    let user = session.user;
+    begin(store, key, session.user, issuer, account, now)
+}
+
+/// Host-local enrollment start: the operator who holds the database file sits
+/// at the host with the person's device, so no session is involved. The same
+/// unconfirmed registration as [`begin_enrollment`]; the confirmation is
+/// audited as host-local ([`confirm_enrollment_host_local`]).
+pub fn begin_enrollment_host_local(
+    store: &Store,
+    key: &Key,
+    user: UserId,
+    issuer: &str,
+    account: &str,
+    now: UnixMillis,
+) -> Result<Enrollment> {
+    begin(store, key, user, issuer, account, now)
+}
+
+fn begin(
+    store: &Store,
+    key: &Key,
+    user: UserId,
+    issuer: &str,
+    account: &str,
+    now: UnixMillis,
+) -> Result<Enrollment> {
     let seed = Seed::generate();
     let provisioning_uri = seed
         .provisioning_uri(issuer, account)
@@ -88,10 +113,20 @@ pub fn begin_enrollment(
             }
             None => {}
         }
+        // The insert trigger refuses anything but an active human account:
+        // an unknown or suspended one is the same `NotFound` as no account.
         tx.execute(
             "INSERT INTO mfa_totp(user_id, sealed_seed, created_ms) VALUES (?1, ?2, ?3)",
             params![user.as_bytes(), sealed, now.0],
-        )?;
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Error::NotFound
+            }
+            other => Error::from(other),
+        })?;
         Ok(())
     })?;
     Ok(Enrollment { provisioning_uri })
@@ -109,7 +144,38 @@ pub fn confirm_enrollment(
     code: &str,
     now: UnixMillis,
 ) -> Result<Vec<RecoveryCode>> {
-    let user = session.user;
+    confirm(
+        store,
+        key,
+        session.user,
+        Some(presented.digest().0),
+        code,
+        now,
+    )
+}
+
+/// Host-local confirmation of an enrollment [`begin_enrollment_host_local`]
+/// started: the code proves the app holds the seed, the recovery codes are
+/// returned once, and the audit row is marked host-local. No session is
+/// stamped; the person signs in and steps up with the new factor.
+pub fn confirm_enrollment_host_local(
+    store: &Store,
+    key: &Key,
+    user: UserId,
+    code: &str,
+    now: UnixMillis,
+) -> Result<Vec<RecoveryCode>> {
+    confirm(store, key, user, None, code, now)
+}
+
+fn confirm(
+    store: &Store,
+    key: &Key,
+    user: UserId,
+    stamp_session: Option<[u8; 32]>,
+    code: &str,
+    now: UnixMillis,
+) -> Result<Vec<RecoveryCode>> {
     let sealed: Vec<u8> = store.read(|conn| {
         conn.prepare_cached(
             "SELECT sealed_seed FROM mfa_totp WHERE user_id = ?1 AND confirmed_ms IS NULL",
@@ -119,11 +185,20 @@ pub fn confirm_enrollment(
         .ok_or(Error::NotFound)
     })?;
     let seed = open_seed(key, user, &sealed)?;
-    let step = mfa::check(&seed, code, unix_seconds(now)).ok_or(Error::Forbidden)?;
+    let Some(step) = mfa::check(&seed, code, unix_seconds(now)) else {
+        // A pending enrollment has no expiry, and a correct code yields the
+        // recovery codes, so a cookie guessing at it is counted like any
+        // wrong proof: five revoke the session. The factor itself is not yet
+        // confirmed, so its account lockout is not involved. Host-local has
+        // no session to count against.
+        if let Some(digest) = stamp_session {
+            refuse(store, digest, user, now)?;
+        }
+        return Err(Error::Forbidden);
+    };
 
     let codes = mfa::recovery_codes();
     let digests: Vec<[u8; 32]> = codes.iter().map(|code| code.digest().0).collect();
-    let digest = presented.digest();
     store.writer().write(move |tx| {
         let confirmed = tx.execute(
             "UPDATE mfa_totp SET confirmed_ms = ?2, last_step = ?3
@@ -134,8 +209,18 @@ pub fn confirm_enrollment(
             return Err(Error::Conflict);
         }
         replace_recovery_codes(tx, user, &digests, now)?;
-        stamp(tx, digest.0, now)?;
-        audit(tx, Event::MfaEnrolled, Some(user), Some(user), false, None)
+        let host_local = stamp_session.is_none();
+        if let Some(digest) = stamp_session {
+            stamp(tx, digest, now)?;
+        }
+        audit(
+            tx,
+            Event::MfaEnrolled,
+            (!host_local).then_some(user),
+            Some(user),
+            host_local,
+            None,
+        )
     })?;
     Ok(codes)
 }
@@ -305,6 +390,29 @@ pub(crate) fn clear_factor_lockout(tx: &rusqlite::Transaction<'_>, user: UserId)
 /// factor refuses every proof for [`FACTOR_LOCKOUT_MS`] and every session of
 /// the account is revoked, so signing in again buys no further guesses.
 fn refuse(store: &Store, digest: [u8; 32], user: UserId, now: UnixMillis) -> Result<bool> {
+    refuse_counting(store, digest, user, now, true)
+}
+
+/// A wrong *password* presented to change the password: it counts against
+/// the session (five revoke it) and is audited, but not against the second
+/// factor. The password is not the factor, and counting it would let a stolen
+/// cookie lock the account's real factor out.
+pub(crate) fn refuse_password(
+    store: &Store,
+    digest: [u8; 32],
+    user: UserId,
+    now: UnixMillis,
+) -> Result<bool> {
+    refuse_counting(store, digest, user, now, false)
+}
+
+fn refuse_counting(
+    store: &Store,
+    digest: [u8; 32],
+    user: UserId,
+    now: UnixMillis,
+    count_factor: bool,
+) -> Result<bool> {
     store.writer().write(move |tx| {
         let failures: Option<i64> = tx
             .prepare_cached(
@@ -327,11 +435,17 @@ fn refuse(store: &Store, digest: [u8; 32], user: UserId, now: UnixMillis) -> Res
                      WHEN (CASE WHEN locked_until_ms != 0 THEN 1 ELSE failures + 1 END) >= ?3
                          THEN ?4
                      ELSE 0 END
-                 WHERE user_id = ?1 AND confirmed_ms IS NOT NULL
+                 WHERE user_id = ?1 AND confirmed_ms IS NOT NULL AND ?5
                  RETURNING locked_until_ms = ?4",
             )?
             .query_row(
-                params![user.as_bytes(), now.0, MAX_FACTOR_FAILURES, until],
+                params![
+                    user.as_bytes(),
+                    now.0,
+                    MAX_FACTOR_FAILURES,
+                    until,
+                    count_factor
+                ],
                 |r| r.get(0),
             )
             .optional()?;
@@ -387,6 +501,17 @@ pub fn enrolled(conn: &Connection, user: UserId) -> Result<bool> {
     Ok(enrolled)
 }
 
+/// Whether an enrollment was begun and not yet confirmed. The URI is never
+/// shown twice, so a client can only offer to start over (which supersedes it).
+pub fn enrollment_pending(conn: &Connection, user: UserId) -> Result<bool> {
+    let pending: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM mfa_totp WHERE user_id = ?1 AND confirmed_ms IS NULL)",
+        )?
+        .query_row([user.as_bytes()], |r| r.get(0))?;
+    Ok(pending)
+}
+
 /// How many unspent recovery codes remain. Metadata: the codes themselves are
 /// unrecoverable once shown.
 pub fn recovery_codes_remaining(conn: &Connection, user: UserId) -> Result<usize> {
@@ -407,7 +532,25 @@ pub fn reissue_recovery_codes(
     now: UnixMillis,
 ) -> Result<Vec<RecoveryCode>> {
     session.require_step_up(policy, now)?;
-    let user = session.user;
+    reissue(store, session.user, false, now)
+}
+
+/// Host-local reissue, for an operator at the host: the old set is replaced
+/// and the new one shown once. Audited as host-local.
+pub fn reissue_recovery_codes_host_local(
+    store: &Store,
+    user: UserId,
+    now: UnixMillis,
+) -> Result<Vec<RecoveryCode>> {
+    reissue(store, user, true, now)
+}
+
+fn reissue(
+    store: &Store,
+    user: UserId,
+    host_local: bool,
+    now: UnixMillis,
+) -> Result<Vec<RecoveryCode>> {
     let codes = mfa::recovery_codes();
     let digests: Vec<[u8; 32]> = codes.iter().map(|code| code.digest().0).collect();
     store.writer().write(move |tx| {
@@ -418,9 +561,9 @@ pub fn reissue_recovery_codes(
         audit(
             tx,
             Event::RecoveryCodesIssued,
+            (!host_local).then_some(user),
             Some(user),
-            Some(user),
-            false,
+            host_local,
             None,
         )
     })?;
