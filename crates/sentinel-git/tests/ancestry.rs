@@ -1,6 +1,3 @@
-//! The reordered-push rule's Git question — is this revision already in the
-//! tip's history? — answered over a real remote with only commits fetched,
-//! and the transport discipline for fetches that carry no source access.
 #![cfg(unix)]
 
 use std::{
@@ -32,8 +29,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-/// A linear history `commits[0] → … → commits[4]` on main, plus a side
-/// branch off `commits[1]` that main never merged.
 struct Repo {
     dir: tempfile::TempDir,
     path: PathBuf,
@@ -93,11 +88,8 @@ fn an_older_commit_is_in_the_tip_history_and_a_newer_or_unrelated_one_is_not() {
     let c = &repo.commits;
     assert!(ancestor(&repo, "older", &c[1], &c[4], 64));
     assert!(ancestor(&repo, "same", &c[4], &c[4], 64));
-    // The other direction: the tip is not in an older commit's history.
     assert!(!ancestor(&repo, "newer", &c[4], &c[1], 64));
-    // A branch that main never merged is not stale relative to main.
     assert!(!ancestor(&repo, "side", &repo.side, &c[4], 64));
-    // Beyond the window nothing is proven: the answer stays conservative.
     assert!(!ancestor(&repo, "window", &c[0], &c[4], 2));
     assert!(ancestor(&repo, "edge", &c[2], &c[4], 3));
 }
@@ -105,7 +97,6 @@ fn an_older_commit_is_in_the_tip_history_and_a_newer_or_unrelated_one_is_not() {
 #[test]
 fn a_tip_the_remote_no_longer_has_proves_nothing_and_an_unreachable_remote_is_an_error() {
     let repo = repository();
-    // Force-pushed away (or never there): not an error, just not proven.
     assert!(!ancestor(
         &repo,
         "gone",
@@ -124,7 +115,6 @@ fn a_tip_the_remote_no_longer_has_proves_nothing_and_an_unreachable_remote_is_an
         Duration::from_secs(30),
     );
     assert!(matches!(outcome, Err(Error::Preparation(_))), "{outcome:?}");
-    // Malformed requests never reach Git.
     let outcome = is_ancestor(
         &work(&repo, "malformed"),
         repo.path.to_str().unwrap(),
@@ -137,9 +127,7 @@ fn a_tip_the_remote_no_longer_has_proves_nothing_and_an_unreachable_remote_is_an
     assert!(matches!(outcome, Err(Error::Preparation(_))), "{outcome:?}");
 }
 
-/// A fetch with no source access is a remote a client named: it never uses
-/// `ssh` (the worker account's own identity and configuration), `git://`,
-/// plain `http://` or a remote helper, and it never follows redirects.
+/// Unauthenticated fetches never use ssh (the worker's own identity), git://, plain http, remote helpers or redirects.
 #[test]
 fn an_unauthenticated_fetch_refuses_ambient_credential_and_plaintext_transports() {
     let repo = repository();
@@ -188,8 +176,7 @@ fn an_unauthenticated_fetch_refuses_ambient_credential_and_plaintext_transports(
         };
         assert!(why.contains("not allowed"), "{remote}: {why}");
     }
-    // A local path still works unauthenticated (worker-local mirrors and
-    // tests); the controller refuses one as a client-named manual source.
+    // Local paths stay unauthenticated for worker-local mirrors; the controller refuses them for manual sources.
     let fetched = file_at(
         &work(&repo, "local"),
         repo.path.to_str().unwrap(),
