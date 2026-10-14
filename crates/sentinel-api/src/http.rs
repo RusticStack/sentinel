@@ -15,7 +15,7 @@
 //! not return while one can still touch the store.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
     io::{self, BufRead, BufReader, Cursor, Read, Write},
     net::{IpAddr, Shutdown, TcpListener, TcpStream},
@@ -45,7 +45,7 @@ pub(crate) struct Tune {
     /// Total time allowed for one client body.
     pub body_time: Duration,
     /// Unauthenticated bodies read at once, each under no handler permit
-    /// ([`Request::public_body`]); slow ones queue behind each other here,
+    /// ([`Request::public_body`]); slow ones queue behind each other here (one slot per client key),
     /// never behind real work.
     pub public_bodies: usize,
     /// Total time one unauthenticated body may take, waiting for its
@@ -155,6 +155,36 @@ struct Gate {
     handlers: Arc<Pool>,
     bodies: Arc<Pool>,
     body_time: Duration,
+    /// Client keys that hold a body slot right now: one slot per client, so
+    /// one host cannot fill the small pool and starve everyone's sign-in.
+    readers: Arc<Mutex<HashSet<u128>>>,
+    trusted: Vec<TrustedProxy>,
+}
+
+/// A client's one public-body slot, released on drop.
+struct ReaderKey {
+    readers: Arc<Mutex<HashSet<u128>>>,
+    key: u128,
+}
+
+impl ReaderKey {
+    /// `None` when this client already has a body being read.
+    fn take(readers: &Arc<Mutex<HashSet<u128>>>, key: u128) -> Option<ReaderKey> {
+        let mut held = readers.lock().unwrap_or_else(|e| e.into_inner());
+        held.insert(key).then(|| ReaderKey {
+            readers: Arc::clone(readers),
+            key,
+        })
+    }
+}
+
+impl Drop for ReaderKey {
+    fn drop(&mut self) {
+        self.readers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
 }
 
 struct Permit(Arc<Pool>);
@@ -912,11 +942,24 @@ impl Request<'_> {
         if let (false, Some(gate)) = (self.ready, self.gate) {
             let deadline = Instant::now() + gate.body_time;
             self.handler = None;
-            slot = Some(
-                gate.bodies
-                    .acquire_until(self.stop, self.poll, deadline)
-                    .ok_or(BodyErr::Busy)?,
-            );
+            let forwarded = self
+                .headers
+                .iter()
+                .find(|h| h.field.equiv("x-forwarded-for"))
+                .map(|h| h.value.as_str());
+            let key = client_key(self.peer(), forwarded, &gate.trusted);
+            // A client with a body already in flight is turned away at
+            // once: its trickle must not also queue for the shared pool.
+            let Some(reader) = ReaderKey::take(&gate.readers, key) else {
+                self.restore_handler(gate)?;
+                return Err(BodyErr::Busy);
+            };
+            let Some(permit) = gate.bodies.acquire_until(self.stop, self.poll, deadline) else {
+                drop(reader);
+                self.restore_handler(gate)?;
+                return Err(BodyErr::Busy);
+            };
+            slot = Some((permit, reader));
             self.body.cap_deadline(deadline);
         }
         let mut bytes = Vec::new();
@@ -924,20 +967,26 @@ impl Request<'_> {
             .take(limit as u64 + 1)
             .read_to_end(&mut bytes);
         drop(slot);
-        if let Some(gate) = self.gate
-            && self.handler.is_none()
-        {
-            self.handler = Some(
-                gate.handlers
-                    .acquire(self.stop, self.poll)
-                    .ok_or(BodyErr::Unreadable)?,
-            );
+        if let Some(gate) = self.gate {
+            self.restore_handler(gate)?;
         }
         read.map_err(|_| BodyErr::Unreadable)?;
         if bytes.len() > limit {
             return Err(BodyErr::TooLarge);
         }
         Ok(bytes)
+    }
+
+    /// Take a handler permit again after a public body read.
+    fn restore_handler(&mut self, gate: &Gate) -> Result<(), BodyErr> {
+        if self.handler.is_none() {
+            self.handler = Some(
+                gate.handlers
+                    .acquire(self.stop, self.poll)
+                    .ok_or(BodyErr::Unreadable)?,
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn body_length(&self) -> Option<usize> {
@@ -1133,6 +1182,8 @@ pub(crate) fn listen(
         handlers: Pool::new(tune.handlers),
         bodies: Pool::new(tune.public_bodies),
         body_time: tune.public_body_time,
+        readers: Arc::new(Mutex::new(HashSet::new())),
+        trusted: exempt.clone(),
     });
     let peers = Arc::new(Peers {
         cap: tune.per_peer,
@@ -1803,6 +1854,68 @@ mod tests {
         let mut all = Vec::new();
         let _ = slow.read_to_end(&mut all);
         assert!(all.starts_with(b"HTTP/1.1 400"), "got {all:?}");
+        conns.close();
+    }
+
+    /// One client holding a body slot does not block a second client, and
+    /// a second body from the same client is turned away at once instead of
+    /// queueing for the shared pool.
+    #[test]
+    fn a_client_holds_one_public_body_slot_and_others_still_get_theirs() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conns = listen(
+            listener,
+            Arc::new(|request: &mut Request| {
+                let outcome = request.public_body(1024).map(|b| b.len());
+                let status = if outcome.is_ok() { 200 } else { 400 };
+                let _ = request.respond(
+                    Response::from_string(String::new()).with_status_code(StatusCode(status)),
+                );
+            }),
+            Arc::new(AtomicBool::new(false)),
+            Tune {
+                connections: 6,
+                handlers: 4,
+                public_bodies: 2,
+                public_body_time: Duration::from_secs(3),
+                ..tune()
+            },
+            TrustedProxy::loopback(),
+        )
+        .unwrap();
+        let post = |client: &str, body: &str, declared: usize| {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "POST /p HTTP/1.1
+host: h
+x-forwarded-for: {client}
+content-length: {declared}
+
+{body}"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stream
+        };
+        let status = |mut stream: TcpStream| {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(1500)))
+                .unwrap();
+            let mut buf = [0u8; 16];
+            let n = stream.read(&mut buf).expect("answered in time");
+            buf[..n].to_vec()
+        };
+        let _slow = post("198.51.100.1", "x", 100);
+        thread::sleep(Duration::from_millis(150));
+
+        let same = status(post("198.51.100.1", "ok", 2));
+        assert!(same.starts_with(b"HTTP/1.1 400"), "got {same:?}");
+        let other = status(post("198.51.100.2", "ok", 2));
+        assert!(other.starts_with(b"HTTP/1.1 200"), "got {other:?}");
         conns.close();
     }
 
