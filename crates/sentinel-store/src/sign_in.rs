@@ -1,5 +1,5 @@
 //! External sign-in: pending authorization state, and what a verified provider
-//! identity is allowed to do (A04).
+//! identity is allowed to do.
 //!
 //! This module never talks to a provider and never decides whether a proof is
 //! genuine — `sentinel-github` does that. What arrives here is already verified:
@@ -8,7 +8,7 @@
 //!
 //! Authenticating somewhere else is not admission. An unknown identity is not
 //! registered here, is not given a placeholder account, and does not become a
-//! tenant: A05 owns invitations, approval and registration policy.
+//! tenant: invitations, approval and registration policy are decided elsewhere.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::secret::Secret;
@@ -114,7 +114,7 @@ pub enum Outcome {
     /// The identity is linked to an active account; a session was issued.
     SignedIn(Issued),
     /// Nothing is linked to this identity. Not an error and not a registration:
-    /// A05 decides whether an invitation or approval can turn it into one.
+    /// the caller decides whether an invitation or approval can turn it into one.
     NoAccount,
 }
 
@@ -160,7 +160,7 @@ pub fn resolve(store: &Store, provider: &str, subject: &str) -> Result<Option<Us
 /// Issue the session of an account [`resolve`] returned, first revoking the
 /// session the browser presented (`previous`, whoever it belongs to) in the
 /// same transaction: the browser is switching to this sign-in, so the session
-/// it held must not outlive the switch (P09S-10). The account could have been
+/// it held must not outlive the switch. The account could have been
 /// suspended since it was resolved: the session insert trigger refuses it,
 /// and that is the same honest answer as never having been linked.
 pub fn finish(

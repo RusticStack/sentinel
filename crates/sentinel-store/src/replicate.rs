@@ -1,4 +1,4 @@
-//! The replicator of the optional external S3 copy (R02/R03), written
+//! The replicator of the optional external S3 copy, written
 //! against a [`Bucket`] so it is tested without a network. The controller
 //! runs [`Replicator::pass`] on its own thread and backs off while the
 //! bucket is unavailable.
@@ -22,7 +22,7 @@
 //!    older than [`ABANDONED_UPLOAD_MS`] are aborted, and recorded uploads
 //!    that old are aborted and forgotten;
 //! 7. the backlog is measured, and past its budget the disk admission gate
-//!    closes for new artifacts and uploads until it drains (R03).
+//!    closes for new artifacts and uploads until it drains.
 //!
 //! Nothing here ever deletes the only copy of an object: a local file goes
 //! only after its S3 copy was verified, and an S3 copy only after its row is
@@ -117,7 +117,7 @@ pub struct Settings {
     /// every local copy.
     pub local_bytes: u64,
     /// Past this many unreplicated bytes the disk admission gate closes for
-    /// new artifacts and uploads (R03); it reopens below nine tenths.
+    /// new artifacts and uploads; it reopens below nine tenths.
     pub backlog_bytes: u64,
 }
 
@@ -142,7 +142,7 @@ pub struct Status {
     pub deleted_copies: AtomicU64,
     pub aborted_uploads: AtomicU64,
     /// Objects skipped because the local copy is missing or does not match
-    /// its digest (R07): never uploaded, and never a reason to stop.
+    /// its digest: never uploaded, and never a reason to stop.
     pub local_faults: AtomicU64,
     pub last_error: Mutex<Option<String>>,
     pub last_local_fault: Mutex<Option<String>>,
@@ -653,7 +653,7 @@ impl Replicator {
     }
 
     fn evict(&self, pass: &mut Pass) -> Result<()> {
-        // Not while a backup copies local files (R04).
+        // Not while a backup copies local files.
         let Some(_maintenance) = self.objects.try_maintenance() else {
             return Ok(());
         };
@@ -745,7 +745,7 @@ impl Replicator {
 
     /// Refresh the backlog and local totals; past the backlog budget close
     /// the disk admission gate for new artifacts and uploads, and reopen it
-    /// below nine tenths (R03).
+    /// below nine tenths.
     fn measure(&self) {
         let Ok(totals) = self.store.read(offload::totals) else {
             return;

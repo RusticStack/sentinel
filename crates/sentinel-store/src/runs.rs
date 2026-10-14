@@ -21,8 +21,7 @@ use crate::{
     provenance::{self, EventFacts},
 };
 
-/// Default queue priority; lower runs first. Scheduling policy (fairness,
-/// aging) adjusts this later without touching the spec.
+/// Default queue priority; lower runs first.
 pub const DEFAULT_PRIORITY: u8 = 5;
 
 /// Insert the run, its spec and its jobs. Returns job IDs in compiled order.
@@ -93,7 +92,7 @@ pub fn create_run(
         ])?;
         if let Ok(image) = sentinel_pipeline::run::ImageRef::parse(&job.spec.image) {
             // The repository part travels with the digest so a prefetch
-            // hint can name `name@digest` without decoding the spec (K05);
+            // hint can name `name@digest` without decoding the spec;
             // a name outside the reference charset is simply never hinted.
             let name = dispatch::prefetch_name(&image.name).then_some(image.name.as_str());
             if image.digest.is_some() || name.is_some() {
@@ -384,8 +383,7 @@ pub fn resolve_image(
 
 /// Every compiled job's digest-pinned image and platform, in job order, or
 /// the first failure: a malformed reference is `InvalidInput`, an unpinned one
-/// `Unresolved` (K05 resolves tags; until then an unpinned image is refused
-/// before a run exists, exactly as for manual dispatch).
+/// `Unresolved`.
 pub fn pinned_images(spec: &RunSpec) -> Result<Vec<(String, String)>> {
     let mut out = Vec::with_capacity(spec.pipeline.jobs.len());
     for job in &spec.pipeline.jobs {
