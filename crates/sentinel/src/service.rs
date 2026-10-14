@@ -280,7 +280,7 @@ impl MailFile {
             }
             return Ok(None);
         };
-        let host_ok = host.len() <= 253
+        let host_ok = (1..=253).contains(&host.len())
             && host
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'));
@@ -3250,5 +3250,124 @@ credentials_file = '/etc/sentinel/s3'
         assert_eq!(resolved.deployment.artifact_retention_ms, 86_400_000);
         assert_eq!(resolved.deployment.run_artifact_bytes, 1 << 30);
         assert_eq!(resolved.attempt_log_bytes, 64 << 20);
+    }
+
+    fn settled(file: MailFile, env: &dyn Fn(&str) -> Option<String>) -> MailSettings {
+        match file.resolve(env) {
+            Ok(Some(settings)) => settings,
+            _ => panic!("expected an SMTP configuration"),
+        }
+    }
+
+    fn mail(text: &str) -> MailFile {
+        toml::from_str(text).unwrap()
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn smtp_is_off_without_a_host_and_a_stray_key_is_an_error_not_a_silent_no_op() {
+        assert_eq!(MailFile::default().resolve(&no_env).ok(), Some(None));
+        for file in [
+            "port = 587",
+            "tls = 'implicit'",
+            "from = 'ci@example.com'",
+            "credentials_file = '/etc/sentinel/smtp'",
+        ] {
+            assert!(mail(file).resolve(&no_env).is_err(), "{file}");
+        }
+        // The same through the environment.
+        let stray =
+            |name: &str| (name == "SENTINEL_SMTP_FROM").then(|| "ci@example.com".to_owned());
+        assert!(MailFile::default().resolve(&stray).is_err());
+        // Empty environment values are unset, so a blank override disables nothing.
+        let blank = |_: &str| Some(String::new());
+        let resolved = settled(
+            mail("host = 'smtp.example.com'\nfrom = 'ci@example.com'"),
+            &blank,
+        );
+        assert_eq!(resolved.port, 587);
+    }
+
+    #[test]
+    fn smtp_defaults_follow_the_transport_and_the_environment_wins() {
+        let settings = |text: &str| settled(mail(text), &no_env);
+        let base = "host = 'smtp.example.com'\nfrom = 'ci@example.com'\n";
+        assert_eq!(settings(base).port, 587);
+        assert_eq!(settings(base).tls, MailTls::StartTls);
+        assert_eq!(settings(&format!("{base}tls = 'implicit'")).port, 465);
+        assert_eq!(settings(&format!("{base}tls = 'none'")).port, 25);
+        assert_eq!(settings(&format!("{base}port = 2525")).port, 2525);
+
+        let env = |name: &str| match name {
+            "SENTINEL_SMTP_HOST" => Some("relay.internal".to_owned()),
+            "SENTINEL_SMTP_PORT" => Some("2465".to_owned()),
+            "SENTINEL_SMTP_TLS" => Some("implicit".to_owned()),
+            "SENTINEL_SMTP_CREDENTIALS_FILE" => Some("/run/secrets/smtp".to_owned()),
+            _ => None,
+        };
+        let merged = settled(mail(base), &env);
+        assert_eq!(
+            (
+                merged.host.as_str(),
+                merged.port,
+                merged.tls,
+                merged.from.as_str()
+            ),
+            ("relay.internal", 2465, MailTls::Implicit, "ci@example.com")
+        );
+        assert_eq!(
+            merged.credentials_file.as_deref(),
+            Some(Path::new("/run/secrets/smtp"))
+        );
+    }
+
+    #[test]
+    fn a_bad_smtp_setting_is_refused_without_echoing_it() {
+        let base = "host = 'smtp.example.com'\nfrom = 'ci@example.com'\n";
+        for (extra, what) in [
+            ("tls = 'ssl3'", "ssl3"),
+            ("port = 0", "0"),
+            ("credentials_file = 'relative/smtp'", "relative/smtp"),
+            (
+                "tls = 'none'\ncredentials_file = '/etc/sentinel/smtp'",
+                "/etc/sentinel/smtp",
+            ),
+        ] {
+            let error = mail(&format!("{base}{extra}"))
+                .resolve(&no_env)
+                .unwrap_err();
+            assert!(!error.message.contains(what), "{}", error.message);
+        }
+        let long_host = "a".repeat(300);
+        for bad_host in ["bad host", "smtp.example.com/evil", long_host.as_str()] {
+            let file = mail(&format!("host = '{bad_host}'\nfrom = 'ci@example.com'"));
+            assert!(file.resolve(&no_env).is_err());
+        }
+        for bad_from in [
+            "",
+            "nobody",
+            "a@@b.example",
+            "@example.com",
+            "ci@",
+            "c i@example.com",
+        ] {
+            let file = mail(&format!("host = 'smtp.example.com'\nfrom = '{bad_from}'"));
+            assert!(file.resolve(&no_env).is_err(), "{bad_from:?}");
+        }
+        assert!(
+            mail("host = 'smtp.example.com'").resolve(&no_env).is_err(),
+            "a host without a sender is incomplete"
+        );
+        // A typo in the section is not ignored.
+        assert!(toml::from_str::<MailFile>("hots = 'x'").is_err());
+        let bad_port = |name: &str| (name == "SENTINEL_SMTP_PORT").then(|| "99999".to_owned());
+        assert!(
+            mail("host = 'h.example.com'\nfrom = 'a@example.com'")
+                .resolve(&bad_port)
+                .is_err()
+        );
     }
 }
