@@ -68,6 +68,19 @@ use crate::{Error, Result, identity::fingerprint_of};
 /// delayed packet must not tear down a session carrying live work.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(15);
+/// The beat interval the controller announces is advice from a peer, not a
+/// trusted number: a worker keeps it within these bounds, so `0` is never a
+/// ping flood and a huge value never lets the deadline lapse between beats
+/// (two beats must always fit inside [`HEARTBEAT_DEADLINE`]).
+pub const HEARTBEAT_MIN_INTERVAL: Duration = Duration::from_secs(1);
+pub const HEARTBEAT_MAX_INTERVAL: Duration = Duration::from_millis(7_500);
+const _: () = assert!(HEARTBEAT_MAX_INTERVAL.as_millis() * 2 <= HEARTBEAT_DEADLINE.as_millis());
+
+/// The announced beat interval, clamped to the bounds above.
+fn clamp_heartbeat(announced_ms: u32) -> Duration {
+    Duration::from_millis(u64::from(announced_ms))
+        .clamp(HEARTBEAT_MIN_INTERVAL, HEARTBEAT_MAX_INTERVAL)
+}
 /// Bytes read from the socket per call; one TLS record fits.
 const TLS_READ_BYTES: usize = 16 * 1024 + 512;
 /// A run spec crosses the link in chunks of this size, reassembled up to
@@ -3095,7 +3108,7 @@ pub fn connect(
             tx: tx.clone(),
             worker: WorkerId::from_bytes(worker).map_err(|_| Error::Protocol("worker id"))?,
             negotiated,
-            interval: Duration::from_millis(u64::from(heartbeat_interval_ms)),
+            interval: clamp_heartbeat(heartbeat_interval_ms),
             seq: 0,
             addr,
             client: config,
@@ -4136,6 +4149,14 @@ pub fn listen(addr: SocketAddr) -> Result<TcpListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_announced_heartbeat_interval_is_clamped() {
+        assert_eq!(clamp_heartbeat(0), HEARTBEAT_MIN_INTERVAL);
+        assert_eq!(clamp_heartbeat(1), HEARTBEAT_MIN_INTERVAL);
+        assert_eq!(clamp_heartbeat(5_000), HEARTBEAT_INTERVAL);
+        assert_eq!(clamp_heartbeat(u32::MAX), HEARTBEAT_MAX_INTERVAL);
+    }
 
     /// One loopback TLS connection, split: the worker end's sender and the
     /// controller end's receiver (kept so the peer stays open).

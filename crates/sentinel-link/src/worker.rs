@@ -263,17 +263,21 @@ fn serve_bulk(
             return;
         }
         if let Some(mut bulk) = next.take() {
+            let started = Instant::now();
             let _ = bulk.run(executor, || stop.load(Ordering::Acquire));
+            // A connection that opens and then dies at once (a peer that
+            // accepts and drops) has proved nothing: only one that served
+            // for a stable stretch earns the short back-off again.
+            if started.elapsed() >= STABLE_SESSION {
+                backoff = BACKOFF_MIN;
+            }
         }
         if !wait_unless_stopped(stop, jitter(backoff, &mut seed)) {
             return;
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
         match dialer.open() {
-            Ok(bulk) => {
-                next = Some(bulk);
-                backoff = BACKOFF_MIN;
-            }
+            Ok(bulk) => next = Some(bulk),
             Err(_) => {
                 if stop.load(Ordering::Acquire) {
                     return;
