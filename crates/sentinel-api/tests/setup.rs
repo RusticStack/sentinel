@@ -40,6 +40,10 @@ impl Drop for Fresh {
 }
 
 fn fresh() -> Fresh {
+    fresh_with(None)
+}
+
+fn fresh_with(mail: Option<Arc<sentinel_mail::Resend>>) -> Fresh {
     let dir = tempfile::tempdir().unwrap();
     let store =
         Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
@@ -53,20 +57,26 @@ fn fresh() -> Fresh {
         "127.0.0.1:0".parse().unwrap(),
     )
     .unwrap();
-    let server = sentinel_api::Server::start(sentinel_api::Config {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        store: Arc::clone(&store),
-        logs,
-        objects,
-        controller: controller.handle(),
-        secret_key: None,
-        sessions: Policy::default(),
-        github_webhook_secret: None,
-        intake: None,
-        public_url: None,
-        github_sign_in: None,
-        trusted_proxies: sentinel_api::TrustedProxy::loopback(),
-    })
+    let server = sentinel_api::Server::start_with(
+        sentinel_api::Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            store: Arc::clone(&store),
+            logs,
+            objects,
+            controller: controller.handle(),
+            secret_key: None,
+            sessions: Policy::default(),
+            github_webhook_secret: None,
+            intake: None,
+            public_url: None,
+            github_sign_in: None,
+            trusted_proxies: sentinel_api::TrustedProxy::loopback(),
+        },
+        sentinel_api::Options {
+            mail,
+            ..Default::default()
+        },
+    )
     .unwrap();
     let base = format!("http://{}", server.local_addr());
     Fresh {
@@ -105,7 +115,7 @@ fn status_says_only_whether_setup_is_open() {
     let f = fresh();
     let (status, headers, answer) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
     assert_eq!(status, 200);
-    assert_eq!(answer, json!({ "open": true }));
+    assert_eq!(answer, json!({ "open": true, "mail_configured": false }));
     assert!(
         headers
             .iter()
@@ -120,7 +130,7 @@ fn status_says_only_whether_setup_is_open() {
     )
     .unwrap();
     let (_, _, closed) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
-    assert_eq!(closed, json!({ "open": false }));
+    assert_eq!(closed, json!({ "open": false, "mail_configured": false }));
 }
 
 #[test]
@@ -157,7 +167,7 @@ fn the_wizard_creates_the_administrator_and_signs_them_in() {
 
     // Setup is closed for everyone afterwards, the same token included.
     let (_, _, closed) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
-    assert_eq!(closed, json!({ "open": false }));
+    assert_eq!(closed, json!({ "open": false, "mail_configured": false }));
     let (status, _, _) = post(&f, "/api/v1/setup", &body(&token_text(&token)));
     assert_eq!(status, 404);
     // And the password signs in by address.
@@ -253,31 +263,139 @@ fn a_bad_field_is_a_bad_request_and_the_token_survives() {
     assert_eq!(status, 201);
 }
 
+const RESEND_KEY: &str = "re_wizardkey_0123456789";
+
+/// A Resend stand-in answering each request with the next scripted status;
+/// returns its endpoint and the requests it saw.
+fn fake_resend(statuses: Vec<u16>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/emails", listener.local_addr().unwrap());
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let log = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for status in statuses {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..n]);
+                let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&raw[..end]).to_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if raw.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            log.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&raw).into_owned());
+            let body = if status == 200 {
+                r#"{"id":"x"}"#
+            } else {
+                r#"{"name":"validation_error","message":"ada@example.com is invalid"}"#
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (url, seen)
+}
+
+fn resend_at(url: &str) -> Arc<sentinel_mail::Resend> {
+    Arc::new(sentinel_mail::Resend::with_endpoint(
+        sentinel_mail::ApiKey::new(RESEND_KEY.as_bytes().to_vec()).unwrap(),
+        sentinel_mail::Sender::parse("Sentinel <ci@example.com>").unwrap(),
+        url,
+    ))
+}
+
 #[test]
-fn the_smtp_test_needs_the_token_and_a_failure_blocks_nothing() {
+fn the_mail_test_without_a_sender_says_not_configured_and_blocks_nothing() {
     let f = fresh();
     let token = setup::issue(&f.store, UnixMillis::now()).unwrap().unwrap();
-    let relay = |token: &str| {
-        json!({
-            "token": token, "host": "127.0.0.1", "port": 1, "tls": "none",
-            "from": "ci@example.com", "to": "ada@example.com",
-        })
-    };
-    let (status, _, _) = post(&f, "/api/v1/setup/smtp-test", &relay("bogus"));
+    let test = |token: &str| json!({ "token": token, "to": "ada@example.com" });
+    let (status, _, _) = post(&f, "/api/v1/setup/mail-test", &test("bogus"));
     assert_eq!(status, 403);
-    // Settings the client refuses are reported, not raised.
-    let mut invalid = relay(&token_text(&token));
-    invalid["tls"] = json!("sometimes");
-    let (status, _, answer) = post(&f, "/api/v1/setup/smtp-test", &invalid);
-    assert_eq!((status, &answer["sent"]), (200, &json!(false)));
-    assert_eq!(answer["failure"], "invalid_settings");
-    // A relay that is not there fails the test without failing setup.
-    let (status, _, answer) = post(&f, "/api/v1/setup/smtp-test", &relay(&token_text(&token)));
+    let (status, _, answer) = post(&f, "/api/v1/setup/mail-test", &test(&token_text(&token)));
     assert_eq!(status, 200, "{answer}");
-    assert_eq!(answer["sent"], false);
+    assert_eq!(
+        (&answer["sent"], &answer["failure"]),
+        (&json!(false), &json!("not_configured"))
+    );
     assert!(f.store.read(setup::is_open).unwrap());
+    // Relay fields are not part of the contract: the body is token and to.
+    let (status, _, _) = post(
+        &f,
+        "/api/v1/setup/mail-test",
+        &json!({ "token": token_text(&token), "to": "ada@example.com", "host": "x", "port": 25 }),
+    );
+    assert_eq!(status, 400);
     let (status, _, _) = post(&f, "/api/v1/setup", &body(&token_text(&token)));
     assert_eq!(status, 201);
+}
+
+#[test]
+fn the_mail_test_sends_through_the_configured_sender_and_reports_failures_briefly() {
+    let (url, seen) = fake_resend(vec![200, 422]);
+    let f = fresh_with(Some(resend_at(&url)));
+    let (_, _, status) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
+    assert_eq!(status, json!({ "open": true, "mail_configured": true }));
+    let token = setup::issue(&f.store, UnixMillis::now()).unwrap().unwrap();
+    let text = token_text(&token);
+    // An address that is not one is reported before anything is sent.
+    let (status, _, answer) = post(
+        &f,
+        "/api/v1/setup/mail-test",
+        &json!({ "token": text, "to": "not an address" }),
+    );
+    assert_eq!(
+        (status, &answer["failure"]),
+        (200, &json!("invalid_settings"))
+    );
+    assert!(seen.lock().unwrap().is_empty());
+    let (status, _, answer) = post(
+        &f,
+        "/api/v1/setup/mail-test",
+        &json!({ "token": text, "to": "Ada@Example.com" }),
+    );
+    assert_eq!((status, &answer), (200, &json!({ "sent": true })));
+    {
+        let seen = seen.lock().unwrap();
+        assert!(seen[0].contains(&format!("Bearer {RESEND_KEY}")));
+        assert!(seen[0].contains("\"to\":[\"ada@example.com\"]"));
+    }
+    let (status, _, answer) = post(
+        &f,
+        "/api/v1/setup/mail-test",
+        &json!({ "token": text, "to": "ada@example.com" }),
+    );
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(
+        (&answer["sent"], &answer["failure"]),
+        (&json!(false), &json!("permanent"))
+    );
+    let reason = answer["reason"].as_str().unwrap();
+    assert!(reason.contains("422"), "{reason}");
+    for secret in [RESEND_KEY, "ada@example.com", "is invalid"] {
+        assert!(!answer.to_string().contains(secret), "{secret} leaked");
+    }
+    assert!(f.store.read(setup::is_open).unwrap());
 }
 
 // ------------------------------------------------------------ organizations

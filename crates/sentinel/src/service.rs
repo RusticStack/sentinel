@@ -124,8 +124,8 @@ struct FileConfig {
     s3: Option<S3File>,
     // Server: scheduled online backups (R04).
     backup: Option<BackupFile>,
-    // Server: optional SMTP delivery of verification and invitation mail;
-    // `SENTINEL_SMTP_*` in the environment override these keys.
+    // Server: optional Resend delivery of verification and invitation mail;
+    // `SENTINEL_RESEND_API_KEY_FILE` and `SENTINEL_EMAIL_FROM` override these keys.
     mail: Option<MailFile>,
     // Worker: the controller's `tc…` address, as written to its `<data_dir>/tailcat/address`
     // (Q06). Required to dial a controller through the helper.
@@ -217,128 +217,68 @@ impl S3File {
     }
 }
 
-/// The `[mail]` section: optional SMTP submission for verification and
-/// invitation mail. Server only. Each key has an environment override
-/// (`SENTINEL_SMTP_HOST`, `_PORT`, `_TLS`, `_CREDENTIALS_FILE`, `_FROM`),
-/// which wins, so a container deployment needs no configuration file for it.
-/// Without a host nothing is delivered and the host-local `sentinel admin`
-/// mints links on demand. The relay's password lives in `credentials_file`
-/// (`username = …` / `password = …`, owner-only), never in this file or the
-/// environment. Kept portable so the CLI build validates it.
+/// The `[mail]` section: optional email delivery of verification and
+/// invitation mail through Resend (<https://resend.com>). Server only. Each
+/// key has an environment override (`SENTINEL_RESEND_API_KEY_FILE`,
+/// `SENTINEL_EMAIL_FROM`), which wins, so a container deployment needs no
+/// configuration file for it. Without them nothing is delivered and the
+/// host-local `sentinel admin` mints links on demand. The API key lives in
+/// `api_key_file` (an owner-only file holding the key), never in this file or
+/// the environment. Kept portable so the CLI build validates it.
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MailFile {
-    host: Option<String>,
-    port: Option<u16>,
-    /// `starttls` (default), `implicit` or `none` (a relay on this host).
-    tls: Option<String>,
-    credentials_file: Option<PathBuf>,
-    /// The sender address, such as `ci@example.com`.
+    /// Absolute path of the owner-only file holding the Resend API key.
+    api_key_file: Option<PathBuf>,
+    /// The sender: `ci@example.com` or `Sentinel <ci@example.com>`, on a
+    /// domain verified in Resend.
     from: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MailTls {
-    StartTls,
-    Implicit,
-    Plain,
-}
-
-/// A validated SMTP configuration.
+/// A validated Resend configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MailSettings {
-    host: String,
-    port: u16,
-    tls: MailTls,
-    credentials_file: Option<PathBuf>,
+    api_key_file: PathBuf,
     from: String,
 }
 
 impl MailFile {
     /// Merge the section with the environment (which wins) and validate. No
-    /// error echoes a value. `Ok(None)` when no host is configured; any other
-    /// key without a host is an error rather than a silently ignored setting.
+    /// error echoes a value. `Ok(None)` when neither the key file nor the
+    /// sender is set; one without the other is an error rather than a
+    /// silently ignored setting.
     fn resolve(self, env: &dyn Fn(&str) -> Option<String>) -> Result<Option<MailSettings>, Error> {
         let set = |name: &str| env(name).filter(|value| !value.is_empty());
-        let host = set("SENTINEL_SMTP_HOST").or(self.host);
-        let port_env = set("SENTINEL_SMTP_PORT");
-        let tls = set("SENTINEL_SMTP_TLS").or(self.tls);
-        let credentials = set("SENTINEL_SMTP_CREDENTIALS_FILE")
+        let key_file = set("SENTINEL_RESEND_API_KEY_FILE")
             .map(PathBuf::from)
-            .or(self.credentials_file);
-        let from = set("SENTINEL_SMTP_FROM").or(self.from);
-        let Some(host) = host else {
-            if port_env.is_some()
-                || self.port.is_some()
-                || tls.is_some()
-                || credentials.is_some()
-                || from.is_some()
-            {
+            .or(self.api_key_file);
+        let from = set("SENTINEL_EMAIL_FROM").or(self.from);
+        let (key_file, from) = match (key_file, from) {
+            (None, None) => return Ok(None),
+            (Some(key_file), Some(from)) => (key_file, from),
+            _ => {
                 return Err(Error::config(
-                    "SMTP settings need a host ([mail] host or SENTINEL_SMTP_HOST)",
+                    "email delivery needs both the Resend API key file and the sender \
+                     (SENTINEL_RESEND_API_KEY_FILE and SENTINEL_EMAIL_FROM)",
                 ));
             }
-            return Ok(None);
         };
-        let host_ok = (1..=253).contains(&host.len())
-            && host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'));
-        if !host_ok {
+        if !key_file.is_absolute() {
             return Err(Error::config(
-                "[mail] host must be a host name or IP address",
+                "the Resend API key file must be an absolute path",
             ));
         }
-        let tls = match tls.as_deref() {
-            None | Some("starttls") => MailTls::StartTls,
-            Some("implicit") => MailTls::Implicit,
-            Some("none") => MailTls::Plain,
-            Some(_) => {
-                return Err(Error::config(
-                    "[mail] tls must be \"starttls\", \"implicit\" or \"none\"",
-                ));
-            }
-        };
-        let port = match port_env {
-            Some(text) => text
-                .parse::<u16>()
-                .ok()
-                .filter(|port| *port != 0)
-                .ok_or_else(|| Error::config("SENTINEL_SMTP_PORT must be 1-65535"))?,
-            None => match (self.port, tls) {
-                (Some(0), _) => return Err(Error::config("[mail] port must be 1-65535")),
-                (Some(port), _) => port,
-                (None, MailTls::Implicit) => 465,
-                (None, MailTls::StartTls) => 587,
-                (None, MailTls::Plain) => 25,
-            },
-        };
-        let from = from.ok_or_else(|| Error::config("[mail] needs a from address"))?;
-        let from_ok = from.len() <= 254
-            && from.matches('@').count() == 1
-            && !from.starts_with('@')
-            && !from.ends_with('@')
-            && !from.chars().any(|c| c.is_control() || c.is_whitespace());
+        let from_ok =
+            from.len() <= 320 && from.contains('@') && !from.chars().any(char::is_control);
         if !from_ok {
             return Err(Error::config(
-                "[mail] from must be a plain address such as ci@example.com",
+                "the sender must be `ci@example.com` or `Sentinel <ci@example.com>`",
             ));
         }
-        if credentials.as_ref().is_some_and(|path| !path.is_absolute()) {
-            return Err(Error::config(
-                "[mail] credentials_file must be an absolute path",
-            ));
-        }
-        if tls == MailTls::Plain && credentials.is_some() {
-            return Err(Error::config(
-                "[mail] tls = \"none\" takes no credentials: they are sent only inside TLS",
-            ));
-        }
+        #[cfg(feature = "server")]
+        sentinel_mail::Sender::parse(&from).map_err(Error::config)?;
         Ok(Some(MailSettings {
-            host,
-            port,
-            tls,
-            credentials_file: credentials,
+            api_key_file: key_file,
             from,
         }))
     }
@@ -960,7 +900,7 @@ impl Config {
                     .resolve(&|name| std::env::var(name).ok())?;
                 if mail.is_some() && public_url.is_none() {
                     return Err(Error::config(
-                        "SMTP needs public_url: the links in messages are built on it",
+                        "email delivery needs public_url: the links in messages are built on it",
                     ));
                 }
                 mail
@@ -1382,7 +1322,7 @@ enum Running {
         checks: Option<Box<sentinel_checks::Lane>>,
         /// The lifecycle reconcile lane draining `github_refresh`.
         reconcile: Option<Box<sentinel_checks::Reconcile>>,
-        /// The mail lane, when SMTP is configured.
+        /// The mail lane, when Resend is configured.
         mail: Option<Box<sentinel_mail::Lane>>,
         /// The GitHub-backed membership lane draining `github_member_checks`.
         members: Option<Box<sentinel_checks::Members>>,
@@ -1665,7 +1605,7 @@ fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
         ("sessions", sentinel_store::local_auth::purge_expired, wall),
         ("sign_in", sentinel_store::sign_in::purge_expired, wall),
         // Spent and expired verification tokens, settled mail and expired
-        // undelivered messages: bounded here so a deployment without SMTP,
+        // undelivered messages: bounded here so a deployment without Resend,
         // where no mail lane runs, does not accumulate them either.
         ("email", sentinel_store::email::purge, wall),
         (
@@ -2064,12 +2004,13 @@ fn start_server(
     };
     // Before the API serves: a request that mints a link queues its message
     // only when a lane will drain it, which the store row records.
-    let mail = start_mail(config, public_url.as_deref(), &store, key.as_ref())?;
+    let (mail, mail_sender) = start_mail(config, public_url.as_deref(), &store, key.as_ref())?;
     announce_setup(&config.data_dir, &store)?;
     // Before the API serves, so the first verification already sees the rules.
     record_auto_join(&config.auto_join, &store)?;
     // The same rules, for the read-only organization settings.
     let options = sentinel_api::Options {
+        mail: mail_sender,
         auto_join: config
             .auto_join
             .rules
@@ -2243,20 +2184,29 @@ fn record_auto_join(
     Ok(())
 }
 
-/// Start the mail lane when SMTP is configured, and record in the store
-/// whether this deployment delivers mail. Without SMTP, or without the master
-/// key that seals a queued message's link, nothing is queued: a request that
-/// needs a link still succeeds, and the operator mints one with
-/// `sentinel admin account email-link` or `invite create --email`. A
-/// configuration that cannot work (an unreadable credentials file, a refused
-/// setting) stops the start like any other configuration error.
+/// Build the Resend sender when it is configured, and start the mail lane
+/// when there is also a master key to seal queued messages with; record in
+/// the store whether this deployment delivers mail. Without a sender, or
+/// without the master key that seals a queued message's link, nothing is
+/// queued: a request that needs a link still succeeds, and the operator mints
+/// one with `sentinel admin account email-link` or `invite create --email`.
+/// A configuration that cannot work (an unreadable or malformed key file)
+/// stops the start like any other configuration error. The sender is returned
+/// even without a master key: the first-run wizard's test message needs only
+/// the Resend key.
 #[cfg(feature = "server")]
 fn start_mail(
     config: &Config,
     public_url: Option<&str>,
     store: &Arc<sentinel_store::Store>,
     key: Option<&Arc<sentinel_auth::sealed::Key>>,
-) -> Result<Option<Box<sentinel_mail::Lane>>, Error> {
+) -> Result<
+    (
+        Option<Box<sentinel_mail::Lane>>,
+        Option<Arc<sentinel_mail::Resend>>,
+    ),
+    Error,
+> {
     let record = |enabled: bool| {
         sentinel_store::email::set_delivery(
             store,
@@ -2270,46 +2220,30 @@ fn start_mail(
         record(false)?;
         tracing::info!(
             event = "mail_disabled",
-            "no SMTP configured: verification and invitation links are minted with `sentinel admin`"
+            "no Resend key configured: verification and invitation links are minted with `sentinel admin`"
         );
-        return Ok(None);
+        return Ok((None, None));
     };
+    let api_key = sentinel_mail::ApiKey::from_file(&mail.api_key_file)
+        .map_err(|reason| Error::config(format!("[mail] {reason}")))?;
+    let from = sentinel_mail::Sender::parse(&mail.from)
+        .map_err(|reason| Error::config(format!("[mail] {reason}")))?;
+    let resend = Arc::new(sentinel_mail::Resend::new(api_key, from));
     let Some(key) = key else {
         record(false)?;
         tracing::warn!(
             event = "mail_disabled",
-            "SMTP is configured but there is no master key to seal queued messages; create one with `sentinel admin key create`"
+            "Resend is configured but there is no master key to seal queued messages; create one with `sentinel admin key create`"
         );
-        return Ok(None);
+        return Ok((None, Some(resend)));
     };
-    let credentials = mail
-        .credentials_file
-        .as_deref()
-        .map(sentinel_mail::Credentials::from_file)
-        .transpose()
-        .map_err(|reason| Error::config(format!("[mail] {reason}")))?;
-    let tls = match mail.tls {
-        MailTls::StartTls => sentinel_mail::Tls::StartTls,
-        MailTls::Implicit => sentinel_mail::Tls::Implicit,
-        MailTls::Plain => sentinel_mail::Tls::Plain,
-    };
-    let smtp_config =
-        sentinel_mail::Config::new(mail.host.clone(), mail.port, tls, credentials, &mail.from)
-            .map_err(|reason| Error::config(format!("[mail] {reason}")))?;
-    let smtp = sentinel_mail::Smtp::new(smtp_config)
-        .map_err(|reason| Error::config(format!("[mail] {reason}")))?;
     record(true)?;
-    tracing::info!(
-        event = "mail_enabled",
-        host = %mail.host,
-        port = mail.port,
-        authenticated = mail.credentials_file.is_some()
-    );
+    tracing::info!(event = "mail_enabled", provider = "resend");
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
-    Ok(Some(Box::new(sentinel_mail::Lane::start(
+    let lane = sentinel_mail::Lane::start(
         Arc::clone(store),
         Arc::clone(key),
-        Box::new(smtp),
+        Box::new(Arc::clone(&resend)),
         sentinel_mail::LaneConfig::default(),
         move |batch| {
             tracing::dispatcher::with_default(&dispatch, || {
@@ -2331,7 +2265,8 @@ fn start_mail(
                 }
             });
         },
-    ))))
+    );
+    Ok((Some(Box::new(lane)), Some(resend)))
 }
 
 /// Build the S3 client from `[s3]`, check it once (a failure is logged and
@@ -3432,7 +3367,7 @@ credentials_file = '/etc/sentinel/s3'
     fn settled(file: MailFile, env: &dyn Fn(&str) -> Option<String>) -> MailSettings {
         match file.resolve(env) {
             Ok(Some(settings)) => settings,
-            _ => panic!("expected an SMTP configuration"),
+            _ => panic!("expected an email configuration"),
         }
     }
 
@@ -3445,106 +3380,75 @@ credentials_file = '/etc/sentinel/s3'
     }
 
     #[test]
-    fn smtp_is_off_without_a_host_and_a_stray_key_is_an_error_not_a_silent_no_op() {
+    fn email_is_off_without_a_key_and_a_sender_and_half_of_it_is_an_error() {
         assert_eq!(MailFile::default().resolve(&no_env).ok(), Some(None));
         for file in [
-            "port = 587",
-            "tls = 'implicit'",
+            "api_key_file = '/etc/sentinel/resend-key'",
             "from = 'ci@example.com'",
-            "credentials_file = '/etc/sentinel/smtp'",
         ] {
             assert!(mail(file).resolve(&no_env).is_err(), "{file}");
         }
         // The same through the environment.
         let stray =
-            |name: &str| (name == "SENTINEL_SMTP_FROM").then(|| "ci@example.com".to_owned());
+            |name: &str| (name == "SENTINEL_EMAIL_FROM").then(|| "ci@example.com".to_owned());
         assert!(MailFile::default().resolve(&stray).is_err());
         // Empty environment values are unset, so a blank override disables nothing.
         let blank = |_: &str| Some(String::new());
         let resolved = settled(
-            mail("host = 'smtp.example.com'\nfrom = 'ci@example.com'"),
+            mail("api_key_file = '/etc/sentinel/resend-key'\nfrom = 'ci@example.com'"),
             &blank,
         );
-        assert_eq!(resolved.port, 587);
+        assert_eq!(resolved.from, "ci@example.com");
     }
 
     #[test]
-    fn smtp_defaults_follow_the_transport_and_the_environment_wins() {
-        let settings = |text: &str| settled(mail(text), &no_env);
-        let base = "host = 'smtp.example.com'\nfrom = 'ci@example.com'\n";
-        assert_eq!(settings(base).port, 587);
-        assert_eq!(settings(base).tls, MailTls::StartTls);
-        assert_eq!(settings(&format!("{base}tls = 'implicit'")).port, 465);
-        assert_eq!(settings(&format!("{base}tls = 'none'")).port, 25);
-        assert_eq!(settings(&format!("{base}port = 2525")).port, 2525);
-
+    fn the_environment_wins_and_the_key_is_only_ever_a_file() {
+        let base = "api_key_file = '/etc/sentinel/resend-key'\nfrom = 'ci@example.com'\n";
         let env = |name: &str| match name {
-            "SENTINEL_SMTP_HOST" => Some("relay.internal".to_owned()),
-            "SENTINEL_SMTP_PORT" => Some("2465".to_owned()),
-            "SENTINEL_SMTP_TLS" => Some("implicit".to_owned()),
-            "SENTINEL_SMTP_CREDENTIALS_FILE" => Some("/run/secrets/smtp".to_owned()),
+            "SENTINEL_RESEND_API_KEY_FILE" => Some("/run/secrets/resend".to_owned()),
+            "SENTINEL_EMAIL_FROM" => Some("Sentinel CI <ci@example.org>".to_owned()),
             _ => None,
         };
         let merged = settled(mail(base), &env);
         assert_eq!(
-            (
-                merged.host.as_str(),
-                merged.port,
-                merged.tls,
-                merged.from.as_str()
-            ),
-            ("relay.internal", 2465, MailTls::Implicit, "ci@example.com")
+            merged.api_key_file.as_path(),
+            Path::new("/run/secrets/resend")
         );
-        assert_eq!(
-            merged.credentials_file.as_deref(),
-            Some(Path::new("/run/secrets/smtp"))
-        );
+        assert_eq!(merged.from, "Sentinel CI <ci@example.org>");
+        // There is no setting that carries the key itself.
+        assert!(toml::from_str::<MailFile>("api_key = 're_abc'").is_err());
+        assert!(toml::from_str::<MailFile>("resend_api_key = 're_abc'").is_err());
     }
 
     #[test]
-    fn a_bad_smtp_setting_is_refused_without_echoing_it() {
-        let base = "host = 'smtp.example.com'\nfrom = 'ci@example.com'\n";
-        for (extra, what) in [
-            ("tls = 'ssl3'", "ssl3"),
-            ("port = 0", "0"),
-            ("credentials_file = 'relative/smtp'", "relative/smtp"),
-            (
-                "tls = 'none'\ncredentials_file = '/etc/sentinel/smtp'",
-                "/etc/sentinel/smtp",
-            ),
-        ] {
-            let error = mail(&format!("{base}{extra}"))
-                .resolve(&no_env)
-                .unwrap_err();
-            assert!(!error.message.contains(what), "{}", error.message);
-        }
-        let long_host = "a".repeat(300);
-        for bad_host in ["bad host", "smtp.example.com/evil", long_host.as_str()] {
-            let file = mail(&format!("host = '{bad_host}'\nfrom = 'ci@example.com'"));
-            assert!(file.resolve(&no_env).is_err());
-        }
-        for bad_from in [
-            "",
-            "nobody",
+    fn a_bad_email_setting_is_refused_without_echoing_it() {
+        let key = "api_key_file = '/etc/sentinel/resend-key'\n";
+        let error = mail("api_key_file = 'relative/resend-key'\nfrom = 'ci@example.com'")
+            .resolve(&no_env)
+            .unwrap_err();
+        assert!(
+            !error.message.contains("relative/resend-key"),
+            "{}",
+            error.message
+        );
+        let mut bad = vec!["", "nobody"];
+        // The server build checks the whole address, not just its shape.
+        #[cfg(feature = "server")]
+        bad.extend([
             "a@@b.example",
             "@example.com",
             "ci@",
             "c i@example.com",
-        ] {
-            let file = mail(&format!("host = 'smtp.example.com'\nfrom = '{bad_from}'"));
-            assert!(file.resolve(&no_env).is_err(), "{bad_from:?}");
+            "Name <ci@example.com",
+            "Evil\\nBcc: x@y.z <ci@example.com>",
+        ]);
+        for bad_from in bad {
+            let file = mail(&format!("{key}from = '{bad_from}'"));
+            let error = file.resolve(&no_env).unwrap_err();
+            assert!(bad_from.is_empty() || !error.message.contains(bad_from));
         }
-        assert!(
-            mail("host = 'smtp.example.com'").resolve(&no_env).is_err(),
-            "a host without a sender is incomplete"
-        );
-        // A typo in the section is not ignored.
+        // A typo in the section is not ignored, and neither is an old key.
         assert!(toml::from_str::<MailFile>("hots = 'x'").is_err());
-        let bad_port = |name: &str| (name == "SENTINEL_SMTP_PORT").then(|| "99999".to_owned());
-        assert!(
-            mail("host = 'h.example.com'\nfrom = 'a@example.com'")
-                .resolve(&bad_port)
-                .is_err()
-        );
+        assert!(toml::from_str::<MailFile>("host = 'x'").is_err());
     }
 }

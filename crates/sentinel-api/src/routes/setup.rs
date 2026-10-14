@@ -7,8 +7,8 @@
 //! registration policy, the instance settings and the optional namespaces and
 //! closes the bootstrap latch, then signs the administrator in. A second
 //! factor is offered, not forced: the session the wizard ends with enrolls one
-//! through the account routes like any other. `POST /api/v1/setup/smtp-test`
-//! sends one test message through settings the wizard was given; it stores
+//! through the account routes like any other. `POST /api/v1/setup/mail-test`
+//! sends one test message through the configured Resend sender; it stores
 //! nothing and its failure blocks nothing.
 //!
 //! `POST /api/v1/orgs` creates an organization for an approved account when
@@ -22,7 +22,7 @@ use sentinel_auth::{
     secret::{Secret, wipe_string},
 };
 use sentinel_core::{TenantId, UnixMillis, auth::Role, auth::Scopes};
-use sentinel_mail::{Credentials, Failure, Mail, Smtp, Tls, Transport};
+use sentinel_mail::{Failure, Mail};
 use sentinel_protocol::error::{ApiError, ErrorCode};
 use sentinel_store::{
     Error as StoreError, email,
@@ -53,7 +53,7 @@ pub(super) fn route(
     Some(match (method, parts) {
         ("GET", ["api", "v1", "setup"]) => status(state),
         ("POST", ["api", "v1", "setup"]) => complete(state, request),
-        ("POST", ["api", "v1", "setup", "smtp-test"]) => smtp_test(state, request),
+        ("POST", ["api", "v1", "setup", "mail-test"]) => mail_test(state, request),
         ("POST", ["api", "v1", "orgs"]) => create_organization(state, request),
         ("GET", ["api", "v1", "tenants", slug, "settings"]) => settings(state, request, slug),
         _ => return None,
@@ -87,7 +87,7 @@ fn status(state: &State) -> Route {
     };
     Ok(Reply::Json(
         200,
-        json!({ "open": open }),
+        json!({ "open": open, "mail_configured": open && state.mail.is_some() }),
         vec![header("cache-control", "no-store")],
     ))
 }
@@ -240,106 +240,56 @@ fn complete_with(state: &State, body: &SetupBody) -> Route {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SmtpBody {
+struct MailTestBody {
     token: String,
-    host: String,
-    port: u16,
-    /// `starttls` (default), `implicit` or `none` (a relay on this host).
-    #[serde(default)]
-    tls: Option<String>,
-    from: String,
     /// Where the test message goes.
     to: String,
-    #[serde(default)]
-    username: Option<String>,
-    #[serde(default)]
-    password: Option<String>,
 }
 
-/// The most of a relay's refusal a client is shown.
+/// The most of a failure's reason a client is shown.
 const MAX_REASON_CHARS: usize = 200;
 
-/// `POST /api/v1/setup/smtp-test`: send one test message through the given
-/// relay settings. Gated by the setup token (a wrong one counts against the
-/// same lock), bounded by one outbound slot and the client's own timeouts,
-/// and never stored. Always `200` for a judged request: `{ "sent": true }`, or
-/// `{ "sent": false, "failure": "invalid_settings" | "transient" |
-/// "permanent", "reason": … }`: a failed test blocks nothing.
-fn smtp_test(state: &State, request: &mut Request) -> Route {
+/// `POST /api/v1/setup/mail-test {token, to}`: send one test message to `to`
+/// through the deployment's configured Resend key and sender. Gated by the
+/// setup token (a wrong one counts against the same lock), bounded by one
+/// outbound slot and the client's own timeouts, and never stored. Always
+/// `200` for a judged request: `{ "sent": true }`, or `{ "sent": false,
+/// "failure": "not_configured" | "invalid_settings" | "transient" |
+/// "permanent", "reason": … }`: a failed test blocks nothing. The reason is
+/// the client's own short text (a status and Resend's error name), never the
+/// key, the address or a message body.
+fn mail_test(state: &State, request: &mut Request) -> Route {
     let bytes = public_json(state, request, Budget::Setup)?;
-    let mut body: SmtpBody = parse(&bytes)?;
-    let outcome = smtp_test_with(state, &mut body);
-    if let Some(password) = body.password.as_mut() {
-        wipe_string(password);
-    }
-    outcome
-}
-
-fn smtp_test_with(state: &State, body: &mut SmtpBody) -> Route {
+    let body: MailTestBody = parse(&bytes)?;
     let token = token_of(&body.token)?;
     setup::verify(&state.store, &token, UnixMillis::now()).map_err(setup_error)?;
     let not_sent = |failure: &str, reason: String| {
         ok(json!({ "sent": false, "failure": failure, "reason": reason }))
     };
+    let Some(resend) = state.mail.as_ref() else {
+        return not_sent(
+            "not_configured",
+            "email delivery is not configured: set SENTINEL_RESEND_API_KEY_FILE and SENTINEL_EMAIL_FROM, then restart".into(),
+        );
+    };
     let Some(_slot) = state.setup_mail.take() else {
         return Err(err(ErrorCode::RateLimited, "busy; retry shortly"));
-    };
-    let tls = match body.tls.as_deref() {
-        None => Tls::StartTls,
-        Some(name) => match Tls::parse(name) {
-            Some(tls) => tls,
-            None => {
-                return not_sent(
-                    "invalid_settings",
-                    "tls must be starttls, implicit or none".into(),
-                );
-            }
-        },
-    };
-    let credentials = match (body.username.take(), body.password.take()) {
-        (None, None) => None,
-        (Some(username), Some(password)) => {
-            match Credentials::new(username, password.into_bytes()) {
-                Ok(credentials) => Some(credentials),
-                Err(reason) => return not_sent("invalid_settings", reason),
-            }
-        }
-        _ => {
-            return not_sent(
-                "invalid_settings",
-                "give both username and password, or neither".into(),
-            );
-        }
     };
     let to = match email::normalize(&body.to) {
         Ok(to) => to,
         Err(_) => return not_sent("invalid_settings", "to must be a plain address".into()),
     };
-    let config = match sentinel_mail::Config::new(
-        body.host.clone(),
-        body.port,
-        tls,
-        credentials,
-        &body.from,
-    ) {
-        Ok(config) => config,
-        Err(reason) => return not_sent("invalid_settings", reason),
-    };
-    let mut smtp = match Smtp::new(config) {
-        Ok(smtp) => smtp,
-        Err(reason) => return not_sent("invalid_settings", reason),
-    };
-    let sent = smtp.send(&Mail {
+    let sent = resend.deliver(&Mail {
         id: sentinel_core::MailId::new(),
         to: &to,
         subject: "Sentinel setup: test message",
         body: "This is a test message from your Sentinel setup. If you can read it, \
-               mail delivery works with these settings.\r\n",
+               email delivery works.\r\n",
         now: UnixMillis::now(),
     });
     match sent {
         Ok(()) => ok(json!({ "sent": true })),
-        Err(Failure::Transient(reason)) => not_sent("transient", brief(&reason)),
+        Err(Failure::Transient { why, .. }) => not_sent("transient", brief(&why)),
         Err(Failure::Permanent(reason)) => not_sent("permanent", brief(&reason)),
     }
 }

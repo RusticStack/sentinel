@@ -592,18 +592,16 @@ fn a_retry_after_pushes_the_next_attempt_out_but_is_bounded() {
     email::set_delivery(&f.store, true, Some("https://ci.example.com"), at(1)).unwrap();
     f.user_of(f.sign_up("slow@example.com", &f.admission(), Some(Arc::clone(&key))));
     let id = f.store.read(|c| email::due(c, at(10), 10)).unwrap()[0].id;
-    let wait = |retry_after_ms: i64, now: i64| {
-        match f
-            .store
-            .writer()
-            .write(move |tx| email::retry(tx, id, at(now), "throttled", retry_after_ms))
-            .unwrap()
-        {
-            email::Retry::Scheduled {
-                next_attempt_ms, ..
-            } => next_attempt_ms - now,
-            email::Retry::GaveUp => panic!("gave up"),
-        }
+    let wait = |retry_after_ms: i64, now: i64| match f
+        .store
+        .writer()
+        .write(move |tx| email::retry(tx, id, at(now), "throttled", retry_after_ms))
+        .unwrap()
+    {
+        email::Retry::Scheduled {
+            next_attempt_ms, ..
+        } => next_attempt_ms - now,
+        email::Retry::GaveUp => panic!("gave up"),
     };
     // Longer than the back-off: honored.
     assert_eq!(wait(120_000, 100), 120_000);

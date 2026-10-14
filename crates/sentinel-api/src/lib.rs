@@ -178,12 +178,18 @@ pub struct AutoJoinRule {
 pub struct Options {
     /// The operator's auto-join rules, for the organization settings route.
     pub auto_join: Vec<AutoJoinRule>,
+    /// The Resend sender, when the deployment configured one: the first-run
+    /// wizard's test message goes through it. Without it the test answers
+    /// `not_configured`.
+    pub mail: Option<Arc<sentinel_mail::Resend>>,
 }
 
 pub(crate) struct State {
     /// The operator's auto-join rules ([`Options::auto_join`]).
     pub auto_join: Vec<AutoJoinRule>,
-    /// First-run SMTP tests in flight, a budget of their own ([`OUTBOUND`]).
+    /// The Resend sender ([`Options::mail`]).
+    pub mail: Option<Arc<sentinel_mail::Resend>>,
+    /// First-run mail tests in flight, a budget of their own ([`OUTBOUND`]).
     pub setup_mail: Outbound,
     /// Set once the first-run latch is seen closed; it never reopens, so the
     /// status route stops asking the store.
@@ -336,6 +342,7 @@ impl Server {
         let proxies = config.trusted_proxies.clone();
         let state = Arc::new(State {
             auto_join: options.auto_join,
+            mail: options.mail,
             setup_mail: Outbound::default(),
             setup_closed: AtomicBool::new(false),
             store: config.store,

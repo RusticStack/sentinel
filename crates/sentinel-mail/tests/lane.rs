@@ -1,7 +1,7 @@
 //! The mail lane against a real store and a scripted transport: a delivered
 //! message settles and loses its body, a transient failure waits for its
 //! backoff instead of spinning, a refused message is given up, and a message
-//! the lane cannot open never reaches the relay.
+//! the lane cannot open never reaches Resend.
 
 use std::{
     collections::VecDeque,
@@ -135,7 +135,7 @@ fn a_transient_failure_waits_for_its_backoff_instead_of_spinning() {
     w.queue("slow@example.com");
     let (lane, sent) = w.start(
         Arc::clone(&w.key),
-        vec![Err(Failure::Transient("relay unreachable".into()))],
+        vec![Err(Failure::transient("resend unreachable"))],
     );
     eventually("the first attempt", || !sent.lock().unwrap().is_empty());
     // Give the lane time to (wrongly) retry in a loop.
@@ -155,12 +155,36 @@ fn a_transient_failure_waits_for_its_backoff_instead_of_spinning() {
 }
 
 #[test]
+fn a_throttled_message_waits_for_the_retry_after_the_service_gave() {
+    let w = world();
+    w.queue("throttled@example.com");
+    let (lane, sent) = w.start(
+        Arc::clone(&w.key),
+        vec![Err(Failure::Transient {
+            why: "resend throttled the request (429)".into(),
+            retry_after: Some(Duration::from_secs(600)),
+        })],
+    );
+    eventually("the first attempt", || !sent.lock().unwrap().is_empty());
+    eventually("the retry to be scheduled", || {
+        w.store
+            .read(email::next_due_ms)
+            .unwrap()
+            .is_some_and(|next| next >= UnixMillis::now().0 + 590_000)
+    });
+    assert_eq!(w.counts(), (1, 0, 0), "pending, not abandoned");
+    drop(lane);
+}
+
+#[test]
 fn a_refused_message_is_given_up_and_not_retried() {
     let w = world();
     w.queue("nobody@example.com");
     let (lane, sent) = w.start(
         Arc::clone(&w.key),
-        vec![Err(Failure::Permanent("RCPT replied 550".into()))],
+        vec![Err(Failure::Permanent(
+            "resend refused the message (422)".into(),
+        ))],
     );
     eventually("the message to be given up", || w.counts() == (0, 0, 1));
     std::thread::sleep(Duration::from_millis(300));

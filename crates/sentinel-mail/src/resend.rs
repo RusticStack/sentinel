@@ -120,9 +120,9 @@ impl Sender {
             .and_then(|n| n.strip_suffix('"'))
             .unwrap_or(name);
         let name_ok = name.chars().count() <= MAX_DISPLAY_NAME_CHARS
-            && !name
-                .chars()
-                .any(|c| c.is_control() || matches!(c, '<' | '>' | '"' | '\\' | ',' | ';' | '@' | ':'));
+            && !name.chars().any(|c| {
+                c.is_control() || matches!(c, '<' | '>' | '"' | '\\' | ',' | ';' | '@' | ':')
+            });
         if !name_ok {
             return Err(BAD);
         }
@@ -154,10 +154,10 @@ impl std::fmt::Debug for Resend {
     }
 }
 
-fn agent(https_only: bool) -> ureq::Agent {
+fn agent(https_only: bool, total: Duration) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
-        .timeout_global(Some(TOTAL_TIMEOUT))
+        .timeout_global(Some(total))
         .max_redirects(0)
         .proxy(None)
         .https_only(https_only)
@@ -172,7 +172,7 @@ fn agent(https_only: bool) -> ureq::Agent {
 impl Resend {
     pub fn new(key: ApiKey, from: Sender) -> Resend {
         Resend {
-            agent: agent(true),
+            agent: agent(true, TOTAL_TIMEOUT),
             endpoint: ENDPOINT.to_owned(),
             key,
             from,
@@ -183,11 +183,19 @@ impl Resend {
     #[cfg(feature = "test-endpoint")]
     pub fn with_endpoint(key: ApiKey, from: Sender, endpoint: &str) -> Resend {
         Resend {
-            agent: agent(false),
+            agent: agent(false, TOTAL_TIMEOUT),
             endpoint: endpoint.to_owned(),
             key,
             from,
         }
+    }
+
+    /// A shorter whole-request deadline, so a timeout test does not wait out
+    /// the production one.
+    #[cfg(feature = "test-endpoint")]
+    pub fn with_total_timeout(mut self, total: Duration) -> Resend {
+        self.agent = agent(false, total);
+        self
     }
 
     /// Send one message. Shared access: the client holds no per-send state.
@@ -346,12 +354,19 @@ mod tests {
     #[test]
     fn senders_are_validated_and_normalized() {
         assert_eq!(
-            Sender::parse("Sentinel CI <CI@Example.com>").unwrap().as_str(),
+            Sender::parse("Sentinel CI <CI@Example.com>")
+                .unwrap()
+                .as_str(),
             "Sentinel CI <ci@example.com>"
         );
-        assert_eq!(Sender::parse("ci@example.com").unwrap().as_str(), "ci@example.com");
         assert_eq!(
-            Sender::parse("\"Sentinel\" <ci@example.com>").unwrap().as_str(),
+            Sender::parse("ci@example.com").unwrap().as_str(),
+            "ci@example.com"
+        );
+        assert_eq!(
+            Sender::parse("\"Sentinel\" <ci@example.com>")
+                .unwrap()
+                .as_str(),
             "Sentinel <ci@example.com>"
         );
         for bad in [

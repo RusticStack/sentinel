@@ -10,7 +10,7 @@
 //!
 //! Nothing here sends mail. A route that needs a link written writes it to the
 //! durable outbox in the same transaction that mints the token; the mail lane
-//! delivers it. A deployment without SMTP answers `"verification": "operator"`
+//! delivers it. A deployment without Resend answers `"verification": "operator"`
 //! and the operator hands the link over from the host
 //! (`sentinel admin account email-link`).
 

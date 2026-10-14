@@ -253,7 +253,7 @@ fn challenge(state: &State, request: &Request, path: &str, error: &ApiError) -> 
         || rest.starts_with("intake/")
         || matches!(
             rest,
-            "login" | "register" | "email/verify" | "email/resend" | "setup" | "setup/smtp-test"
+            "login" | "register" | "email/verify" | "email/resend" | "setup" | "setup/mail-test"
         )
     {
         return Vec::new();

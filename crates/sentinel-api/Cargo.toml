@@ -28,6 +28,7 @@ url = "2.5"
 
 [dev-dependencies]
 sentinel-github = { path = "../sentinel-github", features = ["fake"] }
+sentinel-mail = { path = "../sentinel-mail", features = ["test-endpoint"] }
 tempfile = "3.20"
 
 [lints]

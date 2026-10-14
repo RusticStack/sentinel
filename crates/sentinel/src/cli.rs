@@ -963,7 +963,7 @@ pub enum AccountCommand {
         user: String,
     },
     /// Mint an email verification link for an account and print it to stdout,
-    /// once: for a deployment without SMTP, so nobody is locked out. Earlier
+    /// once: for a deployment without email delivery, so nobody is locked out. Earlier
     /// links of the account stop working
     EmailLink {
         #[command(flatten)]

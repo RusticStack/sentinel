@@ -76,7 +76,7 @@ pub(crate) enum Budget {
     Signup,
     /// Email resend, verification and invitation links.
     Mail,
-    /// First-run setup attempts (`POST /api/v1/setup`, the SMTP test): a
+    /// First-run setup attempts (`POST /api/v1/setup`, the mail test): a
     /// token judgement, and for a right one a password hash. Tight, because
     /// nothing legitimate asks more than a handful of times.
     Setup,

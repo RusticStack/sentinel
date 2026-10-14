@@ -59,3 +59,11 @@ impl Failure {
 pub trait Transport: Send {
     fn send(&mut self, mail: &Mail<'_>) -> Result<(), Failure>;
 }
+
+/// A sender shared with another user of the same configuration (the lane and
+/// the first-run wizard's test message).
+impl Transport for std::sync::Arc<Resend> {
+    fn send(&mut self, mail: &Mail<'_>) -> Result<(), Failure> {
+        self.deliver(mail)
+    }
+}

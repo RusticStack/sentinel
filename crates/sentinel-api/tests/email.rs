@@ -418,7 +418,7 @@ fn an_organization_administrator_invites_by_email_and_a_member_cannot() {
     assert_eq!(status, 201, "{body}");
     assert_eq!(
         body["delivery"], "link",
-        "no SMTP: the inviter passes the link on"
+        "no Resend key: the inviter passes the link on"
     );
     assert_eq!(body["role"], "operator");
     assert!(token::parse(body["token"].as_str().unwrap()).is_some());

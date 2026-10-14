@@ -1357,14 +1357,13 @@ dependencies = [
 name = "sentinel-mail"
 version = "0.1.0-dev"
 dependencies = [
- "base64",
- "rustls",
  "sentinel-auth",
  "sentinel-core",
+ "sentinel-mail",
  "sentinel-store",
+ "serde_json",
  "tempfile",
- "time",
- "webpki-roots",
+ "ureq",
 ]
 
 [[package]]
