@@ -1,6 +1,6 @@
 # Second factors, step-up and session administration (A06)
 
-Implemented in `sentinel-auth::mfa` and `sentinel-auth::sealed`, `sentinel-store::mfa`, the `Authority` type in `sentinel-store::auth`, and `sentinel admin key|mfa|session`, with append-only metadata migrations **9**, **10** (per-session failure limit) and **32** (per-account second-factor lockout).
+Implemented in `sentinel-auth::mfa` and `sentinel-auth::sealed`, `sentinel-store::mfa`, the `Authority` type in `sentinel-store::auth`, the account routes in `sentinel-api` (`routes/account.rs`, `github.rs`), and `sentinel admin key|mfa|session`, with append-only metadata migrations **9**, **10** (per-session failure limit) and **32** (per-account second-factor lockout).
 
 A session proves who you are. **Step-up** proves you are still there, just now, with something more than a cookie — before a change that alters who can authenticate at all. It is freshness, not authority: `Authority::require_privileged` demands both a recent stamp and a live platform-admin check, in the same transaction as the change.
 
@@ -13,9 +13,10 @@ A session proves who you are. **Step-up** proves you are still there, just now, 
 | Suspending or reactivating an account | `local_auth::set_active` |
 | Rejecting an account that was already approved (permanent: a rejected account can be neither approved nor reactivated) | `registration::reject` |
 | Suspending or reactivating a tenant | `tenancy::suspend`, `tenancy::reactivate` |
-| Linking an external identity to an account | `sign_in::link` |
+| Linking an external identity to an account | `sign_in::link`, over `POST /identities/github/link` |
 | Provisioning a local password for an existing account | `local_auth::provision_credential` |
-| Removing your own second factor, reissuing recovery codes | `mfa::disable`, `mfa::reissue_recovery_codes` |
+| Removing your own second factor, reissuing recovery codes | `mfa::disable`, `mfa::reissue_recovery_codes`, over `POST /mfa/recovery-codes` |
+| Changing your password, **when a second factor is enrolled** (always with the current password) | `local_auth::change_password`, over `POST /password` |
 | Creating a service account, allowing it a repository, issuing it a grant — from **anyone**, tenant administrators included | `auth::create_service_account`, `oauth::service::allow_repo`, `oauth::service::issue_service_grant` |
 | Changing a tenant's memberships or repository grants as a platform administrator who is **not** an administrator of that tenant (also needs a reason) | `auth::set_membership_as`, `auth::set_repo_grant_as` |
 
@@ -47,7 +48,7 @@ A super admin has no ambient access to a tenant's data (see [authorization](auth
 - **Recovery codes**: ten 50-bit codes in a look-alike-free alphabet, stored as BLAKE3 digests, each spent once (a trigger refuses to un-spend). Retyping without the separator or in upper case still works. Reissuing a set replaces the old one entirely.
 - **Password**, accepted **only when no second factor is enrolled**. Otherwise the weaker proof would stand in for the stronger, which is the opposite of stepping up.
 
-A wrong proof returns `false` and an audited `StepUpFailed`, not an error: the caller renders one response either way. A GitHub-only account has no password to offer, so a GitHub-only super admin must enroll TOTP before any privileged change; enrollment itself needs only a session, so there is no lockout.
+A wrong proof returns `false` and an audited `StepUpFailed`, not an error: the caller renders one response either way. A GitHub-only account has no password to offer, so a GitHub-only super admin must enroll TOTP before any privileged change. Enrollment is therefore reachable without a password, but never with a bare cookie: see [Enrolling a second factor](#enrolling-a-second-factor) for the proof each kind of account gives first.
 
 ## The seed is sealed
 
@@ -55,7 +56,22 @@ A TOTP seed is the one credential that must be recoverable to be useful, so it i
 
 Enrollment is two steps: `begin_enrollment` writes an unconfirmed seed and returns the `otpauth://` URI once; `confirm_enrollment` requires a code from the app, issues the recovery codes once, and stamps the session. Until confirmed, nothing about authentication changes — an abandoned enrollment cannot lock anybody out. A confirmed factor cannot be quietly re-enrolled by a live session; replacing it means `disable` under step-up, which also revokes every session of the account so no stepped-up window outlives the factor.
 
-There is no host-local *enrollment* — it needs the person and their device — but there is host-local removal, for a lost device with spent codes, audited as host-local.
+### Enrolling a second factor
+
+Routes for a **browser session with its CSRF header** ([API](api.md)); a bearer credential or OAuth token, whatever its scopes, can enroll nothing:
+
+1. `POST /mfa/enroll` begins. What the account must show first depends on what it has, so a stolen cookie enrolls nothing on an account whose password it does not know:
+   - **An account with a local password** sends it in the body. It is verified as a password step-up (counted against the session, five wrong revoke it, audited `step-up-failed`) and stamps the session on success.
+   - **A GitHub-only account** has no password and no factor, so the one proof it can give is the sign-in itself: the session must have been issued within `Policy::step_up_ms` (`Session::signed_in_within`, derived from the absolute deadline), else the answer is `forbidden` with `details.reauthenticate` and the person signs in again. The trade-off is explicit: within ten minutes of a GitHub sign-in, a hijacked session of a GitHub-only account could enroll its own factor; the audit row, the confirmed enrollment's immunity to quiet replacement, and host-local removal bound what follows.
+   - A confirmed factor is `409`; a repeat before confirmation supersedes the earlier seed.
+2. `POST /mfa/enroll/confirm` with a code from the app. A wrong code confirms nothing; the confirmed code's time step is recorded, so it cannot be replayed as a step-up. The ten recovery codes are returned once and the session is stepped up.
+3. `POST /mfa/recovery-codes` replaces the set; it needs a fresh step-up. `POST /password` and `POST /identities/github/link` are the other two changes this section gates ([local authentication](local-authentication.md#changing-a-password), [GitHub sign-in](github-sign-in.md#linking-from-a-signed-in-session)).
+
+`GET /me/security` reports the state (enrolled, pending, codes remaining) without a seed, a code or an identity subject.
+
+### From the host
+
+The same enrollment exists host-locally for an operator sitting with the person and their device (a GitHub-only super admin on a headless deployment, say). `sentinel admin mfa enroll` prints the `otpauth://` URI alone on stdout, once; `confirm --code` proves the app holds it and prints the ten recovery codes on stdout, once; `codes` replaces the set. Authorization is access to the database file and `master.key`, like removal, and the audit rows are marked host-local; no session is stamped. Removal (`mfa disable`) is the recovery path for a lost device with spent codes.
 
 ## Session administration
 
@@ -64,6 +80,9 @@ Sessions now carry a public `ses_` identifier (migration 9; sessions issued befo
 ```sh
 sentinel admin key create   --data-dir <PATH>
 sentinel admin mfa status   --data-dir <PATH> --user root
+sentinel admin mfa enroll   --data-dir <PATH> --user root            # otpauth:// URI on stdout, once
+sentinel admin mfa confirm  --data-dir <PATH> --user root --code 123456   # recovery codes on stdout, once
+sentinel admin mfa codes    --data-dir <PATH> --user root            # replace the recovery codes
 sentinel admin mfa disable  --data-dir <PATH> --user root
 sentinel admin session list       --data-dir <PATH> --user root
 sentinel admin session revoke     --data-dir <PATH> --user root --id ses_...
@@ -74,6 +93,6 @@ sentinel admin session logout-all --data-dir <PATH> --user root
 
 `sentinel-auth` unit tests: RFC 6238 reference vectors, one-step drift with the matched step reported, malformed codes refused before HMAC work, provisioning URI shape and seed redaction, recovery codes distinct and retype-tolerant, sealed values opening only under their key and context, damaged/truncated/unknown-version ciphertexts refused, key file created once at the right size.
 
-`crates/sentinel-store/tests/mfa.rs`: a platform-admin session refused every privileged change until it steps up, the password serving as proof only before enrollment, freshness expiring on schedule and host-local needing none; enrollment confirmed by a code with the seed stored only sealed and no recovery code present in the database; a TOTP code accepted once with replay and raw rewind refused and the password no longer accepted; recovery codes one-use, retype-tolerant, reissue needing step-up and killing the old set; removal needing step-up and ending every session, with host-local removal audited; sessions listed and revoked by name with no secret in the output and outsiders refused; and the stamp neither forgeable, rewindable, placeable on a revoked session, nor fresh when in the future; wrong codes accumulating across fresh sign-ins until the account's factor locks and every session is revoked (`step_up_failures_accumulate_across_sessions`), the lock refusing a correct code and sparing recovery codes until it ends (`an_account_lockout_refuses_even_a_correct_code_until_it_expires`), and host-local recovery clearing it (`host_local_recovery_clears_the_step_up_lockout`). `crates/sentinel-store/tests/registration.rs` covers rejecting an approved account needing step-up (`rejecting_an_approved_account_needs_step_up`). `crates/sentinel-store/tests/oauth_service.rs` covers issuing needing fresh step-up and refusing a bearer authority, host-local and a non-administrator in the right order, a session's stamp being re-read in the transaction (unstamped, stale, and revoked after the authority was built), the platform reason being bounded and audited, and revoking an account's sessions revoking the grants it minted in the window and no others; `crates/sentinel-store/tests/tenant_access.rs` covers a platform administrator being refused self-grants without proof and reason, the audited `platform-override`, and sign-in names resolving only among members; `crates/sentinel-api/tests/oauth_service.rs` covers a bearer and an OAuth token holding `tenant:admin` being refused with `details.step_up`, a cold session being refused and a stepped-up one allowed, and a narrow token managing only its own grant. These suites were written but not run on the workstation; the VPS pass records the results. Every earlier suite was updated to pass an `Authority` and still passes. The `sentinel admin key|mfa|session` surface was exercised end to end on Linux.
+`crates/sentinel-store/tests/mfa.rs`: a platform-admin session refused every privileged change until it steps up, the password serving as proof only before enrollment, freshness expiring on schedule and host-local needing none; enrollment confirmed by a code with the seed stored only sealed and no recovery code present in the database; a TOTP code accepted once with replay and raw rewind refused and the password no longer accepted; recovery codes one-use, retype-tolerant, reissue needing step-up and killing the old set; removal needing step-up and ending every session, with host-local removal audited; sessions listed and revoked by name with no secret in the output and outsiders refused; and the stamp neither forgeable, rewindable, placeable on a revoked session, nor fresh when in the future; wrong codes accumulating across fresh sign-ins until the account's factor locks and every session is revoked (`step_up_failures_accumulate_across_sessions`), the lock refusing a correct code and sparing recovery codes until it ends (`an_account_lockout_refuses_even_a_correct_code_until_it_expires`), and host-local recovery clearing it (`host_local_recovery_clears_the_step_up_lockout`). `crates/sentinel-store/tests/registration.rs` covers rejecting an approved account needing step-up (`rejecting_an_approved_account_needs_step_up`). `crates/sentinel-store/tests/oauth_service.rs` covers issuing needing fresh step-up and refusing a bearer authority, host-local and a non-administrator in the right order, a session's stamp being re-read in the transaction (unstamped, stale, and revoked after the authority was built), the platform reason being bounded and audited, and revoking an account's sessions revoking the grants it minted in the window and no others; `crates/sentinel-store/tests/tenant_access.rs` covers a platform administrator being refused self-grants without proof and reason, the audited `platform-override`, and sign-in names resolving only among members; `crates/sentinel-api/tests/oauth_service.rs` covers a bearer and an OAuth token holding `tenant:admin` being refused with `details.step_up`, a cold session being refused and a stepped-up one allowed, and a narrow token managing only its own grant. `mfa.rs` also covers a password change with a factor needing a fresh step-up (asked for before the password is judged), wrong current passwords counting against the session and never the factor, host-local enrollment (a wrong code confirming nothing, no session stamped, audited host-local, a confirmed factor not replaced, reissue replacing the set) and an unknown or unenrolled account refused. The HTTP and CLI coverage is `crates/sentinel-api/tests/account.rs`, `crates/sentinel-api/tests/github_sign_in.rs` and `crates/sentinel/tests/mfa_admin.rs`. These suites were written but not run on the workstation; the VPS pass records the results. Every earlier suite was updated to pass an `Authority` and still passes. The `sentinel admin key|mfa|session` surface was exercised end to end on Linux.
 
 See [TODO.md](../TODO.md) for commands and results, and [admission](admission.md) for the decisions this gates.

@@ -1149,6 +1149,19 @@ fn host_local_enrollment_needs_the_code_marks_the_audit_and_leaves_sessions_alon
 }
 
 #[test]
+fn a_session_is_a_fresh_sign_in_only_inside_the_step_up_window() {
+    let f = fixture();
+    let policy = Policy::default();
+    // Issued at T0 + 1 by the fixture's login.
+    let session = f.session(at(T0 + 2));
+    assert!(session.signed_in_within(policy, at(T0 + 2)));
+    assert!(session.signed_in_within(policy, at(T0 + policy.step_up_ms)));
+    assert!(!session.signed_in_within(policy, at(T0 + 1 + policy.step_up_ms)));
+    // A clock before the issue is not fresh either.
+    assert!(!session.signed_in_within(policy, at(T0 - 1)));
+}
+
+#[test]
 fn enrollment_and_reissue_refuse_an_account_that_cannot_hold_a_factor() {
     let f = fixture();
     let now = at(T0 + 10);
