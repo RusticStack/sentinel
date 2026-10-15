@@ -1,12 +1,4 @@
-//! Service-account grants over real HTTP on loopback: a tenant administrator creates a service
-//! account, allows it a repository and issues it a grant; the agent refreshes
-//! and reads runs; the grant is listed as metadata and revoked, after which
-//! its refresh token is `invalid_grant`. Plus the refusals: non-admins,
-//! missing `tenant:admin` scope, administrative scopes, lifetime bounds,
-//! foreign repositories and outsiders revoking.
-//!
-//! The harness (`deployment()`, `send()`, `get()`, `grant()`, `bearer()`)
-//! is copied from `oauth_core.rs`.
+//! The harness below is copied from oauth_core.rs; keep the copies in sync.
 
 use std::sync::Arc;
 
@@ -38,12 +30,8 @@ pub struct Deployment {
     pub store: Arc<Store>,
     _controller: Controller,
     server: Option<sentinel_api::Server>,
-    /// `http://127.0.0.1:PORT`; also the issuer.
     pub base: String,
-    /// A `sntl_` credential for root with every permission.
     pub token: String,
-    /// Root's browser session after a step-up: (cookie, CSRF secret). Only a
-    /// session like this mints or widens service credentials.
     pub session: (String, String),
     pub root: UserId,
     pub dev: UserId,
@@ -134,8 +122,6 @@ pub fn deployment() -> Deployment {
     d
 }
 
-/// Root signs in with the password and proves presence again with it (no
-/// second factor is enrolled), as the web interface's step-up dialog does.
 fn stepped_session(d: &Deployment) -> (String, String) {
     let login = send(
         d,
@@ -162,15 +148,12 @@ fn stepped_session(d: &Deployment) -> (String, String) {
     (cookie, csrf)
 }
 
-/// A request body: none, JSON, or a raw `application/x-www-form-urlencoded` form.
 pub enum Body<'a> {
     None,
     Json(&'a Value),
     Form(&'a str),
 }
 
-/// What came back: status, every header (lower-case names) and the body as
-/// JSON (or a JSON string when it is not JSON).
 pub struct Reply {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -186,7 +169,6 @@ impl Reply {
     }
 }
 
-/// One request; redirects are returned, never followed.
 pub fn send(
     d: &Deployment,
     method: &str,
@@ -255,7 +237,6 @@ pub fn send(
     }
 }
 
-/// `GET` with an `Authorization` header.
 pub fn get(d: &Deployment, path: &str, authorization: &str) -> Reply {
     send(
         d,
@@ -266,7 +247,6 @@ pub fn get(d: &Deployment, path: &str, authorization: &str) -> Reply {
     )
 }
 
-/// A login grant for `user` issued without the browser, as the flows would.
 pub fn grant(d: &Deployment, user: UserId, scopes: Scopes) -> Minted {
     oauth::issue_grant_trusted(
         &d.store,
@@ -306,8 +286,7 @@ fn root(d: &Deployment) -> String {
     format!("Bearer {}", d.token)
 }
 
-/// A request as root's stepped-up browser session: the only caller that may
-/// create a service account, allow it a repository or issue it a grant.
+/// Only a stepped-up browser session may create service accounts, allow repositories or issue grants.
 fn as_session(d: &Deployment, method: &str, path: &str, body: &Value) -> Reply {
     let body = if method == "GET" || method == "DELETE" {
         Body::None
@@ -335,7 +314,6 @@ fn refresh(d: &Deployment, refresh_token: &str) -> Reply {
     )
 }
 
-/// Create a service account `deployer` in `acme` as root; its `usr_` id.
 fn create_account(d: &Deployment) -> String {
     let created = as_session(
         d,
@@ -378,7 +356,6 @@ fn an_agent_grant_is_issued_refreshed_used_listed_and_revoked() {
     let expected = UnixMillis::now().0 + oauth::SERVICE_DEFAULT_MS;
     assert!((expected - 60_000..=expected).contains(&expires));
 
-    // The agent imports it: refresh, then read runs as the service account.
     let tokens = refresh(&d, &refresh_token);
     assert_eq!(tokens.status, 200, "{}", tokens.body);
     assert_eq!(tokens.body["sentinel_grant"], grant);
@@ -389,12 +366,10 @@ fn an_agent_grant_is_issued_refreshed_used_listed_and_revoked() {
     assert_eq!(me.body["user"], account);
     assert_eq!(me.body["via"], "oauth");
     assert_eq!(me.body["repo"], d.repo.to_string());
-    // Its own grants, as metadata.
     let own = get(&d, "/api/v1/grants", &access);
     assert_eq!(own.status, 200);
     assert_eq!(own.body["grants"][0]["id"], grant);
 
-    // The administrator's listing: metadata only, never token material.
     let listed = call(
         &d,
         "GET",
@@ -415,7 +390,6 @@ fn an_agent_grant_is_issued_refreshed_used_listed_and_revoked() {
     assert!(!text.contains("sntl_"));
     assert!(!text.contains(&refresh_token[8..]));
 
-    // An operator of the tenant cannot revoke it; the administrator can.
     let dev = tokens::provision(
         &d.store,
         Grant::new(d.dev, "dev", P::REPOSITORY.union(P::TENANT_ADMIN)),
@@ -459,7 +433,6 @@ fn only_tenant_administrators_with_the_scope_manage_service_accounts() {
     let d = deployment();
     let account = create_account(&d);
     let body = json!({"name": "ci", "scope": "runs:read"});
-    // An operator holding every permission bit is still not an administrator.
     let dev = tokens::provision(
         &d.store,
         Grant::new(d.dev, "dev", P::REPOSITORY.union(P::TENANT_ADMIN)),
@@ -485,7 +458,6 @@ fn only_tenant_administrators_with_the_scope_manage_service_accounts() {
             reply.body
         );
     }
-    // An OAuth grant without tenant:admin is refused by scope, even for root.
     let narrow = grant(&d, d.root, Scopes::CLI_DEFAULT);
     let scoped = call(
         &d,
@@ -496,9 +468,6 @@ fn only_tenant_administrators_with_the_scope_manage_service_accounts() {
     );
     assert_eq!(scoped.status, 403);
     assert_eq!(scoped.body["details"]["scope"], "tenant:admin");
-    // With the scope, a token still cannot mint: only a stepped-up browser
-    // session issues credentials, so a stolen token cannot mint a longer-lived
-    // one. The refusal asks for a step-up and writes nothing.
     let admin = grant(&d, d.root, Scopes::CLI_DEFAULT.union(Scopes::TENANT_ADMIN));
     for authorization in [bearer(&admin.access), root(&d)] {
         for (method, path, body) in [
@@ -523,7 +492,6 @@ fn only_tenant_administrators_with_the_scope_manage_service_accounts() {
         &root(&d),
     );
     assert_eq!(listed.body["grants"], json!([]));
-    // A session that has not stepped up is refused the same way.
     let login = send(
         &d,
         "POST",
@@ -546,10 +514,8 @@ fn only_tenant_administrators_with_the_scope_manage_service_accounts() {
     );
     assert_eq!(cold.status, 403, "{}", cold.body);
     assert_eq!(cold.body["details"]["step_up"], true);
-    // After stepping up, the session may.
     let ok = as_session(&d, "POST", &format!("{ACCOUNTS}/{account}/grants"), &body);
     assert_eq!(ok.status, 201, "{}", ok.body);
-    // No credential at all.
     let anonymous = send(
         &d,
         "GET",
@@ -589,7 +555,6 @@ fn grant_terms_are_validated() {
         assert_eq!(reply.status, status, "{body}: {}", reply.body);
         assert!(!reply.body.to_string().contains("sntl_rt_"));
     }
-    // A person is not a service account; an unknown one is not found.
     let person = as_session(
         &d,
         "POST",
@@ -620,10 +585,6 @@ fn grant_terms_are_validated() {
     assert_eq!(bounds.status, 201, "{}", bounds.body);
 }
 
-/// `GET /grants` and `DELETE /grants/{grt}` manage the caller's credentials:
-/// a token without `tenant:admin` sees and revokes only the grant it was
-/// issued under, not its siblings; a browser session or an administrative
-/// token manages them all.
 #[test]
 fn a_narrow_token_manages_only_its_own_grant() {
     let d = deployment();
@@ -636,7 +597,6 @@ fn a_narrow_token_manages_only_its_own_grant() {
     assert_eq!(listed.status, 200, "{}", listed.body);
     assert_eq!(listed.body["grants"].as_array().unwrap().len(), 1);
     assert_eq!(listed.body["grants"][0]["id"], mine.grant.to_string());
-    // The sibling is neither listed nor revocable by it.
     let refused = call(
         &d,
         "DELETE",
@@ -647,14 +607,11 @@ fn a_narrow_token_manages_only_its_own_grant() {
     assert_eq!(refused.status, 403, "{}", refused.body);
     assert_eq!(refused.body["details"]["scope"], "tenant:admin");
     assert_eq!(get(&d, "/api/v1/me", &bearer(&sibling.access)).status, 200);
-    // An administrative token and a browser session list them all.
     let admin = grant(&d, d.root, Scopes::RUNS_READ.union(Scopes::TENANT_ADMIN));
     let all = get(&d, "/api/v1/grants", &bearer(&admin.access));
     assert_eq!(all.body["grants"].as_array().unwrap().len(), 3);
     let by_session = as_session(&d, "GET", "/api/v1/grants", &Value::Null);
     assert_eq!(by_session.body["grants"].as_array().unwrap().len(), 3);
-    // A sntl_ credential whose permissions lack tenant administration has no
-    // grant of its own to show: refused by scope rather than shown nothing.
     let dev = tokens::provision(
         &d.store,
         Grant::new(d.dev, "dev", P::REPOSITORY),
@@ -663,7 +620,6 @@ fn a_narrow_token_manages_only_its_own_grant() {
     .unwrap();
     let dev = format!("Bearer {}", sentinel_auth::token::format(&dev.secret));
     assert_eq!(get(&d, "/api/v1/grants", &dev).status, 403);
-    // The narrow token may revoke its own grant, after which it is dead.
     let own = call(
         &d,
         "DELETE",
@@ -675,9 +631,6 @@ fn a_narrow_token_manages_only_its_own_grant() {
     assert_eq!(get(&d, "/api/v1/me", &narrow).status, 401);
 }
 
-/// A tenant the caller has no part in is the same `not_found` as one that
-/// does not exist, on every service-account route (routes resolve
-/// slugs through the membership-checked lookup).
 #[test]
 fn a_foreign_tenant_is_not_found_like_a_missing_one() {
     let d = deployment();

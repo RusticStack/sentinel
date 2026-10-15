@@ -1,9 +1,4 @@
-//! Offline explanation of a compiled pipeline: what will run, in what
-//! order, with which budgets, and what the run will need from outside the
-//! file. Everything here is derived from the compiled form alone. Runtime
-//! inputs (event context, dependency outcomes, `hash_files`) are reported
-//! as *unresolved* with the phase that resolves them; they are never given
-//! placeholder values, and secrets are listed by name only.
+//! Derived from the compiled form alone: runtime inputs stay unresolved, and secret values are never shown.
 use serde::Serialize;
 
 use crate::{
@@ -18,15 +13,10 @@ pub struct Explanation {
     pub schema: &'static str,
     pub digest: String,
     pub triggers: Vec<&'static str>,
-    /// Ref filters of the declared triggers, in kind order; a kind with no
-    /// filter appears as the empty pattern lists.
     pub trigger_filters: Vec<TriggerFilterExplanation>,
     pub concurrency: Option<ConcurrencyExplanation>,
-    /// Execution order: every job's dependencies appear before it.
     pub jobs: Vec<JobExplanation>,
-    /// What the run needs granted before it can execute.
     pub requires: Requirements,
-    /// Every input that cannot be known offline, with the phase that resolves it.
     pub unresolved: Vec<Unresolved>,
 }
 
@@ -48,7 +38,6 @@ pub struct JobExplanation {
     pub name: String,
     pub needs: Vec<String>,
     pub image: String,
-    /// `true` only when the reference carries a digest.
     pub image_pinned: bool,
     pub condition: Option<String>,
     pub cpu_millis: u32,
@@ -71,34 +60,23 @@ pub struct StepExplanation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CacheExplanation {
     pub name: String,
-    /// `downloads`, `dependencies` or `compiler`: which validity rule the
-    /// entry follows (docs/cache.md). Schema 1 default: `dependencies`.
     pub class: &'static str,
-    /// The key template as written; interpolations are not evaluated.
     pub key: String,
-    /// `true` when the key is a literal and therefore known offline.
     pub key_known: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Requirements {
-    /// Read access to the pinned source is always required.
     pub repository_read: bool,
-    /// Secret names that must be granted to the repository; values are never shown.
     pub secrets: Vec<String>,
-    /// Cache names the worker will materialise (needs a cache scope grant).
     pub caches: Vec<String>,
-    /// Artifact names that will be published (needs artifact storage).
     pub artifacts: Vec<String>,
-    /// Images that will be pulled by tag and pinned at first pull.
     pub unpinned_images: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Unresolved {
-    /// Dotted location, e.g. `jobs.report.if` or `jobs.test.cache.deps.key`.
     pub path: String,
-    /// The expression text.
     pub expression: String,
     pub resolves_at: &'static str,
 }
@@ -274,7 +252,6 @@ impl Explanation {
         }
     }
 
-    /// Human-readable rendering for the CLI.
     pub fn render_text(&self) -> String {
         use std::fmt::Write;
         let mut s = String::new();
@@ -392,7 +369,6 @@ mod tests {
             "/../../fixtures/pipelines/valid/conditions.yml"
         ))
         .unwrap()
-        // A CRLF checkout would leave the surgical replace below a no-op.
         .replace("\r\n", "\n")
         .replace(
             "    image: busybox\n    cache:",
@@ -412,7 +388,6 @@ mod tests {
         assert!(e.requires.repository_read);
         let cache = &e.jobs[1].caches[0];
         assert!(!cache.key_known);
-        // A `class`-less document explains itself as the default class.
         assert_eq!(cache.class, "dependencies");
         assert!(
             cache

@@ -1,21 +1,6 @@
-//! The lifecycle reconcile lane.
-//!
-//! `github_refresh` rows are the durable hint list: a signed webhook asked
-//! for a refresh, or the periodic pass owes one. The lane asks GitHub — never
-//! the webhook body — and commits the answer under the row's `seq` fence, so
-//! a stale pass can never overwrite a newer schedule.
-//!
-//! An installation row (kind 0) applies the authenticated snapshot through
-//! `sources_forge::refresh` — suspension, permission loss and account
-//! transfer all land there — then reconciles the bound repository set against
-//! the installation's actual list: a repository no longer granted, renamed,
-//! transferred or archived loses its binding. A repository row (kind 1)
-//! verifies one binding's remote identity the same way. Nothing is revoked on
-//! a guess: only a 404 or a mismatched identity does it; every other failure
-//! retries under bounded back-off.
-//!
-//! The lane never holds the writer while a request is on the wire. It reads
-//! what the call needs, talks to GitHub, then commits in a short transaction.
+//! Refreshes ask GitHub, never the webhook body, and commit under the row's seq fence so a stale pass cannot overwrite a newer schedule.
+//! Nothing is revoked on a guess: only a 404 or a mismatched identity revokes a binding; other failures retry under back-off.
+//! The lane never holds the writer while a request is on the wire.
 
 use std::{
     collections::HashMap,
@@ -34,13 +19,9 @@ use sentinel_github::{
 };
 use sentinel_store::{Error as StoreError, Store, github_events, sources_forge};
 
-/// How long before expiry a cached reconciliation token is replaced.
 const TOKEN_MARGIN_MS: i64 = 120_000;
-/// One cached token per installation; bounded like the publisher's cache.
 const MAX_CACHED_TOKENS: usize = 1024;
 
-/// How the lane paces itself: a 250 ms idle tick and store-failure back-off
-/// from one second to thirty.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub idle: Duration,
@@ -58,15 +39,12 @@ impl Default for Config {
     }
 }
 
-/// One pass's outcome, for the caller's diagnostics.
 #[derive(Clone, Debug)]
 pub struct Notice {
-    /// 0 for an installation pass, 1 for a repository pass.
     pub kind: i64,
     pub outcome: String,
 }
 
-/// A running lane; dropping it stops and joins the thread.
 pub struct Reconcile {
     stop: Arc<AtomicBool>,
     settled: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
@@ -74,9 +52,6 @@ pub struct Reconcile {
 }
 
 impl Reconcile {
-    /// Start the lane. Seeding is part of startup: every known installation
-    /// and bound repository owes a periodic pass, and a row scheduled while
-    /// the lane was down is simply due.
     pub fn start(
         store: Arc<Store>,
         app: Arc<App>,
@@ -122,7 +97,6 @@ impl Drop for Reconcile {
 struct Worker {
     store: Arc<Store>,
     app: Arc<App>,
-    /// One reconciliation token per installation external id.
     tokens: HashMap<u64, Token>,
 }
 
@@ -134,8 +108,6 @@ fn run(
     notice: &dyn Fn(&Notice),
 ) {
     let mut failures: u32 = 0;
-    // Seeding is retried until it lands: without it, installations and
-    // bindings that predate this start would never owe a periodic pass.
     while !stop.load(Ordering::Acquire) {
         let seeded = worker
             .store
@@ -169,8 +141,6 @@ fn run(
             0 => worker.installation(&work),
             _ => worker.repository(&work),
         };
-        // "store" means the pass could not record its outcome, so the row is
-        // still due: back off instead of picking it again at once.
         let unrecorded = outcome == STORE;
         if unrecorded {
             failures = failures.saturating_add(1);
@@ -187,24 +157,16 @@ fn run(
     }
 }
 
-/// The outcome of a pass whose result the store would not take.
 const STORE: &str = "store";
 
-/// What minting a reconciliation token resolved to.
 enum TokenOutcome {
     Ready(Token),
-    /// A verified 404: the installation is gone for good.
     Gone,
-    /// Suspended or permission-invalid: the kind-0 pass repairs it.
     Refused,
-    /// Transient: try again.
     Retry,
 }
 
 impl Worker {
-    /// A reconciliation token for the installation, cached until close to
-    /// expiry. The installation snapshot is fetched on a miss — the same read
-    /// that decides whether minting is allowed at all.
     fn token(&mut self, external: u64, now: UnixMillis) -> TokenOutcome {
         if let Some(cached) = self.tokens.get(&external)
             && cached.expires_ms > now.0 + TOKEN_MARGIN_MS
@@ -243,10 +205,6 @@ impl Worker {
         TokenOutcome::Ready(Token { secret, expires_ms })
     }
 
-    /// Park the row after a transient failure (`retry=true`, bounded
-    /// back-off) or for the next periodic pass (`false`). A failed write
-    /// leaves the row due — the next pass retries — but the notice must
-    /// not claim the row settled.
     fn settle(&self, work: &github_events::Refresh, retry: bool) -> &'static str {
         let work = *work;
         if self
@@ -260,11 +218,6 @@ impl Worker {
         if retry { "retry" } else { "settled" }
     }
 
-    /// A read of the row's target failed. A value the store cannot decode (a
-    /// corrupt binding blob, say) is a fact about this row, not a passing
-    /// fault: parking it under the retry back-off, which turns into a
-    /// quarantine, keeps it from being picked again at once and starving every
-    /// other row. Any other error is the store being unavailable.
     fn unreadable(&self, work: &github_events::Refresh, error: &StoreError) -> String {
         match error {
             StoreError::Corrupt(_) => self.settle(work, true).into(),
@@ -272,7 +225,6 @@ impl Worker {
         }
     }
 
-    /// The row's target vanished; drop it, fenced by the read sequence.
     fn finish(&self, work: &github_events::Refresh) -> &'static str {
         let work = *work;
         if self
@@ -286,8 +238,6 @@ impl Worker {
         "target gone"
     }
 
-    /// Kind 0: an authenticated installation snapshot plus the repository-set
-    /// reconcile when the installation is usable.
     fn installation(&mut self, work: &github_events::Refresh) -> String {
         let target = match self
             .store
@@ -317,8 +267,6 @@ impl Worker {
             }
             Err(_) => return self.settle(work, true).into(),
         };
-        // The repository list is only fetched — and only proves anything —
-        // while the installation can actually grant access.
         let revoked = if installed.suspended || !installed.permissions_valid {
             Vec::new()
         } else {
@@ -352,22 +300,15 @@ impl Worker {
         }) {
             Ok(()) if count == 0 => "refreshed".into(),
             Ok(()) => format!("refreshed, {count} bindings revoked"),
-            // A newer lifecycle landed while the request was out: retry.
             Err(_) => self.settle(&work, true).into(),
         }
     }
 
-    /// The bindings GitHub no longer grants or names differently. `Err(())`
-    /// is transient: the caller parks the row under retry back-off.
     fn repositories(
         &mut self,
         installed: &Installation,
         installation_row: &[u8; 16],
     ) -> Result<Vec<(sentinel_core::RepoId, i64)>, ()> {
-        // The bindings are read first, with their versions: GitHub's list is
-        // then at least as new as the set it is compared with, so a binding
-        // created after this read can never be judged absent. Each revocation
-        // is fenced on the version read here.
         let bound = self
             .store
             .read(|c| github_events::bound_repositories(c, installation_row))
@@ -382,8 +323,6 @@ impl Worker {
         let mut revoked = Vec::new();
         for (repo, forge_id, remote, version) in bound {
             match observed.get(&forge_id) {
-                // An approved remote never follows a rename, transfer or
-                // archival: only an exact `owner/name` match stays bound.
                 Some(seen) => {
                     let approved = repository_path(&remote)
                         .map(|(owner, name)| seen.full_name == format!("{owner}/{name}"))
@@ -392,7 +331,6 @@ impl Worker {
                         revoked.push((repo, version));
                     }
                 }
-                // A truncated list proves membership, never absence.
                 None if !list.truncated => revoked.push((repo, version)),
                 None => {}
             }
@@ -400,11 +338,9 @@ impl Worker {
         Ok(revoked)
     }
 
-    /// Kind 1: one bound repository's identity against the live API answer.
     fn repository(&mut self, work: &github_events::Refresh) -> String {
         let target = match self.store.read(|c| github_events::repo_target(c, &work.id)) {
             Ok(Some(target)) => target,
-            // The binding was revoked or never existed: nothing to verify.
             Ok(None) => return self.finish(work).into(),
             Err(error) => return self.unreadable(work, &error),
         };
@@ -424,8 +360,6 @@ impl Worker {
                 };
             }
             TokenOutcome::Refused => {
-                // The installation row needs the kind-0 pass; it owns the
-                // suspended/permissions state this token mint just proved.
                 let (work, installation) = (*work, target.installation);
                 let scheduled = self
                     .store
@@ -508,7 +442,6 @@ fn backoff(config: &Config, failures: u32) -> Duration {
         .min(config.max_backoff)
 }
 
-/// Wait until the timeout, or until the lane is asked to stop.
 fn wait(settled: &(std::sync::Mutex<bool>, std::sync::Condvar), timeout: Duration) {
     let (lock, cv) = settled;
     let settled = lock.lock().unwrap_or_else(|p| p.into_inner());

@@ -1,19 +1,5 @@
-//! GitHub sign-in for humans.
-//!
-//! Three things are kept apart here, deliberately:
-//!
-//! 1. **A sign-in identity** — proof from GitHub that a browser controls a
-//!    particular GitHub account. That is all this crate establishes.
-//! 2. **A Sentinel session or credential** — issued by `sentinel-store` only
-//!    after admission policy has been applied. Authenticating at GitHub does
-//!    not admit anybody.
-//! 3. **A GitHub App installation token** — repository access for running jobs.
-//!    A user login token is never used as one, never persisted and
-//!    never handed to a workload; it is read once and dropped.
-//!
-//! The only durable fact this crate produces is the immutable numeric GitHub
-//! account ID. Logins, names and emails are renameable and reusable, so they
-//! are metadata, never an identity key.
+//! A login token is never an installation token: it is never persisted or handed to a workload.
+//! Only the immutable numeric account id is durable; logins, names and emails are renameable and reused.
 
 pub mod app;
 pub mod checks;
@@ -25,15 +11,9 @@ pub mod webhook;
 
 use std::fmt;
 
-/// Configured issuer key for [`sentinel-store`'s external identity table]. Its
-/// value is part of a stored primary key; changing it orphans existing links.
-///
-/// [`sentinel-store`'s external identity table]: https://github.com/RusticStack/sentinel
+/// Part of a stored primary key: changing it orphans existing links.
 pub const PROVIDER: &str = "github";
 
-/// Wall-clock milliseconds, for comparing against an absolute time a server
-/// sent (a rate-limit reset). Durations this crate measures itself are
-/// monotonic; this is provenance, not a measurement.
 pub(crate) fn now_ms() -> i64 {
     let nanos = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
     i64::try_from(nanos / 1_000_000).unwrap_or(i64::MAX)
@@ -41,15 +21,10 @@ pub(crate) fn now_ms() -> i64 {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
-    /// Endpoint or application configuration is unusable; never contains a secret.
     Config(&'static str),
-    /// The callback's parameters were missing, duplicated, oversized or invalid.
     Callback(&'static str),
-    /// The user (or GitHub) refused; carries GitHub's bounded error code.
     Denied(String),
-    /// Transport, timeout, status or body-limit failure talking to GitHub.
     Transport(String),
-    /// GitHub answered with something this contract does not accept.
     Response(&'static str),
 }
 

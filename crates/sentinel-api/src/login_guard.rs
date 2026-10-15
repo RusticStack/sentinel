@@ -1,25 +1,4 @@
-//! Password-guessing limits for `POST /api/v1/login`, per client and
-//! account.
-//!
-//! The store locks an account after consecutive failures, which alone is a
-//! denial of service: anyone who knows a login name (the super admin's is
-//! usually `root`) can lock its owner out with a handful of requests. So
-//! the lock that stops *one client* guessing lives here, keyed by client and
-//! account: a client past [`LoginGuard::max_failures`] failures against an
-//! account is refused (no password hash, no audit row, no writer) until its
-//! lockout ends, while every other client still reaches the account. The
-//! store's own account-wide lock stays as the ceiling against many clients
-//! guessing together; the API gives it a multiple of the policy's
-//! threshold ([`ACCOUNT_LOCK_FACTOR`]), so no single client can reach it.
-//!
-//! After a lockout ends the client keeps one failure of credit, not a fresh
-//! allowance: the next failure locks it again, so a patient guesser gets
-//! one guess per lockout window instead of a full allowance each time. A
-//! success clears the entry.
-//!
-//! The map is bounded: when it is full, expired entries are swept; if none
-//! expired, a new pair goes untracked (the per-client admission budget and
-//! the account ceiling still bound it) rather than growing memory.
+//! Per client and account: the store's account-wide lock alone lets anyone lock out an account owner, so this guard locks only the guessing client.
 
 use std::{
     collections::HashMap,
@@ -28,17 +7,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Client and account pairs tracked at once.
 const MAX_PAIRS: usize = 4096;
-/// The store's account-wide lock threshold is the policy's per-client
-/// threshold times this: it takes several clients to lock an account.
 pub(crate) const ACCOUNT_LOCK_FACTOR: i64 = 4;
-/// Idle lifetime of an entry, in lockout windows.
 const REMEMBER_WINDOWS: u32 = 4;
 
 struct Entry {
     failures: i64,
-    /// Refused until then, when locked.
     until: Option<Instant>,
     last: Instant,
 }
@@ -59,12 +33,9 @@ impl Default for LoginGuard {
 
 impl LoginGuard {
     fn key(&self, client: u128, account: &str) -> (u128, u64) {
-        // Names are compared exactly, as the store does; a keyed hash keeps an
-        // attacker's strings from costing memory per byte.
         (client, self.keys.hash_one(account))
     }
 
-    /// Whether `client` may try `account` at `now`.
     pub(crate) fn allowed(&self, client: u128, account: &str, now: Instant) -> bool {
         let key = self.key(client, account);
         let pairs = self.pairs.lock().unwrap_or_else(|p| p.into_inner());
@@ -73,8 +44,6 @@ impl LoginGuard {
             .is_none_or(|entry| entry.until.is_none_or(|until| until <= now))
     }
 
-    /// Count one failed attempt; `max_failures` of them lock the pair for
-    /// `lockout`.
     pub(crate) fn failed(
         &self,
         client: u128,
@@ -98,7 +67,7 @@ impl LoginGuard {
             last: now,
         });
         if entry.until.is_some_and(|until| until <= now) {
-            // The window was served: one failure of credit remains.
+            // One failure of credit, not a fresh allowance: a patient guesser gets one guess per window.
             entry.until = None;
             entry.failures = (max_failures - 1).max(0);
         }
@@ -109,7 +78,6 @@ impl LoginGuard {
         }
     }
 
-    /// A password was accepted: forget the pair.
     pub(crate) fn succeeded(&self, client: u128, account: &str) {
         let key = self.key(client, account);
         self.pairs
@@ -140,8 +108,6 @@ mod tests {
             guard.failed(attacker, "root", 3, LOCKOUT, start);
         }
         assert!(!guard.allowed(attacker, "root", start));
-        // The owner, from elsewhere, and the attacker against another
-        // account are untouched.
         assert!(guard.allowed(owner, "root", start));
         assert!(guard.allowed(attacker, "someone", start));
     }
@@ -178,7 +144,6 @@ mod tests {
             guard.failed(n, "root", 3, LOCKOUT, start);
         }
         assert_eq!(guard.tracked(), MAX_PAIRS);
-        // Long after, every entry is stale: the next new pair sweeps them.
         let later = start + LOCKOUT * (REMEMBER_WINDOWS + 1);
         guard.failed(u128::MAX, "root", 3, LOCKOUT, later);
         assert_eq!(guard.tracked(), 1);

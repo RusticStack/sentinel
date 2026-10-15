@@ -1,8 +1,4 @@
 <script setup lang="ts">
-// Confirm it's you: a code from the authenticator app, a recovery
-// code, or the password for an account without TOTP; the session is
-// stamped for the policy window and the action that asked is retried.
-// The proof lives in this component only and is cleared after every try.
 const props = defineProps<{ mfa: boolean; password: boolean }>();
 const emit = defineEmits<{ close: [boolean] }>();
 const api = useApi();
@@ -13,8 +9,6 @@ const methods = [
   { label: "Recovery code", value: "recovery", description: "One of the codes saved at enrollment; each works once" },
 ];
 const method = ref<Method>(props.mfa ? "totp" : "password");
-// A GitHub-only account without an authenticator has nothing to prove
-// presence with here: it enrolls one first.
 const impossible = !props.mfa && !props.password;
 const code = ref("");
 const error = ref("");
@@ -40,8 +34,7 @@ onBeforeUnmount(() => {
 
 async function submit() {
   if (busy.value || waiting.value) return;
-  // An app shows its code as "123 456"; a recovery code is retype-tolerant
-  // on the controller, so only the ends are trimmed.
+  // The controller tolerates retyped recovery codes, so only their ends are trimmed.
   const proof = method.value === "totp" ? code.value.replace(/\s+/g, "") : method.value === "recovery" ? code.value.trim() : code.value;
   code.value = "";
   if (!proof) {
@@ -56,8 +49,7 @@ async function submit() {
   } catch (e) {
     const err = e as ApiError;
     if (err.code === "unauthenticated") {
-      // Five wrong proofs end the session, and a locked authenticator ends
-      // them all; `useApi` is already on its way to sign-in.
+      // useApi already routes to sign-in, so closing is the only action here.
       emit("close", false);
       return;
     }

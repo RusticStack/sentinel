@@ -33,6 +33,7 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | OAuth error | RFC 6749 `{"error", "error_description"}` at `/oauth/*` | `sentinel-protocol::oauth` | OAuth clients |
 | CLI profiles | `schema: "sentinel.profiles/1"` in `profiles.json` | `sentinel` CLI | the CLI on one machine |
 | CLI exit codes | 0–8 ([CLI](cli.md#exit-codes)) | `sentinel::client::Exit` | scripts, agents |
+| Run trigger names | the strings `EventKind::as_str` returns and `parse` accepts, stored as run provenance | `sentinel-pipeline::policy` | store, API, workers |
 
 **Secret write surface (migration 39).** Secret routes are additive under `/api/v1`; old clients may ignore them. Writes use raw value bytes, compare-and-set versions and idempotency keys. Migration 39 adds bounded metadata-only replay records. Env-file import accepts the documented literal format and commits all rows in one SQLite writer transaction; this format is a CLI/API contract documented in [secrets](secrets.md).
 

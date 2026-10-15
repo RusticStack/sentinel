@@ -1,49 +1,11 @@
-//! Tenant-scoped immutable objects and versioned manifests.
-//!
-//! Layout under the controller's data directory, all on one filesystem:
-//!
 //! ```text
 //! objects/<tenant>/<hex[0..2]>/<hex-digest>        committed objects
 //! manifests/<tenant>/<kind>/<name-hash>/<version>  manifest files
 //! tmp/<unique>                                     staging, never committed
 //! ```
-//!
-//! **Commit order.** [`Objects::stage`] streams the body to `tmp/` hashing
-//! as it goes, verifies the declared length/digest, `fdatasync`s the file,
-//! atomically renames it into place and `fsync`s the directory chain. Only
-//! then does [`Objects::commit`] insert the reference row — so a crash may
-//! leave an orphan but can never publish an incomplete object. Objects are
-//! addressed by BLAKE3-256 and deduplicated within the tenant; namespaces
-//! never cross tenants, so identical content stored by two tenants is two
-//! objects and reveals nothing about the other tenant's data.
-//!
-//! **Manifests** are named, monotonically versioned lists of object
-//! references. [`Objects::commit_manifest`] picks the next version inside
-//! the reference-commit transaction, refuses references to objects the
-//! tenant has not committed, writes and syncs the manifest file, and
-//! inserts the row — the same order, so a manifest can never dangle.
-//!
-//! **Recovery.** [`Objects::recover`] sweeps `tmp/` (a leftover there is an
-//! incomplete write, removed), then reconciles the filesystem against the
-//! committed rows: files without rows are orphans (reported, not deleted —
-//! reclamation is a separate stage), rows without files or with the wrong
-//! length are corrupt. [`Objects::verify`] rehashes every committed object
-//! for the deeper integrity check.
-//!
-//! Reads are verified: [`Objects::read`] streams the object while rehashing
-//! and compares the committed digest and length before reporting success.
-//!
-//! **Who may delete a file.** A content-addressed file has no single owner
-//! once deduplication is involved, so the decision is never made from the
-//! filesystem alone. Every path that could remove an object's bytes — a
-//! discarded stage, reclamation, the orphan sweep — goes through
-//! [`Objects::discard`] or [`Objects::unlink`], which run inside a writer
-//! transaction and remove a file only when (a) no live stage or reader pins
-//! its `(tenant, digest)` and (b) no committed row names it. A stage takes
-//! its pin under the same lock, in the same step as its "does the file
-//! exist" decision, and holds it until the stage is dropped — after its
-//! commit, which also runs on the writer. So between a dedup decision and
-//! the row that publishes it, nothing can take the bytes away.
+//! Files are fsynced and renamed before their row commits, so a crash leaves only orphans.
+//! Object bytes go only through [`Objects::discard`] or [`Objects::unlink`], which skip any digest
+//! that a live stage or reader pins or a committed row names.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -65,31 +27,17 @@ use crate::{Error, Result, space::Admission};
 pub const OBJECTS_DIR: &str = "objects";
 pub const MANIFESTS_DIR: &str = "manifests";
 pub const TMP_DIR: &str = "tmp";
-/// Resumable upload staging: `incoming/<upl_…>` files sized to the declared
-/// length at `begin_upload`. Unlike `tmp/` these survive a restart — an open
-/// upload's bytes are how the client resumes.
 pub const INCOMING_DIR: &str = "incoming";
-/// Bytes per streamed chunk for staging, reads and verification.
 const CHUNK: usize = 128 << 10;
-/// Manifest format version; bump only under `docs/compatibility.md`.
 const MANIFEST_FORMAT: u16 = 1;
 const MANIFEST_MAGIC: &[u8; 4] = b"SNMF";
-/// A manifest may reference this many entries; the serialized file stays
-/// well under a megabyte and the name list cannot be used as an amplifier.
 pub const MAX_MANIFEST_ENTRIES: usize = 65_536;
-/// Longest stored entry path, in bytes.
 pub const MAX_ENTRY_PATH: usize = 1024;
-/// Longest manifest name, in bytes (matches the column check).
 pub const MAX_MANIFEST_NAME: usize = 255;
-/// Distinct byte ranges one upload may accumulate; a client that fragments
-/// past this is refused and should send ordered chunks instead.
 pub const MAX_UPLOAD_RANGES: usize = 256;
-/// Longest an upload session may stay open.
 pub const MAX_UPLOAD_TTL_MS: i64 = 24 * 3_600_000;
-/// One sweep handles this many expired uploads at a time.
 const SWEEP_BATCH: i64 = 256;
 
-/// BLAKE3-256 content digest. Hex text form is 64 lowercase characters.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Digest([u8; 32]);
 
@@ -101,7 +49,6 @@ impl Digest {
     pub fn from_bytes(bytes: [u8; 32]) -> Digest {
         Digest(bytes)
     }
-    /// Parse the 64-character lowercase hex form used in file names.
     pub fn parse(hex: &str) -> Result<Digest> {
         if hex.len() != 64 {
             return Err(Error::InvalidInput("digest"));
@@ -131,17 +78,12 @@ impl fmt::Debug for Digest {
     }
 }
 
-/// What the body is declared to be; both halves are verified against the
-/// staged bytes before anything is renamed into place.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Expect {
     pub len: Option<u64>,
     pub digest: Option<Digest>,
 }
 
-/// Live holds on `(tenant, digest)`: readers streaming an object and stages
-/// whose file is not yet (or not only) published. A pinned file is never
-/// unlinked; see the module docs.
 type Pins = Arc<Mutex<HashMap<(TenantId, Digest), u64>>>;
 
 fn lock_pins(pins: &Pins) -> std::sync::MutexGuard<'_, HashMap<(TenantId, Digest), u64>> {
@@ -157,19 +99,11 @@ fn unpin(pins: &mut HashMap<(TenantId, Digest), u64>, key: (TenantId, Digest)) {
     }
 }
 
-/// A staged object: fully written, hashed, synced and renamed into its
-/// final path, but not yet referenced. [`Objects::commit`] publishes it;
-/// [`Objects::discard`] removes it when the commit is abandoned. Holding a
-/// `Staged` pins its file: nothing unlinks it until the stage is dropped.
 pub struct Staged {
     tenant: TenantId,
     digest: Digest,
     len: u64,
-    /// The pin taken with the dedup decision; released on drop.
     pin: Option<Pins>,
-    /// Bytes admitted while the file sat uncommitted. Released when the
-    /// stage leaves scope — commit, discard or drop — since the probe then
-    /// accounts the bytes itself (or they are gone).
     charge: Option<(Arc<Admission>, u64)>,
 }
 
@@ -184,10 +118,6 @@ impl Drop for Staged {
     }
 }
 
-/// An open staged write under `tmp/`, for bodies that arrive in pieces —
-/// link artifact frames, where no `Read` exists. Dropping without
-/// [`Objects::stage_seal`] removes the temp file and releases the admission
-/// charge the written bytes held.
 pub struct Staging {
     file: File,
     tmp: PathBuf,
@@ -200,13 +130,9 @@ pub struct Staging {
 }
 
 impl Staging {
-    /// Bytes accepted so far.
     pub fn written(&self) -> u64 {
         self.written
     }
-    /// Consume the handle without the Drop removal firing; the admission
-    /// charge moves with the result so [`Objects::stage_seal`] can hand it
-    /// to the `Staged` it builds.
     fn into_parts(self) -> (File, PathBuf, Option<(Arc<Admission>, u64)>) {
         let this = std::mem::ManuallyDrop::new(self);
         // SAFETY: every field is read at most once and `this` is never
@@ -243,17 +169,10 @@ impl Staged {
     }
 }
 
-/// A file a committed transaction released — a reclaimed object, a retired
-/// manifest version — or one the orphan sweep found without a row. It is
-/// unlinked only through [`Objects::unlink`], on the writer, after the
-/// ownership re-check, so a commit that adopted the same path in between
-/// keeps its bytes.
 #[derive(Debug)]
 pub struct Doomed {
     path: PathBuf,
     owner: Owner,
-    /// Found by the orphan sweep: the file must still be older than
-    /// [`FILE_ORPHAN_GRACE_MS`] when the unlink runs.
     aged: bool,
 }
 
@@ -266,19 +185,15 @@ enum Owner {
         name: Vec<u8>,
         version: u64,
     },
-    /// A manifest file the sweep found: its path carries the name only as
-    /// a hash, so the re-check matches rows of that version by hash.
     ManifestFile {
         tenant: TenantId,
         kind: Kind,
         name_hash: String,
         version: u64,
     },
-    /// No row can ever name it: `tmp/` leftovers and malformed names.
     Stray,
 }
 
-/// One orphan-sweep pass's accumulator.
 struct Walk {
     found: Vec<Doomed>,
     seen: u32,
@@ -290,7 +205,6 @@ impl Walk {
     fn full(&self) -> bool {
         self.found.len() >= self.limit || self.seen >= self.budget
     }
-    /// A file no row can own: collected once past the grace.
     fn stray(&mut self, path: PathBuf) {
         if older_than_grace(&path) {
             self.found.push(Doomed {
@@ -302,8 +216,6 @@ impl Walk {
     }
 }
 
-/// A directory's entries by name, sorted — the orphan sweep's resumable
-/// order. Unreadable directories and non-UTF-8 names yield nothing.
 fn sorted_entries(dir: &Path) -> Vec<(String, PathBuf)> {
     let Ok(read) = fs::read_dir(dir) else {
         return Vec::new();
@@ -316,8 +228,6 @@ fn sorted_entries(dir: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// `manifests/<tenant>/<kind>/<name-hash>/<version>` back to its owner key;
-/// anything off that layout is a stray.
 fn manifest_owner(tenant: TenantId, path: &Path) -> Owner {
     let parse = || -> Option<Owner> {
         let version = path.file_name()?.to_str()?.parse::<u64>().ok()?;
@@ -339,9 +249,6 @@ fn manifest_owner(tenant: TenantId, path: &Path) -> Owner {
     parse().unwrap_or(Owner::Stray)
 }
 
-/// Reclamation candidates, oldest first, from the trigger-kept
-/// `object_unreferenced` set (migration 34) through its age index; the
-/// edge probe is a belt to that set's braces.
 #[doc(hidden)]
 pub const RECLAIM_CANDIDATES: &str = "SELECT u.tenant_id, u.digest, o.len
      FROM object_unreferenced u
@@ -363,26 +270,17 @@ impl Doomed {
     }
 }
 
-/// An upload touched past its expiry, or ready for its next phase. The
-/// expired answer lets the caller retire the session in its **own**
-/// transaction and then report the refusal — retiring inside the failing
-/// request's transaction would roll back with it.
 #[derive(Debug)]
 pub enum Touch<T> {
     Ready(T),
     Expired,
 }
 
-/// A chunk whose bytes are durable in the staging file but not yet recorded
-/// in the upload row ([`Objects::write_chunk`] → [`Objects::record_chunk`]).
-/// Dropping it unrecorded returns its admission charge.
 pub struct ChunkWritten {
     tenant: TenantId,
     id: UploadId,
     start: u64,
     end: u64,
-    /// Bytes admitted for this chunk; what the record step does not keep
-    /// is returned.
     admitted: u64,
     admission: Option<Arc<Admission>>,
 }
@@ -397,18 +295,13 @@ impl Drop for ChunkWritten {
     }
 }
 
-/// A seal whose hashing and file work is done outside the writer
-/// ([`Objects::prepare_seal`]); [`Objects::finish_seal`] commits it.
 pub struct SealPlan {
     tenant: TenantId,
     id: UploadId,
     digest: Digest,
     len: u64,
-    /// Pins the object path from the rename (or dedup decision) to commit.
     staged: Option<Staged>,
-    /// The object already existed: the staging file goes once the row lands.
     dedup: bool,
-    /// Already committed by an earlier seal: its digest is the answer.
     done: bool,
 }
 
@@ -418,15 +311,12 @@ impl SealPlan {
     }
 }
 
-/// A committed object's metadata as the store recorded it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Meta {
     pub len: u64,
     pub created_ms: UnixMillis,
 }
 
-/// What a manifest may name. `Cache` keeps cache entries out of
-/// the artifact namespace; the wire value is part of the schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Artifact = 0,
@@ -446,44 +336,31 @@ impl Kind {
     }
 }
 
-/// One object reference inside a manifest version.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
-    /// Relative archive path: `/`-separated, no `.`/`..` or drive segments.
     pub path: String,
     pub digest: Digest,
     pub len: u64,
-    /// Permission bits to restore (unix mode); 0 means unspecified.
     pub mode: u32,
 }
 
-/// A committed manifest version.
 #[derive(Clone, Debug)]
 pub struct Manifest {
     pub version: u64,
-    /// Digest of the manifest file itself.
     pub digest: Digest,
     pub payload_len: u64,
     pub created_ms: UnixMillis,
     pub entries: Vec<Entry>,
 }
 
-/// What [`Objects::recover`] found. `staged` counts removed `tmp/` files;
-/// orphans/corrupt/missing carry the paths so an operator can inspect them.
 #[derive(Debug, Default)]
 pub struct Recovery {
-    /// Incomplete staged writes removed from `tmp/`.
     pub staged: u32,
-    /// Files under `objects/` or `manifests/` with no committed row.
     pub orphans: Vec<PathBuf>,
-    /// Files whose committed row disagrees (length) or that cannot be read.
     pub corrupt: Vec<PathBuf>,
-    /// Committed rows whose file is absent.
     pub missing: Vec<PathBuf>,
 }
 
-/// Committed object whose bytes failed verification: absent, wrong length,
-/// or content that no longer matches its digest.
 #[derive(Debug)]
 pub struct Corrupt {
     pub tenant: TenantId,
@@ -491,31 +368,14 @@ pub struct Corrupt {
     pub path: PathBuf,
 }
 
-/// How long an unreferenced, unleased object row must sit before
-/// reclamation may collect it: generous enough that a manifest commit a
-/// client is still preparing cannot lose its objects underneath it.
 pub const UNREFERENCED_GRACE_MS: i64 = 24 * 3_600_000;
-/// A file under the object/manifest/tmp trees with no row and no writer
-/// this old is commit-crash garbage and is swept.
 pub const FILE_ORPHAN_GRACE_MS: i64 = 3_600_000;
-/// Longest a single lease may pin an object.
 pub const MAX_LEASE_TTL_MS: i64 = 30 * 24 * 3_600_000;
-/// Reclamation and index passes move this many rows per call, so a sweep
-/// never holds the writer through a whole-store walk.
 const RECLAIM_BATCH: i64 = 256;
 
-/// Largest object one resumable upload may declare, whatever the quota: the
-/// same ceiling a single artifact entry has
-/// ([`sentinel_protocol::limits::MAX_ARTIFACT_BYTES`]). With the default
-/// quota of 0 (unlimited) this is the bound on one session's staging file.
 pub const MAX_UPLOAD_BYTES: u64 = sentinel_protocol::limits::MAX_ARTIFACT_BYTES;
-/// Upload file I/O serializes per upload on one of this many stripes: a
-/// chunk write and a seal's hash of the same upload never interleave,
-/// different uploads rarely contend, and the lock set stays fixed-size.
 const UPLOAD_STRIPES: usize = 64;
 
-/// What one [`Objects::reclaim`] pass removed: rows deleted and the files
-/// the caller hands to [`Objects::unlink`] once the transaction commits.
 #[derive(Debug, Default)]
 pub struct Reclaimed {
     pub objects: u32,
@@ -523,54 +383,26 @@ pub struct Reclaimed {
     pub doomed: Vec<Doomed>,
 }
 
-/// The object and manifest tree under one data directory. Filesystem work
-/// happens here; reference commits happen inside the caller's transaction.
 pub struct Objects {
     root: PathBuf,
-    /// Directories already created and synced this process. Creating a
-    /// tenant's subtree needs one fsync chain, not one per object.
     durable_dirs: Mutex<HashSet<PathBuf>>,
     tmp_seq: AtomicU64,
-    /// Live readers and stages per (tenant, digest). Nothing unlinks a
-    /// pinned file; see the module docs.
     pins: Pins,
-    /// Per-upload file I/O locks, striped by upload id.
     upload_io: [Mutex<()>; UPLOAD_STRIPES],
-    /// Where the bounded orphan sweep resumes: the last shard it finished.
     sweep_cursor: Mutex<Option<String>>,
-    /// Disk admission; unset admits everything.
     admission: OnceLock<Arc<Admission>>,
-    /// The deployment's storage limits: the default tenant quota, the
-    /// deployment-wide cap and the retention defaults.
     deployment: Mutex<crate::retention::Deployment>,
-    /// Where an evicted object's bytes are fetched back from; unset
-    /// when no external copy is configured.
     remote: OnceLock<Arc<dyn Remote>>,
-    /// Objects fetched back since the maintenance pass last looked: their
-    /// rows are marked local again there, off the read path.
     rehydrated: Mutex<Vec<(TenantId, Digest)>>,
-    /// The external copy's replicator status, when one runs: what
-    /// the API and metrics report.
     replication: OnceLock<Arc<crate::replicate::Status>>,
-    /// Held by anything that deletes committed bytes — the storage pass
-    /// (reclaim, orphans, log expiry) and eviction — and by a backup for its
-    /// whole run, so a backup's snapshot never names a file that goes
-    /// before it is copied.
     maintenance: Mutex<()>,
-    /// The backup scheduler, when `[backup]` is configured.
     backups: OnceLock<Arc<dyn crate::backup::Control>>,
 }
 
-/// The external copy an evicted object is fetched back from. The
-/// implementation streams the object at `key` into `out` and returns the
-/// bytes written; the store verifies length and digest before the file is
-/// placed.
 pub trait Remote: Send + Sync {
     fn fetch(&self, key: &str, out: &mut dyn Write) -> Result<u64>;
 }
 
-/// Where a manifest version's file lives under the data directory:
-/// `manifests/<tenant>/<kind>/<blake3(name)>/<version>`.
 pub fn manifest_relpath(tenant: TenantId, kind: u8, name: &[u8], version: u64) -> PathBuf {
     PathBuf::from(MANIFESTS_DIR)
         .join(tenant.to_string())
@@ -579,8 +411,6 @@ pub fn manifest_relpath(tenant: TenantId, kind: u8, name: &[u8], version: u64) -
         .join(version.to_string())
 }
 
-/// Where an object's file lives under the data directory:
-/// `objects/<tenant>/<hex[0..2]>/<hex>`.
 pub fn object_relpath(tenant: TenantId, digest: &Digest) -> PathBuf {
     let hex = digest.to_string();
     PathBuf::from(OBJECTS_DIR)
@@ -589,15 +419,11 @@ pub fn object_relpath(tenant: TenantId, digest: &Digest) -> PathBuf {
         .join(hex)
 }
 
-/// The external key of an object: `objects/<tenant>/<hex[0..2]>/<hex>`,
-/// the local layout under `objects/`.
 pub fn remote_key(tenant: TenantId, digest: &Digest) -> String {
     let hex = digest.to_string();
     format!("objects/{tenant}/{}/{hex}", &hex[..2])
 }
 
-/// A writer that hashes what passes through it and counts it, refusing to
-/// grow past `limit`.
 struct Hashing<'a> {
     file: &'a mut File,
     hasher: blake3::Hasher,
@@ -621,8 +447,6 @@ impl Write for Hashing<'_> {
 }
 
 impl Objects {
-    /// Open (creating) `objects/`, `manifests/`, `tmp/` and `incoming/`
-    /// under `root`. Does not recover; call [`Objects::recover`] at startup.
     pub fn open(root: impl Into<PathBuf>) -> Result<Objects> {
         let root = root.into();
         for dir in [OBJECTS_DIR, MANIFESTS_DIR, TMP_DIR, INCOMING_DIR] {
@@ -646,13 +470,10 @@ impl Objects {
         })
     }
 
-    /// The data directory this store lives under.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Take the maintenance lock if no backup holds it: the caller deletes
-    /// committed bytes only while it holds the guard.
     pub fn try_maintenance(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
         match self.maintenance.try_lock() {
             Ok(guard) => Some(guard),
@@ -661,40 +482,30 @@ impl Objects {
         }
     }
 
-    /// Wait for the maintenance lock and hold it (a backup's whole run).
     pub fn hold_maintenance(&self) -> std::sync::MutexGuard<'_, ()> {
         self.maintenance.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Publish the backup scheduler.
     pub fn set_backups(&self, backups: Arc<dyn crate::backup::Control>) {
         let _ = self.backups.set(backups);
     }
 
-    /// The backup scheduler, when configured.
     pub fn backups(&self) -> Option<&Arc<dyn crate::backup::Control>> {
         self.backups.get()
     }
 
-    /// Publish the replicator's status.
     pub fn set_replication(&self, status: Arc<crate::replicate::Status>) {
         let _ = self.replication.set(status);
     }
 
-    /// The replicator's status, when an external copy is configured.
     pub fn replication(&self) -> Option<&Arc<crate::replicate::Status>> {
         self.replication.get()
     }
 
-    /// Install the external copy evicted objects are fetched back from.
     pub fn set_remote(&self, remote: Arc<dyn Remote>) {
         let _ = self.remote.set(remote);
     }
 
-    /// Open an object's local file, fetching it back from the external copy
-    /// first when it was evicted. The fetch is verified — length and
-    /// digest — before the file is placed, so a corrupt or truncated remote
-    /// copy is `Corrupt`, never served.
     fn open_local(&self, tenant: TenantId, digest: Digest, len: u64) -> Result<File> {
         let path = self.object_path(tenant, &digest);
         match File::open(&path) {
@@ -705,8 +516,6 @@ impl Objects {
         let Some(remote) = self.remote.get() else {
             return Err(Error::Corrupt("object missing"));
         };
-        // One fetch per object at a time: the stripe lock is the upload
-        // lock's, keyed by the digest's first byte.
         let _stripe = self.upload_io[digest.as_bytes()[0] as usize % UPLOAD_STRIPES]
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -752,16 +561,10 @@ impl Objects {
         Ok(File::open(&path)?)
     }
 
-    /// Objects fetched back since the last call, for the maintenance pass to
-    /// mark local again.
     pub fn take_rehydrated(&self) -> Vec<(TenantId, Digest)> {
         std::mem::take(&mut *self.rehydrated.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
-    /// Remove the local files of objects whose rows were just marked evicted,
-    /// skipping any a reader or stage pins right now — those stay
-    /// local and the caller marks them back. Runs after the eviction commits.
-    /// Returns what it removed.
     pub fn evict_files(&self, victims: &[(TenantId, Digest)]) -> Vec<(TenantId, Digest)> {
         let pins = lock_pins(&self.pins);
         victims
@@ -778,16 +581,12 @@ impl Objects {
             .collect()
     }
 
-    /// Install the disk admission gate; staged writes and uploads charge
-    /// against it. Set once at startup.
     pub fn set_admission(&self, admission: Arc<Admission>) {
         let _ = self.admission.set(admission);
     }
-    /// The configured admission gate, when one was installed.
     pub fn admission(&self) -> Option<&Arc<Admission>> {
         self.admission.get()
     }
-    /// Quota applied to tenants without their own; 0 means unlimited.
     pub fn set_default_quota(&self, bytes: u64) {
         self.deployment
             .lock()
@@ -795,37 +594,27 @@ impl Objects {
             .tenant_quota_bytes = bytes;
     }
 
-    /// Install the deployment's storage limits. Set at startup.
     pub fn set_deployment(&self, deployment: crate::retention::Deployment) {
         *self.deployment.lock().unwrap_or_else(|p| p.into_inner()) = deployment;
     }
 
-    /// The deployment's storage limits.
     pub fn deployment(&self) -> crate::retention::Deployment {
         *self.deployment.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Bytes owed by `tenant`: objects, the declared length of its open
-    /// uploads, and its stamped logs.
     pub fn usage(&self, conn: &Connection, tenant: TenantId) -> Result<u64> {
         Ok(crate::retention::tenant_usage(conn, tenant)?.total())
     }
 
-    /// The tenant's quota in bytes: its own policy, else the default; 0
-    /// means unlimited.
     pub fn quota(&self, conn: &Connection, tenant: TenantId) -> Result<u64> {
         Ok(crate::retention::effective(conn, &self.deployment(), tenant, None)?.tenant_quota_bytes)
     }
 
-    /// What the tenant owes against its quota right now: committed usage
-    /// plus staged-but-uncommitted bytes the admission gate is holding.
     fn owed(&self, conn: &Connection, tenant: TenantId) -> Result<u64> {
         let inflight = self.admission.get().map_or(0, |a| a.inflight(tenant));
         Ok(self.usage(conn, tenant)?.saturating_add(inflight))
     }
 
-    /// Set or replace a tenant's quota (admin), keeping the rest of its
-    /// storage policy.
     pub fn set_quota(&self, tx: &Transaction<'_>, tenant: TenantId, bytes: u64) -> Result<()> {
         if bytes == 0 || bytes > i64::MAX as u64 {
             return Err(Error::InvalidInput("quota"));
@@ -844,8 +633,6 @@ impl Objects {
         Ok(())
     }
 
-    /// Remove a tenant's own quota — the default applies again. The rest of
-    /// its storage policy stays; a policy left empty is removed.
     pub fn clear_quota(&self, tx: &Transaction<'_>, tenant: TenantId) -> Result<()> {
         let t = tenant.as_bytes().as_slice();
         tx.execute(
@@ -862,9 +649,6 @@ impl Objects {
         Ok(())
     }
 
-    /// Pin an object for `holder` until `now + ttl_ms` — reclamation skips
-    /// leased objects. Re-issuing renews; [`Objects::release_lease`] frees
-    /// early. The object must be committed (the foreign key enforces it).
     pub fn lease(
         &self,
         tx: &Transaction<'_>,
@@ -896,7 +680,6 @@ impl Objects {
         Ok(())
     }
 
-    /// Drop one holder's lease; no row is not an error.
     pub fn release_lease(
         &self,
         tx: &Transaction<'_>,
@@ -916,8 +699,6 @@ impl Objects {
         Ok(())
     }
 
-    /// Remove expired lease rows; at most [`RECLAIM_BATCH`] per call.
-    /// WITHOUT ROWID has no rowid LIMIT trick, so the keys come out first.
     pub fn sweep_leases(&self, tx: &Transaction<'_>, now: UnixMillis) -> Result<u32> {
         let mut stmt = tx.prepare(
             "SELECT tenant_id, digest, holder FROM object_leases
@@ -947,8 +728,6 @@ impl Objects {
         self.root.join(MANIFESTS_DIR)
     }
     fn tmp(&self) -> PathBuf {
-        // Unique within the process by the counter, across restarts because
-        // recovery sweeps tmp/ before anything new stages.
         let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
         self.root
             .join(TMP_DIR)
@@ -969,8 +748,6 @@ impl Objects {
         self.root.join(INCOMING_DIR).join(upload.to_string())
     }
 
-    /// Create and fsync `dir` and every ancestor down to `root`, once per
-    /// process. The rename that follows is only as durable as these entries.
     fn ensure_dir(&self, dir: &Path) -> Result<()> {
         {
             let known = self.durable_dirs.lock().unwrap_or_else(|p| p.into_inner());
@@ -979,7 +756,6 @@ impl Objects {
             }
         }
         fs::create_dir_all(dir)?;
-        // Sync the chain leaf-first; stop at a directory already durable.
         let mut known = self.durable_dirs.lock().unwrap_or_else(|p| p.into_inner());
         let mut at = Some(dir);
         while let Some(d) = at {
@@ -992,15 +768,6 @@ impl Objects {
         Ok(())
     }
 
-    /// Stream `reader` to `tmp/`, hash, verify against `expect` and `limit`,
-    /// then publish into `objects/<tenant>/` (fsync file, atomic rename,
-    /// fsync directory). The returned [`Staged`] is durable but unreachable
-    /// until [`Objects::commit`] lands its row.
-    ///
-    /// `limit` bounds the staged bytes; over it the temp file is removed and
-    /// nothing is staged. Deduplication is automatic: a second `stage` of
-    /// the same content lands on the same path, skips the fsync, and
-    /// `commit` is a no-op.
     pub fn stage(
         &self,
         tenant: TenantId,
@@ -1025,8 +792,6 @@ impl Objects {
                 if len > limit {
                     return Err(Error::InvalidInput("object size"));
                 }
-                // Admit before the bytes land so a refused stage leaves
-                // nothing but the temp file it already wrote.
                 if let Some(a) = &admission {
                     a.admit(tenant, got as u64)?;
                     charged += got as u64;
@@ -1062,12 +827,6 @@ impl Objects {
         }
     }
 
-    /// The durable half shared by [`Objects::stage`] and
-    /// [`Objects::stage_seal`]: pin the digest and take the dedup decision
-    /// under the pin lock — the same lock every unlink takes — then, only
-    /// when this stage supplies the bytes, `fdatasync`, rename into place
-    /// and fsync the directory. A dedup hit drops its temp copy and skips
-    /// the flush: the file it adopts is already durable and now pinned.
     fn place(
         &self,
         tenant: TenantId,
@@ -1085,7 +844,6 @@ impl Objects {
             *pins.entry((tenant, digest)).or_insert(0) += 1;
             exists
         };
-        // From here the pin is the stage's; an error below drops it.
         let staged = Staged {
             tenant,
             digest,
@@ -1105,9 +863,6 @@ impl Objects {
         Ok(staged)
     }
 
-    /// Open a staged write under `tmp/` for a body that arrives in pieces —
-    /// link artifact frames, where no `Read` exists. `limit` bounds the
-    /// total; dropping the [`Staging`] discards the temp file.
     pub fn stage_begin(&self, tenant: TenantId, limit: u64) -> Result<Staging> {
         let tmp = self.tmp();
         let file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
@@ -1123,8 +878,6 @@ impl Objects {
         })
     }
 
-    /// Append to an open staged write. Over the declared `limit` is refused
-    /// without writing; the file keeps what it already holds.
     pub fn stage_write(&self, staging: &mut Staging, bytes: &[u8]) -> Result<()> {
         let next = staging
             .written
@@ -1148,18 +901,11 @@ impl Objects {
         Ok(())
     }
 
-    /// Verify the write total is `expected`, `fdatasync`, rename into
-    /// `objects/<tenant>/` and fsync the directory: the durable half of the
-    /// commit, identical to what [`Objects::stage`] leaves behind. The
-    /// returned [`Staged`] publishes through [`Objects::commit`].
     pub fn stage_seal(&self, tenant: TenantId, staging: Staging, expected: u64) -> Result<Staged> {
         if staging.written != expected {
             return Err(Error::InvalidInput("object length"));
         }
         let digest = Digest(*staging.hasher.finalize().as_bytes());
-        // `into_parts` consumes without the Drop removal firing; the
-        // admission charge moves into the `Staged` it becomes, and a
-        // failure below removes the temp file and returns the charge here.
         let (file, tmp, charge) = staging.into_parts();
         match self.place(tenant, digest, expected, file, &tmp) {
             Ok(mut staged) => {
@@ -1176,11 +922,7 @@ impl Objects {
         }
     }
 
-    /// Publish a staged object: the reference commit. Idempotent — a second
-    /// commit of the same (tenant, digest) reports `false`. Fails `NotFound`
-    /// for an unknown tenant via the foreign key. A commit that would take
-    /// the tenant over quota fails `QuotaExceeded`; returning `Err` leaves
-    /// the transaction uncommitted — the caller must not swallow it.
+    /// An error leaves the transaction uncommitted; the caller must not swallow it.
     pub fn commit(&self, tx: &Transaction<'_>, staged: &Staged) -> Result<bool> {
         let changed = tx.execute(
             "INSERT OR IGNORE INTO objects(tenant_id, digest, len, created_ms)
@@ -1193,21 +935,12 @@ impl Objects {
             ),
         )?;
         if changed == 1 && staged.charge.is_some() {
-            // A stage-sourced commit: `len` just entered usage and is still
-            // counted in-flight, so `owed - len` is what the tenant owns
-            // once the charge releases. Upload seals skip the check — they
-            // swap a declared reservation for the object, never add usage.
             let owned = self.owed(tx, staged.tenant)?.saturating_sub(staged.len);
             crate::retention::check_tenant(tx, &self.deployment(), staged.tenant, owned, 0)?;
         }
         Ok(changed == 1)
     }
 
-    /// Abandon a stage whose commit will not happen. Runs on the writer
-    /// (`tx` is only read): the stage's pin is released and its file is
-    /// removed only when no other stage or reader still pins it and no
-    /// committed row names it — a dedup hit of the same bytes, committed or
-    /// still in flight, keeps them. Returns whether the file was removed.
     pub fn discard(&self, tx: &Transaction<'_>, mut staged: Staged) -> Result<bool> {
         let key = (staged.tenant, staged.digest);
         let path = self.object_path(key.0, &key.1);
@@ -1221,11 +954,6 @@ impl Objects {
         removed
     }
 
-    /// Unlink files a committed transaction released or the orphan sweep
-    /// found, re-checking each one on the writer immediately before removal:
-    /// a pinned object, a path a row names again (a commit adopted it since),
-    /// or — for a sweep find — a file younger than the grace is kept.
-    /// Returns how many were removed.
     pub fn unlink(&self, tx: &Transaction<'_>, doomed: &[Doomed]) -> Result<u32> {
         let mut removed = 0u32;
         let pins = lock_pins(&self.pins);
@@ -1237,8 +965,6 @@ impl Objects {
         Ok(removed)
     }
 
-    /// The single "may this file go" decision. Callers hold the pin lock,
-    /// so no stage can adopt the path between the check and the removal.
     fn remove_unowned(
         &self,
         tx: &Connection,
@@ -1308,12 +1034,9 @@ impl Objects {
         if owned || (aged && !older_than_grace(path)) {
             return Ok(false);
         }
-        // A file that will not go (gone already, or refused) stays for the
-        // next pass; the decision above is the only thing that must hold.
         Ok(fs::remove_file(path).is_ok())
     }
 
-    /// Committed metadata for an object; `NotFound` covers foreign tenants.
     pub fn meta(&self, conn: &Connection, tenant: TenantId, digest: Digest) -> Result<Meta> {
         conn.query_row(
             "SELECT len, created_ms FROM objects WHERE tenant_id = ?1 AND digest = ?2",
@@ -1329,8 +1052,6 @@ impl Objects {
         .ok_or(Error::NotFound)
     }
 
-    /// Open a committed object for reading. A row without its file is
-    /// corruption, reported as such rather than `NotFound`.
     pub fn open_object(&self, conn: &Connection, tenant: TenantId, digest: Digest) -> Result<File> {
         self.meta(conn, tenant, digest)?;
         File::open(self.object_path(tenant, &digest)).map_err(|e| match e.kind() {
@@ -1339,9 +1060,6 @@ impl Objects {
         })
     }
 
-    /// Stream a committed object into `out`, rehashing as it goes; the
-    /// digest and length must match the committed row or `Corrupt` is
-    /// returned and the bytes already written are the caller's to discard.
     pub fn read(
         &self,
         conn: &Connection,
@@ -1372,10 +1090,6 @@ impl Objects {
         Ok(len)
     }
 
-    /// Commit a new manifest version. The version is chosen inside the
-    /// transaction (`MAX(version)+1`), every referenced object must already
-    /// be committed for this tenant, the manifest file is staged, synced and
-    /// renamed, and the row is inserted — all or nothing visible.
     pub fn commit_manifest(
         &self,
         tx: &Transaction<'_>,
@@ -1391,9 +1105,6 @@ impl Objects {
             return Err(Error::InvalidInput("manifest entries"));
         }
         let mut payload_len = 0u64;
-        // A manifest must be extractable: no path twice, and no path that is
-        // also a directory another entry lives under. Either would make
-        // `materialize` fail midway, after it had already written files.
         let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
         for entry in entries {
             if !valid_entry_path(&entry.path) {
@@ -1414,9 +1125,6 @@ impl Objects {
             }
         }
         for entry in entries {
-            // A manifest may only point at bytes the tenant already owns:
-            // the object row is the reference commit, so its absence would
-            // make the manifest dangle.
             let committed: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM objects
                     WHERE tenant_id = ?1 AND digest = ?2 AND len = ?3)",
@@ -1446,15 +1154,11 @@ impl Objects {
         let digest = Digest(*blake3::hash(&body).as_bytes());
         let path = self.manifest_path(tenant, kind, name.as_bytes(), version);
         let tmp = self.tmp();
-        // Manifest files are small but real bytes: admit them so a burst of
-        // manifests cannot race the watermark either. The charge releases
-        // once the file is durable — the probe accounts it from then on.
         let admission = self.admission.get().cloned();
         if let Some(a) = &admission {
             a.admit(tenant, body.len() as u64)?;
         }
         let landed = (|| -> Result<()> {
-            // Write the manifest through the same stage discipline as objects.
             self.ensure_dir(path.parent().expect("manifest path has a parent"))?;
             {
                 let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
@@ -1510,8 +1214,6 @@ impl Objects {
         Ok(version)
     }
 
-    /// Read a manifest: the given version, or the latest when `None`. The
-    /// file is parsed and verified against the committed digest.
     pub fn manifest(
         &self,
         conn: &Connection,
@@ -1570,10 +1272,7 @@ impl Objects {
         })
     }
 
-    /// Startup reconciliation: sweep incomplete staged writes, then compare
-    /// the `objects/` and `manifests/` trees against committed rows.
-    /// Orphans are reported, never deleted — a staged-but-uncommitted file
-    /// and a leaked file look identical, and reclamation is a separate stage.
+    /// Orphans are reported, never deleted: staged and leaked files look identical.
     pub fn recover(&self, conn: &Connection) -> Result<Recovery> {
         let mut report = Recovery::default();
         let tmp = self.root.join(TMP_DIR);
@@ -1584,9 +1283,6 @@ impl Objects {
                 report.staged += 1;
             }
         }
-        // Committed objects: (tenant, digest) -> (len, evicted). An evicted
-        // object (its only copy is in S3) is not expected on disk, and a
-        // file for it is one fetched back.
         let mut committed: HashMap<(TenantId, Digest), (u64, bool)> = HashMap::new();
         let mut rows =
             conn.prepare("SELECT tenant_id, digest, len, evicted_ms IS NOT NULL FROM objects")?;
@@ -1604,8 +1300,6 @@ impl Objects {
         }
         drop(query);
         drop(rows);
-        // Walk the object tree; unknown files are orphans, wrong lengths are
-        // corrupt, then rows with no file are missing.
         let objects = self.objects_root();
         for entry in fs::read_dir(&objects)? {
             let entry = entry?;
@@ -1625,9 +1319,6 @@ impl Objects {
             }
         }
         self.recover_manifests(conn, &mut report)?;
-        // Staging files for resumable uploads: an open row keeps its file;
-        // anything else under incoming/ is swept — no committed object can
-        // have come from it, since sealing renames the file away.
         let mut open = HashSet::new();
         let mut rows = conn.prepare("SELECT id FROM uploads WHERE state_code = 0")?;
         let mut query = rows.query([])?;
@@ -1685,9 +1376,6 @@ impl Objects {
         Ok(())
     }
 
-    /// Manifest files are keyed by name hash; a row check joins through the
-    /// stored name so a file under a foreign hash is an orphan even when a
-    /// same-version manifest exists.
     fn recover_manifests(&self, conn: &Connection, report: &mut Recovery) -> Result<()> {
         let mut rows = conn.prepare("SELECT tenant_id, kind, name, version FROM manifests")?;
         let mut query = rows.query([])?;
@@ -1723,12 +1411,7 @@ impl Objects {
         Ok(())
     }
 
-    /// Rehash every committed object. The deep check [`Objects::recover`]
-    /// does not do: it catches content rot, not just missing or truncated
-    /// files. Bounded by store size — run it as a drill, not per request.
     pub fn verify(&self, conn: &Connection) -> Result<Vec<Corrupt>> {
-        // Evicted objects live only in S3; their copy there is checked when
-        // it is fetched back, not here.
         let mut rows =
             conn.prepare("SELECT tenant_id, digest, len FROM objects WHERE evicted_ms IS NULL")?;
         let mut query = rows.query([])?;
@@ -1782,9 +1465,6 @@ impl Objects {
         Ok(corrupt)
     }
 
-    /// Open a committed object for ranged reads while registering a live
-    /// reader. The returned guard keeps the object counted until it is
-    /// dropped; reclamation must consult [`Objects::reader_active`].
     pub fn open_read(
         &self,
         conn: &Connection,
@@ -1804,16 +1484,10 @@ impl Objects {
         ))
     }
 
-    /// Whether a reader or an uncommitted stage currently pins this object.
-    /// Reclamation skips pinned candidates; [`Objects::unlink`] re-checks
-    /// under the same lock the pin is taken with.
     pub fn reader_active(&self, tenant: TenantId, digest: Digest) -> bool {
         lock_pins(&self.pins).contains_key(&(tenant, digest))
     }
 
-    /// Begin a resumable upload: the row and a staging file sized to the
-    /// declared length, in the same transaction. `digest` may be omitted;
-    /// `seal_upload` then reports whatever the content hashed to.
     pub fn begin_upload(
         &self,
         tx: &Transaction<'_>,
@@ -1829,8 +1503,6 @@ impl Objects {
         if declared_len > MAX_UPLOAD_BYTES {
             return Err(Error::InvalidInput("upload length"));
         }
-        // The declared length is reserved in `tenant_usage` the moment the
-        // row inserts, so the projected total is what the tenant will owe.
         let owed = self.owed(tx, tenant)?;
         crate::retention::check_tenant(tx, &self.deployment(), tenant, owed, declared_len)?;
         if let Some(a) = self.admission.get() {
@@ -1869,9 +1541,6 @@ impl Objects {
         Ok(id)
     }
 
-    /// The tenant that owns an upload row. The API resolves this before
-    /// checking the caller's membership so a foreign id is indistinguishable
-    /// from a missing one.
     pub fn upload_owner(&self, conn: &Connection, id: UploadId) -> Result<TenantId> {
         conn.query_row(
             "SELECT tenant_id FROM uploads WHERE id = ?1",
@@ -1884,7 +1553,6 @@ impl Objects {
         .ok_or(Error::NotFound)
     }
 
-    /// A resumable upload's durable state: what the client still owes.
     pub fn upload(
         &self,
         conn: &Connection,
@@ -1901,7 +1569,6 @@ impl Objects {
         })
     }
 
-    /// The stripe lock serializing one upload's file I/O.
     fn upload_lock(&self, id: UploadId) -> std::sync::MutexGuard<'_, ()> {
         let bytes = id.as_bytes();
         let stripe =
@@ -1911,11 +1578,6 @@ impl Objects {
             .unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Chunk phase one, **outside the writer**: check the session on any
-    /// connection, admit the bytes this chunk newly covers, then write and
-    /// `fdatasync` them at `offset` under the upload's I/O lock. Bytes land
-    /// before bookkeeping, so a crash can never claim bytes it does not
-    /// have; [`Objects::record_chunk`] is the writer's short second phase.
     pub fn write_chunk(
         &self,
         conn: &Connection,
@@ -1936,8 +1598,6 @@ impl Objects {
             .checked_add(bytes.len() as u64)
             .filter(|end| *end <= row.declared_len)
             .ok_or(Error::InvalidInput("chunk range"))?;
-        // Admit only the bytes this chunk adds against the snapshot; the
-        // record step returns whatever a concurrent chunk covered first.
         let mut ranges = row.ranges;
         ranges_insert(&mut ranges, offset, end)?;
         let received: u64 = ranges.iter().map(|(s, e)| e - s).sum();
@@ -1964,9 +1624,6 @@ impl Objects {
         Ok(Touch::Ready(chunk))
     }
 
-    /// Chunk phase two, **on the writer**: merge the durable range into the
-    /// row. Re-checks that the session is still open; re-sending an
-    /// identical range is idempotent (`received` counts bytes once).
     pub fn record_chunk(&self, tx: &Transaction<'_>, mut chunk: ChunkWritten) -> Result<u64> {
         let row = upload_row(tx, chunk.tenant, chunk.id)?.ok_or(Error::NotFound)?;
         if row.state != UploadState::Open {
@@ -1983,9 +1640,6 @@ impl Objects {
                 received as i64
             ],
         )?;
-        // Keep exactly what this chunk added; the rest (a concurrent chunk
-        // got there first) goes back now. The kept part is the upload's
-        // until it seals or aborts.
         let delta = received - row.received;
         if let Some(a) = chunk.admission.take() {
             let excess = chunk.admitted.saturating_sub(delta);
@@ -1996,9 +1650,6 @@ impl Objects {
         Ok(received)
     }
 
-    /// Both chunk phases on one connection — host-local tools and tests. An
-    /// expired session is refused without being retired: the caller's
-    /// transaction would roll the retirement back with the refusal.
     pub fn put_chunk(
         &self,
         tx: &Transaction<'_>,
@@ -2014,11 +1665,6 @@ impl Objects {
         }
     }
 
-    /// Retire an open session found past its expiry, in its own
-    /// transaction: the row becomes aborted and its reservation leaves
-    /// `tenant_usage`. Returns whether it was open; after the commit the
-    /// caller drops the staging file and charge with
-    /// [`Objects::drop_upload`].
     pub fn retire_expired(
         &self,
         tx: &Transaction<'_>,
@@ -2037,8 +1683,6 @@ impl Objects {
         )? == 1)
     }
 
-    /// After a retirement committed: the staging file and the admission
-    /// charge go.
     pub fn drop_upload(&self, id: UploadId) {
         if let Some(a) = self.admission.get() {
             a.release_upload(id);
@@ -2046,13 +1690,6 @@ impl Objects {
         let _ = fs::remove_file(self.upload_path(id));
     }
 
-    /// Seal phase one, **outside the writer**: the ranges must tile the
-    /// declared length; the staging file is hashed under the upload's I/O
-    /// lock (a concurrent re-sent chunk cannot change bytes after they are
-    /// hashed) and checked against the declared digest; then the object
-    /// path is pinned and — unless identical bytes are already there — the
-    /// file is renamed into place and its directory synced. The writer's
-    /// [`Objects::finish_seal`] only flips the row and inserts the object.
     pub fn prepare_seal(
         &self,
         conn: &Connection,
@@ -2086,11 +1723,6 @@ impl Objects {
         }
         let path = self.upload_path(id);
         let _io = self.upload_lock(id);
-        // A previous seal may have renamed into objects/ and then lost its
-        // transaction: the staging file is gone but the upload row stayed
-        // open. Recover through the declared digest rather than wedging —
-        // without one the computed destination is unknowable and the
-        // upload is genuinely unrecoverable.
         let recovered = !path.exists();
         let digest = if recovered {
             row.digest.ok_or(Error::Corrupt("upload file"))?
@@ -2112,8 +1744,6 @@ impl Objects {
             }
             Digest(*hasher.finalize().as_bytes())
         };
-        // A mismatch is not fatal: the staged bytes stay, so the client can
-        // rewrite whichever ranges were wrong and seal again.
         if row.digest.is_some_and(|declared| declared != digest) {
             return Err(Error::InvalidInput("upload digest"));
         }
@@ -2137,8 +1767,6 @@ impl Objects {
             if recovered {
                 return Err(Error::Corrupt("upload file"));
             }
-            // Every chunk was synced when it landed; only the rename and
-            // its directory entry are new.
             fs::rename(&path, &object)?;
             sync_dir(dir)?;
         }
@@ -2153,9 +1781,6 @@ impl Objects {
         }))
     }
 
-    /// Seal phase two, **on the writer**: re-check the session, close it and
-    /// commit the object row. Sealing twice answers the same digest;
-    /// sealing an aborted upload is a conflict.
     pub fn finish_seal(&self, tx: &Transaction<'_>, plan: SealPlan) -> Result<Digest> {
         if plan.done {
             return Ok(plan.digest);
@@ -2168,9 +1793,7 @@ impl Objects {
             UploadState::Aborted => return Err(Error::Conflict),
             UploadState::Open => {}
         }
-        // Close the upload first: its declared-length reservation leaves
-        // `tenant_usage` as the object row's length enters it, so the seal
-        // is net-zero against the tenant's quota rather than double-counted.
+        // Close the upload first: its reservation leaves usage as the object row's length enters it.
         tx.execute(
             "UPDATE uploads SET state_code = 1, object_digest = ?2 WHERE id = ?1",
             params![
@@ -2182,9 +1805,6 @@ impl Objects {
         debug_assert_eq!(staged.len, plan.len);
         self.commit(tx, staged)?;
         if plan.dedup {
-            // Identical bytes were already published; the staging copy is
-            // redundant. A rolled-back commit leaves the row open with the
-            // declared digest to recover through, as for a lost rename.
             let _ = fs::remove_file(self.upload_path(plan.id));
         }
         if let Some(a) = self.admission.get() {
@@ -2193,7 +1813,6 @@ impl Objects {
         Ok(plan.digest)
     }
 
-    /// Both seal phases on one connection — host-local tools and tests.
     pub fn seal_upload(
         &self,
         tx: &Transaction<'_>,
@@ -2207,8 +1826,6 @@ impl Objects {
         }
     }
 
-    /// Give up on an open upload and remove its staging file. A committed
-    /// upload cannot be aborted — its object is already reachable.
     pub fn abort_upload(&self, tx: &Transaction<'_>, tenant: TenantId, id: UploadId) -> Result<()> {
         let row = upload_row(tx, tenant, id)?.ok_or(Error::NotFound)?;
         if row.state != UploadState::Open {
@@ -2225,8 +1842,6 @@ impl Objects {
         Ok(())
     }
 
-    /// Abort open uploads past their expiry and drop their staging files.
-    /// Returns how many were retired; at most [`SWEEP_BATCH`] per call.
     pub fn sweep_uploads(&self, tx: &Transaction<'_>, now: UnixMillis) -> Result<u32> {
         let mut stmt = tx
             .prepare("SELECT id FROM uploads WHERE state_code = 0 AND expires_ms <= ?1 LIMIT ?2")?;
@@ -2256,11 +1871,6 @@ impl Objects {
         Ok(swept)
     }
 
-    /// Backfill `manifest_refs` for manifests whose edges are not indexed
-    /// yet (`refs_indexed = 0`). Reads each manifest file, inserts its
-    /// edges and flips the flag — all inside the caller's transaction, at
-    /// most `limit` manifests per call. A manifest that will not decode is
-    /// skipped: its tenant's objects stay unreclaimable until it is fixed.
     pub fn index_refs(&self, tx: &Transaction<'_>, limit: i64) -> Result<u32> {
         let pending: Vec<(Vec<u8>, i64, Vec<u8>, i64)> = tx
             .prepare(
@@ -2281,8 +1891,6 @@ impl Objects {
                 .ok()
                 .and_then(|body| decode_manifest(&body).ok().map(|(_, _, e)| e));
             let Some(entries) = entries else {
-                // Corrupt or missing: leave unindexed — reclamation refuses
-                // to collect objects under a tenant it cannot fully see.
                 continue;
             };
             {
@@ -2315,10 +1923,6 @@ impl Objects {
         Ok(indexed)
     }
 
-    /// Delete one manifest version's row; its `manifest_refs` edges cascade.
-    /// Returns the file for the caller to hand to [`Objects::unlink`] once
-    /// the transaction commits — a crash between commit and unlink leaves an
-    /// orphan the file sweep later collects.
     pub fn retire_manifest(
         &self,
         tx: &Transaction<'_>,
@@ -2349,14 +1953,6 @@ impl Objects {
         }))
     }
 
-    /// Collect reclaimable objects: committed past `UNREFERENCED_GRACE_MS`,
-    /// not referenced by any indexed manifest, not leased, not still
-    /// decodable through an unindexed manifest (a tenant with any
-    /// `refs_indexed = 0` row is skipped entirely), and not pinned by a live
-    /// reader or stage. Candidates come from `object_unreferenced`, which
-    /// triggers keep, oldest first — the pass never walks referenced
-    /// objects. Rows are deleted in this transaction; the caller hands the
-    /// returned files to [`Objects::unlink`] after commit.
     pub fn reclaim(&self, tx: &Transaction<'_>, now: UnixMillis, limit: i64) -> Result<Reclaimed> {
         let cutoff = now.0 - UNREFERENCED_GRACE_MS;
         let candidates: Vec<(Vec<u8>, Vec<u8>, i64)> = tx
@@ -2390,17 +1986,6 @@ impl Objects {
         Ok(reclaimed)
     }
 
-    /// One bounded pass of the orphan sweep, **outside the writer**: files
-    /// with no row — objects or manifests a commit orphaned, `tmp/`
-    /// leftovers a restart's `recover` never saw — whose mtime is older
-    /// than `FILE_ORPHAN_GRACE_MS`. The walk goes shard by shard (a
-    /// tenant's manifests, one object prefix directory of a tenant, `tmp/`)
-    /// in name order and stops after the shard that takes it past `budget`
-    /// directory entries or `limit` finds; the next pass resumes after it.
-    /// Returns the finds, for [`Objects::unlink`] on the writer, and whether
-    /// the pass reached the end of the tree (the next one starts over).
-    /// Memory is one shard: a tenant's manifest paths or one prefix
-    /// directory's names.
     pub fn orphans(
         &self,
         conn: &Connection,
@@ -2424,15 +2009,12 @@ impl Objects {
         Ok((walk.found, done))
     }
 
-    /// Walk shards after `resume` until the walk is full; `Some(shard)` is
-    /// where it stopped, `None` means the tree ended.
     fn walk_shards(
         &self,
         conn: &Connection,
         resume: Option<&str>,
         walk: &mut Walk,
     ) -> Result<Option<String>> {
-        // Shard keys sort in walk order: "m/<tenant>", "o/<tenant>/<xx>", "t".
         let after = |key: &str| resume.is_none_or(|r| key > r);
         for (name, path) in sorted_entries(&self.manifests_root()) {
             let key = format!("m/{name}");
@@ -2453,7 +2035,6 @@ impl Objects {
         )?;
         for (name, tenant_path) in sorted_entries(&self.objects_root()) {
             let tenant_key = format!("o/{name}");
-            // Every prefix key of this tenant sorts after `tenant_key/`.
             if resume.is_some_and(|r| format!("{tenant_key}/~").as_str() <= r) {
                 continue;
             }
@@ -2470,8 +2051,6 @@ impl Objects {
                 }
                 walk.seen += 1;
                 if !prefix_path.is_dir() {
-                    // A stray file directly under objects/<tenant>/: no row
-                    // can own a path outside the prefix layout.
                     if !resuming_inside {
                         walk.stray(prefix_path);
                     }
@@ -2509,8 +2088,6 @@ impl Objects {
             }
         }
         if after("t") {
-            // `tmp/` leftovers: no row can ever claim them — the grace alone
-            // decides (a live stage's file is always fresh).
             for (_, path) in sorted_entries(&self.root.join(TMP_DIR)) {
                 walk.seen += 1;
                 if path.is_file() {
@@ -2524,8 +2101,6 @@ impl Objects {
         Ok(None)
     }
 
-    /// One tenant's manifest files against its committed rows: memory is
-    /// that tenant's path set, never the whole table.
     fn manifest_shard(
         &self,
         conn: &Connection,
@@ -2570,9 +2145,6 @@ impl Objects {
         Ok(())
     }
 
-    /// Sweep the whole tree for orphans and unlink them, on one connection —
-    /// host-local tools and tests. The controller runs the bounded
-    /// [`Objects::orphans`] pass per maintenance tick instead.
     pub fn sweep_orphans(&self, conn: &mut Connection, limit: u32) -> Result<u32> {
         *self.sweep_cursor.lock().unwrap_or_else(|p| p.into_inner()) = None;
         let mut removed = 0u32;
@@ -2588,16 +2160,7 @@ impl Objects {
         Ok(removed)
     }
 
-    /// Extract a manifest version under `dest` for host-local use. Entry
-    /// paths are re-validated, every existing ancestor under `dest` is
-    /// checked for symlinks and the file itself is created `O_EXCL`-style
-    /// (existing targets are refused), so a directory prepared in advance
-    /// cannot redirect the extract outside itself. The checks are
-    /// path-based, not descriptor-relative: they do not hold against a
-    /// directory an adversary changes *while* the extract runs — `dest`
-    /// must not be writable by anyone the caller does not trust. Content is
-    /// verified while streaming. No controller path calls this; a caller
-    /// that extracts into shared space needs an `openat` walk first.
+    /// Path checks are not descriptor-relative: dest must not be writable by untrusted users.
     pub fn materialize(
         &self,
         conn: &Connection,
@@ -2614,9 +2177,6 @@ impl Objects {
             let mut path = dest.to_path_buf();
             for part in entry.path.split('/') {
                 path.push(part);
-                // A symlinked component could redirect the write outside
-                // dest; refuse it and anything else that is not a directory
-                // before descending.
                 match fs::symlink_metadata(&path) {
                     Ok(meta) if meta.file_type().is_symlink() => {
                         return Err(Error::InvalidInput("materialize path"));
@@ -2643,8 +2203,6 @@ impl Objects {
             #[cfg(unix)]
             if entry.mode & 0o777 != 0 {
                 use std::os::unix::fs::PermissionsExt;
-                // Never restore setuid, setgid or sticky, whatever a
-                // manifest recorded.
                 file.set_permissions(fs::Permissions::from_mode(entry.mode & 0o777))?;
             }
             written += entry.len;
@@ -2654,8 +2212,6 @@ impl Objects {
     }
 }
 
-/// A live object reader: the file plus the registration that keeps GC from
-/// reclaiming it. Drops itself out of the count.
 pub struct Reader {
     file: File,
     key: (TenantId, Digest),
@@ -2680,11 +2236,9 @@ impl Drop for Reader {
     }
 }
 
-/// Durable upload session state (the `uploads` row decoded).
 struct UploadRow {
     state: UploadState,
     declared_len: u64,
-    /// The digest the client declared at `begin_upload`; verified at seal.
     digest: Option<Digest>,
     received: u64,
     ranges: Vec<(u64, u64)>,
@@ -2692,7 +2246,6 @@ struct UploadRow {
     object_digest: Option<Digest>,
 }
 
-/// Where an upload session stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UploadState {
     Open = 0,
@@ -2700,13 +2253,11 @@ pub enum UploadState {
     Aborted = 2,
 }
 
-/// What a resuming client needs to know.
 #[derive(Clone, Debug)]
 pub struct UploadStatus {
     pub state: UploadState,
     pub declared_len: u64,
     pub received: u64,
-    /// Sorted, disjoint, non-adjacent byte ranges the controller holds.
     pub ranges: Vec<(u64, u64)>,
     pub expires_ms: i64,
 }
@@ -2770,10 +2321,6 @@ fn decode_ranges(bytes: &[u8]) -> Result<Vec<(u64, u64)>> {
         .collect())
 }
 
-/// Merge `[start, end)` into a sorted disjoint range set, coalescing
-/// overlaps and adjacency. Refuses once the set would exceed
-/// [`MAX_UPLOAD_RANGES`] — a fragmented upload is a client bug to fix by
-/// sending ordered chunks, not something the store should track forever.
 fn ranges_insert(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) -> Result<()> {
     if start >= end {
         return Err(Error::InvalidInput("chunk range"));
@@ -2824,8 +2371,6 @@ pub(crate) fn tenant_from(bytes: Vec<u8>) -> Result<TenantId> {
     .map_err(|_| Error::Corrupt("tenant id"))
 }
 
-/// Whether `path`'s mtime is older than [`FILE_ORPHAN_GRACE_MS`]; an
-/// unreadable file is not.
 fn older_than_grace(path: &Path) -> bool {
     let cutoff = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2838,9 +2383,6 @@ fn older_than_grace(path: &Path) -> bool {
         .is_some_and(|age| (age.as_millis() as i64) < cutoff)
 }
 
-/// fsync a directory so a rename inside it is durable. No-op off unix:
-/// the store's durable roles run on Linux and directory fsync is not part
-/// of the portable surface.
 #[cfg(unix)]
 pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     File::open(dir)?.sync_all()?;
@@ -2851,10 +2393,6 @@ pub(crate) fn sync_dir(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A manifest entry path is a relative archive path: `/`-separated, every
-/// component non-empty and never `.` or `..`, and free of separators and
-/// characters that could escape or reinterpret under extraction (`\`, `:`,
-/// NUL, a leading `/` or drive prefix).
 pub fn valid_entry_path(path: &str) -> bool {
     if path.is_empty() || path.len() > MAX_ENTRY_PATH || path.starts_with('/') {
         return false;
@@ -2864,7 +2402,6 @@ pub fn valid_entry_path(path: &str) -> bool {
     })
 }
 
-/// Serialize a manifest version. Deterministic: same inputs, same digest.
 fn encode_manifest(kind: Kind, name: &str, entries: &[Entry]) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + entries.len() * 48);
     out.extend_from_slice(MANIFEST_MAGIC);

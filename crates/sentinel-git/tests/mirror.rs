@@ -1,7 +1,3 @@
-//! Worker-local Git mirrors over local `file://` repositories: the
-//! pinned commit is what lands in the workspace, fetches serialize and stay
-//! incremental, a reader lease holds GC off, a job cannot mutate shared
-//! objects, and a damaged mirror is rebuilt rather than served.
 #![cfg(unix)]
 
 use std::{
@@ -23,7 +19,6 @@ use sentinel_protocol::source::{Access, Binding};
 mod support;
 use support::{git, git_ok, repository, source, work};
 
-/// path → content hash for every regular file under `dir`.
 fn manifest(dir: &Path) -> BTreeMap<PathBuf, u64> {
     let mut out = BTreeMap::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -60,7 +55,6 @@ fn the_pinned_commit_lands_with_separate_phases_and_a_private_store() {
     let mirrors = Mirrors::open(&temp.path().join("mirrors")).unwrap();
     let repo_id = RepoId::new();
     let ws = work(temp.path(), "a");
-    // The mirror serves a commit that is not the branch head exactly.
     let out = mirrors
         .checkout(
             &ws,
@@ -74,12 +68,10 @@ fn the_pinned_commit_lands_with_separate_phases_and_a_private_store() {
     assert_eq!(out.sha, repo.first);
     assert_eq!(git(&ws, &["rev-parse", "HEAD"]), repo.first);
     assert_eq!(fs::read_to_string(ws.join("file.txt")).unwrap(), "one\n");
-    // Fetch and materialization are measured separately, never zero.
     assert!(out.fetch_ns > 0);
     assert!(out.materialize_ns > 0);
 
     let mirror = mirrors.path(&repo_id);
-    // One stable bare mirror per repository, plus its lock and leases.
     assert!(mirror.join("HEAD").is_file());
     assert!(mirror.join("objects").is_dir());
     assert!(
@@ -87,14 +79,10 @@ fn the_pinned_commit_lands_with_separate_phases_and_a_private_store() {
             .join(format!("mirrors/{repo_id}.lock"))
             .is_file()
     );
-    // The event ref enriches mirror history with the ref's own tip — the
-    // pinned commit is `first`, the ref has since moved to `second`.
     assert_eq!(
         git(&mirror, &["rev-parse", "refs/sentinel/event"]),
         repo.second
     );
-    // The workspace's object store is private: no alternates pointer, and
-    // it still verifies with the mirror removed entirely.
     assert!(!ws.join(".git/objects/info/alternates").exists());
     fs::rename(&mirror, temp.path().join("mirror-away")).unwrap();
     assert!(git_ok(&ws, &["fsck", "--strict"]));
@@ -122,8 +110,6 @@ fn fetches_are_incremental_and_accumulate_history() {
     let mirror = mirrors.path(&repo_id);
     let objects_before = manifest(&mirror.join("objects"));
 
-    // A second commit arrives upstream; the next checkout updates the same
-    // mirror — nothing is re-cloned, the earlier objects are still served.
     let second_ws = work(temp.path(), "two");
     let out = mirrors
         .checkout(
@@ -151,7 +137,6 @@ fn fetches_are_incremental_and_accumulate_history() {
         git(&mirror, &["rev-parse", "refs/sentinel/event"]),
         repo.second
     );
-    // The mirror serves full history: the parent chain is complete.
     assert_eq!(
         git(&mirror, &["rev-list", "--count", repo.second.as_str()]),
         "2"
@@ -197,9 +182,7 @@ fn concurrent_checkouts_serialize_writes_and_each_lands_its_sha() {
     for handle in handles {
         handle.join().unwrap();
     }
-    // The mirror is a consistent store after the interleaving.
     assert!(git_ok(&mirrors.path(&repo_id), &["fsck", "--strict"]));
-    // Leases were released with each materialization.
     let leases = temp.path().join(format!("mirrors/{repo_id}.leases"));
     assert!(
         fs::read_dir(&leases)
@@ -212,7 +195,6 @@ fn concurrent_checkouts_serialize_writes_and_each_lands_its_sha() {
 fn a_reader_lease_holds_gc_off_and_an_expired_one_is_swept() {
     let temp = tempfile::tempdir().unwrap();
     let repo = repository(temp.path());
-    // Tuned so any object at all trips the GC trigger.
     let mirrors = Mirrors::open_tuned(&temp.path().join("mirrors"), 0, 0).unwrap();
     let repo_id = RepoId::new();
     mirrors
@@ -226,7 +208,6 @@ fn a_reader_lease_holds_gc_off_and_an_expired_one_is_swept() {
         )
         .unwrap();
     let mirror = mirrors.path(&repo_id);
-    // An unreachable loose object stands in for garbage a GC would collect.
     let garbage = {
         use std::io::Write;
         let mut child = Command::new("git")
@@ -249,7 +230,6 @@ fn a_reader_lease_holds_gc_off_and_an_expired_one_is_swept() {
     };
     assert!(git_ok(&mirror, &["cat-file", "-e", &garbage]));
 
-    // A live reader lease blocks GC: the next checkout leaves the garbage.
     let leases = temp.path().join(format!("mirrors/{repo_id}.leases"));
     fs::create_dir_all(&leases).unwrap();
     let lease = leases.join("att_holder");
@@ -274,7 +254,6 @@ fn a_reader_lease_holds_gc_off_and_an_expired_one_is_swept() {
     );
     assert!(lease.is_file(), "a live lease is left alone");
 
-    // Expire it: the sweep removes it and the next writer's GC prunes.
     fs::write(&lease, "1\n").unwrap();
     mirrors
         .checkout(
@@ -313,8 +292,6 @@ fn a_workspace_cannot_mutate_the_mirror() {
     let mirror = mirrors.path(&repo_id);
     let before = manifest(&mirror.join("objects"));
 
-    // The job scribbles over every object file it can reach — permission
-    // bits first, since Git writes them read-only.
     let objects = ws.join(".git/objects");
     let mut stack = vec![objects.clone()];
     while let Some(d) = stack.pop() {
@@ -328,10 +305,8 @@ fn a_workspace_cannot_mutate_the_mirror() {
             }
         }
     }
-    // The mirror's bytes did not move, and Git still finds it sound.
     assert_eq!(manifest(&mirror.join("objects")), before);
     assert!(git_ok(&mirror, &["fsck", "--strict"]));
-    // And the mirror still serves the pinned commit.
     let ws2 = work(temp.path(), "after");
     let out = mirrors
         .checkout(
@@ -363,13 +338,10 @@ fn a_missing_commit_is_a_preparation_failure_naming_the_sha() {
             Duration::from_secs(60),
         )
         .unwrap_err();
-    // Not a mirror failure (no fallback to another revision would be
-    // honest); the remote's answer is a preparation error naming the SHA.
     match error {
         Error::Preparation(what) => assert!(what.contains(missing), "{what}"),
         other => panic!("expected Preparation, got {other:?}"),
     }
-    // The mirror is not poisoned by the refusal.
     mirrors
         .checkout(
             &work(temp.path(), "good"),
@@ -392,8 +364,6 @@ fn a_damaged_or_partial_mirror_is_rebuilt() {
     let timeout = Duration::from_secs(60);
     let mirror = mirrors.path(&repo_id);
 
-    // Half-initialized: objects exist but no HEAD — created, crashed, never
-    // finished. The next checkout rebuilds and serves.
     fs::create_dir_all(mirror.join("objects")).unwrap();
     let out = mirrors
         .checkout(
@@ -407,7 +377,6 @@ fn a_damaged_or_partial_mirror_is_rebuilt() {
         .unwrap();
     assert_eq!(out.sha, repo.first);
 
-    // The whole mirror removed: rebuilt from scratch.
     fs::remove_dir_all(&mirror).unwrap();
     let out = mirrors
         .checkout(
@@ -421,9 +390,6 @@ fn a_damaged_or_partial_mirror_is_rebuilt() {
         .unwrap();
     assert_eq!(out.sha, repo.first);
 
-    // The mirror marked suspect (as a failed materialization would): the
-    // next writer rebuilds before fetching. A canary inside the directory
-    // proves the rebuild actually happened.
     fs::write(mirror.join("CANARY"), b"x").unwrap();
     fs::write(
         temp.path().join(format!("mirrors/{repo_id}.suspect")),
@@ -443,7 +409,6 @@ fn a_damaged_or_partial_mirror_is_rebuilt() {
     assert_eq!(out.sha, repo.first);
     assert!(!mirror.join("CANARY").exists(), "the store was rebuilt");
 
-    // A leftover from an interrupted fetch is skipped, not served.
     fs::write(mirror.join("objects/pack/tmp_pack_leftover"), b"partial").unwrap();
     let ws = work(temp.path(), "d");
     let out = mirrors
@@ -478,8 +443,6 @@ fn the_writer_lock_bounds_the_wait() {
     let repo = repository(temp.path());
     let mirrors = Mirrors::open(&temp.path().join("mirrors")).unwrap();
     let repo_id = RepoId::new();
-    // Hold the mirror's writer lock from a second descriptor: the waiter
-    // must give up inside its bound, not hang.
     let lock_path = temp.path().join(format!("mirrors/{repo_id}.lock"));
     let lock = fs::OpenOptions::new()
         .read(true)
@@ -508,7 +471,6 @@ fn the_writer_lock_bounds_the_wait() {
     assert!(matches!(error, Error::Mirror(_)), "{error:?}");
     assert!(started.elapsed() < Duration::from_secs(30));
     drop(lock);
-    // Released, the same checkout completes.
     mirrors
         .checkout(
             &work(temp.path(), "free"),
@@ -527,8 +489,6 @@ fn an_authorized_checkout_still_enforces_the_access() {
     let repo = repository(temp.path());
     let mirrors = Mirrors::open(&temp.path().join("mirrors")).unwrap();
     let repo_id = RepoId::new();
-    // A bound remote must be https/ssh: a file path never validates, so
-    // this is refused before any Git runs — no fallback, no fetch.
     let access = Access {
         binding: Binding {
             remote: "https://git.example:8443/team/repo.git".into(),
@@ -553,9 +513,6 @@ fn an_authorized_checkout_still_enforces_the_access() {
     assert!(matches!(error, Error::Preparation(_)));
 }
 
-/// A mirror serves only the remote that filled it — the same
-/// repository id checked out from another remote gets a rebuilt, empty
-/// store, never the first remote's objects.
 #[test]
 fn a_mirror_serves_only_the_remote_that_filled_it() {
     let temp = tempfile::tempdir().unwrap();
@@ -597,9 +554,6 @@ fn a_mirror_serves_only_the_remote_that_filled_it() {
     );
 }
 
-/// Store damage a bare-repository check cannot see — the pinned
-/// commit's object gone from under a ref — is rebuilt and served, not a
-/// permanent preparation failure.
 #[test]
 fn damage_under_a_ref_tip_is_rebuilt_not_a_permanent_failure() {
     let temp = tempfile::tempdir().unwrap();
@@ -619,7 +573,6 @@ fn damage_under_a_ref_tip_is_rebuilt_not_a_permanent_failure() {
         )
         .unwrap();
     let mirror = mirrors.path(&repo_id);
-    // Every object file of the store goes: the pin ref now names nothing.
     let objects = mirror.join("objects");
     for entry in fs::read_dir(&objects).unwrap().flatten() {
         let name = entry.file_name();
@@ -642,8 +595,6 @@ fn damage_under_a_ref_tip_is_rebuilt_not_a_permanent_failure() {
     assert_eq!(out.sha, repo.first);
 }
 
-/// A crashed attempt's leftover lease temp file does not block the
-/// same attempt id's next lease.
 #[test]
 fn a_leftover_lease_temp_file_does_not_block_a_retry() {
     let temp = tempfile::tempdir().unwrap();
@@ -665,11 +616,6 @@ fn a_leftover_lease_temp_file_does_not_block_a_retry() {
         .unwrap();
 }
 
-/// A store too large to copy is materialized by a depth-1 fetch of
-/// the pinned commit alone. The job gets exactly that commit — here one the
-/// branch has moved past, so not an advertised tip — in its own pack: no
-/// history behind it, no `alternates`, sound with the mirror gone, and its
-/// writes never reach the mirror.
 #[test]
 fn a_large_store_is_materialized_by_fetching_the_pinned_commit_alone() {
     let temp = tempfile::tempdir().unwrap();
@@ -678,7 +624,6 @@ fn a_large_store_is_materialized_by_fetching_the_pinned_commit_alone() {
         .unwrap()
         .fetch_materialization();
     let repo_id = RepoId::new();
-    // Fill the mirror with both commits first, so the store holds history.
     mirrors
         .checkout(
             &work(temp.path(), "fill"),
@@ -705,13 +650,10 @@ fn a_large_store_is_materialized_by_fetching_the_pinned_commit_alone() {
     assert_eq!(out.sha, repo.first);
     assert_eq!(git(&ws, &["rev-parse", "HEAD"]), repo.first);
     assert_eq!(fs::read_to_string(ws.join("file.txt")).unwrap(), "one\n");
-    // One commit, shallow, and none of the mirror's other history.
     assert_eq!(git(&ws, &["rev-list", "--count", "HEAD"]), "1");
     assert!(ws.join(".git/shallow").is_file());
     assert!(!git_ok(&ws, &["cat-file", "-e", &repo.second]));
     assert!(!ws.join(".git/objects/info/alternates").exists());
-    // Private: sound without the mirror, and scribbling over the job's
-    // objects leaves the mirror's bytes and verdict unchanged.
     fs::rename(&mirror, temp.path().join("mirror-away")).unwrap();
     assert!(git_ok(&ws, &["fsck", "--strict"]));
     fs::rename(temp.path().join("mirror-away"), &mirror).unwrap();

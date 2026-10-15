@@ -1,19 +1,5 @@
-//! The OAuth sign-in end to end, portable. The real `sentinel` binary
-//! (`CARGO_BIN_EXE_sentinel`) runs against an in-process controller API on
-//! loopback, with a temporary `SENTINEL_CONFIG_DIR` and the file credential
-//! store. A "browser" is played by this test: it signs in with a local
-//! password (`/api/v1/login`), submits the consent or device page with the
-//! session cookie, and follows the `303` to the CLI's own loopback
-//! listener; one login instead signs a GitHub-only account in through
-//! "Sign in with GitHub" against `sentinel_github::fake`. Opening a
-//! real browser is not automated here: every browser login
-//! here uses `--no-browser`, which prints the same URL.
-//!
-//! Every CLI output (stdout and stderr) passes [`assert_no_token_material`].
-//!
-//! The server's clock cannot be moved, so the two "outside the 60 s grace
-//! window" presentations go through `sentinel_store::oauth::refresh` with a
-//! clock 61 s ahead; their effect (a revoked grant) is observed over HTTP.
+//! Every CLI output passes [`assert_no_token_material`].
+//! The server's clock cannot move, so grace-window cases call the store with a clock 61 s ahead.
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -54,7 +40,6 @@ use serde_json::{Value, json};
 
 const PASSWORD: &str = "correct horse battery staple";
 const GITHUB_SECRET: &str = "e2e-github-client-secret";
-/// Bound on any one CLI process, so a hang fails the test instead of CI.
 const PROCESS_LIMIT: Duration = Duration::from_secs(90);
 
 struct Deployment {
@@ -64,15 +49,12 @@ struct Deployment {
     #[cfg(target_os = "linux")]
     logs: Arc<LogStore>,
     server: Option<sentinel_api::Server>,
-    /// `http://127.0.0.1:PORT`; also the issuer.
     base: String,
-    /// An `sntl_` credential for root with every permission.
     root_token: String,
     dev: UserId,
     tenant: TenantId,
     root: UserId,
     repo: RepoId,
-    /// The GitHub-shaped fake, when GitHub sign-in is configured.
     github: Option<FakeGithub>,
 }
 
@@ -90,14 +72,10 @@ impl Drop for Deployment {
     }
 }
 
-/// Super admin `root` administering `acme` (repository `app`); `dev`, an
-/// operator of `acme` with read and run on `app`; both sign in with
-/// [`PASSWORD`].
 fn deployment() -> Deployment {
     deployment_with(false)
 }
 
-/// [`deployment`], optionally with GitHub web sign-in against a fake GitHub.
 fn deployment_with(github_sign_in: bool) -> Deployment {
     let dir = tempfile::tempdir().unwrap();
     let store =
@@ -181,8 +159,6 @@ fn deployment_with(github_sign_in: bool) -> Deployment {
     }
 }
 
-/// One HTTP answer: status, headers (lower-case names), body as JSON or a
-/// JSON string.
 struct Reply {
     status: u16,
     headers: Vec<(String, String)>,
@@ -207,7 +183,6 @@ enum Body<'a> {
     Form(&'a str),
 }
 
-/// One request to an absolute URL; redirects are returned, not followed.
 fn request(method: &str, url: &str, body: Body<'_>, headers: &[(&str, &str)]) -> Reply {
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
@@ -285,7 +260,6 @@ fn encode(pairs: &[(&str, &str)]) -> String {
         .finish()
 }
 
-/// A password session for `username`: the `cookie` header value.
 fn session(d: &Deployment, username: &str) -> String {
     let reply = send(
         d,
@@ -304,9 +278,6 @@ fn session(d: &Deployment, username: &str) -> String {
         .to_owned()
 }
 
-/// Root's browser session after a step-up, as the headers a mutation needs:
-/// the only caller that may create a service account, allow it a repository
-/// or issue it a grant. A bearer token, however administrative, cannot.
 fn stepped_root(d: &Deployment) -> [(&'static str, String); 2] {
     let reply = send(
         d,
@@ -383,9 +354,6 @@ fn refresh_rows(d: &Deployment, grant: GrantId) -> i64 {
         .unwrap()
 }
 
-/// Token material: `sntl_` (optionally a kind prefix) followed by at least
-/// 16 hex digits. Plain mentions such as "a sntl_rt_ refresh token" are
-/// fine; a token, or a recognizable part of one, is not.
 fn assert_no_token_material(what: &str, text: &str) {
     let mut from = 0;
     while let Some(at) = text[from..].find("sntl_") {
@@ -405,7 +373,6 @@ fn assert_no_token_material(what: &str, text: &str) {
     );
 }
 
-/// One CLI user: a configuration directory and the file credential store.
 struct Machine {
     dir: tempfile::TempDir,
 }
@@ -436,7 +403,6 @@ impl Machine {
         command
     }
 
-    /// Start the CLI; its stderr lines are readable as they arrive.
     fn spawn(&self, args: &[&str]) -> Running {
         Running::start(self.command(args).spawn().unwrap())
     }
@@ -453,7 +419,6 @@ impl Machine {
         Running::start(command.spawn().unwrap()).finish()
     }
 
-    /// The stored credential blob of `profile`.
     fn credentials(&self, profile: &str) -> Option<Value> {
         let path = self
             .config()
@@ -470,7 +435,6 @@ impl Machine {
             .join("credentials")
             .join(format!("{profile}.json"));
         std::fs::write(&path, blob.to_string()).unwrap();
-        // A re-created file must be owner-only again, or the store refuses it.
         #[cfg(unix)]
         std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .unwrap();
@@ -490,7 +454,6 @@ impl Machine {
     }
 }
 
-/// A finished CLI process.
 #[derive(Debug)]
 struct Out {
     code: i32,
@@ -498,7 +461,6 @@ struct Out {
     stderr: String,
 }
 
-/// A running CLI process whose output is collected on reader threads.
 struct Running {
     child: Child,
     lines: Receiver<String>,
@@ -537,7 +499,6 @@ impl Running {
         }
     }
 
-    /// The first stderr line containing `needle`.
     fn line_with(&self, needle: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -578,7 +539,6 @@ impl Running {
     }
 }
 
-/// Every hidden field of a consent page, unescaped.
 fn hidden_fields(page: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for piece in page.split("<input type=\"hidden\" name=\"").skip(1) {
@@ -614,7 +574,6 @@ fn param<'a>(pairs: &'a [(String, String)], name: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no {name} in {pairs:?}"))
 }
 
-/// The sign-in URL a `--no-browser` login printed.
 fn authorize_url(login: &Running, d: &Deployment) -> String {
     let line = login.line_with("/oauth/authorize?");
     let url = line.trim().to_owned();
@@ -625,8 +584,6 @@ fn authorize_url(login: &Running, d: &Deployment) -> String {
     url
 }
 
-/// Play the browser: consent as `username` and follow the `303` to the
-/// CLI's loopback listener.
 fn consent_in_browser(d: &Deployment, url: &str, username: &str) {
     let cookie = session(d, username);
     let path = url.strip_prefix(&d.base).unwrap();
@@ -654,7 +611,6 @@ fn consent_in_browser(d: &Deployment, url: &str, username: &str) {
     assert!(landed.text().contains("complete"), "{}", landed.text());
 }
 
-/// A complete browser login of `username` into `profile`.
 fn browser_login(d: &Deployment, m: &Machine, username: &str, profile: &str) -> Out {
     browser_login_with(d, m, username, profile, &[])
 }
@@ -704,8 +660,6 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// A listener that is never answered: afterwards, how many connections
-/// reached it.
 struct Silent(TcpListener);
 
 impl Silent {
@@ -757,10 +711,8 @@ fn browser_login_then_status_and_commands_work() {
 
     let runs = run_list(&m, "work");
     assert_eq!(runs.code, 0, "{runs:?}");
-    // The profile file never holds a secret.
     let profiles = std::fs::read_to_string(m.config().join("profiles.json")).unwrap();
     assert!(!profiles.contains("sntl_"), "{profiles}");
-    // The grant is a kind-1 grant of dev's.
     let grant = m.grant("work");
     let grants = d
         .store
@@ -770,8 +722,6 @@ fn browser_login_then_status_and_commands_work() {
     assert_eq!((grants[0].id, grants[0].kind), (grant, GrantKind::Code));
 }
 
-/// One stdio MCP session of `profile`: initialize, then `list_runs` on
-/// `acme/app`. Returns the process and its JSON-RPC replies.
 fn stdio_list_runs(d: &Deployment, machine: &Machine, profile: &str) -> (Out, Vec<Value>) {
     let input = concat!(
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"stdio-test\",\"version\":\"1\"}}}\n",
@@ -796,12 +746,6 @@ fn stdio_list_runs(d: &Deployment, machine: &Machine, profile: &str) -> (Out, Ve
     (out, replies)
 }
 
-/// Stdio MCP on a real credential profile (a service grant imported
-/// with `auth login --grant-file` into a temporary `SENTINEL_CONFIG_DIR`),
-/// not a static token. A scope refusal is told apart from a repository
-/// refusal by its named scope; after the grant is revoked the profile's
-/// refresh fails; and neither path ever starts an OAuth redirect or creates
-/// a grant.
 #[test]
 fn mcp_stdio_reports_scope_denial_without_starting_an_oauth_redirect_flow() {
     let d = deployment();
@@ -827,7 +771,6 @@ fn mcp_stdio_reports_scope_denial_without_starting_an_oauth_redirect_flow() {
         &headers,
     );
     assert_eq!(allowed.status, 200, "{}", allowed.body);
-    // Repository read is granted; the credential's scope lacks runs:read.
     let issued = send(
         &d,
         "POST",
@@ -868,9 +811,6 @@ fn mcp_stdio_reports_scope_denial_without_starting_an_oauth_redirect_flow() {
     assert_eq!(refusal["code"], "forbidden", "{refusal}");
     assert_eq!(refusal["details"]["scope"], "runs:read", "{refusal}");
 
-    // The grant is revoked: the stored access token and the refresh both
-    // fail, and the session answers that — it does not go looking for a
-    // browser.
     d.store
         .writer()
         .write(move |tx| oauth::revoke_grant(tx, Authority::HostLocal, grant, UnixMillis::now()))
@@ -923,8 +863,6 @@ fn a_delegated_cli_writer_can_provision_a_secret_for_a_job_without_disclosure() 
     let reader_login = browser_login(&d, &machine, "dev", "reader");
     assert_eq!(reader_login.code, 0, "{reader_login:?}");
     let value = b"cli-provisioned-secret-plaintext";
-    // The sign-in created a private config directory with an owner-only DACL
-    // on Windows; its file input inherits that DACL.
     let input = machine.config().join("secret.txt");
     std::fs::write(&input, value).unwrap();
     #[cfg(unix)]
@@ -1013,8 +951,6 @@ fn a_delegated_cli_writer_can_provision_a_secret_for_a_job_without_disclosure() 
             .contains(std::str::from_utf8(value).unwrap())
     );
 
-    // The delegated writer binds its secret to one job step through the CLI:
-    // no store call anywhere in the provisioning flow.
     let bound = machine.run(&[
         "secret",
         "--profile",
@@ -1059,11 +995,6 @@ fn a_delegated_cli_writer_can_provision_a_secret_for_a_job_without_disclosure() 
     secret_runtime::use_cli_secret_in_rootless_job(&d, value);
 }
 
-/// An account that exists only through GitHub (admitted by an
-/// invitation bound to its GitHub account, no password) signs the CLI in.
-/// The "browser" opens the printed URL, finds no session, follows "Sign in
-/// with GitHub" through the fake GitHub and the callback, lands back on the
-/// same consent request, approves, and follows the `303` to the CLI.
 #[test]
 fn a_github_only_account_signs_the_cli_in_through_github() {
     let d = deployment_with(true);
@@ -1128,7 +1059,6 @@ fn a_github_only_account_signs_the_cli_in_through_github() {
     ]);
     let url = authorize_url(&login, &d);
     let mut pages = Vec::new();
-    // No session: the sign-in page offers GitHub beside the password form.
     let page = request("GET", &url, Body::None, &[]);
     assert_eq!(page.status, 200);
     let text = page.text();
@@ -1150,8 +1080,6 @@ fn a_github_only_account_signs_the_cli_in_through_github() {
     let at_github = request("GET", started.header("location").unwrap(), Body::None, &[]);
     assert_eq!(at_github.status, 302);
     let callback = at_github.header("location").unwrap().to_owned();
-    // GitHub's redirect back is cross-site: the callback issues nothing and
-    // moves the browser on to the same-origin finish hop.
     let back = request(
         "GET",
         &callback,
@@ -1180,7 +1108,6 @@ fn a_github_only_account_signs_the_cli_in_through_github() {
         .map(|(_, v)| v.split(';').next().unwrap().to_owned())
         .expect("a session");
     pages.push(done.text().to_owned());
-    // The page continues to the exact request the CLI printed.
     let at = done.text().find("url=").unwrap() + 4;
     let target = done.text()[at..]
         .split('"')
@@ -1224,8 +1151,6 @@ fn a_github_only_account_signs_the_cli_in_through_github() {
         .unwrap();
     assert_eq!(grants.len(), 1);
 
-    // No page and no CLI output holds a GitHub token or code, the client
-    // secret, or Sentinel token material.
     for text in pages.iter().chain([
         &out.stdout,
         &out.stderr,
@@ -1265,7 +1190,6 @@ fn device_login_is_approved_on_the_device_page_and_never_shows_the_device_code()
         .unwrap()
         .to_owned();
     let user_code = forms::normalize_user_code(&display).unwrap();
-    // The person approves in a browser where they are signed in.
     let cookie = session(&d, "dev");
     let page = send(
         &d,
@@ -1343,7 +1267,6 @@ fn untrusted_redirects_wrong_verifiers_and_foreign_audiences_are_refused() {
             &[("cookie", &cookie)],
         )
     };
-    // Redirects other than the exact loopback form: a page, never a redirect.
     for redirect in [
         "http://localhost:49152/callback",
         "https://127.0.0.1:49152/callback",
@@ -1356,7 +1279,6 @@ fn untrusted_redirects_wrong_verifiers_and_foreign_audiences_are_refused() {
         assert!(reply.header("location").is_none(), "{redirect}");
     }
     let good = "http://127.0.0.1:49152/callback";
-    // A foreign audience (resource) and the plain PKCE method come back as errors.
     for (extra, error) in [
         (
             vec![("resource", "https://other.example/api/v1")],
@@ -1370,7 +1292,6 @@ fn untrusted_redirects_wrong_verifiers_and_foreign_audiences_are_refused() {
         assert_eq!(param(&back, "error"), error);
         assert_eq!(param(&back, "iss"), d.base.as_str());
     }
-    // Approve, then present the wrong verifier: the code is spent.
     let page = authorize(good, &[("resource", &format!("{}/api/v1", d.base))]);
     assert_eq!(page.status, 200);
     let mut fields = hidden_fields(page.text());
@@ -1404,7 +1325,6 @@ fn untrusted_redirects_wrong_verifiers_and_foreign_audiences_are_refused() {
     };
     assert_eq!(exchange(&pkce::verifier()).body["error"], "invalid_grant");
     assert_eq!(exchange(&verifier).body["error"], "invalid_grant", "spent");
-    // A refresh token is never a bearer; an access token is never a refresh token.
     let minted = oauth::issue_grant_trusted(
         &d.store,
         NewGrant {
@@ -1457,9 +1377,6 @@ fn the_cli_refuses_a_callback_with_the_wrong_state_or_issuer() {
         assert_eq!(landed.status, 400, "{what}");
         assert!(landed.text().contains("did not complete"), "{what}");
         if wrong_state {
-            // A callback for another login is ignored, not fatal;
-            // the login still waits for its own, which here names the
-            // wrong issuer and so ends it.
             let own = format!(
                 "{redirect}?{}",
                 encode(&[
@@ -1478,7 +1395,6 @@ fn the_cli_refuses_a_callback_with_the_wrong_state_or_issuer() {
             "{what}: nothing saved"
         );
     }
-    // Nothing reached the token endpoint: no grant exists.
     let grants = d
         .store
         .read(|c| oauth::grants(c, Authority::HostLocal, d.dev, 10))
@@ -1493,7 +1409,6 @@ fn four_processes_on_a_nearly_expired_profile_refresh_exactly_once() {
     browser_login(&d, &m, "dev", "race");
     let grant = m.grant("race");
     assert_eq!(refresh_rows(&d, grant), 1);
-    // The stored access token is about to lapse on this machine's clock.
     let mut blob = m.credentials("race").unwrap();
     blob["access_expires_ms"] = json!(now_ms());
     m.write_credentials("race", &blob);
@@ -1548,11 +1463,9 @@ fn a_lost_refresh_response_is_recovered_inside_the_grace_window_and_replayed_out
     let d = deployment();
     let minted = trusted_grant(&d);
     let first = forms::format(Kind::Refresh, &minted.refresh);
-    // The answer to this refresh is "lost": the client never stores it.
     let lost = refresh_http(&d, &first);
     assert_eq!(lost.status, 200, "{}", lost.body);
     let lost_access = lost.body["access_token"].as_str().unwrap().to_owned();
-    // Retrying the same token inside the grace window recovers.
     let retry = refresh_http(&d, &first);
     assert_eq!(retry.status, 200, "{}", retry.body);
     let access = retry.body["access_token"].as_str().unwrap().to_owned();
@@ -1561,12 +1474,10 @@ fn a_lost_refresh_response_is_recovered_inside_the_grace_window_and_replayed_out
     assert_eq!(me(&d, &access).status, 200);
     assert_eq!(me(&d, &lost_access).status, 401, "the lost pair is dead");
     assert!(!grant_revoked(&d, minted.grant));
-    // Rotation goes on normally from the recovered token.
     let third = refresh_http(&d, &second);
     assert_eq!(third.status, 200);
     let access = third.body["access_token"].as_str().unwrap().to_owned();
     let latest = third.body["refresh_token"].as_str().unwrap().to_owned();
-    // The same token presented again after the window (61 s on) is replay.
     let late = oauth::refresh(
         &d.store,
         CLI_CLIENT_ID,
@@ -1593,7 +1504,6 @@ fn a_superseded_or_twice_used_refresh_token_revokes_its_grant() {
     let recovered = refresh_http(&d, &first);
     assert_eq!(recovered.status, 200);
     let access = recovered.body["access_token"].as_str().unwrap().to_owned();
-    // The successor the recovery replaced is a replay, over HTTP, at once.
     let replay = refresh_http(&d, &superseded);
     assert_eq!(
         (replay.status, replay.body["error"].as_str()),
@@ -1602,7 +1512,6 @@ fn a_superseded_or_twice_used_refresh_token_revokes_its_grant() {
     assert!(grant_revoked(&d, minted.grant));
     assert_eq!(me(&d, &access).status, 401);
 
-    // Double use inside the window after the successor was used: replay too.
     let minted = trusted_grant(&d);
     let first = forms::format(Kind::Refresh, &minted.refresh);
     let next = refresh_http(&d, &first);
@@ -1622,7 +1531,6 @@ fn removed_membership_and_suspension_stop_the_cli_with_actionable_exits() {
     let m = Machine::new();
     browser_login(&d, &m, "dev", "p");
     assert_eq!(run_list(&m, "p").code, 0);
-    // Membership removed: the repository is gone for this account.
     let (tenant, dev) = (d.tenant, d.dev);
     let root = d
         .store
@@ -1644,7 +1552,6 @@ fn removed_membership_and_suspension_stop_the_cli_with_actionable_exits() {
     assert!(matches!(out.code, 3 | 4), "{out:?}");
     assert!(out.stdout.is_empty());
 
-    // A suspended account's grants are revoked: exit 3 with the login hint.
     let d = deployment();
     let m = Machine::new();
     browser_login(&d, &m, "dev", "p");
@@ -1691,13 +1598,11 @@ fn a_server_other_than_the_profiles_is_refused_before_any_connection() {
         assert!(out.stderr.contains(&b), "{}", out.stderr);
     }
     assert_eq!(other.connections(), 0, "B never saw a connection");
-    // The same spelling of A (a trailing slash, upper-case host) is A.
     let same = format!("{}/", d.base.to_uppercase().replace("HTTP://", "http://"));
     let out = m.run(&[
         "run", "list", "--tenant", "acme", "--repo", "app", "--server", &same,
     ]);
     assert_eq!(out.code, 0, "{out:?}");
-    // A server whose metadata names another issuer is refused at login.
     let localhost = d.base.replace("127.0.0.1", "localhost");
     let out = m.run(&[
         "auth",
@@ -1728,7 +1633,6 @@ fn logout_revokes_on_the_server_and_offline_logout_exits_one() {
     assert_eq!(me(&d, &access).status, 401);
     assert_eq!(refresh_http(&d, &refresh).body["error"], "invalid_grant");
     assert!(m.credentials("p").is_none(), "the local credential is gone");
-    // The profile stays: a command says exactly how to sign in again.
     let out = run_list(&m, "p");
     assert_eq!(out.code, 3, "{out:?}");
     assert!(
@@ -1737,7 +1641,6 @@ fn logout_revokes_on_the_server_and_offline_logout_exits_one() {
         out.stderr
     );
 
-    // Offline: the credential is deleted anyway, and the exit says so.
     browser_login(&d, &m, "dev", "p");
     let grant = m.grant("p");
     d.stop();
@@ -1751,8 +1654,6 @@ fn logout_revokes_on_the_server_and_offline_logout_exits_one() {
 #[test]
 fn a_service_grant_is_imported_and_used_without_any_prompt() {
     let d = deployment();
-    // An API credential holding every permission cannot mint one: issuing a
-    // credential asks for a step-up that only a browser session can give.
     let refused = send(
         &d,
         "POST",
@@ -1795,7 +1696,6 @@ fn a_service_grant_is_imported_and_used_without_any_prompt() {
     let m = Machine::new();
     let file = m.dir.path().join("agent.token");
     std::fs::write(&file, issued.body["refresh_token"].as_str().unwrap()).unwrap();
-    // stdin is closed: anything that tried to prompt would fail.
     let out = m.run(&[
         "auth",
         "login",
@@ -1813,7 +1713,6 @@ fn a_service_grant_is_imported_and_used_without_any_prompt() {
     let doc: Value = serde_json::from_str(&status.stdout).unwrap();
     assert_eq!(doc["user"], account.as_str());
     assert_eq!(doc["narrowing"]["tenant"], d.tenant.to_string());
-    // Audited: the account's creation and the grant's issuance.
     let audit = d.store.read(|c| local_auth::recent_audit(c, 10)).unwrap();
     for event in [Event::ServiceAccountCreated, Event::ServiceGrantIssued] {
         assert!(audit.iter().any(|a| a.event == event), "{event:?}");
@@ -1841,7 +1740,6 @@ fn check<'a>(doc: &'a Value, name: &str) -> &'a Value {
 fn doctor_passes_every_check_for_a_working_profile_and_names_each_fix() {
     let mut d = deployment();
     let m = Machine::new();
-    // Nothing configured: exit 3 and the login command.
     let (out, doc) = doctor(&m, &[]);
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(check(&doc, "profile")["ok"], false);
@@ -1891,7 +1789,6 @@ fn doctor_passes_every_check_for_a_working_profile_and_names_each_fix() {
         "the refresh check rotated once"
     );
     assert!(!grant_revoked(&d, grant));
-    // Text mode: one line per check.
     let text = m.run(&["doctor"]);
     assert_eq!(text.code, 0, "{text:?}");
     assert_eq!(
@@ -1899,7 +1796,6 @@ fn doctor_passes_every_check_for_a_working_profile_and_names_each_fix() {
         7
     );
 
-    // The credential removed: exit 3, the fix is the login command.
     let blob = m.credentials("p").unwrap();
     std::fs::remove_file(m.config().join("credentials").join("p.json")).unwrap();
     let (out, doc) = doctor(&m, &[]);
@@ -1913,7 +1809,6 @@ fn doctor_passes_every_check_for_a_working_profile_and_names_each_fix() {
     assert_eq!(check(&doc, "access_token")["skipped"], true);
     m.write_credentials("p", &blob);
 
-    // The controller down: exit 6, health names what to check.
     d.stop();
     let (out, doc) = doctor(&m, &[]);
     assert_eq!(out.code, 6, "{out:?}");
@@ -1926,7 +1821,6 @@ fn doctor_passes_every_check_for_a_working_profile_and_names_each_fix() {
         "local checks still run"
     );
     assert_eq!(check(&doc, "refresh")["skipped"], true);
-    // JSON mode: the report on stdout, one error document on stderr.
     let error: Value = serde_json::from_str(out.stderr.trim()).unwrap();
     assert_eq!(error["schema"], "sentinel.error/1");
 }
@@ -1965,7 +1859,6 @@ fn a_missing_scope_names_the_login_that_asks_for_it() {
         d.base
     );
     assert!(out.stderr.contains(&expected), "{}", out.stderr);
-    // JSON mode keeps the server's document, with the scope it lacked.
     let out = m.run(&["artifact", "list", &run, "--profile", "narrow", "--json"]);
     let error: Value = serde_json::from_str(out.stderr.trim()).unwrap();
     assert_eq!(
@@ -2059,7 +1952,6 @@ mod secret_runtime {
             })
             .unwrap()
             .secret;
-        // The binding was made through `sentinel secret bind` above.
         let metadata = d
             .store
             .read(|conn| secrets::describe(conn, admin, Scope::Repo(d.repo), "CLI_TOKEN"))

@@ -1,18 +1,4 @@
-//! The shared API client every networked command uses: where the
-//! controller is, which credential to present, how answers become output,
-//! and how failures become stable exit codes.
-//!
-//! Credential precedence: (1) `--token-file`, then `SENTINEL_TOKEN` — a
-//! static `sntl_` credential or `sntl_at_` access token, which needs
-//! `--server`/`SENTINEL_SERVER` and is never refreshed; (2) otherwise a
-//! profile: `--profile`, then `SENTINEL_PROFILE`, then the `current` one in
-//! `profiles.json` ([`crate::profile`]). A `--server`/`SENTINEL_SERVER`
-//! given with a profile must name the profile's own server after
-//! normalization, or the command stops with exit 2 before any request.
-//!
-//! Exit codes are a compatibility surface ([`Exit`], `docs/cli.md`). In
-//! JSON and NDJSON modes a failure is one `sentinel.error/1` line on stderr
-//! and stdout stays clean.
+//! Exit codes are a compatibility surface; in JSON modes stdout stays clean and a failure is one stderr line.
 
 use std::{
     fmt,
@@ -29,33 +15,21 @@ use serde_json::{Value, json};
 
 use crate::profile;
 
-/// Process exit codes. Stable: scripts and agents switch on them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Exit {
-    /// Success (`wait`: the run passed).
     Ok = 0,
-    /// Remote fault, transport failure the client could not classify, or a
-    /// malformed answer.
     Remote = 1,
-    /// Usage, local configuration or profile error, server/profile mismatch.
     Usage = 2,
-    /// Unauthenticated or forbidden, including an expired or revoked grant.
     Auth = 3,
     NotFound = 4,
-    /// Conflict or idempotency-key mismatch.
     Conflict = 5,
-    /// Busy or rate limited after the client's retries, unreachable, or a
-    /// write whose outcome the controller could not confirm (`outcome_unknown`).
     Busy = 6,
-    /// `wait`: the deadline passed first.
     Timeout = 7,
-    /// `wait`: the run finished but did not pass.
     RunFailed = 8,
 }
 
 impl Exit {
-    /// The `code` of a client-side `sentinel.error/1` document.
     pub const fn client_code(self) -> &'static str {
         match self {
             Exit::Ok => "client_ok",
@@ -70,7 +44,6 @@ impl Exit {
         }
     }
 
-    /// The exit for a `sentinel.error/1` code (after retries were spent).
     pub fn for_code(code: &str) -> Exit {
         match code {
             "unauthenticated" | "forbidden" => Exit::Auth,
@@ -82,8 +55,6 @@ impl Exit {
     }
 }
 
-/// A failed command: a message for humans, the exit, and the server's
-/// `sentinel.error/1` document when there was one.
 #[derive(Debug)]
 pub struct Error {
     pub message: String,
@@ -106,7 +77,6 @@ impl Error {
         Error::new(Exit::Remote, message)
     }
 
-    /// The single-line JSON document JSON/NDJSON modes print on stderr.
     pub fn document(&self) -> Value {
         match &self.api {
             Some(api) => api.clone(),
@@ -139,8 +109,6 @@ pub enum Output {
     Ndjson,
 }
 
-/// The mode failures are reported in; set when a command resolves its
-/// [`ClientArgs::output`], read by [`report`].
 static MODE: AtomicU8 = AtomicU8::new(0);
 
 fn set_mode(output: Output) {
@@ -177,7 +145,6 @@ pub struct ClientArgs {
 }
 
 impl ClientArgs {
-    /// The effective output mode (`--json` wins), recorded for [`report`].
     pub fn output(&self) -> Output {
         let output = if self.json { Output::Json } else { self.output };
         set_mode(output);
@@ -185,13 +152,7 @@ impl ClientArgs {
     }
 }
 
-/// Write to standard output; every command's stdout goes through here (or
-/// the [`crate::out!`]/[`crate::outln!`] macros), never `print!`, which
-/// panics with exit 101 when the reader has gone. A closed stdout — the
-/// reader of a pipe exited, as `| head -1` does — ends the process at once,
-/// quietly, with exit 0: the reader chose to stop, and nothing failed. Any
-/// other write failure (a full disk behind a redirect) is reported in the
-/// current mode and exits 1.
+/// Stdout goes through here, never `print!`: a closed pipe ends the process quietly, where `print!` would panic.
 pub fn stdout_fmt(args: fmt::Arguments<'_>) {
     use std::io::Write;
     if let Err(error) = std::io::stdout().lock().write_fmt(args) {
@@ -199,7 +160,6 @@ pub fn stdout_fmt(args: fmt::Arguments<'_>) {
     }
 }
 
-/// [`stdout_fmt`] for raw bytes (log frames).
 pub fn stdout_bytes(bytes: &[u8]) {
     use std::io::Write;
     if let Err(error) = std::io::stdout().lock().write_all(bytes) {
@@ -207,7 +167,6 @@ pub fn stdout_bytes(bytes: &[u8]) {
     }
 }
 
-/// Push buffered output to the reader now (a followed log between polls).
 pub fn stdout_flush() {
     use std::io::Write;
     if let Err(error) = std::io::stdout().lock().flush() {
@@ -226,7 +185,6 @@ fn stdout_failed(error: &std::io::Error) -> ! {
     std::process::exit(Exit::Remote as i32)
 }
 
-/// Print one result: text, pretty JSON, or one compact line.
 pub fn emit(output: Output, value: &Value, text: impl FnOnce() -> String) {
     match output {
         Output::Text => crate::out!("{}", text()),
@@ -235,9 +193,6 @@ pub fn emit(output: Output, value: &Value, text: impl FnOnce() -> String) {
     }
 }
 
-/// Print one item of a list as it arrives: text, or one JSON line per item
-/// in both JSON modes (a list in `--output json` is emitted whole by the
-/// caller with [`emit`] instead).
 pub fn emit_item(output: Output, value: &Value, text: impl FnOnce() -> String) {
     match output {
         Output::Text => crate::out!("{}", text()),
@@ -245,11 +200,6 @@ pub fn emit_item(output: Output, value: &Value, text: impl FnOnce() -> String) {
     }
 }
 
-/// Append one worker of a `GET /workers` pool as a text line:
-/// `  {id} {name} {arch} connected|offline {transport}`. The transport is
-/// `{path} {rtt}ms`, with `rtt=-` for a round trip nothing measured and
-/// `transport=-` for a worker that never reported one, so an absent
-/// measurement never reads as a direct link with no latency.
 pub fn push_worker_line(out: &mut String, worker: &Value) {
     use fmt::Write as _;
     let str_of = |key: &str| worker[key].as_str().unwrap_or("");
@@ -258,7 +208,6 @@ pub fn push_worker_line(out: &mut String, worker: &Value) {
     } else {
         "offline"
     };
-    // Writing into a String cannot fail.
     let _ = write!(
         out,
         "  {} {} {} {state} ",
@@ -278,8 +227,6 @@ pub fn push_worker_line(out: &mut String, worker: &Value) {
     };
 }
 
-/// Report a failure on stderr in the current mode: `error: …` for text,
-/// one `sentinel.error/1` line for JSON and NDJSON.
 pub fn report(error: &Error) {
     match mode() {
         Output::Text => eprintln!("error: {}", error.message),
@@ -292,9 +239,6 @@ pub fn report(error: &Error) {
     }
 }
 
-/// Normalize a controller URL: lower-case scheme and host, default port
-/// and trailing `/` dropped; userinfo, query and fragment refused; plain
-/// `http` only for loopback (`127.0.0.0/8`, `[::1]`, `localhost`).
 pub fn normalize_server(url: &str) -> Result<String, Error> {
     let invalid = |why: &str| Error::usage(format!("invalid server URL: {why}"));
     let (scheme, rest) = url
@@ -369,24 +313,18 @@ enum Credential {
     Profile(profile::Handle),
 }
 
-/// A connected client: base URL, HTTP agent and credential.
 pub struct Client {
     base: String,
     agent: ureq::Agent,
-    /// The agent for object downloads ([`transfer_agent`]), made on first use.
     transfer: OnceLock<ureq::Agent>,
     credential: Credential,
     tenant: Option<String>,
 }
 
-/// Attempts for a retryable answer (`rate_limited`, `storage_full`,
-/// `internal`, transport) on a request that is safe to repeat.
 const ATTEMPTS: u32 = 3;
 const BACKOFF: Duration = Duration::from_millis(200);
 const MAX_BACKOFF: Duration = Duration::from_secs(2);
-/// The longest back-off a controller can name (`details.retry_after_ms`)
-/// that the client honors; a larger or overflowing value is cut to this, so
-/// a faulty or hostile server cannot park a command indefinitely.
+/// The longest server back-off honored, so a faulty server cannot park a command indefinitely.
 pub const MAX_SERVER_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
@@ -408,27 +346,16 @@ struct BytesRequest<'a> {
     idempotency: Option<&'a str>,
 }
 
-/// A streamed object body.
 pub struct Download {
-    /// 200 (the whole object) or 206 (the requested range).
     pub status: u16,
-    /// The declared body length (`content-length`).
     pub len: Option<u64>,
-    /// Where a `206` body starts (`content-range: bytes START-…`).
     pub start: Option<u64>,
     pub body: Box<dyn Read>,
 }
 
-/// The bound on one API call, request to last byte of the answer.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
-/// The longest an object transfer may go without progress: no byte sent or
-/// received for this long is a stall. The transfer as a whole is unbounded,
-/// since an entry of up to 4 GiB takes minutes on a slow link.
 pub const TRANSFER_IDLE: Duration = Duration::from_secs(30);
 
-/// A debug-build override of [`CALL_TIMEOUT`] and [`TRANSFER_IDLE`]
-/// (`SENTINEL_TEST_TIMEOUT_MS`), so tests exercise slow and stalled
-/// transfers in seconds. Release builds never read it.
 fn test_timeout(normal: Duration) -> Duration {
     #[cfg(debug_assertions)]
     if let Some(ms) = std::env::var("SENTINEL_TEST_TIMEOUT_MS")
@@ -451,11 +378,7 @@ fn agent() -> ureq::Agent {
     )
 }
 
-/// The agent for object downloads: no whole-call bound, but every wait for
-/// the network — connecting, sending, the answer's head, each read of the
-/// body — is bounded by [`TRANSFER_IDLE`]. ureq bounds phases, and
-/// its body phase covers the whole body, so the per-read bound is imposed
-/// on the transport itself ([`idle::Idle`]).
+/// Bounded per wait, not as a whole: the body phase covers the whole body, so the bound lives on the transport.
 fn transfer_agent() -> ureq::Agent {
     use ureq::unversioned::{
         resolver::DefaultResolver,
@@ -475,7 +398,6 @@ fn transfer_agent() -> ureq::Agent {
     )
 }
 
-/// A transport wrapper that caps each single wait for the network.
 mod idle {
     use std::time::Duration;
 
@@ -509,8 +431,6 @@ mod idle {
     }
 
     impl Bounded {
-        /// The phase's own deadline, or the idle bound when that is sooner
-        /// (an unbounded phase included), named as the phase that stalled.
         fn bound(&self, timeout: NextTimeout, stalled: Timeout) -> NextTimeout {
             if *timeout.after > self.idle {
                 NextTimeout {
@@ -552,7 +472,6 @@ mod idle {
     }
 }
 
-/// A static credential must be a Sentinel bearer: `sntl_` or `sntl_at_`.
 fn static_credential(text: &str) -> Result<String, Error> {
     let text = text.trim();
     if sentinel_auth::oauth::bearer(&format!("Bearer {text}")).is_none() {
@@ -563,15 +482,11 @@ fn static_credential(text: &str) -> Result<String, Error> {
     Ok(text.to_owned())
 }
 
-/// The most a token file may hold: a credential is under 100 bytes.
 pub const MAX_TOKEN_FILE_BYTES: u64 = 4 << 10;
-/// Bound API JSON responses before they are parsed into a `Value`. A log
-/// page is limited by the server to 1 MiB of frame payload; JSON escaping
-/// can expand that payload several times.
+// A log page is at most 1 MiB of payload, but JSON escaping can expand it several times.
 const MAX_JSON_RESPONSE_BYTES: u64 = 8 << 20;
 const MAX_ERROR_RESPONSE_BYTES: u64 = 64 << 10;
 
-/// A `--token-file`, read with a bound on the bytes actually read.
 pub fn read_token_file(path: &std::path::Path) -> Result<String, Error> {
     crate::bounded::text(path, MAX_TOKEN_FILE_BYTES)
         .map_err(|e| Error::usage(format!("cannot read the token file: {e}")))
@@ -582,8 +497,6 @@ fn env_nonempty(name: &str) -> Option<String> {
 }
 
 impl Client {
-    /// Resolve server and credential by the documented precedence. Nothing
-    /// touches the network here.
     pub fn connect(args: &ClientArgs) -> Result<Client, Error> {
         args.output();
         let server = args
@@ -633,9 +546,6 @@ impl Client {
         })
     }
 
-    /// A client for the legacy `sentinel api` commands: a static credential
-    /// and the server exactly as given (only a trailing `/` is dropped),
-    /// as those commands always accepted.
     pub fn with_token(server: &str, token: &str) -> Result<Client, Error> {
         Ok(Client {
             base: server.trim_end_matches('/').to_owned(),
@@ -646,17 +556,14 @@ impl Client {
         })
     }
 
-    /// The normalized controller URL.
     pub fn server(&self) -> &str {
         &self.base
     }
 
-    /// The profile's default tenant (`sentinel context use`), if any.
     pub fn default_tenant(&self) -> Option<&str> {
         self.tenant.as_deref()
     }
 
-    /// The HTTP agent, for flows that talk to the server outside `/api/v1`.
     pub fn agent(&self) -> &ureq::Agent {
         &self.agent
     }
@@ -682,8 +589,6 @@ impl Client {
         self.json(Method::Delete, path, None, None)
     }
 
-    /// Send an explicitly bounded secret value as raw bytes. The payload is
-    /// never converted to text or included in a local diagnostic.
     pub fn put_bytes(
         &self,
         path: &str,
@@ -702,7 +607,6 @@ impl Client {
         )
     }
 
-    /// Idempotent raw-byte request used by the atomic env-file importer.
     pub fn post_bytes(
         &self,
         path: &str,
@@ -721,7 +625,6 @@ impl Client {
         )
     }
 
-    /// A version-checked deletion with an idempotency key.
     pub fn delete_with(
         &self,
         path: &str,
@@ -738,11 +641,6 @@ impl Client {
         )
     }
 
-    /// Stream a body (an object download). `range` is `[start, end)` in
-    /// bytes. Returns the status (200 or 206), the declared length, where a
-    /// `206` starts, and the reader; any other status is an error. The
-    /// transfer is bounded per wait for the network, not as a whole
-    /// ([`transfer_agent`]).
     pub fn download(&self, path: &str, range: Option<(u64, u64)>) -> Result<Download, Error> {
         if let Some((start, end)) = range
             && end <= start
@@ -916,7 +814,6 @@ impl Client {
         })
     }
 
-    /// Turn a non-success answer into an [`Error`].
     fn failure(&self, response: Response) -> Error {
         let status = response.status().as_u16();
         let text = response
@@ -960,8 +857,6 @@ impl Client {
         }
     }
 
-    /// A refusal, with what to do: a missing scope names the sign-in that
-    /// asks for it; anything else is the account's own permission.
     fn forbidden(&self, message: &str, scope: Option<&str>) -> String {
         match (scope, &self.credential) {
             (Some(scope), Credential::Profile(handle)) => {
@@ -998,16 +893,6 @@ impl Client {
         }
     }
 
-    /// Send with the credential, retrying where it is safe: a profile's
-    /// rejected access token is refreshed once; `rate_limited`,
-    /// `storage_full`, `internal`, `outcome_unknown`, a proxy's 502/503/504
-    /// and transport failures are retried with back-off for idempotent
-    /// methods and keyed POSTs. A `rate_limited` answer that names
-    /// `details.retry_after_ms` (a store too busy to check the credential,
-    /// or every long-poll slot taken) is retried like any other overload,
-    /// but after the server's own back-off, capped at
-    /// [`MAX_SERVER_BACKOFF`], plus up to half again of jitter, so refused
-    /// clients do not return in lockstep.
     fn exchange(
         &self,
         agent: &ureq::Agent,
@@ -1042,8 +927,6 @@ impl Client {
                     return Ok(response);
                 }
                 Ok(response) if response.status().as_u16() == 429 => {
-                    // The hint is in the error document, so read it now; it
-                    // is small and the read is bounded.
                     let error = self.failure(response);
                     let named = server_backoff(&error).map(named_backoff);
                     (Err(error), named)
@@ -1118,15 +1001,10 @@ impl Client {
     }
 }
 
-/// Answers worth another attempt on a request that is safe to repeat:
-/// `rate_limited` (429), `internal` (500), `outcome_unknown` (503, only
-/// ever repeated with the same idempotency key or on an idempotent method),
-/// `storage_full` (507), and a proxy's 502/503/504.
 fn retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504 | 507)
 }
 
-/// The back-off a `rate_limited` answer names in `details.retry_after_ms`.
 pub fn server_backoff(error: &Error) -> Option<u64> {
     let api = error.api.as_ref()?;
     if api["code"] != "rate_limited" {
@@ -1135,18 +1013,12 @@ pub fn server_backoff(error: &Error) -> Option<u64> {
     api["details"]["retry_after_ms"].as_u64()
 }
 
-/// The pause for a server-named back-off of `retry_after_ms`: at most
-/// [`MAX_SERVER_BACKOFF`], plus up to half of it again of jitter, so refused
-/// clients spread out instead of returning together. Never overflows.
 pub fn named_backoff(retry_after_ms: u64) -> Duration {
     let cap = MAX_SERVER_BACKOFF.as_millis() as u64;
     let base = retry_after_ms.min(cap);
     Duration::from_millis(base + jitter(base / 2 + 1))
 }
 
-/// A cheap, dependency-free spread in `0..bound`: the clock's sub-second
-/// nanoseconds, mixed. Not random enough for anything but de-synchronizing
-/// retries.
 fn jitter(bound: u64) -> u64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1155,9 +1027,6 @@ fn jitter(bound: u64) -> u64 {
     mixed % bound.max(1)
 }
 
-/// A `retry-after` header in seconds, when an answer (typically a proxy's)
-/// carries one. The controller names its back-off in the error document
-/// instead, which [`server_backoff`] reads.
 fn retry_hint(response: &Response) -> Option<Duration> {
     response
         .headers()
@@ -1244,7 +1113,6 @@ mod tests {
 
     #[test]
     fn a_named_backoff_is_capped_and_jittered_without_overflow() {
-        // `retry_after_ms` near u64::MAX must not overflow.
         let cap = MAX_SERVER_BACKOFF.as_millis() as u64;
         for (named, low, high) in [
             (0, 0, 0),

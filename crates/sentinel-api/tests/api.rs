@@ -1,8 +1,3 @@
-//! The controller API over real HTTP on loopback: authentication by bearer credential and
-//! by session cookie (with CSRF on mutations), structured errors, dispatch
-//! with idempotency, status, cancel, rerun, log tail/follow through the
-//! same files the controller writes, and worker status.
-
 use std::{
     sync::{Arc, Barrier},
     thread,
@@ -74,9 +69,6 @@ fn deployment_with(sessions: local_auth::Policy) -> Deployment {
         RepoId::new(),
         PoolId::new(),
     );
-    // A bootstrapped super admin with a password, a namespace, two bound
-    // repositories (one generic, one through a GitHub App installation) and a
-    // pool.
     let root = local_auth::bootstrap(
         &store,
         "root",
@@ -97,8 +89,6 @@ fn deployment_with(sessions: local_auth::Policy) -> Deployment {
                 NamespaceKind::Organization,
                 now,
             )?;
-            // The super admin created the namespace; membership is what
-            // repository access is judged by, so root joins it explicitly.
             auth::set_membership(
                 tx,
                 Principal::new(root, P::ALL, None, None),
@@ -271,7 +261,6 @@ impl Drop for Deployment {
     }
 }
 
-/// A minimal HTTP client: ureq with errors turned into (status, body).
 fn call(
     d: &Deployment,
     method: &str,
@@ -354,8 +343,6 @@ fn bearer(d: &Deployment) -> String {
     format!("Bearer {}", d.token)
 }
 
-/// Another person administering `acme` (so every repository is visible),
-/// with their own read credential: `Bearer sntl_…`.
 fn member_bearer(d: &Deployment, name: &'static str) -> String {
     let (root, tenant) = (d.root, d.tenant);
     let user = UserId::new();
@@ -419,8 +406,6 @@ fn credentials_are_required_and_errors_are_structured() {
     assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
     let (status, _) = call(&d, "GET", "/api/v1/health", None, None, &[]);
     assert_eq!(status, 200);
-    // The controller serves no page: the web interface is its own process
-    // (`web/`), a client of these same routes.
     let (status, page) = call(&d, "GET", "/", None, None, &[]);
     assert_eq!((status, page["code"].as_str()), (404, Some("not_found")));
 }
@@ -455,7 +440,6 @@ fn secret_http_writes_are_versioned_idempotent_and_metadata_only() {
         ("idempotency-key", "create-access-token"),
     ];
     let (status, conflict) = call_bytes(&d, "PUT", path, b"different-secret", &auth, &changed);
-    // Key reuse is the client's bug, not someone else's rotation.
     assert_eq!(status, 422);
     assert_eq!(conflict["code"], "idempotency_mismatch");
     assert!(
@@ -507,7 +491,6 @@ fn secret_http_writes_are_versioned_idempotent_and_metadata_only() {
     d.store
         .writer()
         .write(move |tx| {
-            // Another administrator first: a tenant's last one keeps the role.
             let other = sentinel_core::UserId::new();
             let admin = Principal::new(root, P::ALL, None, None);
             auth::provisioning::insert_human(tx, other, "Other admin", false, now)?;
@@ -714,11 +697,7 @@ fn concurrent_secret_import_retries_and_version_races_are_atomic() {
     );
 }
 
-/// Manual dispatch on a repository with no binding: the worker fetches the
-/// named remote with its own identity, so only an unauthenticated `https://`
-/// remote is admissible — never a path or `file://` URL on the worker host,
-/// never `ssh://` with the worker account's keys, never `git://` or plain
-/// `http://`.
+/// Workers fetch with their own identity, so only unauthenticated https remotes are admissible.
 #[test]
 fn manual_dispatch_refuses_local_and_ambient_credential_remotes() {
     let d = deployment();
@@ -752,7 +731,6 @@ fn manual_dispatch_refuses_local_and_ambient_credential_remotes() {
             "{remote}: {answer}"
         );
     }
-    // Nothing was created by any refusal; an https remote still dispatches.
     let (status, _) = call(
         &d,
         "POST",
@@ -774,9 +752,6 @@ fn manual_dispatch_refuses_local_and_ambient_credential_remotes() {
     assert_eq!(page["runs"].as_array().unwrap().len(), 1, "{page}");
 }
 
-/// A caller holding only `run` submits the pipeline, so it cannot ask for the
-/// repository's secrets: the dispatch is refused up front, naming the rule,
-/// and creates nothing.
 #[test]
 fn manual_dispatch_refuses_a_pipeline_that_declares_secrets() {
     let d = deployment();
@@ -825,7 +800,6 @@ fn manual_dispatch_refuses_a_pipeline_that_declares_secrets() {
 fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     let d = deployment();
     let auth = bearer(&d);
-    // Unpinned images are refused before anything is written.
     let unpinned = serde_json::json!({
         "pipeline": PIPELINE.replace("@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662", ":latest"),
         "source": { "repo": "https://github.com/o/r.git", "sha": "0123456789abcdef0123456789abcdef01234567" }
@@ -848,7 +822,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
             .unwrap()
             .contains("pinned by digest")
     );
-    // A malformed pipeline is a structured refusal that does not echo it.
     let broken = serde_json::json!({ "pipeline": "schema: 1\njobs: []", "source": { "repo": "x", "sha": "0123456789abcdef0123456789abcdef01234567" } });
     let (status, body) = call(
         &d,
@@ -862,7 +835,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         (status, body["code"].as_str()),
         (400, Some("invalid_request"))
     );
-    // The repository and its (empty) run list are visible first.
     let (status, repos) = call(
         &d,
         "GET",
@@ -889,7 +861,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     );
     assert_eq!(status, 200, "{list}");
     assert!(list["runs"].as_array().unwrap().is_empty());
-    // Dispatch, idempotently.
     let key = [("idempotency-key", "run-1")];
     let (status, run) = call(
         &d,
@@ -929,8 +900,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         (status, body["code"].as_str()),
         (422, Some("idempotency_mismatch"))
     );
-    // Listed for the repository, readable by id, not readable through a
-    // credential scoped to another tenant.
     let (status, list) = call(
         &d,
         "GET",
@@ -978,9 +947,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         (status, body["code"].as_str()),
         (400, Some("invalid_request"))
     );
-    // A credential of another, real tenant — with every permission there,
-    // so no scope check stands in for the tenant boundary — sees nothing of
-    // this one: not the run, and it cannot cancel or rerun its jobs.
     let (root, globex) = (d.root, TenantId::new());
     d.store
         .writer()
@@ -1026,9 +992,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         );
     }
 
-    // Cancel the job that is running-to-be; the blocked one is skipped by
-    // the dependency decision in the same step, so the run is over; a
-    // rerun is refused for a cancelled job.
     let (status, body) = call(
         &d,
         "POST",
@@ -1051,7 +1014,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     assert_eq!(view["jobs"][0]["failure_class"], "canceled");
     assert_eq!(view["jobs"][1]["state"], "skipped");
     assert_eq!(view["state"], "canceled");
-    // Never attempted: no log state exists to report.
     assert!(view["jobs"][0]["log_state"].is_null());
     let (status, body) = call(
         &d,
@@ -1070,7 +1032,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         Some(&auth),
         &[],
     );
-    // Nothing is left to cancel: every job already ended.
     assert_eq!((status, body["canceled"].as_u64()), (200, Some(0)));
     let (status, view) = call(
         &d,
@@ -1083,9 +1044,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     assert_eq!(status, 200);
     assert_eq!(view["state"], "canceled");
 
-    // Logs: a lease, frames written the way the controller writes them, a
-    // tail by sequence, a follow that returns as soon as more arrives, and
-    // completion.
     let (status, run2) = call(
         &d,
         "POST",
@@ -1154,8 +1112,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     assert_eq!(body["frames"].as_array().unwrap().len(), 1);
     assert_eq!(body["frames"][0]["stream"], "stderr");
     assert_eq!(body["frames"][0]["text"], "warn\n");
-    // Malformed paging is refused, never read as "from the start" or
-    // "every step".
     for query in ["after=abc", "step=x", "after=-1"] {
         let (status, body) = call(
             &d,
@@ -1171,7 +1127,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
             "{query}"
         );
     }
-    // Another tenant's credential cannot read these logs.
     let (status, body) = call(
         &d,
         "GET",
@@ -1181,7 +1136,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         &[],
     );
     assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
-    // Follow: the request parks until a frame arrives.
     let logs = Arc::clone(&d.logs);
     let store = Arc::clone(&d.store);
     let writer = thread::spawn(move || {
@@ -1199,7 +1153,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         )
         .unwrap();
         logs.finish(run_id, job_id, attempt, 3, &[]).unwrap();
-        // What the controller's `log_end` does: the row lands with the marker.
         store
             .writer()
             .write(move |tx| sentinel_store::dispatch::log_ended(tx, attempt))
@@ -1229,8 +1182,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         &[],
     );
     assert_eq!((status, body["complete"].as_bool()), (200, Some(true)));
-    // The durable end is also visible on the run: `log_state` says the
-    // attempt's end marker is on disk, not merely that frames stopped.
     let (status, view) = call(
         &d,
         "GET",
@@ -1243,7 +1194,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         (status, view["jobs"][0]["log_state"].as_str()),
         (200, Some("complete"))
     );
-    // The step filter serves only that step's frames.
     let (status, body) = call(
         &d,
         "GET",
@@ -1272,7 +1222,6 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     );
     assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
 
-    // Worker status: the pools the tenant may use, with nothing connected.
     let (status, body) = call(
         &d,
         "GET",
@@ -1336,7 +1285,6 @@ fn a_password_session_needs_the_csrf_header_for_mutations() {
         serde_json::from_str(&response.into_body().read_to_string().unwrap()).unwrap();
     let csrf = body["csrf"].as_str().unwrap().to_owned();
     assert_eq!(body["user"], d.root.to_string());
-    // Reads with the cookie alone.
     let (status, me) = call(
         &d,
         "GET",
@@ -1346,8 +1294,6 @@ fn a_password_session_needs_the_csrf_header_for_mutations() {
         &[("cookie", &cookie_value)],
     );
     assert_eq!((status, me["via"].as_str()), (200, Some("session")));
-    // A mutation with the cookie but no CSRF header is refused; with the
-    // header it goes through.
     let (status, body) = call(
         &d,
         "POST",
@@ -1366,7 +1312,6 @@ fn a_password_session_needs_the_csrf_header_for_mutations() {
         &[("cookie", &cookie_value), ("x-sentinel-csrf", &csrf)],
     );
     assert_eq!(status, 201, "{body}");
-    // Logout clears the session; the cookie is dead afterwards.
     let (status, _) = call(
         &d,
         "POST",
@@ -1391,7 +1336,6 @@ fn a_password_session_needs_the_csrf_header_for_mutations() {
     let _ = DIGEST;
 }
 
-/// A GitHub `push` payload for one immutable repository ID.
 fn push_payload(repository: u64) -> serde_json::Value {
     serde_json::json!({
         "ref": "refs/heads/main",
@@ -1405,7 +1349,6 @@ fn push_payload(repository: u64) -> serde_json::Value {
     })
 }
 
-/// A GitHub `pull_request` payload for one repository and head repository.
 fn pr_payload(action: &str, head_repo: u64, merge: Option<&str>) -> serde_json::Value {
     serde_json::json!({
         "action": action,
@@ -1421,7 +1364,6 @@ fn pr_payload(action: &str, head_repo: u64, merge: Option<&str>) -> serde_json::
     })
 }
 
-/// The App webhook signature over exactly the bytes the request carries.
 fn webhook_signature(body: &[u8]) -> String {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, WEBHOOK_SECRET);
     let tag = ring::hmac::sign(&key, body);
@@ -1445,8 +1387,6 @@ fn delivery_state(d: &Deployment, id: &str) -> intake::State {
 fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
     let d = deployment();
 
-    // Generic intake: no secret, a malformed secret, an unknown repository and
-    // another repository's secret are one indistinguishable refusal.
     let update = |delivery: &str| {
         serde_json::json!({
             "delivery_id": delivery,
@@ -1480,8 +1420,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
     );
     assert_eq!(status, 401, "a repository is never enumerable by intake");
 
-    // A malformed body is invalid_request; a body over the route's limit is
-    // refused before it is parsed.
     let (status, body) = call(
         &d,
         "POST",
@@ -1514,8 +1452,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         (413, Some("payload_too_large"))
     );
 
-    // A valid delivery is acknowledged with its record id, durable before the
-    // response; the redelivery is a duplicate of the same record.
     let (status, first) = call(
         &d,
         "POST",
@@ -1547,7 +1483,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         ),
         (202, Some(true), Some(id.as_str()))
     );
-    // The same identity with different content is a conflict, not a replay.
     let (status, body) = call(
         &d,
         "POST",
@@ -1563,8 +1498,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
     );
     assert_eq!((status, body["code"].as_str()), (409, Some("conflict")));
 
-    // GitHub intake: the signature covers the raw body, and a ping is a probe
-    // that stores nothing.
     let payload = push_payload(GITHUB_REPO_ID);
     let raw = payload.to_string();
     let signed = webhook_signature(raw.as_bytes());
@@ -1608,8 +1541,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
     );
     assert_eq!((status, body["pong"].as_bool()), (200, Some(true)));
 
-    // A valid push for an unbound repository is accepted and ignored: GitHub
-    // must not retry it, and no delivery is stored.
     let unbound = push_payload(92);
     let unbound_raw = unbound.to_string();
     let (status, body) = call(
@@ -1631,7 +1562,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         (status, body["ignored"].as_str()),
         (200, Some("unbound_repository"))
     );
-    // A delivery without its identity header is refused before the store.
     let (status, body) = call(
         &d,
         "POST",
@@ -1644,7 +1574,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         (status, body["code"].as_str()),
         (400, Some("invalid_request"))
     );
-    // The bound repository accepts, stores and deduplicates.
     let (status, first) = call(
         &d,
         "POST",
@@ -1678,8 +1607,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
     );
     assert_eq!((status, again["duplicate"].as_bool()), (202, Some(true)));
     assert_eq!(again["delivery"].as_str(), Some(id.as_str()));
-    // An event this deployment does not handle is acknowledged and ignored,
-    // not retried.
     let (status, body) = call(
         &d,
         "POST",
@@ -1696,9 +1623,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         (status, body["ignored"].as_str()),
         (200, Some("unsupported_event"))
     );
-    // A pull request is intake: the base branch is the policy ref and the
-    // tested merge is what it stands for. Only the actions that mean new work
-    // are stored; others are acknowledged and ignored.
     let pr = pr_payload("opened", GITHUB_REPO_ID, Some(&"e".repeat(40)));
     let pr_raw = pr.to_string();
     let (status, body) = call(
@@ -1738,7 +1662,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         ],
     );
     assert_eq!((status, body["ignored"].as_str()), (200, Some("pr_action")));
-    // A malformed pull-request body is a request error, not a crash.
     let broken = serde_json::json!({ "action": "opened", "number": 7 });
     let broken_raw = broken.to_string();
     let (status, body) = call(
@@ -1760,9 +1683,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         (status, body["code"].as_str()),
         (400, Some("invalid_request"))
     );
-    // Control events are acknowledged with their outcome, never retried: a
-    // check-suite rerequest for a check we never published resolves to
-    // nothing, and the receipt deduplicates the replay.
     let suite = serde_json::json!({
         "action": "rerequested",
         "installation": {"id": 42},
@@ -1816,7 +1736,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         (200, Some("unknown_check"), Some(true)),
         "a replayed receipt answers what the first attempt did"
     );
-    // The same delivery id under a different event is a conflict.
     let renamed = serde_json::json!({
         "action": "renamed",
         "installation": {"id": 42},
@@ -1843,8 +1762,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         (409, Some("conflict")),
         "{body}"
     );
-    // A rename under a fresh delivery revokes the binding; an approved remote
-    // never follows a repository's new name.
     let (status, body) = call(
         &d,
         "POST",
@@ -1876,8 +1793,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         })
         .unwrap();
     assert!(revoked, "the rename revoked the binding");
-    // The repository owned by the token is what the delivery belongs to: the
-    // generic secret is scoped to its repository.
     let (status, _) = call(
         &d,
         "POST",
@@ -1888,8 +1803,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
     );
     assert_eq!(status, 401);
 
-    // The admission bound is reported as rate_limited, and a duplicate of an
-    // already-stored delivery is still acknowledged at the bound.
     let repo = d.intake_repo;
     let tenant = d.tenant;
     let received = UnixMillis::now().0;
@@ -1943,7 +1856,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
     assert_eq!((status, again["duplicate"].as_bool()), (202, Some(true)));
 }
 
-/// Raw bytes in and out plus Content-Range, for the transfer routes.
 fn raw(
     d: &Deployment,
     method: &str,
@@ -1985,8 +1897,6 @@ fn raw(
     (status, bytes, range)
 }
 
-/// An upload request that sends its headers and one byte, then stalls: the
-/// server's body read blocks, holding a transfer slot until the socket dies.
 fn held_upload(d: &Deployment, path: &str, auth: &str, len: usize) -> std::net::TcpStream {
     use std::io::Write as _;
     let addr = d.base.strip_prefix("http://").unwrap().to_owned();
@@ -2006,7 +1916,6 @@ fn uploads_resume_commit_and_downloads_range_through_the_api() {
     let content: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
     let digest = blake3::hash(&content).to_hex().to_string();
 
-    // Begin the session under the tenant's slug.
     let (status, begin) = call(
         &d,
         "POST",
@@ -2019,7 +1928,6 @@ fn uploads_resume_commit_and_downloads_range_through_the_api() {
     assert_eq!(begin["received"], 0);
     let upload = begin["upload"].as_str().unwrap().to_owned();
 
-    // Send the tail first, retry it identically, then fill the gap.
     let (status, _, _) = raw(
         &d,
         "PUT",
@@ -2054,7 +1962,6 @@ fn uploads_resume_commit_and_downloads_range_through_the_api() {
     assert_eq!(st["received"], 10_000);
     assert_eq!(st["ranges"][0][0], 30_000);
 
-    // Sealing before the ranges tile is refused; nothing is committed yet.
     let (status, body) = call(
         &d,
         "POST",
@@ -2077,7 +1984,6 @@ fn uploads_resume_commit_and_downloads_range_through_the_api() {
     );
     assert_eq!(status, 404);
 
-    // Out-of-bounds and missing-offset chunks are refused.
     let (status, _, _) = raw(
         &d,
         "PUT",
@@ -2097,7 +2003,6 @@ fn uploads_resume_commit_and_downloads_range_through_the_api() {
     );
     assert_eq!(status, 400);
 
-    // Fill the head and commit; the digest comes back and the object serves.
     let (status, _, _) = raw(
         &d,
         "PUT",
@@ -2119,7 +2024,6 @@ fn uploads_resume_commit_and_downloads_range_through_the_api() {
         (status, sealed["digest"].as_str()),
         (200, Some(digest.as_str()))
     );
-    // Committing again answers the same digest (idempotent close).
     let (status, sealed) = call(
         &d,
         "POST",
@@ -2167,7 +2071,6 @@ fn uploads_resume_commit_and_downloads_range_through_the_api() {
         assert_eq!(status, 400, "{spec} must be refused");
     }
 
-    // Without credentials every transfer route refuses.
     for (method, path) in [
         ("POST", "/api/v1/tenants/acme/uploads"),
         ("GET", &format!("/api/v1/uploads/{upload}")),
@@ -2179,7 +2082,6 @@ fn uploads_resume_commit_and_downloads_range_through_the_api() {
         assert_eq!(status, 401, "{method} {path}");
     }
 
-    // A credential scoped to another tenant cannot see the upload or object.
     let other_tenant = TenantId::new();
     let root = d.root;
     d.store
@@ -2230,7 +2132,6 @@ fn uploads_resume_commit_and_downloads_range_through_the_api() {
     );
     assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
 
-    // Aborting a second open upload drops it; writes after abort conflict.
     let (status, begin) = call(
         &d,
         "POST",
@@ -2266,7 +2167,6 @@ fn uploads_resume_commit_and_downloads_range_through_the_api() {
 fn transfer_slots_are_bounded() {
     let d = deployment();
     let auth = bearer(&d);
-    // A small committed object to download once slots are free again.
     let content = b"downloadable".repeat(64);
     let digest = blake3::hash(&content).to_hex().to_string();
     let (status, begin) = call(
@@ -2298,7 +2198,6 @@ fn transfer_slots_are_bounded() {
     );
     assert_eq!(status, 200);
 
-    // Pin every slot with an upload whose body never finishes arriving.
     let (status, begin) = call(
         &d,
         "POST",
@@ -2319,7 +2218,6 @@ fn transfer_slots_are_bounded() {
             )
         })
         .collect();
-    // Give the workers a moment to reach their blocked body reads.
     thread::sleep(Duration::from_millis(300));
     let object = format!("/api/v1/tenants/acme/objects/{digest}");
     let (status, body, _) = raw(&d, "GET", &object, None, Some(&auth), &[]);
@@ -2329,8 +2227,6 @@ fn transfer_slots_are_bounded() {
         "rate_limited"
     );
     drop(held);
-    // The dead sockets release their slots as their blocked reads fail;
-    // retry briefly rather than assume an instant release.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let (status, bytes) = loop {
         let (status, bytes, _) = raw(&d, "GET", &object, None, Some(&auth), &[]);
@@ -2348,8 +2244,6 @@ fn artifact_routes_are_authorized_and_scoped() {
     let d = deployment();
     let (tenant, repo) = (d.tenant, d.intake_repo);
     let now = UnixMillis::now();
-    // A run over the bound intake repository: one queued job, one placed
-    // attempt, one captured artifact with a manifest and one absent row.
     let run = RunId::new();
     let spec = RunSpec::new(
         PinnedSource::new(
@@ -2423,7 +2317,6 @@ fn artifact_routes_are_authorized_and_scoped() {
         .unwrap()
         .expect("the queued job was placed");
     assert_eq!((offer.run, offer.job), (run, job));
-    // The captured row carries a committed manifest; the absent one does not.
     let objects = Objects::open(d._dir.path()).unwrap();
     let staged = objects
         .stage(tenant, &b"report-bytes"[..], u64::MAX, Expect::default())
@@ -2479,7 +2372,6 @@ fn artifact_routes_are_authorized_and_scoped() {
             .unwrap()
     };
     let auth = bearer(&d);
-    // The listing answers both rows, newest states included.
     let (status, rows) = call(
         &d,
         "GET",
@@ -2491,7 +2383,6 @@ fn artifact_routes_are_authorized_and_scoped() {
     assert_eq!(status, 200);
     let rows = rows["artifacts"].as_array().unwrap();
     assert_eq!(rows.len(), 2, "{rows:?}");
-    // Detail returns the manifest's entry list for the captured row.
     let (status, detail) = call(
         &d,
         "GET",
@@ -2509,7 +2400,6 @@ fn artifact_routes_are_authorized_and_scoped() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["path"], "out/report.txt");
     assert_eq!(entries[0]["len"], 12);
-    // The absent row has no manifest.
     let (status, detail) = call(
         &d,
         "GET",
@@ -2520,7 +2410,6 @@ fn artifact_routes_are_authorized_and_scoped() {
     );
     assert_eq!((status, detail["state"].as_str()), (200, Some("absent")));
     assert!(detail.get("manifest").is_none() || detail["manifest"].is_null());
-    // Anonymous calls refuse; a foreign run or artifact id is invisible.
     for path in [
         format!("/api/v1/runs/{run}/artifacts"),
         format!("/api/v1/runs/{run}/artifacts/{captured}"),
@@ -2541,9 +2430,6 @@ fn artifact_routes_are_authorized_and_scoped() {
     );
     assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
 
-    // The bytes follow repository authorization. The admin reads them; a
-    // tenant reader without a grant on the repository cannot — the
-    // digest answers exactly as an unknown one would — until granted.
     let digest = entries[0]["digest"].as_str().unwrap().to_owned();
     let object = format!("/api/v1/tenants/acme/objects/{digest}");
     let (status, bytes, _) = raw(&d, "GET", &object, None, Some(&auth), &[]);
@@ -2607,8 +2493,6 @@ fn artifact_routes_are_authorized_and_scoped() {
         .unwrap();
     let (status, _, _) = raw(&d, "GET", &object, None, Some(&reader_auth), &[]);
     assert_eq!(status, 200);
-    // A super admin holding platform scope is no member of another tenant:
-    // its bytes are not the admin's to read.
     let beta = TenantId::new();
     let foreign = {
         let objects = Objects::open(d._dir.path()).unwrap();
@@ -2643,7 +2527,6 @@ fn artifact_routes_are_authorized_and_scoped() {
     assert_eq!(status, 404, "platform scope read a tenant's bytes");
 }
 
-/// Upload `content` as root and return its digest.
 fn upload_object(d: &Deployment, auth: &str, content: &[u8]) -> String {
     let digest = blake3::hash(content).to_hex().to_string();
     let (status, begin) = call(
@@ -2680,8 +2563,6 @@ fn upload_object(d: &Deployment, auth: &str, content: &[u8]) -> String {
     digest
 }
 
-/// A GET whose response is never read: once the socket buffers fill, the
-/// server's body write stalls with the request's permits held.
 fn stalled_get(d: &Deployment, path: &str, auth: &str) -> std::net::TcpStream {
     use std::io::Write as _;
     let addr = d.base.strip_prefix("http://").unwrap().to_owned();
@@ -2694,9 +2575,6 @@ fn stalled_get(d: &Deployment, path: &str, auth: &str) -> std::net::TcpStream {
     socket
 }
 
-/// A download holds its transfer slot until its body is
-/// written, and with every transfer slot held by stalled downloads and every
-/// subscriber slot by parked waits, control requests still find a handler.
 #[test]
 fn downloads_hold_their_slot_and_control_requests_keep_handlers() {
     let d = deployment();
@@ -2714,7 +2592,6 @@ fn downloads_hold_their_slot_and_control_requests_keep_handlers() {
         serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
         "rate_limited"
     );
-    // Park every subscriber slot too.
     let (status, run) = call(
         &d,
         "POST",
@@ -2734,7 +2611,6 @@ fn downloads_hold_their_slot_and_control_requests_keep_handlers() {
         &[],
     );
     let version = first["version"].as_str().unwrap().to_owned();
-    // As many users as it takes park them, each within its per-user share.
     const NAMES: [&str; 8] = [
         "holder-0", "holder-1", "holder-2", "holder-3", "holder-4", "holder-5", "holder-6",
         "holder-7",
@@ -2768,8 +2644,6 @@ fn downloads_hold_their_slot_and_control_requests_keep_handlers() {
         })
         .collect();
     thread::sleep(Duration::from_millis(500));
-    // Transfers and long polls hold six of eight permits; the reserved two
-    // still answer at once.
     for _ in 0..3 {
         let started = std::time::Instant::now();
         let (status, _) = call(&d, "GET", "/api/v1/health", None, None, &[]);
@@ -2784,7 +2658,6 @@ fn downloads_hold_their_slot_and_control_requests_keep_handlers() {
         assert_eq!(wait.join().unwrap(), 200);
     }
     drop(stalled);
-    // The dead sockets fail their stalled writes and release the slots.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let status = loop {
         let (status, bytes, _) = raw(
@@ -2804,8 +2677,6 @@ fn downloads_hold_their_slot_and_control_requests_keep_handlers() {
     assert_eq!(status, 206);
 }
 
-/// A whole-object download is rehashed while it streams; bytes that
-/// rotted on disk end the body short instead of arriving complete.
 #[test]
 fn a_rotted_object_is_never_served_whole() {
     use std::io::Read as _;
@@ -2841,7 +2712,6 @@ fn a_rotted_object_is_never_served_whole() {
         "a corrupt object arrived whole ({} bytes)",
         got.len()
     );
-    // A range read is not verified (documented); the route still serves it.
     let (status, _, _) = raw(
         &d,
         "GET",
@@ -2853,8 +2723,6 @@ fn a_rotted_object_is_never_served_whole() {
     assert_eq!(status, 206);
 }
 
-/// Touching an expired upload retires it — durably, not inside the
-/// refused request's rolled-back transaction.
 #[test]
 fn touching_an_expired_upload_retires_it() {
     let d = deployment();
@@ -2898,9 +2766,6 @@ fn touching_an_expired_upload_retires_it() {
     );
 }
 
-/// The log route refuses a malformed position instead of
-/// restarting at zero, pages carry the versioned `c1` cursor bound to the
-/// tenant and attempt, and a page of full frames is bounded in bytes.
 #[test]
 fn log_pages_are_bounded_and_positions_are_validated() {
     let d = deployment();
@@ -2980,8 +2845,6 @@ fn log_pages_are_bounded_and_positions_are_validated() {
             "{body}"
         );
     }
-    // Paging by the numeric position and by the cursor sees every frame,
-    // each page within the byte bound.
     let mut seen = Vec::new();
     let mut next: Option<String> = None;
     loop {
@@ -3017,7 +2880,6 @@ fn log_pages_are_bounded_and_positions_are_validated() {
     assert_eq!(seen, (1..=100).collect::<Vec<_>>());
 }
 
-/// Place the job's attempt through the dispatcher's own path.
 fn attempt_for(d: &Deployment, job: sentinel_core::JobId) -> AttemptId {
     let (tenant, now) = (d.tenant, UnixMillis::now());
     let (pool, worker) = (PoolId::new(), WorkerId::new());
@@ -3071,7 +2933,6 @@ fn attempt_for(d: &Deployment, job: sentinel_core::JobId) -> AttemptId {
     offer.attempt
 }
 
-/// A raw `POST /api/v1/login`: (status, set-cookie, body).
 fn raw_login(
     d: &Deployment,
     body: &str,
@@ -3099,8 +2960,6 @@ fn raw_login(
     )
 }
 
-/// Login CSRF: the body a cross-site `enctype="text/plain"` form produces
-/// (`name=value`, shaped to parse as JSON) mints no session.
 #[test]
 fn login_refuses_a_text_plain_body() {
     let d = deployment();
@@ -3108,7 +2967,6 @@ fn login_refuses_a_text_plain_body() {
     let (status, cookie, body) = raw_login(&d, forged, &[("content-type", "text/plain")]);
     assert_eq!(status, 400, "{body}");
     assert!(cookie.is_none());
-    // Without any content type, too.
     let (status, cookie, _) = raw_login(&d, forged, &[]);
     assert_eq!(status, 400);
     assert!(cookie.is_none());
@@ -3128,7 +2986,6 @@ fn login_refuses_a_foreign_origin() {
     );
     assert_eq!(status, 403);
     assert!(cookie.is_none());
-    // The deployment's own origin, or none (a non-browser client), signs in.
     let own = d.base.clone();
     let (status, cookie, _) = raw_login(
         &d,
@@ -3144,8 +3001,6 @@ fn login_refuses_a_foreign_origin() {
     assert_eq!(status, 200);
 }
 
-/// An existing tenant the caller has no part in lists as the
-/// same `not_found` as a tenant that does not exist, never as an empty page.
 #[test]
 fn a_foreign_tenant_slug_lists_as_not_found() {
     let d = deployment();
@@ -3212,9 +3067,6 @@ fn a_foreign_tenant_slug_lists_as_not_found() {
     assert_eq!(foreign, missing);
 }
 
-/// Using a session slides its idle deadline, so an active session
-/// outlives the idle window it started with; the cookie lives as long as
-/// the session's absolute bound.
 #[test]
 fn an_active_session_outlives_its_first_idle_deadline() {
     let policy = local_auth::Policy {
@@ -3223,10 +3075,6 @@ fn an_active_session_outlives_its_first_idle_deadline() {
         ..local_auth::Policy::default()
     };
     let d = deployment_with(policy);
-    // Scheduled from the deadlines the server recorded, on the same wall
-    // clock it checks them against, never from when this thread sent a
-    // request: a request the loaded server handles late then moves the
-    // deadline it is asserted against with it.
     let deadlines = || -> (i64, i64) {
         d.store
             .read(|c| {
@@ -3239,7 +3087,6 @@ fn an_active_session_outlives_its_first_idle_deadline() {
             })
             .unwrap()
     };
-    // Sleep until the wall clock is strictly past `ms`.
     let past = |ms: i64| {
         while UnixMillis::now().0 <= ms {
             let left = (ms + 1 - UnixMillis::now().0).max(1) as u64;
@@ -3259,23 +3106,18 @@ fn an_active_session_outlives_its_first_idle_deadline() {
     let me = || call(&d, "GET", "/api/v1/me", None, None, &[("cookie", &cookie)]).0;
     let (created, first) = deadlines();
     assert_eq!(first, created + 6_000);
-    // Used after the refresh interval: the deadline slides past the first.
     past(created + 4_000);
     assert_eq!(me(), 200);
     let (_, slid) = deadlines();
     assert!(slid > first, "slid from {first} to {slid}");
-    // Past the first idle deadline, still signed in; this use slides it on.
     past(first);
     assert_eq!(me(), 200);
     let (_, last) = deadlines();
     assert!(last > slid, "slid again from {slid} to {last}");
-    // Idle for a whole window: gone.
     past(last);
     assert_eq!(me(), 401);
 }
 
-/// A human with its own `sntl_` credential of `permissions`; a member of
-/// `acme` with `role` when given one.
 fn person(
     d: &Deployment,
     name: &'static str,
@@ -3308,8 +3150,6 @@ fn person(
     )
 }
 
-/// A second tenant `globex` with repository `hidden`, administered by root
-/// but not joined by anyone else.
 fn globex(d: &Deployment) -> (TenantId, RepoId) {
     let (root, globex, hidden) = (d.root, TenantId::new(), RepoId::new());
     let now = UnixMillis::now();
@@ -3342,9 +3182,6 @@ fn status_code(reply: (u16, serde_json::Value)) -> (u16, String) {
     (reply.0, reply.1["code"].as_str().unwrap_or("").to_owned())
 }
 
-/// For every secret route and every request shape (valid, bad page,
-/// empty body, bad If-Match), a foreign tenant answers exactly as a missing
-/// one, and a repository the caller cannot see exactly as a missing one.
 #[test]
 fn a_foreign_tenant_or_repo_is_not_found_on_every_secret_route() {
     let d = deployment();
@@ -3426,7 +3263,6 @@ fn a_foreign_tenant_or_repo_is_not_found_on_every_secret_route() {
             headers,
         );
         assert_eq!(foreign, missing, "{method} {path}");
-        // `widget` exists in acme but this member holds no grant on it.
         let base = format!("/api/v1/tenants/acme/{path}");
         let hidden = send(method, &with_repo(&base, "widget"), body, headers);
         let absent = send(method, &with_repo(&base, "no-such-repo"), body, headers);
@@ -3447,9 +3283,6 @@ fn a_foreign_tenant_or_repo_is_not_found_on_every_secret_route() {
     }
 }
 
-/// Allowlists, bindings, unbinding, binding listing and single
-/// version revocation are served over HTTP under their scopes, idempotently,
-/// and refuse another tenant, another repository and a read-only scope.
 #[test]
 fn secret_bindings_allowlists_and_revocation_are_served_over_http() {
     let d = deployment();
@@ -3495,7 +3328,6 @@ fn secret_bindings_allowlists_and_revocation_are_served_over_http() {
         200
     );
 
-    // Not yet allowlisted: a tenant source cannot be bound.
     let bind_shared = "/api/v1/tenants/acme/secret-bindings/SHARED?repo=app&job=build";
     let tenant_source = br#"{"from_tenant":true}"#;
     assert_eq!(
@@ -3562,7 +3394,6 @@ fn secret_bindings_allowlists_and_revocation_are_served_over_http() {
     assert_eq!(rest["bindings"][0]["name"], "SHARED");
     assert!(!serde_json::to_string(&rest).unwrap().contains("shared-v1"));
 
-    // Another tenant's administrator sees none of it.
     let (globex_tenant, _) = globex(&d);
     let (outsider, outsider_auth) = person(
         &d,
@@ -3600,7 +3431,6 @@ fn secret_bindings_allowlists_and_revocation_are_served_over_http() {
         404
     );
 
-    // A delegated writer on `app` cannot bind in `widget`.
     let (writer, writer_auth) = person(
         &d,
         "writer",
@@ -3656,12 +3486,10 @@ fn secret_bindings_allowlists_and_revocation_are_served_over_http() {
         200
     );
 
-    // A read-only credential lists but cannot bind or revoke.
     let reader = member_bearer(&d, "reader");
     let (status, denied) = call_bytes(&d, "PUT", bind_shared, tenant_source, &reader, &[]);
     assert_eq!((status, denied["code"].as_str()), (403, Some("forbidden")));
 
-    // Single-version revocation, idempotent; the current version is kept.
     for _ in 0..2 {
         let (status, revoked) = call_bytes(
             &d,
@@ -3688,8 +3516,6 @@ fn secret_bindings_allowlists_and_revocation_are_served_over_http() {
         .0,
         404
     );
-    // Unbinding twice is harmless; denying the tenant secret removes its
-    // remaining binding.
     for _ in 0..2 {
         assert_eq!(
             call_bytes(&d, "DELETE", bind_shared, b"", &auth, &[]).0,
@@ -3707,8 +3533,6 @@ fn secret_bindings_allowlists_and_revocation_are_served_over_http() {
     assert_eq!((status, denied["allowed"].as_bool()), (200, Some(false)));
 }
 
-/// A repository name that needs percent-encoding (the docs'
-/// `RusticStack/app`) is decoded once by the server.
 #[test]
 fn a_repository_name_with_a_slash_is_addressed_by_its_decoded_name() {
     let d = deployment();
@@ -3748,8 +3572,6 @@ fn a_repository_name_with_a_slash_is_addressed_by_its_decoded_name() {
     );
     assert_eq!(status, 200);
     assert_eq!(listed["secrets"][0]["name"], "TOKEN");
-    // A raw `/` cannot be a query value on its own: the undecoded name
-    // `RusticStack%2Fapp` is simply another (missing) repository.
     assert_eq!(
         call(
             &d,
@@ -3764,8 +3586,7 @@ fn a_repository_name_with_a_slash_is_addressed_by_its_decoded_name() {
     );
 }
 
-/// The retry record keeps a keyed MAC, not the unkeyed FNV-1a of
-/// scope, name, version and value that a database copy could brute-force.
+/// The retry record keeps a keyed MAC, not an unkeyed hash that a database copy could brute-force.
 #[test]
 fn the_stored_retry_fingerprint_is_not_an_unkeyed_digest_of_the_value() {
     fn unkeyed(scope: &[u8], name: &str, expected: u64, body: &[u8]) -> [u8; 16] {
@@ -3810,15 +3631,12 @@ fn the_stored_retry_fingerprint_is_not_an_unkeyed_digest_of_the_value() {
     scope.extend_from_slice(d.tenant.as_bytes());
     assert_eq!(stored.len(), 16);
     assert_ne!(stored, unkeyed(&scope, "PIN", 0, b"1234"));
-    // Guessing the value from the row alone finds nothing.
     for guess in 0..10_000u32 {
         let guess = format!("{guess:04}");
         assert_ne!(stored, unkeyed(&scope, "PIN", 0, guess.as_bytes()));
     }
 }
 
-/// A remote MCP session for `d.root` holding `scopes`: the `Authorization`
-/// header and the session ID.
 fn mcp_session(
     d: &Deployment,
     client_id: &'static str,
@@ -3931,9 +3749,6 @@ fn mcp_post(
     (status, headers, body)
 }
 
-/// On MCP, an agent sees which secret each job and step of an
-/// `owner/name` repository receives, and from which scope — never a value —
-/// with `secrets:metadata`; without it the call is the scope challenge.
 #[test]
 fn mcp_lists_a_slash_named_repositorys_secret_bindings_as_metadata_only() {
     use sentinel_core::auth::Scopes;
@@ -4005,7 +3820,6 @@ fn mcp_lists_a_slash_named_repositorys_secret_bindings_as_metadata_only() {
         !body.to_string().contains("bindings-mcp-secret-value"),
         "{body}"
     );
-    // A name the store refuses never leaves the agent.
     let (status, _, body) = tool(
         &reader,
         serde_json::json!({"tenant":"acme","repo":"Rustic\nStack"}),

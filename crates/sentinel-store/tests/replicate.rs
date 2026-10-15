@@ -1,8 +1,3 @@
-//! The replicator against an in-memory bucket with fault
-//! injection — verified copies, multipart resume after an interruption,
-//! eviction and verified read-through, deletes that follow reclamation and
-//! log expiry, the backlog closing admission during an outage and reopening
-//! once drained, and abandoned uploads aborted.
 use std::{
     collections::{BTreeMap, HashMap},
     io::Write,
@@ -39,7 +34,6 @@ const NOW: UnixMillis = UnixMillis(1_000_000_000);
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-/// An object's body and its `blake3` metadata.
 type Stored = (Vec<u8>, Option<String>);
 
 struct Upload {
@@ -49,14 +43,11 @@ struct Upload {
     initiated: Option<i64>,
 }
 
-/// An S3-shaped bucket in memory. `down` fails every call as a transport
-/// fault would; `fail_part` fails upload of that part number once.
 #[derive(Default)]
 struct Fake {
     objects: Mutex<HashMap<String, Stored>>,
     uploads: Mutex<HashMap<String, Upload>>,
     down: AtomicBool,
-    /// Every call is refused as an expired or revoked credential is (403).
     refused: AtomicBool,
     fail_part: AtomicU32,
     parts_sent: AtomicU32,
@@ -229,7 +220,6 @@ impl Bucket for Fake {
     }
 }
 
-/// The store's read-through fetch, served by the same fake.
 struct Fetch(Arc<Fake>);
 
 impl Remote for Fetch {
@@ -338,8 +328,6 @@ impl Fixture {
     fn local(&self, digest: Digest) -> bool {
         self.path(digest).exists()
     }
-    /// A finished attempt with a log, released long enough ago to settle,
-    /// and stamped by retention.
     fn finished_log(&self) -> (RunId, JobId, AttemptId) {
         let (tenant, repo, run, pool, worker) = (
             self.tenant,
@@ -439,9 +427,6 @@ fn objects_are_copied_verified_evicted_and_fetched_back_verified() {
     );
     assert_eq!(r.pass().unwrap().replicated, 0, "nothing twice");
 
-    // A local budget evicts only what it needs: 3,012 bytes against 100
-    // leaves at most 100 local (both were committed in the same
-    // millisecond, so which goes first is the index's tie order).
     let r = f.replicator(Settings {
         local_bytes: 100,
         ..SETTINGS
@@ -449,7 +434,6 @@ fn objects_are_copied_verified_evicted_and_fetched_back_verified() {
     let first = r.pass().unwrap().evicted;
     assert!((1..=2).contains(&first));
     assert!(f.totals().local_bytes <= 100);
-    // A one-byte budget takes both.
     let r = f.replicator(Settings {
         local_bytes: 1,
         ..SETTINGS
@@ -457,18 +441,15 @@ fn objects_are_copied_verified_evicted_and_fetched_back_verified() {
     r.pass().unwrap();
     assert!(!f.local(a) && !f.local(b));
     assert_eq!(f.totals().local_bytes, 0);
-    // A read fetches it back, verified, and the next pass marks it local.
     assert_eq!(f.read(b).unwrap(), vec![7u8; 3000]);
     assert!(f.local(b));
     let r = f.replicator(SETTINGS);
     r.pass().unwrap();
     assert_eq!(f.totals().local_bytes, 3000);
     assert_eq!(r.status().fetched_objects.load(Ordering::Relaxed), 1);
-    // A corrupted remote copy is refused, not served, and not placed.
     f.bucket.corrupt(&key);
     assert!(matches!(f.read(a), Err(Error::Corrupt(_))));
     assert!(!f.local(a));
-    // Recovery knows an evicted object is not missing.
     let report = f.store.read(|c| f.objects.recover(c)).unwrap();
     assert!(report.missing.is_empty(), "{:?}", report.missing);
 }
@@ -491,7 +472,6 @@ fn a_multipart_upload_interrupted_mid_way_resumes_from_what_the_bucket_holds() {
             .is_some(),
         "recorded to resume"
     );
-    // A restart: a new replicator resumes, sending only parts 4, 5 and 6.
     let r = f.replicator(SETTINGS);
     assert_eq!(r.pass().unwrap().replicated, 1);
     assert_eq!(f.bucket.parts_sent.load(Ordering::Relaxed), 6);
@@ -513,7 +493,6 @@ fn copies_follow_reclamation_even_mid_upload() {
     r.pass().unwrap();
     let key = objects::remote_key(f.tenant, &digest);
     assert!(f.bucket.keys().contains(&key));
-    // The row goes (reclamation's delete): its copy is queued and deleted.
     let tenant = f.tenant;
     f.store
         .writer()
@@ -527,7 +506,6 @@ fn copies_follow_reclamation_even_mid_upload() {
         .unwrap();
     assert_eq!(r.pass().unwrap().deleted, 1);
     assert!(!f.bucket.keys().contains(&key));
-    // A copy uploaded for a row reclaimed meanwhile is deleted too.
     let late = f.put(b"reclaimed while uploading");
     let object = f.store.read(|c| offload::unreplicated(c, 1)).unwrap()[0];
     let now = UnixMillis::now();
@@ -558,8 +536,6 @@ fn finished_logs_are_copied_recopied_after_a_late_end_and_deleted_on_expiry() {
     let prefix = offload::log_prefix(run, job, attempt);
     let copied = f.bucket.list(&prefix).unwrap();
     assert!(copied.iter().any(|k| k.ends_with("/end")), "{copied:?}");
-    // A stale key under the prefix and a changed log state: the next pass
-    // copies again and drops the stale key.
     f.bucket
         .put(&format!("{prefix}seg-999999"), b"stale", None)
         .unwrap();
@@ -579,7 +555,6 @@ fn finished_logs_are_copied_recopied_after_a_late_end_and_deleted_on_expiry() {
         .unwrap();
     assert_eq!(r.pass().unwrap().logs, 1);
     assert!(!f.bucket.keys().iter().any(|k| k.ends_with("seg-999999")));
-    // Retention expires it: every key under the prefix goes.
     let due = vec![retention::Expiring { attempt, run, job }];
     let at = UnixMillis(UnixMillis::now().0 + 400 * 86_400_000);
     f.store
@@ -628,7 +603,6 @@ fn an_outage_fills_the_backlog_closes_admission_and_draining_reopens_it() {
     assert!(!admission.is_open());
     assert!(matches!(admission.check(1), Err(Error::StorageFull)));
     assert_eq!(r.status().state(), "degraded");
-    // Back up: the backlog drains and admission reopens.
     f.bucket.down.store(false, Ordering::Relaxed);
     r.pass().unwrap();
     assert_eq!(f.totals().unreplicated_bytes, 0);
@@ -640,8 +614,6 @@ fn an_outage_fills_the_backlog_closes_admission_and_draining_reopens_it() {
 #[test]
 fn abandoned_multipart_uploads_are_aborted() {
     let f = fixture();
-    // One the bucket holds that nothing here recorded, old; one recent; one
-    // recorded here a day and more ago.
     let old = f.bucket.create_multipart("objects/x/old", None).unwrap();
     f.bucket
         .uploads
@@ -664,9 +636,6 @@ fn abandoned_multipart_uploads_are_aborted() {
     assert!(f.store.read(offload::recorded_uploads).unwrap().is_empty());
 }
 
-/// A local copy that rotted (single-part and multipart) or vanished is
-/// skipped — never uploaded under its digest's name — and the objects after
-/// it are still replicated; the external copy stays healthy.
 #[test]
 fn a_damaged_or_lost_local_object_is_skipped_and_holds_nothing_back() {
     let f = fixture();
@@ -698,7 +667,6 @@ fn a_damaged_or_lost_local_object_is_skipped_and_holds_nothing_back() {
     assert_eq!(r.status().state(), "healthy");
     assert_eq!(r.status().local_faults.load(Ordering::Relaxed), 3);
     assert!(r.status().last_local_fault.lock().unwrap().is_some());
-    // Still owed, and retried each pass without holding the others back.
     assert_eq!(f.totals().unreplicated_bytes, 28 + (3 << 20) + 5 + 30);
     let later = f.put(b"committed after the faults");
     let pass = r.pass().unwrap();
@@ -710,8 +678,6 @@ fn a_damaged_or_lost_local_object_is_skipped_and_holds_nothing_back() {
     );
 }
 
-/// While the bucket is unreachable, reading an evicted object fails
-/// cleanly — no partial file placed — and succeeds once it is back.
 #[test]
 fn an_evicted_object_is_unreadable_during_an_outage_and_readable_after() {
     let f = fixture();
@@ -737,9 +703,6 @@ fn an_evicted_object_is_unreadable_during_an_outage_and_readable_after() {
     assert_eq!(r.status().state(), "healthy");
 }
 
-/// An expired or revoked S3 credential (403) degrades the external
-/// copy with the reason and uploads nothing; a replaced credential lets the
-/// next pass catch up.
 #[test]
 fn a_refused_credential_degrades_the_copy_until_it_is_replaced() {
     let f = fixture();
@@ -769,7 +732,6 @@ fn a_queued_delete_never_removes_the_copy_of_content_committed_again() {
     r.pass().unwrap();
     let key = objects::remote_key(f.tenant, &digest);
     let tenant = f.tenant;
-    // Reclaimed: the delete of its copy is queued.
     f.store
         .writer()
         .write(move |tx| {
@@ -780,8 +742,7 @@ fn a_queued_delete_never_removes_the_copy_of_content_committed_again() {
             Ok(())
         })
         .unwrap();
-    // The same content is committed again and its copy recorded before the
-    // queued delete runs (the case of more than one batch of deletes waiting).
+    // Committed again before its queued delete runs; the stale delete must not remove the live copy.
     assert_eq!(f.put(b"same bytes twice"), digest);
     let object = f.store.read(|c| offload::unreplicated(c, 1)).unwrap()[0];
     let now = UnixMillis::now();
@@ -807,8 +768,6 @@ fn a_store_failure_stops_the_pass_and_degrades_health() {
     let r = f.replicator(SETTINGS);
     r.pass().unwrap();
     assert_eq!(r.status().state(), "healthy");
-    // The store cannot answer the delete queue read: the pass fails before
-    // the bucket is touched, and health must say so.
     f.store
         .writer()
         .write(|tx| {
@@ -821,7 +780,6 @@ fn a_store_failure_stops_the_pass_and_degrades_health() {
     assert_eq!(status.consecutive_failures.load(Ordering::Relaxed), 1);
     assert_eq!(status.state(), "degraded");
     assert!(status.last_error.lock().unwrap().is_some());
-    // Failures accumulate; one is not recorded twice for the same pass.
     assert!(r.pass().is_err());
     assert_eq!(status.consecutive_failures.load(Ordering::Relaxed), 2);
 }

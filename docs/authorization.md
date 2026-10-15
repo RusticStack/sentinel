@@ -30,7 +30,7 @@ Effective repository authority is the intersection of:
 | Reader | Only explicitly granted read access; cannot run even if a stale/oversized grant contains the run bit. | None. |
 | Service account | Only its home tenant, live non-admin membership and explicit repo/actions, capped by credential scopes. | None, including when its supplied scope contains admin bits. |
 
-Repository permission bits are `READ` (1), `RUN` (2), `WRITE_SECRETS` (4). Admin scope bits are `TENANT_ADMIN` (8) and `PLATFORM_ADMIN` (16); they cannot be stored in repository grants. These are internal database bit positions, not the OAuth scope vocabulary; fine-grained OAuth scopes are checked in addition.
+Repository permission bits are `READ` (1), `RUN` (2), `WRITE_SECRETS` (4). Admin scope bits are `TENANT_ADMIN` (8) and `PLATFORM_ADMIN` (16); they cannot be stored in repository grants. These are internal database bit positions, not the OAuth scope vocabulary; fine-grained OAuth scopes are checked in addition. Permission and scope bit positions and the OAuth scope wire names are persisted, so renumbering silently changes every stored grant; an undefined bit is refused when a row is read, so a corrupt or newer row cannot widen authority. A scope is only a ceiling on `Permissions`, a repository operator does not implicitly gain `WRITE_SECRETS` or administration, and the audience is stored as an integer in `oauth_*.resource`.
 
 Secret-write delegation is independent: an operator's run grant never grants it implicitly. An explicit secret-write grant may be given to a reader or operator; no role has a plaintext secret read-back operation.
 

@@ -1,18 +1,3 @@
-//! Recipe-measurement driver (bench/k07-recipes.sh): run ONE real
-//! attempt of a recipe pipeline through the worker's own path — workspace,
-//! pinned checkout, digest-pinned image pull, cache restore, rootless
-//! Podman execution of every declared step, and cache publication — then
-//! print one JSON record on stdout describing what the attempt measured.
-//!
-//! The record is the attempt's own summary plus the cache carrier's
-//! per-entry outcomes: lookup/clone/commit timings, hit or the stable
-//! `Miss` reason, staged/reused/dirty byte split, publish answer and the
-//! costly-hit flag. Nothing is simulated; a failed pull or checkout is the
-//! attempt's recorded verdict, not a driver error.
-//!
-//! Linux only — the worker crate is empty elsewhere; the stub main on
-//! other targets just refuses.
-
 #[cfg(target_os = "linux")]
 mod imp {
     use std::{
@@ -63,8 +48,6 @@ mod imp {
         }
     }
 
-    /// Step output teed to a file so the harness can show a bounded tail on
-    /// failure; discarded entirely when no path was given.
     struct Tee(Option<std::fs::File>);
     impl Output for Tee {
         fn write(&self, step: u32, stream: sentinel_protocol::logs::Stream, bytes: &[u8]) {
@@ -182,8 +165,6 @@ mod imp {
             }
         };
         let (recipe, case) = (args.recipe.as_str(), args.case.as_str());
-        // The runtime must be rootless Podman on cgroup v2; probe before any
-        // attempt work so a missing runtime is a driver-level blocked record.
         if let Err(e) = podman::probe() {
             return fail(recipe, case, format!("podman probe: {e}"));
         }
@@ -198,8 +179,7 @@ mod imp {
         let Some(job_index) = compiled.jobs.iter().position(|j| j.name == args.job) else {
             return fail(recipe, case, format!("job {} not in pipeline", args.job));
         };
-        // The spec's image must agree in name with --image; the pin comes from
-        // the flag, exactly as a controller resolves it for the run.
+        // The pin comes from --image, as a controller resolves it; the spec fixes only the name.
         let spec_image = match ImageRef::parse(&compiled.jobs[job_index].spec.image) {
             Ok(i) => i,
             Err(_) => return fail(recipe, case, "spec image unparsable".into()),

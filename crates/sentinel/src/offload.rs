@@ -1,7 +1,3 @@
-//! The controller's optional external S3 copy: the `sentinel_s3`
-//! client adapted to the store's [`Bucket`] and read-through [`Remote`]
-//! seams, and the replicator's thread.
-
 use std::{
     io::Write,
     sync::{
@@ -20,9 +16,7 @@ use sentinel_store::{
 
 /// Pages one listing walks at most (1,000 keys or uploads each).
 const MAX_LIST_PAGES: usize = 16;
-/// The pause between passes with nothing to do.
 const IDLE: Duration = Duration::from_secs(5);
-/// The longest back-off after failures.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 pub struct S3Bucket {
@@ -36,7 +30,6 @@ impl S3Bucket {
     pub fn client(&self) -> &Client {
         &self.client
     }
-    /// A key relative to the prefix, back from a full one.
     fn relative<'a>(&self, full: &'a str) -> Option<&'a str> {
         full.strip_prefix(self.client.config().prefix.as_str())
     }
@@ -54,8 +47,6 @@ fn metadata(blake3: Option<&str>) -> Vec<(&str, &str)> {
     blake3.map(|b| ("blake3", b)).into_iter().collect()
 }
 
-/// `2026-09-28T12:00:00.000Z` as Unix milliseconds; `None` when it is not
-/// that shape.
 pub fn iso_ms(text: &str) -> Option<i64> {
     let b = text.as_bytes();
     if b.len() < 20
@@ -73,7 +64,6 @@ pub fn iso_ms(text: &str) -> Option<i64> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
         return None;
     }
-    // Days from the civil date (Howard Hinnant's algorithm).
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -223,10 +213,6 @@ impl Remote for S3Bucket {
     }
 }
 
-/// The replicator's thread: a pass, then at once again while there is more
-/// to do, every [`IDLE`] when there is not, and backing off (1 s doubling
-/// to [`MAX_BACKOFF`]) while passes fail. Degraded and recovered moments
-/// are logged once each.
 pub struct Running {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,

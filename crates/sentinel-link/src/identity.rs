@@ -1,9 +1,3 @@
-//! A generated TLS identity: one self-signed certificate and its key.
-//!
-//! The fingerprint — BLAKE3 of the certificate's DER — is the identity. The
-//! controller stores only that; the key never leaves the machine it was made
-//! on. Regenerating means becoming a different worker.
-
 use std::path::Path;
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -11,14 +5,10 @@ use sentinel_auth::secret::Digest;
 
 use crate::{Error, Result};
 
-/// Where [`Identity::load_or_generate`]'s identity came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
-    /// Read from the files a previous start saved.
     Loaded,
-    /// Generated: there were no files.
     Generated,
-    /// Generated after removing one file left without the other.
     Recovered,
 }
 
@@ -34,8 +24,7 @@ impl std::fmt::Debug for Identity {
 }
 
 impl Identity {
-    /// Generate a fresh identity. `name` is a label inside the certificate for
-    /// operators reading it; it is not what the controller trusts.
+    /// `name` is a label for operators reading the certificate; the controller does not trust it.
     pub fn generate(name: &str) -> Result<Identity> {
         let generated = rcgen::generate_simple_self_signed([name.to_owned()])
             .map_err(|e| Error::Identity(e.to_string()))?;
@@ -47,7 +36,6 @@ impl Identity {
         })
     }
 
-    /// BLAKE3 of the certificate DER: what the other side pins.
     pub fn fingerprint(&self) -> Digest {
         fingerprint_of(&self.cert)
     }
@@ -60,29 +48,15 @@ impl Identity {
         (self.cert, self.key)
     }
 
-    /// Persist as two PEM files beside each other. The key file is written
-    /// owner-only where the platform supports it; it is the worker's secret.
-    ///
-    /// Each file is written whole to a sibling, synced and renamed into
-    /// place, so neither is ever seen half-written. The key goes first and
-    /// the certificate last: the certificate is the commit marker, and a
-    /// crash between the two leaves a key alone, which
-    /// [`Identity::load_or_generate`] recognizes as a save that never
-    /// finished and replaces.
     pub fn save(&self, cert_path: &Path, key_path: &Path) -> Result<()> {
         let cert_pem = pem_block("CERTIFICATE", self.cert.as_ref());
         let key_pem = pem_block("PRIVATE KEY", self.key.secret_der());
+        // Key first, certificate last: the certificate is the commit marker.
         write_atomic(key_path, key_pem.as_bytes(), true)?;
         write_atomic(cert_path, cert_pem.as_bytes(), false)?;
         Ok(())
     }
 
-    /// Load the identity saved at these paths, or generate and save one when
-    /// there is none. Exactly one of the two files present is a first save
-    /// that a crash cut short (or a file lost since): the identity was never
-    /// handed out whole, or cannot be used any more, so the orphan is
-    /// removed and a new identity generated — [`Origin::Recovered`] says so,
-    /// because a new fingerprint has to be enrolled afresh.
     pub fn load_or_generate(
         name: &str,
         cert_path: &Path,
@@ -133,7 +107,6 @@ fn pem_block(label: &str, der: &[u8]) -> String {
     out
 }
 
-/// Standard base64 with padding; small enough not to warrant a dependency.
 fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -151,9 +124,6 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-/// Write `bytes` to `path` all at once: into a sibling file created
-/// exclusively (owner-only when `private`), synced, then renamed over
-/// `path`, and the directory synced so the rename itself survives a crash.
 fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
     use std::io::Write;
     let name = path
@@ -163,8 +133,7 @@ fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<()>
     tmp_name.push(name);
     tmp_name.push(".tmp");
     let tmp = path.with_file_name(tmp_name);
-    // A leftover of a crashed save is not ours to reuse: it may have been
-    // made readable by someone else.
+    // A leftover from a crashed save may be readable by others; never reuse it.
     match std::fs::remove_file(&tmp) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -255,8 +224,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A first save that stopped after one file must not wedge every later
-    /// start: the orphan is replaced, and the caller is told.
     #[test]
     fn a_lone_file_from_an_interrupted_save_is_replaced() {
         for lost in ["worker.crt", "worker.key"] {

@@ -1,6 +1,3 @@
-//! Store behavior: tenant-owned bindings, sealed credentials, rotation and
-//! revocation with compare-and-set, ref and destination policy, GitHub App
-//! installation lifecycle, and migration that invents no binding.
 use rusqlite::Connection;
 use sentinel_auth::sealed::Key;
 use sentinel_core::{
@@ -142,7 +139,6 @@ fn generic_binding_needs_no_forge_and_credentials_are_tenant_sealed() {
         sources::metadata(&f.conn, f.bob, f.repo),
         Err(Error::NotFound)
     ));
-    // Another account cannot bind this repository even with a valid version.
     let tx = f.conn.transaction().unwrap();
     assert!(
         sources::bind(
@@ -163,8 +159,6 @@ fn generic_binding_needs_no_forge_and_credentials_are_tenant_sealed() {
         .is_err()
     );
     tx.rollback().unwrap();
-    // The host-local path is the operator's own authority: no membership is
-    // required, but the attribution is recorded.
     let (actor_id, repo) = (f.alice.user, f.repo);
     assert_eq!(
         with(&mut f, Authority::HostLocal, Some(actor_id), repo, 1).unwrap(),
@@ -180,7 +174,6 @@ fn generic_binding_needs_no_forge_and_credentials_are_tenant_sealed() {
         .unwrap();
     assert_eq!(actor, Some(*f.alice.user.as_bytes()));
     assert_eq!(action, "bind");
-    // Copying ciphertext to another owned repository fails its AEAD context.
     let (bob, other_repo) = (f.bob, f.other_repo);
     with(&mut f, Authority::credential(bob), None, other_repo, 0).unwrap();
     f.conn
@@ -242,7 +235,6 @@ fn rotation_revocation_ref_policy_and_stale_updates() {
         )
         .unwrap();
     assert!(sources::issue(&f.conn, f.tenant, f.repo, &f.key, NOW).is_err());
-    // A suspended tenant is not reported as usable either.
     assert!(matches!(
         sources::metadata_trusted(&f.conn, f.repo),
         Err(Error::NotFound)
@@ -296,9 +288,8 @@ fn destination_policy_and_credential_transport_cannot_be_bypassed() {
 
 #[test]
 fn a_manual_remote_cannot_name_an_internal_destination() {
-    // The worker fetches a manual remote from inside the deployment's
-    // network, so a client may name only a public DNS name: no IP literal in
-    // any notation, bare hostname or private-use suffix.
+    // The worker fetches manual remotes from inside the deployment network, so a client may name only
+    // a public DNS name: no IP literal in any notation, bare hostname or private-use suffix.
     for allowed in [
         "https://git.example.com/team/repo.git",
         "https://git.example.com:8443/team/repo.git",
@@ -345,7 +336,6 @@ fn installation_lifecycle_requires_binding_and_fresh_permissions() {
         credential: &Credential::Public,
         forge: Some((id, 91)),
     };
-    // Unbound installations authorize nothing, even for a valid binding.
     assert!(
         sources::bind(
             &tx,
@@ -429,14 +419,11 @@ fn a_transfer_never_reauthorizes_the_old_accounts_bindings() {
     .unwrap();
     tx.commit().unwrap();
     assert!(sources_forge::grant(&f.conn, f.tenant, f.repo).is_ok());
-    // The installation now belongs to a different account: the binding is
-    // revoked rather than silently following the transfer.
     let tx = f.conn.transaction().unwrap();
     sources_forge::refresh(&tx, snapshot(99, 1), NOW).unwrap();
     tx.commit().unwrap();
     assert!(sources_forge::grant(&f.conn, f.tenant, f.repo).is_err());
     assert!(sources::metadata_trusted(&f.conn, f.repo).unwrap().revoked);
-    // Binding an unknown installation by hand is refused.
     let tx = f.conn.transaction().unwrap();
     assert!(matches!(
         registration::bind_installation_trusted(&tx, id, f.other, NOW),

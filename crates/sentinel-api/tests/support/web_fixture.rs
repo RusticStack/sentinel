@@ -1,11 +1,3 @@
-//! A controller seeded the way a person finds one: two organizations with
-//! repositories, three members with different roles and a pending
-//! applicant, a worker with capacity and labels, a diamond run with a
-//! passed, a failed (with a gap in its log), a running and a blocked job,
-//! filterable push and pull-request runs, a run with a large log, a job the
-//! fleet cannot place, and a pending GitHub check. Shared by the web API
-//! tests and the real-browser test.
-
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -50,7 +42,6 @@ pub struct Fixture {
     server: Option<sentinel_api::Server>,
     pub base: String,
     pub root: UserId,
-    /// `Bearer sntl_…` for root with every permission.
     pub auth: String,
     pub acme: TenantId,
     pub beta: TenantId,
@@ -64,9 +55,7 @@ pub struct Fixture {
     pub diamond: RunId,
     pub jobs: std::collections::HashMap<&'static str, JobId>,
     pub attempts: std::collections::HashMap<&'static str, (AttemptId, Fence)>,
-    /// The running job's attempt, whose log a test may keep appending to.
     pub live: (RunId, JobId, AttemptId, Fence),
-    /// Next sequence of the live log.
     pub live_seq: std::sync::atomic::AtomicU64,
     pub bulk: RunId,
     pub bulk_attempt: AttemptId,
@@ -136,14 +125,12 @@ fn pipeline(text: &str) -> String {
     text.replace("IMAGE", BUSYBOX)
 }
 
-/// A pipeline compiled and pinned the way dispatch does it.
 fn spec(pipeline_text: &str, sha: &str, ref_name: &str) -> RunSpec {
     let compiled = compile_str(&pipeline(pipeline_text)).expect("fixture pipeline compiles");
     let source = PinnedSource::new("https://github.com/acme/app.git", sha, Some(ref_name)).unwrap();
     RunSpec::new(source, compiled).unwrap()
 }
 
-/// Create a run the way `POST …/runs` does, with explicit provenance.
 #[allow(clippy::too_many_arguments)]
 fn create_run(
     store: &Store,
@@ -271,7 +258,6 @@ fn step(index: u32, id: &str, outcome: StepOutcome, ms: u64) -> StepRecord {
     }
 }
 
-/// Append `text` to a log as frames of at most one frame's bytes.
 fn write_log(
     logs: &LogStore,
     (run, job, attempt): (RunId, JobId, AttemptId),
@@ -298,14 +284,11 @@ fn write_log(
 }
 
 impl Fixture {
-    /// Seed everything. `bulk_mib` sizes the large log's big step.
     pub fn new(bulk_mib: usize) -> Fixture {
         Fixture::serving(bulk_mib, None)
     }
 
-    /// As [`Fixture::new`], with the deployment's public URL: the origin
-    /// browsers use (the web interface's), which sign-in checks `Origin`
-    /// against.
+    /// Sign-in checks `Origin` against `public_url`, so browser tests pass the web origin.
     pub fn serving(bulk_mib: usize, public_url: Option<String>) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let store =
@@ -393,8 +376,6 @@ impl Fixture {
                 )
             })
             .unwrap();
-        // People: an operator and a reader of acme with passwords, and an
-        // applicant waiting for approval.
         let invite = |role: Role| {
             store
                 .writer()
@@ -494,7 +475,6 @@ impl Fixture {
         .unwrap();
         let base = format!("http://{}", server.local_addr());
 
-        // The diamond: alpha passed, beta failed, gamma running, zeta blocked.
         let (diamond, _) = create_run(
             &store,
             root,
@@ -581,7 +561,6 @@ impl Fixture {
             Stream::Stdout,
             b"go: downloading modules\n",
         );
-        // A hole: frame 2 was never stored.
         seq += 1;
         let hole = seq;
         let mut unit = Vec::new();
@@ -656,8 +635,6 @@ impl Fixture {
         );
         attempts.insert("gamma", gamma);
 
-        // A large log: a short first step, then `bulk_mib` MiB of numbered
-        // 128-byte lines, then a needle near the end.
         let (bulk, bulk_jobs) = create_run(
             &store,
             root,
@@ -736,7 +713,6 @@ impl Fixture {
             },
         );
 
-        // Runs to filter by: a pull request and a feature branch in `app`.
         let (pr_run, _) = create_run(
             &store,
             root,
@@ -759,7 +735,6 @@ impl Fixture {
             "push",
             None,
         );
-        // A job no worker can take.
         let (stuck_run, _) = create_run(
             &store,
             root,
@@ -772,7 +747,6 @@ impl Fixture {
             None,
         );
 
-        // A check GitHub has not accepted yet, two minutes old.
         let (tenant_bytes, repo_bytes, run_bytes) =
             (*acme.as_bytes(), *app.as_bytes(), *diamond.as_bytes());
         store
@@ -825,7 +799,6 @@ impl Fixture {
         }
     }
 
-    /// Append one line to the running job's log (step `step`).
     pub fn live_line(&self, step: u32, text: &str) {
         let seq = self
             .live_seq
@@ -847,7 +820,6 @@ impl Fixture {
             .unwrap();
     }
 
-    /// A `Bearer sntl_…` for `user` with `permissions`.
     pub fn bearer(&self, user: UserId, permissions: P) -> String {
         let granted = tokens::provision(
             &self.store,
@@ -858,8 +830,6 @@ impl Fixture {
         format!("Bearer {}", sentinel_auth::token::format(&granted.secret))
     }
 
-    /// A `Bearer sntl_…` for a member who is no platform administrator:
-    /// every tenant and repository permission its memberships allow.
     pub fn member(&self, user: UserId) -> String {
         self.bearer(user, P::REPOSITORY.union(P::TENANT_ADMIN))
     }
@@ -871,7 +841,6 @@ impl Fixture {
     }
 }
 
-/// One HTTP request: status, headers and JSON (or text) body.
 pub fn call(
     base: &str,
     method: &str,

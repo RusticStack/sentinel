@@ -79,7 +79,6 @@ fn create_run_persists_spec_and_seeds_job_states() {
         f.store.read(jobs::pick_ready).unwrap(),
         Some((tenant, ids[0]))
     );
-    // Other tenants see nothing.
     let other = TenantId::new();
     assert!(matches!(
         f.store.read(|c| runs::get_run_spec(c, other, run)),
@@ -105,7 +104,6 @@ fn spec_is_written_once_per_run() {
         matches!(again, Err(Error::Sqlite(_))),
         "same run id cannot be re-created"
     );
-    // The failed transaction left the original spec and jobs intact.
     assert_eq!(
         f.store
             .read(|c| runs::run_jobs(c, tenant, run))
@@ -127,7 +125,6 @@ fn rerun_is_a_new_attempt_of_the_same_spec() {
         .unwrap();
     let job = ids[0];
     let w = f.store.writer();
-    // Attempt 1 fails.
     let (_, fence) = w
         .write(move |tx| {
             runs::resolve_image(tx, tenant, job, DIGEST, "linux/amd64")?;
@@ -161,7 +158,6 @@ fn rerun_is_a_new_attempt_of_the_same_spec() {
         )
     })
     .unwrap();
-    // Rerun: queued again, history cleared, fence kept.
     assert_eq!(
         w.write(move |tx| runs::rerun_job(tx, tenant, job, UnixMillis(50)))
             .unwrap(),
@@ -173,7 +169,6 @@ fn rerun_is_a_new_attempt_of_the_same_spec() {
     assert_eq!(row.timestamps.queued, Some(UnixMillis(50)));
     assert_eq!(row.timestamps.running, None);
     assert_eq!(row.timestamps.terminal, None);
-    // Attempt 2 gets fence 2; the old worker's fence is now stale.
     let (_, fence2) = w
         .write(move |tx| {
             jobs::lease(
@@ -200,7 +195,6 @@ fn rerun_is_a_new_attempt_of_the_same_spec() {
             sentinel_core::TransitionError::StaleFence { .. }
         ))
     ));
-    // The spec never changed.
     assert_eq!(
         f.store
             .read(|c| runs::get_run_spec(c, tenant, run))

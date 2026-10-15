@@ -1,14 +1,12 @@
 <script setup lang="ts">
 import type { StoragePolicy } from "~~/shared/types/api";
 
-// One storage policy: a quota and two retentions, each left blank to
-// inherit. `inherited` shows what blank means here — the tenant's value for
-// a repository, the deployment's for a tenant.
+// Blank means inherit: the tenant's value for a repository, the deployment's for a tenant.
 const props = defineProps<{
   id: string;
   policy: StoragePolicy;
   inherited: { quota_bytes: number; log_retention_ms: number; artifact_retention_ms: number };
-  /** A repository may only narrow: its retentions cap at these. */
+  // A repository may only narrow: its retentions cap at these.
   maxLogDays?: number;
   maxArtifactDays?: number;
 }>();

@@ -4,10 +4,7 @@ fn bench() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sentinel-bench"))
 }
 
-/// Whether git can read the checkout the runner was built from. Where it
-/// cannot (for example Linux git on a worktree that Windows git created,
-/// whose `.git` names a `D:/` path), the runner must refuse to measure
-/// rather than write a record without its source.
+/// False where git cannot read the checkout (a Windows-created worktree seen from Linux).
 fn source_readable() -> bool {
     Command::new("git")
         .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
@@ -15,7 +12,6 @@ fn source_readable() -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
-/// The refusal a runner without readable provenance gives: no record.
 fn refused_for_provenance(out: &Output) -> bool {
     !out.status.success()
         && out.stdout.is_empty()
@@ -76,14 +72,10 @@ fn direct_noop_emits_one_machine_readable_record() {
     assert_eq!(summary["count"], 3);
     assert!(summary["min_ns"].as_u64().unwrap() <= summary["median_ns"].as_u64().unwrap());
     assert!(summary["p95_ns"].as_u64().unwrap() <= summary["max_ns"].as_u64().unwrap());
-    // Spread is recorded, and three samples cannot support a tail: the
-    // record says its p95 is the maximum.
     assert!(summary["mean_ns"].as_u64().unwrap() > 0);
     assert!(summary["stddev_ns"].as_u64().is_some());
     assert!(summary["mad_ns"].as_u64().is_some());
     assert_eq!(summary["p95_is_max"], true);
-    // One unmeasured run preceded the samples; an undeclared cache state is
-    // never presented as verified.
     assert_eq!(record["warm_state_basis"], "warmup-run");
     assert!(record["conditions"].is_object());
     assert!(record.get("interleave").is_none());
@@ -94,8 +86,6 @@ fn direct_noop_emits_one_machine_readable_record() {
 
 #[test]
 fn a_record_names_its_source_and_compiler_even_outside_the_checkout() {
-    // The compiler is recorded at build time, so it does not depend on PATH
-    // at run time; the commit is asked of the build's own checkout.
     let out = bench()
         .current_dir(std::env::temp_dir())
         .args([
@@ -183,8 +173,6 @@ fn podman_runtime_requires_image() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("--image is required"));
 }
 
-/// A contract whose reference host is not this one is refused before
-/// anything runs, and nothing is written.
 #[test]
 fn a_contract_for_another_host_measures_nothing() {
     let dir = std::env::temp_dir().join(format!("sentinel-bench-drift-{}", std::process::id()));

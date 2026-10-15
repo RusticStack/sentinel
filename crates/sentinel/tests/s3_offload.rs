@@ -1,7 +1,4 @@
-//! End to end against real S3 services: the controller's
-//! replicator over `sentinel_s3`, for every endpoint `$SENTINEL_S3_ENDPOINTS`
-//! lists (`crates/sentinel-s3/tests/endpoints.sh`). Without the variable it
-//! reports that it was skipped, never a false pass.
+//! Without SENTINEL_S3_ENDPOINTS the test reports a skip, never a false pass.
 #![cfg(all(target_os = "linux", feature = "server"))]
 
 use std::sync::Arc;
@@ -176,7 +173,6 @@ fn scenario(e: &Endpoint, prefix: &str) -> Result<(), String> {
     );
     f.objects.set_admission(Arc::clone(&admission));
 
-    // Copied and verified: one request and a multipart upload.
     let small = f.put(b"a small artifact");
     let big: Vec<u8> = (0..(11u32 << 20)).map(|i| (i % 249) as u8).collect();
     let large = f.put(&big);
@@ -192,7 +188,6 @@ fn scenario(e: &Endpoint, prefix: &str) -> Result<(), String> {
         return Err(format!("the multipart copy reads back as {head:?}"));
     }
 
-    // Evicted, then fetched back verified on read.
     let r = f.replicator(
         Arc::clone(&bucket),
         Settings {
@@ -212,11 +207,9 @@ fn scenario(e: &Endpoint, prefix: &str) -> Result<(), String> {
     r.pass()?;
     let totals = f.store.read(offload::totals).map_err(|x| x.to_string())?;
     if totals.local_bytes != 0 {
-        // The one-byte budget evicts them again right away.
         return Err(format!("{} bytes still local", totals.local_bytes));
     }
 
-    // A multipart upload a crash interrupted after its first part resumes.
     let body: Vec<u8> = (0..(10u32 << 20) + 3).map(|i| (i % 241) as u8).collect();
     let resumed = f.put(&body);
     let key = objects::remote_key(f.tenant, &resumed);
@@ -238,8 +231,6 @@ fn scenario(e: &Endpoint, prefix: &str) -> Result<(), String> {
         return Err(format!("the resumed upload reads back as {head:?}"));
     }
 
-    // An outage: a replicator pointed at nothing fills the backlog past its
-    // budget and closes admission; the real one drains it and reopens.
     let dead = Arc::new(S3Bucket::new(client(e, "http://127.0.0.1:9", prefix)));
     let down = f.replicator(
         dead,
@@ -272,7 +263,6 @@ fn scenario(e: &Endpoint, prefix: &str) -> Result<(), String> {
         return Err("draining the backlog did not reopen admission".into());
     }
 
-    // A reclaimed object's copy is deleted.
     let tenant = f.tenant;
     f.store
         .writer()
@@ -292,7 +282,6 @@ fn scenario(e: &Endpoint, prefix: &str) -> Result<(), String> {
     {
         return Err("a reclaimed object's copy stayed".into());
     }
-    // Leave the bucket as found.
     for key in bucket.list("").map_err(|x| x.message)? {
         bucket.delete(&key).map_err(|x| x.message)?;
     }

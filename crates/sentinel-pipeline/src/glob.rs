@@ -1,12 +1,4 @@
-//! One file-path/ref-segment glob, shared by `hash_files` patterns and source
-//! policies so a repository learns one wildcard rule.
-//!
-//! `*` matches any run of characters inside one segment; segments themselves
-//! are separated by `/`. `**` is a whole-segment wildcard handled by callers
-//! that walk segments ([`crate::policy::pattern_matches`] for refs,
-//! `hash_files` for directory trees).
-
-/// An iterative, linear-time match of one glob segment against one name.
+/// Linear time: only the last `*` is a backtrack point, so no pattern can cause exponential work.
 pub(crate) fn segment(pattern: &str, name: &str) -> bool {
     let (p, n) = (pattern.as_bytes(), name.as_bytes());
     let (mut pi, mut ni) = (0, 0);

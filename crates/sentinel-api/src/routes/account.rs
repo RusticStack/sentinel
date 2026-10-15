@@ -1,26 +1,3 @@
-//! An account's own security over the API: second-factor enrollment, recovery
-//! codes, password change and the state the web interface shows for them.
-//!
-//! Every route here is for a **browser session** with its CSRF header. A bearer
-//! credential or OAuth token — whatever scopes it carries — cannot enroll a
-//! factor, reissue codes or change a password: those change who can
-//! authenticate, which only the person at a signed-in browser may do.
-//!
-//! Proof rules, in one place:
-//! - Starting an enrollment needs the account's password when it has one, and
-//!   otherwise (a GitHub-only account) a session issued within the step-up
-//!   window. A stolen cookie alone enrolls nothing on a password account, and
-//!   a GitHub-only account is never locked out of its first factor.
-//! - Confirming needs the code from the app. It spends the code's time step, so
-//!   the same code cannot step up afterwards.
-//! - Reissuing recovery codes needs a fresh step-up.
-//! - Changing the password needs the current password and, with a second
-//!   factor enrolled, a fresh step-up; every session and grant of the account
-//!   ends with it.
-//!
-//! Wrong proofs are one `forbidden` whatever was wrong. Anything that hashes a
-//! password draws on the sign-in admission budget first.
-
 use sentinel_auth::cookie;
 use sentinel_core::UnixMillis;
 use sentinel_protocol::error::{ApiError, ErrorCode};
@@ -40,15 +17,11 @@ use super::{
 };
 use crate::{State, auth::Via, http::Request};
 
-/// Issuer shown by authenticator apps next to the account label.
 const ISSUER: &str = "Sentinel";
-/// A code from an app is six digits and a recovery code about a dozen
-/// characters; nothing longer is a code.
+/// Longest code accepted: a TOTP is six digits, a recovery code about a dozen characters.
 const MAX_CODE_BYTES: usize = 64;
-/// Largest body any route here takes: two passwords at most.
 const MAX_BODY_BYTES: usize = 4 << 10;
 
-/// Route one request; `None` when the path is not one of these.
 pub(super) fn route(
     state: &State,
     request: &mut Request,
@@ -65,8 +38,6 @@ pub(super) fn route(
     })
 }
 
-/// The caller's browser session: the cookie value, the validated session and
-/// the instant it was judged at. CSRF was enforced by [`identify`].
 pub(crate) fn browser_session(
     state: &State,
     request: &Request,
@@ -100,7 +71,6 @@ fn master_key(state: &State) -> Result<&sentinel_auth::sealed::Key, ApiError> {
     })
 }
 
-/// A body that may be absent: an empty one is the default.
 fn optional_body<T: for<'de> Deserialize<'de> + Default>(
     request: &mut Request,
 ) -> Result<T, ApiError> {
@@ -123,9 +93,6 @@ fn admit(state: &State, request: &Request) -> Result<(), ApiError> {
     }
 }
 
-/// `GET /api/v1/me/security`: what the account page shows — whether a local
-/// password exists, the second factor's state, and the linked identities.
-/// Metadata only: no seed, no code, no subject.
 fn security(state: &State, request: &mut Request) -> Route {
     let (_, session, now) = browser_session(state, request, false)?;
     let user = session.user;
@@ -160,15 +127,9 @@ fn security(state: &State, request: &mut Request) -> Route {
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct EnrollBody {
-    /// The account's password; required when it has one.
     password: Option<String>,
 }
 
-/// `POST /api/v1/mfa/enroll {password?}`: begin enrolling TOTP. Returns the
-/// `otpauth://` URI once; nothing about authentication changes until
-/// `…/confirm`. `409` when a factor is already confirmed (replacing one is
-/// removal under step-up first), and a second `enroll` supersedes an
-/// unconfirmed one.
 fn enroll(state: &State, request: &mut Request) -> Route {
     let (presented, session, now) = browser_session(state, request, true)?;
     let key = master_key(state)?;
@@ -182,7 +143,6 @@ fn enroll(state: &State, request: &mut Request) -> Route {
     }
     let proof: EnrollBody = optional_body(request)?;
     match (&username, proof.password) {
-        // The password is the proof a password account can give.
         (Some(_), Some(password)) => {
             admit(state, request)?;
             if password.is_empty() || password.len() > sentinel_auth::password::MAX_LEN {
@@ -207,8 +167,7 @@ fn enroll(state: &State, request: &mut Request) -> Route {
                 "the account password is required to enroll",
             ));
         }
-        // A GitHub-only account has no password: the sign-in itself, within
-        // the step-up window, is the proof.
+        // A GitHub-only account has no password: a fresh sign-in is its proof.
         (None, _) => {
             if !session.signed_in_within(state.sessions, now) {
                 return Err(err(
@@ -231,11 +190,7 @@ struct ConfirmBody {
     code: String,
 }
 
-/// `POST /api/v1/mfa/enroll/confirm {code}`: a current code from the app
-/// proves it holds the seed. Returns the recovery codes **once** and stamps
-/// the session as stepped up. A wrong code is `forbidden` and the enrollment
-/// stays pending; none begun is `404`; the code's time step is spent, so the
-/// same code cannot step up afterwards.
+/// The code's time step is spent, so the same code cannot step up afterwards.
 fn confirm(state: &State, request: &mut Request) -> Route {
     let (presented, session, now) = browser_session(state, request, true)?;
     let key = master_key(state)?;
@@ -256,9 +211,6 @@ fn confirm(state: &State, request: &mut Request) -> Route {
     }))
 }
 
-/// `POST /api/v1/mfa/recovery-codes`: a fresh set of ten, replacing the old
-/// one entirely, shown once. A fresh step-up first (`forbidden` with
-/// `details.step_up`), and `404` without an enrolled factor.
 fn recovery_codes(state: &State, request: &mut Request) -> Route {
     let (_, session, now) = browser_session(state, request, true)?;
     let codes = mfa::reissue_recovery_codes(&state.store, &session, state.sessions, now)
@@ -275,13 +227,6 @@ struct PasswordBody {
     new: String,
 }
 
-/// `POST /api/v1/password {current, new}`: change the local password. The
-/// current password is always needed; with a second factor a fresh step-up is
-/// too (`forbidden` with `details.step_up`). Success ends **every** session and
-/// OAuth grant of the account, this one included, and the response clears the
-/// cookie: sign in again with the new password. Anything wrong with the
-/// current password — or no local password at all — is one `forbidden`, and
-/// five wrong ones revoke the session.
 fn change_password(state: &State, request: &mut Request) -> Route {
     let (presented, session, now) = browser_session(state, request, true)?;
     admit(state, request)?;

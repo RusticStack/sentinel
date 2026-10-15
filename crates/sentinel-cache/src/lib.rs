@@ -1,20 +1,5 @@
-//! Worker-local cache metadata: the scope paths every entry lives under,
-//! the sealed-generation manifest format, and the explainable hit/miss
-//! vocabulary the worker reports. See `docs/cache.md` for the design and
-//! `docs/compatibility.md` for the versioned contract.
-//!
-//! Three cache classes exist because their validity rules differ
-//! (`sentinel_protocol::cache::Class`): `downloads` are tool-addressed
-//! blobs the installing tool validates itself, so they survive compatible
-//! lockfile edits and prefix keys; `dependencies` are exact
-//! materializations that may only serve a request whose recorded inputs
-//! match completely; `compiler` entries live in a stable toolchain
-//! namespace where the compiler performs input-level invalidation.
-//!
-//! Everything here is metadata. Corruption, incompatibility and truncation
-//! are `Miss` values, never build failures. Clone backends, publication
-//! leases, garbage collection and remote hydration ([`remote`]) build
-//! on what this crate owns: paths, formats and reasons.
+//! `downloads` survive compatible lockfile edits, `dependencies` need every recorded input to match, and `compiler` relies on input-level invalidation.
+//! Corruption, incompatibility and truncation are misses, never build failures.
 
 pub mod attach;
 pub mod clone;
@@ -34,6 +19,4 @@ pub use manifest::{Boundary, Compat, FileEntry, FilesBlob, Manifest, Request};
 pub use outcome::{Hit, Miss, Outcome};
 pub use scope::{Os, Platform, Scope};
 
-/// The cache root inside the worker's data directory — every scope path
-/// (`Scope::dir`) hangs under `<data_dir>/cache`.
 pub const CACHE_DIR: &str = "cache";

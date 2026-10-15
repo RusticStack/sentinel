@@ -160,6 +160,7 @@ Every command below takes the [shared client flags](#the-shared-client). `--tena
 | `sentinel job cancel JOB`, `sentinel job rerun JOB` | `POST /jobs/{id}/cancel\|rerun` | the cancel outcome, or the rerun job's state |
 | `sentinel log show ATTEMPT [--follow] [--step N]` | `GET /attempts/{id}/logs` | the log as the job wrote it; `--follow` waits until it is complete |
 | `sentinel log search ATTEMPT --text TEXT [--limit N]` | `GET /attempts/{id}/logs/search` | matching lines (`seq`, step, stream, text), default 100, at most 10,000 |
+| *(`log show --output json`)* | same | one document of at most 10,000 frames and 16 MiB of frame text, continued with `next_after` when cut (the first frame is always included): the listing is held whole before it prints, so it is bounded in bytes as well as frames, since 10,000 full 32 KiB frames would be about 320 MiB. Raising either limit needs a matching change to the memory budget |
 | `sentinel workers list [--tenant]` | `GET /workers?tenant` | pools and their workers with connection state and transport: `{path} {rtt}ms`, `{path} rtt=-` when the round trip was not measured, `transport=-` when the worker never reported (`sentinel api workers` prints the same lines) |
 | `sentinel workers drain\|undrain WORKER` | `POST /workers/{id}/drain\|undrain` | the new drain state (platform admin) |
 | `sentinel queue [--tenant] [--limit N]` | `GET /queue?tenant&limit` | waiting jobs, oldest first, with age and reason; the total when cut (`--limit` 1–500, default 100) |

@@ -1,11 +1,3 @@
-//! Log store behavior: frames are acknowledged only once written and
-//! synced, in sequence; a resend is accepted without a second copy; a
-//! sequence jump records a hole and a resend inside a hole fills it; the
-//! end marker completes the log with merged gaps — declared, observed and
-//! the never-stored tail; a torn tail is cut on reopen; sealed segments
-//! compress in the background; the sparse index seeks tails without
-//! re-reading the head; the size cap holds.
-
 use std::time::{Duration, Instant};
 
 use sentinel_core::{AttemptId, JobId, RunId};
@@ -42,8 +34,7 @@ fn wait_compressed(dir: &std::path::Path, seg: u32) {
     let done = dir.join(format!("seg-{seg:06}.z"));
     let plain = dir.join(format!("seg-{seg:06}"));
     let deadline = Instant::now() + Duration::from_secs(30);
-    // The compressor lands `.z`, fsyncs the directory and only then unlinks
-    // the plain segment — waiting for `.z` alone races the removal.
+    // Waiting for `.z` alone races the unlink of the plain segment.
     while !done.exists() || plain.exists() {
         assert!(Instant::now() < deadline, "seg-{seg:06} never compressed");
         std::thread::sleep(Duration::from_millis(25));
@@ -64,8 +55,6 @@ fn frames_are_stored_in_sequence_acknowledged_once_durable_and_completed_with_ga
             .unwrap(),
         Appended::Stored { through: 1 }
     );
-    // A jump is recorded as a hole, not refused: the frame still lands and
-    // the gap shows up for readers and in the end marker.
     assert_eq!(
         logs.append(run(), job(), attempt, &frame(3, "three\n"))
             .unwrap(),
@@ -76,13 +65,11 @@ fn frames_are_stored_in_sequence_acknowledged_once_durable_and_completed_with_ga
             .unwrap(),
         Appended::Stored { through: 4 }
     );
-    // A resend of a stored sequence is acknowledged, not written twice.
     assert_eq!(
         logs.append(run(), job(), attempt, &frame(1, "one\n"))
             .unwrap(),
         Appended::Duplicate { through: 4 }
     );
-    // A resend landing inside the hole fills it.
     assert_eq!(
         logs.append(run(), job(), attempt, &frame(2, "two\n"))
             .unwrap(),
@@ -109,7 +96,6 @@ fn frames_are_stored_in_sequence_acknowledged_once_durable_and_completed_with_ga
             .len(),
         1
     );
-    // A last_seq below what was stored is refused; past it is truncation.
     assert!(matches!(
         logs.finish(run(), job(), attempt, 1, &[]),
         Err(Error::Conflict)
@@ -117,15 +103,11 @@ fn frames_are_stored_in_sequence_acknowledged_once_durable_and_completed_with_ga
     logs.finish(run(), job(), attempt, 6, &[(9, 9)]).unwrap();
     let tail = logs.tail(run(), job(), attempt, 0, 10, None).unwrap();
     assert!(tail.complete);
-    // Declared (9,9) plus the truncated tail 5-6.
     assert_eq!(tail.gaps, vec![(5, 6), (9, 9)]);
-    // Nothing after the end.
     assert!(matches!(
         logs.append(run(), job(), attempt, &frame(3, "late\n")),
         Err(Error::Conflict)
     ));
-    // A second finish with the same last_seq is idempotent, a different
-    // one is refused.
     logs.finish(run(), job(), attempt, 6, &[]).unwrap();
     assert!(matches!(
         logs.finish(run(), job(), attempt, 7, &[]),
@@ -158,8 +140,6 @@ fn torn_tails_are_cut_on_reopen() {
     let dir = logs.attempt_dir(run(), job(), attempt);
     drop(logs);
     {
-        // A crash mid-write: a partial record on the segment, a partial
-        // entry on the index.
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -186,9 +166,7 @@ fn torn_tails_are_cut_on_reopen() {
     );
 }
 
-/// A power cut can persist a segment's new size without the data written
-/// into it: the unacknowledged tail reads back as zeros. It is cut like a
-/// torn record, and readers and the writer go on. Garbage that is not zeros still is.
+/// A zeroed tail from a power cut is cut like a torn record; other garbage is corrupt.
 #[test]
 fn a_zeroed_tail_from_a_power_cut_is_cut_but_garbage_is_corrupt() {
     let temp = tempfile::tempdir().unwrap();
@@ -246,7 +224,6 @@ fn sealed_segments_compress_and_still_read() {
     let temp = tempfile::tempdir().unwrap();
     let logs = LogStore::open(temp.path().join("logs")).unwrap();
     let attempt = AttemptId::new();
-    // 4 MiB of ~32 KiB frames crosses SEGMENT_BYTES: seg 0 seals.
     let text = "x".repeat(32 * 1024 - 18);
     for seq in 1..=140u64 {
         logs.append(run(), job(), attempt, &frame(seq, &text))
@@ -258,7 +235,6 @@ fn sealed_segments_compress_and_still_read() {
     assert!(!dir.join("seg-000000").exists());
     logs.finish(run(), job(), attempt, 140, &[]).unwrap();
     wait_compressed(&dir, 1);
-    // The compressed stream reads identically, seeks included.
     let tail = read_dir(&dir, 0, 300, None).unwrap();
     assert!(tail.complete);
     assert_eq!(tail.frames.len(), 140);
@@ -283,9 +259,7 @@ fn the_sparse_index_carries_step_line_and_time_checkpoints() {
     let dir = logs.attempt_dir(run(), job(), attempt);
     let index = std::fs::read(dir.join("index")).unwrap();
     assert_eq!(index[..4], *b"SNLI");
-    // Step-0 first frame, the 0→3 step change, line/byte totals grow.
     assert!(index.len() >= 6 + 41 * 2);
-    // The step filter serves frames of one step only.
     let tail = read_dir(&dir, 0, 50, Some(3)).unwrap();
     assert_eq!(tail.frames.len(), 10);
     assert!(tail.frames.iter().all(|f| f.step == 3));
@@ -306,7 +280,6 @@ fn reopen_resumes_the_sequence_and_the_cap() {
         logs.append(run(), job(), attempt, &frame(4, "d")).unwrap();
     }
     let logs = LogStore::open(temp.path().join("logs")).unwrap();
-    // The hole survives reopen; the fill still lands.
     assert_eq!(
         logs.append(run(), job(), attempt, &frame(2, "b")).unwrap(),
         Appended::Stored { through: 4 }
@@ -326,7 +299,6 @@ fn pre_d04_flat_logs_still_read() {
     let temp = tempfile::tempdir().unwrap();
     let logs = LogStore::open(temp.path().join("logs")).unwrap();
     let attempt = AttemptId::new();
-    // A flat log: frames then the end record, whole-file.
     let mut bytes = Vec::new();
     Record::Frame(frame(1, "old\n")).encode(&mut bytes).unwrap();
     Record::End {
@@ -376,8 +348,6 @@ fn an_attempt_log_is_capped() {
         logs.append(run(), job(), attempt, &f),
         Err(Error::InvalidInput("log size"))
     ));
-    // The refused tail still completes: last_seq passes what was stored
-    // and lands in the gaps.
     logs.finish(run(), job(), attempt, fits + 1, &[]).unwrap();
     let dir = logs.attempt_dir(run(), job(), attempt);
     let tail = read_dir(&dir, 0, 1, None).unwrap();
@@ -385,9 +355,6 @@ fn an_attempt_log_is_capped() {
     assert_eq!(tail.gaps, vec![(fits + 1, fits + 1)]);
 }
 
-/// A hole whose neighbours sit in a sealed segment survives a
-/// restart: a later fill is stored (not acked as a duplicate), and a finish
-/// without the fill still declares it.
 #[test]
 fn a_hole_in_a_sealed_segment_survives_a_reopen() {
     let full = "x".repeat(32 * 1024 - 18);
@@ -398,7 +365,6 @@ fn a_hole_in_a_sealed_segment_survives_a_reopen() {
             let logs = LogStore::open(temp.path().join("logs")).unwrap();
             logs.append(run(), job(), attempt, &frame(1, "one"))
                 .unwrap();
-            // Sequence 2 never arrives; 3..=140 seal the first segment.
             for seq in 3..=140u64 {
                 logs.append(run(), job(), attempt, &frame(seq, &full))
                     .unwrap();
@@ -406,7 +372,6 @@ fn a_hole_in_a_sealed_segment_survives_a_reopen() {
         }
         let logs = LogStore::open(temp.path().join("logs")).unwrap();
         let dir = logs.attempt_dir(run(), job(), attempt);
-        // A live mid-stream read already names the hole.
         assert_eq!(read_dir(&dir, 139, 10, None).unwrap().gaps, vec![(2, 2)]);
         if fill {
             assert_eq!(
@@ -427,9 +392,6 @@ fn a_hole_in_a_sealed_segment_survives_a_reopen() {
     }
 }
 
-/// Writers of attempts that never finish are closed when idle and
-/// capped in number; their logs then fall under retention, and a late frame
-/// reopens the log from disk exactly.
 #[test]
 fn idle_writers_close_are_capped_and_their_logs_expire() {
     let temp = tempfile::tempdir().unwrap();
@@ -443,20 +405,15 @@ fn idle_writers_close_are_capped_and_their_logs_expire() {
     assert_eq!(logs.open_writers(), 4, "the writer cap did not hold");
     assert_eq!(logs.close_idle(Duration::ZERO), 4);
     assert_eq!(logs.open_writers(), 0);
-    // A late frame reopens from disk and continues the sequence.
     assert_eq!(
         logs.append(run(), job(), attempts[0], &frame(2, "b"))
             .unwrap(),
         Appended::Stored { through: 2 }
     );
     logs.close_idle(Duration::ZERO);
-    // Nothing is held open any more, so the retention sweep reaches every
-    // log the database has released.
     assert_eq!(logs.sweep_dirs(256, |_| true).unwrap(), 10);
 }
 
-/// An API page is bounded in bytes and in decode work,
-/// says where to continue, and a step filter over a finished step says so.
 #[test]
 fn pages_are_bounded_and_a_finished_step_is_reported() {
     use sentinel_store::logs::{Page, read_page};
@@ -491,11 +448,9 @@ fn pages_are_bounded_and_a_finished_step_is_reported() {
         }
     }
     assert_eq!(seen, (1..=80).collect::<Vec<_>>());
-    // Step 0 is over: a poll past its last frame learns so at once.
     let step0 = read_page(&dir, 40, page, Some(0)).unwrap();
     assert!(step0.frames.is_empty() && step0.step_done);
     assert!(!read_page(&dir, 79, page, Some(1)).unwrap().step_done);
-    // The scan bound cuts a filtered read that matches nothing.
     let small = Page {
         scan: 64 * 1024,
         ..page
@@ -509,10 +464,6 @@ fn pages_are_bounded_and_a_finished_step_is_reported() {
     );
 }
 
-/// The newest window of a failed step survives a later
-/// `if: always()` step that wrote more than a window, and a log without an
-/// end marker or live writer reports its real last frame, not the last
-/// sparse-index checkpoint.
 #[test]
 fn the_newest_page_of_a_step_ignores_later_steps_and_reaches_the_real_end() {
     use sentinel_store::logs::Page;
@@ -542,12 +493,10 @@ fn the_newest_page_of_a_step_ignores_later_steps_and_reaches_the_real_end() {
             (73..=200).collect::<Vec<_>>()
         );
         assert!(failed.step_done && failed.next_after.is_none());
-        // Frames past the last checkpoint exist only in the segment.
         for seq in 401..=430u64 {
             logs.append(run(), job(), attempt, &at_step(seq, 1, "late\n"))
                 .unwrap();
         }
-        // The writer goes with the store: no end marker, no frontier.
     }
     let logs = LogStore::open(temp.path().join("logs")).unwrap();
     assert_eq!(logs.last_seq(run(), job(), attempt).unwrap(), Some(430));
@@ -559,14 +508,12 @@ fn the_newest_page_of_a_step_ignores_later_steps_and_reaches_the_real_end() {
         (426..=430).collect::<Vec<_>>()
     );
     assert!(!newest.complete);
-    // A step that never wrote has no frames.
     let never = logs
         .newest_page(run(), job(), attempt, page, Some(7))
         .unwrap();
     assert!(never.frames.is_empty());
 }
 
-/// The byte bound keeps the newest frames, however long the step was.
 #[test]
 fn the_newest_page_holds_at_most_its_byte_bound_of_the_newest_frames() {
     use sentinel_store::logs::Page;
@@ -604,7 +551,6 @@ fn deferred_frames_are_readable_and_a_window_syncs_once_before_it_is_acknowledge
     let temp = tempfile::tempdir().unwrap();
     let logs = LogStore::open(temp.path().join("logs")).unwrap();
     let attempt = AttemptId::new();
-    // Nothing is open yet: there is nothing a sync could vouch for.
     assert!(matches!(logs.sync(attempt), Err(Error::Conflict)));
     for seq in 1..=5 {
         assert_eq!(
@@ -621,11 +567,9 @@ fn deferred_frames_are_readable_and_a_window_syncs_once_before_it_is_acknowledge
             Appended::Stored { through: seq }
         );
     }
-    // Written frames are visible to readers before the window is synced.
     let tail = logs.tail(run(), job(), attempt, 0, 10, None).unwrap();
     assert_eq!(tail.frames.len(), 5);
     logs.sync(attempt).unwrap();
-    // A second sync with nothing dirty is a no-op, not an error.
     logs.sync(attempt).unwrap();
     logs.finish(run(), job(), attempt, 5, &[]).unwrap();
     let dir = logs.attempt_dir(run(), job(), attempt);
@@ -645,13 +589,9 @@ fn a_deferred_hole_fill_is_on_disk_before_the_hole_is_recorded_closed() {
                 Appended::Stored { through }
             );
         }
-        // No `sync`: persisting the closed hole had to make the fill
-        // durable itself, so after a reopen its resend is a duplicate of
-        // bytes that are actually there.
     }
     let logs = LogStore::open(temp.path().join("logs")).unwrap();
     let tail = logs.tail(run(), job(), attempt, 0, 10, None).unwrap();
-    // Frames read back in the order they were written; the fill is there.
     let mut seqs = tail.frames.iter().map(|f| f.seq).collect::<Vec<_>>();
     seqs.sort_unstable();
     assert_eq!(seqs, vec![1, 2, 3]);
@@ -688,8 +628,6 @@ fn a_resent_deferred_frame_is_a_duplicate_and_a_reopen_keeps_what_was_written() 
             ),
         )
         .unwrap();
-        // The connection died before the window was acknowledged; the worker
-        // resends from its last acknowledgement.
         assert_eq!(
             logs.append_deferred(
                 run(),

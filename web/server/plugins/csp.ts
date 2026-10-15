@@ -1,13 +1,4 @@
-// A Content-Security-Policy for every page this process renders. Nuxt
-// inlines a few scripts and styles whose text changes per build and per
-// request (the runtime config, the colour-mode script, critical CSS), so
-// each inline block is allowed by its SHA-256 instead of `unsafe-inline`.
-// Style elements that a library creates in the browser (vaul-vue's drawer
-// rules, which Nuxt UI bundles) cannot be hashed ahead of time, so each
-// response also carries a fresh nonce for `style-src` alone, published in
-// the `csp-nonce` meta tag that vaul-vue reads; scripts never get a nonce.
-// Only rendered pages get it: the controller's own pages, reached through
-// the proxy, keep the policy the controller sets.
+// Inline blocks are allowed by SHA-256 hash; styles a library creates at run time get a per-response nonce, scripts never do.
 const SCRIPT = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
 const STYLE = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
 
@@ -44,8 +35,7 @@ export default defineNitroPlugin((nitro) => {
     const parts = [...html.head, ...html.bodyPrepend, ...html.body, ...html.bodyAppend];
     const scripts = await inline(parts, SCRIPT, 2, /\bsrc\s*=/i);
     const styles = await inline(parts, STYLE, 1);
-    // Style attributes (progress-bar widths) cannot be hashed, so they alone
-    // may be inline; script and style elements stay hash-only.
+    // Style attributes (progress-bar widths) cannot be hashed; only style-src-attr allows them.
     const styleNonce = nonce();
     html.head.push(`<meta property="csp-nonce" content="${styleNonce}">`);
     const policy = [

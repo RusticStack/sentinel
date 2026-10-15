@@ -1,9 +1,5 @@
-//! Bounded YAML loading. The event parser feeds a receiver that builds a
-//! compact tree while enforcing limits as events arrive, so an oversized or
-//! hostile document is rejected before it is fully materialised. Anchors,
-//! aliases, tags, multiple documents and duplicate keys are errors: the
-//! pipeline schema needs none of them and each is a classic amplification
-//! or ambiguity vector.
+//! Anchors, aliases, tags, extra documents and duplicate keys are rejected: each is an
+//! amplification or ambiguity vector the pipeline schema never needs.
 use std::fmt;
 
 use yaml_rust2::{
@@ -25,9 +21,6 @@ pub enum Node {
     Int(i64),
     Str(String),
     Seq(Vec<Node>),
-    /// Insertion-ordered; duplicate keys were rejected at load time, so a
-    /// linear scan on lookup is correct and, for schema-sized maps, faster
-    /// than hashing.
     Map(Vec<(String, Node)>),
 }
 
@@ -102,7 +95,6 @@ impl std::error::Error for YamlError {}
 
 enum Frame {
     Seq(Vec<Node>),
-    /// Entries plus the pending key awaiting its value.
     Map(Vec<(String, Node)>, Option<String>),
 }
 
@@ -119,7 +111,6 @@ impl Receiver {
         if self.error.is_none() {
             self.error = Some(YamlError {
                 line: mark.line(),
-                // The scanner reports zero-based columns; humans expect one-based.
                 col: mark.col() + 1,
                 kind,
             });
@@ -142,7 +133,6 @@ impl Receiver {
             Some(Frame::Map(entries, pending)) => match pending.take() {
                 Some(key) => entries.push((key, node)),
                 None => {
-                    // This node is a key.
                     let key = match node {
                         Node::Str(s) => s,
                         _ => return self.fail(mark, YamlErrorKind::NonStringKey),
@@ -177,7 +167,6 @@ impl Receiver {
         if !self.count(mark) {
             return;
         }
-        // A collection used as a mapping key is rejected when it closes.
         self.stack.push(frame);
     }
 
@@ -241,10 +230,7 @@ impl MarkedEventReceiver for Receiver {
     }
 }
 
-/// YAML 1.2 core schema for plain scalars: null, booleans, decimal integers;
-/// everything else (including `yes`, `on`, octal, floats) stays a string so
-/// nothing is silently coerced. Hex/octal ints are strings too: the schema
-/// never needs them and `0o` forms are a known foot-gun.
+/// Only null, booleans and decimal integers resolve; anything else stays a string, never coerced.
 fn resolve_plain(value: String) -> Node {
     match value.as_str() {
         "" | "~" | "null" | "Null" | "NULL" => Node::Null,
@@ -265,7 +251,6 @@ fn resolve_plain(value: String) -> Node {
     }
 }
 
-/// Load one document under the limits above.
 pub fn load(text: &str) -> Result<Node, YamlError> {
     if text.len() > MAX_PIPELINE_FILE_BYTES {
         return Err(YamlError {

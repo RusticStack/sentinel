@@ -1,79 +1,27 @@
-//! Output redaction: registered secret values are replaced before a
-//! byte reaches the spool, and therefore before it reaches the link, the
-//! controller or a log reader.
-//!
-//! A redactor belongs to one attempt: registration is per attempt and
-//! dynamic — the secret resolver registers each value into the
-//! live attempt before the step that receives it starts — so one tenant's
-//! values never touch another's output, and they go with the attempt.
-//! Boundaries are handled: the redactor holds back the shortest tail of each
-//! stream that may still grow into a registered value, so a value split
-//! across two reads is still caught. Every non-empty secret is registered;
-//! short values can cause noisy redaction, but leaving an authorized value
-//! visible is worse.
-//!
-//! Matching is leftmost-longest (at each position the longest value that
-//! starts there wins; the scan resumes after it) and costs O(bytes) whatever
-//! the number or length of the registered values: two
-//! Aho–Corasick automata built once per registration set — one over the
-//! values reversed, which gives the longest value starting at every
-//! position in one backward pass, and one over the values as they are,
-//! whose state at the end of the buffer is the longest tail that is still
-//! the beginning of a value. The work runs on the worker's log thread, so a
-//! job cannot buy quadratic CPU there with a long near-miss value.
+//! Redaction runs before any byte reaches the spool, so a stored log never holds a registered value.
 
 use std::borrow::Cow;
 
 use sentinel_protocol::logs::Stream;
 
-/// The shortest value [`Redactor::register`] accepts. Redaction is an exact
-/// match on bytes, so it replaces every occurrence of the value wherever it
-/// appears: a one-, two- or three-byte value is a single character or a
-/// short digit run that turns up in nearly every line of ordinary output,
-/// so registering it blanks the log without hiding the secret (a reader
-/// still sees everything around the stars) and a value that small is
-/// guessable without any log. From four bytes a chance occurrence in
-/// output the job did not copy from the secret is rare enough for exact
-/// matching to stay precise. The rule is a length, not an entropy test. The
-/// secret store accepts values from one byte, so the floor is enforced at
-/// delivery: a bound value below it fails the attempt as `Preparation`
-/// rather than reaching a job that could print it unredacted. Lines of a
-/// longer multi-line value are not held to the floor ([`carries_material`] decides those).
 pub const MIN_SECRET_BYTES: usize = 4;
-/// The longest value whose base64 and percent-encoded forms are registered
-/// beside it: a value of a few KiB (a key, a token, a certificate) costs a
-/// handful of extra patterns built once at registration, while a very large
-/// one would multiply its size in both automata. Past it only the value
-/// itself and its JSON escapings are matched.
 pub const MAX_ENCODED_SOURCE_BYTES: usize = 16 * 1024;
-/// The shortest base64 fragment registered for a value at a shifted
-/// alignment (see [`base64_fragments`]): a fragment of a handful of
-/// characters would match in unrelated base64 text by chance.
 const MIN_FRAGMENT_BYTES: usize = 8;
 pub const REPLACEMENT: &[u8] = b"***";
-/// Characters a diagnostic excerpt keeps: the verdict detail and the stored
-/// summary are bounded, whatever a step printed.
 pub const EXCERPT_CHARS: usize = 200;
 
-/// A byte trie with Aho–Corasick failure links. Node 0 is the root; its
-/// transitions are dense (the path every byte of ordinary output takes),
-/// every other node's are a sorted run in `edges`.
 #[derive(Default)]
 struct Automaton {
     root: Box<[u32]>,
-    /// `(byte, child)` runs, one per node, sorted by byte.
     edges: Vec<(u8, u32)>,
-    /// Node `n`'s run is `edges[first[n]..first[n + 1]]`.
     first: Vec<u32>,
     fail: Vec<u32>,
     depth: Vec<u32>,
-    /// Length of the longest value that is a suffix of the node's string.
     out: Vec<u32>,
 }
 
 impl Automaton {
     fn build<'a>(values: impl Iterator<Item = &'a [u8]> + Clone) -> Automaton {
-        // The trie, children as small per-node lists while it grows.
         let mut children: Vec<Vec<(u8, u32)>> = vec![Vec::new()];
         let mut depth: Vec<u32> = vec![0];
         let mut terminal: Vec<bool> = vec![false];
@@ -118,8 +66,6 @@ impl Automaton {
             depth,
             out: vec![0; nodes],
         };
-        // Breadth first, so a node's failure target is final before its
-        // children need it.
         let mut queue = std::collections::VecDeque::with_capacity(nodes);
         for &(_, child) in automaton.children(0) {
             queue.push_back(child);
@@ -157,7 +103,6 @@ impl Automaton {
         }
     }
 
-    /// The Aho–Corasick transition: amortized O(1) per byte.
     #[inline]
     fn next(&self, mut state: u32, byte: u8) -> u32 {
         loop {
@@ -172,7 +117,6 @@ impl Automaton {
     }
 
     fn wipe(&mut self) {
-        // The edges spell the registered values.
         self.edges.fill((0, 0));
         self.root.fill(0);
         core::hint::black_box((&mut self.edges, &mut self.root));
@@ -181,25 +125,16 @@ impl Automaton {
 
 #[derive(Default)]
 struct Matcher {
-    /// Over the values reversed: the longest value starting at a position.
     reversed: Automaton,
-    /// Over the values: the longest tail that is still a value's prefix.
     forward: Automaton,
 }
 
 #[derive(Default)]
 pub struct Redactor {
-    /// Registered values with their escaped forms and lines; distinct and
-    /// sorted whenever a matcher exists.
     secrets: Vec<Vec<u8>>,
     longest: usize,
-    /// Built on first use after a registration; `None` means stale.
     matcher: Option<Matcher>,
-    /// `(position, length)` of the longest value starting at each position
-    /// of the buffer being scanned where one starts, decreasing position;
-    /// reused between calls.
     starts: Vec<(u32, u32)>,
-    /// Held-back tail per stream, indexed by `Stream as usize`.
     carry: [Vec<u8>; 3],
 }
 
@@ -208,22 +143,8 @@ impl Redactor {
         Redactor::default()
     }
 
-    /// Register a non-empty value; returns whether it was accepted.
-    ///
-    /// Structured output carries values JSON-escaped (Go `test2json`,
-    /// rustc/cargo JSON), and the controller's failure parser decodes them,
-    /// so every escaping a standard encoder produces is registered too: the stored log never holds a decodable copy the raw
-    /// value would not have matched. A multi-line value is written by
-    /// line-oriented producers one record per line, never contiguously, so
-    /// each of its lines that [`carries_material`] is registered as well,
-    /// raw and escaped, whatever its length. All of this is paid once here;
-    /// the per-byte scan stays O(output).
-    ///
-    /// A value shorter than [`MIN_SECRET_BYTES`] is refused (`false`): see
-    /// that constant for the rule. A value of at most
-    /// [`MAX_ENCODED_SOURCE_BYTES`] is registered in its base64 and
-    /// percent-encoded forms too (see [`base64_fragments`] and
-    /// [`percent_encodings`] for what exactly is covered).
+    /// Structured output is JSON-escaped and the controller decodes it, so every standard escaping is registered.
+    /// Multi-line values arrive one record per line, so each line that carries material is registered alone.
     pub fn register(&mut self, secret: &[u8]) -> bool {
         if secret.len() < MIN_SECRET_BYTES {
             return false;
@@ -239,10 +160,6 @@ impl Redactor {
         true
     }
 
-    /// The value as it is, its JSON escapings and (when it has several
-    /// lines) its lines — no floor, no derived encodings. What
-    /// [`Redactor::excerpt`] uses to rebuild a redactor from values that
-    /// were already expanded.
     fn register_exact(&mut self, secret: &[u8]) {
         if secret.is_empty() {
             return;
@@ -264,8 +181,6 @@ impl Redactor {
         }
     }
 
-    /// Duplicates are removed (and wiped) when the matcher is next built,
-    /// so a value with many lines costs no quadratic search here.
     fn insert(&mut self, value: &[u8]) {
         self.longest = self.longest.max(value.len());
         self.secrets.push(value.to_vec());
@@ -277,8 +192,6 @@ impl Redactor {
 
     fn matcher(&mut self) -> &Matcher {
         if self.matcher.is_none() {
-            // Sorting moves the owned buffers, not their bytes; a removed
-            // duplicate is wiped before it is freed.
             self.secrets.sort_unstable();
             self.secrets.dedup_by(|later, kept| {
                 let same = later == kept;
@@ -304,10 +217,6 @@ impl Redactor {
         self.matcher.as_ref().expect("built above")
     }
 
-    /// Redact `chunk` on `stream`, returning what may be emitted now. The
-    /// tail that could still be the start of a secret is kept for the next
-    /// call or [`Redactor::flush`]. With nothing registered the chunk is
-    /// passed through borrowed — no copy on the common path.
     pub fn apply<'a>(&mut self, stream: Stream, chunk: &'a [u8]) -> Cow<'a, [u8]> {
         if self.secrets.is_empty() {
             return Cow::Borrowed(chunk);
@@ -316,15 +225,12 @@ impl Redactor {
         buf.extend_from_slice(chunk);
         let mut out = Vec::with_capacity(buf.len());
         let at = self.scan(&buf, true, &mut out);
-        // The held tail becomes the next carry in place: no second copy.
         buf[..at].fill(0);
         buf.drain(..at);
         self.carry[stream as usize] = buf;
         Cow::Owned(out)
     }
 
-    /// Redact a complete text — a diagnostic line, not a stream — holding
-    /// nothing back: a partial secret at its end is left as it is.
     pub fn redact_all(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(bytes.len());
         if self.secrets.is_empty() {
@@ -336,14 +242,6 @@ impl Redactor {
         out
     }
 
-    /// The bounded, printable excerpt of a step's stderr tail that a
-    /// failure detail carries: redacted **before** anything
-    /// transforms it — lossy UTF-8 decoding, line selection, control
-    /// filtering and the length cut could otherwise leave a value no longer
-    /// matching exactly. A multi-line value is also redacted line by line,
-    /// so its later lines are caught where the tail began inside it; and a
-    /// tail that filled its ring (`wrapped`) loses its first, possibly cut,
-    /// line.
     pub fn excerpt(&self, tail: &[u8], wrapped: bool) -> String {
         let tail = if wrapped {
             match tail.iter().position(|b| *b == b'\n') {
@@ -357,8 +255,6 @@ impl Redactor {
             return excerpt(tail);
         }
         let mut lines = Redactor::new();
-        // `self.secrets` already holds every derived form; each is only
-        // split into lines here, never expanded again.
         for secret in &self.secrets {
             lines.register_exact(secret);
             for line in secret.split(|b| matches!(*b, b'\n' | b'\r')) {
@@ -371,18 +267,10 @@ impl Redactor {
         text
     }
 
-    /// Copy `buf` to `out` with every registered value replaced, returning
-    /// how much was consumed; with `hold`, stop before the first tail the
-    /// scan reaches that may still grow into a value (or into a longer one
-    /// than it already matches).
     fn scan(&mut self, buf: &[u8], hold: bool, out: &mut Vec<u8>) -> usize {
         let longest = self.longest;
         let mut starts = std::mem::take(&mut self.starts);
         let matcher = self.matcher();
-        // Backward over the reversed values: every position at which a
-        // value begins (and ends inside `buf`), with the longest such
-        // value, in decreasing position. Output that starts no value stays
-        // at the dense root: one table load per byte, nothing written.
         starts.clear();
         let reversed = &matcher.reversed;
         let mut state = 0u32;
@@ -400,10 +288,6 @@ impl Redactor {
                 }
             }
         }
-        // Where a held tail may begin: every tail of `buf` that is a
-        // proper prefix of some value — the forward state's failure chain,
-        // restricted to nodes that continue, walked lazily longest tail
-        // (smallest position) first.
         let mut chain = 0u32;
         if hold {
             let from = buf.len().saturating_sub(longest);
@@ -422,11 +306,7 @@ impl Redactor {
             }
             None
         };
-        // Leftmost-longest replacement up to the first hold candidate the
-        // scan actually reaches; a candidate inside a replaced value is not
-        // reached and cannot hold.
         let mut next_hold = candidate();
-        // `starts` is in decreasing position: its tail is the next match.
         let mut next = starts.len();
         let mut at = 0;
         loop {
@@ -436,7 +316,6 @@ impl Redactor {
             let stop = next_hold.unwrap_or(buf.len());
             let mut plain = at;
             loop {
-                // A value starting inside one already replaced is skipped.
                 while next > 0 && (starts[next - 1].0 as usize) < at {
                     next -= 1;
                 }
@@ -458,22 +337,16 @@ impl Redactor {
                 out.extend_from_slice(&buf[plain..at]);
                 break;
             }
-            // A value ran past the candidate: the scan never reached it.
         }
         self.starts = starts;
         at
     }
 
-    /// The stream is finished: whatever is held back is the beginning of a
-    /// secret that never completed, so it is emitted as it is.
     pub fn flush(&mut self, stream: Stream) -> Vec<u8> {
         std::mem::take(&mut self.carry[stream as usize])
     }
 }
 
-/// The last non-empty line of `bytes`, printable characters only, at most
-/// [`EXCERPT_CHARS`]: what a failure detail shows of a helper's stderr.
-/// Callers holding secrets redact first ([`Redactor::excerpt`]).
 pub fn excerpt(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     let line = text
@@ -492,32 +365,12 @@ pub fn excerpt(bytes: &[u8]) -> String {
     out
 }
 
-/// Whether a line of a multi-line value is registered on its own: any line
-/// holding a byte other than ASCII punctuation or whitespace, however
-/// short. A line of only punctuation and whitespace (`{`, `}`, `-----`, a
-/// blank line) is structure a producer prints everywhere; redacting it would
-/// erase that character from all later output while hiding nothing a reader
-/// could not already guess from the value's format.
 fn carries_material(line: &[u8]) -> bool {
     line.iter()
         .any(|byte| !(byte.is_ascii_punctuation() || byte.is_ascii_whitespace()))
 }
 
-/// Call `each` with the base64 forms a tool is likely to print `value` in,
-/// in both the standard and the URL-safe alphabet, unpadded (a padded form
-/// then matches up to its `=`).
-///
-/// A value rarely appears as a base64 string of its own: HTTP Basic
-/// authorization encodes `user:secret`, a config file base64s a whole
-/// document. What base64 produces for the value depends on where it falls
-/// in the 3-byte groups, so the three alignments are each registered as the
-/// characters that depend on the value alone: the leading characters that
-/// mix in the unknown preceding byte(s) and the trailing character that
-/// mixes in the unknown following one are dropped. A fragment of fewer than
-/// [`MIN_FRAGMENT_BYTES`] characters is skipped. Everything is derived once
-/// at registration; the scan never encodes anything. Not covered: base64
-/// of a transformed value (hashed, compressed, re-encoded twice) or split
-/// across lines by a wrapping encoder, which no exact match can recognize.
+/// Registers the base64 alignments of a value, keeping only characters that depend on the value alone.
 fn base64_fragments(value: &[u8], mut each: impl FnMut(&[u8])) {
     const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -532,18 +385,12 @@ fn base64_fragments(value: &[u8], mut each: impl FnMut(&[u8])) {
             for group in input.chunks(3) {
                 let n = group.iter().fold(0u32, |acc, b| (acc << 8) | u32::from(*b))
                     << (8 * (3 - group.len()));
-                // A group of 1 or 2 bytes yields 2 or 3 characters.
                 for i in 0..=group.len() {
                     encoded.push(table[((n >> (18 - 6 * i)) & 63) as usize]);
                 }
             }
-            // Characters mixing in the filler before the value, and the
-            // last one of an incomplete group, which mixes in what follows.
             let lead = [0, 2, 3][shift];
             let complete = (shift + value.len()).is_multiple_of(3);
-            // The value as a string of its own (shift 0) keeps every
-            // character; the same, without its last, is what it looks like
-            // with more following it.
             let trims: &[usize] = match (shift, complete) {
                 (0, false) => &[0, 1],
                 (0, true) | (_, true) => &[0],
@@ -552,10 +399,7 @@ fn base64_fragments(value: &[u8], mut each: impl FnMut(&[u8])) {
             for &trim in trims {
                 let end = encoded.len() - trim;
                 let fragment = &encoded[lead.min(end)..end];
-                // The two alphabets differ only in two characters.
                 let distinct = !url || fragment.iter().any(|b| matches!(b, b'-' | b'_'));
-                // The whole value on its own is as long as the value
-                // warrants; any cut-down fragment must clear the floor.
                 let standalone = shift == 0 && trim == 0;
                 if distinct && (standalone || fragment.len() >= MIN_FRAGMENT_BYTES) {
                     each(fragment);
@@ -568,11 +412,6 @@ fn base64_fragments(value: &[u8], mut each: impl FnMut(&[u8])) {
     core::hint::black_box((&mut input, &mut encoded));
 }
 
-/// Call `each` with the percent-encoded forms of `value` that differ from
-/// it: RFC 3986 (everything outside the unreserved set `A-Z a-z 0-9 - . _ ~`
-/// as `%XX`) with upper- and lower-case hex digits, and the
-/// `application/x-www-form-urlencoded` form (a space as `+`). What a URL,
-/// a query string or a form body carries a value as.
 fn percent_encodings(value: &[u8], mut each: impl FnMut(&[u8])) {
     let unreserved = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
     if value.iter().all(|b| unreserved(*b)) {
@@ -600,11 +439,6 @@ fn percent_encodings(value: &[u8], mut each: impl FnMut(&[u8])) {
     }
 }
 
-/// Call `each` with every distinct JSON string escaping of `value` that
-/// differs from it: RFC 8259 minimal escaping with and without the `\b`/`\f`
-/// short forms (serde_json and Go ≥ 1.22 use them, older Go does not), each
-/// with and without Go's HTML-safe `\u003c \u003e \u0026 \u2028 \u2029`.
-/// Hex digits are lowercase, as both encoders write them.
 fn json_escapings(value: &[u8], mut each: impl FnMut(&[u8])) {
     let needs = value.iter().enumerate().any(|(at, byte)| {
         matches!(byte, b'"' | b'\\' | b'<' | b'>' | b'&' | 0..=0x1f)
@@ -689,8 +523,6 @@ mod tests {
         out
     }
 
-    /// A shorter secret is not replaced while the rest of the
-    /// buffer may still be the start of a longer one arriving next.
     #[test]
     fn the_longest_secret_wins_across_a_chunk_boundary() {
         let mut r = Redactor::new();
@@ -700,17 +532,14 @@ mod tests {
             run(&mut r, &[b"xAAAAAAAAAAAAB", b"BBBy"]),
             b"x***y".to_vec()
         );
-        // The shorter one still wins when the longer never completes.
         assert_eq!(
             run(&mut r, &[b"xAAAAAAAAAAAAB", b"Cy"]),
             b"x***BCy".to_vec()
         );
-        // One-shot redaction of a diagnostic line holds nothing back.
         assert_eq!(
             r.redact_all(b"Error: AAAAAAAAAAAABBBB and AAAAAAAAAAAA"),
             b"Error: *** and ***".to_vec()
         );
-        // Nothing registered: the chunk is passed through, not copied.
         let mut empty = Redactor::new();
         assert!(matches!(
             empty.apply(Stream::Stdout, b"plain"),
@@ -718,9 +547,6 @@ mod tests {
         ));
     }
 
-    /// A value JSON-escaped by Go's test2json or by serde-style
-    /// encoders is redacted in the stored bytes, so the failure parser has
-    /// nothing to decode back into the plaintext.
     #[test]
     fn json_escaped_values_are_redacted_before_a_parser_can_decode_them() {
         use sentinel_protocol::diagnostics::{StepReference, parse_go_test_json};
@@ -742,7 +568,6 @@ mod tests {
         );
         let message = &parsed.diagnostics[0].diagnostic.message;
         assert_eq!(message, "token=***\n");
-        // serde_json / rustc style: no HTML escaping.
         let rustc = b"{\"message\":\"bad pa&ss<word>\\\"q\\\\\\u0001 used\"}\n";
         assert_eq!(
             run(&mut r, &[rustc]),
@@ -750,8 +575,6 @@ mod tests {
         );
     }
 
-    /// A multi-line value arrives one JSON record per line; each line is
-    /// redacted, so joining a test's output never reassembles the value.
     #[test]
     fn multi_line_values_are_redacted_line_by_line() {
         use sentinel_protocol::diagnostics::{StepReference, parse_go_test_json};
@@ -782,15 +605,9 @@ mod tests {
         );
         let message = &parsed.diagnostics[0].diagnostic.message;
         assert_eq!(message, "***\n***\n***\n}\n");
-        // Punctuation-only structural lines are not registered on their own.
         assert_eq!(run(&mut r, &[b"{ok}\n"]), b"{ok}\n".to_vec());
     }
 
-    /// A short line of a multi-line value: a line of a multi-line value is
-    /// registered whatever its length once it holds anything but
-    /// punctuation and whitespace, so a short password on its own line, a
-    /// PEM's short last base64 line or a one-letter line never survives a
-    /// line-by-line print; only punctuation-only lines do.
     #[test]
     fn short_lines_of_a_multi_line_value_are_redacted() {
         let mut r = Redactor::new();
@@ -799,14 +616,12 @@ mod tests {
             run(&mut r, &[b"pw1\n", b"Zw==\n", b"x\n", b"  }\n"]),
             b"***\n***\n***\n  }\n".to_vec()
         );
-        // Each line is also caught JSON-escaped.
         let mut r = Redactor::new();
         r.register(b"line one\np\"w\n");
         assert_eq!(
             run(&mut r, &[b"{\"Output\":\"p\\\"w\\n\"}"]),
             b"{\"Output\":\"***\\n\"}".to_vec()
         );
-        // Registering the same value again changes nothing.
         let known = r.secrets.len();
         r.register(b"line one\np\"w\n");
         assert_eq!(r.secrets.len(), known);
@@ -825,12 +640,10 @@ mod tests {
             run(&mut r, &[b"token=ghs_super", b"secret_", b"token done\n"]),
             b"token=*** done\n".to_vec()
         );
-        // A partial value at the very end is emitted at flush, not swallowed.
         assert_eq!(
             run(&mut r, &[b"tail ghs_super"]),
             b"tail ghs_super".to_vec()
         );
-        // Longest match wins, and short values are left alone.
         let mut r = Redactor::new();
         r.register(b"AAAAAAAAAAAA");
         r.register(b"AAAAAAAAAAAABBBB");
@@ -839,7 +652,6 @@ mod tests {
             run(&mut r, &[b"xAAAAAAAAAAAAy short"]),
             b"x***y short".to_vec()
         );
-        // Streams carry independently.
         let mut r = Redactor::new();
         r.register(b"stderr-only-secret");
         assert_eq!(
@@ -853,9 +665,6 @@ mod tests {
         assert_eq!(r.apply(Stream::Stderr, b"ret!\n").as_ref(), b"***!\n");
     }
 
-    /// The plain per-value scan, kept as the specification: at each
-    /// reached position hold a tail that is a proper prefix of a longer
-    /// value, else replace the longest value starting there.
     fn reference(secrets: &[Vec<u8>], buf: &[u8], hold: bool, out: &mut Vec<u8>) -> usize {
         let mut at = 0;
         while at < buf.len() {
@@ -886,7 +695,6 @@ mod tests {
         at
     }
 
-    /// A small deterministic generator: the property test needs no crate.
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u64 {
@@ -901,10 +709,6 @@ mod tests {
         }
     }
 
-    /// The automata keep the exact leftmost-longest semantics and
-    /// hold-back of the scan they replaced, over many random value sets
-    /// (overlapping prefixes and suffixes over a tiny alphabet), texts and
-    /// chunkings.
     #[test]
     fn the_automaton_matches_the_reference_scan() {
         let mut rng = Lcg(0x5eed);
@@ -912,9 +716,6 @@ mod tests {
             let alphabet = 1 + rng.below(3) as u8;
             let mut secrets: Vec<Vec<u8>> = Vec::new();
             for _ in 0..1 + rng.below(5) {
-                // At least the floor `register` accepts: a shorter value is
-                // refused, so the reference scan would redact what the
-                // automaton never held.
                 let len = MIN_SECRET_BYTES + rng.below(5) as usize;
                 let value: Vec<u8> = (0..len)
                     .map(|_| b'a' + rng.below(alphabet.into()) as u8)
@@ -926,7 +727,6 @@ mod tests {
             let text: Vec<u8> = (0..rng.below(40))
                 .map(|_| b'a' + rng.below(u64::from(alphabet) + 1) as u8)
                 .collect();
-            // One-shot.
             let mut r = Redactor::new();
             for s in &secrets {
                 r.register(s);
@@ -939,8 +739,6 @@ mod tests {
                 expected,
                 "case {case}: {secrets:?} {text:?}"
             );
-            // Streamed in random chunks: the reference applied to the same
-            // carry discipline.
             let mut streamed = Vec::new();
             let mut model = Vec::new();
             let mut carry: Vec<u8> = Vec::new();
@@ -960,11 +758,6 @@ mod tests {
         }
     }
 
-    /// 16 near-miss values of 64 KiB (a full 1 MiB bundle)
-    /// against a stream that keeps almost matching them cost O(output), not
-    /// O(output × values × length): a MiB of such output is redacted within
-    /// a bound a per-value scan (16 comparisons of up to 64 KiB per byte)
-    /// would not meet.
     #[test]
     fn a_near_miss_value_costs_linear_time() {
         let mut r = Redactor::new();
@@ -989,7 +782,6 @@ mod tests {
             took < std::time::Duration::from_secs(5),
             "1 MiB of near-miss output took {took:?}"
         );
-        // And a full value is still caught when it does arrive, split.
         let value = &values[0];
         let mut r = Redactor::new();
         r.register(value);
@@ -1001,28 +793,20 @@ mod tests {
         assert_eq!(out, REPLACEMENT);
     }
 
-    /// The excerpt is redacted before it is transformed. Each of
-    /// the transformations that could otherwise run first — lossy decoding,
-    /// line selection, control filtering, the 200-character cut and the tail
-    /// ring's cut — leaves no fragment of a value.
     #[test]
     fn a_failure_excerpt_carries_no_fragment_of_a_value() {
-        // A multi-line file secret whose last line is the token.
         let mut r = Redactor::new();
         r.register(b"user: deploy\nhunter2-token");
         let tail = b"step output\nuser: deploy\nhunter2-token\n";
         let excerpt = r.excerpt(tail, false);
         assert!(!excerpt.contains("hunter2"), "{excerpt}");
-        // The tail ring began inside it: its later lines are still caught.
         let excerpt = r.excerpt(b"ploy\nhunter2-token", true);
         assert!(!excerpt.contains("hunter2"), "{excerpt}");
-        // A tab inside the value; control filtering would have joined it.
         let mut r = Redactor::new();
         r.register(b"tab\tsecret-value");
         let excerpt = r.excerpt(b"error: tab\tsecret-value\n", false);
         assert!(!excerpt.contains("secret-value"), "{excerpt}");
         assert!(excerpt.contains("***"), "{excerpt}");
-        // A binary value: lossy decoding would have changed its bytes.
         let mut r = Redactor::new();
         let binary = b"\xff\xfebinary-secret\x80";
         r.register(binary);
@@ -1030,24 +814,18 @@ mod tests {
         tail.extend_from_slice(binary);
         let excerpt = r.excerpt(&tail, false);
         assert!(!excerpt.contains("binary-secret"), "{excerpt}");
-        // A value straddling the 200-character cut.
         let mut r = Redactor::new();
         r.register(b"straddling-secret-value");
         let mut line = "x".repeat(190);
         line.push_str("straddling-secret-value");
         let excerpt = r.excerpt(line.as_bytes(), false);
         assert!(!excerpt.contains("straddl"), "{excerpt}");
-        // A value cut at the start of a wrapped ring: its suffix is on the
-        // first, dropped line.
         let excerpt = r.excerpt(b"ing-secret-value\nError: step failed\n", true);
         assert_eq!(excerpt, "Error: step failed");
-        // Nothing registered, nothing wrapped: the plain excerpt.
         assert_eq!(Redactor::new().excerpt(b"a\nlast\n\n", false), "last");
         assert_eq!(Redactor::new().excerpt(b"", false), "no diagnostic output");
     }
 
-    /// A value too short to be told from ordinary output is refused, so a
-    /// one-byte secret cannot blank every occurrence of that byte.
     #[test]
     fn a_value_below_the_floor_is_refused_and_blanks_nothing() {
         let mut r = Redactor::new();
@@ -1063,39 +841,28 @@ mod tests {
         assert_eq!(run(&mut r, &[b"a abc abcd"]), b"a abc ***".to_vec());
     }
 
-    /// The value as base64 of its own, standard or URL-safe, padded or not.
     #[test]
     fn a_secret_printed_as_base64_is_redacted() {
         let mut r = Redactor::new();
         assert!(r.register(b"s3cr3t-value!"));
-        // Padded: only the padding stays.
         assert_eq!(
             run(&mut r, &[b"token=czNjcjN0LXZhbHVlIQ==\n"]),
             b"token=***==\n".to_vec()
         );
-        // Bytes whose encodings differ between the two alphabets.
         let mut r = Redactor::new();
         assert!(r.register(b"\xfb\xff\xfe\xfa\xfbxyz!"));
         assert_eq!(run(&mut r, &[b"std +//++vt4eXoh."]), b"std ***.".to_vec());
         assert_eq!(run(&mut r, &[b"url -__--vt4eXoh."]), b"url ***.".to_vec());
     }
 
-    /// `user:secret` in a Basic header, a secret deep inside an encoded
-    /// document: whichever of the three alignments the value falls on, the
-    /// characters that depend on the value alone are caught; only the ones
-    /// that mix in its neighbours stay.
     #[test]
     fn a_secret_inside_a_larger_base64_string_is_redacted_at_every_alignment() {
         let mut r = Redactor::new();
         assert!(r.register(b"s3cr3t-value!"));
         for (haystack, expected) in [
-            // "" + value + "-tail"
             ("czNjcjN0LXZhbHVlIS10YWls", "***S10YWls"),
-            // "u" + value + "-tail"
             ("dXMzY3IzdC12YWx1ZSEtdGFpbA==", "dX***EtdGFpbA=="),
-            // "us" + value + "-tail"
             ("dXNzM2NyM3QtdmFsdWUhLXRhaWw=", "dXN***LXRhaWw="),
-            // "usr:" + value + "-tail"
             ("dXNyOnMzY3IzdC12YWx1ZSEtdGFpbA==", "dXNyOn***EtdGFpbA=="),
         ] {
             assert_eq!(
@@ -1106,7 +873,6 @@ mod tests {
         }
     }
 
-    /// What a URL or a form body carries a value as.
     #[test]
     fn a_secret_printed_percent_encoded_is_redacted() {
         let mut r = Redactor::new();
@@ -1120,8 +886,6 @@ mod tests {
         );
     }
 
-    /// Encodings are derived for values up to the cap only: past it a
-    /// value's base64 would multiply its size in both automata.
     #[test]
     fn encodings_are_derived_up_to_the_cap_only() {
         let encoded = |len: usize| -> Vec<u8> { b"YWFh".repeat(len / 3) };

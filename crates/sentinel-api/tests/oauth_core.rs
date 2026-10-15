@@ -1,15 +1,4 @@
-//! OAuth core over real HTTP on loopback: authorization-server and protected-
-//! resource metadata, OAuth access tokens on `/api/v1` with per-route
-//! scopes and `WWW-Authenticate` challenges, the `refresh_token` grant, RFC
-//! 7009 revocation, the RFC 6749 error shape, and unchanged sessions and
-//! `sntl_` credentials.
-//!
-//! `deployment()`, `send()` and `grant()` below are the minimal harness the
-//! other OAuth suites (`oauth_code.rs`, `oauth_device.rs`, `oauth_service.rs`,
-//! `wait.rs`) copy: one bootstrapped super admin `root` (password
-//! `PASSWORD`) administering tenant `acme` with repository `app`, one
-//! ordinary member `dev`, an `sntl_` credential for root, and a real
-//! server on `127.0.0.1:0` whose issuer is its own base URL.
+//! The harness below is copied into oauth_device.rs and oauth_service.rs; keep the copies in sync.
 
 use std::sync::Arc;
 
@@ -41,9 +30,7 @@ pub struct Deployment {
     pub store: Arc<Store>,
     _controller: Controller,
     server: Option<sentinel_api::Server>,
-    /// `http://127.0.0.1:PORT`; also the issuer.
     pub base: String,
-    /// A `sntl_` credential for root with every permission.
     pub token: String,
     pub root: UserId,
     pub dev: UserId,
@@ -63,8 +50,6 @@ pub fn deployment() -> Deployment {
     deployment_under(None)
 }
 
-/// A deployment whose `public_url` carries `path` (`/sentinel`), reached
-/// directly (the tests play both a stripping and a forwarding proxy).
 pub fn deployment_under(path: Option<&str>) -> Deployment {
     let (listen, public_url): (std::net::SocketAddr, Option<String>) = match path {
         None => ("127.0.0.1:0".parse().unwrap(), None),
@@ -143,15 +128,12 @@ pub fn deployment_under(path: Option<&str>) -> Deployment {
     }
 }
 
-/// A request body: none, JSON, or a raw `application/x-www-form-urlencoded` form.
 pub enum Body<'a> {
     None,
     Json(&'a Value),
     Form(&'a str),
 }
 
-/// What came back: status, every header (lower-case names) and the body as
-/// JSON (or a JSON string when it is not JSON).
 pub struct Reply {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -167,7 +149,6 @@ impl Reply {
     }
 }
 
-/// One request; redirects are returned, never followed.
 pub fn send(
     d: &Deployment,
     method: &str,
@@ -236,7 +217,6 @@ pub fn send(
     }
 }
 
-/// `GET` with an `Authorization` header.
 pub fn get(d: &Deployment, path: &str, authorization: &str) -> Reply {
     send(
         d,
@@ -247,7 +227,6 @@ pub fn get(d: &Deployment, path: &str, authorization: &str) -> Reply {
     )
 }
 
-/// A login grant for `user` issued without the browser, as the flows would.
 pub fn grant(d: &Deployment, user: UserId, scopes: Scopes) -> Minted {
     oauth::issue_grant_trusted(
         &d.store,
@@ -309,7 +288,6 @@ fn metadata_documents_name_this_deployment_exactly() {
         &[],
     );
     assert_eq!(meta.status, 200);
-    // The default instance policy: metadata documents, no DCR.
     let expected =
         Metadata::for_issuer(&d.base, &Scopes::NAMES).with_client_registration(false, true);
     assert_eq!(
@@ -402,7 +380,6 @@ fn an_access_token_reads_runs_and_me_reports_the_grant() {
             "cache:read"
         ])
     );
-    // No local password for dev; root has one.
     assert_eq!(me.body["username"], Value::Null);
     let root = get(&d, "/api/v1/me", &format!("Bearer {}", d.token));
     assert_eq!(root.body["username"], "root");
@@ -476,8 +453,6 @@ fn unusable_bearers_are_401_with_a_resource_metadata_challenge() {
     let minted = grant(&d, d.dev, Scopes::CLI_DEFAULT);
     let mut hex = String::new();
     Secret::generate().expose(&mut hex);
-    // An access token for another audience (the reserved MCP code), only
-    // insertable with the CHECK constraint lifted.
     let foreign = Secret::generate();
     let (digest, grant_id, dev) = (foreign.digest().0, GrantId::new(), d.dev);
     let now = UnixMillis::now().0;
@@ -562,7 +537,6 @@ fn the_refresh_grant_rotates_and_a_replay_is_invalid_grant() {
         200
     );
 
-    // Narrowing on refresh.
     let narrowed = send(
         &d,
         "POST",
@@ -577,8 +551,6 @@ fn the_refresh_grant_rotates_and_a_replay_is_invalid_grant() {
     let latest = narrowed.body["refresh_token"].as_str().unwrap().to_owned();
     let latest_access = narrowed.body["access_token"].as_str().unwrap().to_owned();
 
-    // The first refresh token's successor was used: presenting it again is
-    // a replay, which is invalid_grant and revokes the whole grant.
     let replay = send(
         &d,
         "POST",
@@ -683,22 +655,18 @@ fn the_token_endpoint_refuses_malformed_requests_in_the_rfc_shape() {
         );
         assert_eq!(reply.header("cache-control"), Some("no-store"));
     }
-    // Not a form at all.
     let json_body = json!({"grant_type": "refresh_token"});
     let reply = send(&d, "POST", "/oauth/token", Body::Json(&json_body), &[]);
     assert_eq!(
         (reply.status, reply.body["error"].as_str()),
         (400, Some("invalid_request"))
     );
-    // Larger than the form bound.
     let huge = format!("grant_type=refresh_token&padding={}", "a".repeat(9 << 10));
     let reply = send(&d, "POST", "/oauth/token", Body::Form(&huge), &[]);
     assert_eq!(
         (reply.status, reply.body["error"].as_str()),
         (413, Some("invalid_request"))
     );
-    // The refused requests spent nothing: the token still rotates, and
-    // `resource` naming this API is accepted.
     let ok = send(
         &d,
         "POST",
@@ -783,7 +751,6 @@ fn sessions_and_api_credentials_keep_their_behavior() {
     assert_eq!(bearer_me.status, 200);
     assert_eq!(bearer_me.body["via"], "bearer");
     assert_eq!(bearer_me.body["super_admin"], true);
-    // A read-only API credential keeps reading and cannot dispatch.
     let read_only = tokens::provision(
         &d.store,
         Grant::new(d.dev, "ro", P::READ),
@@ -839,7 +806,6 @@ fn sessions_and_api_credentials_keep_their_behavior() {
         &[("cookie", &cookie), ("x-sentinel-csrf", &csrf)],
     );
     assert_eq!(with_csrf.status, 201, "{}", with_csrf.body);
-    // A refused password login carries no bearer challenge.
     let refused = send(
         &d,
         "POST",
@@ -866,10 +832,6 @@ fn oauth_pages_carry_the_security_headers() {
     assert!(csp.contains("frame-ancestors 'none'") && !csp.contains("form-action"));
 }
 
-/// One client flooding revocation (or device authorization) takes
-/// its own budget, not everyone's; another client's refresh still goes
-/// through. Loopback is a proxy address, so `X-Forwarded-For` names the
-/// client here as a reverse proxy would.
 #[test]
 fn a_flooding_client_cannot_stop_another_clients_refresh() {
     let d = deployment();
@@ -908,7 +870,6 @@ fn a_flooding_client_cannot_stop_another_clients_refresh() {
         &[("x-forwarded-for", "203.0.113.7")],
     );
     assert_eq!(refreshed.status, 200, "{}", refreshed.body);
-    // And another client can still start a device login.
     let device = send(
         &d,
         "POST",
@@ -919,15 +880,13 @@ fn a_flooding_client_cannot_stop_another_clients_refresh() {
     assert_eq!(device.status, 200, "{}", device.body);
 }
 
-/// A store too busy to check a credential is `rate_limited`, never
-/// `401` — a `401` would make an OAuth client spend its refresh token.
+/// A busy store answers rate_limited, never 401: a 401 would make the client spend its refresh token.
 #[test]
 fn a_busy_store_is_rate_limited_not_unauthenticated() {
     let d = deployment();
     let minted = grant(&d, d.dev, Scopes::CLI_DEFAULT);
     let auth = bearer(&minted.access);
     assert_eq!(get(&d, "/api/v1/me", &auth).status, 200);
-    // Hold every reader for longer than read admission waits.
     let (hold, held) = (
         std::sync::Arc::new(std::sync::Barrier::new(sentinel_store::READER_LIMIT + 1)),
         std::time::Duration::from_millis(sentinel_store::READ_ADMISSION.as_millis() as u64 + 2_000),
@@ -961,9 +920,6 @@ fn a_busy_store_is_rate_limited_not_unauthenticated() {
     assert_eq!(get(&d, "/api/v1/me", &auth).status, 200);
 }
 
-/// With a path-carrying `public_url`, every URL handed out stays
-/// inside the issuer, the RFC 8414 / 9728 well-known locations answer, and
-/// a proxy that forwards the prefix unstripped still reaches the routes.
 #[test]
 fn a_path_issuer_keeps_every_url_inside_its_mount() {
     let d = deployment_under(Some("/sentinel"));
@@ -990,7 +946,6 @@ fn a_path_issuer_keeps_every_url_inside_its_mount() {
         assert_eq!(reply.status, 200, "{path}");
         assert_eq!(reply.body["resource"], format!("{issuer}/api/v1"));
     }
-    // The challenge names the RFC 9728 location of the resource.
     let anonymous = send(&d, "GET", "/sentinel/api/v1/me", Body::None, &[]);
     assert_eq!(anonymous.status, 401);
     assert_eq!(
@@ -1003,7 +958,6 @@ fn a_path_issuer_keeps_every_url_inside_its_mount() {
             .as_str()
         )
     );
-    // The sign-in and the device forms post inside the mount.
     for path in ["/device", "/sentinel/device"] {
         let page = send(&d, "GET", path, Body::None, &[]);
         assert_eq!(page.status, 200, "{path}");
@@ -1039,7 +993,6 @@ fn a_path_issuer_keeps_every_url_inside_its_mount() {
             .unwrap()
             .contains(&format!("action=\"{issuer}/device\""))
     );
-    // A foreign well-known path is still nothing.
     let other = send(
         &d,
         "GET",

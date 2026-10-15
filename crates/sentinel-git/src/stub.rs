@@ -1,5 +1,4 @@
-//! Non-Unix hosts: every entry point refuses explicitly. The controller and
-//! worker roles are Linux; this exists so callers compile everywhere.
+//! Non-Unix hosts: every entry point refuses, so callers still compile everywhere.
 use std::{
     path::Path,
     process::Command,
@@ -48,7 +47,6 @@ pub fn run(_: Command, _: Instant, _: &'static str) -> Result<Output> {
     Err(Error::UnsupportedPlatform)
 }
 
-/// Nothing runs here, so there is nothing to cancel: `f` runs as is.
 pub fn cancel_scope<T>(
     _: std::sync::Arc<std::sync::atomic::AtomicBool>,
     f: impl FnOnce() -> T,

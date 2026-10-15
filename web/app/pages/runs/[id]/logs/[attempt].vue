@@ -1,8 +1,6 @@
 <script setup lang="ts">
 import type { Explanation, LogPage, Run, Steps } from "~~/shared/types/api";
 
-// One attempt's log: steps that fold, windowed lines, search, deep links,
-// and live following through the log stream.
 const route = useRoute();
 const api = useApi();
 const session = useSession();
@@ -26,8 +24,7 @@ const stepList = computed(() => {
   if (data.value?.steps.present) return data.value.steps.steps!.map((s) => ({ index: s.index, id: s.id }));
   return [{ index: 0, id: "step 0" }];
 });
-// The current attempt's log is live until its end marker is durable; an
-// earlier attempt's is finished.
+// The current attempt's log is live until its end marker is durable.
 const complete = computed(() => !job.value || job.value.log_state === "complete" || (job.value.terminal && job.value.log_state === "incomplete"));
 const refused = ref<string | null>(null);
 async function onRefused(message: string) {

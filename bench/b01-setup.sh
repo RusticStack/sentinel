@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
-# B01: prepare a bench root for the lockwell-ci contract, as the bench user.
-#   bench/b01-setup.sh ROOT BUNDLES_DIR
-# ROOT gets src/<source> clones at the contract's commits (from git bundles
-# in BUNDLES_DIR: the repositories are private and the host holds no
-# credential for them), empty cache directories, and toolchain/go: the Go
-# toolchain copied out of the contract's pinned image, so a scoped (direct)
-# run uses the very binaries the container does. One root per runtime keeps
-# their caches apart.
+# Clones come from git bundles: the repositories are private and the host has no credential for them.
+# Go is copied from the contract's pinned image, so scoped and container runs use the same binaries.
 set -euo pipefail
 ROOT=$1
 BUNDLES=$2

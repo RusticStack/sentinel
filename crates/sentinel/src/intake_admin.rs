@@ -1,11 +1,5 @@
-//! Host-local inspection of durable event intake.
-//!
-//! Deliveries are tenant-owned rows; the operator opening the database reads
-//! them the way they read any other record. Listing is metadata only, and
-//! purging is bounded and retention-scoped: it never touches a pending
-//! delivery, only settled ones older than the retention duration, and it
-//! retires GitHub control-event receipts the same way (never inside their
-//! replay window).
+//! Purging retires only settled deliveries older than the retention, never pending ones,
+//! and GitHub control-event receipts only outside their replay window.
 
 use sentinel_core::{RepoId, UnixMillis};
 use sentinel_store::{Store, github_events, intake, lookup};
@@ -17,7 +11,6 @@ use crate::{
 };
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
-/// Longest retention the command accepts.
 const MAX_RETENTION_MS: i64 = 366 * DAY_MS;
 
 pub fn run(args: &IntakeArgs) -> Result<(), Error> {

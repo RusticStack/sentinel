@@ -1,21 +1,3 @@
-//! First-run setup and self-service organizations over the API.
-//!
-//! `GET /api/v1/setup` tells the web interface whether the first-run wizard is
-//! open, and nothing else about the instance. `POST /api/v1/setup` completes
-//! it with the one-time token the controller showed on the host (see
-//! [`sentinel_store::setup`]): one commit creates the administrator, the
-//! registration policy, the instance settings and the optional namespaces and
-//! closes the bootstrap latch, then signs the administrator in. A second
-//! factor is offered, not forced: the session the wizard ends with enrolls one
-//! through the account routes like any other. `POST /api/v1/setup/mail-test`
-//! sends one test message through the configured Resend sender; it stores
-//! nothing and its failure blocks nothing.
-//!
-//! `POST /api/v1/orgs` creates an organization for an approved account when
-//! the deployment's `tenant_creation` policy allows it, and
-//! `GET /api/v1/tenants/{slug}/settings` shows a namespace's kind and where
-//! its membership comes from.
-
 use sentinel_auth::{
     cookie,
     password::MAX_LEN as MAX_PASSWORD_BYTES,
@@ -38,10 +20,8 @@ use super::{
 };
 use crate::{State, auth, http::Request, oauth::Budget};
 
-/// Largest body any route here takes.
 const MAX_BODY_BYTES: usize = 8 << 10;
-/// What a refusal says about the setup token: one message for wrong, expired,
-/// absent and locked-out.
+/// One message for every token refusal, so the answer never says which case applied.
 const TOKEN_REFUSED: &str = "setup token refused";
 
 pub(super) fn route(
@@ -60,8 +40,6 @@ pub(super) fn route(
     })
 }
 
-/// The wizard's refusals: a token problem is one `forbidden`, a closed setup
-/// is `not_found`, anything else is the store's usual mapping.
 fn setup_error(error: StoreError) -> ApiError {
     match error {
         StoreError::Forbidden => err(ErrorCode::Forbidden, TOKEN_REFUSED),
@@ -71,9 +49,6 @@ fn setup_error(error: StoreError) -> ApiError {
     }
 }
 
-/// `GET /api/v1/setup`: `{ "open": bool }`. Public and uncached. Closed is
-/// permanent (the latch never reopens), so once seen it is remembered and
-/// the question never touches the store again.
 fn status(state: &State) -> Route {
     use std::sync::atomic::Ordering;
     let open = if state.setup_closed.load(Ordering::Acquire) {
@@ -92,9 +67,6 @@ fn status(state: &State) -> Route {
     ))
 }
 
-/// The browser-facing checks every public JSON route makes before a body is
-/// read: a JSON content type, this deployment's own `Origin`, and an
-/// admission slot for the client.
 fn public_json(state: &State, request: &mut Request, budget: Budget) -> Result<Vec<u8>, ApiError> {
     let json_body = header_value(request, "content-type").is_some_and(|value| {
         value
@@ -123,9 +95,7 @@ fn public_json(state: &State, request: &mut Request, budget: Budget) -> Result<V
     public_body_limit(request, MAX_BODY_BYTES)
 }
 
-/// A presented setup token, or the one refusal. A token of the wrong shape
-/// is refused without a store visit and without counting against the lock:
-/// the lock bounds guesses of a well-formed token.
+/// A malformed token is refused before the store, so only well-formed guesses count against the lock.
 fn token_of(text: &str) -> Result<Secret, ApiError> {
     Secret::parse(text.trim()).ok_or_else(|| err(ErrorCode::Forbidden, TOKEN_REFUSED))
 }
@@ -138,9 +108,7 @@ struct SetupBody {
     password: String,
     #[serde(default)]
     display_name: Option<String>,
-    /// `closed`, `invite-only` or `approval-required`.
     registration: String,
-    /// `super-admin-only` (default) or `approved-users`.
     #[serde(default)]
     tenant_creation: Option<String>,
     instance_name: String,
@@ -169,15 +137,9 @@ fn tenant_creation_of(text: Option<&str>) -> Result<TenantCreation, ApiError> {
     }
 }
 
-/// `POST /api/v1/setup`: complete first-run setup with the host's token.
-/// `201` with the administrator's session cookie and CSRF secret; `403` for a
-/// token that is wrong, expired or locked out; `404` once setup is closed;
-/// `409` for a taken address or name; `400` for a bad field. Nothing is
-/// created unless everything is.
 fn complete(state: &State, request: &mut Request) -> Route {
     let bytes = public_json(state, request, Budget::Setup)?;
     let mut body: SetupBody = parse(&bytes)?;
-    // Wiped on every path out, whatever the outcome.
     let outcome = complete_with(state, &body);
     wipe_string(&mut body.password);
     outcome
@@ -227,8 +189,6 @@ fn complete_with(state: &State, body: &SetupBody) -> Route {
             "csrf": csrf,
             "organization": body.organization.as_ref().filter(|_| completed.organization.is_some()),
             "personal_namespace": body.personal_namespace.as_ref().filter(|_| completed.personal.is_some()),
-            // Offered, not forced: enroll with `POST /mfa/enroll` from this
-            // session.
             "mfa_enrollment": "available",
         }),
         vec![
@@ -242,22 +202,12 @@ fn complete_with(state: &State, body: &SetupBody) -> Route {
 #[serde(deny_unknown_fields)]
 struct MailTestBody {
     token: String,
-    /// Where the test message goes.
     to: String,
 }
 
-/// The most of a failure's reason a client is shown.
 const MAX_REASON_CHARS: usize = 200;
 
-/// `POST /api/v1/setup/mail-test {token, to}`: send one test message to `to`
-/// through the deployment's configured Resend key and sender. Gated by the
-/// setup token (a wrong one counts against the same lock), bounded by one
-/// outbound slot and the client's own timeouts, and never stored. Always
-/// `200` for a judged request: `{ "sent": true }`, or `{ "sent": false,
-/// "failure": "not_configured" | "invalid_settings" | "transient" |
-/// "permanent", "reason": … }`: a failed test blocks nothing. The reason is
-/// the client's own short text (a status and Resend's error name), never the
-/// key, the address or a message body.
+/// The reason is the client's own short text, never the key, the address or a message body.
 fn mail_test(state: &State, request: &mut Request) -> Route {
     let bytes = public_json(state, request, Budget::Setup)?;
     let body: MailTestBody = parse(&bytes)?;
@@ -308,16 +258,6 @@ struct OrgBody {
     slug: String,
 }
 
-/// `POST /api/v1/orgs {slug}`: create an organization the caller will
-/// administer. A browser session only (it changes what the account owns).
-/// `201 {slug, role: "admin"}`; `403` unless the deployment's
-/// `tenant_creation` is `approved-users` and the account is approved (a
-/// platform administrator always may); `400` for a reserved or malformed
-/// name; `409` for a taken one; `429` for the per-client budget and, as
-/// `quota_exceeded`, the account's own limit of
-/// [`sentinel_store::organizations::MAX_SELF_SERVICE_ORGS`] organizations or
-/// [`sentinel_store::organizations::SELF_SERVICE_PER_HOUR`] an hour. Whether
-/// a name is taken is inherently what `409` says; the budget bounds probing.
 fn create_organization(state: &State, request: &mut Request) -> Route {
     if !crate::oauth::admitted(state, request, Budget::Organization) {
         return Err(
@@ -356,15 +296,6 @@ fn create_organization(state: &State, request: &mut Request) -> Route {
     ))
 }
 
-/// `GET /api/v1/tenants/{slug}/settings`: a namespace's kind (`personal` or
-/// `organization`), where its membership comes from (`app`: invitations,
-/// administrators and the operator's auto-join rules; `github`: GitHub
-/// confirms it) and whether a GitHub App installation is bound; for a
-/// GitHub-backed organization, the caller's own `github_sync`. For an
-/// administrator, also whether email-domain auto-join applies (read-only: the
-/// rule is the operator's `SENTINEL_AUTO_JOIN_DOMAINS`) and the domains that
-/// name this organization. A namespace the caller cannot see is `not_found`,
-/// like every slug route.
 fn settings(state: &State, request: &mut Request, slug: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::RUNS_READ)?;
@@ -390,10 +321,6 @@ fn settings(state: &State, request: &mut Request, slug: &str) -> Route {
     if found.github_backed
         && let Value::Object(map) = &mut value
     {
-        // The caller's own standing with GitHub, never anyone else's: when
-        // GitHub last confirmed it, whether a check is due now, and how many
-        // passes in a row GitHub could not answer (unknown keeps what exists
-        // for the grace period and grants nothing new).
         let now = UnixMillis::now().0;
         map.insert(
             "github_sync".into(),
@@ -414,8 +341,6 @@ fn settings(state: &State, request: &mut Request, slug: &str) -> Route {
         map.insert(
             "auto_join".into(),
             json!({
-                // Never for a personal namespace or a GitHub-backed
-                // organization, whatever the rules say.
                 "applies": !found.personal && !github && !domains.is_empty(),
                 "domains": domains,
             }),

@@ -1,12 +1,6 @@
-//! Log frames and the on-disk record they are spooled and stored as.
-//!
-//! A frame is at most `MAX_LOG_FRAME_BYTES` of one stream of one step,
-//! numbered by a per-attempt sequence that starts at 1 and never skips.
-//! The same record encoding is used by the worker's spool and the
-//! controller's log file, so what was acknowledged is byte-for-byte what
-//! was written: `kind u8 | seq u64 | step u32 | stream u8 | len u32 | bytes`
-//! for a frame, and `kind u8 | last_seq u64 | gaps u32 | (from u64, to u64)*`
-//! for the end marker that makes an attempt's log complete.
+//! The spool and the controller log share this record encoding, so acknowledged bytes are written bytes.
+//! Frame: kind u8 | seq u64 | step u32 | stream u8 | len u32 | bytes.
+//! End: kind u8 | last_seq u64 | gaps u32 | (from u64, to u64)*.
 
 use crate::limits::MAX_LOG_FRAME_BYTES;
 
@@ -35,12 +29,9 @@ pub struct Frame {
     pub bytes: Vec<u8>,
 }
 
-/// A record in a spool or log file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Record {
     Frame(Frame),
-    /// The attempt produced nothing after `last_seq`; `gaps` are ranges the
-    /// worker could not deliver (spool loss), reported rather than hidden.
     End {
         last_seq: u64,
         gaps: Vec<(u64, u64)>,
@@ -50,19 +41,14 @@ pub enum Record {
 const KIND_FRAME: u8 = 1;
 const KIND_END: u8 = 2;
 pub const FRAME_HEADER_BYTES: usize = 1 + 8 + 4 + 1 + 4;
-/// Gap ranges an end record may carry.
 pub const MAX_GAPS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordError {
-    /// The buffer ends inside a record: wait for more, or a torn tail.
     Incomplete,
-    /// Not a record: wrong kind, oversized frame, unknown stream.
     Invalid,
 }
 
-/// Append one frame record to `out` straight from borrowed parts — the same
-/// bytes as `Record::Frame(..).encode`, without building an owned frame.
 pub fn encode_frame(
     seq: u64,
     step: u32,
@@ -84,7 +70,6 @@ pub fn encode_frame(
 }
 
 impl Record {
-    /// Append the record's bytes to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), RecordError> {
         match self {
             Record::Frame(frame) => {
@@ -106,8 +91,6 @@ impl Record {
         Ok(())
     }
 
-    /// Decode one record from the front of `bytes`; returns it with the
-    /// number of bytes consumed.
     pub fn decode(bytes: &[u8]) -> Result<(Record, usize), RecordError> {
         let kind = *bytes.first().ok_or(RecordError::Incomplete)?;
         match kind {

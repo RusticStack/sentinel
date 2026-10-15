@@ -1,38 +1,20 @@
-//! The generic ref-update event contract.
-//!
-//! One authenticated delivery is one ref transition: a stable delivery ID
-//! chosen by the sender, the full ref name, and the old and new object IDs.
-//! A commit ID alone is not a delivery identity — returning a ref to an
-//! earlier commit is a distinct transition — so both ends are carried and the
-//! delivery ID exists to make redelivery idempotent.
-//!
-//! Field bounds here are the wire's; the store's CHECK constraints repeat
-//! them, so a route cannot insert anything this contract would not have
-//! accepted.
+//! A commit ID alone is not a delivery identity: returning a ref to an earlier commit is a new transition.
+
 use serde::{Deserialize, Serialize};
 
-/// Body cap for the generic intake route. The payload is a handful of fields.
 pub const MAX_HOOK_BODY_BYTES: usize = 64 * 1024;
-/// Body cap for provider webhooks. A push payload with a long commit list can
-/// outgrow the generic contract; GitHub truncates that list, so this bounds
-/// the request rather than the event.
+// GitHub truncates long commit lists, so this bounds the request rather than the event.
 pub const MAX_WEBHOOK_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_DELIVERY_ID_BYTES: usize = 128;
 pub const MAX_REF_BYTES: usize = 1024;
 pub const MAX_SHA_BYTES: usize = 64;
-/// The one presentation of a repository hook secret. The prefix keeps it
-/// distinguishable from an API credential and from a Git remote credential.
 pub const HOOK_TOKEN_PREFIX: &str = "sentinel_hook_";
 
-/// A sender-chosen, stable delivery identity. Bounded printable ASCII: it is
-/// stored, indexed and compared, never parsed.
 pub fn valid_delivery_id(value: &str) -> bool {
     (1..=MAX_DELIVERY_ID_BYTES).contains(&value.len())
         && value.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
-/// A full Git ref as a sender may report it. The *binding* decides which refs
-/// a repository accepts; this only rejects values that are not refs at all.
 pub fn valid_ref(value: &str) -> bool {
     value.starts_with("refs/")
         && value.len() <= MAX_REF_BYTES
@@ -50,7 +32,6 @@ pub fn valid_ref(value: &str) -> bool {
             .all(|s| !s.is_empty() && !s.starts_with('.'))
 }
 
-/// A SHA-1 (40) or SHA-256 (64) object ID in canonical lower-case hex.
 pub fn valid_sha(value: &str) -> bool {
     (value.len() == 40 || value.len() == 64)
         && value
@@ -58,16 +39,13 @@ pub fn valid_sha(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// The all-zero object ID Git reports for a creation or a deletion.
 pub fn is_zero_sha(value: &str) -> bool {
     valid_sha(value) && value.bytes().all(|b| b == b'0')
 }
 
-/// The generic relay's request body.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RefUpdate {
-    /// Stable across redeliveries of the same event; unique across events.
     pub delivery_id: String,
     #[serde(rename = "ref")]
     pub ref_name: String,
@@ -76,7 +54,6 @@ pub struct RefUpdate {
 }
 
 impl RefUpdate {
-    /// Bounded, canonical shape. Returns the first violation, never the value.
     pub fn validate(&self) -> Result<(), &'static str> {
         if !valid_delivery_id(&self.delivery_id) {
             return Err("delivery id");
@@ -133,7 +110,6 @@ mod tests {
         });
         let update: RefUpdate = serde_json::from_value(body).unwrap();
         assert!(update.validate().is_ok());
-        // Unknown keys are refused: a sender cannot smuggle fields in.
         let extra = serde_json::json!({
             "delivery_id": "hook-1", "ref": "refs/heads/main",
             "old_sha": "0".repeat(40), "new_sha": "a".repeat(40), "extra": 1,

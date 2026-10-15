@@ -1,5 +1,3 @@
-//! Benchmark runner: runs a fixed workload N times and emits one JSON record.
-//! Durations are monotonic; unmeasured fields are omitted, never zero.
 mod contract;
 
 use std::{
@@ -117,10 +115,7 @@ struct Record {
     workload: Workload,
     runtime: Runtime,
     warm_state: WarmState,
-    /// How the declared state was established: `contract-prepare` (the
-    /// contract's own per-run preparation resets it), `warmup-run` (an
-    /// identical unmeasured run completed before the first sample) or
-    /// `unverified` (operator-declared; nothing the runner can observe)
+    /// How the declared warm state was established: `contract-prepare`, `warmup-run` or `unverified`.
     warm_state_basis: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     interleave: Option<Interleave>,
@@ -132,7 +127,6 @@ struct Record {
     image: Option<Image>,
     #[serde(skip_serializing_if = "Option::is_none")]
     contract: Option<contract::Stamp>,
-    /// `go version` (or the lane's toolchain) as the measured runtime sees it.
     #[serde(skip_serializing_if = "Option::is_none")]
     toolchain: Option<String>,
     warmup: u32,
@@ -141,40 +135,28 @@ struct Record {
     summary: Summary,
 }
 
-/// Runtimes measured alternately in one group; each has its own record.
 #[derive(Serialize)]
 struct Interleave {
     runtimes: Vec<Runtime>,
     order: &'static str,
 }
 
-/// Host state around the measured window, so a sample set taken on a
-/// contended, stealing or throttled host says so. Every field is read from
-/// the kernel; an absent field was not readable there (a VM often has no
-/// cpufreq), never zero.
 #[derive(Clone, Default, Serialize)]
 struct Conditions {
-    /// CPU pressure (`some`, percent) before the first warm-up run
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_pressure_avg10_start: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_pressure_avg60_start: Option<f64>,
-    /// CPU pressure after the last sample; avg10 covers the sampling window
-    /// of a short run, avg60 lags it
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_pressure_avg10_end: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_pressure_avg60_end: Option<f64>,
-    /// Time the hypervisor took from this guest over the window, summed over
-    /// CPUs (`/proc/stat` steal), in nanoseconds
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_steal_ns: Option<u64>,
-    /// `scaling_governor` of cpu0
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_governor: Option<String>,
 }
 
-/// Kernel counters read at the window's start and again at its end.
 struct Probe {
     pressure_avg10: Option<f64>,
     pressure_avg60: Option<f64>,
@@ -205,8 +187,6 @@ fn conditions(start: &Probe, end: &Probe) -> Conditions {
     }
 }
 
-/// Cumulative steal time of all CPUs in nanoseconds: the eighth `cpu` field
-/// of `/proc/stat` is in clock ticks.
 #[cfg(unix)]
 fn cpu_steal_ns() -> Option<u64> {
     let text = fs::read_to_string("/proc/stat").ok()?;
@@ -264,7 +244,6 @@ struct Image {
 #[derive(Serialize)]
 struct Sample {
     index: u32,
-    /// Position in the whole measured sequence of an interleaved group
     #[serde(skip_serializing_if = "Option::is_none")]
     seq: Option<u32>,
     elapsed_ns: u64,
@@ -296,14 +275,9 @@ struct Summary {
     p95_ns: u64,
     max_ns: u64,
     mean_ns: u64,
-    /// Sample standard deviation (n - 1); absent for a single sample
     #[serde(skip_serializing_if = "Option::is_none")]
     stddev_ns: Option<u64>,
-    /// Median absolute deviation from the median: a spread that one slow
-    /// outlier cannot move
     mad_ns: u64,
-    /// The nearest-rank p95 is the largest sample (fewer than 20 samples),
-    /// so it describes one run, not a tail
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     p95_is_max: bool,
 }
@@ -319,8 +293,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// What one invocation measures: the argv, its environment and the
-/// unmeasured preparation before each run.
 struct Plan {
     runtime: Runtime,
     argv: Vec<String>,
@@ -338,8 +310,6 @@ struct Plan {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
-    // Provenance first: a record without its source revision cannot be
-    // attributed, so none is written (and nothing is measured) without it.
     let source = source_revision()?;
     let mut runtimes = vec![cli.runtime];
     for runtime in &cli.interleave {
@@ -359,8 +329,6 @@ fn run(cli: Cli) -> Result<(), String> {
     if plans[0].samples == 0 {
         return Err("samples must be at least 1".into());
     }
-    // A declared warm state the runner can contradict is refused before any
-    // run; the rest is labelled by how it was established.
     let bases = plans
         .iter()
         .map(warm_state_basis)
@@ -394,8 +362,7 @@ fn run(cli: Cli) -> Result<(), String> {
         .collect();
     let mut seq = 0u32;
     for index in 0..plans[0].samples {
-        // ABBA: the order reverses every sample, so a drift across the
-        // group cannot favour one runtime.
+        // ABBA order: drift across the group cannot favour one runtime.
         for k in abba_order(index, plans.len()) {
             let mut sample = once(&plans[k], index)?;
             check_exit(&sample)?;
@@ -470,8 +437,6 @@ fn run(cli: Cli) -> Result<(), String> {
     Ok(())
 }
 
-/// The order the plans run within sample `index`: forward on even samples,
-/// reversed on odd ones.
 fn abba_order(index: u32, plans: usize) -> Vec<usize> {
     if index.is_multiple_of(2) {
         (0..plans).collect()
@@ -507,9 +472,6 @@ fn summary_line(runtime: Runtime, s: &Summary) -> String {
     )
 }
 
-/// How a plan's declared warm state is established (see `Record`), or an
-/// error when the runner can see that it does not hold: a warm podman run
-/// whose image is absent would pull inside the first sample.
 fn warm_state_basis(plan: &Plan) -> Result<&'static str, String> {
     if matches!(plan.warm_state, WarmState::Warm)
         && plan.runtime == Runtime::Podman
@@ -528,7 +490,6 @@ fn warm_state_basis(plan: &Plan) -> Result<&'static str, String> {
     })
 }
 
-/// A built-in workload (`noop`, `nonzero-exit`).
 fn plain_plan(cli: &Cli) -> Result<Plan, String> {
     let inner: Vec<&str> = match (cli.workload, cfg!(windows)) {
         (Workload::Noop, false) => vec!["true"],
@@ -563,7 +524,6 @@ fn plain_plan(cli: &Cli) -> Result<Plan, String> {
     })
 }
 
-/// A contract lane: checked against the contract before anything runs.
 fn contract_plan(cli: &Cli, path: &Path) -> Result<Plan, String> {
     let loaded = contract::load(path)?;
     let c = &loaded.contract;
@@ -677,8 +637,6 @@ fn contract_plan(cli: &Cli, path: &Path) -> Result<Plan, String> {
         toolchain: None,
         limits,
     };
-    // The toolchain the measured runtime actually runs, asked through the
-    // same wrapper (unmeasured).
     let probe = Plan {
         argv: wrap(
             cli.runtime,
@@ -711,7 +669,6 @@ fn contract_plan(cli: &Cli, path: &Path) -> Result<Plan, String> {
     Ok(plan)
 }
 
-/// `PATH` with `--path-prepend` in front, for the direct and scoped runtimes.
 fn path_env(cli: &Cli) -> Result<Vec<(String, String)>, String> {
     if cli.path_prepend.is_empty() || cli.runtime == Runtime::Podman {
         return Ok(Vec::new());
@@ -724,9 +681,7 @@ fn path_env(cli: &Cli) -> Result<Vec<(String, String)>, String> {
     Ok(vec![("PATH".into(), joined.to_string_lossy().into_owned())])
 }
 
-/// The argv that runs `inner` under `runtime` with `limits`. For podman the
-/// bench root is mounted at the same path and the caller's user is kept, so
-/// files, paths and ownership match a direct run.
+/// Podman mounts the bench root at its own path and keeps the caller's user, so files and ownership match a direct run.
 fn wrap(
     runtime: Runtime,
     image: Option<&str>,
@@ -791,7 +746,6 @@ fn wrap(
     })
 }
 
-/// Run one unmeasured preparation step; its failure stops the record.
 fn prepare_run(shell: &str, script: &str) -> Result<(), String> {
     let status = Command::new(shell)
         .args(["-c", script])
@@ -890,7 +844,6 @@ fn summarize(samples: &[Sample]) -> Summary {
     let mut sorted: Vec<u64> = samples.iter().map(|s| s.elapsed_ns).collect();
     sorted.sort_unstable();
     let n = sorted.len();
-    // Nearest rank in integers: rank = ceil(percent * n / 100), one-based.
     let rank = |percent: usize| (percent * n).div_ceil(100).max(1);
     let median = sorted[rank(50) - 1];
     let p95_rank = rank(95);
@@ -916,9 +869,6 @@ fn summarize(samples: &[Sample]) -> Summary {
     }
 }
 
-/// The commit and dirty state of the checkout this runner was built from,
-/// asked of `git` there rather than in the working directory, so a runner
-/// started elsewhere still names its source.
 fn source_revision() -> Result<Source, String> {
     let dir = env!("CARGO_MANIFEST_DIR");
     let git_commit = command_line(&["git", "-C", dir, "rev-parse", "HEAD"]).ok_or_else(|| {
@@ -996,7 +946,6 @@ fn host_info() -> Host {
     }
 }
 
-/// Filesystem type of the longest mount-point prefix of `path` (Linux /proc/self/mounts).
 fn mount_fs(path: &Path) -> Option<String> {
     let mounts = fs::read_to_string("/proc/self/mounts").ok()?;
     let path = path.to_str()?;

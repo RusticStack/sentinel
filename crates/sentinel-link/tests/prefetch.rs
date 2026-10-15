@@ -1,16 +1,3 @@
-//! Bounded image prefetch over the real link: a controller and worker
-//! processes on loopback TLS, recorder executors whose "pull" is a short
-//! sleep that then reports the image warm, exactly as the worker's
-//! `Images` record does after a real pull.
-//!
-//! - A protocol-9 worker that a locality hold passes over is hinted the
-//!   held job's image, pulls it, reports it warm, and is offered the job
-//!   within seconds instead of after `LOCALITY_WAIT_MS`.
-//! - A protocol-8 worker is never sent a hint (older-peer negotiation).
-//!
-//! `prefetch_placement_latency` (ignored) measures the same scenario with
-//! and without the hint.
-
 use std::{
     sync::{
         Arc, Mutex,
@@ -47,8 +34,6 @@ const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const KEY: [u8; 8] = [0xaa; 8];
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// Holds the warm worker's only core: the job's timeout puts its end inside
-/// the locality window, so the cold worker is held off.
 const FILLER: &str = "schema: 1
 on: [push]
 jobs:
@@ -144,7 +129,6 @@ impl Deployment {
             .secret
     }
 
-    /// One run of `yaml` with its image resolved; then the dispatcher wakes.
     fn run(&self, yaml: &str) -> JobId {
         let spec = RunSpec::new(
             PinnedSource::new("https://github.com/o/r.git", SHA, Some("refs/heads/main")).unwrap(),
@@ -167,10 +151,6 @@ impl Deployment {
     }
 }
 
-/// A recorder executor. It holds what it is offered (nothing ever runs),
-/// reports `warm` images in its profile, and "pulls" a hinted image by
-/// sleeping `pull` and then reporting it warm — the availability change
-/// the link sends as a profile refresh.
 struct Recorder {
     offers: Mutex<Vec<(Offer, Instant)>>,
     held: Mutex<Vec<AttemptId>>,
@@ -179,8 +159,6 @@ struct Recorder {
     pull: Duration,
 }
 
-/// The "image store": what the recorder reports warm, and the version the
-/// link's profile refresh watches.
 struct Warm {
     keys: Mutex<Vec<[u8; 8]>>,
     version: AtomicU64,
@@ -334,11 +312,6 @@ fn eventually(what: &str, within: Duration, mut predicate: impl FnMut() -> bool)
     }
 }
 
-/// The scenario both tests share: the warm worker (one core, the image
-/// warm) takes the filler; then a cold worker speaking `protocol_max`
-/// joins and the target is queued. Returns the cold worker's recorder,
-/// when the target was queued, and the processes (kept alive by the
-/// caller).
 fn held_for_locality(
     d: &Deployment,
     protocol_max: u16,
@@ -391,8 +364,6 @@ fn a_hinted_worker_prefetches_and_takes_the_job_a_locality_hold_kept_from_it() {
 fn a_protocol_8_worker_is_never_hinted() {
     let d = deployment();
     let (cold, target, _, _processes) = held_for_locality(&d, 8);
-    // Several prefetch passes and a profile beat later: no hint, and the
-    // job is still held for the warm worker.
     thread::sleep(Duration::from_secs(7));
     assert!(cold.hints.lock().unwrap().is_empty());
     assert!(cold.offered_job(target).is_none());
@@ -403,9 +374,6 @@ fn a_protocol_8_worker_is_never_hinted() {
     );
 }
 
-/// Measurement: time from queueing the target to its offer on the cold
-/// worker, with the hint (protocol 9) and without it (protocol 8, where
-/// only the end of the locality hold releases it).
 #[test]
 #[ignore = "measurement: waits out a locality hold"]
 fn prefetch_placement_latency() {

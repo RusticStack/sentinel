@@ -1,5 +1,3 @@
-//! `run dispatch|status|list|cancel|wait`, `status` and `wait`.
-
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -61,9 +59,6 @@ pub(super) fn status(client: &Client, output: Output, run: &str) -> Result<(), E
     Ok(())
 }
 
-/// Newest first, page by page: each page is printed (text, NDJSON) before
-/// the next is requested, and at most the cap is ever printed. A listing
-/// cut short names the cursor that continues it.
 pub(super) fn list(
     client: &Client,
     output: Output,
@@ -107,9 +102,7 @@ pub(super) fn list(
             next => break next,
         }
     };
-    // JSON carries the cursor as `next`; text and NDJSON name it on stderr,
-    // so an NDJSON consumer knows a cut listing from a complete one (the
-    // cursor is also the last line's `id`).
+    // Text and NDJSON name the cursor on stderr, so an NDJSON consumer can tell a cut listing from a complete one.
     if let Some(next) = &more
         && output != Output::Json
     {
@@ -130,17 +123,8 @@ pub(super) fn cancel(client: &Client, output: Output, run: &str) -> Result<(), E
     Ok(())
 }
 
-/// Each wait request parks on the server at most this long.
 const WAIT_SLICE: Duration = Duration::from_secs(25);
 
-/// Follow a run until it finishes, one long poll at a time: the server
-/// answers when the run's version moves, so an idle wait costs one request
-/// per 25 s. Exit 0 when it passed, 8 when it finished otherwise, 7 when
-/// the deadline came first. A `rate_limited` answer (every subscriber slot
-/// taken) is waited out with jitter, never counted as a failure.
-///
-/// Text prints a line per change and the job table at the end; NDJSON one
-/// `{version, changed, finished, run}` line per change; JSON the final run.
 pub(super) fn wait(
     client: &Client,
     output: Output,
@@ -190,10 +174,7 @@ pub(super) fn wait(
                 Output::Json => {}
             }
         }
-        // `finished` must describe the view it came with: a server that
-        // judged `finished` and read the view separately can
-        // pair it with a view taken after a rerun made the run live again.
-        // Such an answer is progress, not the end.
+        // `finished` must describe the view it came with: a rerun can make the run live again between two reads.
         if answer["finished"] == true && settled(&answer["run"]) {
             let view = &answer["run"];
             match output {
@@ -213,14 +194,12 @@ pub(super) fn wait(
     }
 }
 
-/// Every job of a run view is terminal: nothing about it changes by itself.
 fn settled(run: &Value) -> bool {
     run["jobs"]
         .as_array()
         .is_none_or(|jobs| jobs.iter().all(|j| j["terminal"] == true))
 }
 
-/// One text line per change: the run's state and how many jobs finished.
 fn progress(run: &Value) -> String {
     let jobs = run["jobs"].as_array().map_or(&[][..], Vec::as_slice);
     let done = jobs.iter().filter(|j| j["terminal"] == true).count();

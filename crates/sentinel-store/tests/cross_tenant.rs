@@ -1,10 +1,3 @@
-//! The consolidated cross-tenant sweep. One deployment, two
-//! organizations and a personal namespace, overlapping memberships, a
-//! tenant-bound service account, unbound installations, invitations raced and
-//! reused, guessed identifiers, cross-tenant queries and cursors, and
-//! last-admin recovery — exercised together rather than per feature, because the
-//! failures worth finding live between the modules.
-
 use std::thread;
 
 use sentinel_auth::secret::Secret;
@@ -51,8 +44,6 @@ struct World {
     globex_repo: RepoId,
 }
 
-/// root: bootstrapped super admin. dev: acme admin, globex reader, owns a
-/// personal namespace. sam: globex admin only. bot: acme service account.
 fn world() -> World {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
@@ -144,8 +135,6 @@ fn overlapping_memberships_resolve_per_tenant_and_never_bleed_across() {
     let w = world();
     let (dev, sam, bot) = (principal(w.dev), principal(w.sam), principal(w.bot));
 
-    // dev administers acme, only reads globex (and has no grant there), owns the
-    // personal namespace; sam sees globex only; the bot sees its grant only.
     w.store
         .read(|c| auth::require_repo(c, dev, w.acme_repo, P::WRITE_SECRETS))
         .unwrap();
@@ -180,23 +169,18 @@ fn overlapping_memberships_resolve_per_tenant_and_never_bleed_across() {
             .read(|c| auth::get_namespace(c, sam, Namespace::parse("dev").unwrap())),
         Err(Error::NotFound)
     ));
-    // Lists are filtered before pagination: a globex reader lists nothing of
-    // acme, and the page never says how much was hidden.
     assert!(
         w.store
             .read(|c| auth::list_repos(c, sam, w.acme, None, 100))
             .unwrap()
             .is_empty()
     );
-    // A credential narrowed to globex cannot reach acme even for its admin.
     let narrowed = Principal::new(w.dev, P::ALL, Some(w.globex), None);
     assert!(matches!(
         w.store
             .read(|c| auth::require_repo(c, narrowed, w.acme_repo, P::READ)),
         Err(Error::NotFound)
     ));
-    // Tenant administration is per tenant: sam cannot grant on acme's repo,
-    // and dev cannot administer globex despite being a member.
     let refused = w
         .store
         .writer()
@@ -219,7 +203,6 @@ fn guessed_identifiers_and_foreign_cursors_yield_nothing_distinguishable() {
         .write(move |tx| jobs::insert_run(tx, w.globex, w.globex_repo, run, "abc", T))
         .unwrap();
 
-    // Guessed or real-but-foreign identifiers give the same answer.
     for repo in [RepoId::new(), w.globex_repo] {
         assert!(matches!(
             w.store.read(|c| auth::get_repo(c, dev, repo)),
@@ -248,8 +231,6 @@ fn guessed_identifiers_and_foreign_cursors_yield_nothing_distinguishable() {
         Err(Error::Forbidden)
     ));
 
-    // A cursor minted for globex is refused when presented as acme, and a
-    // substituted tenant inside the text is refused as well.
     let cursor = Cursor {
         tenant: w.globex,
         kind: StreamKind::RunEvents,
@@ -271,8 +252,6 @@ fn guessed_identifiers_and_foreign_cursors_yield_nothing_distinguishable() {
         Cursor::parse(&forged, w.acme),
         Ok(_) | Err(CursorError::Malformed)
     ));
-    // Whatever the forgery parses to, the run it names still resolves through
-    // ownership, and ownership is not acme's.
     assert!(matches!(
         w.store.read(|c| auth::get_run_spec(c, dev, run)),
         Err(Error::NotFound)
@@ -337,7 +316,6 @@ fn an_invitation_raced_by_many_applicants_admits_exactly_one() {
         .filter(|o| matches!(o, Admission::Refused(Refusal::InvitationUnusable)))
         .count();
     assert_eq!((admitted, refused), (1, 7));
-    // Exactly one membership came out of it.
     let members: i64 = w
         .store
         .read(|c| {
@@ -352,8 +330,6 @@ fn an_invitation_raced_by_many_applicants_admits_exactly_one() {
         .unwrap();
     assert_eq!(members, 1);
 
-    // Reuse after the fact, and reuse of a username under a race, both fail
-    // cleanly: no half-created account exists.
     let again = registration::register(
         &w.store,
         Applicant::Local {
@@ -419,8 +395,6 @@ fn unbound_installations_and_pending_accounts_hold_nothing_anywhere() {
         Admission::Pending(user) => user,
         other => panic!("{other:?}"),
     };
-    // Pending: no session by any path, no membership even if an admin tries,
-    // no credential.
     assert!(matches!(
         sign_in::complete(&w.store, "github", "777", Policy::default(), T).unwrap(),
         sign_in::Outcome::NoAccount
@@ -436,8 +410,6 @@ fn unbound_installations_and_pending_accounts_hold_nothing_anywhere() {
         Err(Error::Sqlite(_))
     ));
 
-    // An installation seen twice is one row, unbound, resolving to no tenant,
-    // and binding it to a tenant the caller does not administer fails.
     let installation = w
         .store
         .writer()
@@ -463,7 +435,6 @@ fn unbound_installations_and_pending_accounts_hold_nothing_anywhere() {
             move |tx| registration::bind_installation(tx, dev, installation, acme, T)
         })
         .unwrap();
-    // Bound to acme, it is still nothing to globex's admin.
     let refused = w.store.writer().write({
         let sam = principal(w.sam);
         move |tx| registration::unbind_installation(tx, sam, installation, T)
@@ -509,8 +480,6 @@ fn suspension_of_one_tenant_leaves_the_others_and_shared_people_working() {
         })
         .unwrap();
 
-    // dev's session still works, their globex credential still works, their
-    // personal namespace still resolves; only acme is gone.
     w.store
         .read(|c| local_auth::authenticate(c, &dev_cookie, at(2_100)))
         .unwrap();
@@ -539,7 +508,6 @@ fn suspension_of_one_tenant_leaves_the_others_and_shared_people_working() {
         w.store.read(|c| tenancy::epoch(c, w.globex)).unwrap(),
         globex_epoch
     );
-    // The acme service account is dead in every way that matters.
     assert!(matches!(
         w.store
             .read(|c| auth::require_repo(c, principal(w.bot), w.acme_repo, P::RUN)),
@@ -552,8 +520,6 @@ fn suspension_of_one_tenant_leaves_the_others_and_shared_people_working() {
 fn last_admin_recovery_survives_lockout_demotion_and_suspension_attempts() {
     let w = world();
     let root = stepped(w.root);
-    // Root cannot be demoted, suspended or rejected while alone; a deputy
-    // changes that, and removing the deputy again restores the protection.
     for attempt in [
         w.store
             .writer()
@@ -583,8 +549,6 @@ fn last_admin_recovery_survives_lockout_demotion_and_suspension_attempts() {
         Err(Error::Sqlite(_))
     ));
 
-    // Lock root's password out entirely, then recover host-locally: the
-    // account is reactivated by an admin, recovered, and signs in again.
     w.store
         .writer()
         .write(move |tx| local_auth::set_active(tx, dev, w.root, true, at(2_300)))
@@ -626,7 +590,6 @@ fn last_admin_recovery_survives_lockout_demotion_and_suspension_attempts() {
         .unwrap(),
         Login::Accepted(_)
     ));
-    // Bootstrap stays closed throughout: recovery is the path, not a re-bootstrap.
     assert!(matches!(
         local_auth::bootstrap(&w.store, "root2", "Root", PASSWORD, at(2_800)),
         Err(Error::Forbidden)
@@ -674,15 +637,11 @@ fn everything_above_survives_a_reopen() {
     assert!(store.read(|c| tenancy::epoch(c, acme)).unwrap() >= 1);
 }
 
-/// Resolving a tenant slug (and a repository name) for a
-/// client never tells a non-member whether the tenant exists. A foreign,
-/// a suspended and a missing slug are the same `NotFound`, for principals,
-/// narrowed credentials and the OAuth narrowing alike.
+// Slug resolution never reveals to a non-member whether a tenant exists: foreign, suspended and missing all read as NotFound.
 #[test]
 fn slugs_and_names_resolve_only_for_members() {
     let w = world();
     let sam = principal(w.sam);
-    // sam belongs to globex only.
     assert_eq!(
         w.store
             .read(|c| auth::member_tenant_by_slug(c, sam, "globex"))
@@ -700,7 +659,6 @@ fn slugs_and_names_resolve_only_for_members() {
             Err(Error::NotFound)
         ));
     }
-    // A repository name only inside a tenant the account can see into.
     assert!(matches!(
         w.store
             .read(|c| auth::narrowing_by_name(c, w.sam, "acme", Some("app"))),
@@ -717,8 +675,6 @@ fn slugs_and_names_resolve_only_for_members() {
             .read(|c| auth::narrowing_by_name(c, w.sam, "globex", Some("missing"))),
         Err(Error::NotFound)
     ));
-    // dev is only a globex reader with no grant: globex's repository is
-    // invisible to them, though the tenant itself resolves.
     assert!(
         w.store
             .read(|c| auth::narrowing_by_name(c, w.dev, "globex", None))
@@ -729,9 +685,6 @@ fn slugs_and_names_resolve_only_for_members() {
             .read(|c| auth::narrowing_by_name(c, w.dev, "globex", Some("app"))),
         Err(Error::NotFound)
     ));
-    // A credential narrowed to acme resolves acme only; the service account
-    // resolves its home tenant only; a platform credential sees any active
-    // tenant, and a suspended one is gone for everybody.
     let narrowed = Principal::new(w.dev, P::ALL, Some(w.acme), None);
     assert!(
         w.store

@@ -1,6 +1,3 @@
-//! First-run setup and self-service organizations: the behavior a person at
-//! the wizard or an attacker against it can observe, and the failure paths.
-
 use rusqlite::params;
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
@@ -75,7 +72,6 @@ fn setup_creates_the_administrator_policy_and_session_in_one_commit() {
     )
     .unwrap();
 
-    // The latch the CLI bootstrap uses is the one that closed.
     assert!(!store.read(setup::is_open).unwrap());
     assert_eq!(count(&store, "SELECT COUNT(*) FROM bootstrap"), 1);
     assert_eq!(count(&store, "SELECT COUNT(*) FROM setup_token"), 0);
@@ -84,7 +80,6 @@ fn setup_creates_the_administrator_policy_and_session_in_one_commit() {
         Err(Error::Forbidden)
     ));
 
-    // A verified, canonical address; the administrator signs in with it.
     let (address, verified) = store
         .read(|c| email::account_email(c, done.user))
         .unwrap()
@@ -101,14 +96,12 @@ fn setup_creates_the_administrator_policy_and_session_in_one_commit() {
     .unwrap();
     assert!(matches!(login, Login::Accepted(_)));
 
-    // The session the wizard ended with is a live super-admin session.
     let session = store
         .read(|c| local_auth::authenticate(c, &done.issued.session, at(2_500)))
         .unwrap();
     assert_eq!(session.user, done.user);
     assert!(session.super_admin);
 
-    // The choices were recorded, and the organization is the admin's.
     let policy = store.read(registration::policy).unwrap();
     assert_eq!(policy.registration, Registration::ApprovalRequired);
     assert_eq!(policy.tenant_creation, TenantCreation::ApprovedUsers);
@@ -131,7 +124,6 @@ fn setup_creates_the_administrator_policy_and_session_in_one_commit() {
         1
     );
     assert!(done.organization.is_some() && done.personal.is_some());
-    // Audited as the host-local act it is.
     assert!(
         count(
             &store,
@@ -152,7 +144,6 @@ fn a_token_works_once_and_setup_after_it_is_closed() {
     )
     .unwrap();
 
-    // Reuse of the spent token, and a fresh attempt by anyone, find setup shut.
     let again = setup::complete(
         &store,
         &request(&token, "mallory@example.com"),
@@ -194,9 +185,7 @@ fn an_expired_token_is_refused_and_nothing_is_written() {
     );
     assert!(matches!(outcome, Err(Error::Forbidden)));
     nothing_was_created(&store);
-    // One second before the deadline it still worked.
     setup::verify(&store, &token, at(setup::TOKEN_TTL_MS - 1000)).unwrap();
-    // Maintenance then deletes the dead row; a later attempt is still refused.
     setup::purge(&store, late, 64).unwrap();
     assert_eq!(count(&store, "SELECT COUNT(*) FROM setup_token"), 0);
     assert!(matches!(
@@ -247,7 +236,6 @@ fn guessing_locks_setup_for_everyone_until_the_lock_ends() {
         );
         assert!(matches!(outcome, Err(Error::Forbidden)));
     }
-    // Locked: even the right token is refused, and nothing was created.
     let during = setup::complete(
         &store,
         &request(&token, "ada@example.com"),
@@ -256,7 +244,6 @@ fn guessing_locks_setup_for_everyone_until_the_lock_ends() {
     );
     assert!(matches!(during, Err(Error::Forbidden)));
     nothing_was_created(&store);
-    // After the lock the right token works: the lock delays, never admits.
     setup::complete(
         &store,
         &request(&token, "ada@example.com"),
@@ -312,7 +299,6 @@ fn a_bad_field_is_refused_before_the_token_is_judged_or_spent() {
         Err(Error::InvalidInput(_))
     ));
     nothing_was_created(&store);
-    // The token survived every refusal and still works.
     setup::complete(
         &store,
         &request(&token, "ada@example.com"),
@@ -325,7 +311,6 @@ fn a_bad_field_is_refused_before_the_token_is_judged_or_spent() {
 #[test]
 fn a_taken_organization_name_rolls_the_whole_setup_back() {
     let (_dir, store) = open();
-    // A namespace of that name already exists (made host-locally).
     store
         .writer()
         .write(|tx| {
@@ -347,12 +332,10 @@ fn a_taken_organization_name_rolls_the_whole_setup_back() {
         setup::complete(&store, &clash, Policy::default(), at(1)),
         Err(Error::Conflict)
     ));
-    // The administrator, the latch and the settings rolled back with it.
     assert_eq!(count(&store, "SELECT COUNT(*) FROM users"), 0);
     assert_eq!(count(&store, "SELECT COUNT(*) FROM bootstrap"), 0);
     assert_eq!(count(&store, "SELECT COUNT(*) FROM instance_settings"), 0);
     assert!(store.read(setup::is_open).unwrap());
-    // The token is still good: the person fixes the name and tries again.
     setup::complete(
         &store,
         &request(&token, "ada@example.com"),
@@ -521,7 +504,6 @@ fn an_approved_user_creates_an_organization_and_administers_it() {
         ),
         1
     );
-    // The same name again, by anyone, is a conflict and creates nothing.
     let bob = w.member("bob");
     assert!(matches!(w.create(bob, "acme", 11), Err(Error::Conflict)));
 }
@@ -535,7 +517,6 @@ fn the_default_policy_keeps_organization_creation_with_the_platform() {
         count(&w.store, "SELECT COUNT(*) FROM tenants WHERE slug = 'acme'"),
         0
     );
-    // A platform administrator still may.
     w.create(w.admin, "acme", 11).unwrap();
 }
 
@@ -612,15 +593,12 @@ fn quotas_bound_how_many_organizations_an_account_creates() {
     for n in 0..organizations::SELF_SERVICE_PER_HOUR {
         w.create(ada, &format!("org-{n}"), 100 + n).unwrap();
     }
-    // The hourly allowance is spent, not the lifetime one.
     assert!(matches!(
         w.create(ada, "one-too-many", 200),
         Err(Error::QuotaExceeded)
     ));
-    // Someone else is unaffected by Ada's budget.
     let bob = w.member("bob");
     w.create(bob, "bobs-org", 201).unwrap();
-    // Later hours refill the allowance until the lifetime cap.
     let mut made = organizations::SELF_SERVICE_PER_HOUR;
     let mut hours = 1;
     while made < organizations::MAX_SELF_SERVICE_ORGS {
@@ -638,7 +616,6 @@ fn quotas_bound_how_many_organizations_an_account_creates() {
         w.create(ada, "past-the-cap", hours * hour * 2 + 5),
         Err(Error::QuotaExceeded)
     ));
-    // The platform administrator is not held to it.
     w.create(w.admin, "platform-made", hours * hour * 2 + 6)
         .unwrap();
 }
@@ -676,7 +653,6 @@ fn settings_report_github_backing_apart_from_a_bound_installation() {
         .unwrap();
     assert!(settings.github_backed);
     assert!(!settings.installation_bound);
-    // Nothing confirmed and nothing queued yet.
     assert_eq!(settings.github_confirmed_ms, None);
     assert_eq!(settings.github_check_failures, None);
     assert_eq!(settings.github_check_next_ms, None);
@@ -700,8 +676,6 @@ fn settings_report_only_the_callers_own_github_standing() {
                 "UPDATE memberships SET synced_ms = 5000 WHERE tenant_id = ?1 AND user_id = ?2",
                 params![tenant.as_bytes(), ada_id.as_bytes()],
             )?;
-            // GitHub could not answer Ada's last three checks; Bob, who is
-            // no member, has a queued check of his own that must not leak.
             tx.execute(
                 "INSERT INTO github_member_checks(tenant_id, user_id, next_ms, attempts)
                  VALUES (?1, ?2, 0, 3), (?1, ?3, 0, 7)",
@@ -717,7 +691,6 @@ fn settings_report_only_the_callers_own_github_standing() {
     assert_eq!(settings.github_confirmed_ms, Some(5000));
     assert_eq!(settings.github_check_failures, Some(3));
     assert_eq!(settings.github_check_next_ms, Some(0));
-    // A queued check is no membership: Bob still cannot see the tenant.
     assert!(matches!(
         w.store.read(|c| organizations::settings(c, bob, "acme")),
         Err(Error::NotFound)

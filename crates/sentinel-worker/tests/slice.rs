@@ -1,12 +1,3 @@
-//! The vertical slice through the real components — a controller with
-//! its store, log store and API; a worker with the real executor; rootless
-//! Podman — under the things that go wrong: a cancel that lands during
-//! preparation, the network dropping under a running job, the controller
-//! restarting under a running job. Every job's verdict is read through the
-//! API, every log through the API, and at the end nothing is duplicated,
-//! nothing is owned, nothing is left. Gated like the other container tests:
-//! `SENTINEL_PODMAN_TESTS=1` as a rootless Podman account.
-
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -78,7 +69,6 @@ fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
     }
 }
 
-/// The API as the CLI would use it.
 struct Api {
     base: String,
     token: String,
@@ -164,8 +154,7 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
     if !enabled() {
         return;
     }
-    // The slice dispatches from a repository on disk; a deployment refuses
-    // local manual sources, so this process opts in explicitly.
+    // A deployment refuses local manual sources; this test process opts in.
     sentinel_store::sources::permit_any_manual_source_for_tests();
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("origin");
@@ -176,7 +165,6 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
     git(&repo, &["commit", "-q", "-m", "one"]);
     let sha = git(&repo, &["rev-parse", "HEAD"]);
 
-    // Controller, store, logs, API, credential.
     let store =
         Arc::new(Store::open(temp.path().join("metadata.sqlite"), Durability::Normal).unwrap());
     let logs = Arc::new(LogStore::open(temp.path().join("logs")).unwrap());
@@ -258,7 +246,6 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
         .unwrap()
         .secret;
 
-    // Worker with the real executor.
     let worker_dir = temp.path().join("worker");
     fs::create_dir(&worker_dir).unwrap();
     let notices = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -296,8 +283,7 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
                 memory_bytes: 4 << 30,
             },
             profile: sentinel_protocol::negotiate::Profile {
-                // A profile-protocol worker states its scratch disk; zero offers none,
-                // and every job declares some.
+                // Zero would offer no scratch disk, and every job declares some.
                 disk_bytes: 64 << 30,
                 ..sentinel_protocol::negotiate::Profile::default()
             },
@@ -320,7 +306,6 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
     };
     eventually("worker connected", || connected(&controller));
 
-    // 1. Success and command failure, through the API, with the log.
     let ok = api.dispatch(&pipeline("ok", "cat greeting.txt; echo done"), &repo, &sha);
     let bad = api.dispatch(&pipeline("bad", "echo boom >&2; exit 7"), &repo, &sha);
     let (ok_id, bad_id) = (
@@ -350,9 +335,6 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
             .any(|f| f["stream"] == "stderr" && f["text"] == "boom\n")
     );
 
-    // 1b. Artifacts: a captured file commits through the object store and is
-    // listed, detailed and downloadable through the API; a declared artifact
-    // that matches nothing is recorded absent, not missing.
     let artifact_pipeline = "schema: 1\non: [push]\njobs:\n  pack:\n    image: ".to_owned()
         + IMAGE
         + "@"
@@ -382,7 +364,6 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
     let entries = detail["manifest"]["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["path"], "out/report.txt");
-    // The entry digest is downloadable through the tenant object route.
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .http_status_as_error(false)
@@ -400,8 +381,6 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
     assert_eq!(got.status().as_u16(), 200);
     assert_eq!(got.into_body().read_to_string().unwrap(), "report\n");
 
-    // A required artifact that matches nothing fails the job as a
-    // publication failure — it cannot silently disappear.
     let required_missing = "schema: 1\non: [push]\njobs:\n  must:\n    image: ".to_owned()
         + IMAGE
         + "@"
@@ -424,9 +403,6 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
         "{list}"
     );
 
-    // 2. Cancel during preparation: the hold between checkout and pull is
-    // where the cancel lands; no container ever starts; the verdict is a
-    // cancel, not a preparation failure.
     let held = api.dispatch(&pipeline("held", "echo never"), &repo, &sha);
     let held_id = held["id"].as_str().unwrap().to_owned();
     eventually("held preparing", || {
@@ -445,9 +421,6 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
             .any(|n| n.contains("Started") && false)
     );
 
-    // 3. Network loss under a running job: the controller drops the
-    // session; the worker keeps the attempt, reconnects with back-off,
-    // resends its log from the cursor and reports once.
     let long = api.dispatch(
         &pipeline("long", "echo start; sleep 4; echo end"),
         &repo,
@@ -485,10 +458,6 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
     seqs.dedup();
     assert_eq!(seqs.len(), before);
 
-    // 4. Controller restart under a running job: the same store, log store
-    // and identity come back on the same address; startup reconciliation
-    // finds the live lease and leaves it; the worker reconnects and the
-    // job completes exactly once.
     let slow = api.dispatch(&pipeline("slow", "echo a; sleep 5; echo b"), &repo, &sha);
     let slow_id = slow["id"].as_str().unwrap().to_owned();
     eventually("slow running", || {
@@ -523,8 +492,6 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
     assert_eq!(text, "a\nb\n");
     assert_eq!(slow_job["fence"], 1, "one attempt, never replayed");
 
-    // No duplicate execution anywhere: each job has exactly one attempt and
-    // one `Started` notice; nothing is owned or left behind.
     let started = notices
         .lock()
         .unwrap()

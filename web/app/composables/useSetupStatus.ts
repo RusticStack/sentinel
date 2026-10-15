@@ -1,7 +1,3 @@
-/// Whether first-run setup is open (`GET /setup`). Closed is permanent, so
-/// once seen it is remembered for the page's life and never asked again. A
-/// controller that cannot be reached counts as closed: sign-in then shows its
-/// own error instead of a wizard that could not finish.
 export function useSetupStatus() {
   const closed = useState<boolean>("setup-closed", () => false);
   const api = useApi();
@@ -12,10 +8,10 @@ export function useSetupStatus() {
       if (!open) closed.value = true;
       return open;
     } catch {
+      // Unreachable counts as closed: sign-in then shows its own error, not a setup wizard.
       return false;
     }
   }
-  /** Setup just completed in this page. */
   const markClosed = () => { closed.value = true; };
   return { isOpen, markClosed };
 }

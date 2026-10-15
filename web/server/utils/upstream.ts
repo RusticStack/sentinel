@@ -1,14 +1,10 @@
 import type { H3Event } from "h3";
 
-/// The controller's API base, from `NUXT_SENTINEL_API`.
 export function sentinelApi(event: H3Event): string {
   return String(useRuntimeConfig(event).sentinelApi).replace(/\/+$/, "");
 }
 
-/// The caller's own credentials, forwarded as they came (the session
-/// cookie, or a bearer), plus who is really calling: the controller counts
-/// unauthenticated budgets per client by the last `X-Forwarded-For` entry
-/// and trusts that header from its `trusted_proxies` only.
+// The controller counts unauthenticated budgets by the last X-Forwarded-For entry, trusted only from its trusted_proxies.
 export function forwarded(event: H3Event): Record<string, string> {
   const out: Record<string, string> = { accept: "application/json" };
   const cookie = getRequestHeader(event, "cookie");
@@ -20,17 +16,11 @@ export function forwarded(event: H3Event): Record<string, string> {
   return out;
 }
 
-/// Who is really calling, as the controller should count them: the socket
-/// peer, or, when `NUXT_CLIENT_IP_HEADER` names the header the reverse
-/// proxy sets, that header's last entry. A client-sent `X-Forwarded-For` is
-/// never passed on.
 export function clientIp(event: H3Event): string {
   const name = String(useRuntimeConfig(event).clientIpHeader || "").toLowerCase();
   return clientAddress(getRequestIP(event), name ? getRequestHeader(event, name) : undefined);
 }
 
-/// Headers for a proxied request: the browser's own, minus anything that
-/// names the client, plus the one address the controller counts.
 export function upstreamHeaders(event: H3Event): Record<string, string> {
   const headers = getProxyRequestHeaders(event);
   for (const name of ["x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded", "x-real-ip"]) delete headers[name];
@@ -39,7 +29,6 @@ export function upstreamHeaders(event: H3Event): Record<string, string> {
   return headers;
 }
 
-/// Wraps a request body so it fails once it passes `limit` bytes.
 export function capBody(source: ReadableStream<Uint8Array>, limit: number, exceeded: { value: boolean }): ReadableStream<Uint8Array> {
   let seen = 0;
   return source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
@@ -51,7 +40,6 @@ export function capBody(source: ReadableStream<Uint8Array>, limit: number, excee
   }));
 }
 
-/// Identifiers are checked before they go into an upstream URL.
 export const RUN_ID = /^run_[0-9a-f-]{36}$/;
 export const ATTEMPT_ID = /^att_[0-9a-f-]{36}$/;
 
@@ -61,7 +49,6 @@ export const sleep = (ms: number, signal: AbortSignal) =>
     signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
   });
 
-/// One upstream JSON call: status and body (`null` when not JSON).
 export async function upstream(
   event: H3Event,
   path: string,

@@ -1,18 +1,4 @@
-//! The owner-only file store, `credentials/<profile>.json`, and the private
-//! file helpers the profile module shares: on Unix, directories are created
-//! `0700` and files `0600`, and a directory or file another user can reach
-//! (`mode & 0o077 != 0`) or that another user owns is refused with the
-//! command that fixes it. Files are replaced atomically (write a sibling,
-//! `fsync`, rename), so a reader never sees half a credential and a crash
-//! never loses a rotated refresh token that was reported written. On
-//! Windows a directory Sentinel creates, and the `credentials` directory on
-//! every credential write, get a protected DACL granting only the current
-//! user and SYSTEM (inherited by the files inside), so the store is
-//! owner-only wherever `SENTINEL_CONFIG_DIR` points — not only under the
-//! per-user `%APPDATA%`. Every directory and file that already exists is
-//! checked on its open handle, as on Unix: it must be owned by this user,
-//! SYSTEM or Administrators, and its DACL may allow no one else; anything
-//! looser is refused with the `icacls` command that fixes it.
+//! Atomic replace (sibling, fsync, rename): a crash must never lose a rotated refresh token.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -23,16 +9,13 @@ use std::{
 
 use crate::client::Error;
 
-/// The largest credential or profiles file read back (a credential blob is
-/// about 250 bytes; `profiles.json` a few hundred per profile).
 const MAX_FILE: u64 = 1 << 20;
 
 pub fn credentials_dir(dir: &Path) -> PathBuf {
     dir.join("credentials")
 }
 
-/// `credentials/<profile>.json` (profile names are validated by the caller
-/// to a safe file-name alphabet).
+// The caller validates profile names to a safe file-name alphabet.
 pub fn path(dir: &Path, profile: &str) -> PathBuf {
     let mut path = credentials_dir(dir);
     path.push(format!("{profile}.json"));
@@ -52,9 +35,7 @@ pub fn read(dir: &Path, profile: &str) -> Result<Option<Vec<u8>>, Error> {
 pub fn write(dir: &Path, profile: &str, blob: &[u8]) -> Result<(), Error> {
     ensure_private_dir(dir)?;
     let creds = credentials_dir(dir);
-    // A credentials directory made by an older Sentinel is brought to
-    // owner-only before a refresh token goes into it; one owned by someone
-    // else is still refused below (Unix refuses any loose one instead).
+    // Older Sentinel versions left this directory loose: tighten it before a refresh token is written.
     #[cfg(windows)]
     if creds.is_dir() {
         acl::owner_only(&creds).map_err(|e| io_error("restrict access to", &creds, &e))?;
@@ -72,8 +53,6 @@ pub fn delete(dir: &Path, profile: &str) -> Result<(), Error> {
     }
 }
 
-/// Read a private file, checking the opened file itself (no race between
-/// the check and the read). `Ok(None)` when it does not exist.
 pub fn read_private(path: &Path) -> Result<Option<Vec<u8>>, Error> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -91,8 +70,6 @@ pub fn read_private(path: &Path) -> Result<Option<Vec<u8>>, Error> {
             path.display()
         )));
     }
-    // The length check above is a fast refusal; the read is what is bounded,
-    // since the file can grow after `metadata`.
     match crate::bounded::read(file, MAX_FILE) {
         Ok(data) => Ok(Some(data)),
         Err(crate::bounded::ReadError::Io(e)) => Err(io_error("read", path, &e)),
@@ -103,7 +80,6 @@ pub fn read_private(path: &Path) -> Result<Option<Vec<u8>>, Error> {
     }
 }
 
-/// Create `path` (and missing parents) owner-only, or check an existing one.
 pub fn ensure_private_dir(path: &Path) -> Result<(), Error> {
     match fs::metadata(path) {
         Ok(meta) if meta.is_dir() => check_meta(path, &meta, true),
@@ -127,15 +103,11 @@ pub fn ensure_private_dir(path: &Path) -> Result<(), Error> {
     }
 }
 
-/// Check that `path` is owner-only and owned by this user (Unix mode and
-/// owner; Windows owner and DACL).
 pub fn check_private(path: &Path) -> Result<(), Error> {
     let meta = fs::metadata(path).map_err(|e| io_error("read", path, &e))?;
     check_meta(path, &meta, meta.is_dir())
 }
 
-/// Check the already-open secret input itself, so the read and permission
-/// check refer to the same file even if its path changes concurrently.
 pub fn check_private_input(path: &Path, file: &File) -> Result<(), Error> {
     let meta = file.metadata().map_err(|e| io_error("inspect", path, &e))?;
     if !meta.is_file() {
@@ -162,8 +134,6 @@ pub fn check_private_input(path: &Path, file: &File) -> Result<(), Error> {
     }
 }
 
-/// [`check_private`] as if the effective user were `euid`: lets tests
-/// exercise the foreign-owner refusal without a second account.
 #[cfg(unix)]
 #[doc(hidden)]
 pub fn check_private_as(path: &Path, euid: u32) -> Result<(), Error> {
@@ -176,7 +146,6 @@ fn check_meta(path: &Path, meta: &fs::Metadata, dir: bool) -> Result<(), Error> 
     check_unix(path, meta, dir, rustix::process::geteuid().as_raw())
 }
 
-/// Windows: open the object and judge its owner and DACL on the handle.
 #[cfg(windows)]
 fn check_meta(path: &Path, _meta: &fs::Metadata, dir: bool) -> Result<(), Error> {
     let file = acl::open(path).map_err(|e| io_error("inspect", path, &e))?;
@@ -188,10 +157,6 @@ fn check_meta(_path: &Path, _meta: &fs::Metadata, _dir: bool) -> Result<(), Erro
     Ok(())
 }
 
-/// The Windows equivalent of the Unix owner and mode check: the
-/// object must be owned by this user (or SYSTEM, or Administrators) and its
-/// DACL may allow no one else, whether Sentinel created it or it existed
-/// before. A refusal names the `icacls` commands that fix it.
 #[cfg(windows)]
 fn check_windows(path: &Path, file: &File, dir: bool) -> Result<(), Error> {
     let shown = path.display();
@@ -257,7 +222,6 @@ fn check_unix(path: &Path, meta: &fs::Metadata, dir: bool, euid: u32) -> Result<
     Ok(())
 }
 
-/// Open (creating owner-only) a file for locking.
 pub fn open_lock(path: &Path) -> Result<File, Error> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -266,8 +230,6 @@ pub fn open_lock(path: &Path) -> Result<File, Error> {
     options.open(path).map_err(|e| io_error("open", path, &e))
 }
 
-/// Replace `path` atomically with `data`, owner-only and durable before the
-/// rename.
 pub fn write_private(path: &Path, data: &[u8]) -> Result<(), Error> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
@@ -302,10 +264,6 @@ fn io_error(what: &str, path: &Path, error: &io::Error) -> Error {
     Error::usage(format!("cannot {what} {}: {error}", path.display()))
 }
 
-/// Owner-only access on Windows: a protected DACL (no inherited entries)
-/// granting full control to the current user and to SYSTEM, inherited by
-/// everything created inside — the equivalent of `chmod 700` — and the
-/// checks that refuse anything looser, made on an open handle.
 #[cfg(windows)]
 mod acl {
     use std::{
@@ -337,14 +295,11 @@ mod acl {
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
 
-    /// `READ_CONTROL`: enough access to read an object's security.
     const READ_CONTROL: u32 = 0x0002_0000;
-    /// `FILE_FLAG_BACKUP_SEMANTICS`: required to open a directory handle.
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 
-    /// A SID copied into owned, 4-aligned storage.
     struct Sid(Box<[u32]>);
 
     impl Sid {
@@ -383,13 +338,11 @@ mod acl {
             Ok(Sid(storage.into_boxed_slice()))
         }
 
-        /// Whether `other` (a valid SID) is this SID.
         fn is(&self, other: PSID) -> bool {
             // SAFETY: both pointers refer to valid SIDs for the call.
             unsafe { EqualSid(self.as_psid(), other) != 0 }
         }
 
-        /// The `S-1-…` text of the SID at `sid` (valid), for a fix command.
         fn text_of(sid: PSID) -> String {
             let mut wide: *mut u16 = ptr::null_mut();
             // SAFETY: `sid` is valid; on success `wide` receives a
@@ -411,8 +364,6 @@ mod acl {
         }
     }
 
-    /// This process's user and the built-in accounts the checks accept,
-    /// looked up once per process.
     struct Sids {
         user: Sid,
         system: Sid,
@@ -439,8 +390,6 @@ mod acl {
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        // TOKEN_USER plus the SID it points at: at most 16 + 68 bytes. u64
-        // storage keeps the pointer inside TOKEN_USER aligned.
         let mut user = [0u64; 16];
         let mut len = 0u32;
         // SAFETY: `token` is the live token handle opened above; `user` is
@@ -522,32 +471,18 @@ mod acl {
         Ok(())
     }
 
-    /// Why an object is not private.
     pub(super) enum Refusal {
-        /// Owned by another account (the SID's text).
         Owner(String),
-        /// The DACL lets another principal in: the SIDs it names (empty
-        /// for a null DACL or an entry type that is not a plain allow or
-        /// deny).
         Loose(Vec<String>),
         Io(io::Error),
     }
 
-    /// What an object may grant.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Policy {
-        /// A secret input file: allow entries for this user and SYSTEM
-        /// only, nothing but allow entries, owned by this user or SYSTEM.
         SecretInput,
-        /// A configuration directory or file: owned by this user, SYSTEM
-        /// or Administrators, and allow entries only for those (the
-        /// Administrators group can take any file anyway); deny entries
-        /// are fine.
         Private,
     }
 
-    /// Open `path` (a file or a directory) with just enough access to read
-    /// its security.
     pub(super) fn open(path: &Path) -> io::Result<File> {
         OpenOptions::new()
             .access_mode(READ_CONTROL)
@@ -555,7 +490,6 @@ mod acl {
             .open(path)
     }
 
-    /// The configuration directory's rule, checked on the open object.
     pub(super) fn check_private(file: &File) -> Result<(), Refusal> {
         check(file, Policy::Private)
     }
@@ -574,7 +508,6 @@ mod acl {
         })
     }
 
-    /// This user's SID text, for a fix command.
     pub(super) fn user_text() -> String {
         sids().map_or_else(|_| "?".to_owned(), |s| Sid::text_of(s.user.as_psid()))
     }
@@ -609,15 +542,13 @@ mod acl {
         result
     }
 
-    /// Judge an owner and a DACL, both from one live security descriptor.
     fn judge(sids: &Sids, policy: Policy, owner: PSID, dacl: *mut ACL) -> Result<(), Refusal> {
         let accepted = |sid: PSID| {
             sids.user.is(sid)
                 || sids.system.is(sid)
                 || (policy == Policy::Private && sids.admins.is(sid))
         };
-        // The owner holds implicit WRITE_DAC whatever the DACL says, so both
-        // policies judge it.
+        // The owner keeps implicit WRITE_DAC whatever the DACL says, so it is always judged.
         if owner.is_null() || !accepted(owner) {
             let who = if owner.is_null() {
                 "nobody".to_owned()
@@ -627,7 +558,6 @@ mod acl {
             return Err(Refusal::Owner(who));
         }
         if dacl.is_null() {
-            // A null DACL grants everyone everything.
             return Err(Refusal::Loose(Vec::new()));
         }
         let mut info = ACL_SIZE_INFORMATION::default();
@@ -658,7 +588,6 @@ mod acl {
             match (kind, policy) {
                 (ACCESS_ALLOWED_ACE_TYPE, _) => {}
                 (ACCESS_DENIED_ACE_TYPE, Policy::Private) => continue,
-                // Object, callback and other entry types are not judged.
                 _ => return Err(Refusal::Loose(others)),
             }
             // SAFETY: an ACCESS_ALLOWED ACE has the ACCESS_ALLOWED_ACE

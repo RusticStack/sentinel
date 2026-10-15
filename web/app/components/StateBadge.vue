@@ -1,5 +1,4 @@
 <script setup lang="ts">
-// A state as a badge: the word always, colour and icon as reinforcement.
 const props = defineProps<{ state: string | null | undefined; label?: string }>();
 const look = computed(() => stateLook(props.state || "unknown"));
 </script>

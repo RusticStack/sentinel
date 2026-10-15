@@ -1,11 +1,3 @@
-//! `sentinel service-account` end to end, portable: the real CLI binary
-//! against an in-process controller with a static `sntl_` credential.
-//! Creating, allowing and granting need a fresh step-up that a static
-//! credential cannot give (forbidden, exit 3); list as metadata and revoke
-//! work, and the issued token refreshes until revoked (the account and grant
-//! are provisioned in the store with a stepped-up authority); usage and
-//! authorization failures exit 2 and 3.
-
 use std::{path::PathBuf, process::Command, sync::Arc};
 
 use sentinel_core::{
@@ -33,14 +25,11 @@ struct Deployment {
     admin: UserId,
     tenant: TenantId,
     repo: RepoId,
-    /// Token files: root (super admin, administers `acme`) and dev (operator).
     root: PathBuf,
     dev: PathBuf,
 }
 
-/// A caller that has just proven presence, as a stepped-up browser session
-/// would. The CLI's static credential can never do this, so the tests that
-/// need a service principal or a grant provision it here, in the store.
+/// Step-up needs live presence, which a static credential can never provide.
 fn stepped(user: UserId) -> Authority {
     Authority::Credential {
         principal: Principal::new(user, P::REPOSITORY.union(P::TENANT_ADMIN), None, None),
@@ -49,8 +38,6 @@ fn stepped(user: UserId) -> Authority {
 }
 
 impl Deployment {
-    /// A service principal of `acme`, allowed read and run on `app`, made
-    /// through the store with a stepped-up authority.
     fn service_account(&self, admin: UserId) -> UserId {
         let (tenant, repo, account) = (self.tenant, self.repo, UserId::new());
         self.store
@@ -81,7 +68,6 @@ impl Deployment {
         account
     }
 
-    /// A grant of `account`, as the refresh token the person would hand over.
     fn grant(&self, admin: UserId, account: UserId) -> String {
         let (tenant, repo) = (self.tenant, self.repo);
         let (_, refresh, _) = self
@@ -238,9 +224,6 @@ fn refresh(d: &Deployment, token: &str) -> (u16, Value) {
     (status, serde_json::from_str(&body).unwrap())
 }
 
-/// Minting who can authenticate needs fresh step-up, which a static
-/// credential cannot give: create, allow and grant are forbidden with
-/// `step_up` set, exit 3, and nothing is created.
 #[test]
 fn the_cli_cannot_mint_service_credentials_without_a_step_up() {
     let d = deployment();
@@ -283,7 +266,6 @@ fn the_cli_cannot_mint_service_credentials_without_a_step_up() {
 #[test]
 fn an_administrator_lists_and_revokes_an_agent_grant_from_the_cli() {
     let d = deployment();
-    // Provisioned with a stepped-up authority: the CLI only reads and revokes.
     let account = d.service_account(d.admin);
     let token = d.grant(d.admin, account);
     assert!(
@@ -306,7 +288,6 @@ fn an_administrator_lists_and_revokes_an_agent_grant_from_the_cli() {
     assert_eq!(record["scope"], "runs:read logs:read");
     assert_eq!(record["revoked"], false);
 
-    // The agent's import works until the grant is revoked.
     let (status, tokens) = refresh(&d, &token);
     assert_eq!(status, 200, "{tokens}");
     let next = tokens["refresh_token"].as_str().unwrap().to_owned();
@@ -330,7 +311,6 @@ fn an_administrator_lists_and_revokes_an_agent_grant_from_the_cli() {
 #[test]
 fn usage_and_authorization_failures_have_their_exit_codes() {
     let d = deployment();
-    // No tenant and no profile context: usage, before any request.
     let no_tenant = cli(&d, &d.root, &["create", "--name", "x"]);
     assert_eq!(no_tenant.code, 2, "{}", no_tenant.stderr);
     assert!(no_tenant.stderr.contains("--tenant"));
@@ -359,12 +339,9 @@ fn usage_and_authorization_failures_have_their_exit_codes() {
         let run = cli(&d, &d.root, args);
         assert_eq!(run.code, 2, "{args:?}: {}", run.stderr);
     }
-    // An operator is not an administrator: forbidden is exit 3.
     let refused = cli(&d, &d.dev, &["create", "--tenant", "acme", "--name", "x"]);
     assert_eq!(refused.code, 3, "{}", refused.stderr);
-    // The step-up check comes before any validation: an administrative scope
-    // is refused for want of it, in JSON mode as one error document on
-    // stderr and nothing on stdout (the scope rule itself is a store test).
+    // Step-up is checked before validation, so the scope is refused for want of it.
     let account = d.service_account(d.admin).to_string();
     let admin = cli(
         &d,
@@ -385,7 +362,6 @@ fn usage_and_authorization_failures_have_their_exit_codes() {
     assert!(admin.stdout.is_empty());
     let document: Value = serde_json::from_str(admin.stderr.trim()).unwrap();
     assert_eq!(document["code"], "forbidden");
-    // Revoking a well-formed but unknown grant is not found (exit 4).
     let missing = sentinel_core::GrantId::new().to_string();
     let unknown = cli(&d, &d.root, &["revoke", &missing]);
     assert_eq!(unknown.code, 4, "{}", unknown.stderr);

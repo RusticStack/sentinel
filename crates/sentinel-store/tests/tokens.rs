@@ -1,6 +1,3 @@
-//! Host-local provisioning, scoped and expiring credentials, hashed secrets,
-//! delegation limits, revocation and reuse of the live authorization layer.
-
 use sentinel_auth::{secret::Secret, token};
 use sentinel_core::{
     RepoId, TenantId, TokenId, UnixMillis, UserId,
@@ -30,8 +27,6 @@ struct Ids {
     other_repo: RepoId,
 }
 
-/// One organization with a developer tenant admin, a tenant-bound service
-/// principal, an unrelated tenant and an account with no membership at all.
 fn fixture() -> (tempfile::TempDir, Store, Ids) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
@@ -129,8 +124,6 @@ fn a_host_local_credential_authenticates_through_the_ordinary_authorization_laye
         store.read(|conn| auth::require_repo(conn, principal, i.repo, P::WRITE_SECRETS)),
         Err(Error::NotFound)
     ));
-    // Losing the membership behind the credential ends its access at once
-    // (a second administrator first: the tenant's last one cannot leave).
     store
         .writer()
         .write(move |tx| auth::set_membership(tx, admin(i), i.tenant, i.root, Role::TenantAdmin))
@@ -164,7 +157,6 @@ fn the_secret_is_shown_once_and_stored_only_as_a_digest() {
         .unwrap();
     assert_eq!(found, 0);
 
-    // Only the exact presented secret validates.
     assert!(authenticate(&store, &Secret::generate(), NOW).is_err());
     let presented = token::parse(&token::format(&granted.secret)).unwrap();
     assert!(authenticate(&store, &presented, NOW).is_ok());
@@ -294,7 +286,6 @@ fn delegation_can_only_narrow_and_only_where_authority_already_exists() {
     let (_dir, store, i) = fixture();
     let dev = Principal::new(i.dev, P::READ.union(P::RUN), Some(i.tenant), None);
 
-    // Self-issue inside the caller's own scope.
     let granted = store
         .writer()
         .write(move |tx| {
@@ -311,8 +302,6 @@ fn delegation_can_only_narrow_and_only_where_authority_already_exists() {
         .unwrap();
     assert!(authenticate(&store, &granted.secret, NOW).is_ok());
 
-    // Wider than the caller holds, or for another human, or outside the
-    // caller's tenant: refused.
     for grant in [
         Grant {
             tenant: Some(i.tenant),
@@ -357,8 +346,6 @@ fn a_tenant_admin_may_issue_for_its_own_service_principal_only() {
     assert_eq!(principal.user, i.bot);
     assert_eq!(principal.tenant, Some(i.tenant));
 
-    // A service credential cannot be scoped outside its home tenant, and the
-    // admin of an unrelated tenant cannot issue for it.
     assert!(matches!(
         tokens::provision(
             &store,
@@ -408,14 +395,12 @@ fn revocation_is_immediate_final_and_reaches_the_whole_account() {
     ));
     assert!(authenticate(&store, &second.secret, at(2_100)).is_ok());
 
-    // A revoked credential cannot be brought back by a raw update.
     let revive = store.writer().write(move |tx| {
         tx.execute("UPDATE api_tokens SET revoked_ms = NULL", [])?;
         Ok(())
     });
     assert!(matches!(revive, Err(Error::Sqlite(_))));
 
-    // Suspending the account takes its remaining credentials with it.
     store
         .writer()
         .write(move |tx| local_auth::set_active(tx, stepped(i), i.dev, false, at(2_200)))
@@ -441,7 +426,6 @@ fn another_account_cannot_revoke_list_or_learn_of_a_credential() {
         store.read(|conn| tokens::list(conn, Authority::credential(outsider), i.dev, 10)),
         Err(Error::NotFound)
     ));
-    // A guessed identifier is not a discovery channel either.
     let refused = store.writer().write(move |tx| {
         tokens::revoke(
             tx,

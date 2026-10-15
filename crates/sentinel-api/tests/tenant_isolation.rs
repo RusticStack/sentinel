@@ -1,12 +1,4 @@
-//! Two camps over real HTTP: an owner (a personal namespace and the
-//! organization `rusticstack`) and a colleague (the organization `mutualismo`
-//! and a personal namespace), each with repositories, a queued and a placed
-//! run, logs, an artifact and its bytes, secrets, an open upload, a pool and a
-//! worker. Neither may see, change or discover anything of the other's, and
-//! the refusal is the answer a guessed identifier gets: the same status and
-//! the same body, byte for byte once the identifiers the caller supplied are
-//! normalized away. (Timing is not asserted: the answers are structurally
-//! identical, and the stores do the same keyed probe either way.)
+//! A refusal for another camp's resource must match a guessed identifier's answer byte for byte.
 
 use std::{
     sync::{Arc, Barrier},
@@ -56,7 +48,6 @@ enum Body {
     Raw(&'static [u8]),
 }
 
-/// One HTTP request: (status, JSON or text body).
 fn send(
     base: &str,
     method: &str,
@@ -103,7 +94,6 @@ fn send(
     )
 }
 
-/// Everything one camp owns, as the strings a caller would put in a request.
 #[derive(Clone)]
 struct Target {
     org: String,
@@ -140,7 +130,6 @@ impl Target {
         ]
     }
 
-    /// What a stranger would type: nothing here exists.
     fn guess() -> Target {
         Target {
             org: "no-such-organization".into(),
@@ -236,8 +225,6 @@ fn bearer_of(store: &Store, user: UserId, permissions: P) -> String {
     format!("Bearer {}", sentinel_auth::token::format(&granted.secret))
 }
 
-/// The namespaces, a pool and a worker; users come first, data after the
-/// server is up (runs are created through the API).
 fn camp(
     store: &Store,
     root: UserId,
@@ -419,8 +406,6 @@ fn deployment() -> Deployment {
     d
 }
 
-/// A run through the API, placed on the camp's worker, with a log, an
-/// artifact and its bytes, two secrets and an open upload.
 fn seed(d: &mut Deployment, owner: bool) {
     let camp = if owner { &d.owner } else { &d.colleague };
     let mut target = camp.target.clone();
@@ -508,7 +493,6 @@ fn seed(d: &mut Deployment, owner: bool) {
         })
         .unwrap();
     target.artifact = artifact.to_string();
-    // Secrets, through the API: one repository's, one the organization's.
     for (path, name) in [
         (format!("?repo={}", target.repo), "TOKEN"),
         (String::new(), "SHARED"),
@@ -545,8 +529,7 @@ struct Probe {
     path: String,
     body: Body,
     headers: Vec<(&'static str, &'static str)>,
-    /// The owner of the resource must get a success (a typo in the path would
-    /// otherwise make every refusal look right).
+    /// Also require the owner to read this path, so a typo cannot make every refusal look right.
     owner_reads: bool,
 }
 
@@ -570,8 +553,6 @@ fn change(method: &'static str, path: String, body: Body) -> Probe {
     }
 }
 
-/// Every route that names a tenant, repository, run, job, attempt, artifact,
-/// object, upload, member, worker or pool of the target.
 fn probes(t: &Target) -> Vec<Probe> {
     let (org, repo) = (&t.org, &t.repo);
     let v1 = |rest: &str| format!("/api/v1{rest}");
@@ -611,7 +592,6 @@ fn probes(t: &Target) -> Vec<Probe> {
         get(v1(&format!("/queue?tenant={org}"))),
         get(v1(&format!("/uploads/{}", t.upload))),
     ];
-    // Reads whose success for the owner is not part of the contract here.
     let mut failure = get(v1(&format!("/attempts/{}/failure", t.attempt)));
     failure.owner_reads = false;
     list.push(failure);
@@ -734,8 +714,6 @@ fn probes(t: &Target) -> Vec<Probe> {
     list
 }
 
-/// Replace every string the caller supplied (and the guess's) so two answers
-/// that differ only in what was echoed compare equal.
 fn normalized(body: &Value, real: &Target, guess: &Target) -> String {
     let mut text = body.to_string();
     for (a, b) in real.strings().into_iter().zip(guess.strings()) {
@@ -755,7 +733,6 @@ fn sweep(d: &Deployment, attacker: &Camp, victim: &Camp) {
     assert_eq!(real.len(), guessed.len());
     for (probe, decoy) in real.iter().zip(&guessed) {
         let label = format!("{} {}", probe.method, probe.path);
-        // The attacker is refused exactly as a guess is.
         let refused = send(
             &d.base,
             probe.method,
@@ -782,7 +759,6 @@ fn sweep(d: &Deployment, attacker: &Camp, victim: &Camp) {
             normalized(&missing.1, &victim.target, &guess),
             "{label}"
         );
-        // And the answer repeats nothing the caller did not supply.
         let body = refused.1.to_string();
         for secret in victim.target.strings() {
             assert!(
@@ -790,7 +766,6 @@ fn sweep(d: &Deployment, attacker: &Camp, victim: &Camp) {
                 "{label}: the refusal leaks {secret}"
             );
         }
-        // No credential at all is the same refusal for everyone.
         let anonymous = send(
             &d.base,
             probe.method,
@@ -841,9 +816,6 @@ fn nothing_the_other_camp_tried_changed_anything() {
     for (camp, other) in [(&d.owner, &d.colleague), (&d.colleague, &d.owner)] {
         let t = &camp.target;
         let get = |path: String| send(&d.base, "GET", &path, &Body::None, Some(&camp.bearer), &[]);
-        // The run was neither canceled nor given a second one; the secret is
-        // still version 1 and active; the only member is its administrator;
-        // no invitation, repository or service account was planted.
         let (_, run) = get(format!("/api/v1/runs/{}", t.run));
         assert!(!run["cancel_requested"].as_bool().unwrap_or(false), "{run}");
         assert_ne!(run["state"], "canceled", "{run}");
@@ -872,7 +844,6 @@ fn nothing_the_other_camp_tried_changed_anything() {
         assert_eq!(repos["repos"].as_array().unwrap().len(), 1, "{repos:?}");
         let (_, upload) = get(format!("/api/v1/uploads/{}", t.upload));
         assert_eq!(upload["received"].as_u64().unwrap_or(0), 0, "{upload}");
-        // The other camp's administrator is not a member here.
         assert!(members.iter().all(|m| m["user"] != other.target.user));
     }
 }
@@ -913,8 +884,6 @@ fn a_caller_lists_only_the_tenants_it_belongs_to_and_the_platform_stays_closed()
         for foreign in [&other.target.org, &other.target.home] {
             assert!(!text.contains(foreign.as_str()), "{text}");
         }
-        // Platform routes: refused alike for every non-administrator, whoever
-        // they are and whatever they name.
         for path in [
             "/api/v1/admin/tenants",
             "/api/v1/admin/audit",
@@ -957,8 +926,6 @@ fn a_caller_lists_only_the_tenants_it_belongs_to_and_the_platform_stays_closed()
             assert!(matches!(status, 403 | 404), "{path}: {status}");
         }
     }
-    // The platform administrator, for contrast, lists every tenant, and still
-    // reads no tenant's data without being a member.
     let (status, body) = send(
         &d.base,
         "GET",
@@ -994,9 +961,6 @@ fn a_caller_lists_only_the_tenants_it_belongs_to_and_the_platform_stays_closed()
 #[test]
 fn a_credential_narrowed_to_one_tenant_cannot_reach_the_same_peoples_other_tenant() {
     let d = deployment();
-    // The owner holds a personal namespace and an organization; a credential
-    // minted for the organization only cannot touch the personal one, and the
-    // reverse, even though the same person administers both.
     for (tenant, other_slug, other_repo) in [
         (d.owner.org, &d.owner.target.home, &d.owner.target.home_repo),
         (d.owner.home, &d.owner.target.org, &d.owner.target.repo),
@@ -1058,8 +1022,6 @@ fn a_log_cursor_belongs_to_its_tenant_and_authorization_is_asked_first() {
         .to_owned();
     let (status, resumed) = logs(olivia, &olivia.target.attempt, &format!("?cursor={cursor}"));
     assert_eq!(status, 200, "{resumed}");
-    // The colleague presents it on the owner's attempt: not found, never
-    // "invalid cursor", which would confirm that the attempt exists.
     let (foreign, body) = logs(carlos, &olivia.target.attempt, &format!("?cursor={cursor}"));
     let (guessed, guess_body) = logs(
         carlos,
@@ -1068,13 +1030,11 @@ fn a_log_cursor_belongs_to_its_tenant_and_authorization_is_asked_first() {
     );
     assert_eq!((foreign, guessed), (404, 404), "{body} / {guess_body}");
     assert_eq!(body["code"], guess_body["code"]);
-    // On the colleague's own attempt the same text is refused as a cursor.
     let (status, body) = logs(carlos, &carlos.target.attempt, &format!("?cursor={cursor}"));
     assert_eq!(
         (status, body["code"].as_str()),
         (400, Some("invalid_cursor"))
     );
-    // And the run-list cursor of another repository is not a way across.
     let (status, runs) = send(
         &d.base,
         "GET",
@@ -1106,8 +1066,6 @@ fn a_log_cursor_belongs_to_its_tenant_and_authorization_is_asked_first() {
 #[test]
 fn a_sign_in_name_is_never_resolved_outside_the_tenant() {
     let d = deployment();
-    // carlos administers mutualismo and names olivia by her sign-in name, and
-    // an unknown name: one answer, and she is not added.
     for name in [d.owner.username, "nobody-by-that-name"] {
         let (status, body) = send(
             &d.base,
@@ -1141,8 +1099,6 @@ fn a_sign_in_name_is_never_resolved_outside_the_tenant() {
         &[],
     );
     assert_eq!(members["members"].as_array().unwrap().len(), 1, "{members}");
-    // A member's own name does resolve (an administrator may address people
-    // already in the tenant): control for the refusals above.
     let (status, body) = send(
         &d.base,
         "PUT",
@@ -1157,7 +1113,6 @@ fn a_sign_in_name_is_never_resolved_outside_the_tenant() {
     assert_eq!(status, 200, "{body}");
 }
 
-/// A browser session for `username`: (cookie header, CSRF secret).
 fn session(d: &Deployment, username: &str) -> (String, String) {
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
@@ -1191,7 +1146,6 @@ fn session(d: &Deployment, username: &str) -> (String, String) {
 #[test]
 fn an_invitation_link_presented_by_two_people_at_once_joins_exactly_one() {
     let d = deployment();
-    // The owner invites into rusticstack by link (no mail on this deployment).
     let (status, invited) = send(
         &d.base,
         "POST",
@@ -1202,9 +1156,6 @@ fn an_invitation_link_presented_by_two_people_at_once_joins_exactly_one() {
     );
     assert_eq!(status, 201, "{invited}");
     assert_eq!(invited["delivery"], "link");
-    // An address-bound invitation is not a bearer secret: two accounts racing
-    // for it who hold no such verified address both get "verification sent" or
-    // nothing, and neither joins.
     let token = invited["token"].as_str().unwrap().to_owned();
     let dana = local_user(&d.store, "dana");
     let erin = local_user(&d.store, "erin");
@@ -1246,8 +1197,6 @@ fn an_invitation_link_presented_by_two_people_at_once_joins_exactly_one() {
     };
     assert_eq!((members(dana), members(erin)), (0, 0));
 
-    // A link-form invitation (no address) is single-use: of two simultaneous
-    // presenters exactly one joins, and the loser learns nothing.
     let rustic = d.owner.org;
     let link = d
         .store
@@ -1292,7 +1241,6 @@ fn an_invitation_link_presented_by_two_people_at_once_joins_exactly_one() {
     assert_eq!((joined, refused.len()), (1, 1), "{answers:?}");
     assert_eq!(refused[0].1["code"], "not_found");
     assert_eq!(members(dana) + members(erin), 1);
-    // The winner holds the one organization and nothing of the colleague's.
     let winner = sessions
         .iter()
         .find(|(user, _)| members(*user) == 1)
@@ -1312,8 +1260,6 @@ fn an_invitation_link_presented_by_two_people_at_once_joins_exactly_one() {
         .map(|t| t["slug"].as_str().unwrap())
         .collect();
     assert_eq!(slugs, [d.owner.target.org.as_str()], "{listed}");
-    // The colleague's administrator can neither list nor revoke the owner's
-    // invitations, and the owner's list shows both of theirs.
     let (status, _) = send(
         &d.base,
         "GET",
@@ -1328,9 +1274,6 @@ fn an_invitation_link_presented_by_two_people_at_once_joins_exactly_one() {
 #[test]
 fn setup_and_registration_say_the_same_thing_to_everyone() {
     let d = deployment();
-    // The deployment is past first-run setup: it is closed, and says so with
-    // nothing else about the instance (`mail_configured` is false once closed,
-    // whatever the deployment has).
     let (status, body) = send(&d.base, "GET", "/api/v1/setup", &Body::None, None, &[]);
     assert_eq!(status, 200);
     assert_eq!(body, json!({ "open": false, "mail_configured": false }));
@@ -1351,8 +1294,6 @@ fn setup_and_registration_say_the_same_thing_to_everyone() {
         status, 404,
         "a closed setup is not found, whatever the token"
     );
-    // Sign-up answers alike for an address already claimed (by an earlier
-    // sign-up) and for a fresh one: the reply never tells an address apart.
     d.store
         .writer()
         .write(|tx| {

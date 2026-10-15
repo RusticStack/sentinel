@@ -1,8 +1,3 @@
-//! Windows Credential Manager backend: one `CRED_TYPE_GENERIC` credential per
-//! profile, persisted `CRED_PERSIST_LOCAL_MACHINE` (this user, this machine,
-//! not roamed), keyed by the key the profile recorded ([`super::key`],
-//! [`super::scoped_key`]).
-
 use std::{io, ptr};
 
 use windows_sys::Win32::{
@@ -13,11 +8,8 @@ use windows_sys::Win32::{
     },
 };
 
-/// The largest blob Credential Manager stores for a generic credential
-/// (`CRED_MAX_CREDENTIAL_BLOB_SIZE`, 5 × 512 bytes).
 const MAX_BLOB: usize = 5 * 512;
 
-/// UTF-16, NUL-terminated.
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -28,15 +20,10 @@ fn last_error() -> io::Error {
     io::Error::from_raw_os_error(code as i32)
 }
 
-/// How long a Credential Manager call waits for another Sentinel process's.
 const STORE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Held around every Credential Manager call. With several processes
-/// writing at once, `CredReadW` was measured answering `ERROR_NOT_FOUND`
-/// for an entry another thread had just written and nobody deleted (15 of
-/// 20 probe processes, four at a time, lost reads; one process alone never
-/// did). Sentinel processes of this logon session therefore take turns;
-/// each call holds the lock for one short system call.
+// Concurrent CredReadW calls were measured returning ERROR_NOT_FOUND for entries just written,
+// so every call takes this session-wide mutex.
 fn store_lock() -> io::Result<NamedLock> {
     NamedLock::acquire(r"Local\sentinel-credential-manager", STORE_WAIT)
 }
@@ -86,7 +73,6 @@ pub fn write(key: &str, blob: &[u8]) -> io::Result<()> {
         Type: CRED_TYPE_GENERIC,
         TargetName: target.as_mut_ptr(),
         CredentialBlobSize: blob.len() as u32,
-        // CredWriteW only reads the blob; the API type is merely not const.
         CredentialBlob: blob.as_ptr().cast_mut(),
         Persist: CRED_PERSIST_LOCAL_MACHINE,
         UserName: user.as_mut_ptr(),
@@ -116,15 +102,10 @@ pub fn delete(key: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Held while a legacy shared entry is refreshed: the entry is
-/// shared by every configuration directory of this user, while profile
-/// locks live in each directory, so two directories could otherwise both
-/// present its refresh token at once. A named mutex in this logon
-/// session's namespace, named after the key's digest, serializes them.
+// Config directories share this legacy entry but not their profile locks, so this mutex stops two of them presenting its refresh token at once.
 pub struct LegacyLock(#[allow(dead_code)] NamedLock);
 
 impl LegacyLock {
-    /// Wait at most `deadline` for the legacy entry `key`.
     pub fn acquire(key: &str, deadline: std::time::Duration) -> io::Result<LegacyLock> {
         let digest = blake3::hash(key.as_bytes()).to_hex();
         NamedLock::acquire(
@@ -135,10 +116,6 @@ impl LegacyLock {
     }
 }
 
-/// An owned named mutex of this logon session. The OS releases it if the
-/// holder dies (the next waiter then sees `WAIT_ABANDONED`, which still
-/// grants ownership). Ownership belongs to the acquiring thread, which
-/// releases it on drop; the guard is not `Send`.
 struct NamedLock(windows_sys::Win32::Foundation::HANDLE);
 
 impl NamedLock {
@@ -197,9 +174,6 @@ mod tests {
 
     use super::LegacyLock;
 
-    /// One holder per legacy key at a time, across threads (and so across
-    /// processes of this session); other keys are independent; a waiter
-    /// past its deadline is told so.
     #[test]
     fn a_legacy_entry_is_refreshed_by_one_holder_at_a_time() {
         let key = format!("sentinel:test-legacy-lock:{}", std::process::id());
@@ -219,7 +193,6 @@ mod tests {
             flag.store(true, Ordering::SeqCst);
             drop(lock);
         });
-        // The waiter cannot have it while this thread holds it.
         thread::sleep(Duration::from_millis(100));
         assert!(!got.load(Ordering::SeqCst));
         drop(held);

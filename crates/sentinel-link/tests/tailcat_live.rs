@@ -1,38 +1,8 @@
-//! Live evidence: the pinned helper over a real NAT boundary.
-//!
-//! These tests need the real `tailcat` binary, Podman and the tools named
-//! below; they are `#[ignore]`d by default and run on a Linux host with:
-//!
+//! Each test skips unless SENTINEL_TAILCAT_LIVE is set; with it set, a missing prerequisite fails the test.
 //! ```sh
 //! SENTINEL_TAILCAT_LIVE=/root/tailcat/tailcat \
 //!   cargo test -p sentinel-link --all-features --test tailcat_live -- --ignored --nocapture --test-threads=1
 //! ```
-//!
-//! With the gate unset every test skips; with it set, a missing prerequisite
-//! fails the test rather than passing it vacuously. The Podman in use here is
-//! **rootful** (the tests run as root, the relay test drops UDP with
-//! `iptables` on the default `10.88.0.0/16` bridge and the self-hosted relay
-//! binds that bridge's gateway): the helper crosses a real network-namespace
-//! and NAT boundary, but rootless Podman / slirp4netns is not what is proven.
-//! The allow-list hand-off test also needs `nsenter` (util-linux): it runs a
-//! worker link in a parked container's network namespace, and for its
-//! relay-only half drops UDP other than DNS there with `iptables`; for
-//! 800 ms around some changes it drops everything arriving there with `nft`
-//! (nftables), through a set element the kernel expires on time.
-//!
-//! One side of each tunnel runs in a container, so the link port on the host
-//! and in the container are different sockets: a byte that comes back went
-//! through the tunnel. The controller side is Sentinel's own supervisor
-//! ([`tailcat::start_server`], `set_allow`, the address file) wherever the
-//! test is about admission; the older tests keep a raw `tailcat serve` in the
-//! container to prove the worker's forward across the NAT boundary.
-//!
-//! The self-hosted relay test additionally needs `derper` (Tailscale's DERP
-//! server, e.g. `go install tailscale.com/cmd/derper@v1.86.2`), `openssl` and
-//! `python3`, and TLS trust for its throwaway CA — the helper trusts it only
-//! through `SSL_CERT_FILE`, one of the two trust overrides Sentinel passes on.
-//! The runner provides a copy of the system roots; the test appends its CA:
-//!
 //! ```sh
 //! cp /etc/ssl/certs/ca-certificates.crt /tmp/tailcat-live-ca.pem
 //! SENTINEL_TAILCAT_DERPER=/root/derper-bin/derper \
@@ -62,20 +32,12 @@ use sentinel_link::{
 };
 use sha2::{Digest, Sha256};
 
-/// Longest a healthy tunnel may take to come up through a relay.
 const READY: Duration = Duration::from_secs(60);
-/// How often the worker re-proves its tunnel in these tests.
 const PROBE_EVERY: Duration = Duration::from_secs(3);
-/// Longest a revoked or dead tunnel may take to show a problem.
 const PROBLEM: Duration = Duration::from_secs(45);
 
-/// The relay-only test drops outbound UDP host-wide; serializing the file
-/// keeps that block from overlapping another test's tunnel.
 static LIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The pinned helper, copied into a directory this user owns (Sentinel
-/// refuses a helper another user can rewrite), or `None` when the live gate
-/// is not set. A binary that is not the pinned build fails the test.
 struct Helper {
     _dir: tempfile::TempDir,
     binary: PathBuf,
@@ -101,15 +63,12 @@ fn live_binary() -> Option<Helper> {
     Some(Helper { _dir: dir, binary })
 }
 
-/// The gate, plus every named tool: missing any of them with the gate set is
-/// a failure, never a pass.
 fn gate(tools: &[&str]) -> Option<Helper> {
     let Some(helper) = live_binary() else {
         eprintln!("SENTINEL_TAILCAT_LIVE unset; skipping live tailcat test");
         return None;
     };
     for tool in tools {
-        // Only whether it runs at all: exit codes of `--version` vary.
         let found = Command::new(tool)
             .arg("--version")
             .stdout(Stdio::null())
@@ -124,7 +83,6 @@ fn gate(tools: &[&str]) -> Option<Helper> {
     Some(helper)
 }
 
-/// A free loopback port, raced the way tests always race it.
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -155,20 +113,12 @@ fn wait_until(what: &str, within: Duration, mut ready: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-/// A container serving `port` with an echo behind it, optionally restricted
-/// to one worker node key. Dropping it removes the container; the key
-/// directory is the caller's, so a restart with the same one keeps the same
-/// helper identity (and therefore the same address).
 struct Server {
     name: String,
     address: Address,
 }
 
 impl Server {
-    /// `allow` is the worker node key the helper accepts; `None` serves any
-    /// peer (upstream's default when `--allow` is absent — which is why
-    /// Sentinel's own supervisor never omits it), `Some(key)` passes
-    /// `--allow=<key>`.
     fn start(binary: &Path, name: &str, port: u16, allow: Option<&NodeKey>, keys: &Path) -> Self {
         let bind = binary.parent().unwrap();
         let allow_arg = allow
@@ -213,7 +163,6 @@ impl Server {
         server
     }
 
-    /// The `listening on tc…` line from the container's helper output.
     fn wait_address(&self) -> Address {
         let deadline = Instant::now() + READY;
         while Instant::now() < deadline {
@@ -236,9 +185,6 @@ impl Server {
         panic!("container {} never reported an address", self.name);
     }
 
-    /// Restart the same container with a different allow list. The key
-    /// directory is reused, so the helper keeps its identity and address:
-    /// the allow list is then the only variable a refusal can come from.
     fn restart_with(
         &self,
         binary: &Path,
@@ -269,8 +215,6 @@ fn remove_container(name: &str) {
         .status();
 }
 
-/// A byte string through the worker's loopback forward and back. Nothing on
-/// the host listens on this port but the forward, so a reply is tunnel proof.
 fn echo(port: u16, payload: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
@@ -288,9 +232,6 @@ fn echo(port: u16, payload: &[u8]) -> Vec<u8> {
     reply
 }
 
-/// The controller-side link port on the host: an echo that answers once per
-/// connection and closes, so a container client sees its bytes come back
-/// only through the tunnel the controller's helper serves.
 struct HostEcho {
     stop: Arc<AtomicBool>,
 }
@@ -326,9 +267,6 @@ impl Drop for HostEcho {
     }
 }
 
-/// A worker in a container: the pinned helper `forward`s the controller's
-/// address to the container's own loopback, with a key the host generated
-/// through [`tailcat::ensure_key`] (so its node key is known up front).
 struct ContainerWorker {
     name: String,
     port: u16,
@@ -346,8 +284,6 @@ impl ContainerWorker {
         Self::start_keyed(binary, name, keys, controller, port, extra, None)
     }
 
-    /// As [`ContainerWorker::start`], forwarding with the saved key `key`
-    /// (`--key=<name>`) instead of the helper's default client key.
     fn start_keyed(
         binary: &Path,
         name: &str,
@@ -400,8 +336,6 @@ impl ContainerWorker {
         }
     }
 
-    /// Sends `payload` to the container's forward and returns what came back
-    /// (empty when the tunnel refused or dropped it).
     fn echo(&self, payload: &str) -> String {
         let output = Command::new("podman")
             .args([
@@ -452,14 +386,11 @@ fn the_helper_carries_the_link_port_and_reports_telemetry() {
     let port = free_port();
     let config = config(binary, port);
 
-    // The worker's identity persists: the same node key comes back after a
-    // second ensure, which is what makes the address stable across restarts.
     let key = tailcat::ensure_key(&config, data_dir.path(), Role::Worker).unwrap();
     assert_eq!(
         key,
         tailcat::ensure_key(&config, data_dir.path(), Role::Worker).unwrap()
     );
-    // …and it is on disk where the operator copies it from.
     let recorded =
         std::fs::read_to_string(tailcat::nodekey_file(data_dir.path(), Role::Worker)).unwrap();
     assert_eq!(recorded.trim(), key.expose());
@@ -486,18 +417,14 @@ fn the_helper_carries_the_link_port_and_reports_telemetry() {
             .is_some_and(|v| v.contains(PINNED_VERSION)),
         "helper version missing from telemetry: {telemetry:?}"
     );
-    // The path and latency are what `tailcat ping` measured, never a guess.
     let measured = forward.probe().expect("the tunnel does not answer a probe");
     assert_ne!(measured.path, Route::Unknown, "{measured:?}");
     let rtt = measured.rtt.expect("the pong reported no latency");
     assert!(rtt < Duration::from_secs(10), "probe rtt {rtt:?}");
     eprintln!("live probe: path {:?}, rtt {rtt:?}", measured.path);
 
-    // The link port is carried end to end: a byte written to the loopback
-    // forward comes back from the container's echo through the tunnel.
     assert_eq!(echo(port, b"sentinel-live"), b"sentinel-live");
 
-    // A killed helper is replaced and the tunnel comes back on its own.
     forward.restart();
     wait_until("a replacement helper", READY, || {
         forward.telemetry().restarts >= 1 && forward.telemetry().ready
@@ -536,9 +463,6 @@ fn a_revoked_peer_loses_the_tunnel_and_a_new_endpoint_is_dialed() {
     wait_until("the tunnel", READY, || forward.telemetry().ready);
     assert_eq!(echo(port, b"before-revoke"), b"before-revoke");
 
-    // Revocation: the same helper identity comes back allowing a different
-    // peer, so the only variable is the allow list and a refusal can only be
-    // a rejection — not an endpoint that moved.
     let before = server.address.expose().to_owned();
     let other = NodeKey::parse(&format!("nodekey:{}", "ab".repeat(32))).unwrap();
     let server = server.restart_with(binary, port, Some(&other), server_keys.path());
@@ -550,12 +474,8 @@ fn a_revoked_peer_loses_the_tunnel_and_a_new_endpoint_is_dialed() {
     wait_until("the revocation to show", PROBLEM, || {
         forward.telemetry().problem.is_some() && forward.probe().is_err()
     });
-    // Release the loopback port: a second forward must bind it, and only one
-    // listener per host port exists.
     forward.shutdown();
 
-    // A changed endpoint is a new address: a second server with its own key
-    // serves the same port, and a fresh forward dials it.
     let endpoint_keys = tempfile::tempdir().unwrap();
     let server_b = Server::start(
         binary,
@@ -586,9 +506,6 @@ fn a_dead_address_fails_fast_and_stays_supervised() {
     let config = config(&helper.binary, port);
     let _key = tailcat::ensure_key(&config, data_dir.path(), Role::Worker).unwrap();
 
-    // A well-formed address that no peer serves: the NAT path cannot be
-    // found, so probes fail and supervision keeps replacing the helper
-    // instead of trusting a bound port.
     let dead = Address::parse(&format!("tc{}", "deadbeef".repeat(8))).unwrap();
     let forward =
         tailcat::start_forward_every(&config, data_dir.path(), &dead, PROBE_EVERY).unwrap();
@@ -611,13 +528,9 @@ fn the_controller_supervisor_admits_only_listed_workers() {
     let port = free_port();
     let _echo = HostEcho::start(port);
 
-    // The worker's key, generated through Sentinel and handed to the
-    // container as its helper's HOME.
     let worker_dir = tempfile::tempdir().unwrap();
     let key = tailcat::ensure_key(&config(binary, port), worker_dir.path(), Role::Worker).unwrap();
 
-    // Sentinel's controller supervisor with nobody admitted: it still has an
-    // address (in its owner-only file) and admits no peer.
     let controller_dir = tempfile::tempdir().unwrap();
     let server = tailcat::start_server(&config(binary, port), controller_dir.path(), &[]).unwrap();
     let address = server.wait_ready(READY).unwrap();
@@ -639,13 +552,11 @@ fn the_controller_supervisor_admits_only_listed_workers() {
         "an empty allow list must admit no peer"
     );
 
-    // Admitted: the same container's bytes now come back through the tunnel.
     server.set_allow(std::slice::from_ref(&key));
     wait_until("the admitted worker's echo", READY, || {
         worker.echo("admitted") == "admitted"
     });
 
-    // Emptied again (the worker was revoked): the tunnel closes.
     server.set_allow(&[]);
     wait_until("the revoked worker's tunnel to close", PROBLEM, || {
         worker.echo("revoked").is_empty()
@@ -653,8 +564,6 @@ fn the_controller_supervisor_admits_only_listed_workers() {
     server.shutdown();
 }
 
-/// `CLOCK_MONOTONIC` in nanoseconds: one clock for this process and the
-/// worker it runs in another network namespace, so their events compare.
 fn mono_ns() -> u64 {
     let mut now = libc::timespec {
         tv_sec: 0,
@@ -667,14 +576,7 @@ fn mono_ns() -> u64 {
     now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
 }
 
-/// When set, this binary plays the Sentinel worker in another network
-/// namespace; the value names its working directory.
 const WORKER_ROLE: &str = "SENTINEL_TAILCAT_LIVE_WORKER";
-/// How the worker reacts to a lost session: unset is the shipped rule (a
-/// clean close replaces the forward after [`tailcat::CLOSE_GRACE`],
-/// anything else goes through [`tailcat::Forward::session_lost`]);
-/// `immediate` is the rule before the grace, `session_lost` for every loss,
-/// kept for comparison only.
 const WORKER_RULE: &str = "SENTINEL_TAILCAT_LIVE_WORKER_RULE";
 
 struct Idle;
@@ -697,9 +599,6 @@ impl sentinel_link::session::Executor for Idle {
     fn log_refused(&self, _: sentinel_core::AttemptId) {}
 }
 
-/// The worker role: Sentinel's helper supervisor (production probe interval)
-/// and the real worker link, fed the same session events `sentinel worker`
-/// feeds it, appending `<event> <monotonic ns>` lines to `<dir>/events`.
 fn play_worker(dir: &Path) {
     use sentinel_link::{identity::Identity, worker};
     let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
@@ -720,10 +619,8 @@ fn play_worker(dir: &Path) {
             .unwrap(),
     )));
     let note = |event: &str| notes.note(event);
-    // The worker link dials the forward through a slow link it controls.
     let slow = slow_link(dir, forward.local_addr(), Arc::clone(&notes));
     let rule = std::env::var(WORKER_RULE).unwrap_or_default();
-    // Presented only until the first session was welcomed.
     let secret = std::fs::read_to_string(dir.join("enrollment"))
         .ok()
         .and_then(|text| sentinel_auth::secret::Secret::parse(text.trim()));
@@ -736,8 +633,6 @@ fn play_worker(dir: &Path) {
         hello: sentinel_protocol::negotiate::Hello {
             protocol_min: sentinel_protocol::negotiate::ProtocolVersion(1),
             protocol_max: sentinel_protocol::negotiate::ProtocolVersion(3),
-            // The shipped rule answers hand-offs, as `sentinel worker` says;
-            // the comparison rule stands for a worker from before that.
             capabilities: if rule == "immediate" {
                 sentinel_protocol::negotiate::Capabilities::REQUIRED
             } else {
@@ -752,8 +647,6 @@ fn play_worker(dir: &Path) {
             memory_bytes: 1 << 30,
         },
         profile: sentinel_protocol::negotiate::Profile {
-            // A profile-protocol worker states its scratch disk; zero offers none,
-            // and every job declares some.
             disk_bytes: 64 << 30,
             ..sentinel_protocol::negotiate::Profile::default()
         },
@@ -763,8 +656,6 @@ fn play_worker(dir: &Path) {
     let identity = Identity::load(&dir.join("worker.crt"), &dir.join("worker.key")).unwrap();
     let handle = worker::Handle::new();
     std::thread::scope(|scope| {
-        // Which path the tunnel took, as `tailcat ping` measures it, once
-        // the first session is up.
         scope.spawn(|| {
             std::thread::sleep(Duration::from_secs(5));
             match forward.probe() {
@@ -776,7 +667,6 @@ fn play_worker(dir: &Path) {
     });
 }
 
-/// The worker's `events` file: `<event> <monotonic ns>` lines.
 struct Notes(std::sync::Mutex<std::fs::File>);
 
 impl Notes {
@@ -787,18 +677,8 @@ impl Notes {
     }
 }
 
-/// Written into the worker's directory by the controller side: the next
-/// connection the worker opens is stalled (see [`slow_link`]).
 const STALL: &str = "stall";
 
-/// A slow link between the worker link and its forward, on loopback in the
-/// worker's namespace. Bytes pass as they are, and so does each end (a FIN
-/// or a reset) in either direction, the controller's close included. Only
-/// the one connection opened after the controller side wrote [`STALL`] is
-/// slowed: once the controller's first bytes (its TLS handshake flight)
-/// came back, the worker's bytes stop getting through, so the controller
-/// holds that connection in its TLS handshake, not yet a session. The
-/// worker notes `stalled` at that moment.
 fn slow_link(
     dir: &Path,
     upstream: std::net::SocketAddr,
@@ -817,7 +697,6 @@ fn slow_link(
             let held = Arc::new(AtomicBool::new(false));
             let _ = client.set_nodelay(true);
             let _ = server.set_nodelay(true);
-            // Neither direction lingers past a dead tunnel forever.
             let _ = server.set_read_timeout(Some(Duration::from_secs(120)));
             let (Ok(client_rx), Ok(server_tx)) = (client.try_clone(), server.try_clone()) else {
                 continue;
@@ -840,9 +719,6 @@ fn slow_link(
     local
 }
 
-/// Copy `from` to `to` until `from` ends, passing its end on: a FIN as a
-/// FIN, an error as a reset of both. `pass` decides, per read, whether the
-/// bytes are delivered or swallowed (a link that stopped delivering).
 fn pump(mut from: TcpStream, mut to: TcpStream, mut pass: impl FnMut(usize) -> bool) {
     let mut buf = [0u8; 16 * 1024];
     loop {
@@ -866,7 +742,6 @@ fn pump(mut from: TcpStream, mut to: TcpStream, mut pass: impl FnMut(usize) -> b
     }
 }
 
-/// The worker link of [`play_worker`], reacting to lost sessions by `rule`.
 fn play_link(
     settings: sentinel_link::worker::Config,
     identity: sentinel_link::identity::Identity,
@@ -893,7 +768,6 @@ fn play_link(
                 note("lost");
                 note(if clean { "closed" } else { "cut" });
                 if clean && rule != "immediate" {
-                    // The shipped rule, as `sentinel worker` has it.
                     forward.session_closed();
                     note("replaced");
                 } else if forward.session_lost() {
@@ -905,9 +779,6 @@ fn play_link(
     );
 }
 
-/// The worker process in the network namespace of a parked container, so
-/// its loopback forward and the controller's link port on the host are
-/// different sockets.
 struct NetnsWorker {
     child: Child,
     events: PathBuf,
@@ -930,7 +801,6 @@ impl NetnsWorker {
         Self { child, events }
     }
 
-    /// `(event, monotonic ns)` for every line the worker wrote so far.
     fn events(&self) -> Vec<(String, u64)> {
         std::fs::read_to_string(&self.events)
             .unwrap_or_default()
@@ -942,7 +812,6 @@ impl NetnsWorker {
             .collect()
     }
 
-    /// The first `event` at or after `since`, waiting at most `within`.
     fn first_after(&self, event: &str, since: u64, within: Duration) -> Option<u64> {
         let deadline = Instant::now() + within;
         loop {
@@ -963,37 +832,13 @@ impl NetnsWorker {
 
 impl Drop for NetnsWorker {
     fn drop(&mut self) {
-        // The helper dies with the thread that started it (PDEATHSIG).
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-/// This test's name, for the worker process it starts in another namespace.
 const HANDOFF_TEST: &str = "an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper";
 
-/// The outage an allow-list change costs a connected worker, measured on a
-/// real worker link: Sentinel's controller link and helper supervisor on the
-/// host, the worker link and its helper supervisor in a container's network
-/// namespace, over a direct path and then over a relay only (UDP other than
-/// DNS dropped inside the worker's namespace). The change restarts the
-/// controller's helper. Cut, as `Server::set_allow` alone does it, the
-/// tunnelled session ends without a close reaching the worker, which sees it
-/// only at the session heartbeat deadline; handed off, as
-/// `Handle::hand_off` does it, the controller first closes that session
-/// through the old helper. The outage is from the change to the next
-/// welcomed session, on `CLOCK_MONOTONIC`.
-///
-/// On each path: cut changes (the "before" figure), then at least 60
-/// handed-off changes of a settled session (so a close lost once in 52
-/// would show), changes that meet the worker's connection still in its TLS
-/// handshake ([`slow_link`]), and changes during a moment of loss at the
-/// worker ([`NetnsLoss`]), whose close only the old helper's resend
-/// delivers. Every handed-off close must come back answered before the old
-/// helper goes. Last, a worker that behaves as one from before
-/// `HANDOFF_ANSWER` must never keep the old helper past the short bound.
-/// It takes about 55 minutes; the `SENTINEL_TAILCAT_LIVE_*` counts in
-/// [`plan`] shorten a development run.
 #[test]
 #[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman + nsenter + iptables + nft"]
 fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
@@ -1008,7 +853,6 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
     use sentinel_link::{controller::Controller, identity::Identity};
     use sentinel_store::{Durability, Store, auth::Authority, tenancy, workers};
 
-    // The controller: store, a shared pool, the link on the helper's port.
     let state = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(
         Store::open(state.path().join("metadata.sqlite"), Durability::Normal).unwrap(),
@@ -1045,7 +889,6 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
     .unwrap();
     let link = controller.handle();
 
-    // The worker's files, readable from the other namespace (same host).
     let worker_dir = tempfile::tempdir().unwrap();
     let dir = worker_dir.path();
     let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap();
@@ -1084,11 +927,8 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
     .unwrap();
     write("address", server.wait_ready(READY).unwrap().expose());
 
-    // A parked container lends its network namespace (NAT to the relays).
     let parked = ParkedNetns::start("sentinel-live-netns");
 
-    // Rounds of allow-list changes, each set on a fresh worker; every change
-    // widens the list, so the worker stays admitted throughout.
     let plan = plan();
     let mut change = 0u16;
     let mut next_allow = || {
@@ -1109,8 +949,6 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
             if relay { "relay" } else { "direct" },
             if rule.is_empty() { "shipped" } else { rule }
         );
-        // The path the worker's helper measured; a relay-only namespace must
-        // not find a direct one.
         let mut path = None;
         wait_until("the worker's path probe", Duration::from_secs(40), || {
             path = worker
@@ -1125,12 +963,9 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
         }
         let mut rounds = Vec::new();
         for index in 0..count {
-            // Past the settle time, as a long-running worker's helper is.
             std::thread::sleep(tailcat::SESSION_SETTLE + Duration::from_secs(1));
             let mut first = None;
             if kind == Kind::Stalled {
-                // A handed-off change whose redial the slow link then holds
-                // in its TLS handshake, through the restarted helper.
                 std::fs::write(dir.join(STALL), "").unwrap();
                 let at = mono_ns();
                 let handed = link
@@ -1146,9 +981,6 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
                 first = Some((handed, lost, Duration::from_nanos(stalled - at)));
             }
             let (change, allow) = next_allow();
-            // A lossy moment: everything reaching the worker's namespace is
-            // dropped from the change on, so the close is lost in the tunnel
-            // and gets through only if the old helper resends it.
             let loss = (kind == Kind::Lossy).then(|| NetnsLoss::engage(&parked.pid));
             let changed = mono_ns();
             let handed = if kind == Kind::Cut {
@@ -1163,8 +995,6 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
             let back = worker
                 .first_after("connected", changed, Duration::from_secs(300))
                 .expect("the worker never came back after an allow-list change");
-            // The line written right after `connected` says which path the
-            // new session took.
             std::thread::sleep(Duration::from_millis(200));
             let since = |at: u64| Duration::from_nanos(at - changed);
             let trail: Vec<String> = worker
@@ -1192,7 +1022,6 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
         }
         rounds
     };
-    // Set here, it picks the worker's rule for a comparison run.
     let rule = std::env::var(WORKER_RULE).unwrap_or_default();
     let mut results = Vec::new();
     for relay in [false, true] {
@@ -1207,9 +1036,6 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
         }
     }
 
-    // A removal is handed off too, and still cuts the removed worker off:
-    // its session is closed at once, and the restarted helper no longer
-    // admits it, so it never gets back in.
     let worker = NetnsWorker::start(&parked.pid, dir, "");
     assert!(
         worker.first_after("connected", 0, READY * 2).is_some(),
@@ -1244,7 +1070,6 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
     for (relay, kind, rounds) in &results {
         let mut outages: Vec<Duration> = rounds.iter().map(|round| round.outage).collect();
         outages.sort_unstable();
-        // A close the worker did not see promptly: it waited for a deadline.
         let late = rounds
             .iter()
             .filter(|round| !round.lost.is_some_and(|lost| lost < HANDOFF_NOTICED))
@@ -1285,16 +1110,12 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
                 );
             }
             if *kind == Kind::Older {
-                // Its answer may be lost with its forward, but the old
-                // helper is never kept past the short bound for it.
                 assert!(
                     handed.waited < HANDOFF_BOUND + Duration::from_millis(250),
                     "{label}: the hand-off waited {:?} for a worker that does not answer: {round:?}",
                     handed.waited
                 );
             } else {
-                // The worker's end came back before the old helper went:
-                // the close was delivered, and the controller knew it.
                 assert_eq!(
                     handed.ended,
                     handed.closed + handed.arrivals,
@@ -1319,57 +1140,25 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
     }
 }
 
-/// A handed-off worker sees its session (or its connection in the
-/// handshake) end within this long (measured over two full runs, 316
-/// changes: 1.6-26 ms direct, 34-69 ms relayed).
 const HANDOFF_NOTICED: Duration = Duration::from_millis(500);
-/// A handed-off change costs a worker less than this, from the change to
-/// the next welcomed session (measured over the same 316 changes:
-/// 3.30-4.63 s, the restarted helper's own start).
 const HANDOFF_OUTAGE: Duration = Duration::from_millis(5_500);
-/// The same through a lossy moment, whose close only the old helper's
-/// resend delivers (measured over 44 changes: 4.6-7.0 s; a helper that went
-/// at 600 ms left the direct worker to its heartbeat deadline, 17.7-20.5 s).
 const LOSSY_OUTAGE: Duration = Duration::from_secs(9);
 
-/// How an allow-list change meets the worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
-    /// Cut, as `Server::set_allow` alone does it: the "before" figure.
     Cut,
-    /// Handed off, the worker's session settled.
     Settled,
-    /// Handed off while the worker's connection is still in its TLS
-    /// handshake (see [`slow_link`]).
     Stalled,
-    /// Handed off, the worker's session settled, while everything reaching
-    /// the worker is dropped for [`LOSS`] ([`NetnsLoss`]): the close is lost
-    /// in the tunnel and only the old helper can resend it.
     Lossy,
-    /// Handed off, the worker's session settled, but the worker behaves as
-    /// one from before `HANDOFF_ANSWER`: it replaces its forward on a clean
-    /// close at once (when older than 10 s) and does not advertise the bit.
     Older,
 }
 
-/// Handed-off changes per path with a settled session. At least 60, so a
-/// close lost once in 52 changes would show; `SENTINEL_TAILCAT_LIVE_CHANGES`
-/// overrides it for a shorter development run.
 const SETTLED_CHANGES: usize = 64;
-/// Handed-off changes per path that meet a connection in its handshake;
-/// `SENTINEL_TAILCAT_LIVE_STALLS` overrides it.
 const STALLED_CHANGES: usize = 10;
-/// Cut changes per path, for the figure the hand-off is compared with;
-/// `SENTINEL_TAILCAT_LIVE_CUTS` overrides it.
 const CUT_CHANGES: usize = 4;
-/// Handed-off changes per path that meet a lossy moment;
-/// `SENTINEL_TAILCAT_LIVE_LOSSY` overrides it.
 const LOSSY_CHANGES: usize = 6;
-/// Handed-off changes per path with a worker from before `HANDOFF_ANSWER`;
-/// `SENTINEL_TAILCAT_LIVE_OLDER` overrides it.
 const OLDER_CHANGES: usize = 10;
 
-/// What each path measures, in order.
 fn plan() -> [(Kind, usize); 5] {
     let count = |name: &str, default: usize| {
         std::env::var(name)
@@ -1397,18 +1186,13 @@ fn plan() -> [(Kind, usize); 5] {
     ]
 }
 
-/// One measured allow-list change.
 #[derive(Debug)]
 // `trail` and `first` are read only through `Debug`, in failure messages.
 #[allow(dead_code)]
 struct Round {
-    /// From the change to the next welcomed session.
     outage: Duration,
-    /// From the change to the worker seeing its session end.
     lost: Option<Duration>,
     handed: Option<sentinel_link::controller::Handoff>,
-    /// For a stalled change: the change before it (its hand-off, when the
-    /// worker saw that close, and when the redial reached the handshake).
     first: Option<(
         sentinel_link::controller::Handoff,
         Option<Duration>,
@@ -1417,7 +1201,6 @@ struct Round {
     trail: Vec<String>,
 }
 
-/// A parked container whose network namespace a worker process enters.
 struct ParkedNetns {
     name: &'static str,
     pid: String,
@@ -1452,8 +1235,6 @@ impl Drop for ParkedNetns {
     }
 }
 
-/// Every UDP datagram but DNS dropped inside one network namespace: the
-/// helper there can reach its peer only through a DERP relay (over TCP).
 struct NetnsUdpBlock {
     pid: String,
 }
@@ -1485,15 +1266,8 @@ impl Drop for NetnsUdpBlock {
     }
 }
 
-/// How long a [`Kind::Lossy`] change drops what reaches the worker.
 const LOSS: Duration = Duration::from_millis(800);
 
-/// Everything arriving in one network namespace other than on loopback
-/// dropped for [`LOSS`], from `engage` on. The kernel ends the loss: the
-/// drop matches an nft set element that expires after [`LOSS`], so neither
-/// a hand-off in progress nor a slow `nft` or `iptables` call can stretch
-/// it (an `iptables` rule removed from a timer thread held for 0.85-4.1 s).
-/// `lift` waits out the window and removes the table.
 struct NetnsLoss {
     pid: String,
     until: Instant,
@@ -1522,8 +1296,6 @@ impl NetnsLoss {
     fn engage(pid: &str) -> Self {
         let table = Self::TABLE;
         let ms = LOSS.as_millis();
-        // `add` then `delete` makes the reset idempotent; the element is
-        // added last, so the window starts once everything is in place.
         let script = format!(
             "add table inet {table}\n\
              delete table inet {table}\n\
@@ -1540,7 +1312,6 @@ impl NetnsLoss {
         );
         Self {
             pid: pid.to_owned(),
-            // The element may have been added at any point of the call.
             until: engaged_at + LOSS,
             removed: false,
         }
@@ -1551,8 +1322,6 @@ impl NetnsLoss {
     }
 
     fn lift(mut self) {
-        // Nothing reaching the worker is dropped past the element's expiry;
-        // the table goes so that the next round starts from nothing.
         std::thread::sleep(self.until.saturating_duration_since(Instant::now()));
         self.removed = self.remove();
         assert!(self.removed, "the loss table could not be removed");
@@ -1567,22 +1336,6 @@ impl Drop for NetnsLoss {
     }
 }
 
-/// Operator-driven rotation of both identities, end to end on the pinned
-/// helper: a worker's staged key cannot commit until the controller lists
-/// it; both worker keys are admitted through the overlap, and retiring the
-/// old one refuses only it; the controller's staged key is served beside the
-/// active one, and the commit keeps the workers already on the new address
-/// connected while the old address stops answering; revocation still closes
-/// the rotated tunnel.
-///
-/// An allow-list change restarts the controller's helper. The containers
-/// here run a bare `tailcat forward` probed with short `nc` connections, and
-/// such a forward was measured not to answer again within 300 s of the
-/// restart (three restarts, none recovered). A Sentinel worker's link does
-/// recover through its own forward (see
-/// `an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper`), so
-/// this test replaces a container's helper after an allow-list change
-/// before judging it.
 #[test]
 #[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman"]
 fn node_keys_rotate_with_an_overlap_window_and_revocation_still_applies() {
@@ -1612,8 +1365,6 @@ fn node_keys_rotate_with_an_overlap_window_and_revocation_still_applies() {
         before.echo("old-key") == "old-key"
     });
 
-    // Worker rotation. Unlisted, the staged key cannot commit: the
-    // controller's helper refuses its handshake.
     let new = tailcat::stage_rotation(&config, worker_dir.path(), Role::Worker).unwrap();
     assert_ne!(new, old);
     assert!(
@@ -1624,15 +1375,11 @@ fn node_keys_rotate_with_an_overlap_window_and_revocation_still_applies() {
         tailcat::staged_rotation(worker_dir.path(), Role::Worker).unwrap(),
         Some(new.clone())
     );
-    // The old key's material, kept aside by the test only, to show later
-    // that the retired key is refused (the commit deletes it).
     let old_keys = tempfile::tempdir().unwrap();
     let saved = Path::new(".config/tailcat/keys/client-default.private.json");
     std::fs::create_dir_all(old_keys.path().join(saved.parent().unwrap())).unwrap();
     std::fs::copy(keys.join(saved), old_keys.path().join(saved)).unwrap();
 
-    // Listed beside the old key: the old key is still admitted, and the
-    // commit's ping with the new key succeeds.
     server.set_allow(&[old.clone(), new.clone()]);
     let before = ContainerWorker::start(binary, old_name, &keys, &address, port, &[]);
     wait_until("the old key with both listed", READY, || {
@@ -1653,7 +1400,6 @@ fn node_keys_rotate_with_an_overlap_window_and_revocation_still_applies() {
     };
     assert_eq!(committed.key, new);
     assert!(committed.previous_deleted);
-    // Both keys carry the link at once through the overlap.
     let after = ContainerWorker::start_keyed(
         binary,
         new_name,
@@ -1668,8 +1414,6 @@ fn node_keys_rotate_with_an_overlap_window_and_revocation_still_applies() {
     });
     assert_eq!(before.echo("overlap"), "overlap");
 
-    // Retired: the new key is the worker's only one; a fresh helper with the
-    // old key is refused.
     server.set_allow(std::slice::from_ref(&new));
     let after = ContainerWorker::start_keyed(
         binary,
@@ -1688,8 +1432,6 @@ fn node_keys_rotate_with_an_overlap_window_and_revocation_still_applies() {
     assert_eq!(before.echo("retired"), "", "the retired key was admitted");
     drop(before);
 
-    // Controller rotation: the staged key is served beside the active one,
-    // and both addresses carry the link.
     let staged = tailcat::stage_rotation(&config, controller_dir.path(), Role::Controller).unwrap();
     server.reload_keys().unwrap();
     wait_until("the staged address", READY, || {
@@ -1721,9 +1463,6 @@ fn node_keys_rotate_with_an_overlap_window_and_revocation_still_applies() {
         "the active address during the overlap"
     );
 
-    // Commit: the helper serving the new key becomes the main one without a
-    // restart, so the worker already on the new address keeps its tunnel;
-    // the old address stops answering.
     let committed =
         tailcat::commit_rotation(&config, controller_dir.path(), Role::Controller, None).unwrap();
     assert_eq!(committed.key, staged);
@@ -1746,7 +1485,6 @@ fn node_keys_rotate_with_an_overlap_window_and_revocation_still_applies() {
     });
     eprintln!("live rotation: both identities rotated with an overlap window");
 
-    // Revocation still applies to the rotated identity.
     server.set_allow(&[]);
     let moved = ContainerWorker::start_keyed(
         binary,
@@ -1762,10 +1500,6 @@ fn node_keys_rotate_with_an_overlap_window_and_revocation_still_applies() {
     server.shutdown();
 }
 
-/// Outbound UDP to the container subnet blocked for the scope of the guard:
-/// the direct WireGuard path to the peer cannot form, so the helper can only
-/// reach it through a DERP relay. Everything else stays open — WSL's DNS
-/// resolver and the DERP map fetch are not on this path.
 struct UdpBlock;
 
 impl UdpBlock {
@@ -1828,9 +1562,6 @@ fn relay_only_paths_report_derp() {
 
     let _block = UdpBlock::engage();
 
-    // With UDP dropped the direct path cannot form: the supervisor's own
-    // probe must measure a relayed path, and the forward still carries the
-    // link port.
     let forward =
         tailcat::start_forward_every(&config, data_dir.path(), &server.address, PROBE_EVERY)
             .unwrap();
@@ -1841,7 +1572,6 @@ fn relay_only_paths_report_derp() {
     forward.shutdown();
 }
 
-/// A throwaway CA and a leaf for `ip`, written with `openssl`.
 fn issue_certs(dir: &Path, ip: &str, ca_out: &Path) -> (PathBuf, PathBuf) {
     let run = |args: &[&str]| {
         let status = Command::new("openssl")
@@ -1904,8 +1634,6 @@ fn issue_certs(dir: &Path, ip: &str, ca_out: &Path) -> (PathBuf, PathBuf) {
         "-out",
         &crt_text,
     ]);
-    // Appended to the runner's bundle (a copy of the system roots), so the
-    // tests that use the public relays keep working in the same run.
     let ca = std::fs::read(dir.join("ca.pem")).unwrap();
     std::fs::OpenOptions::new()
         .append(true)
@@ -1915,7 +1643,6 @@ fn issue_certs(dir: &Path, ip: &str, ca_out: &Path) -> (PathBuf, PathBuf) {
     (crt, key)
 }
 
-/// Kills a background process on drop.
 struct Background(Child);
 
 impl Drop for Background {
@@ -1952,8 +1679,6 @@ fn a_self_hosted_derp_relay_carries_the_link() {
     let _echo = HostEcho::start(port);
 
     assert!(derper.is_file(), "SENTINEL_TAILCAT_DERPER is not a file");
-    // The relay lives on the Podman bridge's gateway, which both the host and
-    // the container reach. The bridge exists once a container runs.
     let worker_dir = tempfile::tempdir().unwrap();
     let placeholder = "sentinel-live-derp-bridge";
     remove_container(placeholder);
@@ -2038,8 +1763,6 @@ fn a_self_hosted_derp_relay_carries_the_link() {
         tailcat::start_server(&relayed, controller_dir.path(), std::slice::from_ref(&key)).unwrap();
     let address = server.wait_ready(READY).unwrap();
 
-    // Direct UDP between the container and the host is dropped, so the only
-    // way through is the self-hosted relay — the only region in the map.
     let _block = UdpBlock::engage();
     let worker = ContainerWorker::start(
         binary,

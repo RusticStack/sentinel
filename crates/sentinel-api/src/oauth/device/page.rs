@@ -1,18 +1,3 @@
-//! `GET`/`POST /device`: a signed-in person enters the user code shown by a
-//! device, sees what it asks for, and approves (optionally narrowing the
-//! scopes, a tenant and a repository) or denies.
-//!
-//! A session cookie is required; without one the page embeds the ordinary
-//! password sign-in. The approval form carries a token keyed to the
-//! session's CSRF digest, and an `Origin` header, when sent, must be the
-//! issuer's. Five wrong user codes per account within ten minutes lock the
-//! account out of the page for the rest of that window, so a code cannot be
-//! guessed from a session. Approval terms the account cannot grant — a
-//! tenant or repository that is absent, foreign or not visible to it, or a
-//! scope beyond it — get one identical refusal and count toward the same
-//! limit, so the form is not a way to learn what exists elsewhere. The
-//! device code never appears here.
-
 use std::{
     fmt::Write as _,
     time::{Duration, Instant},
@@ -36,23 +21,16 @@ use crate::{
 
 const TITLE: &str = "Connect a device";
 
-/// Wrong user codes an account may enter per window.
+// Five wrong codes lock the account out for the window, so a code cannot be guessed from a session.
 const MAX_WRONG_CODES: u8 = 5;
-/// The window those are counted in.
 const WRONG_CODE_WINDOW: Duration = Duration::from_secs(10 * 60);
-/// Accounts tracked at once. A hard bound: past it, an untracked account is
-/// treated as locked out until a window ends and makes room (fail closed),
-/// because evicting a live count would hand its owner fresh guesses.
+/// Past this many tracked accounts, an untracked one is locked out until a window
+/// ends (fail closed): evicting a live count would hand its owner fresh guesses.
 const MAX_TRACKED: usize = 4096;
-/// Least time between two sweeps of a full map for ended windows, so a full
-/// map costs one bounded scan per interval rather than one per request.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Wrong user codes (and refused approval terms) per account in the current
-/// window, bounded by [`MAX_TRACKED`] entries.
 pub(crate) struct WrongCodes {
     counts: std::collections::HashMap<UserId, (u8, Instant)>,
-    /// When the map was last swept; `None` before the first sweep.
     swept: Option<Instant>,
 }
 
@@ -64,9 +42,6 @@ impl WrongCodes {
         }
     }
 
-    /// When full, drop the windows that have ended — at most once per
-    /// [`SWEEP_INTERVAL`]. `true` when `user` has no entry and there is
-    /// still no room for one.
     fn full_for(&mut self, user: &UserId, now: Instant) -> bool {
         if self.counts.len() < MAX_TRACKED || self.counts.contains_key(user) {
             return false;
@@ -82,7 +57,6 @@ impl WrongCodes {
         self.counts.len() >= MAX_TRACKED
     }
 
-    /// Whether the account may not try a code now.
     fn locked(&mut self, user: UserId, now: Instant) -> bool {
         if self.full_for(&user, now) {
             return true;
@@ -92,8 +66,6 @@ impl WrongCodes {
         })
     }
 
-    /// Count one wrong code; nothing is stored when the map has no room,
-    /// and [`WrongCodes::locked`] then refuses the account anyway.
     fn record(&mut self, user: UserId, now: Instant) {
         if self.full_for(&user, now) {
             return;
@@ -111,11 +83,8 @@ impl WrongCodes {
     }
 }
 
-/// `GET`/`POST /device`.
 pub(crate) fn page(state: &State, request: &mut Request, method: &str, query: &str) -> Route {
     let Some((who, csrf)) = session(state, request).and_then(|who| Some((who, who.csrf?))) else {
-        // A GET keeps its query (a verification_uri_complete carries the
-        // user code); a POST without a session starts over at the entry form.
         let here = if method == "GET" && !query.is_empty() {
             format!("/device?{query}")
         } else {
@@ -139,7 +108,6 @@ pub(crate) fn page(state: &State, request: &mut Request, method: &str, query: &s
     })
 }
 
-/// Whether the account has used up its wrong codes for this window.
 fn locked(state: &State, user: UserId, now: Instant) -> bool {
     state
         .oauth
@@ -149,7 +117,6 @@ fn locked(state: &State, user: UserId, now: Instant) -> bool {
         .locked(user, now)
 }
 
-/// Count one wrong code (or refused approval terms) for the account.
 fn wrong_code(state: &State, user: UserId, now: Instant) {
     state
         .oauth
@@ -166,7 +133,6 @@ fn lockout() -> Reply {
     )
 }
 
-/// The user-code entry form, with an optional message.
 fn entry(state: &State, status: u16, message: Option<&str>) -> Reply {
     let mut body = String::with_capacity(512);
     if let Some(message) = message {
@@ -220,7 +186,6 @@ fn show(state: &State, who: &Identity, csrf: &Digest, query: &str) -> Reply {
     }
 }
 
-/// The approval form for one pending request.
 fn approval(
     state: &State,
     who: &Identity,
@@ -276,7 +241,6 @@ fn approval(
     html::page(200, TITLE, &body)
 }
 
-/// The scopes whose checkbox came back ticked.
 fn ticked(form: &Form) -> Scopes {
     let mut name = String::with_capacity(24);
     let mut scopes = Scopes::NONE;
@@ -367,11 +331,6 @@ fn submit(state: &State, request: &mut Request, who: &Identity, csrf: &Digest) -
     }
 }
 
-/// The one answer to every approval the account cannot make: a tenant or
-/// repository that does not exist, one it has no part in, or a scope beyond
-/// it. The same bytes for each, so the form reveals nothing about other
-/// tenants; each counts toward the wrong-code lockout, so it cannot be used
-/// to probe at speed either.
 fn refused_terms() -> Reply {
     html::error_page(
         403,
@@ -380,18 +339,11 @@ fn refused_terms() -> Reply {
     )
 }
 
-/// Why a narrowing produced no terms.
 enum Narrowing {
-    /// Not a tenant or repository this account may narrow to.
     Refused,
-    /// A malformed form or a busy store: its own page.
     Page(Reply),
 }
 
-/// The optional tenant (by slug) and repository (by name) narrowing,
-/// resolved only among the account's own memberships (see
-/// `sentinel_store::auth::narrowing_by_name`). The store re-checks
-/// membership and ownership when recording the decision.
 fn narrowing(
     state: &State,
     user: UserId,
@@ -425,9 +377,6 @@ fn narrowing(
 mod tests {
     use super::*;
 
-    /// More accounts than the bound, all inside one window: the map never
-    /// grows past it, and an account it has no room for is refused rather
-    /// than left uncounted.
     #[test]
     fn the_wrong_code_map_is_bounded_and_fails_closed() {
         let mut codes = WrongCodes::new();
@@ -440,7 +389,6 @@ mod tests {
         assert!(codes.locked(late, start));
         codes.record(late, start + Duration::from_secs(2));
         assert_eq!(codes.len(), MAX_TRACKED);
-        // Once those windows end, one sweep makes room again.
         let later = start + WRONG_CODE_WINDOW + Duration::from_secs(1);
         assert!(!codes.locked(late, later));
         codes.record(late, later);

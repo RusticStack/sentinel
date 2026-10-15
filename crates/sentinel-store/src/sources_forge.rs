@@ -1,5 +1,3 @@
-//! Trusted GitHub App lifecycle snapshots. A webhook is a refresh hint, never
-//! authority to revive a previously bound installation from a stale body.
 use crate::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{InstallationId, RepoId, TenantId, UnixMillis};
@@ -14,7 +12,6 @@ pub struct Snapshot<'a> {
     pub expected: u64,
 }
 
-/// What a refresh reads back to decide whether the installation row changed.
 struct Row {
     account: Option<i64>,
     personal: Option<i64>,
@@ -23,8 +20,6 @@ struct Row {
     permissions_valid: i64,
 }
 
-/// Call only with a freshly authenticated GitHub App API response. The
-/// expected local version was read before starting that bounded request.
 pub fn refresh(tx: &Transaction<'_>, s: Snapshot<'_>, now: UnixMillis) -> Result<InstallationId> {
     if s.external_id == 0
         || s.account_id == 0
@@ -60,8 +55,7 @@ pub fn refresh(tx: &Transaction<'_>, s: Snapshot<'_>, now: UnixMillis) -> Result
         // A transfer never silently reauthorizes old source bindings.
         tx.execute("UPDATE source_bindings SET revoked=1,credential=x'',version=version+1 WHERE installation_id=?1 AND revoked=0",[id.as_bytes()])?;
     }
-    // A refresh that changes nothing is not a new lifecycle: bumping the
-    // version would fail every grant re-check an in-flight issuance holds.
+    // A no-op refresh must not bump the version, or every in-flight grant re-check would fail.
     if old.is_some_and(|row| {
         row.account == Some(s.account_id as i64)
             && row.personal == Some(i64::from(s.personal))
@@ -75,8 +69,7 @@ pub fn refresh(tx: &Transaction<'_>, s: Snapshot<'_>, now: UnixMillis) -> Result
     Ok(id)
 }
 
-/// An authenticated deletion notification (or confirmed API 404) disables
-/// issuance immediately. Only a fresh API snapshot can enable it again.
+// Removal disables issuance at once; only a fresh API snapshot may re-enable it.
 pub fn remove(tx: &Transaction<'_>, id: InstallationId) -> Result<()> {
     if tx.execute("UPDATE installations SET suspended=1,permissions_valid=0,lifecycle_version=lifecycle_version+1 WHERE id=?1",[id.as_bytes()])? != 1 { return Err(Error::NotFound); }
     Ok(())

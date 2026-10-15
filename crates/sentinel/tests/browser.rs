@@ -1,33 +1,3 @@
-//! The CLI's real browser opener, launched for real.
-//!
-//! No libtest harness: this binary plays three parts, chosen by how it was
-//! started, so the production opener runs and its spawn reaches a harmless
-//! stand-in instead of a browser.
-//!
-//! - **Test**: copies itself into a temporary directory twice —
-//!   as a runner and under the platform opener's name (`rundll32.exe`
-//!   or `xdg-open`) — and starts the runner with credential-bearing
-//!   `SENTINEL_*` variables set.
-//! - **Runner**: opens the URL exactly as `sentinel auth login` does. On
-//!   Linux that is `sentinel::browser::open` unchanged, with the stand-in
-//!   first on `PATH`. On Windows production names the launcher by its
-//!   absolute System32 path, so the runner hands the same
-//!   `browser::open_with`/`command_with` path the stand-in's location
-//!   instead; everything else — arguments, environment, spawn — is the
-//!   production code.
-//! - **Opener stand-in**: records the argv it received, NUL-separated, and
-//!   the names of the `SENTINEL_*` variables it inherited, then exits.
-//!   Nothing is opened.
-//!
-//! The URL carries shell metacharacters, quotes, spaces and variable syntax
-//! for both `sh` and `cmd.exe`; the stand-in must receive it as one argv
-//! element and the canary commands inside it must not run. On Windows the
-//! stand-in is a Rust program that splits its command line by the MSVC
-//! rules, which the real `rundll32` does not (it hands the raw rest of the
-//! line to `FileProtocolHandler`); so there the test proves that no shell
-//! ran and what the command line decodes to, not what `rundll32` itself
-//! would see. The real authorization URL never contains spaces or quotes.
-
 use std::{
     ffi::OsString,
     fs,
@@ -36,14 +6,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Set on the runner: the URL to open, and whether to launch.
 const URL: &str = "SENTINEL_BROWSER_TEST_URL";
 const LAUNCH: &str = "SENTINEL_BROWSER_TEST_LAUNCH";
-/// Where the stand-in records what it received, beside itself.
 const ARGV_FILE: &str = "argv.bin";
 const ENV_FILE: &str = "env.bin";
 
-/// The launcher `browser::command` names on this platform.
 const OPENER: &str = if cfg!(windows) {
     "rundll32.exe"
 } else {
@@ -86,9 +53,6 @@ fn main() -> ExitCode {
             no_browser_prints_the_url_and_launches_nothing,
         ),
     ];
-    // Enough of libtest's command line for `cargo test` and cargo-nextest:
-    // `--list` names the tests (none are ignored), and a name filter —
-    // exact with `--exact`, a substring otherwise — picks which run.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
     if flag("--list") {
@@ -130,9 +94,6 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The opener stand-in: the `SENTINEL_*` variable names it inherited, then
-/// its argv after the program name, NUL-separated, written atomically so
-/// the test never reads half of it.
 fn stand_in(me: &Path) -> ExitCode {
     let mut names = Vec::new();
     for (name, _) in std::env::vars_os() {
@@ -155,8 +116,6 @@ fn stand_in(me: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// A directory holding the runner and the opener stand-in, both copies of
-/// this binary.
 struct Stage {
     dir: tempfile::TempDir,
     runner: PathBuf,
@@ -176,8 +135,6 @@ impl Stage {
         Self { dir, runner, out }
     }
 
-    /// Runs the opener in the runner, with credentials in its environment,
-    /// and returns its standard error.
     fn open(&self, url: &str, launch: bool) -> String {
         let mut command = Command::new(&self.runner);
         command
@@ -190,7 +147,6 @@ impl Stage {
         } else {
             command.env_remove(LAUNCH);
         }
-        // Where the real opener is looked up first: `PATH` on Unix.
         if cfg!(unix) {
             let mut path = OsString::from(self.dir.path());
             if let Some(inherited) = std::env::var_os("PATH") {
@@ -204,8 +160,7 @@ impl Stage {
         String::from_utf8(output.stderr).expect("UTF-8 stderr")
     }
 
-    /// The `SENTINEL_*` variables the stand-in inherited (read after
-    /// [`Stage::received`]).
+    /// Call after [`Stage::received`]: the environment is recorded before the argv is published.
     fn inherited(&self) -> Vec<String> {
         let bytes = fs::read(self.dir.path().join(ENV_FILE)).expect("read the environment");
         String::from_utf8(bytes)
@@ -215,7 +170,6 @@ impl Stage {
             .collect()
     }
 
-    /// What the stand-in received, once it has written it.
     fn received(&self) -> Vec<String> {
         let deadline = Instant::now() + Duration::from_secs(60);
         while !self.out.exists() {
@@ -229,8 +183,6 @@ impl Stage {
         args
     }
 
-    /// Nothing was launched: after the runner exited (the spawn happens
-    /// before it does), a stand-in would have left its record by now.
     fn assert_nothing_launched(&self) {
         std::thread::sleep(Duration::from_millis(500));
         assert!(!self.out.exists(), "an opener was started");
@@ -238,8 +190,6 @@ impl Stage {
     }
 }
 
-/// A URL that a shell (`sh` or `cmd.exe`) would split, expand or run parts
-/// of. Each canary, if any shell ran it, would create a file in `dir`.
 fn hostile_url(dir: &Path) -> (String, Vec<PathBuf>) {
     let canaries: Vec<PathBuf> = ["semicolon", "subshell", "backtick", "ampersand"]
         .iter()
@@ -258,8 +208,6 @@ fn the_opener_command_is_the_platform_launcher_with_the_url_as_one_argument() {
     let command = sentinel::browser::command(url);
     let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
     if cfg!(windows) {
-        // An absolute path into the system directory, never a bare
-        // name that the CLI's own directory could answer.
         let program = Path::new(command.get_program());
         assert!(program.is_absolute(), "{program:?}");
         let lower = program.to_string_lossy().to_ascii_lowercase();
@@ -292,8 +240,6 @@ fn the_real_opener_receives_a_hostile_url_as_one_argv_element_without_a_shell_or
     for canary in canaries {
         assert!(!canary.exists(), "a shell ran part of the URL: {canary:?}");
     }
-    // The runner held SENTINEL_TOKEN and other SENTINEL_* variables; the
-    // browser inherits none of them.
     assert_eq!(stage.inherited(), Vec::<String>::new());
 }
 

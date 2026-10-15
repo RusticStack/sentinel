@@ -1,12 +1,3 @@
-//! Fault isolation and live policy in the intake and poll lanes:
-//! a delivery or poll configuration whose binding authorizes nothing any more
-//! settles or backs off on its own and never holds another tenant's work
-//! behind it; the deployment's destination policy is rechecked before any
-//! controller-side fetch; a rotation that races issuance is retried, not
-//! failed; and an idle lane costs no writes.
-//!
-//! Fetching and listing are injected (and counted), so these run everywhere.
-
 use std::{
     collections::HashMap,
     sync::{
@@ -43,7 +34,6 @@ const MAIN: &str = "refs/heads/main";
 const AUTHORITY: &str = "https://git.example:8443";
 const IMAGE: &str = "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
 
-/// A fetcher that serves one valid push pipeline and counts every call.
 #[derive(Default)]
 struct CountingFetch {
     calls: AtomicUsize,
@@ -77,7 +67,6 @@ impl Fetch for CountingFetch {
     }
 }
 
-/// A lister answering per remote, counting every call.
 #[derive(Default)]
 struct RoutedLister {
     answers: Mutex<HashMap<String, Result<Vec<sentinel_git::RefTip>, String>>>,
@@ -126,10 +115,8 @@ struct Fixture {
     dir: tempfile::TempDir,
     store: Arc<Store>,
     key: Arc<Key>,
-    /// Two tenants' generic repositories.
     one: Repo,
     two: Repo,
-    /// Tenant one's GitHub-App-bound repository.
     app: Repo,
     installation: InstallationId,
 }
@@ -297,7 +284,6 @@ impl Fixture {
             .unwrap()
     }
 
-    /// Lane phase one, by hand: every due pending delivery becomes ready.
     fn validate_all(&self) {
         self.store
             .writer()
@@ -346,9 +332,6 @@ fn start_lane(f: &Fixture, resolver: Resolver) -> Lane {
     )
 }
 
-/// Ready deliveries whose binding stopped authorizing anything — a suspended
-/// tenant, a suspended installation, a revoked App binding — settle with
-/// their reason, and another tenant's later delivery still dispatches.
 #[test]
 fn an_unusable_binding_settles_its_delivery_and_never_stalls_another_tenant() {
     let f = fixture();
@@ -357,7 +340,6 @@ fn an_unusable_binding_settles_its_delivery_and_never_stalls_another_tenant() {
     f.validate_all();
     assert_eq!(f.delivery(suspended).state, State::Ready);
     assert_eq!(f.delivery(uninstalled).state, State::Ready);
-    // The installation is suspended by its owner, then the tenant is.
     f.sql(
         "UPDATE installations SET suspended = 1 WHERE id = ?1",
         *f.installation.as_bytes(),
@@ -402,8 +384,6 @@ fn a_suspended_installation_and_a_revoked_app_binding_settle_with_their_reasons(
             detail: None
         }
     );
-    // A `repository renamed` revocation keeps the installation association
-    // on the row; it must still read as revoked, not as a store fault.
     f.sql(
         "UPDATE installations SET suspended = 0 WHERE id = ?1",
         *f.installation.as_bytes(),
@@ -427,14 +407,11 @@ fn a_suspended_installation_and_a_revoked_app_binding_settle_with_their_reasons(
     );
 }
 
-/// A delivery whose resolution hits a store fault is parked under its own
-/// retry schedule; the pass carries on with the rest.
 #[test]
 fn a_store_fault_on_one_delivery_parks_it_and_the_pass_continues() {
     let f = fixture();
     let broken = f.accept(&f.one, "one-1", 'a', 'b');
     f.validate_all();
-    // An undecodable binding: reading it is a store fault, not a verdict.
     f.sql(
         "UPDATE source_bindings SET binding = x'00' WHERE repo_id = ?1",
         *f.one.id.as_bytes(),
@@ -463,8 +440,6 @@ fn a_store_fault_on_one_delivery_parks_it_and_the_pass_continues() {
     assert!(next.is_some_and(|at| at > UnixMillis::now().0 - 60_000));
 }
 
-/// Narrowing `source-destinations.json` stops controller-side fetches for a
-/// binding outside it, with an explicit reason, before any remote work.
 #[test]
 fn a_binding_outside_the_destination_policy_is_refused_before_any_fetch() {
     let f = fixture();
@@ -490,8 +465,6 @@ fn a_binding_outside_the_destination_policy_is_refused_before_any_fetch() {
     assert_eq!(fetch.calls.load(Ordering::SeqCst), 0, "nothing was fetched");
 }
 
-/// A binding rotated between the lookup and the issuance is retried under a
-/// fresh lookup instead of failing the delivery for good.
 #[test]
 fn a_rotation_racing_issuance_is_transient() {
     let f = fixture();
@@ -545,13 +518,11 @@ fn a_rotation_racing_issuance_is_transient() {
     );
 }
 
-/// An idle lane reads; it does not write. Every commit wakes each run-watch
-/// long poll, so an empty validation pass must not be one.
+/// Every commit wakes each run-watch long poll, so an idle pass must not commit.
 #[test]
 fn an_idle_lane_takes_no_writes() {
     let f = fixture();
     let lane = start_lane(&f, f.resolver(everything(), Arc::default()));
-    // Let the lane settle into its idle loop.
     std::thread::sleep(Duration::from_millis(100));
     let before = f.store.changes().generation();
     std::thread::sleep(Duration::from_millis(500));
@@ -560,7 +531,6 @@ fn an_idle_lane_takes_no_writes() {
         before,
         "an idle tick committed"
     );
-    // And it still wakes for work.
     let delivery = f.accept(&f.two, "two-1", 'a', 'b');
     lane.waker().wake();
     wait_for("the dispatch", || {
@@ -621,8 +591,6 @@ fn start_poll(f: &Fixture, destinations: Arc<[String]>, lister: &Arc<RoutedListe
     .unwrap()
 }
 
-/// A suspended tenant's poll configuration backs off (and is kept for when
-/// the tenant returns); another repository's poll is never blocked by it.
 #[test]
 fn a_suspended_tenants_poll_backs_off_without_blocking_others() {
     let f = fixture();
@@ -648,7 +616,6 @@ fn a_suspended_tenants_poll_backs_off_without_blocking_others() {
     assert!(!suspended.baselined);
 }
 
-/// The poller rechecks the destination policy before listing a remote.
 #[test]
 fn a_poll_outside_the_destination_policy_is_refused_without_listing() {
     let f = fixture();
@@ -666,14 +633,10 @@ fn a_poll_outside_the_destination_policy_is_refused_without_listing() {
     assert_eq!(lister.calls.load(Ordering::SeqCst), 0);
 }
 
-/// A remote's multibyte diagnostic longer than the stored bound is cut on a
-/// character boundary, and the poll lane keeps polling afterwards.
 #[test]
 fn a_multibyte_failure_reason_is_bounded_and_the_lane_survives() {
     let f = fixture();
     let lister = Arc::new(RoutedLister::default());
-    // As recorded, the reason reads `git: git ls-remote failed: é…`: 27
-    // bytes of prefix plus two-byte characters, so byte 256 falls inside one.
     let reason = format!("git ls-remote failed: {}", "é".repeat(200));
     let shown = sentinel_git::Error::Preparation(reason.clone()).to_string();
     assert!(!shown.is_char_boundary(256));
@@ -686,7 +649,6 @@ fn a_multibyte_failure_reason_is_bounded_and_the_lane_survives() {
     });
     let stored = poll_config(&f, &f.one).unwrap().last_error.unwrap();
     assert!(stored.len() <= 256, "{}", stored.len());
-    // The lane is alive: a repository configured afterwards is polled.
     configure(&f, &f.two);
     wait_for("the next repository's baseline", || {
         poll_config(&f, &f.two).is_some_and(|c| c.baselined)

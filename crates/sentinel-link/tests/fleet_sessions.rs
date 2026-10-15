@@ -1,13 +1,3 @@
-//! One hundred concurrent worker sessions over real TLS against a real
-//! `Controller`, each ending in a simulated executor.
-//!
-//! What this covers is the link and the scheduler at fleet scale: one hundred
-//! mutual-TLS handshakes, admission, fleet bookkeeping, profile reporting,
-//! heartbeat renewal and placement of a burst that exactly fills every
-//! session. The executors are simulations — they acknowledge offers and hold
-//! attempts, and no container, checkout or step ever runs, so this is TLS
-//! and scheduler evidence, not executor evidence.
-
 use std::{
     path::PathBuf,
     sync::{
@@ -42,16 +32,12 @@ use sentinel_store::{
 };
 
 const SESSIONS: usize = 100;
-/// Each session takes exactly two quarter-core jobs: the burst is sized so
-/// a hundred healthy sessions all receive work and none is oversubscribed.
 const JOBS: usize = 200;
 const JOBS_PER_RUN: usize = 50;
 const RUNS: usize = JOBS / JOBS_PER_RUN;
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-/// A session that reports its disk and its own host, so host-scoped
-/// accounting never aggregates two simulated machines into one.
 fn profile(index: usize) -> Profile {
     let mut host_id = [0u8; 16];
     host_id[..4].copy_from_slice(&(index as u32).to_be_bytes());
@@ -92,7 +78,6 @@ fn jobs_yaml() -> String {
 struct Deployment {
     _dir: tempfile::TempDir,
     store: Arc<Store>,
-    /// Held for the controller's lifetime; the test reads the store.
     _logs: Arc<sentinel_store::logs::LogStore>,
     _objects: Arc<sentinel_store::objects::Objects>,
     controller: Option<Controller>,
@@ -162,12 +147,7 @@ impl Deployment {
         self.controller.as_ref().unwrap()
     }
 
-    /// Enroll every identity in the store, as an operator provisioning a
-    /// fleet would. The link rate-limits enrollments over the wire (a few
-    /// per source, twenty a minute overall; docs/worker-link.md), so a
-    /// hundred workers arriving at once over loopback cannot all enroll
-    /// through it; this test is about sessions, and each worker connects as
-    /// the known identity it is.
+    /// Enrolls in the store directly: the wire rate limit would throttle a hundred workers.
     fn enroll_all(&self, workers: &[(WorkerId, Identity)]) {
         let pool = self.pool;
         let enrolled: Vec<_> = workers
@@ -235,8 +215,6 @@ impl Deployment {
     }
 }
 
-/// A simulated executor: acknowledges every offer, holds the attempt, and
-/// never runs anything.
 struct Sim {
     held: Mutex<Vec<AttemptId>>,
     jobs: Mutex<Vec<JobId>>,
@@ -280,7 +258,6 @@ impl Executor for Sim {
     fn log_refused(&self, _: AttemptId) {}
 }
 
-/// Wait until `predicate` holds, within `within`.
 fn eventually(what: &str, within: Duration, mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + within;
     while !predicate() {
@@ -316,7 +293,6 @@ fn one_hundred_sessions_connect_and_take_their_share_of_the_burst() {
         threads.push(thread::spawn(move || -> Result<(), Error> {
             let config = tls::client_config(identity, fingerprint).unwrap();
             let mut link = session::connect(addr, config, id, "fleet", hello(), None, capacity())?;
-            // Protocol 7: the profile carries what a hello cannot.
             link.send_profile(&profile(index))?;
             link.run(&*sim, || stop.load(Ordering::Relaxed))
         }));
@@ -342,9 +318,6 @@ fn one_hundred_sessions_connect_and_take_their_share_of_the_burst() {
     ids.sort();
     assert_eq!(live, ids, "every enrolled identity holds a session");
 
-    // The burst exactly fills every session: 500 millicpu each against 200
-    // quarter-core jobs means two jobs per session, no session idle and no
-    // session oversubscribed.
     let jobs = d.run();
     assert_eq!(jobs.len(), JOBS);
     eventually("every job acknowledged", Duration::from_secs(30), || {
@@ -359,8 +332,6 @@ fn one_hundred_sessions_connect_and_take_their_share_of_the_burst() {
         assert_eq!(sim.held.lock().unwrap().len(), 2);
     }
 
-    // No attempt or job reached two sessions: at this scale a retransmit or
-    // a stale fleet entry must never become duplicate execution.
     let mut attempts = std::collections::HashSet::new();
     let mut placed_jobs = std::collections::HashSet::new();
     for sim in &sims {
@@ -371,8 +342,6 @@ fn one_hundred_sessions_connect_and_take_their_share_of_the_burst() {
     }
     assert_eq!(placed_jobs.len(), JOBS);
 
-    // The sessions are still alive under load: every one answers a fresh
-    // heartbeat after this point, renewing its lease.
     let renewals: Vec<i64> = sims
         .iter()
         .map(|s| s.renewed.load(Ordering::SeqCst))
@@ -387,7 +356,6 @@ fn one_hundred_sessions_connect_and_take_their_share_of_the_burst() {
         },
     );
 
-    // A clean stop closes every session and leaves an empty fleet.
     stop.store(true, Ordering::Relaxed);
     for (index, thread) in threads.into_iter().enumerate() {
         thread.join().unwrap().unwrap_or_else(|error| {

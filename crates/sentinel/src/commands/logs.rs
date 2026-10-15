@@ -1,5 +1,3 @@
-//! `log show [--follow] [--step]` and `log search --text`.
-
 use std::io::Write;
 
 use serde_json::{Map, Value, json};
@@ -7,21 +5,8 @@ use serde_json::{Map, Value, json};
 use super::{List, MAX_ITEMS, PAGE, busy_backoff, segment, text};
 use crate::client::{self, Client, Error, Output};
 
-/// The most frame text one `--output json` document collects. The JSON
-/// listing is held whole before it is printed, so it is bounded in bytes as
-/// well as frames: 10,000 full 32 KiB frames would be about 320 MiB.
 const MAX_JSON_TEXT: usize = 16 << 20;
 
-/// Print an attempt's frames page by page. Text writes each frame's bytes
-/// to the stream it came from (stdout or stderr), as the job wrote them;
-/// NDJSON prints one `{seq, step, stream, text}` line per frame; JSON one
-/// `{attempt, frames, complete, gaps}` document of at most 10,000 frames and
-/// [`MAX_JSON_TEXT`] of frame text (`next_after` continues a cut one; the
-/// first frame is always included). Pages follow the server's
-/// `next_after`: a page is bounded in bytes as well as frames (1 MiB of
-/// payload), so a log of full 32 KiB frames never produces a response the
-/// client cannot read. Without `--follow` the command ends at the end of
-/// what is stored; with it, it parks until the log is complete.
 pub(super) fn show(
     client: &Client,
     output: Output,
@@ -82,8 +67,6 @@ pub(super) fn show(
         }
         let complete = page["complete"] == true;
         capped |= output == Output::Json && shown >= MAX_ITEMS;
-        // A page the server cut (bytes, frames or a step filter's scan
-        // bound) says where the next one starts; follow it at once.
         let more = page["next_after"].as_u64();
         if let Some(next) = more
             && !capped
@@ -118,12 +101,8 @@ pub(super) fn show(
     Ok(())
 }
 
-/// Longest literal the server searches for, in bytes.
 const MAX_TEXT: usize = 256;
 
-/// Follow the server's bounded scans (`next_after`) until the log's end or
-/// the match limit: each request scans at most 4 MiB, so a large log costs
-/// several short requests rather than one long one.
 pub(super) fn search(
     client: &Client,
     output: Output,
@@ -144,8 +123,7 @@ pub(super) fn search(
     let mut list = List::new(output);
     let mut shown = 0usize;
     let mut after = 0u64;
-    // The server's scan state at `after` (hex), so a literal split across
-    // two requests is still found, once.
+    // The server's scan state at `after`, so a literal split across two requests is still found once.
     let mut carry = String::new();
     let (next, complete) = loop {
         let size = (cap - shown).min(PAGE);
@@ -153,9 +131,7 @@ pub(super) fn search(
         let page = client.get(&format!(
             "/api/v1/attempts/{attempt}/logs/search?q={query}&after={after}&limit={size}{resume}{carry}"
         ))?;
-        // The server checks `limit` between frames, so one frame can bring
-        // several matches past the cap. Those are cut here; the resume point
-        // is then just before that frame, so a rerun from it sees them.
+        // Matches past the cap are cut here; the resume point precedes that frame so a rerun sees them.
         let mut cut: Option<u64> = None;
         for m in page["matches"].as_array().into_iter().flatten() {
             if shown >= cap {

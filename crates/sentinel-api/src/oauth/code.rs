@@ -1,21 +1,3 @@
-//! The authorization-code flow over HTTP: `GET`/`POST
-//! /oauth/authorize` (sign-in, consent, approve or deny, `303` back to the
-//! client) and the `authorization_code` branch of the token endpoint.
-//!
-//! Consent is stateless. `GET` validates the request and renders the page
-//! with every parameter in hidden fields plus a form token keyed to the
-//! session's CSRF digest; `POST` re-validates all of it from the body,
-//! checks the form token and, when present, `Origin`, and only then writes
-//! (the code on approval, an audit row on denial).
-//!
-//! Until the client and its redirect URI are established nothing is sent
-//! back to the client: an unknown client or an unacceptable redirect gets
-//! an error page with no `location`. Every later refusal is an RFC 6749
-//! §4.1.2.1 redirect carrying `error`, `state` and `iss` (RFC 9207) — for a
-//! third-party (DCR/CIMD) client only once an account has signed in (RFC
-//! 9700 §4.11.2), and a CIMD document is fetched only for a signed-in
-//! account.
-
 mod consent;
 
 use sentinel_auth::{
@@ -40,10 +22,8 @@ use crate::{
     routes::{self, Reply, Route},
 };
 
-/// Longest `state` accepted, in bytes.
 const MAX_STATE_BYTES: usize = 512;
 
-/// `GET` renders sign-in or consent; `POST` records the decision.
 pub(crate) fn authorize(state: &State, request: &mut Request, method: &str, query: &str) -> Route {
     Ok(match method {
         "POST" => decide(state, request),
@@ -51,7 +31,6 @@ pub(crate) fn authorize(state: &State, request: &mut Request, method: &str, quer
     })
 }
 
-/// A validated authorization request. Borrowed from the query or form.
 pub(super) struct Params<'a> {
     pub client: Client,
     pub redirect_uri: &'a str,
@@ -62,17 +41,9 @@ pub(super) struct Params<'a> {
     pub resource: Option<&'a str>,
 }
 
-/// Before an account signs in, this server acts for no third party:
-///
-/// - A CIMD client (`client_id` is a URL) gets the sign-in page with no
-///   metadata fetch, so anonymous requests cannot make the server call out
-///   or hold a handler on a slow host.
-/// - A registered (DCR/CIMD) client's refusals are never redirects: RFC 9700
-///   §4.11.2 requires authenticating the user before redirecting to a URI a
-///   third party registered, or `/oauth/authorize` is an open redirector.
-///
-/// The first-party CLI's loopback redirects keep RFC 6749's error redirects
-/// before sign-in: they can only reach the user's own machine.
+// Refusals to a registered (DCR/CIMD) client are never redirects before sign-in
+// (RFC 9700 4.11.2), or this endpoint becomes an open redirector.
+// Anonymous requests make no CIMD metadata fetch.
 fn show(state: &State, request: &Request, query: &str) -> Reply {
     let Ok(form) = Form::parse(query.as_bytes()) else {
         return html::error_page(400, "The authorization request is malformed.");
@@ -133,8 +104,6 @@ fn sign_in(state: &State, query: &str, client_name: Option<&str>) -> Reply {
 }
 
 fn decide(state: &State, request: &mut Request) -> Reply {
-    // A cross-site POST cannot carry the session cookie (SameSite=Strict),
-    // but a present Origin that is not ours is refused outright.
     if routes::header_value(request, "origin").is_some_and(|o| o != state.oauth.origin) {
         return html::error_page(403, "This form was submitted from another site.");
     }
@@ -248,16 +217,11 @@ fn signed_in(
     Some((who, csrf))
 }
 
-/// Validate an authorization request (query or re-posted form) for a
-/// signed-in account. Refusals before the redirect is trusted are pages;
-/// later ones are redirects.
 fn validate<'a>(state: &State, request: &Request, form: &'a Form) -> Result<Params<'a>, Reply> {
     let (client, redirect_uri) = establish(state, request, form)?;
     validate_rest(state, form, client, redirect_uri)
 }
 
-/// Establish the client and its redirect URI. Every refusal is a page with
-/// no `location`: nothing goes to a redirect that is not yet trusted.
 fn establish<'a>(
     state: &State,
     request: &Request,
@@ -283,8 +247,6 @@ fn establish<'a>(
     Ok((client, redirect_uri))
 }
 
-/// The rest of the request, once `client` and `redirect_uri` are trusted
-/// with an answer: every refusal is an RFC 6749 error redirect.
 fn validate_rest<'a>(
     state: &State,
     form: &'a Form,
@@ -377,8 +339,6 @@ fn validate_rest<'a>(
     })
 }
 
-/// What only the signed-in account decides: `platform:admin` needs a super
-/// admin. Membership and repository terms are checked at approval.
 fn eligible(state: &State, params: &Params<'_>, who: &Identity) -> Result<(), Reply> {
     if params.scopes.contains(Scopes::PLATFORM_ADMIN) && !who.super_admin {
         return Err(refuse(
@@ -401,7 +361,6 @@ fn refuse(state: &State, params: &Params<'_>, code: OAuthErrorCode, description:
     )
 }
 
-/// An RFC 6749 §4.1.2.1 error redirect with RFC 9207 `iss`.
 fn redirect_error(
     state: &State,
     redirect_uri: &str,
@@ -425,7 +384,6 @@ fn redirect_error(
     back(redirect_uri, &pairs[..used])
 }
 
-/// `303` to the client's redirect URI with `pairs` appended to its query.
 fn back(redirect_uri: &str, pairs: &[(&str, &str)]) -> Reply {
     let mut url = String::with_capacity(redirect_uri.len() + 192);
     url.push_str(redirect_uri);
@@ -437,7 +395,6 @@ fn back(redirect_uri: &str, pairs: &[(&str, &str)]) -> Reply {
     html::redirect(&url)
 }
 
-/// A store failure while rendering or deciding: busy is 503, else 500.
 fn unavailable(e: &sentinel_store::Error) -> Reply {
     match e {
         sentinel_store::Error::WriterUnavailable
@@ -449,10 +406,6 @@ fn unavailable(e: &sentinel_store::Error) -> Reply {
     }
 }
 
-/// `grant_type=authorization_code` at the token endpoint. `client` is the
-/// looked-up `client_id`; `resource` has already been checked. A client
-/// could only have obtained a code through a redirect it may use, so there
-/// is no separate capability flag: the code binds the client.
 pub(crate) fn token(
     state: &State,
     client: &Client,

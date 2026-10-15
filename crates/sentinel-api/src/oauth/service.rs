@@ -1,23 +1,3 @@
-//! Grant and service-account routes: `GET /api/v1/grants`, `DELETE
-//! /api/v1/grants/{grt}`, and `/api/v1/tenants/{slug}/service-accounts…`
-//! (create, repository access, grant issue and listing). These answer
-//! `sentinel.error/1` like the rest of `/api/v1`.
-//!
-//! Every service-account route needs the `tenant:admin` scope and, in the
-//! store, live administration of the tenant (a platform administrator
-//! qualifies). The routes that mint or widen credentials (create an account,
-//! allow a repository, issue a grant) also need a browser session that
-//! stepped up recently: a bearer credential or OAuth token never can, so a
-//! stolen token cannot mint a longer-lived one. A platform administrator who
-//! does not administer the tenant gives a `reason` for the audit. A grant's
-//! refresh token appears exactly once, in the `201` answer that issues it;
-//! listings are metadata.
-//!
-//! `GET /grants` and `DELETE /grants/{grt}` are about the caller's own
-//! credentials: a browser session, or a token with `tenant:admin`, manages
-//! them all; any other OAuth token sees and revokes only the grant it was
-//! issued under.
-
 use sentinel_auth::oauth::{self as forms, Kind};
 use sentinel_core::{
     GrantId, UnixMillis, UserId,
@@ -40,7 +20,6 @@ use crate::{
     routes::{Reply, Route, body, err, id, identify, ok, parse, store_error},
 };
 
-/// `/api/v1/grants` and below; `rest` is the path after `grants`.
 pub(crate) fn grants(state: &State, request: &mut Request, method: &str, rest: &[&str]) -> Route {
     match (method, rest) {
         ("GET", []) => {
@@ -78,9 +57,6 @@ pub(crate) fn grants(state: &State, request: &mut Request, method: &str, rest: &
     }
 }
 
-/// Whether the caller manages every grant of its account: a browser session
-/// (the person themselves) or a token that holds `tenant:admin`. Anything
-/// else acts only on the grant it was issued under.
 fn manages_grants(who: &Identity) -> bool {
     who.via == Via::Session || who.scopes.contains(Scopes::TENANT_ADMIN)
 }
@@ -91,7 +67,6 @@ struct NewAccount {
     name: String,
     #[serde(default)]
     role: Option<String>,
-    /// Why, for a platform administrator who does not administer the tenant.
     #[serde(default)]
     reason: Option<String>,
 }
@@ -117,8 +92,8 @@ struct NewServiceGrant {
     reason: Option<String>,
 }
 
-/// `/api/v1/tenants/{slug}/service-accounts` and below; `rest` is the path
-/// after `service-accounts`.
+// Credential-minting routes need a recently stepped-up browser session: a bearer or OAuth token
+// can never do it, so a stolen token cannot mint a longer-lived one.
 pub(crate) fn accounts(
     state: &State,
     request: &mut Request,
@@ -282,7 +257,7 @@ fn list(state: &State, request: &mut Request, slug: &str, account: &str) -> Rout
     ok(json!({ "grants": records.iter().map(grant_json).collect::<Vec<_>>() }))
 }
 
-/// A grant as metadata; never a token or a digest.
+// Metadata only: never a token or a digest.
 fn grant_json(g: &GrantRecord) -> Value {
     json!({
         "id": g.id.to_string(),

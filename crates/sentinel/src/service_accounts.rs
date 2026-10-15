@@ -1,13 +1,3 @@
-//! `sentinel service-account create|allow|grant|grants|revoke`: a
-//! tenant administrator creates service principals, allows them
-//! repositories, and issues grants whose refresh token goes to stdout once
-//! (metadata to stderr) for `sentinel auth login --grant-file`.
-//!
-//! Every subcommand is one request through the shared [`Client`]; the
-//! tenant is `--tenant`, else the profile's context (`sentinel context
-//! use`). Path segments are checked locally so a name can never reshape the
-//! request path.
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
@@ -88,13 +78,11 @@ pub enum ServiceAccountCommand {
 
 pub fn run(args: ServiceAccountArgs) -> Result<(), client::Error> {
     let output = args.client.output();
-    // Arguments are checked before any connection is made.
     let request = Request::from(args.command)?;
     let client = Client::connect(&args.client)?;
     request.send(&client, output)
 }
 
-/// One validated request.
 enum Request {
     Create {
         tenant: Option<String>,
@@ -277,7 +265,6 @@ impl Request {
     }
 }
 
-/// `/api/v1/tenants/{slug}` for the explicit or the profile's tenant.
 fn accounts(client: &Client, tenant: Option<&str>) -> Result<String, client::Error> {
     let tenant = match tenant {
         Some(tenant) => tenant,
@@ -291,7 +278,6 @@ fn accounts(client: &Client, tenant: Option<&str>) -> Result<String, client::Err
     Ok(format!("/api/v1/tenants/{tenant}"))
 }
 
-/// A path segment: 1..=128 of `A-Z a-z 0-9 - . _ ~`, not `.` or `..`.
 fn segment(value: &str, what: &str) -> Result<(), client::Error> {
     let valid = !value.is_empty()
         && value.len() <= 128
@@ -311,7 +297,6 @@ fn segment_owned(what: &'static str) -> impl Fn(String) -> Result<String, client
     move |value| segment(&value, what).map(|()| value)
 }
 
-/// `read,run` as the API's access list; empty withdraws access.
 fn parse_access(text: &str) -> Result<Vec<&'static str>, client::Error> {
     let mut access = Vec::with_capacity(2);
     for item in text.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -327,8 +312,6 @@ fn parse_access(text: &str) -> Result<Vec<&'static str>, client::Error> {
     Ok(access)
 }
 
-/// `90m`, `12h`, `30d` (or `s`) as milliseconds. The server enforces the
-/// 1 h..90 d bounds; this only refuses what is not a duration.
 fn parse_duration(text: &str) -> Result<i64, client::Error> {
     let bad = || client::Error::usage(format!("invalid duration {text:?}; use e.g. 30d, 12h, 90m"));
     // The unit is the last character, which need not be one byte: split on
@@ -353,7 +336,6 @@ fn text(value: &Value) -> &str {
     value.as_str().unwrap_or("-")
 }
 
-/// A wall-clock millisecond timestamp relative to now, e.g. `in 29d`.
 fn when(value: &Value) -> String {
     let Some(at) = value.as_i64() else {
         return "-".to_owned();

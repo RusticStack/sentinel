@@ -1,10 +1,4 @@
-//! Versioned schema. Each migration runs once inside its own transaction and
-//! is recorded in `schema_migrations`; the list is append-only. Tenant-owned
-//! rows carry tenant_id. Global human identities are authorized through live
-//! memberships; a caller-supplied tenant predicate alone is not authorization.
-//!
-//! Encoding: IDs are 16-byte BLOBs (the raw UUID); state is one INTEGER
-//! (`state_code`, see `codec`); timestamps are UTC milliseconds.
+//! Global human identities are authorized through live memberships; a tenant predicate alone is not authorization.
 
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (
@@ -154,20 +148,11 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (53, include_str!("migrations/053_auto_join.sql")),
 ];
 
-/// The newest schema this build knows.
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 
-/// Migrations an older binary may keep running after: `(version,
-/// readable_by)`, the oldest schema whose binary still operates on the
-/// result. Every migration not listed is readable only by its own version:
-/// a rollback past it needs the pre-migration snapshot or a backup. List a
-/// migration here only when it adds nothing an older binary could break or
-/// be broken by — an index, a column no older statement reads or writes
-/// with a default every older insert satisfies — and say so in
-/// `docs/compatibility.md`.
+// List a migration only when an older binary can neither break it nor be broken by it.
 pub const READABLE_BY: &[(u32, u32)] = &[(45, 44), (48, 47), (49, 48), (52, 51), (53, 51)];
 
-/// The declared `readable_by` of `version`.
 pub fn readable_by(version: u32) -> u32 {
     READABLE_BY
         .iter()
@@ -175,13 +160,9 @@ pub fn readable_by(version: u32) -> u32 {
         .map_or(version, |(_, r)| *r)
 }
 
-/// From this version on, `schema_migrations` records `readable_by`.
 pub const READABLE_BY_SINCE: u32 = 48;
 
-/// Whether `versions` are exactly `1..=N` in order. `migrate` skips every
-/// entry at or below a database's version, so an entry inserted out of
-/// order, renumbered or duplicated would silently never apply to databases
-/// already past it while fresh ones get it: installations would diverge.
+// `migrate` skips entries at or below the database version, so a misnumbered entry never applies there.
 pub const fn contiguous_from_one(migrations: &[(u32, &str)]) -> bool {
     let mut i = 0;
     while i < migrations.len() {
@@ -193,7 +174,6 @@ pub const fn contiguous_from_one(migrations: &[(u32, &str)]) -> bool {
     true
 }
 
-// A build whose migration list is out of order does not compile.
 const _: () = assert!(
     contiguous_from_one(MIGRATIONS),
     "MIGRATIONS must be numbered 1..=N in order"
@@ -210,7 +190,6 @@ mod tests {
         for pair in MIGRATIONS.windows(2) {
             assert_eq!(pair[1].0, pair[0].0 + 1, "after {}", pair[0].0);
         }
-        // The check itself refuses every way a merge can go wrong.
         assert!(contiguous_from_one(&[]));
         assert!(contiguous_from_one(&[(1, ""), (2, "")]));
         for bad in [

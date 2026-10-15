@@ -1,10 +1,6 @@
 <script setup lang="ts">
 import type { Security, TenantChoice } from "~~/shared/types/api";
 
-// Every namespace the person belongs to, kept in three groups: their own
-// personal namespace, organizations managed in Sentinel, and organizations
-// whose membership GitHub manages. Creating an organization (when the
-// deployment allows it), and what joining a GitHub-managed one takes.
 // Nothing here lists a namespace the person is not a member of.
 useHead({ title: "Organizations · Sentinel" });
 const api = useApi();
@@ -108,7 +104,6 @@ async function create() {
         </div>
       </section>
 
-      <!-- Joining an organization whose membership GitHub manages. -->
       <UCard as="section" aria-labelledby="gh-h">
         <template #header>
           <h2 id="gh-h" class="text-base font-semibold flex items-center gap-2"><UIcon name="i-lucide-github" />Organizations on GitHub</h2>
@@ -125,7 +120,6 @@ async function create() {
         </div>
       </UCard>
 
-      <!-- Create an organization. -->
       <UCard as="section" aria-labelledby="new-org-h">
         <template #header>
           <h2 id="new-org-h" class="text-base font-semibold flex items-center gap-2"><UIcon name="i-lucide-plus" />Create an organization</h2>

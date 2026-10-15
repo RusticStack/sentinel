@@ -1,13 +1,4 @@
-//! Upgrades: what a database needs before this build opens it, and the
-//! snapshot taken before any migration runs.
-//!
-//! Migrations are forward-only and each runs in its own transaction
-//! ([`crate::migrate`]): a failure leaves the database at the last version
-//! that committed, never half-way through one. Before the first pending
-//! migration, [`open_upgrading`] copies the database aside
-//! (`metadata.sqlite.v047` for a database at schema 47), so a failed or
-//! regretted upgrade rolls back by restoring that file and starting the
-//! previous release. The newest [`SNAPSHOTS_KEPT`] are kept.
+//! Each migration runs in its own transaction, so a failure leaves the last committed version, never half of one.
 
 use std::path::{Path, PathBuf};
 
@@ -15,33 +6,21 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::{Durability, Error, Result, Store, schema};
 
-/// Pre-migration snapshots kept beside the database.
 pub const SNAPSHOTS_KEPT: usize = 2;
 
-/// What [`inspect`] found, without changing anything.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Inspection {
-    /// No database at the path yet: a fresh installation.
     pub fresh: bool,
-    /// The database's schema.
     pub database: u32,
-    /// The newest schema this build knows.
     pub binary: u32,
-    /// Migrations this build would apply, in order.
     pub pending: Vec<u32>,
-    /// The database is newer than this build.
     pub newer: bool,
-    /// For a newer database: the schema its unknown migrations need; this
-    /// build runs on it only when that is at most `binary`.
     pub needs: Option<u32>,
-    /// SQLite's `PRAGMA quick_check`.
     pub integrity: String,
-    /// The database's size on disk (main file and write-ahead log).
     pub bytes: u64,
 }
 
 impl Inspection {
-    /// Whether this build can open the database at all.
     pub fn openable(&self) -> bool {
         !self.newer || self.needs.is_some_and(|n| n <= self.binary)
     }
@@ -57,8 +36,6 @@ fn size(path: &Path) -> u64 {
         .sum()
 }
 
-/// Look at the database at `path` read-only: its schema against this
-/// build's, what would migrate, and its integrity. Nothing is written.
 pub fn inspect(path: &Path) -> Result<Inspection> {
     let binary = schema::LATEST;
     if !path.exists() {
@@ -119,14 +96,12 @@ pub fn inspect(path: &Path) -> Result<Inspection> {
     })
 }
 
-/// The pre-migration snapshot of a database at schema `version`.
 pub fn snapshot_path(database: &Path, version: u32) -> PathBuf {
     let mut name = database.as_os_str().to_owned();
     name.push(format!(".v{version:03}"));
     PathBuf::from(name)
 }
 
-/// Pre-migration snapshots beside `database`, oldest first.
 pub fn snapshots(database: &Path) -> Vec<(u32, PathBuf)> {
     let (Some(dir), Some(name)) = (database.parent(), database.file_name()) else {
         return Vec::new();
@@ -146,18 +121,12 @@ pub fn snapshots(database: &Path) -> Vec<(u32, PathBuf)> {
     found
 }
 
-/// Open the store, copying the database aside first when this build will
-/// migrate it. Returns the store and the snapshot it took, if any. A failed
-/// migration's error names the snapshot to roll back to
-/// ([`Error::MigrationFailed`]).
 pub fn open_upgrading(path: &Path, durability: Durability) -> Result<(Store, Option<PathBuf>)> {
     let inspection = inspect(path)?;
     let mut snapshot = None;
     if !inspection.fresh && !inspection.newer && !inspection.pending.is_empty() {
         let dest = snapshot_path(path, inspection.database);
-        // Written under a temporary name and renamed once durable: a copy
-        // interrupted by a crash or a full disk is never taken for a complete
-        // one, and a rerun starts it again.
+        // Renamed into place only once durable: a copy cut short by a crash or full disk is never mistaken for complete.
         let mut partial = dest.clone().into_os_string();
         partial.push(".partial");
         let partial = PathBuf::from(partial);
@@ -208,35 +177,26 @@ pub fn open_upgrading(path: &Path, durability: Durability) -> Result<(Store, Opt
     }
 }
 
-/// One enrolled worker, as a skew check sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerVersion {
     pub name: String,
     pub protocol: u16,
     pub software: Option<String>,
     pub last_seen_ms: Option<i64>,
-    /// Outside the protocol range this build accepts: it would be refused
-    /// at its next hello until upgraded.
     pub refused: bool,
 }
 
-/// Everything `sentinel admin upgrade check` reports: the database against
-/// this build, the room the upgrade needs, the key, and the workers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preflight {
     pub inspection: Inspection,
     pub free_bytes: Option<u64>,
-    /// The pre-migration copy plus growth: twice the database.
     pub needed_bytes: u64,
     pub sealed_values: bool,
     pub key_present: bool,
     pub workers: Vec<WorkerVersion>,
-    /// What would stop this build from starting, in words.
     pub blocking: Vec<String>,
 }
 
-/// Check a stopped controller's data directory against this build without
-/// changing anything.
 pub fn preflight(data_dir: &Path) -> Result<Preflight> {
     use sentinel_protocol::negotiate::{SUPPORTED_MAX, SUPPORTED_MIN};
     let path = data_dir.join(crate::METADATA_FILE);

@@ -1,8 +1,3 @@
-// A minimal Chrome DevTools Protocol driver for the web interface's browser
-// tests and benchmarks: Node's built-in WebSocket, no packages. Launches a
-// Chromium-family browser (Edge, Chrome, Chromium) headless with a throwaway
-// profile, and drives pages over one browser connection.
-
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -77,8 +72,7 @@ export async function launch({ browser = findBrowser(), headless = true } = {}) 
       return page;
     },
     async close() {
-      // A browser that exits as it answers never replies, and the promise
-      // would wait for ever: give it two seconds, then kill it below.
+      // A browser that exits as it answers never replies, so the wait is capped at two seconds.
       try { await Promise.race([cdp.send("Browser.close"), sleep(2000)]); } catch (e) { /* gone */ }
       ws.close();
       await sleep(300);
@@ -117,13 +111,9 @@ export class Page {
   async goto(url) {
     await this.send("Page.navigate", { url });
     await this.waitFor("document.readyState === 'complete'", 15000);
-    // A Nuxt page is server-rendered before it is interactive: a form filled
-    // and submitted in that gap is submitted natively (a reload, nothing
-    // signed in), so wait until Vue has taken the page over. Other pages
-    // have no such app and pass at once.
+    // A form submitted before Vue takes over is submitted natively, so wait for hydration.
     await this.waitFor("(() => { try { return typeof window.useNuxtApp !== 'function' || !window.useNuxtApp().isHydrating; } catch (e) { return true; } })()", 15000, "hydration");
   }
-  /// Evaluate an expression (awaiting a promise) and return its value.
   async eval(expression) {
     const r = await this.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
     if (r.exceptionDetails) throw new Error(`eval failed: ${r.exceptionDetails.exception?.description || r.exceptionDetails.text}\n${expression}`);
@@ -146,14 +136,11 @@ export class Page {
     await this.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
   }
   async type(text) { await this.send("Input.insertText", { text }); }
-  /// Click an element's centre with the mouse, as a person would.
   async click(selector) {
     const box = await this.eval(`(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return null; el.scrollIntoView({block: "center"}); const r = el.getBoundingClientRect(); return {x: r.x + r.width / 2, y: r.y + r.height / 2}; })()`);
     if (!box) throw new Error(`no element ${selector}`);
     for (const type of ["mousePressed", "mouseReleased"]) await this.send("Input.dispatchMouseEvent", { type, x: box.x, y: box.y, button: "left", clickCount: 1 });
   }
-  /// Click, with the mouse, the first `selector` element whose text
-  /// includes `text` (menus and listboxes act on pointer events).
   async clickText(selector, text) {
     const box = await this.eval(`(() => { const el = [...document.querySelectorAll(${JSON.stringify(selector)})].find((e) => e.textContent.trim().includes(${JSON.stringify(text)}));
       if (!el) return null; el.scrollIntoView({block: "center"}); const r = el.getBoundingClientRect(); return {x: r.x + r.width / 2, y: r.y + r.height / 2}; })()`);

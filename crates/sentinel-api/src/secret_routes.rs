@@ -1,16 +1,4 @@
-//! Secret routes: metadata reads, raw-byte versioned writes, env
-//! imports, repository allowlists, bindings and single-version revocation.
-//!
-//! Every handler validates its path, query, headers and body shape before
-//! it resolves the tenant slug or repository name, and it resolves them with
-//! the membership-checked [`authz::member_tenant_by_slug`] inside the same
-//! store transaction that authorizes and performs the operation. A foreign
-//! tenant or repository is therefore the same `not_found` as a missing one
-//! on every route, and a write costs one writer transaction, not a
-//! read followed by a write.
-//!
-//! Stored retry fingerprints are keyed MACs under a subkey of the master key:
-//! a copy of the database cannot confirm a guessed value.
+//! Retry fingerprints are keyed MACs under a master-key subkey: a copied database cannot confirm a guessed value.
 
 use std::sync::Arc;
 
@@ -31,7 +19,6 @@ use crate::{
     routes::{Reply, Route, err, header_value, identify, ok, parse, store_error},
 };
 
-/// Longest repository name the store accepts.
 const MAX_REPO_NAME: usize = 128;
 
 pub(crate) fn route(
@@ -62,7 +49,6 @@ pub(crate) fn route(
     }
 }
 
-/// A plaintext request body, wiped when dropped on every path.
 struct WipeBytes(Vec<u8>);
 impl Drop for WipeBytes {
     fn drop(&mut self) {
@@ -79,9 +65,7 @@ impl Drop for WipeRecords {
     }
 }
 
-/// Read a secret-bearing body within `limit`, into a buffer that is wiped
-/// on every path and sized from `Content-Length` up front, so a declared
-/// body is never reallocated and no unwiped partial copy is freed.
+/// Sized from Content-Length up front: a reallocation would free an unwiped partial copy.
 fn secret_body(request: &mut Request, limit: usize) -> Result<WipeBytes, ApiError> {
     use std::io::Read;
     let declared = request.body_length();
@@ -104,9 +88,6 @@ fn secret_body(request: &mut Request, limit: usize) -> Result<WipeBytes, ApiErro
     Ok(bytes)
 }
 
-/// The query parameters a secret route reads, percent-decoded once
-/// (`form_urlencoded`), so `repo=org%2Fapp` names the repository `org/app`.
-/// A repeated parameter is refused rather than guessed at.
 #[derive(Default)]
 struct Params {
     repo: Option<String>,
@@ -176,9 +157,7 @@ fn write_identity(state: &State, request: &Request) -> Result<Identity, ApiError
     Ok(who)
 }
 
-/// Resolve `slug` (membership-checked) and the optional repository name in
-/// the caller's own transaction. A foreign tenant or repository and a
-/// missing one are the same `NotFound`.
+/// A foreign and a missing repository are the same NotFound, resolved in the caller transaction.
 fn resolve(
     conn: &sentinel_store::Connection,
     who: &Identity,
@@ -297,9 +276,7 @@ fn idempotency_key(request: &Request) -> Result<IdempotencyKey, ApiError> {
         .and_then(|value| IdempotencyKey::parse(value).map_err(ApiError::from))
 }
 
-/// The request half of a keyed fingerprint, computed before the writer so
-/// the value is hashed off the single writer thread: route, name, expected
-/// versions and body, each length-delimited.
+/// Hashed before the writer so the single writer thread never runs the MAC over the body.
 fn request_mac(key: &Key, route: &str, name: &str, expected: &[u8], body: &[u8]) -> [u8; 16] {
     let mut mac = key.fingerprinter();
     for part in [route.as_bytes(), name.as_bytes(), expected] {
@@ -309,8 +286,6 @@ fn request_mac(key: &Key, route: &str, name: &str, expected: &[u8], body: &[u8])
     mac.finish().to_le_bytes()
 }
 
-/// Bind the request MAC to the resolved scope, inside the writer: a few
-/// dozen bytes, still keyed.
 fn scoped_fingerprint(key: &Key, request: &[u8; 16], scope: secrets::Scope) -> Fingerprint {
     let mut mac = key.fingerprinter();
     mac.update(request);
@@ -321,8 +296,6 @@ fn scoped_fingerprint(key: &Key, request: &[u8; 16], scope: secrets::Scope) -> F
     Fingerprint(mac.finish())
 }
 
-/// A value-free fingerprint for a delete, which carries no secret material:
-/// FNV over route, scope, name and expected version is enough there.
 fn delete_fingerprint(scope: secrets::Scope, name: &str, expected: u64) -> Fingerprint {
     let mut bytes = Vec::with_capacity(1 + 16 + name.len() + 8);
     match scope {
@@ -537,8 +510,6 @@ fn import(state: &State, request: &mut Request, slug: &str, query: &str) -> Rout
     ok(value)
 }
 
-/// `GET /tenants/{slug}/secrets/{name}/allow?after&limit`: the repositories
-/// a tenant secret is allowed in, keyset by repository ID.
 fn allowed(state: &State, request: &Request, slug: &str, name: &str, query: &str) -> Route {
     let who = read_identity(state, request)?;
     checked_name(name)?;
@@ -574,10 +545,6 @@ fn allowed(state: &State, request: &Request, slug: &str, name: &str, query: &str
     }))
 }
 
-/// `PUT|DELETE /tenants/{slug}/secrets/{name}/allow?repo=NAME`: allow a
-/// tenant secret in one repository, or stop allowing it (which also removes
-/// its bindings there). Idempotent state changes, so a retry is safe
-/// without an idempotency key.
 fn allow(
     state: &State,
     request: &Request,
@@ -612,9 +579,6 @@ fn allow(
     ok(value)
 }
 
-/// `POST /tenants/{slug}/secrets/{name}/versions/{version}/revoke?repo`:
-/// permanently revoke one version. Idempotent; the answer is the secret's
-/// metadata after the change.
 fn revoke(
     state: &State,
     request: &Request,
@@ -661,7 +625,6 @@ fn binding_json(binding: &secrets::Binding) -> Value {
     })
 }
 
-/// `GET /tenants/{slug}/secret-bindings?repo=NAME&after=JOB/STEP/NAME&limit`.
 fn bindings(state: &State, request: &Request, slug: &str, query: &str) -> Route {
     let who = read_identity(state, request)?;
     let params = params(query)?;
@@ -727,9 +690,6 @@ fn selectors(params: &Params) -> Result<(String, String), ApiError> {
     Ok((job, step))
 }
 
-/// `PUT /tenants/{slug}/secret-bindings/{name}?repo&job&step` with an
-/// optional `{"from_tenant": bool, "override_tenant": bool}` body. Replaces
-/// the binding at that selector; repeating it is harmless.
 fn bind(state: &State, request: &mut Request, slug: &str, name: &str, query: &str) -> Route {
     let who = write_identity(state, request)?;
     checked_name(name)?;
@@ -770,8 +730,6 @@ fn bind(state: &State, request: &mut Request, slug: &str, name: &str, query: &st
     ok(value)
 }
 
-/// `DELETE /tenants/{slug}/secret-bindings/{name}?repo&job&step`: remove
-/// that binding if present; repeating it is harmless.
 fn unbind(state: &State, request: &Request, slug: &str, name: &str, query: &str) -> Route {
     let who = write_identity(state, request)?;
     checked_name(name)?;

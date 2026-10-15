@@ -1,6 +1,3 @@
-//! The routes behind the web interface and how the interface
-//! itself is served, over real HTTP against a seeded controller.
-
 #[path = "support/web_fixture.rs"]
 mod fixture;
 
@@ -32,7 +29,6 @@ fn ids(body: &Value) -> Vec<String> {
         .collect()
 }
 
-/// A browser session for `username`: (cookie header, CSRF secret).
 fn session(f: &Fixture, username: &str) -> (String, String) {
     let (status, headers, body) = call(
         &f.base,
@@ -67,8 +63,6 @@ fn with_session(
     (status, body)
 }
 
-/// The sign-in page shows GitHub sign-in only when it is configured; the
-/// health route says so without a credential.
 #[test]
 fn health_says_whether_github_sign_in_is_offered() {
     let f = Fixture::new(1);
@@ -101,7 +95,6 @@ fn run_lists_filter_by_ref_pull_request_and_commit_prefix() {
         (Some("pull_request"), Some("refs/heads/main"), Some(42))
     );
 
-    // A bare branch means the branch; a full ref is taken as given.
     let (_, main) = get(&f, &format!("{runs}?ref=main"), &f.auth);
     let main = ids(&main);
     assert_eq!(main.len(), 3);
@@ -115,7 +108,6 @@ fn run_lists_filter_by_ref_pull_request_and_commit_prefix() {
     let (_, none) = get(&f, &format!("{runs}?sha=abcdef0"), &f.auth);
     assert!(ids(&none).is_empty());
 
-    // A filtered page keeps the keyset contract: one run a page, no repeats.
     let mut seen = Vec::new();
     let mut next: Option<String> = None;
     loop {
@@ -147,7 +139,6 @@ fn run_lists_filter_by_ref_pull_request_and_commit_prefix() {
             "{bad}"
         );
     }
-    // A member of another tenant only sees nothing, filter or not.
     let (status, _) = get(
         &f,
         "/api/v1/tenants/beta/repos/site/runs?pr=42",
@@ -175,7 +166,6 @@ fn a_caller_lists_its_own_tenants_and_a_narrowed_credential_only_its_one() {
         body["tenants"],
         json!([{ "slug": "acme", "role": "operator", "kind": "organization", "membership": "app" }])
     );
-    // `/me` says whether a session is stepped up and whether TOTP exists.
     let (_, me) = get(&f, "/api/v1/me", &dana);
     assert_eq!(
         (me["stepped_up"].as_bool(), me["mfa"].as_bool()),
@@ -208,10 +198,8 @@ fn attempt_steps_report_measured_phases_and_leave_the_unmeasured_out() {
         !timings.contains_key("image_pull"),
         "never measured, never zero"
     );
-    // A running attempt has not reported yet.
     let (status, body) = get(&f, &format!("/api/v1/attempts/{}/steps", f.live.2), &f.auth);
     assert_eq!((status, body["present"].as_bool()), (200, Some(false)));
-    // A step-filtered log page says when the step is over.
     let (_, page) = get(&f, &format!("/api/v1/attempts/{beta}/logs?step=0"), &f.auth);
     assert_eq!(page["step_done"], true);
     let (_, page) = get(
@@ -233,7 +221,6 @@ fn workers_report_capacity_reservations_labels_and_drain() {
         worker["capacity"],
         json!({ "cpu_millis": 8000, "memory_bytes": 16_u64 << 30, "disk_bytes": 100_u64 << 30 })
     );
-    // Only the running job still holds its reservation.
     assert_eq!(worker["held_attempts"], 1);
     let held_cpu = worker["held"]["cpu_millis"].as_i64().unwrap();
     assert_eq!(
@@ -259,7 +246,6 @@ fn workers_report_capacity_reservations_labels_and_drain() {
     let worker = &body["pools"][0]["workers"][0];
     assert_eq!(worker["draining"], true);
     assert!(worker["draining_since_ms"].as_i64().is_some());
-    // An operator may look but not drain.
     let dana = f.member(f.dana);
     let (status, _) = get(&f, "/api/v1/workers?tenant=acme", &dana);
     assert_eq!(status, 200);
@@ -288,7 +274,6 @@ fn sync_reports_pending_check_lag_per_repository() {
         (web["pending"].as_u64(), web["oldest_pending_ms"].as_i64()),
         (Some(0), None)
     );
-    // Not a member: the same answer as no such tenant.
     let stranger = f.member(f.dana);
     let (status, _) = get(&f, "/api/v1/tenants/beta/sync", &stranger);
     assert_eq!(status, 404);
@@ -314,7 +299,6 @@ fn tenant_members_are_administered_and_the_last_admin_keeps_the_role() {
     assert_eq!(listed.len(), 3);
     assert!(listed.contains(&("root".into(), "admin".into())));
     assert!(listed.contains(&("dana".into(), "operator".into())));
-    // An operator is not an administrator.
     let dana = f.member(f.dana);
     let (status, _) = get(&f, members, &dana);
     assert_eq!(status, 403);
@@ -327,7 +311,6 @@ fn tenant_members_are_administered_and_the_last_admin_keeps_the_role() {
     );
     assert_eq!(status, 403);
 
-    // By sign-in name or id; an unknown one is not found.
     let (status, body) = send(
         &f,
         "PUT",
@@ -353,7 +336,6 @@ fn tenant_members_are_administered_and_the_last_admin_keeps_the_role() {
     );
     assert_eq!(status, 400);
 
-    // The last administrator cannot be demoted or removed…
     let root = f.root.to_string();
     let (status, body) = send(
         &f,
@@ -371,7 +353,6 @@ fn tenant_members_are_administered_and_the_last_admin_keeps_the_role() {
         &f.auth,
     );
     assert_eq!(status, 409);
-    // …until another administrator exists.
     let (status, _) = send(
         &f,
         "PUT",
@@ -391,7 +372,6 @@ fn tenant_members_are_administered_and_the_last_admin_keeps_the_role() {
         status, 200,
         "a super admin still administers the tenant it no longer admins"
     );
-    // Removal takes effect on the member's next request.
     let rui = f.member(f.rui);
     assert_eq!(get(&f, "/api/v1/tenants/acme/repos", &rui).0, 200);
     let (status, _) = send(&f, "DELETE", &format!("{members}/rui"), json!({}), &f.auth);
@@ -447,7 +427,6 @@ fn platform_administration_needs_the_platform_and_privileged_changes_a_step_up()
     );
     assert_eq!((status, body["quota_set"].as_bool()), (200, Some(false)));
 
-    // A bearer can never step up, so suspension is refused with the reason.
     let (status, body) = send(
         &f,
         "POST",
@@ -469,7 +448,6 @@ fn platform_administration_needs_the_platform_and_privileged_changes_a_step_up()
     );
     assert_eq!(status, 400, "{body}");
 
-    // A session steps up with its password (no TOTP enrolled), then may.
     let root = session(&f, "root");
     let (status, body) = with_session(
         &f,
@@ -523,7 +501,6 @@ fn platform_administration_needs_the_platform_and_privileged_changes_a_step_up()
     );
     assert_eq!(status, 200);
 
-    // Policy: readable by the platform, changed only when stepped up.
     let (status, policy) = get(&f, "/api/v1/admin/policy", &f.auth);
     assert_eq!(
         (status, policy["registration"].as_str()),
@@ -540,7 +517,6 @@ fn platform_administration_needs_the_platform_and_privileged_changes_a_step_up()
         (200, Some("closed"))
     );
 
-    // Registrations: the applicant waits until approved.
     let (_, body) = get(&f, "/api/v1/admin/registrations", &f.auth);
     assert_eq!(body["pending"][0]["user"], f.pat.to_string());
     let (status, _) = send(
@@ -554,7 +530,6 @@ fn platform_administration_needs_the_platform_and_privileged_changes_a_step_up()
     let (_, body) = get(&f, "/api/v1/admin/registrations", &f.auth);
     assert!(body["pending"].as_array().unwrap().is_empty());
 
-    // Tenants and pools.
     let (status, body) = send(
         &f,
         "POST",
@@ -626,7 +601,6 @@ fn platform_administration_needs_the_platform_and_privileged_changes_a_step_up()
         400
     );
 
-    // The audit trail pages back through what just happened.
     let (_, first) = get(&f, "/api/v1/admin/audit?limit=3", &f.auth);
     let events = first["events"].as_array().unwrap();
     assert_eq!(events.len(), 3);
@@ -711,7 +685,6 @@ fn repositories_are_created_and_described_without_any_credential() {
             .iter()
             .any(|r| r["name"] == "api")
     );
-    // Without a grant on the repository an operator cannot see it at all.
     let source = "/api/v1/tenants/acme/repos/app/source";
     assert_eq!(get(&f, source, &dana).0, 404);
     assert_eq!(
@@ -727,7 +700,6 @@ fn repositories_are_created_and_described_without_any_credential() {
     );
     let (status, body) = get(&f, source, &dana);
     assert_eq!((status, body), (200, json!({ "bound": false })));
-    // Grants: read and run for a member, withdrawn with an empty list.
     let (status, body) = send(
         &f,
         "PUT",
@@ -796,9 +768,6 @@ fn tenant_audit_pages_run_control_actions() {
     assert_eq!(get(&f, "/api/v1/tenants/acme/audit", &dana).0, 403);
 }
 
-/// A page left open keeps a run wait or a log poll parked; removing the
-/// person from the tenant ends both at once with the same `not_found` a
-/// fresh request gets, not when their 25 s run out.
 #[test]
 fn a_parked_poll_ends_as_soon_as_its_reader_loses_the_tenant() {
     let f = Fixture::new(1);
@@ -860,9 +829,6 @@ fn a_parked_poll_ends_as_soon_as_its_reader_loses_the_tenant() {
     }
 }
 
-/// A parked poll whose client hung up gives its subscriber slot back at
-/// once: a person clicking from one run page to the next (each page's web
-/// server stream aborting its upstream wait) never runs out of their share.
 #[test]
 fn a_parked_poll_whose_client_left_frees_its_slot() {
     use std::io::Write;
@@ -874,7 +840,6 @@ fn a_parked_poll_whose_client_left_frees_its_slot() {
         "/api/v1/runs/{}/wait?since={version}&timeout_ms=20000",
         f.diamond
     );
-    // Parked waits hold this user's whole share…
     let mut parked = Vec::new();
     for _ in 0..sentinel_api::SUBSCRIBERS_PER_USER {
         let mut s = std::net::TcpStream::connect(&addr).unwrap();
@@ -893,7 +858,6 @@ fn a_parked_poll_whose_client_left_frees_its_slot() {
     );
     let (status, _) = get(&f, &quick, &f.auth);
     assert_eq!(status, 429, "the share is held");
-    // …until their clients leave.
     drop(parked);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
@@ -918,9 +882,6 @@ fn a_parked_poll_whose_client_left_frees_its_slot() {
     }
 }
 
-/// Parked polls hold no handler permit: with three people's whole shares
-/// parked — three times the handler permits — sign-ins, reads and writes
-/// are still answered at once. Waiting is not work.
 #[test]
 fn parked_polls_leave_every_handler_for_work() {
     use std::io::Write;
@@ -951,7 +912,6 @@ fn parked_polls_leave_every_handler_for_work() {
         }
     }
     std::thread::sleep(std::time::Duration::from_millis(700));
-    // They are all parked: each person's share is full…
     let quick = format!(
         "/api/v1/runs/{}/wait?since={version}&timeout_ms=100",
         f.diamond
@@ -959,7 +919,6 @@ fn parked_polls_leave_every_handler_for_work() {
     for auth in &people {
         assert_eq!(get(&f, &quick, auth).0, 429, "the share is parked");
     }
-    // …and requests doing work are served straight away.
     for _ in 0..(2 * sentinel_api::WORKERS) {
         let started = std::time::Instant::now();
         let (status, _) = get(&f, "/api/v1/me", &f.auth);
@@ -975,16 +934,11 @@ fn parked_polls_leave_every_handler_for_work() {
     drop(parked);
 }
 
-/// Storage policy over the API — the platform sets a tenant's, the
-/// tenant's administration narrows a repository's and reads both with
-/// usage, the deployment reports its disk and limits, and a log retention
-/// removed says so instead of looking like a log still to come.
 #[test]
 fn storage_policy_is_administered_per_level_and_an_expired_log_says_so() {
     let f = Fixture::new(1);
     let dana = f.member(f.dana);
     const DAY: u64 = 86_400;
-    // An operator reads no storage and sets nothing.
     assert_ne!(get(&f, "/api/v1/tenants/acme/storage", &dana).0, 200);
     assert_eq!(get(&f, "/api/v1/admin/storage", &dana).0, 403);
     let (status, _) = send(
@@ -1014,7 +968,6 @@ fn storage_policy_is_administered_per_level_and_an_expired_log_says_so() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["effective"]["log_retention_ms"], 10 * DAY * 1000);
     assert_eq!(body["policy"]["artifact_retention_ms"], Value::Null);
-    // A repository never keeps longer than its tenant, nor out of range.
     for wider in [
         json!({ "log_retention_secs": 11 * DAY }),
         json!({ "log_retention_secs": 60 }),
@@ -1058,7 +1011,6 @@ fn storage_policy_is_administered_per_level_and_an_expired_log_says_so() {
     assert!(body["stored_bytes"].is_u64());
     assert!(body["log_retention_ms"].is_i64() || body["log_retention_ms"].is_u64());
 
-    // Retention removed alpha's log: its page says when, with no frames.
     let (alpha, _) = f.attempts["alpha"];
     f.store
         .writer()
@@ -1083,10 +1035,7 @@ fn storage_policy_is_administered_per_level_and_an_expired_log_says_so() {
     assert_eq!((status, &body["expired_ms"]), (200, &json!(2)), "{body}");
 }
 
-/// End to end: the controller's maintenance pass stamps a finished
-/// attempt's log (its bytes count toward the tenant's usage), and once its
-/// deadline passes records it expired, frees the usage and deletes the
-/// files — the database first, the files after.
+/// The database records expiry before the files are deleted.
 #[test]
 fn the_maintenance_pass_stamps_expires_and_deletes_finished_logs() {
     let f = Fixture::new(1);
@@ -1151,9 +1100,6 @@ fn the_maintenance_pass_stamps_expires_and_deletes_finished_logs() {
     assert_eq!(tenant_logs(), before - bytes as u64);
 }
 
-/// While the external copy's backlog holds admission closed, nothing
-/// is placed — the queue says the job waits on storage, not that it is
-/// ready — and `GET /admin/storage` reports the replicator's state.
 #[test]
 fn a_full_external_copy_backlog_is_what_the_queue_and_the_storage_report_say() {
     let f = Fixture::new(1);
@@ -1191,8 +1137,6 @@ fn a_full_external_copy_backlog_is_what_the_queue_and_the_storage_report_say() {
         .backlog_full
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let during = reasons();
-    // Jobs held by something else keep their own reason; the one nothing
-    // else holds says storage, and why.
     for (b, d) in before.iter().zip(&during) {
         if b["code"] == "ready" || b["code"] == "capacity" {
             assert_eq!(d["code"], "storage", "{b} -> {d}");
@@ -1214,14 +1158,10 @@ fn a_full_external_copy_backlog_is_what_the_queue_and_the_storage_report_say() {
     assert_eq!(queue["placement_paused"], Value::Null);
 }
 
-/// `/metrics` is platform administration and counts what it answered,
-/// including refused credentials; `/ready` is public and says what is
-/// degraded; the diagnostic bundle counts without naming.
 #[test]
 fn metrics_readiness_and_the_diagnostic_bundle() {
     let f = Fixture::new(1);
     let dana = f.member(f.dana);
-    // Refusals first, so the counters have something to show.
     assert_eq!(get(&f, "/api/v1/metrics", "Bearer sntl_nope").0, 401);
     assert_eq!(get(&f, "/metrics", &dana).0, 403);
     assert_eq!(get(&f, "/api/v1/admin/diagnostics", &dana).0, 403);
@@ -1269,7 +1209,6 @@ fn metrics_readiness_and_the_diagnostic_bundle() {
         env!("CARGO_PKG_VERSION"),
         sentinel_store::schema::LATEST
     )));
-    // Every family is declared once, and every sample line parses.
     let mut families = std::collections::HashSet::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("# TYPE ") {
@@ -1282,7 +1221,6 @@ fn metrics_readiness_and_the_diagnostic_bundle() {
             assert!(value.parse::<f64>().is_ok(), "{line}");
         }
     }
-    // Tenants are not labels: a scrape names none.
     assert!(!text.contains("acme") && !text.contains("beta"), "{text}");
 
     let (status, bundle) = get(&f, "/api/v1/admin/diagnostics?integrity=1", &f.auth);
@@ -1292,7 +1230,6 @@ fn metrics_readiness_and_the_diagnostic_bundle() {
     assert_eq!(bundle["schema"], sentinel_store::schema::LATEST);
     assert!(bundle["counts"]["tenants"].as_i64().unwrap() >= 2);
     assert!(bundle["counts"]["repos"].as_i64().unwrap() >= 2);
-    // Every count query ran: a failed one would read -1.
     for (name, n) in bundle["counts"].as_object().unwrap() {
         if let Some(n) = n.as_i64() {
             assert!(n >= 0, "{name} = {n}");
@@ -1307,7 +1244,6 @@ fn metrics_readiness_and_the_diagnostic_bundle() {
             .unwrap()
             >= 1
     );
-    // Nothing names a tenant, repository or person.
     let flat = bundle.to_string();
     for name in [
         "\"acme\"", "\"beta\"", "\"app\"", "\"web\"", "Dana", "dana", "Pat", "\"pat\"",

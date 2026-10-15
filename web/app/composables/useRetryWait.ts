@@ -1,7 +1,3 @@
-/// A countdown for a `rate_limited` answer: `start(err)` (or a number of
-/// milliseconds) begins it, `waiting` is the whole seconds left (0 when the
-/// person may try again), and the timer stops itself and on unmount. A form
-/// disables its submit button while `waiting` is non-zero and says why.
 export function useRetryWait() {
   const until = ref(0);
   const now = ref(0);

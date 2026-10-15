@@ -1,7 +1,3 @@
-//! Checkout routing on Linux: with a mirrors handle the checkout goes
-//! through the repository's local mirror and says so; a mirror that cannot
-//! serve falls back to the direct fetch with the reason on record; the
-//! remote's own answer never retries.
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -40,7 +36,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-/// A repository with two commits; returns (path, first sha, second sha).
 fn repository(root: &Path) -> (std::path::PathBuf, String, String) {
     let repo = root.join("origin");
     fs::create_dir(&repo).unwrap();
@@ -93,9 +88,6 @@ fn a_mirror_that_cannot_serve_falls_back_with_the_reason_on_record() {
     let (repo, first, _) = repository(temp.path());
     let mirrors = Mirrors::open(&temp.path().join("mirrors")).unwrap();
     let repo_id = RepoId::new();
-    // A held writer lock is a mirror that cannot serve inside its bound:
-    // the attempt must still get its workspace, by the direct route, with
-    // the reason recorded — not silently, and not after hanging.
     let lock_path = temp.path().join(format!("mirrors/{repo_id}.lock"));
     let lock = fs::OpenOptions::new()
         .read(true)
@@ -119,9 +111,7 @@ fn a_mirror_that_cannot_serve_falls_back_with_the_reason_on_record() {
         &source,
         None,
         "att_fallback",
-        // The lock wait is bounded by the smaller of the mirror bound and
-        // this timeout: four seconds is far under the 120 s bound, so the
-        // fallback path is what the test actually exercises.
+        // Four seconds is well under the mirror's 120 s bound, so the fallback is what runs.
         Duration::from_secs(4),
     )
     .unwrap();
@@ -129,7 +119,6 @@ fn a_mirror_that_cannot_serve_falls_back_with_the_reason_on_record() {
     let reason = out.fallback_reason.expect("the reason is on record");
     assert!(reason.contains("lock"), "{reason}");
     assert!(started.elapsed() < Duration::from_secs(15));
-    // The direct fetch produced a truthful checkout anyway.
     assert_eq!(out.checkout.sha, first);
     assert_eq!(
         fs::read_to_string(ws.path().join("file.txt")).unwrap(),
@@ -157,8 +146,6 @@ fn without_a_mirror_the_route_is_direct_and_honest() {
     .unwrap();
     assert_eq!(out.route, CheckoutRoute::Direct);
     assert_eq!(out.fallback_reason, None);
-    // The direct path measures its own fetch; materialization is measured
-    // too, so nothing is claimed absent when it was in fact measured.
     assert!(out.checkout.fetch_ns > 0);
     assert!(out.checkout.materialize_ns > 0);
     assert_eq!(out.checkout.sha, first);
@@ -183,15 +170,11 @@ fn an_absent_commit_is_a_preparation_failure_not_a_fallback() {
         Duration::from_secs(60),
     )
     .unwrap_err();
-    // The remote's answer propagates as the preparation failure it is;
-    // falling back would only re-ask the same question.
+    // Falling back would only ask the remote the same question again.
     assert!(matches!(error, Error::Preparation(_)), "{error:?}");
     ws.destroy().unwrap();
 }
 
-/// A manual run names its own remote — here a local path, which
-/// could as well be another repository's mirror — so it never goes through
-/// (or fills) a mirror: the route is direct and no store is created.
 #[test]
 fn a_manual_run_never_reads_or_feeds_a_mirror() {
     let temp = tempfile::tempdir().unwrap();
@@ -216,8 +199,6 @@ fn a_manual_run_never_reads_or_feeds_a_mirror() {
     ws.destroy().unwrap();
 }
 
-/// When the mirror cannot serve, the direct fallback runs within
-/// what is left of the one deadline — never a fresh one.
 #[test]
 fn a_fallback_spends_the_remaining_deadline_not_a_new_one() {
     let temp = tempfile::tempdir().unwrap();

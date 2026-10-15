@@ -1,5 +1,3 @@
-//! Helpers shared by the mirror suites: throwaway `file://` origins and
-//! workspaces.
 #![allow(dead_code)] // each suite uses its own subset
 
 use std::{
@@ -49,7 +47,6 @@ pub struct Repo {
     pub second: String,
 }
 
-/// Two commits on `main`, one file that changes between them.
 pub fn repository(root: &Path) -> Repo {
     let dir = tempfile::tempdir_in(root).unwrap();
     let path = dir.path().join("origin");

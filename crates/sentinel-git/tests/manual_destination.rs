@@ -1,6 +1,5 @@
-//! A manual (unbound) remote is judged before Git connects, and every
-//! refusal or failure is the same message: the worker's reach into its own
-//! network is never an oracle for a client who names the remote.
+//! Manual remotes are refused before Git connects, with one message for every refusal or failure:
+//! the worker's network reach must never be an oracle for a client who names the remote.
 #![cfg(unix)]
 
 use std::time::Duration;
@@ -26,8 +25,6 @@ fn internal_destinations_all_get_one_answer_and_leave_no_git_diagnostic() {
         "https://127.0.0.1:9/repo.git",
         "https://localhost:9/repo.git",
         "https://metadata/computeMetadata/v1",
-        // A public name that does not resolve is indistinguishable from a
-        // refused one.
         "https://does-not-exist.invalid.example/repo.git",
     ]
     .into_iter()

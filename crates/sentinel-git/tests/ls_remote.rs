@@ -1,6 +1,3 @@
-//! Ref discovery over a real remote: `git ls-remote` advertises heads
-//! and tags, annotated tags arrive with their peeled commit, and the result
-//! and its budgets are bounded.
 #![cfg(unix)]
 
 use std::{
@@ -70,14 +67,10 @@ fn heads_and_tags_are_advertised_with_annotated_peels() {
     let tips = ls_remote(repo.work.path(), remote, None, 64, Duration::from_secs(30)).unwrap();
     let by_name = |name: &str| tips.iter().find(|t| t.name == name);
     assert_eq!(by_name("refs/heads/main").unwrap().oid, repo.main);
-    // The annotated tag's ref names its tag object; the commit it peels to
-    // arrives alongside.
     let v1 = by_name("refs/tags/v1").unwrap();
     assert_eq!(v1.oid, repo.tag_object);
     assert_eq!(v1.peeled.as_deref(), Some(repo.tag_commit.as_str()));
-    // A lightweight tag has nothing to peel.
     assert_eq!(by_name("refs/tags/light").unwrap().peeled, None);
-    // HEAD is not a head or tag advertisement.
     assert!(tips.iter().all(|t| t.name != "HEAD"));
 }
 
@@ -85,12 +78,10 @@ fn heads_and_tags_are_advertised_with_annotated_peels() {
 fn advertisement_budgets_and_failures_are_explicit() {
     let repo = repository();
     let remote = repo.path.to_str().unwrap();
-    // More refs than the cap is a bounded refusal, not a truncation.
     assert!(matches!(
         ls_remote(repo.work.path(), remote, None, 1, Duration::from_secs(30)),
         Err(Error::TooLarge("git ls-remote"))
     ));
-    // A remote that is not a repository is a preparation failure.
     assert!(matches!(
         ls_remote(
             repo.work.path(),
@@ -101,7 +92,6 @@ fn advertisement_budgets_and_failures_are_explicit() {
         ),
         Err(Error::Preparation(_))
     ));
-    // An option-shaped remote never reaches the process.
     assert!(matches!(
         ls_remote(
             repo.work.path(),
@@ -112,7 +102,6 @@ fn advertisement_budgets_and_failures_are_explicit() {
         ),
         Err(Error::Preparation(_))
     ));
-    // An unresolvable remote inside a tiny budget fails within it.
     let started = std::time::Instant::now();
     let _ = ls_remote(
         repo.work.path(),

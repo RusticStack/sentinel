@@ -1,7 +1,3 @@
-//! Tenant suspension propagating to credentials, invitations,
-//! live jobs and long-lived subscriptions; audited membership and grant
-//! changes; pool grants that never cross a tenant boundary.
-
 use sentinel_core::{
     Actor, Event as JobEvent, Fence, JobId, JobState, Outcome, PoolId, RepoId, RunId, TenantId,
     UnixMillis, UserId, WorkerId,
@@ -36,7 +32,6 @@ struct Fixture {
     repo: RepoId,
 }
 
-/// A stepped-up platform admin, as a session that just proved presence.
 fn privileged(user: UserId) -> Authority {
     Authority::Credential {
         principal: Principal::new(user, P::ALL, None, None),
@@ -93,7 +88,6 @@ fn fixture() -> Fixture {
     }
 }
 
-/// A run with three jobs: one queued, one leased to a worker, one blocked.
 fn seed_jobs(f: &Fixture) -> (JobId, JobId, JobId) {
     let (queued, leased, blocked) = (JobId::new(), JobId::new(), JobId::new());
     let (tenant, repo, run) = (f.acme, f.repo, RunId::new());
@@ -175,7 +169,6 @@ fn suspension_stops_intake_revokes_scoped_credentials_and_cancels_live_work() {
         .unwrap();
     let epoch_before = f.store.read(|c| tenancy::epoch(c, f.acme)).unwrap();
 
-    // A plain session cannot suspend; a stepped-up platform admin can.
     let refused = f.store.writer().write({
         let root = f.root;
         let acme = f.acme;
@@ -208,13 +201,11 @@ fn suspension_stops_intake_revokes_scoped_credentials_and_cancels_live_work() {
         }
     );
 
-    // Intake: the repository is unreachable through any live predicate.
     assert!(matches!(
         f.store
             .read(|c| auth::require_repo(c, dev, f.repo, P::READ)),
         Err(Error::NotFound)
     ));
-    // Credentials: the tenant-scoped ones died, the deployment-wide one lives.
     assert!(matches!(
         f.store
             .read(|c| tokens::authenticate(c, &scoped.secret, at(2_100))),
@@ -230,7 +221,6 @@ fn suspension_stops_intake_revokes_scoped_credentials_and_cancels_live_work() {
             .read(|c| tokens::authenticate(c, &unscoped.secret, at(2_100)))
             .is_ok()
     );
-    // The invitation into the tenant is spent.
     assert!(matches!(
         registration::register(
             &f.store,
@@ -245,8 +235,6 @@ fn suspension_stops_intake_revokes_scoped_credentials_and_cancels_live_work() {
         .unwrap(),
         registration::Admission::Refused(registration::Refusal::InvitationUnusable)
     ));
-    // Jobs: unowned ones are canceled through the state machine; the leased
-    // one carries the durable cancel flag for its worker.
     for (job, expected) in [
         (queued, JobState::Terminal(Outcome::Canceled)),
         (blocked, JobState::Terminal(Outcome::Canceled)),
@@ -256,9 +244,7 @@ fn suspension_stops_intake_revokes_scoped_credentials_and_cancels_live_work() {
         assert_eq!(row.state, expected);
         assert!(row.cancel_requested);
     }
-    // Subscriptions: the epoch moved, so a held stream re-authorizes and fails.
     assert!(f.store.read(|c| tenancy::epoch(c, f.acme)).unwrap() > epoch_before);
-    // Retained evidence is untouched.
     let runs: i64 = f
         .store
         .read(|c| {
@@ -267,7 +253,6 @@ fn suspension_stops_intake_revokes_scoped_credentials_and_cancels_live_work() {
         })
         .unwrap();
     assert_eq!(runs, 1);
-    // The other tenant is unaffected: the reader still resolves it.
     assert!(
         f.store
             .read(|c| auth::get_namespace(c, dev, Namespace::parse("other").unwrap()))
@@ -285,8 +270,6 @@ fn suspension_stops_intake_revokes_scoped_credentials_and_cancels_live_work() {
         Some("tokens=2 invitations=1 canceled=2 requested=1")
     );
 
-    // Suspending twice is not a silent success; reactivation restores intake
-    // and nothing revoked comes back.
     let again = f.store.writer().write({
         let root = f.root;
         let acme = f.acme;
@@ -354,7 +337,6 @@ fn membership_and_grant_changes_are_audited_and_move_the_epoch() {
     )
     .unwrap();
 
-    // Downgrade: takes effect on the next query, and the epoch moves.
     f.store
         .writer()
         .write({
@@ -387,8 +369,6 @@ fn membership_and_grant_changes_are_audited_and_move_the_epoch() {
             .is_ok()
     );
 
-    // Removal: grants cascade, the tenant-scoped credential dies, the other
-    // tenant's credential survives.
     f.store
         .writer()
         .write({
@@ -474,7 +454,6 @@ fn pool_access_is_ownership_or_an_explicit_grant_and_never_crosses_tenants() {
         );
     }
 
-    // Ownership admits; nothing else does, and a dedicated pool takes no grant.
     f.store
         .read(|c| tenancy::require_pool_access(c, f.acme, dedicated))
         .unwrap();
@@ -505,7 +484,6 @@ fn pool_access_is_ownership_or_an_explicit_grant_and_never_crosses_tenants() {
     });
     assert!(matches!(raw, Err(Error::Sqlite(_))));
 
-    // A grant admits exactly that tenant, moves its epoch, and is withdrawable.
     let epoch0 = f.store.read(|c| tenancy::epoch(c, f.acme)).unwrap();
     f.store
         .writer()
@@ -523,7 +501,6 @@ fn pool_access_is_ownership_or_an_explicit_grant_and_never_crosses_tenants() {
             .read(|c| tenancy::require_pool_access(c, f.other, shared)),
         Err(Error::Forbidden)
     ));
-    // Only a tenant's own members (or the platform) see its pools.
     let dev = Authority::credential(Principal::new(f.dev, P::ALL, None, None));
     let pools = f
         .store
@@ -573,7 +550,6 @@ fn pool_access_is_ownership_or_an_explicit_grant_and_never_crosses_tenants() {
     });
     assert!(matches!(again, Err(Error::NotFound)));
 
-    // A suspended tenant loses its own dedicated pool too.
     f.store
         .writer()
         .write({

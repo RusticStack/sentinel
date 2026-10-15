@@ -1,11 +1,3 @@
-//! The OAuth 2.0 wire contract: endpoint paths, the CLI client,
-//! authorization-server and protected-resource metadata (RFC 8414, RFC
-//! 9728), token and device-authorization responses, and the RFC 6749 error
-//! shape the `/oauth/*` endpoints answer with. `/api/v1/*` keeps
-//! `sentinel.error/1`.
-//!
-//! Token-bearing types redact their secrets in `Debug`.
-
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -19,21 +11,16 @@ pub const REVOKE_PATH: &str = "/oauth/revoke";
 pub const DEVICE_AUTHORIZATION_PATH: &str = "/oauth/device_authorization";
 pub const DEVICE_VERIFICATION_PATH: &str = "/device";
 pub const REGISTRATION_PATH: &str = "/oauth/register";
-/// Appended to the issuer to name the API resource (`Audience::Api`).
 pub const API_RESOURCE_SUFFIX: &str = "/api/v1";
-/// Appended to the issuer to name the remote MCP resource (`Audience::Mcp`).
 pub const MCP_RESOURCE_SUFFIX: &str = "/mcp";
 
-/// The first-party public client every deployment seeds.
 pub const CLI_CLIENT_ID: &str = "sentinel-cli";
-/// The only path a loopback redirect of the CLI client may use.
 pub const CLI_REDIRECT_PATH: &str = "/callback";
 
 pub const GRANT_AUTHORIZATION_CODE: &str = "authorization_code";
 pub const GRANT_REFRESH_TOKEN: &str = "refresh_token";
 pub const GRANT_DEVICE_CODE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// Authorization-server metadata (RFC 8414).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metadata {
     pub issuer: String,
@@ -41,13 +28,9 @@ pub struct Metadata {
     pub token_endpoint: String,
     pub revocation_endpoint: String,
     pub device_authorization_endpoint: String,
-    /// RFC 7591 registration, present only while the deployment's policy
-    /// allows Dynamic Client Registration. Optional on the wire: metadata
-    /// only ever gains optional members, so a newer client reads an older
-    /// controller's document.
+    // Metadata only gains optional members, so newer clients can read older documents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_endpoint: Option<String>,
-    /// Whether Client ID Metadata Documents are accepted; absent is `false`.
     #[serde(default)]
     pub client_id_metadata_document_supported: bool,
     pub response_types_supported: Vec<String>,
@@ -61,8 +44,6 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    /// Advertise the client registration mechanisms the deployment's policy
-    /// currently allows.
     #[must_use]
     pub fn with_client_registration(mut self, dynamic: bool, metadata_documents: bool) -> Self {
         self.registration_endpoint = dynamic.then(|| format!("{}{REGISTRATION_PATH}", self.issuer));
@@ -70,8 +51,6 @@ impl Metadata {
         self
     }
 
-    /// The metadata this deployment publishes under `issuer`, with no
-    /// client registration advertised ([`Self::with_client_registration`]).
     pub fn for_issuer(issuer: &str, scopes: &[&str]) -> Self {
         let owned = |values: &[&str]| values.iter().map(|v| (*v).to_owned()).collect();
         Self {
@@ -98,7 +77,6 @@ impl Metadata {
     }
 }
 
-/// Protected-resource metadata for `/api/v1` (RFC 9728).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtectedResource {
     pub resource: String,
@@ -112,7 +90,6 @@ impl ProtectedResource {
         Self::for_resource(&format!("{issuer}{API_RESOURCE_SUFFIX}"), issuer, scopes)
     }
 
-    /// Metadata for one resource served by this deployment.
     pub fn for_resource(resource: &str, issuer: &str, scopes: &[&str]) -> Self {
         Self {
             resource: resource.to_owned(),
@@ -123,9 +100,6 @@ impl ProtectedResource {
     }
 }
 
-/// A successful token-endpoint answer. `sentinel_grant` names the grant so a
-/// client can show and revoke it; `sentinel_refresh_expires_in` is the
-/// refresh token's remaining life in seconds.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
@@ -154,8 +128,6 @@ impl fmt::Debug for TokenResponse {
     }
 }
 
-/// The device-authorization answer (RFC 8628 §3.2). `user_code` is the
-/// display form `XXXX-XXXX`; the device code is for the polling client only.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceAuthorization {
     pub device_code: String,
@@ -179,7 +151,6 @@ impl fmt::Debug for DeviceAuthorization {
     }
 }
 
-/// RFC 6749 §5.2 / RFC 7009 / RFC 8628 error codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OAuthErrorCode {
@@ -233,8 +204,7 @@ impl OAuthErrorCode {
     }
 }
 
-/// `{"error": "...", "error_description": "..."}`. The description is for
-/// humans and never echoes a submitted value.
+// The description is for humans only and never echoes a submitted value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthError {
     pub error: OAuthErrorCode,
@@ -270,8 +240,6 @@ impl std::error::Error for OAuthError {}
 mod tests {
     use super::*;
 
-    /// A controller that publishes neither registration member must still
-    /// be readable by a newer client.
     #[test]
     fn metadata_from_a_controller_before_client_registration_still_parses() {
         let older = r#"{"issuer":"https://ci.example","authorization_endpoint":"https://ci.example/oauth/authorize","token_endpoint":"https://ci.example/oauth/token","revocation_endpoint":"https://ci.example/oauth/revoke","device_authorization_endpoint":"https://ci.example/oauth/device_authorization","response_types_supported":["code"],"response_modes_supported":["query"],"grant_types_supported":["authorization_code"],"code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none"],"revocation_endpoint_auth_methods_supported":["none"],"scopes_supported":["runs:read"],"authorization_response_iss_parameter_supported":true}"#;

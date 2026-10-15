@@ -1,5 +1,3 @@
-//! `artifact list|show|download` and `cache show`.
-
 use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
@@ -68,18 +66,6 @@ pub(super) fn show(
     Ok(())
 }
 
-/// Stream one manifest entry to `out` through a sibling partial file,
-/// hashing (BLAKE3, the object store's digest) and counting as it goes;
-/// the file replaces `out` only when the declared length, the byte count
-/// and the digest all match the manifest. A mismatch removes the partial
-/// file, leaves `out` as it was and exits 1.
-///
-/// The transfer has no overall deadline, only a bound on each wait for the
-/// network ([`crate::client::TRANSFER_IDLE`]). A stall or a dropped
-/// connection resumes with a `Range` request after the bytes already
-/// written; after [`STALLED_ATTEMPTS`] attempts in a row that move nothing
-/// the command exits 6 and keeps the partial file, and running it again
-/// continues from there.
 pub(super) fn download(
     client: &Client,
     output: Output,
@@ -92,8 +78,6 @@ pub(super) fn download(
     let run = segment("run", run)?;
     let artifact = segment("artifact", artifact)?;
     let view = client.get(&format!("/api/v1/runs/{run}/artifacts/{artifact}"))?;
-    // The answer names the run's tenant; `--tenant` or the profile context
-    // only matter for a server that does not.
     let slug = match (tenant_flag, view["tenant"].as_str()) {
         (Some(flag), _) => tenant(client, Some(flag))?,
         (None, Some(owner)) => segment("tenant", owner)?.to_owned(),
@@ -121,7 +105,6 @@ pub(super) fn download(
             let _ = fs::remove_file(&part);
             Error::usage(format!("cannot write {}: {e}", out.display()))
         })?,
-        // Kept: the next run resumes after its bytes.
         Err(Failure::Interrupted(error)) => return Err(error),
         Err(Failure::Failed(error)) => {
             let _ = fs::remove_file(&part);
@@ -144,17 +127,11 @@ pub(super) fn download(
     Ok(())
 }
 
-/// Transfer attempts in a row that may end without a single new byte before
-/// a download gives up (each already includes the client's own retries of
-/// a refused or failed request).
 const STALLED_ATTEMPTS: u32 = 3;
-/// The pause before resuming after an interrupted transfer.
 const RESUME_PAUSE: Duration = Duration::from_millis(200);
 const BUFFER: usize = 64 << 10;
 
-/// `<out>.<first 16 digest hex>.sentinel-part` beside the destination, so
-/// the final rename never crosses a filesystem and a partial file is only
-/// ever resumed by a download of the same content.
+/// Beside the destination so the final rename never crosses a filesystem; keyed by digest so only the same content resumes.
 fn partial_path(out: &Path, digest: &str) -> PathBuf {
     let mut name = out.as_os_str().to_owned();
     name.push(".");
@@ -164,13 +141,10 @@ fn partial_path(out: &Path, digest: &str) -> PathBuf {
 }
 
 enum Failure {
-    /// The transfer stopped making progress; the partial file stays.
     Interrupted(Error),
-    /// The bytes or the answer are wrong, or the file cannot be written.
     Failed(Error),
 }
 
-/// The partial file being filled: the bytes in it so far and their hash.
 struct Part {
     file: fs::File,
     hasher: blake3::Hasher,
@@ -178,7 +152,6 @@ struct Part {
 }
 
 impl Part {
-    /// Start over from an empty file.
     fn restart(&mut self) -> std::io::Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
@@ -214,7 +187,6 @@ fn fetch(
         count: 0,
     };
     let mut buf = vec![0u8; BUFFER];
-    // What an earlier, interrupted run left is hashed again and continued.
     let mut resumed = resume(&mut part_file, len, &mut buf).map_err(local)?;
     loop {
         let mut stalls = 0;
@@ -247,8 +219,7 @@ fn fetch(
         if part_file.hasher.finalize().to_hex().as_str() == digest {
             return part_file.file.sync_all().map_err(local);
         }
-        // Bytes an earlier run left may not be this content's (a damaged
-        // or foreign partial file): fetch everything once more.
+        // Bytes an earlier run left may belong to other content: fetch everything once more.
         if !resumed {
             return Err(Failure::Failed(Error::remote(
                 "the downloaded bytes do not match the manifest digest",
@@ -259,8 +230,6 @@ fn fetch(
     }
 }
 
-/// Hash the bytes already in the partial file and leave the cursor after
-/// them; a file longer than the entry is emptied. Whether anything was kept.
 fn resume(part: &mut Part, len: u64, buf: &mut [u8]) -> std::io::Result<bool> {
     let existing = part.file.metadata()?.len();
     if existing > len {
@@ -276,14 +245,11 @@ fn resume(part: &mut Part, len: u64, buf: &mut [u8]) -> std::io::Result<bool> {
         part.count += n as u64;
     }
     if part.count != existing {
-        // The file changed while it was read; do not trust it.
         part.restart()?;
     }
     Ok(part.count > 0)
 }
 
-/// One request for the bytes after `part.count`, appended to the file as
-/// they arrive.
 fn transfer(
     client: &Client,
     object: &str,
@@ -361,7 +327,6 @@ fn transfer(
     Ok(())
 }
 
-/// An attempt's cache records from its terminal summary.
 pub(super) fn cache(client: &Client, output: Output, attempt: &str) -> Result<(), Error> {
     let attempt = segment("attempt", attempt)?;
     let view = client.get(&format!("/api/v1/attempts/{attempt}/summary"))?;

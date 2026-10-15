@@ -1,10 +1,5 @@
 <script setup lang="ts">
-// Where a verification email's link lands (`/verify-email#token=…`). The
-// secret is in the fragment, so no server sees it; the page reads it once
-// in the browser, removes it from the address bar and history entry, and
-// spends it only when the person presses Confirm (a mail scanner that opens
-// links does not). Without a usable link the page offers a new one, with
-// the same answer for every address.
+// The secret stays in the fragment so no server sees it, and is spent only on Confirm, since mail scanners open links.
 definePageMeta({ layout: "auth" });
 useHead({ title: "Confirm your email address · Sentinel" });
 const api = useApi();

@@ -1,28 +1,3 @@
-//! Framing, hello/negotiation, heartbeat and offers over an established,
-//! full-duplex TLS stream.
-//!
-//! Frames are a big-endian `u32` length followed by a postcard-encoded
-//! message, capped at `MAX_CONTROL_MESSAGE_BYTES` before any allocation. The
-//! first exchange is `Hello`/`Welcome`; after that the worker sends
-//! heartbeats (which carry lease renewals) and offer answers, and the
-//! controller sends pongs and offers, in either order. Anything else on the
-//! wire is a protocol violation and ends the session.
-//!
-//! From protocol 7 a session has two connections with one identity. The
-//! first is the **control** connection: negotiation, heartbeats, offers and
-//! reports — everything whose latency decides whether live work survives. A
-//! protocol-7 worker then dials a second **bulk** connection (`BulkHello`)
-//! and moves logs, spec chunks, artifact streams and cache transfers onto
-//! it. Each connection has its own rustls state behind its own mutex, so a
-//! bulk write that blocks on a slow reader can never hold up a pong or an
-//! offer; the control connection keeps accepting bulk messages as a
-//! fallback when the second connection cannot be established.
-//!
-//! Full duplex on one TLS connection: the rustls state sits behind a mutex
-//! that is held only while bytes move between it and a buffer, never across
-//! a socket call. One thread reads the socket; any thread may send. An offer
-//! therefore reaches a worker the moment it is placed, not at its next beat.
-
 use std::{
     collections::HashMap,
     io::{Read, Write},
@@ -63,91 +38,45 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result, identity::fingerprint_of};
 
-/// How often a worker proves it is still there, and how long the controller
-/// waits before deciding it is not. Two missed beats, not one: a single
-/// delayed packet must not tear down a session carrying live work.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(15);
-/// The beat interval the controller announces is advice from a peer, not a
-/// trusted number: a worker keeps it within these bounds, so `0` is never a
-/// ping flood and a huge value never lets the deadline lapse between beats
-/// (two beats must always fit inside [`HEARTBEAT_DEADLINE`]).
 pub const HEARTBEAT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 pub const HEARTBEAT_MAX_INTERVAL: Duration = Duration::from_millis(7_500);
 const _: () = assert!(HEARTBEAT_MAX_INTERVAL.as_millis() * 2 <= HEARTBEAT_DEADLINE.as_millis());
 
-/// The announced beat interval, clamped to the bounds above.
 fn clamp_heartbeat(announced_ms: u32) -> Duration {
     Duration::from_millis(u64::from(announced_ms))
         .clamp(HEARTBEAT_MIN_INTERVAL, HEARTBEAT_MAX_INTERVAL)
 }
-/// Bytes read from the socket per call; one TLS record fits.
 const TLS_READ_BYTES: usize = 16 * 1024 + 512;
-/// A run spec crosses the link in chunks of this size, reassembled up to
-/// [`MAX_SPEC_BYTES`]; a spec is bounded by the pipeline file it came from.
 pub const SPEC_CHUNK_BYTES: usize = 48 * 1024;
 pub const MAX_SPEC_BYTES: usize = MAX_API_BODY_BYTES;
-/// The controller may interleave a few spec requests on one session; the
-/// aggregate secret transfer state remains bounded independently of holds.
 const MAX_IN_FLIGHT_SECRET_BYTES: usize = 8 * sentinel_protocol::secrets::MAX_DELIVERY_BYTES;
-/// One cache chunk on the wire. The frame cap is
-/// [`MAX_CONTROL_MESSAGE_BYTES`], so a chunk's payload has to leave room for
-/// its envelope; the link refuses anything larger as `TooLarge` rather than
-/// splitting it, because a chunk's running digest cannot be recomputed for a
-/// split piece.
 pub const MAX_CACHE_CHUNK_BYTES: usize = 48 * 1024;
-/// Cache downloads one session streams at a time; beyond this a need is
-/// refused `Busy` instead of spawning another transfer thread. Uploads one
-/// connection holds open are bounded the same way.
 const MAX_CACHE_TRANSFERS: usize = 4;
-/// An upload that has not moved for this long is dropped with its staging
-/// file and entry lock: a worker that went quiet mid-offer never
-/// pins an entry for the life of its connection.
 const UPLOAD_IDLE: Duration = Duration::from_secs(60);
-/// Control beats between transport telemetry refreshes.
 const TRANSPORT_BEATS: u64 = 12;
 
-/// How the worker reached the controller. `Unknown` is the honest
-/// answer when nothing measured the path — no helper running, or one that has
-/// not reported — never a guess that a relay is in use.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Path {
     #[default]
     Unknown,
-    /// A direct TCP/TLS path to the controller.
     Direct,
-    /// Through the Tailcat helper (NAT-traversing, possibly DERP-relayed).
     Relay,
 }
 
-/// What the worker's process can say about its transport. Assembled by
-/// the worker's process layer when a helper probe exists; every field that
-/// nothing measured stays absent, never a zero claim: `path` is `Unknown`,
-/// `rtt_ns`/`helper_version` are `None`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportStats {
     pub path: Path,
-    /// Round-trip time of the control session (a Ping/Pong pair), nanoseconds;
-    /// `None` before the first beat completes.
     pub rtt_ns: Option<u64>,
-    /// Control sessions this worker has opened since process start.
     pub reconnects: u64,
-    /// The Tailcat helper's version when one is running; `None` without one.
     pub helper_version: Option<String>,
-    /// Bytes written to / read from the session's connections: the control
-    /// connection plus, from protocol 7, every bulk connection it has had.
-    /// Cumulative counters: throughput is their rate between two reports.
     pub bytes_out: u64,
     pub bytes_in: u64,
 }
 
-/// A live source of the process's transport measurements: the worker
-/// process hands one to the link so each session starts from — and each
-/// telemetry resend refreshes — what the Tailcat helper last measured,
-/// rather than what it measured once at process start.
 pub type TransportSource = Arc<dyn Fn() -> TransportStats + Send + Sync>;
 
-/// What a worker has, as it measures at each hello.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capacity {
     pub cpu_millis: u64,
@@ -158,43 +87,32 @@ pub struct Capacity {
 pub enum ClientMessage {
     Hello {
         hello: Hello,
-        /// The worker's generated identifier, as raw bytes on the wire.
         worker: [u8; 16],
         name: String,
-        /// Present exactly once, on the session that redeems it.
         enrollment: Option<String>,
         capacity: Capacity,
     },
-    /// Heartbeat. `held` names the attempts the worker still holds; the
-    /// controller renews their leases and answers with what to stop.
     Ping {
         seq: u64,
         held: Vec<[u8; 16]>,
     },
-    /// The worker took the offer and owns the attempt under this fence.
     Ack {
         attempt: [u8; 16],
         fence: u64,
     },
-    /// The worker will not take the offer; the job returns to the queue.
     Decline {
         attempt: [u8; 16],
         fence: u64,
     },
-    /// The attempt moved: a worker-side state event under its fence. A
-    /// terminal report may carry the attempt's encoded summary.
     Report {
         attempt: [u8; 16],
         fence: u64,
         event: WireEvent,
         summary: Option<Vec<u8>>,
     },
-    /// The worker needs the run spec of an attempt it holds.
     NeedSpec {
         attempt: [u8; 16],
     },
-    /// One log frame of an attempt the worker holds, in sequence. At most
-    /// `MAX_UNACKED_LOG_FRAMES` may be in flight per attempt.
     Log {
         attempt: [u8; 16],
         seq: u64,
@@ -202,96 +120,54 @@ pub enum ClientMessage {
         stream: u8,
         bytes: Vec<u8>,
     },
-    /// No more frames will come: the log is complete through `last_seq`,
-    /// with the ranges the worker could not deliver declared as gaps.
     LogEnd {
         attempt: [u8; 16],
         last_seq: u64,
         gaps: Vec<(u64, u64)>,
     },
-    /// The worker restarted with this attempt in its leftovers and cannot
-    /// say what happened: the controller reconciles it under the fence.
     Abandon {
         attempt: [u8; 16],
         fence: u64,
     },
-    /// Protocol 4. Begin publishing artifact `name` of the attempt's job;
-    /// the controller validates it against the run spec and answers
-    /// `ArtifactGrant` or a refusing `ArtifactVerdict`. One artifact is in
-    /// flight per attempt at a time.
     ArtifactBegin {
         attempt: [u8; 16],
         name: String,
     },
-    /// Protocol 4. The next file of the in-flight artifact: its `ArtifactData`
-    /// frames follow with `seq` from 0 and exactly `len` bytes in order.
     ArtifactFile {
         attempt: [u8; 16],
         path: String,
         len: u64,
         mode: u32,
     },
-    /// Protocol 4. One ordered chunk of the in-flight file.
     ArtifactData {
         attempt: [u8; 16],
         seq: u32,
         bytes: Vec<u8>,
     },
-    /// Protocol 4. The artifact's file set is complete; the controller
-    /// commits the objects, manifest and record and answers a verdict.
     ArtifactEnd {
         attempt: [u8; 16],
         name: String,
     },
-    /// Protocol 4. No publishable content, also closing an in-flight
-    /// artifact: `reason` 0 = no paths matched, 1 = capture failed.
     ArtifactAbsent {
         attempt: [u8; 16],
         name: String,
         reason: u8,
     },
     Bye,
-    /// Protocol 7. The scheduling profile, sent immediately after `Welcome`
-    /// when the session negotiated protocol 7: what the worker offers the
-    /// scheduler beyond raw CPU and memory. Appended last: postcard encodes
-    /// enum variants positionally, so every older variant keeps its index.
     Profile(Profile),
-    /// Protocol 7. Opens the second connection of this session: this socket
-    /// carries the bulk traffic (logs, spec chunks, artifacts, cache
-    /// transfers) while the control connection keeps heartbeats, offers and
-    /// reports. `worker` must name a live control session presenting the
-    /// same certificate; the controller closes the connection otherwise.
     BulkHello {
         worker: [u8; 16],
     },
-    /// Protocol 7. How the worker reached the controller.
     Transport(TransportStats),
-    /// Protocol 7. The worker needs a cache object; answered by
-    /// `CacheGrant`, `CacheChunk`s and `CacheEnd`, or by `CacheRefused`.
-    /// Resuming an interrupted transfer is the same need with a non-zero
-    /// `offset` (and the matching `have` digest), never a separate message.
     CacheNeed(Need),
-    /// Protocol 7. The worker offers an object it holds so the
-    /// controller can keep it for the fleet; answered by `CacheGrant`
-    /// (stream it), `CacheEnd` (already stored) or `CacheRefused`.
     CacheOffer(Upload),
-    /// Protocol 7. One pushed chunk of an open offer.
     CachePush(Push),
-    /// Protocol 7. The offer's stream is complete.
     CachePushEnd(End),
-    /// Protocol 8. The worker abandoned the attempt's transfer —
-    /// a fetch past its budget or a failed offer: the controller stops the
-    /// serve (answering `CacheRefused` with `aborted` as its terminal) or
-    /// drops the upload's staging. Appended last: postcard encodes variants
-    /// positionally.
     CacheCancel {
         attempt: [u8; 16],
     },
 }
 
-/// `ClientMessage::Log` from borrowed parts: the same postcard bytes (variant
-/// index, then the fields in order; a byte slice encodes exactly like a
-/// `Vec<u8>`), without copying a log frame into an owned message first.
 struct LogRef<'a> {
     attempt: &'a [u8; 16],
     seq: u64,
@@ -300,20 +176,14 @@ struct LogRef<'a> {
     bytes: &'a [u8],
 }
 
-/// `ClientMessage::Log`'s position in the enum; asserted by a test.
 const LOG_VARIANT: u32 = 6;
 
-/// `ClientMessage::CachePush` from a borrowed chunk: the same postcard
-/// bytes as the owned message (variant index, then `Push`'s fields in
-/// order), so an offer sends each chunk straight from its read buffer
-/// instead of copying it into an owned `Vec` first.
 struct PushRef<'a> {
     attempt: &'a [u8; 16],
     offset: u64,
     bytes: &'a [u8],
 }
 
-/// `ClientMessage::CachePush`'s position in the enum; asserted by a test.
 const CACHE_PUSH_VARIANT: u32 = 20;
 
 impl Serialize for PushRef<'_> {
@@ -322,8 +192,6 @@ impl Serialize for PushRef<'_> {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        // A newtype variant around the struct, exactly as `CachePush(Push)`
-        // derives it.
         struct Body<'b>(&'b PushRef<'b>);
         impl Serialize for Body<'_> {
             fn serialize<S: serde::Serializer>(
@@ -362,8 +230,6 @@ impl Serialize for LogRef<'_> {
     }
 }
 
-/// A worker's state event on the wire; mirrors the worker-raised half of
-/// `sentinel_core::Event` with the failure class as its stored code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireEvent {
     PreparationStarted,
@@ -374,8 +240,6 @@ pub enum WireEvent {
 }
 
 impl WireEvent {
-    /// Only the events a worker may raise are representable; the controller
-    /// still runs them through the state machine under the worker's fence.
     pub fn from_event(event: Event) -> Option<WireEvent> {
         Some(match event {
             Event::PreparationStarted => WireEvent::PreparationStarted,
@@ -408,7 +272,6 @@ impl WireEvent {
     }
 }
 
-/// A lease on the wire; typed as [`Offer`] on both ends.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WireOffer {
     pub attempt: [u8; 16],
@@ -432,105 +295,60 @@ pub enum ServerMessage {
         heartbeat_interval_ms: u32,
     },
     Reject(Rejection),
-    /// Answers a `Ping`: the renewed lease deadline for everything in `held`
-    /// that this worker still holds, and the attempts it must stop now.
     Pong {
         seq: u64,
         lease_until_ms: i64,
         stop: Vec<[u8; 16]>,
-        /// Held attempts whose job has cancellation desired: end them
-        /// gracefully and report `Canceled`.
         cancel: Vec<[u8; 16]>,
     },
     Offer(WireOffer),
-    /// One chunk of the run spec asked for with `NeedSpec`, in order.
     Spec {
         attempt: [u8; 16],
         seq: u32,
         last: bool,
         bytes: Vec<u8>,
     },
-    /// The attempt is not held by this worker or has no spec: stop it.
     NoSpec {
         attempt: [u8; 16],
     },
-    /// Precedes the `Spec` chunks: what the worker needs to evaluate the
-    /// job's expressions.
     Context(WireContext),
-    /// Frames through `through` are durably stored; the worker may drop
-    /// them from its spool.
     LogAck {
         attempt: [u8; 16],
         through: u64,
     },
-    /// The controller will store no more frames of this attempt (size cap,
-    /// or the attempt is not held here); the worker stops sending.
     LogRefused {
         attempt: [u8; 16],
     },
-    /// Protocol 5. The attempt's end marker is durable on the controller;
-    /// the worker may drop the spool it replayed from.
     LogEndAck {
         attempt: [u8; 16],
     },
-    /// Protocol 2 only; follows Context, before spec bytes. Never persisted.
     Source {
         attempt: [u8; 16],
         access: sentinel_protocol::source::Access,
     },
-    /// Protocol 4. The artifact named in `ArtifactBegin` was validated
-    /// against the run spec and budgets; the worker may stream its files.
     ArtifactGrant {
         attempt: [u8; 16],
         name: String,
     },
-    /// Protocol 4. The terminal answer for an artifact: stored, recorded
-    /// absent/failed, or refused (`ArtifactCode`); the artifact is closed.
     ArtifactVerdict {
         attempt: [u8; 16],
         name: String,
         code: u8,
     },
-    /// Protocol 6. The job context with its cache boundary: the tenant the
-    /// run belongs to and the trust class derived from the recorded event.
-    /// Sent instead of `Context` to workers that negotiated it; earlier
-    /// workers get `Context` and default to the pull-request scope.
     /// Appended last: postcard encodes enum variants positionally.
     Context2(WireContext2),
-    /// Protocol 7. The accepted start of a cache transfer: the offset
-    /// the stream resumes from and the whole object's digest. For a
-    /// `CacheOffer` the controller already stores, there is no grant: it
-    /// answers `CacheEnd` with no bytes.
     CacheGrant(Grant),
-    /// Protocol 7. One chunk of a granted transfer, in order, with the
-    /// running digest of the stream through it.
     CacheChunk(Chunk),
-    /// Protocol 7. Terminal both ways: the fetch is complete, or an
-    /// offer was stored. Appended last: postcard encodes variants positionally.
     CacheEnd(End),
-    /// Protocol 7. The transfer is refused; `code` is the cache
-    /// owner's stable refusal code.
     CacheRefused(Refused),
-    /// Protocol 9. The image references (`name@sha256:…`) this
-    /// worker should pull ahead of an offer: ready jobs it could be placed
-    /// but does not hold warm. The whole wanted set, replacing the last one
-    /// — a reference that is gone from it is stale and its prefetch stops.
-    /// At most `MAX_PREFETCH_IMAGES`; sent on the control connection, and
-    /// only when the set changed. Appended last: postcard encodes variants
-    /// positionally.
     Prefetch {
         images: Vec<String>,
     },
-    /// Protocol 10. Starts an attempt-bound secret bundle transfer. The
-    /// following chunks are accepted only for this attempt and total length.
     SecretBegin {
         attempt: [u8; 16],
         fence: u64,
         length: u32,
     },
-    /// Protocol 10. A bounded ordered chunk of the sealed-store values
-    /// resolved for one fenced attempt. The payload's debug view is redacted
-    /// and its owned bytes are wiped after handling.
     SecretChunk {
         attempt: [u8; 16],
         fence: u64,
@@ -556,52 +374,28 @@ impl SensitiveFrame for ServerMessage {
     }
 }
 
-/// What the controller did with a log frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogVerdict {
-    /// Stored and synced through this sequence.
     Acked(u64),
-    /// Written through this sequence but not yet durable: the session must
-    /// call [`SessionHandler::log_sync`] before it acknowledges, which lets
-    /// one `fsync` cover a whole burst of frames. Only `log` answers it.
+    /// Not yet durable: the session calls log_sync before acknowledging, so one fsync covers a burst of frames.
     Stored(u64),
-    /// Permanently refused: the attempt is not this worker's, its log has
-    /// already ended, or the size cap is reached. `LogRefused` goes out
-    /// and the worker stops sending.
     Refused,
-    /// A transient controller fault (a store read or write, log I/O):
-    /// nothing is answered and the connection that carried the frame is
-    /// closed, so the worker rewinds to its last acknowledgement and
-    /// resends — a fault never becomes a permanent refusal.
     Retry,
 }
 
-/// A file's permission bits inside an artifact manifest; only the low mode
-/// bits are meaningful on the wire. Setuid, setgid and sticky are never
-/// carried: an artifact is data, not a privileged executable.
+/// Setuid, setgid and sticky are never carried: an artifact is data, not a privileged executable.
 pub const ARTIFACT_MODE_BITS: u32 = 0o777;
 
-/// The terminal code of an `ArtifactVerdict`: what the controller did with
-/// an artifact publication, so the worker learns how it was recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArtifactCode {
-    /// Committed and recorded present.
     Stored,
-    /// The job's spec declared no artifact of that name.
     NotDeclared,
-    /// Duplicates a finished artifact record for this attempt.
     Duplicate,
-    /// Name/path/frame/length/ordering constraint violated.
     Invalid,
-    /// The per-artifact or per-run byte budget was exceeded.
     TooLarge,
-    /// The artifact holds no matching content (recorded absent).
     Absent,
-    /// Recorded as failed: capture or publication could not complete.
     CaptureFailed,
-    /// The attempt is not held here under that fence.
     Stale,
-    /// Storage faulted; nothing was recorded, the worker may retry once.
     Store,
 }
 
@@ -619,8 +413,6 @@ impl ArtifactCode {
             Self::Store => 8,
         }
     }
-    /// Decode a verdict code; unrecognised values read as `Stale` — to an
-    /// older worker the safest reading is that nothing landed.
     pub fn from_u8(code: u8) -> Self {
         match code {
             0 => Self::Stored,
@@ -635,17 +427,12 @@ impl ArtifactCode {
     }
 }
 
-/// The grant-or-verdict answer to `ArtifactBegin`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArtifactReply {
-    /// Validated; the worker may stream the artifact's files.
     Grant,
-    /// Terminal; the artifact is closed on the controller.
     Verdict(ArtifactCode),
 }
 
-/// [`JobContext`] on the wire; dependency outcomes as their stored codes.
-/// Protocol 3 adds the event facts; older workers are served `NoSpec`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WireContext {
     pub attempt: [u8; 16],
@@ -657,24 +444,14 @@ pub struct WireContext {
     pub sha: String,
     pub cancelled: bool,
     pub needs: Vec<(String, u8)>,
-    /// What triggered the run: `push`, `tag`, `pull_request` or `manual`.
     pub event: String,
-    /// The ref the event concerns, as recorded in the run's provenance.
     pub event_ref: String,
-    /// The pull request's base branch, when the run came from one.
     pub base_ref: Option<String>,
     pub pr_number: Option<u64>,
-    /// A short, stable key for the event: the branch or tag name, `pr-<n>`,
-    /// or `manual`.
     pub event_key: String,
 }
 
-/// [`JobContext`] on the wire from protocol 6: everything `WireContext`
-/// carries, plus the cache boundary — the run's tenant and the trust class
-/// the controller derived from the recorded event (`Trust::of_event`).
-/// `tenant` is all-zero when the context carries none; `trust` is a
-/// `Trust` wire code, never defaulted: an undecodable byte is a protocol
-/// error rather than a guessed boundary.
+/// `trust` is never defaulted: an undecodable byte is a protocol error, not a guessed cache boundary.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WireContext2 {
     pub attempt: [u8; 16],
@@ -686,23 +463,15 @@ pub struct WireContext2 {
     pub sha: String,
     pub cancelled: bool,
     pub needs: Vec<(String, u8)>,
-    /// What triggered the run: `push`, `tag`, `pull_request` or `manual`.
     pub event: String,
-    /// The ref the event concerns, as recorded in the run's provenance.
     pub event_ref: String,
-    /// The pull request's base branch, when the run came from one.
     pub base_ref: Option<String>,
     pub pr_number: Option<u64>,
-    /// A short, stable key for the event: the branch or tag name, `pr-<n>`,
-    /// or `manual`.
     pub event_key: String,
-    /// The tenant the run belongs to; all-zero encodes "none recorded".
     pub tenant: [u8; 16],
-    /// `Trust` wire code for the cache scope this job may use.
     pub trust: u8,
 }
 
-/// The event facts a worker may evaluate `event.*` against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventContext {
     pub name: String,
@@ -712,11 +481,6 @@ pub struct EventContext {
     pub key: String,
 }
 
-/// What the worker evaluates expressions against: identity of the run,
-/// repository and job, the event that triggered it, dependency outcomes by
-/// name, cancellation. `tenant`/`trust` are the cache boundary (protocol 6;
-/// absent on older wires, where the worker defaults to the pull-request
-/// scope and no recorded tenant).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobContext {
     pub source: Option<sentinel_protocol::source::Access>,
@@ -729,20 +493,10 @@ pub struct JobContext {
     pub event: EventContext,
     pub cancelled: bool,
     pub needs: Vec<(String, Outcome)>,
-    /// The tenant the run belongs to; `None` on a protocol <6 context,
-    /// which could not carry it.
     pub tenant: Option<TenantId>,
-    /// The cache trust class derived from `event` (`Trust::of_event`);
-    /// `PullRequest` on a protocol <6 context — the scope that can never
-    /// touch protected state.
     pub trust: Trust,
 }
 
-/// How long a worker honors a delivered source access, counted from the
-/// moment it arrives: the whole checkout deadline (ten minutes, covering a
-/// mirror lock wait or timeout followed by the direct fallback) plus two
-/// minutes before the checkout starts. The access lives only in the
-/// attempt's in-memory context, which the fence and lease already bound.
 pub const SOURCE_ACCESS_WINDOW_MS: i64 = 12 * 60 * 1000;
 
 const fn outcome_code(outcome: Outcome) -> u8 {
@@ -769,8 +523,6 @@ const fn outcome_from_code(code: u8) -> Option<Outcome> {
 }
 
 impl JobContext {
-    /// The protocol <6 shape: `tenant` and `trust` do not exist on that
-    /// wire — the receiver defaults them to `None`/`PullRequest`.
     pub(crate) fn to_wire(&self, attempt: AttemptId) -> WireContext {
         WireContext {
             attempt: *attempt.as_bytes(),
@@ -794,7 +546,6 @@ impl JobContext {
         }
     }
 
-    /// The protocol 6 shape: same facts plus the cache boundary.
     pub(crate) fn to_wire2(&self, attempt: AttemptId) -> WireContext2 {
         WireContext2 {
             attempt: *attempt.as_bytes(),
@@ -840,8 +591,7 @@ impl JobContext {
                 },
                 cancelled: wire.cancelled,
                 needs: decode_needs(wire.needs)?,
-                // The wire could not say it: the safest scope is the one a
-                // pull request would get.
+                // The wire could not say it: the safest scope is the one a pull request would get.
                 tenant: None,
                 trust: Trust::PullRequest,
             },
@@ -849,8 +599,6 @@ impl JobContext {
     }
 
     fn from_wire2(wire: WireContext2) -> Result<(AttemptId, JobContext)> {
-        // A trust byte this build cannot decode is a protocol error, never
-        // a guessed boundary.
         let trust = Trust::from_u8(wire.trust).ok_or(Error::Protocol("trust"))?;
         let tenant = if wire.tenant == [0; 16] {
             None
@@ -883,7 +631,6 @@ impl JobContext {
     }
 }
 
-/// Dependency outcomes as their stored codes; bounded like every list.
 fn decode_needs(wire: Vec<(String, u8)>) -> Result<Vec<(String, Outcome)>> {
     if wire.len() > MAX_LIST_ITEMS {
         return Err(Error::Protocol("needs list"));
@@ -898,8 +645,6 @@ fn decode_needs(wire: Vec<(String, u8)>) -> Result<Vec<(String, Outcome)>> {
     Ok(needs)
 }
 
-/// The context message for the negotiated protocol: `Context2` from
-/// protocol 6, the original `Context` before it.
 pub(crate) fn context_message(
     protocol: u16,
     context: &JobContext,
@@ -907,8 +652,6 @@ pub(crate) fn context_message(
 ) -> ServerMessage {
     if protocol >= 6 {
         let mut wire = context.to_wire2(attempt);
-        // Before protocol 8 there is no `Unprotected`: such a job gets the
-        // pull-request scope, which can never touch protected state.
         wire.trust = context.trust.for_protocol(protocol).to_u8();
         ServerMessage::Context2(wire)
     } else {
@@ -916,8 +659,6 @@ pub(crate) fn context_message(
     }
 }
 
-/// An offer as the worker sees it: a fenced lease it must acknowledge within
-/// the ack timeout and renew on every heartbeat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Offer {
     pub attempt: AttemptId,
@@ -928,12 +669,8 @@ pub struct Offer {
     pub lease_until: UnixMillis,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
-    /// The `sha256:…` digest resolved on the run — the digest alone: the
-    /// worker pulls `<spec image name>@<digest>` once the spec arrives, so
-    /// no pull can start from the offer itself.
     pub image_digest: String,
     pub image_platform: String,
-    /// Position of the job in the run's compiled spec.
     pub job_index: u32,
 }
 
@@ -971,31 +708,20 @@ impl Offer {
     }
 }
 
-/// Why a hello was refused. A worker must not retry an unchanged hello.
-///
-/// Wire-flat on purpose: `Rejected` is an internally tagged enum for its JSON
-/// form, which postcard cannot encode, so it is mirrored here.
+/// Wire-flat on purpose: postcard cannot encode the internally tagged `Rejected`, so it is mirrored here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Rejection {
-    /// No protocol version in common. `upgrade_worker` says which side is behind.
     UnsupportedVersion {
         supported_min: u16,
         supported_max: u16,
         upgrade_worker: bool,
     },
-    /// Required capabilities the worker did not advertise, as a bit set.
     MissingCapabilities(u64),
     InvalidRange,
-    /// The certificate is not an enrolled, unrevoked worker, and no valid
-    /// enrollment was presented.
     NotEnrolled,
-    /// The enrollment secret was unknown, spent, expired or for a dead pool.
     Enrollment,
-    /// Identity or name refused by policy.
     Identity,
-    /// The reported capacity is not representable.
     Capacity,
-    /// The controller could not record the admission; try again later.
     Unavailable,
 }
 
@@ -1017,7 +743,6 @@ impl From<Rejected> for Rejection {
     }
 }
 
-/// What the controller decided about a presenting certificate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Admitted {
     pub worker: WorkerId,
@@ -1025,11 +750,7 @@ pub struct Admitted {
     pub negotiated: Negotiated,
 }
 
-/// The controller's admission policy. Implemented by the store glue; the
-/// session code never touches the database.
 pub trait Admission: Send + Sync {
-    /// A known fingerprint, or an enrollment being redeemed with it. The
-    /// capacity is recorded with the admission.
     fn admit(
         &self,
         fingerprint: &Digest,
@@ -1040,9 +761,6 @@ pub trait Admission: Send + Sync {
         capacity: Capacity,
     ) -> std::result::Result<Admitted, Rejection>;
 
-    /// [`admit`](Self::admit) with the address the connection came from,
-    /// when it has one, for policies that budget unauthenticated peers by
-    /// source. The default ignores it.
     #[allow(clippy::too_many_arguments)]
     fn admit_from(
         &self,
@@ -1058,21 +776,14 @@ pub trait Admission: Send + Sync {
     }
 }
 
-/// The controller's answer to a heartbeat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Beat {
-    /// Every held attempt the controller recognises is renewed to this.
     pub lease_until: UnixMillis,
-    /// Attempts the controller no longer counts as held: stop at once.
     pub stop: Vec<AttemptId>,
-    /// Attempts whose job has cancellation desired: end gracefully.
     pub cancel: Vec<AttemptId>,
 }
 
-/// What the controller does with an admitted worker's messages.
 pub trait SessionHandler: Send + Sync {
-    /// A controller may resolve source access off the heartbeat thread.
-    /// True means it owns sending Spec/NoSpec on this exact session.
     fn spec_requested(
         &self,
         _worker: WorkerId,
@@ -1082,12 +793,9 @@ pub trait SessionHandler: Send + Sync {
     ) -> bool {
         false
     }
-    /// A heartbeat naming the attempts the worker holds.
     fn ping(&self, worker: WorkerId, held: &[AttemptId]) -> Result<Beat>;
     fn acknowledged(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
     fn declined(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
-    /// A worker-side state event. The handler applies it under the fence;
-    /// a stale one changes nothing. `summary` accompanies a terminal event.
     fn reported(
         &self,
         worker: WorkerId,
@@ -1096,23 +804,11 @@ pub trait SessionHandler: Send + Sync {
         event: Event,
         summary: Option<Vec<u8>>,
     );
-    /// The job context and encoded run spec of an attempt this worker
-    /// holds, or `None`.
     fn spec(&self, worker: WorkerId, attempt: AttemptId) -> Option<(JobContext, Vec<u8>)>;
-    /// A log frame of an attempt this worker holds. Acknowledged only once
-    /// durable; a frame out of sequence or past the size cap is refused.
     fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict;
-    /// Make the frames `log` answered [`LogVerdict::Stored`] for durable.
-    /// `false` is a transient fault: the session closes the connection and
-    /// acknowledges nothing, so the worker resends. The default has nothing
-    /// deferred.
     fn log_sync(&self, _worker: WorkerId, _attempt: AttemptId) -> bool {
         true
     }
-    /// The attempt's log is complete through `last_seq`. `Acked` means the
-    /// end marker is durable; the session answers `LogEndAck` when the
-    /// negotiated protocol carries it. The default refuses: nothing was
-    /// recorded.
     fn log_end(
         &self,
         _worker: WorkerId,
@@ -1122,17 +818,10 @@ pub trait SessionHandler: Send + Sync {
     ) -> LogVerdict {
         LogVerdict::Refused
     }
-    /// The worker found the attempt in its leftovers after a restart.
     fn abandoned(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
-    /// Protocol 4. Begin publishing artifact `name` of a held attempt:
-    /// validate it against the run spec and the byte budgets. `Grant` lets
-    /// the worker stream; a verdict closes the artifact at once. The
-    /// default answers `Stale`: nothing was granted.
     fn artifact_begin(&self, _worker: WorkerId, _attempt: AttemptId, _name: &str) -> ArtifactReply {
         ArtifactReply::Verdict(ArtifactCode::Stale)
     }
-    /// Protocol 4. The next file of the in-flight artifact, `len` bytes of
-    /// `ArtifactData` to follow. `Some` fails the artifact at once.
     fn artifact_file(
         &self,
         _worker: WorkerId,
@@ -1143,8 +832,6 @@ pub trait SessionHandler: Send + Sync {
     ) -> Option<ArtifactCode> {
         Some(ArtifactCode::Stale)
     }
-    /// Protocol 4. Ordered chunk `seq` of the in-flight file. `Some` fails
-    /// the artifact at once.
     fn artifact_data(
         &self,
         _worker: WorkerId,
@@ -1154,12 +841,9 @@ pub trait SessionHandler: Send + Sync {
     ) -> Option<ArtifactCode> {
         Some(ArtifactCode::Stale)
     }
-    /// Protocol 4. Commit the in-flight artifact; the code is terminal.
     fn artifact_end(&self, _worker: WorkerId, _attempt: AttemptId, _name: &str) -> ArtifactCode {
         ArtifactCode::Stale
     }
-    /// Protocol 4. Record `name` absent (`reason` 0) or failed (1); also
-    /// abandons an in-flight publication of the same name.
     fn artifact_absent(
         &self,
         _worker: WorkerId,
@@ -1169,46 +853,25 @@ pub trait SessionHandler: Send + Sync {
     ) -> ArtifactCode {
         ArtifactCode::Stale
     }
-    /// Protocol 7. The scheduling profile the worker reported immediately
-    /// after `Welcome`, with the capacity it sent in its hello (reported
-    /// together so disk and CPU/RAM land in one write). Recording it is what
-    /// lets placement see the worker's disk, labels, host and availability;
-    /// `Err` ends the session, because a worker whose profile cannot be
-    /// recorded must not keep taking work against stale placement data. The
-    /// default accepts and records nothing.
     fn profiled(&self, _worker: WorkerId, _profile: &Profile, _capacity: Capacity) -> Result<()> {
         Ok(())
     }
-    /// Protocol 7. The worker's latest transport telemetry.
     fn transport(&self, _worker: WorkerId, _stats: &TransportStats) {}
-    /// Protocol 7. Authorizes a cache download. `Some(root)` means the
-    /// fence and cache scope checked out and the session may serve the need
-    /// from the controller's store under `root`; `None` refuses. The
-    /// authorization rule is the fenced attempt: it must be held by the
-    /// worker, and the need's tenant, repo and trust class must equal the
-    /// attempt's. The default refuses.
+    /// The need's tenant, repo and trust class must equal the attempt's, and the worker must hold the attempt.
     fn cache_need(&self, _worker: WorkerId, _need: &Need) -> Option<PathBuf> {
         None
     }
-    /// Protocol 7. Authorizes an upload the same way. `Some(root)`
-    /// seeds the object under `root` and the session holds the receiving
-    /// state for the offer's push frames; `None` refuses.
     fn cache_offer(&self, _worker: WorkerId, _upload: &Upload) -> Option<PathBuf> {
         None
     }
 }
 
-/// The rustls state and the socket it writes to. The lock is held only while
-/// bytes move between the connection and a buffer.
+/// Held only while bytes move between the connection and a buffer, never across a socket call.
 struct Shared {
     conn: Mutex<rustls::Connection>,
     sock: TcpStream,
-    /// Frame bytes written to / socket bytes read from this connection. What
-    /// transport telemetry reports is measured here, never estimated.
     out: AtomicU64,
     in_: AtomicU64,
-    /// Set by [`Sender::close_notify`]: the connection is ending on purpose,
-    /// and frames sent from then on are dropped rather than failing it.
     closing: std::sync::atomic::AtomicBool,
 }
 
@@ -1221,39 +884,22 @@ impl Shared {
     }
 }
 
-/// The sending half: cheap to clone, usable from any thread.
 #[derive(Clone)]
 pub struct Sender(Arc<Shared>);
 
 thread_local! {
-    /// Encode scratch, reused by every send on this thread: a frame costs
-    /// no allocation once the buffer has grown to the largest one sent.
     static ENCODE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl Sender {
-    /// Encode, encrypt and write one frame. Holds the connection lock across
-    /// the socket write so frames from different threads never interleave.
-    /// A write that fails — including one that ran into the socket's write
-    /// timeout because the peer stopped reading — leaves the TLS stream in
-    /// an unknown state, so the connection is torn down: the reader fails
-    /// out, the session ends, and nothing waits on a dead peer forever.
     pub(crate) fn send<M: Serialize>(&self, message: &M) -> Result<()> {
         self.send_inner(message, false, None)
     }
 
-    /// [`send`](Self::send) for a caller that must not wait on one peer (the
-    /// controller's single dispatcher): fails with [`BUSY`], touching
-    /// nothing, when another thread is mid-write on this connection, and
-    /// otherwise writes under `within` instead of the full write timeout.
-    /// A write that runs past `within` tears the connection down exactly as
-    /// a timed-out `send` does.
     pub(crate) fn send_bounded<M: Serialize>(&self, message: &M, within: Duration) -> Result<()> {
         self.send_inner(message, false, Some(within))
     }
 
-    /// Same frame path as `send`, but wipe the reusable postcard buffer after
-    /// a secret payload is encoded and written.
     pub(crate) fn send_sensitive<M: Serialize>(&self, message: &M) -> Result<()> {
         self.send_inner(message, true, None)
     }
@@ -1308,16 +954,11 @@ impl Sender {
 
     fn write_frame(&self, frame: &[u8], bound: Option<Duration>) -> Result<()> {
         if self.0.closing.load(Ordering::Acquire) {
-            // Past the close: a failed write here would tear the socket
-            // down (and reset it on unread bytes) before the peer read the
-            // close, so the frame is dropped, as it would be by a
-            // connection that is ending anyway.
+            // A failed write here would reset the socket before the peer reads the close alert, so the frame is dropped.
             return Ok(());
         }
         let mut conn = match bound {
             None => self.0.conn.lock().unwrap_or_else(|p| p.into_inner()),
-            // Busy is not a failure of the connection: nothing was written,
-            // so it stays open.
             Some(_) => match self.0.conn.try_lock() {
                 Ok(conn) => conn,
                 Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
@@ -1325,8 +966,6 @@ impl Sender {
             },
         };
         if let Some(within) = bound {
-            // Under the connection lock, so no other writer sees the
-            // shortened timeout; restored below on every path.
             let _ = self.0.sock.set_write_timeout(Some(within));
         }
         let written = (|| -> Result<()> {
@@ -1343,8 +982,6 @@ impl Sender {
         drop(conn);
         match written {
             Ok(()) => {
-                // Counted only once the bytes are out: a frame that failed
-                // to write never inflates the throughput figure.
                 self.0.out.fetch_add(frame.len() as u64, Ordering::Relaxed);
                 Ok(())
             }
@@ -1365,28 +1002,14 @@ impl Sender {
         }
     }
 
-    /// (bytes written, socket bytes read) on this connection.
     pub fn bytes(&self) -> (u64, u64) {
         self.0.bytes()
     }
 
-    /// Tear the transport down from any thread; the reading side then fails
-    /// out of its blocking read. Used by shutdown and by a replacing session.
     pub fn close(&self) {
         let _ = self.0.sock.shutdown(Shutdown::Both);
     }
 
-    /// End the connection cleanly from any thread: a TLS `close_notify`,
-    /// then a FIN on this side only. The peer reads the end of its stream at
-    /// once, wherever the bytes travel (a relaying helper passes the close
-    /// on), and the reading side here keeps running until the peer closes
-    /// its half too, so the session's end marks the close as delivered.
-    ///
-    /// Frames sent after this are dropped, so a reply the session thread
-    /// still makes cannot fail the socket before the peer has read the
-    /// close. Bounded: another thread's write in progress is waited for at
-    /// most [`CLOSE_WRITE_TIMEOUT`] (after that the alert is skipped and
-    /// only the FIN goes out), and so is a peer that stopped reading.
     pub fn close_notify(&self) {
         self.0.closing.store(true, Ordering::Release);
         let deadline = Instant::now() + CLOSE_WRITE_TIMEOUT;
@@ -1415,16 +1038,13 @@ impl Sender {
         let _ = self.0.sock.shutdown(Shutdown::Write);
     }
 
-    /// The remote end of the socket; fails once the socket is shut down.
     pub fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.0.sock.peer_addr()
     }
 }
 
-/// Longest [`Sender::close_notify`] waits to hand its alert to the socket.
 const CLOSE_WRITE_TIMEOUT: Duration = Duration::from_millis(50);
 
-/// The receiving half: exactly one thread reads the socket.
 pub struct Receiver {
     shared: Arc<Shared>,
     sock: TcpStream,
@@ -1449,16 +1069,12 @@ impl Receiver {
         let message: M =
             postcard::from_bytes(&self.plain[4..4 + len]).map_err(|_| Error::Protocol("decode"))?;
         if message.is_sensitive() {
-            // The deserialized SecretChunk owns and wipes its copy. Clear the
-            // decrypted frame too before Vec::drain shifts later messages.
             self.plain[..4 + len].fill(0);
         }
         self.plain.drain(..4 + len);
         Ok(Some(message))
     }
 
-    /// Move decrypted bytes out of rustls into the plaintext buffer. Returns
-    /// whether anything arrived; `Closed` on the peer's close_notify.
     fn drain_plaintext(&mut self) -> Result<bool> {
         let mut conn = self.shared.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut got = false;
@@ -1486,11 +1102,6 @@ impl Receiver {
         }
     }
 
-    /// Wait up to `timeout` for the next frame. `Ok(None)` is the timeout;
-    /// `Lost` is the peer going away. The bound is on the whole frame, not
-    /// on each read: a peer dripping one byte just inside the socket's read
-    /// timeout still runs out after at most twice `timeout` (the check runs
-    /// between reads, so no per-read timer syscall is spent on it).
     pub(crate) fn recv_timeout<M: for<'de> Deserialize<'de> + SensitiveFrame>(
         &mut self,
         timeout: Duration,
@@ -1541,15 +1152,10 @@ impl Receiver {
                 let stalled = match conn.read_tls(&mut slice) {
                     Ok(0) => true,
                     Ok(_) => false,
-                    // "message buffer full": rustls holds as much undecrypted
-                    // or unread plaintext as it will take.
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidData => true,
                     Err(e) => return Err(e.into()),
                 };
                 if stalled {
-                    // Decrypt, then move the plaintext out so rustls has room
-                    // for the rest of this read: a burst of full frames (a
-                    // cache push stream) must never overflow its buffer.
                     conn.process_new_packets()
                         .map_err(|e| Error::Tls(e.to_string()))?;
                     let before = self.plain.len();
@@ -1568,7 +1174,6 @@ impl Receiver {
         }
     }
 
-    /// Wait for the next frame; the peer is `Lost` after `deadline`.
     pub(crate) fn recv<M: for<'de> Deserialize<'de> + SensitiveFrame>(
         &mut self,
         deadline: Duration,
@@ -1577,8 +1182,6 @@ impl Receiver {
     }
 }
 
-/// Move whatever plaintext rustls has decrypted into `plain`. A clean close
-/// is left for the next `drain_plaintext` to report.
 fn move_plaintext(conn: &mut rustls::Connection, plain: &mut Vec<u8>) -> Result<()> {
     loop {
         let start = plain.len();
@@ -1622,7 +1225,6 @@ fn split(conn: rustls::Connection, sock: TcpStream) -> Result<(Sender, Receiver)
     ))
 }
 
-/// One answer to an in-flight cache transfer, as it arrived.
 enum CacheAnswer {
     Grant(Grant),
     Chunk(Chunk),
@@ -1631,43 +1233,24 @@ enum CacheAnswer {
 }
 
 impl CacheAnswer {
-    /// `CacheEnd` and `CacheRefused` close a transfer; nothing of it
-    /// follows them.
     fn terminal(&self) -> bool {
         matches!(self, Self::End | Self::Refused(_))
     }
 }
 
-/// Answers one transfer may have queued before its caller reads them; a
-/// transfer whose caller falls further behind (disk or hashing slower than
-/// the link) is abandoned rather than buffered without bound.
 const ANSWER_QUEUE: usize = 64;
 
-/// One attempt's place in the router.
 enum Slot {
-    /// A caller is waiting on these answers.
     Live(mpsc::SyncSender<CacheAnswer>),
-    /// The caller gave up before the transfer's terminal answer: what the
-    /// controller still sends for it is swallowed here until that terminal
-    /// arrives, and a new transfer of the attempt is `busy` meanwhile — the
-    /// stale tail can never be routed into it.
     Draining,
 }
 
-/// Routes cache answers from whichever thread reads the session to the call
-/// waiting on that attempt: a transfer is synchronous — the caller sends the
-/// need and blocks — but the frames arrive on the session reader, so the two
-/// meet here. The reader never blocks on a slow caller: a full queue
-/// abandons that transfer.
 #[derive(Default)]
 pub struct CacheRouter {
     waiting: Mutex<HashMap<AttemptId, Slot>>,
 }
 
 impl CacheRouter {
-    /// Claim `attempt` for one transfer. A second concurrent transfer for the
-    /// same attempt — or one while an abandoned transfer still drains — is
-    /// refused `Busy`: the wire routes by attempt alone.
     fn register(&self, attempt: AttemptId) -> std::result::Result<Channel<CacheAnswer>, Refusal> {
         let (tx, rx) = mpsc::sync_channel(ANSWER_QUEUE);
         let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
@@ -1678,8 +1261,6 @@ impl CacheRouter {
         Ok(rx)
     }
 
-    /// The caller is done: a transfer that saw its terminal answer frees the
-    /// attempt, one that did not leaves it draining.
     fn finish(&self, attempt: AttemptId, terminal: bool) {
         let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
         if terminal {
@@ -1689,7 +1270,6 @@ impl CacheRouter {
         }
     }
 
-    /// Hand an answer to the transfer waiting for it, if any.
     fn route(&self, attempt: AttemptId, answer: CacheAnswer) {
         let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
         let terminal = answer.terminal();
@@ -1698,13 +1278,10 @@ impl CacheRouter {
             Some(Slot::Draining) => terminal,
             Some(Slot::Live(tx)) => match tx.try_send(answer) {
                 Ok(()) => false,
-                // The caller is too far behind: dropping the sender ends its
-                // wait (disconnected), and the rest of the stream drains.
                 Err(mpsc::TrySendError::Full(_)) => {
                     waiting.insert(attempt, Slot::Draining);
                     false
                 }
-                // The caller already left; a terminal closes the attempt.
                 Err(mpsc::TrySendError::Disconnected(_)) => {
                     if !terminal {
                         waiting.insert(attempt, Slot::Draining);
@@ -1719,36 +1296,22 @@ impl CacheRouter {
     }
 }
 
-/// The worker's [`sentinel_cache::remote::Remote`] over the link:
-/// requests go out on the bulk connection when one is attached and on the
-/// control connection otherwise, and the session reader routes the answers
-/// back to the call that is waiting for them. Cheap to clone a reference to;
-/// the executor gets it from [`Reporter::remote_cache`].
 pub struct LinkRemote {
     control: Sender,
     bulk: Mutex<BulkSlot>,
-    /// Offer fences are received on control while protocol-10 spec and
-    /// secret frames normally arrive on bulk. Keep the accepted fence in
-    /// session state shared by both readers.
     fences: Mutex<HashMap<AttemptId, Fence>>,
     router: Arc<CacheRouter>,
-    /// The negotiated protocol: from 8 an abandoned transfer is cancelled
-    /// on the controller (`CacheCancel`).
     protocol: u16,
 }
 
-/// The live bulk attachment and the route history it has been through.
 #[derive(Default)]
 struct BulkSlot {
     sender: Option<Sender>,
     route: Route,
-    /// Bytes out/in of the bulk connections this session already lost, so
-    /// the transport totals keep counting across a bulk redial.
     done: (u64, u64),
 }
 
 impl BulkSlot {
-    /// Retire the live bulk sender, keeping its byte counts.
     fn retire(&mut self) -> bool {
         let Some(sender) = self.sender.take() else {
             return false;
@@ -1760,11 +1323,6 @@ impl BulkSlot {
     }
 }
 
-/// Which route a bulk-class send took, as counts of bulk attachments and
-/// detachments over the session. A sender that finds `detached` moved since
-/// its last send knows frames it handed to the dead connection may never
-/// have arrived and must rewind before anything else goes out; `attached`
-/// moving means later frames may overtake ones still in flight on control.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Route {
     pub attached: u64,
@@ -1802,10 +1360,6 @@ impl LinkRemote {
             .retain(|attempt, _| held.contains(attempt));
     }
 
-    /// Tell the controller this worker abandoned the attempt's transfer: a
-    /// serve stops at its next chunk, and an upload releases its staging and
-    /// lock. Best effort, protocol 8 only; the draining slot swallows whatever
-    /// is already in flight.
     fn cancel(&self, attempt: AttemptId) {
         if self.protocol >= CACHE_CANCEL_MIN.0 {
             let _ = self.send(&ClientMessage::CacheCancel {
@@ -1837,8 +1391,6 @@ impl LinkRemote {
         slot.route.attached += 1;
     }
 
-    /// The bulk connection ended: the control connection takes the traffic
-    /// back until a new one is up.
     fn detach_bulk(&self) {
         let mut slot = self.bulk.lock().unwrap_or_else(|p| p.into_inner());
         if slot.retire() {
@@ -1846,8 +1398,6 @@ impl LinkRemote {
         }
     }
 
-    /// Bytes out/in over every bulk connection this session has had, so
-    /// throughput counts the bulk traffic, not only control.
     fn bulk_bytes(&self) -> (u64, u64) {
         let slot = self.bulk.lock().unwrap_or_else(|p| p.into_inner());
         let (out, in_) = slot.sender.as_ref().map_or((0, 0), Sender::bytes);
@@ -1868,9 +1418,6 @@ impl sentinel_cache::remote::Remote for LinkRemote {
     ) -> std::result::Result<(), Refusal> {
         let attempt = AttemptId::from_bytes(need.attempt).map_err(|_| Refusal::Denied)?;
         let answers = self.router.register(attempt)?;
-        // Deregister on every exit, including a sink's early stop — and on
-        // an exit before the terminal answer, cancel on the controller and
-        // leave the attempt draining.
         let mut claim = Claim {
             remote: self,
             attempt,
@@ -1905,8 +1452,6 @@ impl sentinel_cache::remote::Remote for LinkRemote {
                     }
                     sink.chunk(&chunk)?;
                 }
-                // The end marker is terminal; a stream without a plan never
-                // opened, so it is a protocol violation, not a completion.
                 Ok(CacheAnswer::End) => {
                     claim.terminal = true;
                     return if planned { Ok(()) } else { Err(Refusal::Store) };
@@ -1921,8 +1466,6 @@ impl sentinel_cache::remote::Remote for LinkRemote {
         deadline: Instant,
         source: &mut dyn Read,
     ) -> std::result::Result<[u8; 32], Refusal> {
-        // A digest named only at the end needs a controller that takes it
-        // there (protocol 9); an older one would store nothing.
         let at_end = upload.digest == DIGEST_AT_END;
         if at_end && !self.digest_at_end() {
             return Err(Refusal::Store);
@@ -1936,14 +1479,11 @@ impl sentinel_cache::remote::Remote for LinkRemote {
         };
         self.send(&ClientMessage::CacheOffer(upload.clone()))
             .map_err(|_| Refusal::Aborted)?;
-        // The controller either grants a stream (it does not store this
-        // digest yet), answers `CacheEnd` (it already stores it) or refuses.
         let start = match wait_answer(&answers, deadline)? {
             CacheAnswer::Refused(refused) => {
                 claim.terminal = true;
                 return Err(Refusal::from_code(refused.code).unwrap_or(Refusal::Denied));
             }
-            // Only a digest stated up front can already be stored.
             CacheAnswer::End if !at_end => {
                 claim.terminal = true;
                 return Ok(upload.digest);
@@ -1952,13 +1492,9 @@ impl sentinel_cache::remote::Remote for LinkRemote {
             CacheAnswer::End | CacheAnswer::Chunk(_) => return Err(Refusal::Store),
         };
         let mut offset = 0u64;
-        // A granted offset is where the controller wants the stream to start;
-        // today it is always 0, but skipping is cheap and keeps the contract.
         let mut skip = start.offset;
         let mut buffer = vec![0u8; MAX_CACHE_CHUNK_BYTES];
         let mut sent = 0u64;
-        // Hashed as it goes out when the digest is stated at the end: the
-        // one read that sends the stream also names it.
         let mut hasher = at_end.then(blake3::Hasher::new);
         loop {
             if Instant::now() >= deadline {
@@ -1980,8 +1516,6 @@ impl sentinel_cache::remote::Remote for LinkRemote {
             if piece.is_empty() {
                 continue;
             }
-            // Encoded straight from the read buffer: no owned copy of the
-            // chunk is made to build the message.
             self.send(&PushRef {
                 attempt: &upload.attempt,
                 offset,
@@ -1995,8 +1529,6 @@ impl sentinel_cache::remote::Remote for LinkRemote {
             }
         }
         if sent != upload.total {
-            // The source ended before the declared length: never claim a
-            // complete stream the bytes do not back.
             return Err(Refusal::Aborted);
         }
         let digest = match hasher {
@@ -2024,7 +1556,6 @@ impl sentinel_cache::remote::Remote for LinkRemote {
     }
 }
 
-/// Answers one transfer waits for, bounded by `deadline`.
 fn wait_answer(
     answers: &Channel<CacheAnswer>,
     deadline: Instant,
@@ -2039,9 +1570,6 @@ fn wait_answer(
     }
 }
 
-/// Settles a transfer's claim when it ends, however it ends: a transfer
-/// that saw its terminal answer frees the attempt; one that did not is
-/// cancelled on the controller and left draining.
 struct Claim<'a> {
     remote: &'a LinkRemote,
     attempt: AttemptId,
@@ -2057,38 +1585,22 @@ impl Drop for Claim<'_> {
     }
 }
 
-/// One accepted, authenticated worker session on the controller.
 pub struct WorkerSession {
     rx: Receiver,
     tx: Sender,
     pub admitted: Admitted,
     pub fingerprint: Digest,
-    /// The capacity the hello reported, kept so the protocol-7 profile is
-    /// recorded together with it, not after a second read.
     capacity: Capacity,
     profiled: bool,
 }
 
-/// One accepted connection, before it is clear which half of a session it
-/// carries: the control connection opens with `Hello`, the bulk connection
-/// with `BulkHello`.
 pub enum Accepted {
     Control(WorkerSession),
-    /// A second connection of a session whose control half must be live:
-    /// the caller checks that `fingerprint` matches, and only then serves it.
     Bulk(BulkSession),
 }
 
-/// How long an accepted connection may take to finish its TLS handshake and
-/// send its first message, all told. Before that the peer has proved
-/// nothing, so it must not hold a session slot for longer.
 pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Drive a TLS handshake to completion, bounded in absolute time: every
-/// read or write waits at most `deadline`, and the loop gives up once the
-/// whole handshake has taken that long. With an `arrival`, reads wait
-/// [`ARRIVAL_POLL`] at a time (the socket's read timeout) and a hand-off's
-/// claim ends the loop with [`Error::Closed`], for the caller to close.
 fn handshake(
     conn: &mut rustls::Connection,
     socket: &TcpStream,
@@ -2118,24 +1630,8 @@ fn handshake(
     Ok(())
 }
 
-/// How often a connection a hand-off may claim ([`Arrival`]) looks for the
-/// claim while it waits for its peer's handshake or hello: the longest a
-/// claim waits to be acted on. It is the socket's read timeout then, so a
-/// peer that answers sooner costs no extra wake-up.
 pub const ARRIVAL_POLL: Duration = Duration::from_millis(20);
 
-/// A connection still in its TLS handshake or hello that a Tailcat hand-off
-/// may claim. The controller keeps one per loopback arrival (a helper dials
-/// the link port on loopback) and gives it to [`accept_arriving`].
-///
-/// A claim ([`Arrival::hand_off`]) succeeds only while the connection waits
-/// for its peer. Its own thread then ends it the way a hand-off ends a
-/// session: a TLS `close_notify` and a FIN, which the helper carries to the
-/// worker, then it reads and drops what still comes until the worker's own
-/// end (the close was delivered) or the bound passes. A connection whose
-/// hello already arrived is being admitted and cannot be claimed: it
-/// becomes a session, and the hand-off closes it as one once it is
-/// registered ([`Arrival::leave`]).
 #[derive(Debug, Default)]
 pub struct Arrival(std::sync::atomic::AtomicU8);
 
@@ -2147,8 +1643,6 @@ impl Arrival {
     const UNANSWERED: u8 = 4;
     const LEFT: u8 = 5;
 
-    /// Claim the connection for a hand-off; `false` once its hello arrived
-    /// or it ended.
     pub fn hand_off(&self) -> bool {
         self.0
             .compare_exchange(
@@ -2160,15 +1654,10 @@ impl Arrival {
             .is_ok()
     }
 
-    /// Its hello arrived and is being admitted; it has not yet been
-    /// registered as a session.
     pub fn admitting(&self) -> bool {
         self.0.load(Ordering::Acquire) == Self::ADMITTING
     }
 
-    /// For a claimed connection: `Some(true)` once it ended at the other
-    /// side too, `Some(false)` when the bound passed first, `None` while
-    /// its close is still under way.
     pub fn answered(&self) -> Option<bool> {
         match self.0.load(Ordering::Acquire) {
             Self::ANSWERED => Some(true),
@@ -2177,9 +1666,6 @@ impl Arrival {
         }
     }
 
-    /// Its thread is done with it: registered as a session, or failed. A
-    /// claimed connection that failed before its close was sent ended all
-    /// the same, so it counts as answered.
     pub fn leave(&self) {
         let _ = self
             .0
@@ -2194,8 +1680,6 @@ impl Arrival {
         self.0.load(Ordering::Acquire) == Self::HANDED
     }
 
-    /// The hello arrived: from now on the connection cannot be claimed.
-    /// `false` when a claim came first.
     fn admit(&self) -> bool {
         self.0
             .compare_exchange(
@@ -2207,8 +1691,6 @@ impl Arrival {
             .is_ok()
     }
 
-    /// End a claimed connection: `close_notify` and a FIN through `tx`, then
-    /// read and drop until the peer ends too or `within` passes.
     fn close(&self, tx: &Sender, socket: &TcpStream, within: Duration) {
         tx.close_notify();
         let started = Instant::now();
@@ -2225,7 +1707,6 @@ impl Arrival {
                             | std::io::ErrorKind::TimedOut
                             | std::io::ErrorKind::Interrupted
                     ) => {}
-                // Reset: the other side ended as well, if less politely.
                 Err(_) => break true,
             }
             if started.elapsed() >= within {
@@ -2243,9 +1724,6 @@ impl Arrival {
     }
 }
 
-/// Socket options every link connection carries: no Nagle delay, and a
-/// write timeout so a peer that stops reading cannot block a sender (and
-/// with it the connection lock and its reader) forever.
 fn configure(socket: &TcpStream, read: Duration) -> Result<()> {
     socket.set_read_timeout(Some(read))?;
     socket.set_write_timeout(Some(HEARTBEAT_DEADLINE))?;
@@ -2253,9 +1731,6 @@ fn configure(socket: &TcpStream, read: Duration) -> Result<()> {
     Ok(())
 }
 
-/// Complete the TLS handshake on an accepted socket, read the first message,
-/// and answer on the control connection (which runs the admission policy),
-/// all within [`HANDSHAKE_DEADLINE`].
 pub fn accept(
     socket: TcpStream,
     config: Arc<rustls::ServerConfig>,
@@ -2264,7 +1739,6 @@ pub fn accept(
     accept_within(socket, config, admission, HANDSHAKE_DEADLINE)
 }
 
-/// [`accept`] under a caller-chosen handshake-plus-hello deadline.
 pub fn accept_within(
     socket: TcpStream,
     config: Arc<rustls::ServerConfig>,
@@ -2274,9 +1748,6 @@ pub fn accept_within(
     accept_watched(socket, config, admission, deadline, None)
 }
 
-/// [`accept_within`] for a connection a hand-off may claim until its hello
-/// arrives. Claimed, it is closed cleanly and waits up to `answer_within`
-/// for the peer's end ([`Arrival`]); the result is then [`Error::Closed`].
 pub fn accept_arriving(
     socket: TcpStream,
     config: Arc<rustls::ServerConfig>,
@@ -2405,10 +1876,6 @@ fn accept_watched(
     }
 }
 
-/// The bulk half of a protocol-7 session: the worker's second connection,
-/// carrying logs, spec chunks, artifacts and cache transfers. It is admitted
-/// only when a live control session with the same certificate exists; the
-/// controller checks that before calling [`BulkSession::serve`].
 pub struct BulkSession {
     rx: Receiver,
     tx: Sender,
@@ -2421,21 +1888,12 @@ impl BulkSession {
         self.tx.clone()
     }
 
-    /// Serve bulk messages until the worker says goodbye, breaks protocol,
-    /// or `alive` says its control session is gone. `protocol` is the
-    /// control session's negotiated version: the bulk connection carries no
-    /// negotiation of its own. Bulk has no heartbeat — the control session
-    /// is the liveness signal — so an idle bulk connection is kept for as
-    /// long as its control session lives rather than torn down and redialled
-    /// every heartbeat deadline.
     pub fn serve(
         &mut self,
         handler: &dyn SessionHandler,
         protocol: u16,
         alive: &dyn Fn() -> bool,
     ) -> Result<()> {
-        // Bulk connections carry no negotiation and cannot report a profile;
-        // the capacity is only ever read by the control connection.
         let mut profiled = true;
         serve_connection(
             handler,
@@ -2459,10 +1917,6 @@ impl WorkerSession {
         self.capacity
     }
 
-    /// Serve heartbeats and offer answers until the worker says goodbye,
-    /// stops answering, or breaks protocol. Bulk-class messages are accepted
-    /// here too: a protocol-7 worker whose second connection cannot be
-    /// established falls back to this one.
     pub fn serve(&mut self, handler: &dyn SessionHandler) -> Result<()> {
         let worker = self.admitted.worker;
         let protocol = self.admitted.negotiated.protocol.0;
@@ -2479,14 +1933,8 @@ impl WorkerSession {
     }
 }
 
-/// The most log frames written ahead of one `fsync`: well inside the
-/// worker's `MAX_UNACKED_LOG_FRAMES` window, so a full window is never
-/// waiting on an acknowledgement the batch has not earned yet.
 const LOG_SYNC_FRAMES: usize = 64;
 
-/// Make the deferred frames durable, then acknowledge each attempt once, at
-/// the highest sequence it holds. A sync that fails acknowledges nothing and
-/// closes the connection; the worker resends from its last acknowledgement.
 fn flush_log_acks(
     handler: &dyn SessionHandler,
     worker: WorkerId,
@@ -2507,14 +1955,6 @@ fn flush_log_acks(
     Ok(())
 }
 
-/// Serve one connection's inbound messages until `Bye`, a protocol violation
-/// or loss. `bulk` is `None` on the control connection: it carries
-/// heartbeats, offer answers and reports, accepts bulk-class messages as the
-/// fallback path, and is lost after a heartbeat deadline of silence. A bulk
-/// connection (`Some(alive)`) carries the bulk classes only and refuses
-/// control-class messages, so a misrouted offer can never surface as a
-/// silently dropped heartbeat; its silence is fine for as long as `alive`
-/// says the control session is.
 #[allow(clippy::too_many_arguments)]
 fn serve_connection(
     handler: &dyn SessionHandler,
@@ -2527,34 +1967,17 @@ fn serve_connection(
     tx: &Sender,
 ) -> Result<()> {
     let control = bulk.is_none();
-    // In-flight artifact per attempt (protocol 4): set when a begin is
-    // granted, cleared by every verdict. Names the verdict a mid-flight
-    // failure answers with and orders begin/file/data/end.
     let mut artifacts: HashMap<AttemptId, String> = HashMap::new();
-    // In-flight upload per attempt (protocol 7): the receiving state a
-    // `CacheOffer` opened, fed by its `CachePush` frames until `CachePushEnd`,
-    // with the time it last moved. Bounded per connection, and one idle
-    // past `UPLOAD_IDLE` is dropped — its staging file and entry lock with
-    // it.
     let mut uploads: HashMap<AttemptId, (sentinel_cache::remote::Receiving, Instant)> =
         HashMap::new();
-    // Downloads this connection is streaming right now, bounded so a worker
-    // cannot make the controller spawn threads without limit.
     let transfers = Arc::new(AtomicUsize::new(0));
-    // The cancel flag of each download in flight (protocol 8).
     let serving: Arc<Mutex<HashMap<AttemptId, Arc<AtomicBool>>>> = Arc::default();
-    // Log frames written but not yet acknowledged: one `fsync` per attempt
-    // covers the whole burst the receiver already holds, so the durability
-    // cost is paid per window of frames, never per frame. Nothing here is
-    // acknowledged before `log_sync` says it is durable.
     let mut unsynced: Vec<(AttemptId, u64)> = Vec::new();
     let mut unsynced_frames = 0usize;
     loop {
         let received = if unsynced.is_empty() {
             rx.recv_timeout::<ClientMessage>(HEARTBEAT_DEADLINE)?
         } else {
-            // Only what the receiver already holds: a zero wait never
-            // reads the socket, so an idle link acknowledges at once.
             match rx.recv_timeout::<ClientMessage>(Duration::ZERO)? {
                 Some(message) => Some(message),
                 None => {
@@ -2617,9 +2040,6 @@ fn serve_connection(
                     return Err(Error::Protocol("control message on bulk"));
                 }
                 let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                // An oversized summary (the frame cap leaves room above it)
-                // is telemetry the controller will not keep, not a reason to
-                // drop the session and lose the verdict riding with it.
                 let summary = summary.filter(|s| s.len() <= MAX_SUMMARY_BYTES);
                 handler.reported(worker, attempt, Fence(fence), event.to_event()?, summary);
             }
@@ -2628,7 +2048,6 @@ fn serve_connection(
                 if handler.spec_requested(worker, id, tx.clone(), protocol) {
                     continue;
                 }
-                // The synchronous fallback still owes the protocol gate.
                 if protocol < 3 {
                     tx.send(&ServerMessage::NoSpec { attempt })?;
                     continue;
@@ -2730,8 +2149,6 @@ fn serve_connection(
                 }
                 let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
                 match handler.log_end(worker, id, last_seq, &gaps) {
-                    // Protocol 5 names the durable-end boundary;
-                    // earlier versions sent nothing here.
                     LogVerdict::Acked(_) if protocol >= 5 => {
                         tx.send(&ServerMessage::LogEndAck { attempt })?;
                     }
@@ -2866,8 +2283,6 @@ fn serve_connection(
                 if protocol < PROFILE_MIN.0 {
                     return Err(Error::Protocol("profile needs protocol 7"));
                 }
-                // From protocol 8 a later profile is an availability refresh:
-                // the worker re-reports what it holds as it changes.
                 if *profiled && protocol < CACHE_CANCEL_MIN.0 {
                     return Err(Error::Protocol("second profile"));
                 }
@@ -2944,13 +2359,9 @@ fn serve_connection(
                 let attempt = upload.attempt;
                 let id = attempt_id(attempt)?;
                 if uploads.contains_key(&id) || uploads.len() >= MAX_CACHE_TRANSFERS {
-                    // One upload per attempt, a few per connection: an
-                    // abandoned one cannot pin more than its share.
                     send_cache_refused(tx, attempt, Refusal::Busy)?;
                     continue;
                 }
-                // A digest stated only at the end is a protocol-9 offer; an
-                // older session never agreed to it.
                 if upload.digest == DIGEST_AT_END && protocol < DIGEST_AT_END_MIN.0 {
                     send_cache_refused(tx, attempt, Refusal::Store)?;
                     continue;
@@ -2958,7 +2369,6 @@ fn serve_connection(
                 match handler.cache_offer(worker, &upload) {
                     None => send_cache_refused(tx, attempt, Refusal::Denied)?,
                     Some(root) => match sentinel_cache::remote::Receiving::begin(&root, &upload) {
-                        // Already stored: no grant, no bytes, done.
                         Ok(None) => {
                             tx.send(&ServerMessage::CacheEnd(End {
                                 attempt,
@@ -2989,8 +2399,6 @@ fn serve_connection(
                     }
                     None => None,
                 };
-                // A push for an upload already failed, cancelled or reaped
-                // is dropped: its refusal was sent once, never per frame.
                 if let Some(Err(code)) = pushed {
                     uploads.remove(&id);
                     send_cache_refused(tx, attempt, code)?;
@@ -3024,9 +2432,6 @@ fn serve_connection(
                 let Some(id) = well_formed_attempt(&attempt) else {
                     continue;
                 };
-                // A download stops at its next chunk and sends its own
-                // terminal; an upload is dropped here — staging and lock
-                // with it — and answered once.
                 if let Some(flag) = serving.lock().unwrap_or_else(|p| p.into_inner()).get(&id) {
                     flag.store(true, Ordering::Release);
                 }
@@ -3040,9 +2445,6 @@ fn serve_connection(
     }
 }
 
-/// The attempt's id when the bytes are well-formed; `None` means a cache
-/// frame named an id that cannot exist, which is answered `Store` rather
-/// than tearing the session down.
 fn well_formed_attempt(raw: &[u8; 16]) -> Option<AttemptId> {
     AttemptId::from_bytes(*raw).ok()
 }
@@ -3058,7 +2460,6 @@ fn send_cache_refused(sender: &Sender, attempt: [u8; 16], code: Refusal) -> Resu
     }))
 }
 
-/// Counts one download this connection is streaming, released on every exit.
 struct TransferPermit(Arc<AtomicUsize>);
 
 impl Drop for TransferPermit {
@@ -3067,12 +2468,6 @@ impl Drop for TransferPermit {
     }
 }
 
-/// Stream one authorized download off the session thread: grant,
-/// ordered chunks, end — or, once the worker cancelled it (protocol 8),
-/// `CacheRefused` with `aborted` as the terminal at the next chunk. One
-/// chunk buffer serves the whole transfer. The chunk size is checked here
-/// because the frame cap is the link's, and a running digest cannot be
-/// recomputed for a split piece.
 fn serve_cache_need(
     root: &std::path::Path,
     need: &Need,
@@ -3123,13 +2518,6 @@ fn ids(raw: &[[u8; 16]]) -> Result<Vec<AttemptId>> {
         .collect()
 }
 
-/// Push an offer to a worker. The dispatcher's only way in.
-///
-/// A connection another thread holds for a moment — the session's own
-/// reader taking the previous offer's acknowledgement off the wire — is
-/// waited for up to [`OFFER_BUSY_WAIT`]; a peer that holds it longer (a
-/// spec or log stream) is refused as [`BUSY`] so it costs the single
-/// dispatcher no more than that.
 pub fn offer(sender: &Sender, offer: &Offer) -> Result<()> {
     let message = ServerMessage::Offer(offer.to_wire());
     let give_up = Instant::now() + OFFER_BUSY_WAIT;
@@ -3143,34 +2531,20 @@ pub fn offer(sender: &Sender, offer: &Offer) -> Result<()> {
     }
 }
 
-/// How long [`offer`] waits for a connection that is busy for a moment
-/// before it reports [`BUSY`].
 pub const OFFER_BUSY_WAIT: Duration = Duration::from_millis(20);
 
-/// What the dispatcher's own pushes (offers, prefetch hints) may wait on one
-/// peer: they come from the single dispatcher thread, so a peer that stopped
-/// reading must cost the fleet this, not the 15 s write timeout.
 pub const DISPATCH_WRITE_BOUND: Duration = Duration::from_millis(250);
 
-/// The error [`Sender::send_bounded`] returns when another thread is
-/// mid-write on the connection: nothing was sent and the connection is fine.
 pub const BUSY: &str = "sender busy";
 
-/// Whether `error` is the [`BUSY`] refusal rather than a failed connection.
 pub fn is_busy(error: &Error) -> bool {
     matches!(error, Error::Internal(BUSY))
 }
 
-/// Whether the connection is free for a push right now (a peer whose spec or
-/// log traffic holds the connection lock is skipped this pass, not waited
-/// for). Advisory: [`Sender::send_bounded`] is the check that counts.
 pub fn is_free(sender: &Sender) -> bool {
     sender.0.conn.try_lock().is_ok()
 }
 
-/// Push a prefetch hint (protocol 9) to a session: the whole wanted set of
-/// image references. Refused before anything is sent when it is over the
-/// wire bounds, so a caller can never make a worker drop the session.
 pub fn prefetch(sender: &Sender, images: &[String]) -> Result<()> {
     if images.len() > MAX_PREFETCH_IMAGES
         || images
@@ -3187,7 +2561,6 @@ pub fn prefetch(sender: &Sender, images: &[String]) -> Result<()> {
     )
 }
 
-/// The worker's end of a session.
 pub struct Link {
     rx: Receiver,
     tx: Sender,
@@ -3195,29 +2568,15 @@ pub struct Link {
     pub negotiated: Negotiated,
     interval: Duration,
     seq: u64,
-    /// Where the bulk connection dials back to, and with which identity.
     addr: SocketAddr,
     client: Arc<rustls::ClientConfig>,
-    /// The session's remote side: the live bulk attachment and the cache
-    /// transfer router. Shared with the reader threads.
     remote: Arc<LinkRemote>,
-    /// Process telemetry to refresh on the control connection.
     transport: Option<TransportStats>,
-    /// Where the process's own transport measurements come from (the Tailcat
-    /// helper's latest probe): read at every telemetry resend, so a path
-    /// that changed mid-session (direct to relayed, say) is reported.
     transport_source: Option<TransportSource>,
     beats: u64,
-    /// When the last heartbeat left: what the lease the pong renews is
-    /// measured from, monotonically.
     ping_sent: Instant,
-    /// Whether [`Reporter::remote_cache`] hands the executor a handle:
-    /// off by configuration, every remote lookup is a local miss.
     remote_cache: bool,
-    /// The profile this session reported last (protocol 7), the base a
-    /// protocol-8 availability refresh amends.
     profile: Option<Profile>,
-    /// The executor's availability version that profile carried.
     availability_sent: u64,
 }
 
@@ -3231,8 +2590,6 @@ impl std::fmt::Debug for Link {
     }
 }
 
-/// Connect, present the identity, say hello (redeeming an enrollment on the
-/// first connection), and wait for the answer.
 pub fn connect(
     addr: SocketAddr,
     config: Arc<rustls::ClientConfig>,
@@ -3244,7 +2601,6 @@ pub fn connect(
 ) -> Result<Link> {
     let socket = TcpStream::connect_timeout(&addr, HEARTBEAT_DEADLINE)?;
     configure(&socket, HEARTBEAT_DEADLINE)?;
-    // The name is irrelevant with a pinned fingerprint but rustls needs one.
     let server_name = ServerName::try_from("sentinel").expect("static name");
     let mut conn = rustls::Connection::Client(
         ClientConnection::new(Arc::clone(&config), server_name)
@@ -3262,8 +2618,6 @@ pub fn connect(
         capacity,
     })?;
     match rx.recv::<ServerMessage>(HEARTBEAT_DEADLINE)? {
-        // A welcome at a version this worker did not offer is one it cannot
-        // speak: refuse it here rather than fail on the first frame.
         ServerMessage::Welcome { negotiated, .. } if !range.contains(&negotiated.protocol.0) => {
             Err(Error::Protocol(
                 "negotiated version outside the hello's range",
@@ -3320,23 +2674,10 @@ pub fn connect(
     }
 }
 
-/// The executor's way to speak on the session from its own threads: state
-/// events under the attempt's fence, spec requests, log frames and artifact
-/// publication. Sending fails once the session is gone; the executor keeps
-/// the event and resends it when it is attached to the next session.
-///
-/// From protocol 7 the bulk-class messages (spec requests, logs, artifacts)
-/// prefer the bulk connection and fall back to the control one when no bulk
-/// connection is up; reports and abandons always go control, because their
-/// latency is what keeps a lease alive.
 #[derive(Clone)]
 pub struct Reporter {
     control: Sender,
-    /// Protocol 7: the session's remote side, which owns the live bulk
-    /// attachment. `None` below protocol 7, where everything is control.
     bulk: Option<Arc<LinkRemote>>,
-    /// Whether the remote cache is exposed to the executor at all:
-    /// protocol 7 and not disabled by configuration.
     remote_cache: bool,
     protocol: u16,
 }
@@ -3353,16 +2694,10 @@ impl Reporter {
         }
     }
 
-    /// The route bulk-class sends take now. Constant below protocol 7,
-    /// where everything is control.
     pub fn route(&self) -> Route {
         self.bulk.as_ref().map(|r| r.route()).unwrap_or_default()
     }
 
-    /// Protocol 7. The session's remote cache: fetch and offer objects
-    /// over the link. `None` below protocol 7 or when the operator disabled
-    /// remote cache in this process's configuration; the executor must then
-    /// treat every remote lookup as a local miss, never as a failure.
     pub fn remote_cache(&self) -> Option<Arc<dyn sentinel_cache::remote::Remote>> {
         if !self.remote_cache {
             return None;
@@ -3382,7 +2717,6 @@ impl Reporter {
         })
     }
 
-    /// The terminal report with the attempt's encoded summary.
     pub fn finish(
         &self,
         attempt: AttemptId,
@@ -3408,17 +2742,11 @@ impl Reporter {
         })
     }
 
-    /// One frame from the spool. The executor keeps at most
-    /// `MAX_UNACKED_LOG_FRAMES` in flight per attempt.
     pub fn log(&self, attempt: AttemptId, frame: &Frame) -> Result<()> {
         self.log_frame(attempt, frame.seq, frame.step, frame.stream, &frame.bytes)
             .map(|_| ())
     }
 
-    /// [`Reporter::log`] from borrowed parts, encoded straight into the
-    /// frame buffer (no owned copy of the bytes), returning the route the
-    /// frame took so the log pipe can tell when frames may have been lost
-    /// with a bulk connection.
     pub fn log_frame(
         &self,
         attempt: AttemptId,
@@ -3439,10 +2767,6 @@ impl Reporter {
         })
     }
 
-    /// Hand back an attempt this worker acknowledged but never started (its
-    /// run spec never arrived, or was refused): the controller requeues it,
-    /// or settles it canceled when that is desired. Control class: it
-    /// decides a lease.
     pub fn decline(&self, attempt: AttemptId, fence: Fence) -> Result<()> {
         self.control.send(&ClientMessage::Decline {
             attempt: *attempt.as_bytes(),
@@ -3450,13 +2774,10 @@ impl Reporter {
         })
     }
 
-    /// The protocol this session negotiated; the log pipe uses it to
-    /// know whether `LogEnd` is answered by `LogEndAck`.
     pub fn protocol(&self) -> u16 {
         self.protocol
     }
 
-    /// The attempt was in this worker's leftovers after a restart.
     pub fn abandon(&self, attempt: AttemptId, fence: Fence) -> Result<()> {
         self.control.send(&ClientMessage::Abandon {
             attempt: *attempt.as_bytes(),
@@ -3472,14 +2793,10 @@ impl Reporter {
         })
     }
 
-    /// Whether this session can publish artifacts at all. A worker on an
-    /// older protocol records every capture `failed` without sending.
     pub fn artifacts(&self) -> bool {
         self.protocol >= 4
     }
 
-    /// Begin publishing artifact `name`; the answer arrives as
-    /// `Executor::artifact_granted` or `artifact_verdict`.
     pub fn artifact_begin(&self, attempt: AttemptId, name: &str) -> Result<()> {
         if self.protocol < 4 {
             return Err(Error::Protocol("artifact needs protocol 4"));
@@ -3493,8 +2810,6 @@ impl Reporter {
         })
     }
 
-    /// The next file of the granted artifact; `len` bytes of `artifact_data`
-    /// follow it, seq from 0.
     pub fn artifact_file(&self, attempt: AttemptId, path: &str, len: u64, mode: u32) -> Result<()> {
         if path.is_empty() || path.len() > MAX_ARTIFACT_PATH_BYTES || len > MAX_ARTIFACT_BYTES {
             return Err(Error::Protocol("artifact file"));
@@ -3507,7 +2822,6 @@ impl Reporter {
         })
     }
 
-    /// One ordered chunk of the in-flight file.
     pub fn artifact_data(&self, attempt: AttemptId, seq: u32, bytes: &[u8]) -> Result<()> {
         if bytes.len() > MAX_ARTIFACT_CHUNK_BYTES {
             return Err(Error::Protocol("artifact chunk"));
@@ -3519,7 +2833,6 @@ impl Reporter {
         })
     }
 
-    /// The artifact's file set is complete; the verdict is terminal.
     pub fn artifact_end(&self, attempt: AttemptId, name: &str) -> Result<()> {
         self.bulk_class(&ClientMessage::ArtifactEnd {
             attempt: *attempt.as_bytes(),
@@ -3527,8 +2840,6 @@ impl Reporter {
         })
     }
 
-    /// No publishable content for `name`: `reason` 0 no match, 1 capture
-    /// failed. Also abandons an in-flight publication of the same name.
     pub fn artifact_absent(&self, attempt: AttemptId, name: &str, reason: u8) -> Result<()> {
         if self.protocol < 4 {
             return Err(Error::Protocol("artifact needs protocol 4"));
@@ -3541,39 +2852,19 @@ impl Reporter {
     }
 }
 
-/// What a worker does with the offers and orders it receives. Implemented by
-/// the worker's executor; the link owns dedup, acknowledgement and renewal.
 pub trait Executor: Send + Sync {
-    /// Called after the acknowledgement is on the wire.
     fn accepted(&self, _attempt: AttemptId) {}
-    /// Take the offer or not. Called once per attempt per session.
     fn offered(&self, offer: &Offer) -> bool;
-    /// The controller no longer counts this attempt as held: stop it now.
     fn stop(&self, attempt: AttemptId);
-    /// Cancellation is desired for this attempt's job: end it gracefully
-    /// (TERM, then KILL after the grace period) and report `Canceled`.
     fn cancel(&self, attempt: AttemptId);
-    /// Attempts still held, renewed with every heartbeat.
     fn held(&self) -> Vec<AttemptId>;
-    /// The controller renewed every held lease to this deadline.
     fn renewed(&self, until: UnixMillis);
-    /// The same renewal with the monotonic instant the answered heartbeat
-    /// left this worker. The renewal happened after that instant, so the
-    /// lease lasts at least `LEASE_MS` from it on this machine's own clock —
-    /// the deadline an executor should act on, with no wall-clock
-    /// comparison between two hosts. The default forwards to `renewed`.
     fn renewed_at(&self, until: UnixMillis, _sent: Instant) {
         self.renewed(until);
     }
-    /// A session is live: reports and spec requests go through `reporter`
-    /// until `detached`. Pending reports from a lost session are resent here.
     fn attached(&self, reporter: Reporter);
     fn detached(&self);
-    /// The run spec asked for with `Reporter::need_spec`, whole, with the
-    /// job context that precedes it.
     fn spec(&self, attempt: AttemptId, context: JobContext, bytes: Vec<u8>);
-    /// Protocol 10: the attempt's run spec and its separately framed secret
-    /// bundle. Old executors fail closed if a non-empty bundle reaches them.
     fn spec_with_secrets(
         &self,
         attempt: AttemptId,
@@ -3587,49 +2878,19 @@ pub trait Executor: Send + Sync {
             self.no_spec(attempt);
         }
     }
-    /// The fence of an attempt this executor accepted and still waits to
-    /// start. A secret transfer is bound to the fence of the offer
-    /// the worker acknowledged, which may have arrived on an earlier
-    /// session than the one the spec now answers on. The default knows
-    /// none: only fences offered on the current session are accepted.
     fn fence_of(&self, _attempt: AttemptId) -> Option<Fence> {
         None
     }
-    /// The controller will not serve the attempt's spec: it is not held
-    /// here, it was settled canceled, or its source or spec was refused for
-    /// good. A transient controller fault is never answered this way — the
-    /// request is queued or simply unanswered, and the executor asks again.
     fn no_spec(&self, attempt: AttemptId);
-    /// The bulk connection ended: frames handed to it may never have
-    /// arrived. Log senders rewind to their last acknowledgement before
-    /// anything else goes out on the fallback route.
     fn bulk_detached(&self) {}
-    /// Frames through `through` are durable on the controller.
     fn log_acked(&self, attempt: AttemptId, through: u64);
-    /// The controller stores no more frames of this attempt.
     fn log_refused(&self, attempt: AttemptId);
-    /// Protocol 5. The attempt's end marker is durable on the controller:
-    /// the spool may be dropped.
     fn log_ended(&self, _attempt: AttemptId) {}
-    /// The artifact named in `artifact_begin` was granted; the executor may
-    /// stream its files.
     fn artifact_granted(&self, _attempt: AttemptId, _name: &str) {}
-    /// The artifact's terminal answer; the publication is over either way.
     fn artifact_verdict(&self, _attempt: AttemptId, _name: &str, _code: ArtifactCode) {}
-    /// What this worker holds right now for placement — resident
-    /// image keys and cache bytes — with a version that moves whenever it
-    /// changes. The session reports it in the profile it opens with and,
-    /// from protocol 8, refreshes the profile when the version moves.
-    /// `None` (the default) reports nothing measured.
     fn availability(&self) -> Option<(u64, sentinel_protocol::negotiate::Availability)> {
         None
     }
-    /// Protocol 9: the controller's current prefetch hint — image
-    /// references (`name@sha256:…`) of queued work this worker could be
-    /// placed. The whole wanted set: it replaces the previous one, and a
-    /// prefetch of a reference no longer in it is stale. Bounded by the
-    /// session (`MAX_PREFETCH_IMAGES`); the executor still validates each
-    /// reference and pulls within its own bounds. The default ignores it.
     fn prefetch(&self, _images: &[String]) {}
 }
 
@@ -3638,10 +2899,6 @@ impl Link {
         self.interval
     }
 
-    /// Protocol 7: report the scheduling profile, immediately after
-    /// `Welcome`. A no-op on an older session: the controller negotiated
-    /// what it can decode, and a lower version means the extras do not
-    /// travel. Refuses a profile outside its bounds rather than truncating.
     pub fn send_profile(&mut self, profile: &Profile) -> Result<()> {
         if self.negotiated.protocol.0 < PROFILE_MIN.0 {
             return Ok(());
@@ -3654,15 +2911,10 @@ impl Link {
         Ok(())
     }
 
-    /// The availability version the opening profile already carried; a
-    /// later refresh is sent only once the executor's version moves.
     pub fn set_availability_sent(&mut self, version: u64) {
         self.availability_sent = version;
     }
 
-    /// Protocol 8: resend the profile when the executor's
-    /// availability changed since it was last reported — at most once per
-    /// heartbeat, and only when something moved.
     fn refresh_profile(&mut self, executor: &dyn Executor) -> Result<()> {
         if self.negotiated.protocol.0 < CACHE_CANCEL_MIN.0 {
             return Ok(());
@@ -3687,9 +2939,6 @@ impl Link {
         Ok(())
     }
 
-    /// Protocol 7: report transport telemetry and keep refreshing it
-    /// (round-trip time and byte counters) every `TRANSPORT_BEATS` beats. A
-    /// no-op on an older session.
     pub fn report_transport(&mut self, stats: &TransportStats) -> Result<()> {
         if self.negotiated.protocol.0 < PROFILE_MIN.0 {
             return Ok(());
@@ -3698,29 +2947,18 @@ impl Link {
         self.tx.send(&ClientMessage::Transport(stats.clone()))
     }
 
-    /// Protocol 7: where refreshed path telemetry comes from; read
-    /// each time the telemetry is resent.
     pub fn set_transport_source(&mut self, source: TransportSource) {
         self.transport_source = Some(source);
     }
 
-    /// Frame bytes written to / socket bytes read from the control
-    /// connection.
     pub fn bytes(&self) -> (u64, u64) {
         self.tx.bytes()
     }
 
-    /// Whether this session exposes the remote cache to the executor.
-    /// Disabled, [`Reporter::remote_cache`] answers `None` and the executor
-    /// treats every remote lookup as a local miss — the link still carries
-    /// whatever the other side asks for, since that is their decision.
     pub fn set_remote_cache(&mut self, enabled: bool) {
         self.remote_cache = enabled;
     }
 
-    /// Protocol 7: how the bulk connection is dialled, or `None` below it.
-    /// Detached from the control `Link` so the bulk thread can redial on its
-    /// own after its connection dies.
     pub fn bulk_dialer(&self) -> Option<BulkDialer> {
         (self.negotiated.protocol.0 >= PROFILE_MIN.0).then(|| BulkDialer {
             addr: self.addr,
@@ -3739,7 +2977,6 @@ impl Link {
             .take(MAX_LIST_ITEMS)
             .map(|a| *a.as_bytes())
             .collect();
-        // Taken before the send: the renewal cannot precede it.
         self.ping_sent = Instant::now();
         self.tx.send(&ClientMessage::Ping {
             seq: self.seq,
@@ -3747,9 +2984,6 @@ impl Link {
         })
     }
 
-    /// Refresh the telemetry a completed beat makes measurable: the
-    /// round-trip time of the ping/pong pair and the connection's byte
-    /// counters, resent every `TRANSPORT_BEATS` beats.
     fn beat_recorded(&mut self, rtt: Duration) -> Result<()> {
         self.beats += 1;
         let Some(stats) = self.transport.as_mut() else {
@@ -3761,9 +2995,6 @@ impl Link {
         stats.bytes_out = out + bulk_out;
         stats.bytes_in = bytes_in + bulk_in;
         if self.beats.is_multiple_of(TRANSPORT_BEATS) {
-            // What the process measured about the path since: the helper's
-            // latest probe. Round-trip time stays this session's own beat,
-            // the better measure of the link actually in use.
             if let Some(source) = &self.transport_source {
                 let fresh = source();
                 stats.path = fresh.path;
@@ -3774,8 +3005,6 @@ impl Link {
         Ok(())
     }
 
-    /// One beat: send a ping and wait for its pong within the deadline.
-    /// Offers arriving in between are answered through `executor`.
     pub fn beat(&mut self, executor: &dyn Executor) -> Result<()> {
         self.ping(executor)?;
         let sent = std::time::Instant::now();
@@ -3795,9 +3024,6 @@ impl Link {
         }
     }
 
-    /// Handle one message on the control connection; true when it was the
-    /// awaited pong. Bulk-class messages are accepted here as the fallback
-    /// path when the worker has no second connection up.
     fn handle(
         &mut self,
         message: ServerMessage,
@@ -3828,8 +3054,6 @@ impl Link {
                 if self.negotiated.protocol.0 >= 10 {
                     self.remote.set_fence(offer.attempt, offer.fence);
                 }
-                // Dedup within the session: a repeated offer of an attempt
-                // already taken is re-acknowledged, never re-executed.
                 let seen = &mut state.seen;
                 let take = if seen.insert(offer.attempt) {
                     executor.offered(&offer)
@@ -3848,9 +3072,6 @@ impl Link {
                 Ok(false)
             }
             ServerMessage::Prefetch { images } => {
-                // Only a protocol-9 session agreed to hints, and a hint is
-                // bounded like every wire list: over a bound is a
-                // violation, never a truncation.
                 if self.negotiated.protocol.0 < PREFETCH_MIN.0 {
                     return Err(Error::Protocol("prefetch needs protocol 9"));
                 }
@@ -3874,15 +3095,10 @@ impl Link {
         }
     }
 
-    /// A handle another thread can use to end the session (`Sender::close`);
-    /// `run` then returns `Lost` without waiting for a beat.
     pub fn sender(&self) -> Sender {
         self.tx.clone()
     }
 
-    /// Run the session until `until` returns true (checked after every
-    /// message and beat) or the controller is lost: beats at the interval,
-    /// offers answered the moment they arrive.
     pub fn run(&mut self, executor: &dyn Executor, mut until: impl FnMut() -> bool) -> Result<()> {
         executor.attached(Reporter {
             control: self.tx.clone(),
@@ -3923,7 +3139,6 @@ impl Link {
                 });
                 self.beat_recorded(rtt)?;
                 awaiting = None;
-                // Forget answered attempts the executor no longer holds.
                 let held = executor.held();
                 state.seen.retain(|a| held.contains(a));
                 if self.negotiated.protocol.0 >= 10 {
@@ -3935,9 +3150,6 @@ impl Link {
     }
 }
 
-/// Handle one bulk-class answer on either connection (the bulk one normally,
-/// the control one as a fallback) and hand cache answers to the transfer
-/// waiting for them.
 fn handle_bulk_message(
     message: ServerMessage,
     executor: &dyn Executor,
@@ -3968,9 +3180,6 @@ fn handle_bulk_message(
                     return Err(Error::Protocol("spec before secret bundle end"));
                 }
                 if state.discarded.remove(&attempt) {
-                    // Its secrets were bound to a fence this worker does not
-                    // hold: nothing of this answer is used. An attempt still
-                    // awaiting its spec here asks again or is handed back.
                     return Ok(());
                 }
                 let secrets = state.secret_bundles.remove(&attempt).map_or_else(
@@ -4004,9 +3213,6 @@ fn handle_bulk_message(
                 return Err(Error::Protocol("secret bundle length or duplicate"));
             }
             if !fence_held(remote, executor, attempt, Fence(fence)) {
-                // A stale or foreign fence for an attempt the controller
-                // still answers: refuse this transfer alone, keep the link
-                // that every other attempt's logs and caches ride on.
                 state.discarded.insert(attempt);
                 return Ok(());
             }
@@ -4036,7 +3242,6 @@ fn handle_bulk_message(
                 return Err(Error::Protocol("secret chunk size"));
             }
             if state.discarded.contains(&attempt) {
-                // The owned chunk wipes itself on drop.
                 return Ok(());
             }
             let assembly = state
@@ -4074,20 +3279,12 @@ fn handle_bulk_message(
             let (attempt, context) = JobContext::from_wire(wire)?;
             state.contexts.insert(attempt, context);
         }
-        // Protocol 6 shape: carries the tenant and the cache trust
-        // class; same in-flight bookkeeping as `Context`.
         ServerMessage::Context2(wire) => {
             let (attempt, context) = JobContext::from_wire2(wire)?;
             state.contexts.insert(attempt, context);
         }
         ServerMessage::Source { attempt, access } => {
             let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-            // The controller's `expires_ms` is its own wall clock: comparing
-            // it with this host's would tear the link down on every bound
-            // spec when the two clocks differ by more than the access's life.
-            // Validity is instead measured from receipt, on this host's
-            // clock, for the window one checkout (mirror attempt, then the
-            // direct fallback) can take.
             if !access.well_formed() {
                 return Err(Error::Protocol("source access"));
             }
@@ -4166,14 +3363,8 @@ fn handle_bulk_message(
     Ok(())
 }
 
-/// How long a bulk reader waits for the next frame before checking whether
-/// the session ended; bulk has no heartbeat of its own, the control
-/// connection is the liveness signal.
 const BULK_POLL: Duration = Duration::from_millis(500);
 
-/// How the bulk connection is dialled: the session's address, identity and
-/// remote state, detached from the control `Link` so the bulk thread can
-/// redial after its connection dies.
 #[derive(Clone)]
 pub struct BulkDialer {
     addr: SocketAddr,
@@ -4183,10 +3374,6 @@ pub struct BulkDialer {
 }
 
 impl BulkDialer {
-    /// Dial the second connection and announce it with `BulkHello`. The
-    /// controller attaches it to the live control session with the same
-    /// certificate; no answer is sent — the bulk path is usable as soon as
-    /// this returns.
     pub fn open(&self) -> Result<BulkLink> {
         let socket = TcpStream::connect_timeout(&self.addr, HEARTBEAT_DEADLINE)?;
         configure(&socket, HEARTBEAT_DEADLINE)?;
@@ -4200,8 +3387,6 @@ impl BulkDialer {
         tx.send(&ClientMessage::BulkHello {
             worker: *self.worker.as_bytes(),
         })?;
-        // Bulk-class sends move here now; the control connection stays the
-        // fallback until this connection ends.
         self.remote.attach_bulk(tx.clone());
         Ok(BulkLink {
             rx,
@@ -4212,8 +3397,6 @@ impl BulkDialer {
     }
 }
 
-/// The worker's bulk connection: anyone may send on it, exactly one thread
-/// reads it, and the cache router is fed from that read.
 pub struct BulkLink {
     rx: Receiver,
     tx: Sender,
@@ -4230,15 +3413,10 @@ impl BulkLink {
         self.worker
     }
 
-    /// End the connection from here; the reader fails out of its read.
     pub fn close(&self) {
         self.tx.close();
     }
 
-    /// Serve the controller's bulk answers until `until` returns true, the
-    /// connection is lost, or the peer breaks protocol. Detaches the bulk
-    /// attachment on the way out, so senders fall back to the control
-    /// connection instead of writing into a dead socket.
     pub fn run(&mut self, executor: &dyn Executor, mut until: impl FnMut() -> bool) -> Result<()> {
         let mut state = Inbound::default();
         let outcome = loop {
@@ -4270,7 +3448,6 @@ struct SecretAssembly {
     next_seq: u32,
 }
 
-/// Per-session inbound state: offers already answered, specs in flight.
 #[derive(Default)]
 struct Inbound {
     seen: std::collections::HashSet<AttemptId>,
@@ -4280,16 +3457,9 @@ struct Inbound {
     secret_bundles:
         std::collections::HashMap<AttemptId, (sentinel_protocol::secrets::DeliveryBundle, usize)>,
     secret_bytes: usize,
-    /// Attempts whose secret transfer named a fence this worker does not
-    /// hold them under: the transfer and its spec are dropped, never used
-    /// and never a reason to end the link. Bounded like `contexts`,
-    /// whose entry each one needs.
     discarded: std::collections::HashSet<AttemptId>,
 }
 
-/// Whether a secret transfer's `fence` is the one this worker accepted the
-/// attempt under — offered on this session, or on an earlier one and still
-/// awaiting its spec here.
 fn fence_held(
     remote: &LinkRemote,
     executor: &dyn Executor,
@@ -4299,11 +3469,6 @@ fn fence_held(
     remote.has_fence(attempt, fence) || executor.fence_of(attempt) == Some(fence)
 }
 
-/// The machine identity a worker reports in its protocol-7 profile: 16 bytes
-/// derived from the host's machine id, so sibling worker processes on one
-/// host agree on it — a host-level failure or drain can then be told apart
-/// from one process's. All zero when the host has no readable machine id:
-/// an unknown host, never a shared one.
 pub fn host_id() -> [u8; 16] {
     let mut out = [0u8; 16];
     for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
@@ -4334,8 +3499,6 @@ mod tests {
         assert_eq!(clamp_heartbeat(u32::MAX), HEARTBEAT_MAX_INTERVAL);
     }
 
-    /// One loopback TLS connection, split: the worker end's sender and the
-    /// controller end's receiver (kept so the peer stays open).
     fn tls_pair() -> (Sender, Receiver) {
         let server_identity = crate::identity::Identity::generate("controller").unwrap();
         let pin = server_identity.fingerprint();
@@ -4360,8 +3523,6 @@ mod tests {
         (tx, accept.join().unwrap())
     }
 
-    /// The transport's byte totals count the bulk connection too, and
-    /// keep counting across a bulk redial instead of restarting from zero.
     #[test]
     fn transport_bytes_count_every_bulk_connection_of_the_session() {
         let (control, _control_peer) = tls_pair();
@@ -4381,8 +3542,6 @@ mod tests {
         assert!(first_out > 0);
         assert_eq!(remote.bulk_bytes().0, first_out);
         assert_eq!(remote.control.bytes().0, 0, "bulk-class sends went bulk");
-        // The bulk connection drops; its bytes stay counted while control
-        // carries the traffic, and a redialled connection adds to them.
         remote.detach_bulk();
         remote.send(&cancel).unwrap();
         assert_eq!(remote.bulk_bytes().0, first_out);
@@ -4394,8 +3553,6 @@ mod tests {
         assert_eq!(remote.bulk_bytes().0, first_out + second_out);
     }
 
-    /// The borrowed cache push is byte-for-byte the owned message, so an
-    /// offer can send each chunk without copying it into a `Push` first.
     #[test]
     fn a_borrowed_cache_push_encodes_exactly_like_the_owned_message() {
         let attempt = AttemptId::new();
@@ -4419,8 +3576,6 @@ mod tests {
         ));
     }
 
-    /// The borrowed log frame is byte-for-byte the owned message: the
-    /// variant index and field order of `ClientMessage::Log` are the wire.
     #[test]
     fn a_borrowed_log_frame_encodes_exactly_like_the_owned_message() {
         let attempt = AttemptId::new();
@@ -4448,9 +3603,6 @@ mod tests {
         ));
     }
 
-    /// A peer that stops reading cannot hold a sender forever. The
-    /// write times out, the send fails and the connection is torn down so
-    /// its reader ends too.
     #[test]
     fn a_send_to_a_peer_that_never_reads_fails_within_the_write_timeout() {
         let server_identity = crate::identity::Identity::generate("controller").unwrap();
@@ -4461,7 +3613,6 @@ mod tests {
                 .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        // The client completes the handshake and then never reads again.
         let peer = thread::spawn(move || {
             let socket = TcpStream::connect(addr).unwrap();
             let mut conn = rustls::Connection::Client(
@@ -4493,7 +3644,6 @@ mod tests {
         };
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(matches!(failed, Error::Lost | Error::Io(_)), "{failed}");
-        // Torn down: the next send fails at once rather than blocking.
         let again = Instant::now();
         assert!(
             tx.send(&ServerMessage::NoSpec { attempt: [1; 16] })
@@ -4503,8 +3653,6 @@ mod tests {
         drop(peer);
     }
 
-    /// A server-side sender whose peer completes the handshake and then
-    /// never reads. The peer thread is returned so the test keeps it alive.
     fn sender_to_a_peer_that_never_reads() -> (Sender, thread::JoinHandle<()>) {
         let server_identity = crate::identity::Identity::generate("controller").unwrap();
         let pin = server_identity.fingerprint();
@@ -4528,9 +3676,6 @@ mod tests {
         (split(conn, socket).unwrap().0, peer)
     }
 
-    /// A dispatcher push to a peer that stopped reading waits at
-    /// most the dispatch bound (not the 15 s write timeout), fails, and
-    /// tears the connection down so the next push fails at once.
     #[test]
     fn a_bounded_send_to_a_peer_that_never_reads_fails_fast_and_closes() {
         let (tx, peer) = sender_to_a_peer_that_never_reads();
@@ -4553,7 +3698,6 @@ mod tests {
         };
         assert!(matches!(failed, Error::Lost | Error::Io(_)), "{failed}");
         assert!(!is_busy(&failed));
-        // The bound is 250 ms; well under the 15 s heartbeat deadline.
         assert!(took < Duration::from_secs(2), "{took:?}");
         let again = Instant::now();
         let next = tx
@@ -4567,9 +3711,6 @@ mod tests {
         drop(peer);
     }
 
-    /// While another thread holds the connection, a bounded send
-    /// is refused as busy without waiting and without closing; the push
-    /// works once the connection is free again.
     #[test]
     fn a_bounded_send_skips_a_busy_connection_without_closing_it() {
         let (tx, _rx) = tls_pair();
@@ -4629,8 +3770,6 @@ mod tests {
         }
     }
 
-    /// An unprotected job reaches a protocol-8 worker as itself and
-    /// an older one as the pull-request scope — never as protected.
     #[test]
     fn unprotected_jobs_downgrade_for_older_peers() {
         let job = context(None, Trust::Unprotected);
@@ -4678,8 +3817,6 @@ mod tests {
 
     #[test]
     fn context_v5_decode_defaults_to_pr_scope() {
-        // A protocol <6 context carries no tenant/trust: the decode must
-        // land the worker in the scope that cannot touch protected state.
         let wire_attempt = AttemptId::new();
         let (attempt, decoded) = JobContext::from_wire(
             context(Some(TenantId::new()), Trust::Protected).to_wire(wire_attempt),
@@ -4708,7 +3845,6 @@ mod tests {
             context_message(6, &context, attempt),
             ServerMessage::Context2(_)
         ));
-        // A future version still gets the newer shape.
         assert!(matches!(
             context_message(7, &context, attempt),
             ServerMessage::Context2(_)
@@ -4717,8 +3853,6 @@ mod tests {
 
     #[test]
     fn wire_context2_survives_postcard() {
-        // The variant index is positional: Context2 must remain the last
-        // variant or every older peer breaks.
         let attempt = AttemptId::new();
         let message = context_message(
             6,
@@ -4737,8 +3871,6 @@ mod tests {
         }
     }
 
-    /// An executor that holds one attempt awaiting its spec under a fence
-    /// acknowledged on an earlier session, and records what it is handed.
     struct Awaiting {
         attempt: AttemptId,
         fence: Fence,
@@ -4779,8 +3911,6 @@ mod tests {
         fn log_refused(&self, _: AttemptId) {}
     }
 
-    /// The controller's answer to a spec request: context, secret bundle
-    /// under `fence`, spec.
     fn secret_answer(attempt: AttemptId, fence: u64) -> Vec<ServerMessage> {
         use sentinel_protocol::secrets::{
             DeliveryBundle, DeliveryTarget, DeliveryValue, SecretBytes, TargetKind,
@@ -4822,11 +3952,6 @@ mod tests {
         ]
     }
 
-    /// A session that replaced the one the offer was acknowledged
-    /// on knows no fence of its own, yet the spec answering the re-asked
-    /// request carries its secret bundle through — bound to the fence the
-    /// executor accepted. A transfer under any other fence is dropped with
-    /// its spec, and the link stays up.
     #[test]
     fn a_secret_transfer_survives_a_new_session_between_ack_and_spec() {
         let (control, _peer) = tls_pair();
@@ -4850,7 +3975,6 @@ mod tests {
         assert_eq!(*executor.delivered.lock().unwrap(), vec![(attempt, 1)]);
         assert_eq!(state.secret_bytes, 0);
 
-        // A stale fence: nothing delivered, nothing kept, no link error.
         executor.delivered.lock().unwrap().clear();
         for message in secret_answer(attempt, 6) {
             handle_bulk_message(message, &executor, &mut state, &remote).unwrap();

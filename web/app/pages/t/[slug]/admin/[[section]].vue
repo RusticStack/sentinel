@@ -1,7 +1,4 @@
 <script setup lang="ts">
-// A tenant's administration: members and roles, email invitations,
-// repositories and access, service accounts and their credentials, secret metadata (never values),
-// storage and retention, and the run control audit.
 const route = useRoute();
 const slug = route.params.slug as string;
 const section = computed(() => (route.params.section as string) || "members");

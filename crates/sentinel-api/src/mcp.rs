@@ -1,8 +1,4 @@
-//! Streamable HTTP transport for the version-pinned MCP contract.
-//!
-//! The transport authenticates every request against the MCP OAuth audience.
-//! Session identifiers are random capabilities for protocol state only: the
-//! table stores their digests and every use still requires a live access token.
+//! Session ids are capabilities: the table keys them by digest, and every use still needs a live access token.
 
 use std::{
     collections::HashMap,
@@ -27,9 +23,7 @@ use crate::{
 };
 
 const MAX_SESSIONS: usize = 1024;
-/// Sessions one account may hold. A new one past it replaces that account's
-/// least recently used session, so one account can neither take the whole
-/// table from everyone else nor lock itself out.
+/// Past this, the account's least recently used session is replaced, so no account can fill the table.
 const MAX_SESSIONS_PER_USER: usize = 16;
 const _: () = assert!(MAX_SESSIONS_PER_USER >= 1 && MAX_SESSIONS_PER_USER * 4 <= MAX_SESSIONS);
 const SESSION_IDLE: Duration = Duration::from_secs(60 * 60);
@@ -43,8 +37,6 @@ struct Session {
     initialized: bool,
 }
 
-/// Small bounded protocol-state table. The key is `BLAKE3(session id)`, never
-/// the bearer-like value returned to the client.
 #[derive(Default)]
 pub(crate) struct Sessions {
     entries: Mutex<HashMap<[u8; 32], Session>>,
@@ -63,8 +55,6 @@ impl Sessions {
 
     fn create_at(&self, user: UserId, now: Instant) -> Result<String, ApiError> {
         let mut entries = self.lock();
-        // One pass: drop idle sessions and find this account's share and
-        // its least recently used session.
         let mut held = 0;
         let mut oldest: Option<([u8; 32], Instant)> = None;
         entries.retain(|digest, session| {
@@ -184,12 +174,7 @@ fn accepts(request: &Request, media_type: &str) -> bool {
     })
 }
 
-/// The Streamable HTTP version header (MCP 2025-11-25, "Protocol Version
-/// Header"). An unsupported value is `400 Bad Request` — still carrying the
-/// `unsupported_version` code and the supported revision. An absent header
-/// is accepted: every request after `initialize` belongs to a session, and
-/// a session only ever negotiated [`contract::PROTOCOL_VERSION`], which is
-/// the "other way to identify the version" the specification allows.
+/// An absent header is accepted: a session only ever negotiated the one supported version.
 fn protocol_header(request: &Request) -> Result<(), Reply> {
     match routes::header_value(request, "mcp-protocol-version") {
         None => Ok(()),
@@ -205,9 +190,6 @@ fn protocol_header(request: &Request) -> Result<(), Reply> {
     }
 }
 
-/// The request's session. A missing `Mcp-Session-Id` is `400` (the client
-/// must send one); an unknown or expired one is `404`, which tells the
-/// client to initialize a new session.
 fn session_digest(
     state: &State,
     request: &Request,
@@ -228,7 +210,6 @@ fn json_response(value: Value, headers: Vec<Header>) -> Route {
     bounded(body, headers)
 }
 
-/// A serialized JSON-RPC answer within the response limit.
 fn bounded(body: String, headers: Vec<Header>) -> Route {
     if body.len() > MAX_RESPONSE_BYTES {
         return Err(ApiError::new(
@@ -323,9 +304,6 @@ pub(crate) fn post(state: &State, request: &mut Request) -> Route {
                 "initialize requires clientInfo and capabilities objects",
             ));
         }
-        // Lifecycle version negotiation: whatever revision the client asks
-        // for, the answer names the one this server supports, and the
-        // client decides whether to continue.
         if !params.get("protocolVersion").is_some_and(Value::is_string) {
             return Ok(rpc_error(
                 Some(id),
@@ -368,7 +346,6 @@ pub(crate) fn post(state: &State, request: &mut Request) -> Route {
     let params = params.unwrap_or(&empty);
     match method {
         "ping" => raw_result(&id, "{}"),
-        // The static catalogue and documents are serialized once per process.
         "tools/list" => raw_result(&id, contract::tools_list_json()),
         "resources/list" => raw_result(&id, contract::resources_list_json()),
         "resources/templates/list" => raw_result(&id, r#"{"resourceTemplates":[]}"#),
@@ -384,7 +361,6 @@ pub(crate) fn post(state: &State, request: &mut Request) -> Route {
     }
 }
 
-/// A JSON-RPC result whose `result` is already serialized JSON.
 fn raw_result(id: &Value, result: &str) -> Route {
     let id = serde_json::to_string(id)
         .map_err(|_| ApiError::new(ErrorCode::Internal, "controller fault"))?;
@@ -397,9 +373,6 @@ fn raw_result(id: &Value, result: &str) -> Route {
     bounded(body, Vec::new())
 }
 
-/// A `tools/call` result: the payload once as structured content and once
-/// as its JSON text, which the specification asks of a tool returning
-/// structured content. Serialized in one pass over borrowed parts.
 #[derive(Serialize)]
 struct ToolReply<'a> {
     jsonrpc: &'static str,
@@ -523,9 +496,7 @@ impl Backend for ApiBackend<'_, '_> {
         self.default_tenant
     }
 
-    /// The API route authorizes, scope included, exactly as for any other
-    /// caller; a scope refusal it answers is lifted to the HTTP `403` with
-    /// its `insufficient_scope` challenge so the client can step up.
+    /// A scope refusal is lifted to HTTP 403 with its insufficient_scope challenge so the client can step up.
     fn call_api(&mut self, call: ApiCall) -> Result<Value, Value> {
         let (path, query) = call.path.split_once('?').unwrap_or((&call.path, ""));
         let body = if call.body.is_null() {
@@ -650,8 +621,6 @@ fn rpc_error(id: Option<Value>, code: i32, message: &str, status: u16) -> Reply 
 mod tests {
     use super::*;
 
-    /// One account cannot take the table from everyone else; its
-    /// seventeenth session replaces its least recently used one.
     #[test]
     fn mcp_sessions_are_capped_per_user_with_lru_eviction() {
         let sessions = Sessions::default();
@@ -661,7 +630,6 @@ mod tests {
         let ids: Vec<String> = (0..MAX_SESSIONS_PER_USER as u64)
             .map(|n| sessions.create_at(flood, at(n)).unwrap())
             .collect();
-        // Use the first so the second becomes the least recently used.
         sessions.touch_at(&ids[0], flood, at(100)).unwrap();
         for n in 0..(MAX_SESSIONS as u64) {
             sessions.create_at(flood, at(200 + n)).unwrap();
@@ -676,7 +644,6 @@ mod tests {
                 .code,
             ErrorCode::NotFound
         );
-        // Idle sessions expire.
         let late = at(5_001) + SESSION_IDLE;
         let fresh = sessions.create_at(other, at(5_002)).unwrap();
         assert_eq!(

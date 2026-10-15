@@ -1,10 +1,3 @@
-//! Fresh per-attempt workspaces under `<data_dir>/workspaces/<attempt>`.
-//!
-//! A workspace is created empty exactly once and destroyed after the attempt
-//! finalizes. It is never reused: a second attempt of the same job is a new
-//! attempt with a new directory, so nothing from a previous run — files,
-//! Git state, a half-written cache — can leak into the next.
-
 use std::{
     fs,
     os::{
@@ -26,13 +19,8 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// Create `<root>/workspaces/<attempt>`, refusing if anything is already
-    /// there: a leftover is a reconciliation matter, not a workspace.
     pub fn create(root: &Path, attempt: AttemptId) -> Result<Workspace> {
-        // The directory that holds every workspace is owner-only. The
-        // attempt's own directory keeps the umask's mode: a container user
-        // other than the worker's mapped root must be able to enter its
-        // bind-mounted `/workspace`, and only the path to it is guarded.
+        // Only the parent is owner-only: a container user must enter the attempt's bind-mounted /workspace.
         let parent = root.join(WORKSPACES_DIR);
         crate::private_dir_all(&parent)?;
         let path = parent.join(attempt.to_string());
@@ -53,14 +41,10 @@ impl Workspace {
         self.attempt
     }
 
-    /// Remove everything. Files a container created are owned by this user
-    /// (rootless mapping), so no privilege is needed. Read-only bits set by
-    /// a build are cleared first so the removal cannot stall on them.
     pub fn destroy(self) -> Result<()> {
         remove_tree(&self.path)
     }
 
-    /// Attempt directories left behind by an earlier process.
     pub fn leftovers(root: &Path) -> Result<Vec<AttemptId>> {
         let parent = root.join(WORKSPACES_DIR);
         let mut found = Vec::new();
@@ -83,18 +67,10 @@ impl Workspace {
     }
 }
 
-/// Deepest directory level the permission pass descends; one descriptor is
-/// held per level. A tree nested deeper keeps its deeper read-only
-/// directories, and the removal then reports the failure.
+/// Held descriptors cost one per level, so the walk stops here and deeper read-only directories are left to fail removal.
 const MAX_WALK_DEPTH: usize = 128;
 
-/// Remove a tree we own, restoring write permission on directories so
-/// read-only checkouts do not leave orphans.
-///
-/// The job controls what is in its workspace, so nothing here may follow a
-/// link it plants: each directory is opened `O_NOFOLLOW` relative to its
-/// parent's descriptor, and its mode is changed through that descriptor, not
-/// through a path the job could re-point between the check and the change.
+/// The job controls the tree, so nothing may follow a link it plants: each step is relative to a held descriptor.
 pub fn remove_tree(path: &Path) -> Result<()> {
     if let Ok(root) = std::ffi::CString::new(path.as_os_str().as_bytes())
         && let Some(root) = open_dir_nofollow(libc::AT_FDCWD, &root)
@@ -108,10 +84,6 @@ pub fn remove_tree(path: &Path) -> Result<()> {
     }
 }
 
-/// A path-only descriptor for the directory `name` under `parent`: a
-/// symlink in the last component is not followed, and a non-directory is
-/// refused. `O_PATH` needs no read permission, so a directory whose mode
-/// was cleared can still be named.
 fn open_dir_nofollow(parent: libc::c_int, name: &std::ffi::CStr) -> Option<OwnedFd> {
     // SAFETY: `name` is NUL-terminated and `parent` is a live descriptor or
     // `AT_FDCWD`; the flags only open, never create.
@@ -126,10 +98,6 @@ fn open_dir_nofollow(parent: libc::c_int, name: &std::ffi::CStr) -> Option<Owned
     (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Give `dir` and every directory below it owner read/write/search, so the
-/// removal that follows can list and unlink them. Errors are not fatal
-/// here: a directory the pass could not open or change is left for the
-/// removal to report.
 fn make_walkable(dir: &OwnedFd, depth: usize) {
     let fd = dir.as_raw_fd();
     let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
@@ -139,8 +107,6 @@ fn make_walkable(dir: &OwnedFd, depth: usize) {
     }
     // SAFETY: `fstat` returned 0, so it filled the structure.
     let mode = unsafe { stat.assume_init() }.st_mode;
-    // The magic link names the very inode `fd` holds, so the change cannot
-    // land elsewhere, whatever happens to the path meanwhile.
     let through = format!("/proc/self/fd/{fd}");
     if mode & 0o700 != 0o700 {
         let _ = fs::set_permissions(&through, fs::Permissions::from_mode(0o700));
@@ -167,8 +133,6 @@ fn make_walkable(dir: &OwnedFd, depth: usize) {
 mod tests {
     use super::*;
 
-    /// A read-only, nested checkout (a build's `chmod -R a-w`) is removed
-    /// whole.
     #[test]
     fn a_read_only_tree_is_removed() {
         let dir = tempfile::tempdir().unwrap();
@@ -183,8 +147,6 @@ mod tests {
         assert!(!root.exists());
     }
 
-    /// A link a job planted to a directory outside its workspace is removed
-    /// as a link: the directory it names keeps its mode and its contents.
     #[test]
     fn a_planted_link_never_changes_what_it_points_at() {
         let dir = tempfile::tempdir().unwrap();

@@ -1,5 +1,4 @@
-//! Authorization inputs constructed by trusted authentication code, never from
-//! request JSON or a caller's selected tenant. No role snapshot is cached here.
+//! Authorization inputs come only from trusted authentication code, never from request JSON or a selected tenant.
 use crate::{RepoId, TenantId, UserId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,8 +9,7 @@ pub enum Role {
     TenantAdmin = 3,
 }
 
-/// Stable database bit positions, not OAuth wire scope names. A repository
-/// operator does not implicitly gain secret-write or administration rights.
+/// Bit positions are stored; renumbering silently changes every existing grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Permissions(u8);
 
@@ -34,8 +32,7 @@ impl Permissions {
     pub const fn bits(self) -> u8 {
         self.0
     }
-    /// Reconstruct from a persisted value, rejecting undefined bits so a corrupt
-    /// or newer row cannot widen authority by setting one.
+    /// Undefined bits are refused so a corrupt or newer row cannot widen authority.
     pub const fn from_bits(bits: u8) -> Option<Self> {
         if bits & !Self::ALL.0 == 0 {
             Some(Self(bits))
@@ -45,14 +42,9 @@ impl Permissions {
     }
 }
 
-/// OAuth scopes. Bit positions are STORED (grants, codes, access
-/// tokens) and stable; the names are the wire form. A scope is a ceiling on
-/// [`Permissions`], never a grant of its own: every repository and tenant
-/// decision is still a live check against membership.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Scopes(u32);
 
-/// A scope name this deployment does not define.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnknownScope;
 
@@ -76,15 +68,11 @@ impl Scopes {
     pub const TENANT_ADMIN: Self = Self(1 << 8);
     pub const PLATFORM_ADMIN: Self = Self(1 << 9);
     pub const ALL: Self = Self(0x3FF);
-    /// Maximum authority a remote MCP client may request; excludes secret
-    /// writes and all administrative scopes.
     pub const MCP: Self =
         Self(Self::RUNS_READ.0 | Self::RUNS_WRITE.0 | Self::LOGS_READ.0 | Self::SECRETS_METADATA.0);
-    /// Least-privilege default for a new remote MCP authorization.
     pub const MCP_DEFAULT: Self = Self(Self::RUNS_READ.0 | Self::LOGS_READ.0);
     pub const MCP_NAMES: [&'static str; 4] =
         ["runs:read", "runs:write", "logs:read", "secrets:metadata"];
-    /// What `sentinel auth login` asks for unless told otherwise.
     pub const CLI_DEFAULT: Self = Self(
         Self::RUNS_READ.0
             | Self::RUNS_WRITE.0
@@ -92,7 +80,6 @@ impl Scopes {
             | Self::ARTIFACTS_READ.0
             | Self::CACHE_READ.0,
     );
-    /// Wire names in bit order; index `i` names bit `1 << i`.
     pub const NAMES: [&'static str; 10] = [
         "runs:read",
         "runs:write",
@@ -105,7 +92,6 @@ impl Scopes {
         "tenant:admin",
         "platform:admin",
     ];
-    /// Every scope whose ceiling is [`Permissions::READ`].
     const READS: Self = Self(
         Self::RUNS_READ.0
             | Self::LOGS_READ.0
@@ -113,13 +99,11 @@ impl Scopes {
             | Self::CACHE_READ.0
             | Self::SECRETS_METADATA.0,
     );
-    /// Every scope whose ceiling is [`Permissions::RUN`].
     const RUNS: Self = Self(Self::RUNS_WRITE.0 | Self::CACHE_WRITE.0);
 
     pub const fn bits(self) -> u32 {
         self.0
     }
-    /// Reconstruct from a persisted value, rejecting undefined bits.
     pub const fn from_bits(bits: u32) -> Option<Self> {
         if bits & !Self::ALL.0 == 0 {
             Some(Self(bits))
@@ -136,7 +120,6 @@ impl Scopes {
     pub const fn intersect(self, other: Self) -> Self {
         Self(self.0 & other.0)
     }
-    /// `self` without the scopes in `other`.
     pub const fn difference(self, other: Self) -> Self {
         Self(self.0 & !other.0)
     }
@@ -144,8 +127,6 @@ impl Scopes {
         self.0 == 0
     }
 
-    /// Parse a space-separated scope list. An unknown name refuses the whole
-    /// list; a repeated name is harmless. Empty input is [`Scopes::NONE`].
     pub fn parse(text: &str) -> Result<Self, UnknownScope> {
         let mut bits = 0;
         for name in text.split(' ').filter(|n| !n.is_empty()) {
@@ -158,7 +139,6 @@ impl Scopes {
         Ok(Self(bits))
     }
 
-    /// Append the canonical, space-separated names in bit order.
     pub fn write_names(self, out: &mut String) {
         for (index, name) in self.names().enumerate() {
             if index != 0 {
@@ -168,7 +148,6 @@ impl Scopes {
         }
     }
 
-    /// The canonical text form, as [`Scopes::write_names`] writes it.
     #[must_use]
     pub fn to_names(self) -> String {
         let mut out = String::with_capacity(self.0.count_ones() as usize * 16);
@@ -176,7 +155,6 @@ impl Scopes {
         out
     }
 
-    /// The names present, in bit order.
     pub fn names(self) -> impl Iterator<Item = &'static str> {
         Self::NAMES
             .iter()
@@ -185,7 +163,6 @@ impl Scopes {
             .map(|(_, name)| *name)
     }
 
-    /// The permission ceiling these scopes allow.
     pub const fn ceiling(self) -> Permissions {
         let mut bits = 0;
         if self.0 & Self::READS.0 != 0 {
@@ -206,8 +183,6 @@ impl Scopes {
         Permissions(bits)
     }
 
-    /// The scopes a pre-OAuth credential or a session implicitly carries, so
-    /// that scope checks leave their authority exactly as it was.
     pub const fn from_permissions(permissions: Permissions) -> Self {
         let mut bits = 0;
         if permissions.0 & Permissions::READ.0 != 0 {
@@ -229,15 +204,10 @@ impl Scopes {
     }
 }
 
-/// Who a token may be presented to (RFC 8707 resource). Stored as its
-/// integer in `oauth_* .resource`; the historical `audience` column remains
-/// API-only for migration compatibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Audience {
-    /// `{issuer}/api/v1`.
     Api = 1,
-    /// `{issuer}/mcp`.
     Mcp = 2,
 }
 
@@ -254,9 +224,6 @@ impl Audience {
     }
 }
 
-/// A validated credential's upper bound. Identity authenticators must intersect
-/// token/client scopes before constructing this value. Membership/grants remain
-/// live database checks; this is not a transferable authorization decision.
 #[derive(Clone, Copy, Debug)]
 pub struct Principal {
     pub user: UserId,
@@ -281,8 +248,6 @@ impl Principal {
     }
 }
 
-/// Borrowed canonical namespace: validate without allocating or normalizing a
-/// potentially conflicting spelling. Organization and personal names share it.
 #[derive(Clone, Copy, Debug)]
 pub struct Namespace<'a>(&'a str);
 

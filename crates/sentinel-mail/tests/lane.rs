@@ -1,8 +1,3 @@
-//! The mail lane against a real store and a scripted transport: a delivered
-//! message settles and loses its body, a transient failure waits for its
-//! backoff instead of spinning, a refused message is given up, and a message
-//! the lane cannot open never reaches Resend.
-
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -138,7 +133,6 @@ fn a_transient_failure_waits_for_its_backoff_instead_of_spinning() {
         vec![Err(Failure::transient("resend unreachable"))],
     );
     eventually("the first attempt", || !sent.lock().unwrap().is_empty());
-    // Give the lane time to (wrongly) retry in a loop.
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(
         sent.lock().unwrap().len(),

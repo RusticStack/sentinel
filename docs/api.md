@@ -8,6 +8,8 @@ Everything a person, the CLI, the web interface or an agent does goes through th
 
 Plain HTTP on loopback by default; TLS and exposure are a reverse proxy's job. The session cookie is `__Host-sentinel_session` (Secure, HttpOnly, SameSite=Strict), which a browser accepts from `localhost` or over HTTPS only — deliberately.
 
+A response body that fails mid-stream, or ends shorter than its declared length, closes the connection (`Request::respond` sets `close` and, on a failed write, shuts the socket) instead of reusing it for another request head. Otherwise the client would read the next response out of the middle of the unfinished body, a framing desync; keep that branch when changing `respond`.
+
 ## Authentication and authorization
 
 | Credential | How | Mutations |

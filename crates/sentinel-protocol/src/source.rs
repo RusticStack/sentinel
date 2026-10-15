@@ -1,5 +1,5 @@
-//! Bounded source-access contract. Credentials are ephemeral checkout inputs,
-//! never part of a persisted run specification.
+//! Credentials are ephemeral checkout inputs, never part of a persisted run specification.
+
 use serde::{Deserialize, Serialize};
 
 pub const MAX_SOURCE_BYTES: usize = 48 * 1024;
@@ -11,7 +11,6 @@ pub struct Binding {
     pub remote: String,
     pub allowed_refs: Vec<String>,
     pub pipeline_path: String,
-    /// PEM trust roots for HTTPS, or OpenSSH known_hosts for SSH.
     pub trust: String,
 }
 
@@ -121,9 +120,6 @@ impl Binding {
     }
 }
 
-/// A ref selector as bindings and ref polling share it: an exact ref under
-/// `refs/heads/` or `refs/tags/`, or one trailing `*` making the rest a
-/// prefix (`refs/heads/feature-*`). Anything else is not a pattern.
 pub fn valid_ref_pattern(r: &str) -> bool {
     (r.starts_with("refs/heads/") || r.starts_with("refs/tags/"))
         && r.len() <= 1024
@@ -140,16 +136,12 @@ pub fn valid_ref_pattern(r: &str) -> bool {
             .any(|b| b <= 32 || b == 127 || b"~^:?\\[".contains(&b))
 }
 
-/// Does `pattern` — a valid ref pattern — cover `reference`? An exact match,
-/// or a prefix match when the pattern ends in `*`.
 pub fn ref_matches(pattern: &str, reference: &str) -> bool {
     pattern
         .strip_suffix('*')
         .map_or(pattern == reference, |prefix| reference.starts_with(prefix))
 }
 
-/// Exact deployment-allowlist key: transport plus hostname and explicit port.
-/// No passwords, query, fragment, scp syntax, local paths or remote helpers.
 pub fn remote(value: &str) -> Option<&str> {
     if value.len() > 2048
         || value
@@ -241,8 +233,6 @@ pub struct Access {
 }
 
 impl Access {
-    /// Everything about the access except whether it is still live: the
-    /// version, the binding and the credential's fit for the remote.
     pub fn well_formed(&self) -> bool {
         self.version > 0
             && self.binding.validate()
@@ -253,11 +243,7 @@ impl Access {
         self.expires_ms > now_ms && self.well_formed()
     }
 
-    /// The same access with its expiry restated on the holder's own clock:
-    /// `window_ms` from `now_ms`. The controller's `expires_ms` is a
-    /// wall-clock instant, meaningless to a worker whose clock differs, so a
-    /// worker measures validity from the moment it received the access
-    /// instead of comparing the two clocks.
+    // expires_ms is a controller wall-clock instant; the holder re-bases it on its own clock.
     #[must_use]
     pub fn rebased(mut self, now_ms: i64, window_ms: i64) -> Self {
         self.expires_ms = now_ms.saturating_add(window_ms);
@@ -265,10 +251,6 @@ impl Access {
     }
 }
 
-/// Environment variable naming the deployment's explicit allowlist of manual
-/// (unbound) destinations that are exempt from the public-destination policy:
-/// comma-separated `https://host[:port]` authorities, exact match. Read once
-/// per process by the controller (admission) and by the worker (fetch).
 pub const MANUAL_DESTINATIONS_ENV: &str = "SENTINEL_MANUAL_DESTINATIONS";
 
 fn listed_manual_destinations() -> &'static [String] {
@@ -286,15 +268,11 @@ fn listed_manual_destinations() -> &'static [String] {
     })
 }
 
-/// Whether the deployment explicitly allowlisted this manual remote's
-/// authority ([`MANUAL_DESTINATIONS_ENV`]).
 pub fn manual_destination_listed(remote_url: &str) -> bool {
     remote(remote_url)
         .is_some_and(|authority| listed_manual_destinations().iter().any(|a| a == authority))
 }
 
-/// The hostname and port of a canonical `https://` remote ([`remote`]); the
-/// port defaults to 443.
 pub fn https_host_port(remote_url: &str) -> Option<(&str, u16)> {
     let authority = remote(remote_url)?.strip_prefix("https://")?;
     Some(match authority.split_once(':') {
@@ -303,11 +281,6 @@ pub fn https_host_port(remote_url: &str) -> Option<(&str, u16)> {
     })
 }
 
-/// Whether `host` is a public DNS name: at least two non-empty labels, a
-/// purely alphabetic (or `xn--`) top-level label — so no IPv4 literal in any
-/// notation (decimal, octal, hexadecimal), no bare hostname — and not a
-/// private-use or reserved suffix. A syntactic admission check only; the
-/// worker still resolves and refuses non-public addresses.
 pub fn public_dns_name(host: &str) -> bool {
     const PRIVATE_TLDS: [&str; 11] = [
         "localhost",
@@ -333,9 +306,6 @@ pub fn public_dns_name(host: &str) -> bool {
     tld_ok && !PRIVATE_TLDS.contains(&tld) && !rest.is_empty() && rest.iter().all(|l| !l.is_empty())
 }
 
-/// The destination policy for a client-named manual remote at admission: an
-/// `https://` remote in the canonical grammar whose host is a public DNS
-/// name, or whose authority the deployment explicitly allowlisted.
 pub fn manual_destination_allowed(remote_url: &str) -> bool {
     https_host_port(remote_url).is_some_and(|(host, _)| public_dns_name(host))
         || (remote_url.starts_with("https://") && manual_destination_listed(remote_url))

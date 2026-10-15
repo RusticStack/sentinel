@@ -1,12 +1,3 @@
-//! Polling end to end: a remote advertisement becomes a durable `poll` delivery
-//! that the unchanged intake path validates, resolves and dispatches, while
-//! remote failures back the schedule off and a revoked binding retires the
-//! configuration entirely.
-//!
-//! The lister is injected so the lane's scheduling, selection, cursor and
-//! admission behavior are tested deterministically; `sentinel-git`'s own
-//! tests cover the real `git ls-remote` exchange.
-
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -36,7 +27,6 @@ const NOW: UnixMillis = UnixMillis(1_000);
 const MAIN: &str = "refs/heads/main";
 const IMAGE: &str = "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
 
-/// A lister whose answer the test controls between polls.
 struct FakeLister {
     answer: Mutex<Result<Vec<sentinel_git::RefTip>, String>>,
 }
@@ -67,7 +57,6 @@ fn tip(name: &str, oid: &str) -> sentinel_git::RefTip {
     }
 }
 
-/// The injected fetcher: every push event reads the same valid pipeline.
 struct FakeFetch;
 
 impl Fetch for FakeFetch {
@@ -90,7 +79,6 @@ impl Fetch for FakeFetch {
         panic!("poll deliveries are pushes, not pull requests")
     }
     fn is_ancestor(&self, _: resolve::AncestryRequest<'_>) -> Result<bool, sentinel_git::Error> {
-        // No history is modelled: nothing is proven stale.
         Ok(false)
     }
 }
@@ -171,8 +159,6 @@ fn configure(f: &Fixture, refs: &[&str]) {
         .unwrap();
 }
 
-/// Make the repository's next poll due immediately rather than waiting out
-/// the configured interval.
 fn due_now(f: &Fixture) {
     let repo = f.repo;
     f.store
@@ -202,7 +188,6 @@ fn config(f: &Fixture) -> Option<store_poll::Config> {
     f.store.read(|c| store_poll::of_repo(c, f.repo)).unwrap()
 }
 
-/// The deployment's approved authorities: exactly the fixture binding's.
 fn destinations() -> Arc<[String]> {
     vec!["https://git.example:8443".to_owned()].into()
 }
@@ -233,10 +218,8 @@ fn an_observed_push_becomes_a_delivery_and_dispatches_a_run() {
     )
     .unwrap();
     configure(&f, &[MAIN]);
-    // First poll: baseline only — no delivery, no run.
     assert!(wait_for(5_000, || config(&f).is_some_and(|c| c.baselined)));
     assert!(deliveries(&f).is_empty());
-    // The remote moves: the next poll admits a transition.
     lister.set(vec![tip(MAIN, &"b".repeat(40))]);
     due_now(&f);
     assert!(wait_for(5_000, || !deliveries(&f).is_empty()));
@@ -248,7 +231,6 @@ fn an_observed_push_becomes_a_delivery_and_dispatches_a_run() {
         (d.old_sha.as_deref(), d.new_sha.as_deref()),
         (Some("a".repeat(40).as_str()), Some("b".repeat(40).as_str()))
     );
-    // That delivery resolves and dispatches through the unchanged intake path.
     let resolver = Resolver::new(
         Arc::clone(&f.store),
         Some(Arc::clone(&f.key)),
@@ -301,14 +283,11 @@ fn remote_failures_back_the_schedule_off_and_revocation_retires_it() {
     }));
     let first = config(&f).unwrap();
     assert!(first.next_poll_ms > 0);
-    // A healthy remote clears the failure state on its next pass.
     lister.set(vec![tip(MAIN, &"a".repeat(40))]);
     due_now(&f);
     assert!(wait_for(5_000, || {
         config(&f).is_some_and(|c| c.failures == 0 && c.baselined)
     }));
-    // Revoking the binding retires the configuration instead of polling a
-    // remote the tenant no longer authorizes.
     let repo = f.repo;
     f.store
         .writer()
@@ -318,7 +297,7 @@ fn remote_failures_back_the_schedule_off_and_revocation_retires_it() {
         config(&f).is_none(),
         "revoke removes the poll configuration"
     );
-    due_now(&f); // in case a stale row survived, a pass must not resurrect it
+    due_now(&f);
     std::thread::sleep(Duration::from_millis(50));
     assert!(deliveries(&f).is_empty());
     drop(poller);
@@ -342,8 +321,6 @@ fn a_binding_that_vanished_mid_schedule_drops_the_configuration() {
     )
     .unwrap();
     configure(&f, &[MAIN]);
-    // Simulate a config whose binding disappeared without revoke's cleanup:
-    // the lane notices and drops it rather than polling forever.
     let repo = f.repo;
     f.store
         .writer()

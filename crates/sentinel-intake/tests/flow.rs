@@ -1,6 +1,3 @@
-//! Intake end to end, without HTTP: the two authenticated ingest paths store
-//! deduplicated, tenant-owned deliveries, and the bounded lane resolves them
-//! on a wake or on its idle tick.
 use std::{
     sync::{Arc, mpsc},
     thread,
@@ -89,7 +86,6 @@ fn fixture() -> Fixture {
                 &key,
                 now,
             )?;
-            // A GitHub App installation bound to the same tenant and one repo.
             let installation = sources_forge::refresh(
                 tx,
                 sources_forge::Snapshot {
@@ -178,7 +174,6 @@ fn signed_push(repository: i64, delivery: Option<&str>) -> (Vec<u8>, String, Opt
     sign(payload, delivery)
 }
 
-/// A `pull_request` payload for the bound repository, same-repository head.
 fn signed_pr(action: &str, delivery: &str) -> (Vec<u8>, String) {
     let payload = serde_json::json!({
         "action": action,
@@ -217,8 +212,6 @@ fn the_generic_path_authenticates_scopes_and_deduplicates() {
     assert!(again.duplicate && again.id == first.id);
     assert_eq!(state(&f, f.repo), vec![State::Pending]);
 
-    // A malformed body, an unparseable secret and a valid secret for a
-    // different repository are all refusals that store nothing.
     assert_eq!(
         ingest::generic(&f.store, &f.token, f.repo, b"not json", now),
         Err(IngestError::InvalidRequest("body"))
@@ -233,8 +226,6 @@ fn the_generic_path_authenticates_scopes_and_deduplicates() {
         ),
         Err(IngestError::Unauthenticated)
     );
-    // Authentication comes first: without a valid secret a malformed body is
-    // refused as unauthenticated, never as a body the caller got to probe.
     assert_eq!(
         ingest::generic(
             &f.store,
@@ -250,8 +241,6 @@ fn the_generic_path_authenticates_scopes_and_deduplicates() {
         ingest::generic(&f.store, &f.token, unknown, &body("hook-3"), now),
         Err(IngestError::Unauthenticated)
     ));
-    // The GitHub repository's token does not exist, so its own path
-    // authenticates nothing here; the generic one is scoped to its repository.
     assert_eq!(state(&f, f.repo).len(), 1);
 }
 
@@ -260,7 +249,6 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
     let f = fixture();
     let now = UnixMillis::now();
     let (body, signature, delivery) = signed_push(GITHUB_REPO_ID, Some("gh-1"));
-    // Ping: verified, nothing stored.
     assert_eq!(
         ingest::github(
             &f.store,
@@ -274,7 +262,6 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
         .unwrap(),
         Github::Pong
     );
-    // A tampered body is a failed signature, never a stored delivery.
     let mut tampered = body.clone();
     tampered[10] ^= 1;
     assert_eq!(
@@ -289,8 +276,6 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
         ),
         Err(IngestError::Unauthenticated)
     );
-    // A missing signature is unauthenticated; a missing delivery header is
-    // rejected before any store work.
     assert_eq!(
         ingest::github(&f.store, WEBHOOK_SECRET, "push", None, None, &body, now),
         Err(IngestError::Unauthenticated)
@@ -307,8 +292,6 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
         ),
         Err(IngestError::InvalidRequest("delivery header"))
     );
-    // A valid delivery for a repository this deployment has not bound is
-    // accepted and ignored: GitHub must not retry it.
     let (other_body, other_signature, other_delivery) = signed_push(92, Some("gh-2"));
     assert_eq!(
         ingest::github(
@@ -323,8 +306,6 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
         .unwrap(),
         Github::Ignored("unbound_repository")
     );
-    // An event this deployment does not handle yet is acknowledged and
-    // ignored, not retried.
     assert_eq!(
         ingest::github(
             &f.store,
@@ -338,8 +319,6 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
         .unwrap(),
         Github::Ignored("unsupported_event")
     );
-    // A pull request for the bound repository is intake: only the actions that
-    // mean new work are stored, and the others are acknowledged and ignored.
     let pr = signed_pr("opened", "gh-4");
     assert!(matches!(
         ingest::github(
@@ -368,8 +347,6 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
         .unwrap(),
         Github::Ignored("pr_action")
     );
-    // The stored terms are the base branch and the tested merge, with the head
-    // repository recorded rather than inferred.
     let delivery_id = f
         .store
         .read(|c| {
@@ -394,7 +371,6 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
     assert_eq!(terms.head_repo, GITHUB_REPO_ID as u64);
     assert_eq!(terms.base_ref, "main");
     assert_eq!(terms.merge_sha.as_deref(), Some("e".repeat(40).as_str()));
-    // The bound repository accepts the push and deduplicates a redelivery.
     let accepted = ingest::github(
         &f.store,
         WEBHOOK_SECRET,
@@ -426,13 +402,10 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
             ..accepted
         })
     );
-    // The push and the pull request are both durable and pending; the
-    // redelivery and the ignored action added nothing.
     assert_eq!(
         state(&f, f.github_repo),
         vec![State::Pending, State::Pending]
     );
-    // A wrong secret never reaches the payload.
     assert_eq!(
         ingest::github(
             &f.store,
@@ -445,8 +418,6 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
         ),
         Err(IngestError::Unauthenticated)
     );
-    // Control events answer with their durable outcome and deduplicate by
-    // receipt, not by delivery row.
     let suspend = serde_json::json!({
         "action": "suspend",
         "installation": {"id": 42},
@@ -486,7 +457,6 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
             duplicate: true,
         }
     );
-    // The same delivery id under a different signed body conflicts.
     let deleted = serde_json::json!({
         "action": "deleted",
         "installation": {"id": 42},
@@ -523,7 +493,6 @@ fn the_lane_resolves_on_a_wake_and_on_its_tick() {
         },
     );
 
-    // One delivery resolved by an explicit wake.
     let now = UnixMillis::now();
     let woken = ingest::generic(&f.store, &f.token, f.repo, &body("wake-1"), now).unwrap();
     lane.waker().wake();
@@ -531,7 +500,6 @@ fn the_lane_resolves_on_a_wake_and_on_its_tick() {
         .recv_timeout(Duration::from_secs(5))
         .expect("wake resolved");
     assert!(batch.settled.iter().any(|s| s.id == woken.id));
-    // One resolved by the idle tick alone: no wake call.
     let ticked = ingest::generic(&f.store, &f.token, f.repo, &body("tick-1"), now).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut saw_ticked = false;
@@ -547,8 +515,6 @@ fn the_lane_resolves_on_a_wake_and_on_its_tick() {
         "both deliveries settled ready"
     );
 
-    // Dropping the lane stops and joins its thread; a new delivery would now
-    // wait for the next process.
     drop(lane);
     ingest::generic(&f.store, &f.token, f.repo, &body("after-stop"), now).unwrap();
     thread::sleep(Duration::from_millis(50));

@@ -1,16 +1,11 @@
-//! Durable idempotency records for mutations. The decision (execute,
-//! replay, mismatch) is taken inside the same write transaction as the
-//! mutation itself, so a duplicate request can never execute twice even if
-//! two copies arrive back to back: the single writer serialises them and
-//! the second one sees the first one's record.
+//! Decide and mutate in one write transaction: the single writer serialises duplicate
+//! requests, so the second one sees the first one's record and cannot execute twice.
 use rusqlite::{OptionalExtension, Transaction, params};
 use sentinel_core::{RunId, TenantId, UnixMillis};
 use sentinel_protocol::idempotency::{Decision, Fingerprint, IdempotencyKey, Stored, decide};
 
 use crate::{Error, Result};
 
-/// Where a key applies. Keys are meaningless outside their scope, so the
-/// same key from another tenant or route is simply a different record.
 #[derive(Clone, Copy, Debug)]
 pub struct Scope<'a> {
     pub tenant: TenantId,
@@ -18,21 +13,14 @@ pub struct Scope<'a> {
     pub route: &'a str,
 }
 
-/// Outcome of `begin`: either execute (and later `complete`) or return the
-/// stored result without executing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Begin {
     Execute,
-    /// The earlier request created this run; return it again.
     Replay(RunId),
-    /// Same key, different body.
     Mismatch,
-    /// First request recorded but not completed (only possible after a crash
-    /// between `begin` and `complete` in separate transactions).
     InFlight,
 }
 
-/// (fingerprint bytes, created_ms, completed, run_id)
 type StoredRow = (Vec<u8>, i64, i64, Option<[u8; 16]>);
 
 pub fn begin(
@@ -81,7 +69,6 @@ pub fn begin(
         Decision::Mismatch => Ok(Begin::Mismatch),
         Decision::InFlight => Ok(Begin::InFlight),
         Decision::Execute => {
-            // Replace an expired record or insert a fresh one; completion fills run_id.
             tx.execute(
                 "INSERT INTO idempotency_keys(tenant_id, principal, route, key, fingerprint, created_ms, completed, run_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL)
@@ -102,8 +89,7 @@ pub fn begin(
     }
 }
 
-/// Record the result of an executed request. Must run in the same
-/// transaction as the mutation so both commit or neither does.
+/// Must share the mutation's transaction so both commit or neither does.
 pub fn complete(
     tx: &Transaction<'_>,
     scope: Scope<'_>,
@@ -127,17 +113,10 @@ pub fn complete(
     Ok(())
 }
 
-/// The oldest `?2` expired records, oldest first, off `idempotency_by_age`.
 const PURGE_SQL: &str = "DELETE FROM idempotency_keys WHERE (tenant_id, principal, route, key) IN
      (SELECT tenant_id, principal, route, key FROM idempotency_keys
       WHERE created_ms < ?1 ORDER BY created_ms LIMIT ?2)";
 
-/// Remove at most `limit` records past the TTL, oldest first, in one write;
-/// the controller's maintenance tick calls it. An expired record is already
-/// dead to [`begin`] (it executes afresh and overwrites it), so purging only
-/// bounds the table: without it every distinct key would stay forever.
-/// Batched so a backlog drains over several writes instead of holding the
-/// writer. Returns how many were removed.
 pub fn purge_expired(store: &crate::Store, now: UnixMillis, limit: u32) -> Result<usize> {
     let cutoff = now.0 - sentinel_protocol::idempotency::IDEMPOTENCY_TTL_MS;
     store
@@ -149,8 +128,6 @@ pub fn purge_expired(store: &crate::Store, now: UnixMillis, limit: u32) -> Resul
 mod tests {
     use rusqlite::Connection;
 
-    /// The purge must walk `idempotency_by_age` and probe the primary key,
-    /// never scan or sort the table it bounds.
     #[test]
     fn the_purge_is_an_index_range() {
         let mut conn = Connection::open_in_memory().unwrap();

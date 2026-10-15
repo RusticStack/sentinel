@@ -1,13 +1,4 @@
-//! Compiler-state persistence against a real container: a
-//! `class: compiler` entry mounted writable inside the environment keeps
-//! serving across small source edits, and the tool inside the namespace —
-//! `fixtures/compiler/fakecc.sh`, a content-keyed compiler stand-in —
-//! rebuilds only the inputs that changed. A cache hit restores bytes for
-//! the steps to consume; the tool still runs and still decides staleness
-//! per input, which is exactly why a hit is never a cached verdict.
-//!
-//! Gated like the Podman suite: `SENTINEL_PODMAN_TESTS=1` as a rootless
-//! Podman account; otherwise it reports the skip, never a false pass.
+//! A cache hit restores bytes only: the tool still decides staleness per input, so a hit is never a cached verdict.
 
 #![cfg(target_os = "linux")]
 
@@ -33,7 +24,6 @@ use sentinel_protocol::{
 use sentinel_worker::podman::{self, Container, Limits, Mount};
 
 const IMAGE: &str = "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
-/// The checked-in fixture the container runs — the job's "compiler".
 const FAKECC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../fixtures/compiler/fakecc.sh"
@@ -47,9 +37,6 @@ fn enabled() -> bool {
     false
 }
 
-/// A bare `class: compiler` declaration with an absolute cache path, so
-/// the restored view reaches the container through a bind mount — the
-/// writability this test exists to prove.
 fn decl() -> Cache {
     Cache {
         name: "cc".into(),
@@ -111,7 +98,6 @@ fn sh(script: &str) -> StepCommand {
     }
 }
 
-/// One attempt's worth of workspace: the fixture plus its "sources".
 fn workspace(dir: &Path, b_source: &[u8]) {
     fs::create_dir_all(dir.join("src")).unwrap();
     fs::copy(FAKECC, dir.join("fakecc.sh")).unwrap();
@@ -158,8 +144,6 @@ fn a_compiler_namespace_persists_across_attempts_and_the_tool_decides_staleness(
     };
     let run_fakecc = sh("sh /workspace/fakecc.sh /cc-cache src/a.c src/b.c");
 
-    // Attempt 1 — a cold namespace: restore misses, the tool fills its
-    // writable mounted view inside the container, publish seals it.
     let ws1 = tmp.path().join("ws1");
     workspace(&ws1, b"int b(void) { return 1; }\n");
     let a1 = restore::restore(
@@ -190,8 +174,6 @@ fn a_compiler_namespace_persists_across_attempts_and_the_tool_decides_staleness(
         out.contains("built a.c") && out.contains("built b.c"),
         "{out}"
     );
-    // The mount was genuinely writable inside the environment: the two
-    // artifacts the container wrote are visible in the host view.
     assert_eq!(fs::read_dir(&a1.targets[0].dir).unwrap().count(), 2);
     let sealed = publish(&root, &a1);
     assert!(
@@ -201,10 +183,6 @@ fn a_compiler_namespace_persists_across_attempts_and_the_tool_decides_staleness(
     c1.destroy().unwrap();
     drop(a1);
 
-    // Attempt 2 — a small source edit moves the rendered key's tail; the
-    // stem is the same, so the namespace serves. The tool then runs and
-    // rebuilds only the edited input — the hit restored state, not a
-    // verdict, and the work still happened.
     let ws2 = tmp.path().join("ws2");
     workspace(&ws2, b"int b(void) { return 2; }\n");
     let a2 = restore::restore(
@@ -232,8 +210,6 @@ fn a_compiler_namespace_persists_across_attempts_and_the_tool_decides_staleness(
     assert!(out.contains("reused a.c"), "{out}");
     assert!(out.contains("built b.c"), "{out}");
     let sealed = publish(&root, &a2);
-    // a.c's artifact, both b.c artifacts (the stale one accumulates —
-    // the tool's content keys keep it correct): three files sealed.
     assert!(
         matches!(sealed, Published::Sealed { files: 3, .. }),
         "{sealed:?}"
@@ -241,8 +217,6 @@ fn a_compiler_namespace_persists_across_attempts_and_the_tool_decides_staleness(
     c2.destroy().unwrap();
     drop(a2);
 
-    // Attempt 3 — another tail, still the same stem: the newest
-    // generation serves the accumulated state.
     let ws3 = tmp.path().join("ws3");
     workspace(&ws3, b"int b(void) { return 2; }\n");
     let a3 = restore::restore(
@@ -254,8 +228,6 @@ fn a_compiler_namespace_persists_across_attempts_and_the_tool_decides_staleness(
     );
     assert!(a3.outcome.is_hit(), "{:?}", a3.outcome);
     assert_eq!(fs::read_dir(&a3.targets[0].dir).unwrap().count(), 3);
-    // The `gen-*` name of the generation this attempt cloned from — the
-    // source the next publish would reuse.
     assert!(
         a3.generation
             .as_deref()

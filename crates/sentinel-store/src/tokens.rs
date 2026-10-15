@@ -1,13 +1,5 @@
-//! Scoped, expiring API credentials.
-//!
-//! A credential produces the same [`Principal`] a session does, and every
-//! tenant, repository and administrative decision remains a live check in
-//! [`crate::auth`]. No code path skips authentication or returns
-//! `Permissions::ALL` because a request looked local.
-//!
-//! A credential is a 256-bit opaque secret stored only as its BLAKE3 digest,
-//! carrying an explicit scope and a mandatory expiry. It is shown exactly once,
-//! at issuance; a lost credential is replaced, never recovered.
+//! A credential is stored only as a BLAKE3 digest and shown once at issuance; a lost one is replaced.
+//! It yields the same Principal as a session, so every tenant and repository check still runs live.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::secret::Secret;
@@ -24,33 +16,21 @@ use crate::{
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// Hard ceiling on a credential's life. An unattended agent renews; it does not
-/// hold a credential that outlives the decision to grant it.
 pub const MAX_LIFETIME_MS: i64 = 90 * DAY_MS;
-/// Used when the issuer does not state a lifetime. There is no unlimited value.
 pub const DEFAULT_LIFETIME_MS: i64 = 30 * DAY_MS;
-/// Minimum age of `last_used_ms` before a request pays a write to update it.
 pub const USE_RECORD_INTERVAL_MS: i64 = 60 * 1000;
 
-/// What a credential may do, decided once at issuance. Widening means issuing a
-/// new credential: the stored row is immutable except for use and revocation.
 #[derive(Clone, Copy, Debug)]
 pub struct Grant<'a> {
-    /// The account that acts. A credential never carries an identity of its own.
     pub user: UserId,
-    /// Operator-facing label, so a credential can be recognized and revoked.
     pub name: &'a str,
-    /// Upper bound on authority, intersected with live membership per query.
     pub permissions: Permissions,
-    /// Optional narrowing. A service principal must be scoped to its home tenant.
     pub tenant: Option<TenantId>,
-    /// Optional narrowing to one repository of `tenant`.
     pub repo: Option<RepoId>,
     pub lifetime_ms: i64,
 }
 
 impl<'a> Grant<'a> {
-    /// A grant with the default lifetime and no tenant/repository narrowing.
     pub const fn new(user: UserId, name: &'a str, permissions: Permissions) -> Self {
         Self {
             user,
@@ -63,15 +43,12 @@ impl<'a> Grant<'a> {
     }
 }
 
-/// The one and only presentation of a new credential.
 pub struct Granted {
     pub id: TokenId,
     pub secret: Secret,
     pub expires: UnixMillis,
 }
 
-/// A validated credential. `principal` is already intersected with what the
-/// account can still hold; it is not the scope as written at issuance.
 #[derive(Clone, Copy, Debug)]
 pub struct Authenticated {
     pub token: TokenId,
@@ -81,8 +58,6 @@ pub struct Authenticated {
 }
 
 impl Authenticated {
-    /// True when this credential's recorded use is old enough to be worth one
-    /// write. Recording use is operator visibility, not part of authentication.
     pub fn record_use_due(&self, now: UnixMillis) -> bool {
         self.last_used
             .is_none_or(|last| now.0.saturating_sub(last) >= USE_RECORD_INTERVAL_MS)
@@ -133,9 +108,6 @@ fn insert(tx: &Transaction<'_>, grant: &Grant<'_>, now: UnixMillis) -> Result<Gr
     })
 }
 
-/// Host-local provisioning: authorized by access to the database file, the same
-/// authority that admits the first administrator. Used by `sentinel admin`, so
-/// an operator can obtain a working credential before any login route exists.
 pub fn provision(store: &Store, grant: Grant<'_>, now: UnixMillis) -> Result<Granted> {
     check(&grant)?;
     let owned = grant.name.to_owned();
@@ -157,9 +129,6 @@ pub fn provision(store: &Store, grant: Grant<'_>, now: UnixMillis) -> Result<Gra
     })
 }
 
-/// Issue through the ordinary authorization layer: a platform admin may issue
-/// for any account, a tenant admin for a service principal of that tenant, and
-/// any account for itself — never wider than the issuer's own live authority.
 pub fn issue(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -167,16 +136,12 @@ pub fn issue(
     now: UnixMillis,
 ) -> Result<Granted> {
     check(&grant)?;
-    // Delegation can only narrow. This is checked before identity so that an
-    // over-wide request fails the same way for every caller.
     if !principal.permissions.contains(grant.permissions) {
         return Err(Error::Forbidden);
     }
     let platform = crate::auth::require_platform_admin(tx, principal).is_ok();
     if !platform {
         if principal.user == grant.user {
-            // Self-issued: a credential may not escape the scope the caller is
-            // already acting under.
             if principal.tenant.is_some_and(|id| Some(id) != grant.tenant)
                 || principal.repo.is_some_and(|id| Some(id) != grant.repo)
             {
@@ -210,13 +175,7 @@ pub fn issue(
     Ok(granted)
 }
 
-/// Validate a presented credential. One primary-key probe; expiry, revocation,
-/// the account's live state and a service principal's home tenant are all
-/// predicates of the same statement.
-///
-/// The stored scope is a ceiling, not a grant: platform administration is
-/// dropped unless the account still holds it, so demoting a super admin takes
-/// effect on the next request without hunting down its credentials.
+// Stored permissions are a ceiling: a demoted super admin loses platform admin on its next request.
 pub fn authenticate(
     conn: &Connection,
     presented: &Secret,
@@ -282,8 +241,6 @@ pub fn authenticate(
     })
 }
 
-/// Record that a credential was used. Call only when
-/// [`Authenticated::record_use_due`] says so: this is one writer round trip.
 pub fn record_use(store: &Store, token: TokenId, now: UnixMillis) -> Result<()> {
     store.writer().write(move |tx| {
         tx.execute(
@@ -294,8 +251,6 @@ pub fn record_use(store: &Store, token: TokenId, now: UnixMillis) -> Result<()> 
     })
 }
 
-/// Revoke one credential. Its owner or a platform admin may do so; both are
-/// checked live, inside this transaction. Revocation is immediate and final.
 pub fn revoke(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -324,8 +279,6 @@ pub fn revoke(
     )
 }
 
-/// Host-local revocation, for an operator who no longer has a working
-/// credential or session to revoke one with.
 pub fn revoke_host_local(store: &Store, token: TokenId, now: UnixMillis) -> Result<()> {
     store.writer().write(move |tx| {
         let owner: [u8; 16] = tx
@@ -347,8 +300,6 @@ fn revoke_row(tx: &Transaction<'_>, token: TokenId, now: UnixMillis) -> Result<(
     Ok(())
 }
 
-/// Revoke every live credential of one account: suspension, and the caller's
-/// "revoke everything" action.
 pub fn revoke_all_for_user(tx: &Transaction<'_>, user: UserId, now: UnixMillis) -> Result<usize> {
     let revoked = tx.execute(
         "UPDATE api_tokens SET revoked_ms = ?2 WHERE user_id = ?1 AND revoked_ms IS NULL",
@@ -357,7 +308,6 @@ pub fn revoke_all_for_user(tx: &Transaction<'_>, user: UserId, now: UnixMillis) 
     Ok(revoked)
 }
 
-/// Metadata about one issued credential. Never carries the secret or its digest.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Record {
     pub id: TokenId,
@@ -372,9 +322,6 @@ pub struct Record {
     pub revoked: bool,
 }
 
-/// List one account's credentials, newest first. The account itself or a
-/// platform admin may look; nobody may list another account's credentials by
-/// guessing its ID. At most 100 records.
 pub fn list(
     conn: &Connection,
     authority: Authority,
@@ -433,9 +380,6 @@ pub fn list(
     .collect()
 }
 
-/// Delete credentials that can no longer authenticate anybody, in bounded
-/// batches. Maintenance only: expiry and revocation are already enforced by
-/// the validation statement.
 pub fn purge_expired(store: &Store, now: UnixMillis, limit: u32) -> Result<usize> {
     store.writer().write(move |tx| {
         let removed = tx.execute(
@@ -452,8 +396,6 @@ pub fn purge_expired(store: &Store, now: UnixMillis, limit: u32) -> Result<usize
 mod tests {
     use rusqlite::Connection;
 
-    /// Credential validation runs on every API request; it must stay a
-    /// primary-key probe and one key join.
     #[test]
     fn credential_validation_is_an_index_search() {
         let mut conn = Connection::open_in_memory().unwrap();

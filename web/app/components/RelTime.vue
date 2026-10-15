@@ -1,7 +1,5 @@
 <script setup lang="ts">
-// A time as relative text, with the absolute time for the curious. The
-// server and the first browser render show the same UTC clock time (the
-// two clocks differ); once mounted it turns relative and ticks every 15 s.
+// Server and first client render must match, so the time shows as UTC until mounted.
 const props = defineProps<{ ms: number | null | undefined }>();
 const now = ref<number | null>(null);
 let timer: ReturnType<typeof setInterval> | undefined;

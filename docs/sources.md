@@ -184,6 +184,8 @@ only a sealed credential that cannot be opened is a permanent
 
 ## Commands
 
+These host-local commands are authorized by holding the database file, not by `--actor`, which is only the attribution recorded in the audit trail; adding an actor check expecting it to gate access would not change who can run them. The authenticated tenant-administrator path is the API route `POST /tenants/{slug}/repos`.
+
 ```sh
 # A tenant-owned repository row, then its binding
 sentinel admin source create --data-dir "$DATA" --actor usr_... \

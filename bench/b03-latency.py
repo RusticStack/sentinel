@@ -232,8 +232,7 @@ def first(d, out, n):
              intake_ack_ns=ack_ns, queued_ms=queued, offered_ms=offered, acked_ms=acked,
              ready_to_offer_ms=offered - queued, offer_to_ack_ms=acked - offered,
              ready_to_first_ms=first_ns / 1e6 - queued,
-             # The budgets above start at `queued_ms`, which is stamped after
-             # the pipeline is resolved; these two start at the event itself.
+             # queued_ms is stamped after pipeline resolution; these two start at the POST.
              intake_to_ready_ms=queued - posted_ns / 1e6,
              intake_to_first_ms=first_ns / 1e6 - posted_ns / 1e6)
         print(f"first {i}: offer {offered - queued} ms, ack {acked - offered} ms, first process {first_ns / 1e6 - queued:.0f} ms", file=sys.stderr)
@@ -252,8 +251,7 @@ def logs(d, out, n):
             try:
                 body = d.get(q, timeout=40)
             except urllib.error.HTTPError as e:
-                # The attempt's log does not exist until its first frame;
-                # lines captured meanwhile count as visible later.
+                # 404 until the first frame; lines captured before then count as visible later.
                 if e.code != 404:
                     raise
                 time.sleep(0.02)
@@ -278,7 +276,7 @@ def cancel(d, out, n):
         delivery, ack_ns, _ = d.push("cancel")
         run = d.run_of(delivery)
         d.wait_state(run, {"running"})
-        time.sleep(1)  # the step is under way
+        time.sleep(1)
         t0 = time.monotonic_ns()
         d.call("POST", f"/runs/{run}/cancel", {})
         done = d.wait_finished(run)

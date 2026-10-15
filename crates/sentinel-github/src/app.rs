@@ -1,5 +1,3 @@
-//! GitHub App identity is separate from human OAuth. Tokens are minted for
-//! one immutable repository ID and contents:read only, without a token cache.
 use crate::{Error, Result, http::Client};
 use base64::{
     Engine,
@@ -33,36 +31,26 @@ pub struct Token {
     pub expires_ms: i64,
 }
 
-/// A repository an installation currently covers, as the API reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallationRepo {
     pub id: u64,
-    /// `owner/name`, GitHub's canonical spelling of the repository.
     pub full_name: String,
     pub archived: bool,
 }
 
-/// The answer to "which repositories does this installation cover".
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InstallationRepos {
     pub repos: Vec<InstallationRepo>,
-    /// The page cap stopped the walk: the list proves membership, never
-    /// absence.
     pub truncated: bool,
 }
 
-/// GitHub's two organization roles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrgRole {
     Owner,
     Member,
 }
 
-/// A bounded read of GitHub that may prove nothing. `Known` and `Absent` are
-/// verified answers; `Unknown` is everything else — a rate limit, a server
-/// error, a missing App permission, an unreachable network, a reply about a
-/// different account or organization than the one asked about — and a caller
-/// must treat it as neither membership nor its absence.
+/// `Unknown` proves neither membership nor absence; callers must not act as if it did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Answer<T> {
     Known(T),
@@ -78,7 +66,6 @@ impl<T> Answer<T> {
         Answer::Unknown { retry_after_s }
     }
 
-    /// A non-success reply: `Unknown`, carrying GitHub's rate-limit hint.
     fn from_failure(reply: &crate::http::Reply) -> Self {
         let wait = reply
             .retry_after_s
@@ -92,7 +79,6 @@ impl<T> Answer<T> {
     }
 }
 
-/// A login as GitHub spells it, safe as a URL path segment.
 fn valid_login(login: &str) -> bool {
     !login.is_empty()
         && login.len() <= 128
@@ -101,7 +87,6 @@ fn valid_login(login: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// A repository owner or name, safe as a URL path segment.
 fn valid_path_part(part: &str) -> bool {
     !part.is_empty()
         && part.len() <= 100
@@ -112,15 +97,10 @@ fn valid_path_part(part: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
-/// What the reconcile lane learned about one bound repository.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepoState {
-    /// Id, owner and clone URL still match the approved binding.
     Verified,
-    /// Renamed, transferred, archived or disabled: the approved remote no
-    /// longer describes it.
     Changed,
-    /// The API answered 404: deleted or removed from the installation.
     Gone,
 }
 
@@ -131,17 +111,12 @@ impl core::fmt::Debug for Token {
 }
 
 impl Drop for Token {
-    /// The installation token is wiped when it is released (best effort: the
-    /// copies the HTTP layer and the parsed response made are outside it).
-    /// Take the secret out with `mem::take` to keep it past the token.
     fn drop(&mut self) {
         sentinel_auth::secret::wipe_string(&mut self.secret);
     }
 }
 
 impl App {
-    /// GitHub's downloaded PKCS#1 PEM or unencrypted PKCS#8 PEM. Keep the
-    /// protected key file outside SQLite and replace/restart for key rotation.
     pub fn new(id: u64, pem: &str) -> Result<Self> {
         if id == 0 || pem.len() > 16 * 1024 {
             return Err(Error::Config("App key"));
@@ -182,10 +157,6 @@ impl App {
         })
     }
 
-    /// The same App against another API endpoint: a GitHub Enterprise host,
-    /// or a test stub. The URL must be absolute, bounded, free of query and
-    /// fragment, and use HTTPS — HTTP is accepted only for a loopback host,
-    /// which is how the token and Checks paths are exercised offline.
     pub fn with_endpoint(mut self, endpoint: &str) -> Result<Self> {
         let trimmed = endpoint.trim_end_matches('/');
         let loopback = trimmed
@@ -201,7 +172,6 @@ impl App {
         Ok(self)
     }
 
-    /// The endpoint this App talks to, for diagnostics (never a secret).
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
@@ -238,9 +208,6 @@ impl App {
         parse_installation(&value, self.id, id)
     }
 
-    /// The same read for the reconcile lane: `Ok(None)` is a verified
-    /// 404 — the installation is gone for good — while any other non-200 is a
-    /// transport-class failure the caller retries.
     pub fn installation_status(&self, id: u64, now_ms: i64) -> Result<Option<Installation>> {
         let reply = self.http.send_json(
             "GET",
@@ -255,11 +222,6 @@ impl App {
         }
     }
 
-    /// An installation-wide read token for reconciliation: `contents: read`
-    /// over every repository the installation covers, minted only for an
-    /// installation a fresh snapshot just proved usable. The token stays in
-    /// the controller — it is never issued to a workload — and expires like
-    /// every other installation token.
     pub fn reconciliation_token(&self, installation: &Installation, now_ms: i64) -> Result<Token> {
         if installation.suspended || !installation.permissions_valid {
             return Err(Error::Response("installation access refused"));
@@ -275,10 +237,7 @@ impl App {
         parse_token(&value, now_ms, &[("contents", "read")])
     }
 
-    /// The repositories an installation currently covers, in bounded pages.
-    /// `truncated` means the page cap stopped the walk: the list then proves
-    /// membership and naming, never absence — a caller must not revoke what
-    /// it did not see.
+    /// `truncated` proves membership, never absence: a caller must not revoke what it did not see.
     pub fn installation_repositories(&self, token: &Token) -> Result<InstallationRepos> {
         const PER_PAGE: u32 = 100;
         const MAX_PAGES: u32 = 10;
@@ -327,14 +286,6 @@ impl App {
         })
     }
 
-    /// An installation-wide token for reading organization membership:
-    /// `members: read` plus `metadata: read` and nothing else. Metadata is
-    /// requested explicitly because `GET /repos/{o}/{r}/collaborators/{login}/permission`
-    /// needs repository Metadata read, which an organization-only token does
-    /// not carry; it grants no content, checks or write access. A different permission set is a
-    /// different token, so an installation whose App was never granted the
-    /// permission fails here (and only here), never in the source or Checks
-    /// paths. Minted only for an installation a fresh snapshot proved usable.
     pub fn membership_token(&self, installation: &Installation, now_ms: i64) -> Result<Token> {
         if installation.suspended || !installation.permissions_valid || installation.personal {
             return Err(Error::Response("installation access refused"));
@@ -350,9 +301,6 @@ impl App {
         parse_token(&value, now_ms, &[("members", "read"), ("metadata", "read")])
     }
 
-    /// The current login of the account with this immutable numeric id. The
-    /// login is only ever a path segment for the next request: it is checked
-    /// against the id GitHub echoes, and nothing is granted by it.
     pub fn user_login(&self, token: &Token, github_id: u64) -> Answer<String> {
         let reply = match self.http.send_json(
             "GET",
@@ -371,18 +319,12 @@ impl App {
                     _ => Answer::unknown(None),
                 }
             }
-            // The account no longer exists: nobody can hold this identity.
             404 | 410 => Answer::Absent,
             _ => Answer::from_failure(&reply),
         }
     }
 
-    /// Whether the account is an *active* member of the organization, and in
-    /// which role. Identity is the numeric id: the reply must name the same
-    /// account id and organization id that were asked about, or it proves
-    /// nothing (a renamed login, a reused login or an organization that was
-    /// transferred are all `Unknown`, never a guess). A pending invitation is
-    /// not membership.
+    /// Identity is the numeric id: a renamed, reused or transferred account is `Unknown`, never a guess.
     pub fn org_membership(
         &self,
         token: &Token,
@@ -423,12 +365,6 @@ impl App {
         }
     }
 
-    /// The account's role on one repository, as GitHub's canonical token
-    /// (`admin`, `maintain`, `write`, `triage`, `read` or `none`). A role the
-    /// contract does not name falls back to GitHub's legacy `permission`
-    /// field, which maps a custom role onto its base; the token is never
-    /// *higher* than what GitHub reported. Anything but a verified 200 for
-    /// the same account id is `Unknown`.
     pub fn repo_role(
         &self,
         token: &Token,
@@ -466,8 +402,6 @@ impl App {
             Some("none") => "none",
             _ => return Answer::unknown(None),
         };
-        // `role_name` only ever narrows the legacy value: triage reads as
-        // `read`, maintain as `write`; a custom role keeps its base.
         let narrowed = match (body["role_name"].as_str(), legacy) {
             (Some("triage"), "write" | "read") => "triage",
             (Some("maintain"), "write") => "maintain",
@@ -477,10 +411,6 @@ impl App {
         Answer::Known(narrowed)
     }
 
-    /// Whether the repository a binding approved still is that repository.
-    /// `Gone` and `Changed` both revoke: an approved remote never silently
-    /// follows a removal, rename, transfer or archival. Any other non-200 is
-    /// transport-class — the caller retries rather than revoking on a guess.
     pub fn repository_state(
         &self,
         token: &Token,
@@ -511,8 +441,6 @@ impl App {
         }
     }
 
-    /// Validate the installation, restrict token scope explicitly, then verify
-    /// repository ownership and the exact approved clone URL using that token.
     pub fn source_token(
         &self,
         installation: u64,
@@ -531,9 +459,6 @@ impl App {
         )
     }
 
-    /// A token for publishing Checks: `checks: write` and nothing else,
-    /// for the same one immutable repository and with the same verification.
-    /// A different permission set is a different token, never a wider one.
     pub fn checks_token(
         &self,
         installation: u64,
@@ -646,8 +571,6 @@ fn parse_token(v: &Value, now_ms: i64, requested: &[(&str, &str)]) -> Result<Tok
     let permissions = v["permissions"]
         .as_object()
         .ok_or(Error::Response("token permissions"))?;
-    // The token must carry exactly what was requested (metadata read is the
-    // implicit companion), never more: a narrowed token is the whole point.
     let allows_metadata = permissions
         .iter()
         .all(|(key, _)| key == "metadata" || requested.iter().any(|(k, _)| k == key));
@@ -701,12 +624,10 @@ mod tests {
         assert!(parse_token(&v, now, &source).is_err());
         v["permissions"].as_object_mut().unwrap().remove("checks");
         assert!(parse_token(&v, token.expires_ms, &source).is_err());
-        // The checks token is a different, equally exact permission set.
         assert!(parse_token(&v, now, &[("checks", "write")]).is_err());
         v["permissions"] = json!({"checks":"write","metadata":"read"});
         assert!(parse_token(&v, now, &[("checks", "write")]).is_ok());
         assert!(parse_token(&v, now, &source).is_err());
-        // A wider grant than requested is refused, not narrowed silently.
         v["permissions"] = json!({"checks":"write","contents":"read","metadata":"read"});
         assert!(parse_token(&v, now, &[("checks", "write")]).is_err());
     }

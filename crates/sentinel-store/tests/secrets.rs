@@ -302,7 +302,6 @@ fn scoped_bindings_delegate_writes_and_resolve_only_explicit_versions() {
         }),
         Err(Error::Conflict)
     ));
-    // Removing the colliding repository secret permits the tenant binding.
     store
         .writer()
         .write(move |tx| secrets::delete(tx, writer_principal, Scope::Repo(repo), "TOKEN", 2, NOW))

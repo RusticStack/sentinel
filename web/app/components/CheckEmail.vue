@@ -1,8 +1,5 @@
 <script setup lang="ts">
-// "Look for the link": what follows a sign-up, a resend or an invitation that
-// needs the mailbox proved. Worded so it never says whether the address
-// already had an account. `verification: operator` means this deployment
-// sends no mail and the operator hands the link over.
+// Worded so it never reveals whether the address already has an account.
 defineProps<{ email?: string; verification: "email" | "operator"; joining?: boolean }>();
 </script>
 

@@ -1,9 +1,3 @@
-//! Preparation overlaps the image pull with the checkout, pulls are
-//! single-flight per `name@sha256:…` across attempts, and helpers keep the
-//! worker's registry authorization. The slot mechanics live behind a stub
-//! download so nothing here needs a registry; `images`'s own tests cover
-//! the follower/cancel paths, and `podman`'s cover the environment.
-
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -58,14 +52,10 @@ impl Report for Rec {
     }
 }
 
-/// Sentinel value for a `Job`'s cancel flag.
 fn uncanceled() -> attempt::Cancel {
     Default::default()
 }
 
-/// What the stub download saw: the reference it was handed, whether the
-/// checkout's file was already there when the pull began, and whether it
-/// appeared while the pull was in flight.
 #[derive(Default)]
 struct Seen {
     image: String,
@@ -73,9 +63,6 @@ struct Seen {
     appeared_during: bool,
 }
 
-/// A real local checkout and a stubbed pull run in one `prepare`: the
-/// pull must begin while the checkout is still working — a serial
-/// implementation would only see the checkout's file already present.
 #[test]
 fn the_pull_overlaps_the_checkout() {
     let temp = tempfile::tempdir().unwrap();
@@ -83,8 +70,7 @@ fn the_pull_overlaps_the_checkout() {
     fs::create_dir(&repo).unwrap();
     git(&repo, &["init", "-q", "--initial-branch=main"]);
     fs::write(repo.join("greeting.txt"), "hello\n").unwrap();
-    // Enough files that the checkout's four Git invocations cannot plausibly
-    // finish before the pull thread's first look at the workspace.
+    // 200 files keep the checkout busy long enough for the pull to start first.
     for i in 0..200 {
         fs::write(repo.join(format!("file-{i:03}.txt")), "x\n").unwrap();
     }
@@ -104,14 +90,11 @@ fn the_pull_overlaps_the_checkout() {
                 seen.image = image.to_owned();
                 seen.present_at_start = workspace.join("greeting.txt").exists();
             }
-            // Stay in flight until the checkout's file lands.
             let deadline = Instant::now() + Duration::from_secs(15);
             while !workspace.join("greeting.txt").exists() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(2));
             }
             seen.lock().unwrap().appeared_during = workspace.join("greeting.txt").exists();
-            // The stub stands in for a download: `false` is `podman
-            // pull`'s "the store did not already hold it" answer.
             Ok(false)
         }
     });
@@ -171,10 +154,6 @@ fn the_pull_overlaps_the_checkout() {
     );
     let seen = seen.lock().unwrap();
 
-    // The stub pulled the exact `name@sha256:…` reference — the spec's tag
-    // is dropped in favor of the run's pin — and it ran while the checkout
-    // was still working: the file was absent at pull start and appeared
-    // during it. A serial `prepare` could satisfy neither.
     assert_eq!(seen.image, format!("example.test/image@{DIGEST}"));
     assert!(
         !seen.present_at_start,
@@ -184,16 +163,11 @@ fn the_pull_overlaps_the_checkout() {
         seen.appeared_during,
         "the checkout finished while the pull was in flight"
     );
-    // Both phases still carry their own measured wall time, and the image
-    // the run pinned joins the worker's held record.
     assert!(summary.checkout_ns.is_some());
     assert!(summary.image_pull_ns.is_some());
-    // The image was absent before the stub's pull, so `image_present` is
-    // false even though production still runs its scoped auth pull.
+    // image_present stays false even though production still runs its scoped auth pull.
     assert_eq!(summary.image_present, Some(false));
     assert!(images.holds(DIGEST));
-    // There is no podman image behind the stub, so the container start —
-    // or the helper spawn — is what preparation reports.
     match verdict {
         Verdict::Failed(FailureClass::Preparation, _) => {}
         other => panic!("expected a preparation failure, got {other:?}"),
@@ -208,8 +182,6 @@ fn the_pull_overlaps_the_checkout() {
     assert!(rec.summary.lock().unwrap().is_some());
 }
 
-/// A tag-only reference is refused before any pull machinery runs, on the
-/// shared path just as on the direct one.
 #[test]
 fn an_unpinned_reference_is_still_refused() {
     let images = Images::with_download(|_, _, _, _, _| Ok(false));

@@ -1,8 +1,3 @@
-//! Through the real binaries: a running server loads its webhook secret,
-//! accepts an authenticated generic ref update, resolves it off the request
-//! path against a repository served on loopback HTTPS — policy, pinned
-//! revision, immutable run — and the host-local CLI shows the durable record
-//! with its run before retention purges it.
 #![cfg(all(target_os = "linux", feature = "server"))]
 
 use std::{
@@ -41,8 +36,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-/// The shared loopback HTTPS Git fixture: `git_https.py` serving one
-/// repository, with a CA the binding pins and a deploy password it seals.
 struct GitServer {
     child: Child,
     port: u16,
@@ -140,8 +133,6 @@ impl Server {
         self.wait(|record| record["fields"]["event"] == event, event)
     }
 
-    /// The `intake_settled` record for one delivery whose outcome starts with
-    /// `prefix` (`ready`, `dispatched:`, `ignored:duplicate`, …).
     fn settled(&mut self, delivery: &str, prefix: &str) -> serde_json::Value {
         self.wait(
             |record| {
@@ -201,9 +192,6 @@ impl Drop for Server {
     }
 }
 
-/// `sentinel admin <path> --data-dir <data> <args>` with `stdin` fed in.
-/// Nested command groups need the data directory before their subcommand; the
-/// path parameter is what says where it goes.
 fn admin_stdin(data: &str, path: &[&str], args: &[&str], stdin: &[u8]) -> std::process::Output {
     let mut child = Command::new(binary())
         .args(["admin"])
@@ -249,8 +237,6 @@ fn post(url: &str, token: &str, body: &serde_json::Value) -> (u16, serde_json::V
     )
 }
 
-/// The repository the fixture serves: one pipeline commit and one source-only
-/// commit, so the delivery is a real transition.
 fn source_repository(root: &Path) -> (PathBuf, String, String) {
     let git_dir = root.join("repo");
     fs::create_dir(&git_dir).unwrap();
@@ -264,7 +250,6 @@ fn source_repository(root: &Path) -> (PathBuf, String, String) {
     git(&git_dir, &["add", "-A"]);
     git(&git_dir, &["commit", "-qm", "two"]);
     let second = git(&git_dir, &["rev-parse", "HEAD"]);
-    // A real server must be told to serve an arbitrary pinned revision.
     git(
         &git_dir,
         &["config", "uploadpack.allowAnySHA1InWant", "true"],
@@ -283,7 +268,6 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
     let tenant = admin_path(data, &["tenant", "create"], &["--slug", "acme"])
         .trim()
         .to_owned();
-    // The actor must be a real account; use the bootstrapped super admin.
     let status = admin_path(data, &["status"], &[]);
     let actor = status
         .split("subject=")
@@ -304,8 +288,6 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
         .expect("create prints the repository")
         .to_owned();
 
-    // Serve the repository over loopback HTTPS and bind it with the CA as
-    // trust and the deploy password as the sealed credential.
     let (_, first, second) = source_repository(temp.path());
     let cert = temp.path().join("ca.pem");
     let tls_key = temp.path().join("tls.key");
@@ -367,8 +349,6 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
     let hook_token = admin_path(data, &source, &["hook-token", "--repo", &repo]);
     let hook_token = hook_token.trim().to_owned();
     assert!(hook_token.starts_with("sentinel_hook_"));
-    // A webhook secret makes the GitHub route exist; the generic route does
-    // not need one.
     let webhook = serde_json::json!({ "secret": "a-webhook-secret-value" });
     fs::write(
         temp.path().join("controller/github-webhook.json"),
@@ -389,7 +369,6 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
     let base = format!("http://{}", api["fields"]["addr"].as_str().unwrap());
     let intake = format!("{base}/api/v1/intake/{repo}");
 
-    // A bad secret is refused before the body is looked at.
     let update = serde_json::json!({
         "delivery_id": "e2e-1",
         "ref": "refs/heads/main",
@@ -405,8 +384,6 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
     );
     assert_eq!(status, 401, "the webhook secret is loaded and required");
 
-    // The delivery is accepted with its record id, and the same identity
-    // redelivered is a duplicate of that record.
     let (status, first_answer) = post(&intake, &hook_token, &update);
     assert_eq!(
         (status, first_answer["duplicate"].as_bool()),
@@ -424,9 +401,6 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
         (202, Some(true), Some(id.as_str()))
     );
 
-    // The lane validates the binding, resolves the pipeline at the pushed
-    // revision through Git and creates one immutable run, all off the request
-    // path; the server says so in order.
     let validated = server_process.settled(&id, "ready");
     assert_eq!(validated["fields"]["delivery"], id);
     let dispatched = server_process.settled(&id, "dispatched:");
@@ -434,8 +408,6 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
     let run = outcome.trim_start_matches("dispatched:").to_owned();
     assert!(run.starts_with("run_") && run.len() == 40, "{outcome}");
 
-    // A ref the binding does not allow settles with an explicit reason and no
-    // run: it is history retention may remove.
     let rejected = serde_json::json!({
         "delivery_id": "e2e-2",
         "ref": "refs/heads/dev",
@@ -449,8 +421,6 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
     assert_eq!(failed["fields"]["outcome"], "failed:ref_not_allowed");
 
     server_process.stop();
-    // The durable record survives the process and names exactly the run that
-    // was created; the CLI reads it without the server running.
     let listed = admin_path(
         data,
         &["intake"],
@@ -470,8 +440,6 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
         b"",
     );
     assert_eq!(unknown_state.status.code(), Some(2));
-    // Retention purges settled history that produced nothing — never an open
-    // delivery and never one a run's provenance depends on.
     thread::sleep(Duration::from_millis(1200));
     let purged = admin_path(data, &["intake"], &["purge", "--older-than", "1s"]);
     assert!(purged.contains("\"purged\":1"), "{purged}");
@@ -483,8 +451,7 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
     assert_eq!(remaining[0]["run"], run);
 }
 
-/// A test-only RSA key, generated for this suite (the same one the checks
-/// suites use); it authenticates nothing.
+/// A test-only RSA key; it authenticates nothing.
 const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
 MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCn0jnG5Bokc3Af
 NRpzCYPskbFJvhtol1PCsuD1plfDG/Zl2UPU8U9Wv1d+kggr9b+yphtg4u2R1IXL
@@ -514,8 +481,6 @@ rxl8y5pZ+rkMirxkGkfSo5k0JPL96DYRYd5GPPxxAaymC2DaaSIbBT20vtXZKyCO
 BXHyoYy6w9e7POYAfdFeqKcU
 -----END PRIVATE KEY-----";
 
-/// A stub GitHub API over loopback: the installation, a checks token, the
-/// repository check and the check-run creations the publisher makes.
 struct GithubApi {
     addr: std::net::SocketAddr,
     records: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
@@ -724,8 +689,6 @@ fn a_refused_fork_pull_request_publishes_a_completed_check() {
         .expect("create prints the repository")
         .to_owned();
 
-    // The App and its API are a loopback stub; the deployment has a public URL
-    // for `details_url`.
     let api = GithubApi::start();
     let app_key = temp.path().join("app.pem");
     fs::write(&app_key, TEST_KEY).unwrap();
@@ -757,7 +720,6 @@ fn a_refused_fork_pull_request_publishes_a_completed_check() {
         )
         .unwrap();
     }
-    // The App association is refreshed through the stub, then bound.
     let refreshed = admin_path(
         data,
         &source,
@@ -820,8 +782,6 @@ fn a_refused_fork_pull_request_publishes_a_completed_check() {
     let api_info = server_process.event("api_listening");
     let base = format!("http://{}", api_info["fields"]["addr"].as_str().unwrap());
 
-    // A pull request whose head lives in another repository is refused before
-    // any fetch, and that refusal still owes a completed check.
     let merge = "e".repeat(40);
     let pr = serde_json::json!({
         "action": "opened",
@@ -837,7 +797,6 @@ fn a_refused_fork_pull_request_publishes_a_completed_check() {
     });
     let raw = pr.to_string();
     let (status, body) = post(&format!("{base}/api/v1/hooks/github"), "irrelevant", &pr);
-    // The generic `post` helper sends no signature; use the signed path.
     assert_eq!(status, 401, "{body}");
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
@@ -867,7 +826,6 @@ fn a_refused_fork_pull_request_publishes_a_completed_check() {
     assert_eq!(check["body"]["name"], "sentinel / ci");
     assert_eq!(check["body"]["status"], "completed");
     assert_eq!(check["body"]["conclusion"], "neutral");
-    // A pull-request check belongs on the delivered head, not the merge.
     assert_eq!(check["body"]["head_sha"], "c".repeat(40));
     assert!(
         check["body"]["output"]["summary"]
@@ -876,7 +834,6 @@ fn a_refused_fork_pull_request_publishes_a_completed_check() {
             .contains("fork"),
         "{check}"
     );
-    // A settled delivery with no run has no details link.
     assert!(check["body"]["details_url"].is_null(), "{check}");
 
     server_process.stop();

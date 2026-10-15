@@ -1,8 +1,4 @@
-//! Consistent online backup, verification and restore.
-//!
-//! A backup directory holds any number of backups sharing one copy of every
-//! immutable file:
-//!
+//! Objects and manifests are immutable and the maintenance lock is held until the last copy, so no named file can be reclaimed mid-backup.
 //! ```text
 //! <target>/objects/…              committed objects, content-addressed (shared)
 //! <target>/manifests/…            manifest versions, immutable (shared)
@@ -11,25 +7,6 @@
 //! <target>/<id>/config/…          the controller's own files (never the key)
 //! <target>/<id>/backup.json       what it holds, with checksums
 //! ```
-//!
-//! **Consistency.** The database is snapshotted with `VACUUM INTO` on a read
-//! connection — one transaction, so the copy is the database at one instant
-//! while the controller keeps writing. Objects and manifests are immutable
-//! and content-addressed; the only way a file the snapshot names could
-//! vanish is reclamation, log expiry or eviction, and all three take the
-//! object store's maintenance lock, which the backup holds from before the
-//! snapshot until the last copy. Every object is rehashed as it is copied,
-//! so a backup never stores rot.
-//!
-//! **The master key is not in it.** Sealed values (secrets, second-factor
-//! seeds, source credentials) are useless without the key, and a backup
-//! that carried both would be one theft away from all of them. The manifest
-//! records which key ids the sealed values need; a restore refuses to
-//! finish without a key that opens them.
-//!
-//! Evicted objects live only in the external S3 copy; the backup
-//! records them as `remote`, and a restored controller with the same `[s3]`
-//! section fetches them back on read.
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -51,8 +28,6 @@ pub const FORMAT: &str = "sentinel.backup/1";
 const METADATA: &str = "metadata.sqlite";
 const MANIFEST: &str = "backup.json";
 const CONFIG_DIR: &str = "config";
-/// The controller's own files a restore needs, beside the database. The
-/// master key is deliberately not among them.
 pub const CONFIG_FILES: &[&str] = &[
     "controller.crt",
     "controller.key",
@@ -72,12 +47,9 @@ fn io(context: &str, error: std::io::Error) -> Error {
     ))
 }
 
-/// Remember `from` and every ancestor up to `root` as holding a new directory
-/// entry that still has to be fsynced.
 fn note_dirs(dirty: &mut BTreeSet<PathBuf>, from: &Path, root: &Path) {
     let mut dir = from;
     loop {
-        // An ancestor chain is always noted whole, so a hit ends the walk.
         if dirty.contains(dir) {
             return;
         }
@@ -89,8 +61,6 @@ fn note_dirs(dirty: &mut BTreeSet<PathBuf>, from: &Path, root: &Path) {
     }
 }
 
-/// Make the renames of a batch of copies durable: one directory fsync each,
-/// however many files landed in it.
 fn sync_dirs(dirty: &BTreeSet<PathBuf>) -> Result<()> {
     for dir in dirty {
         sync_dir(dir)?;
@@ -98,7 +68,6 @@ fn sync_dirs(dirty: &BTreeSet<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// [`copy_file_into`] for a single file: its directory is synced at once.
 fn copy_file(src: &Path, dst: &Path) -> Result<(Digest, u64)> {
     let mut dirty = BTreeSet::new();
     let copied = copy_file_into(src, dst, dst.parent().unwrap_or(dst), &mut dirty)?;
@@ -106,11 +75,6 @@ fn copy_file(src: &Path, dst: &Path) -> Result<(Digest, u64)> {
     Ok(copied)
 }
 
-/// Copy `src` to `dst` through a temporary file, fsynced and renamed, and
-/// return the BLAKE3 digest and length of what was copied. The directories
-/// the rename touched (up to `root`) are added to `dirty`; the caller syncs
-/// them with [`sync_dirs`] before it relies on the copy, so a batch pays one
-/// directory fsync per directory rather than one per file.
 fn copy_file_into(
     src: &Path,
     dst: &Path,
@@ -146,17 +110,9 @@ fn copy_file_into(
     Ok((Digest::from_bytes(*hasher.finalize().as_bytes()), len))
 }
 
-/// The lock file in a backup directory that serializes the writers of the
-/// shared files. [`create`] copies new objects into the shared store *before*
-/// its backup directory exists, so a [`prune`] from another process (a
-/// host-local tool beside the scheduler) would see them named by no kept
-/// backup and delete them from under it.
+// A prune from another process would delete shared objects that no kept backup names yet.
 const LOCK: &str = ".lock";
 
-/// Take the exclusive writer lock on `target`, waiting for another process's
-/// create or prune to finish. The lock is held until the returned file is
-/// dropped. A file system without advisory locks (`Unsupported`) runs
-/// unlocked: the host's own coordination is then all there is.
 fn lock_target(target: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .create(true)
@@ -206,8 +162,6 @@ fn digest(bytes: Vec<u8>) -> Result<Digest> {
     ))
 }
 
-/// One object row of a snapshot: where its file lives and whether only the
-/// external copy holds it.
 struct ObjectRow {
     rel: PathBuf,
     digest: Digest,
@@ -233,7 +187,6 @@ fn object_rows(snapshot: &Connection) -> Result<Vec<ObjectRow>> {
     Ok(out)
 }
 
-/// `(relative path, file digest)` of every manifest version in a snapshot.
 fn manifest_rows(snapshot: &Connection) -> Result<Vec<(PathBuf, Digest)>> {
     let mut stmt =
         snapshot.prepare("SELECT tenant_id, kind, name, version, digest FROM manifests")?;
@@ -252,7 +205,6 @@ fn manifest_rows(snapshot: &Connection) -> Result<Vec<(PathBuf, Digest)>> {
     Ok(out)
 }
 
-/// Attempts whose logs a snapshot still keeps (not expired).
 fn kept_logs(snapshot: &Connection) -> Result<HashSet<AttemptId>> {
     let mut stmt = snapshot.prepare("SELECT id FROM attempts WHERE log_expired_ms IS NULL")?;
     let mut rows = stmt.query([])?;
@@ -268,7 +220,6 @@ fn kept_logs(snapshot: &Connection) -> Result<HashSet<AttemptId>> {
     Ok(out)
 }
 
-/// The id of a backup taken at `now`: its UTC time, sortable.
 pub fn backup_id(now: UnixMillis) -> String {
     let secs = now.0.max(0) as u64 / 1_000;
     let days = (secs / 86_400) as i64;
@@ -297,7 +248,6 @@ fn valid_id(id: &str) -> bool {
         && id.bytes().filter(|b| b.is_ascii_digit()).count() == 14
 }
 
-/// What [`create`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Report {
     pub id: String,
@@ -305,34 +255,21 @@ pub struct Report {
     pub objects: u64,
     pub objects_copied: u64,
     pub object_bytes_copied: u64,
-    /// Objects whose shared copy from an earlier backup no longer matched its
-    /// digest (counted in `objects_copied` too): replaced from the data
-    /// directory.
     pub objects_recopied: u64,
-    /// The same for manifest versions.
     pub manifests_recopied: u64,
-    /// Evicted objects only the external S3 copy holds.
     pub objects_remote: u64,
-    /// Objects whose local bytes did not match their digest: not stored.
     pub objects_corrupt: Vec<String>,
-    /// Objects the database names but the data directory no longer holds:
-    /// not stored. The backup carries on without them.
     pub objects_missing: Vec<String>,
-    /// Staging directories an interrupted backup left, removed first.
     pub partials_removed: u64,
     pub manifests: u64,
     pub manifests_copied: u64,
     pub log_files_copied: u64,
     pub log_bytes_copied: u64,
     pub config_files: Vec<String>,
-    /// Key ids the backup's sealed values need.
     pub key_ids: BTreeSet<u32>,
     pub took_ms: i64,
 }
 
-/// Take a backup of the controller whose store is `store`, objects `objects`
-/// and data directory `data_dir`, into `target`. Online: the controller keeps
-/// serving; deletions of committed bytes wait for the maintenance lock.
 pub fn create(
     store: &Store,
     objects: &Objects,
@@ -342,24 +279,17 @@ pub fn create(
 ) -> Result<Report> {
     let started = UnixMillis::now();
     fs::create_dir_all(target)?;
-    // Before anything is copied and until the backup directory is in place:
-    // a concurrent prune must not see the shared files as unreferenced.
     let _writer = lock_target(target)?;
     let mut id = backup_id(started);
     if target.join(&id).exists() {
-        // Two backups in one second: the later waits its turn.
         std::thread::sleep(std::time::Duration::from_millis(1_000));
         id = backup_id(UnixMillis::now());
     }
     let _maintenance = objects.hold_maintenance();
-    // An interrupted backup (a crash, a kill, a full target) leaves its
-    // staging directory behind; never listed, it only holds space. One
-    // backup runs at a time, so every staging directory now is stale.
     let partials_removed = remove_partials(target)?;
     let staging = target.join(format!(".{id}.partial"));
     fs::create_dir_all(&staging)?;
 
-    // The database at one instant.
     let snapshot_path = staging.join(METADATA);
     store.snapshot_into(&snapshot_path)?;
     File::open(&snapshot_path)?.sync_all()?;
@@ -377,8 +307,6 @@ pub fn create(
         ..Report::default()
     };
 
-    // Objects, rehashed as they are copied; the shared store keeps one copy.
-    // Directory entries of the whole batch are synced once, below.
     let mut dirty = BTreeSet::new();
     for row in object_rows(&snapshot)? {
         report.objects += 1;
@@ -387,9 +315,7 @@ pub fn create(
             continue;
         }
         let dst = target.join(&row.rel);
-        // A copy an earlier backup left is reused only if it still hashes to
-        // the row's digest: a length match proves nothing about rot, and a
-        // reused rotted file would be named by every later backup.
+        // A length match proves nothing about rot, so a reused copy is rehashed.
         if fs::metadata(&dst).is_ok_and(|m| m.len() == row.len) {
             if hash_file(&dst).is_ok_and(|(d, len)| d == row.digest && len == row.len) {
                 continue;
@@ -423,8 +349,6 @@ pub fn create(
         }
         let (got, _) = copy_file_into(&data_dir.join(&rel), &dst, target, &mut dirty)?;
         if got != want {
-            // Unlike an object, a manifest version has no meaningful backup
-            // without it: refuse rather than store a damaged one.
             let _ = fs::remove_file(&dst);
             return Err(Error::Corrupt("manifest content"));
         }
@@ -432,7 +356,6 @@ pub fn create(
     }
     drop(snapshot);
 
-    // Logs: the shared mirror gains new and changed files.
     let logs = data_dir.join(crate::logs::LOGS_DIR);
     if logs.exists() {
         let mut stack = vec![logs.clone()];
@@ -459,8 +382,6 @@ pub fn create(
                 if !changed {
                     continue;
                 }
-                // A live log may move while it is read; what is copied is
-                // what the next backup refreshes.
                 match copy_file_into(&path, &dst, target, &mut dirty) {
                     Ok((_, len)) => {
                         report.log_files_copied += 1;
@@ -473,10 +394,8 @@ pub fn create(
         }
     }
 
-    // Every shared file's rename is durable before a backup names it.
     sync_dirs(&dirty)?;
 
-    // The controller's own files; never the master key.
     let config = staging.join(CONFIG_DIR);
     fs::create_dir_all(&config)?;
     for name in CONFIG_FILES {
@@ -554,8 +473,6 @@ fn restrict(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove the staging directories (`.<id>.partial`) interrupted backups
-/// left in `target`; how many.
 fn remove_partials(target: &Path) -> Result<u64> {
     let mut removed = 0;
     for entry in fs::read_dir(target)?.flatten() {
@@ -574,7 +491,6 @@ fn remove_partials(target: &Path) -> Result<u64> {
     Ok(removed)
 }
 
-/// The backups in `target`, oldest first.
 pub fn list(target: &Path) -> Result<Vec<String>> {
     let mut ids: Vec<String> = match fs::read_dir(target) {
         Ok(read) => read
@@ -589,7 +505,6 @@ pub fn list(target: &Path) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-/// A backup's `backup.json`.
 pub fn manifest(target: &Path, id: &str) -> Result<Value> {
     if !valid_id(id) {
         return Err(Error::InvalidInput("backup id"));
@@ -603,7 +518,6 @@ pub fn manifest(target: &Path, id: &str) -> Result<Value> {
     Ok(value)
 }
 
-/// What [`verify`] found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Verification {
     pub integrity: String,
@@ -624,9 +538,6 @@ impl Verification {
     }
 }
 
-/// Check a backup end to end: the snapshot's checksum and SQLite's own
-/// integrity check, and every object and manifest it names rehashed against
-/// its digest. A drill, not a request-path cost.
 pub fn verify(target: &Path, id: &str) -> Result<Verification> {
     let manifest = manifest(target, id)?;
     let dir = target.join(id);
@@ -635,7 +546,6 @@ pub fn verify(target: &Path, id: &str) -> Result<Verification> {
         metadata_matches: manifest["metadata"]["blake3"].as_str() == Some(got.to_string().as_str()),
         ..Verification::default()
     };
-    // A damaged snapshot is a finding, not an error: say what SQLite says.
     let checked = open_snapshot(&dir.join(METADATA)).and_then(|snapshot| {
         let integrity: String = snapshot.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
         Ok((snapshot, integrity))
@@ -673,7 +583,6 @@ pub fn verify(target: &Path, id: &str) -> Result<Verification> {
     Ok(out)
 }
 
-/// What [`restore`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Restored {
     pub objects: u64,
@@ -684,11 +593,6 @@ pub struct Restored {
     pub key_checked: bool,
 }
 
-/// Rebuild a data directory from a backup, onto a controller that is not
-/// running and a `data_dir` without a database. Every object and manifest
-/// is rehashed as it is copied. With sealed values in the backup, `key`
-/// must be a key file that opens them: it is copied in (owner-only) and
-/// checked against the restored rows before the restore reports success.
 pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> Result<Restored> {
     let manifest = manifest(target, id)?;
     if data_dir.join(METADATA).exists() {
@@ -723,9 +627,6 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
         key_checked: loaded.is_some(),
         ..Restored::default()
     };
-    // The restored files' directory entries are synced once, before the
-    // database lands: a half-restored directory is never taken for a
-    // controller's, and a crash after the restore reports success loses none.
     let mut dirty = BTreeSet::new();
     for row in object_rows(&snapshot)? {
         if row.remote_only {
@@ -755,9 +656,6 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
         }
         out.manifests += 1;
     }
-    // Logs of attempts the snapshot keeps; a log directory's name is its
-    // attempt id (`logs/<run>/<job>/<attempt>/`), an older flat log's is
-    // `<attempt>.log`.
     let kept = kept_logs(&snapshot)?;
     drop(snapshot);
     let logs = target.join(crate::logs::LOGS_DIR);
@@ -807,8 +705,7 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
         restrict(&dst)?;
     }
     sync_dirs(&dirty)?;
-    // The database last: until it lands, a half-restored directory is not
-    // mistaken for a controller's.
+    // The database lands last, so a half-restored directory is never taken for a controller's.
     let (d, _) = copy_file(&dir.join(METADATA), &data_dir.join(METADATA))?;
     if d != got {
         return Err(Error::Corrupt("backup metadata checksum"));
@@ -817,7 +714,6 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
     Ok(out)
 }
 
-/// What [`prune`] removed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Pruned {
     pub backups: Vec<String>,
@@ -826,15 +722,10 @@ pub struct Pruned {
     pub log_files: u64,
 }
 
-/// Keep the newest `keep` backups and remove the rest, then every shared
-/// object, manifest and log file no kept backup names.
 pub fn prune(target: &Path, keep: usize) -> Result<Pruned> {
     if keep == 0 {
         return Err(Error::InvalidInput("keep at least one backup"));
     }
-    // A create in another process holds this while it copies shared files no
-    // kept backup names yet; pruning waits for it rather than deleting them.
-    // A directory that does not exist has nothing to prune and nothing to lock.
     let _writer = match lock_target(target) {
         Ok(lock) => Some(lock),
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -920,23 +811,13 @@ pub fn prune(target: &Path, keep: usize) -> Result<Pruned> {
     Ok(out)
 }
 
-/// What the API sees of the backup scheduler.
 pub trait Control: Send + Sync {
-    /// Start a backup now unless one is running; `false` when one is.
     fn trigger(&self) -> bool;
-    /// The scheduler's state as JSON: target, interval, keep, whether one
-    /// is running, the last success or failure.
     fn status(&self) -> Value;
-    /// Where backups go.
     fn target(&self) -> &Path;
 }
 
-/// Scheduled online backups: one every `interval`, the newest `keep` kept,
-/// and one more whenever [`Control::trigger`] asks. A failure is recorded
-/// and retried at the next interval; it never stops the controller.
 pub struct Scheduler {
-    // Weak: the object store holds this scheduler (for the API), and the
-    // controller's shutdown must be able to take the last store handle.
     store: std::sync::Weak<Store>,
     objects: std::sync::Weak<Objects>,
     data_dir: PathBuf,
@@ -986,7 +867,6 @@ impl Scheduler {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Run the schedule on a thread of its own until [`Scheduler::stop`].
     pub fn start(self: &std::sync::Arc<Self>) -> std::io::Result<std::thread::JoinHandle<()>> {
         let me = std::sync::Arc::clone(self);
         std::thread::Builder::new()
@@ -999,8 +879,6 @@ impl Scheduler {
         self.wake.notify_all();
     }
 
-    /// One backup now, then prune — on the caller's thread. What the
-    /// schedule runs, and what host-local tools call directly.
     pub fn once(&self) -> Result<Report> {
         let (Some(store), Some(objects)) = (self.store.upgrade(), self.objects.upgrade()) else {
             return Err(Error::InvalidInput("the controller is shutting down"));
@@ -1017,8 +895,6 @@ impl Scheduler {
     }
 
     fn run(&self) {
-        // The first backup waits one interval: a restarting controller does
-        // not take one every restart.
         let mut next = std::time::Instant::now() + self.interval;
         loop {
             {

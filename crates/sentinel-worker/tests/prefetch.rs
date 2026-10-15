@@ -1,13 +1,3 @@
-//! Bounded image prefetch with real rootless Podman. Runs only with
-//! `SENTINEL_PODMAN_TESTS=1` as an account with rootless Podman (see
-//! docs/development.md); otherwise it reports that it was skipped, never a
-//! false pass. It needs the registry: the images are pulled from Docker
-//! Hub by digest. It removes only the images below, which no other suite
-//! uses, so it can run beside them against the same store.
-//!
-//! `prefetch_saves_the_attempt_pull` (ignored) measures an attempt's pull
-//! of a 123 MB image cold and after a prefetch.
-
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -24,9 +14,8 @@ use sentinel_worker::{
 };
 use tempfile::TempDir;
 
-/// 25 KB: a prefetch that lands in well under a second.
 const SMALL: &str = "docker.io/library/hello-world@sha256:5e23090353324d887c48ad5e5c56d294eab81588df9605b07d1afe895f9cc8f8";
-/// `python:3.12-slim`, 123 MB: a pull long enough to be caught mid-way.
+/// Large enough that a pull is still running when a hint drops it.
 const LARGE: &str = "docker.io/library/python@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9";
 
 fn enabled() -> bool {
@@ -49,8 +38,7 @@ fn exists(image: &str) -> bool {
         .success()
 }
 
-/// Remove `image`, retrying briefly: other suites share the store and may
-/// hold its lock for a moment.
+/// Other suites share the store and may hold its lock briefly.
 fn remove(image: &str) {
     for _ in 0..5 {
         let _ = Command::new("podman")
@@ -82,11 +70,6 @@ fn new_images() -> (TempDir, Images) {
     (root, images)
 }
 
-/// A hint lands the image through the real store: the prefetch pulls it,
-/// records it held (what the profile then reports warm) and charges its
-/// real size to the byte window; the attempt that then needs it finds it
-/// without a download. The disk reserve was measured on podman's own
-/// graph root.
 #[test]
 fn a_hinted_image_is_prefetched_and_the_attempt_finds_it_held() {
     if !enabled() {
@@ -110,7 +93,6 @@ fn a_hinted_image_is_prefetched_and_the_attempt_finds_it_held() {
         podman::image_bytes(SMALL),
         "charged exactly what the store holds"
     );
-    // The attempt's own pull: the store already has it.
     let present = images
         .pull(SMALL, podman::IMAGE_PULL_TIMEOUT, &uncanceled())
         .unwrap();
@@ -118,8 +100,6 @@ fn a_hinted_image_is_prefetched_and_the_attempt_finds_it_held() {
     prefetcher.stop();
 }
 
-/// A hint that drops a reference kills its running `podman pull`: the pull
-/// ends early, nothing is recorded held, and the store holds no image.
 #[test]
 fn a_stale_prefetch_kills_the_real_pull() {
     if !enabled() {
@@ -154,8 +134,6 @@ fn a_stale_prefetch_kills_the_real_pull() {
     prefetcher.stop();
 }
 
-/// Measurement: the attempt-side pull of `LARGE` cold, then with the image
-/// prefetched while the "job" was still queued. Three rounds.
 #[test]
 #[ignore = "measurement; needs the registry"]
 fn prefetch_saves_the_attempt_pull() {

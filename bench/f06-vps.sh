@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# F06 probe: isolated vs concurrent Lockwell test commands on the CI VPS sandbox.
 set -uo pipefail
 cd "$HOME/work/repo" || exit 1
 OUT="$HOME/f06"; mkdir -p "$OUT"
@@ -12,7 +11,6 @@ TIMEBIN=""; [[ -x /usr/bin/time ]] && TIMEBIN=/usr/bin/time
 cgstat() { awk '/^usage_usec|^nr_throttled|^throttled_usec/{printf "%s=%s ", $1, $2}' "$SLICE/cpu.stat"; }
 loadavg() { cut -d' ' -f1-3 /proc/loadavg; }
 
-# phase <name> <logfile> <cmd...>: wall ns, rusage (if GNU time), cgroup deltas, load
 phase() {
   local name="$1" log="$2"; shift 2
   local before after t0 t1 rc rus
@@ -39,7 +37,6 @@ phase unit_buildonly_warm "$OUT/unit_buildonly.json" go test -count=1 -run '^$' 
 phase race_cold "$OUT/race_cold.json" go test -count=1 -race -json $packages
 phase race_warm "$OUT/race_warm.json" go test -count=1 -race -json $packages
 
-# Concurrent: unit + race warm at the same time, as the CI DAG runs them.
 before="$(cgstat)"; t0=$(date +%s%N)
 ( t=$(date +%s%N); go test -count=1 -json $packages > "$OUT/conc_unit.json" 2>&1; echo "conc_unit rc=$? wall_ns=$(( $(date +%s%N) - t ))" >> "$OUT/conc.log" ) &
 ( t=$(date +%s%N); go test -count=1 -race -json $packages > "$OUT/conc_race.json" 2>&1; echo "conc_race rc=$? wall_ns=$(( $(date +%s%N) - t ))" >> "$OUT/conc.log" ) &

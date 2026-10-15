@@ -1,11 +1,3 @@
-/// A platform administrator who is not an administrator of `slug` reaches
-/// it by platform scope alone: a change that grants access (a member's
-/// role, repository access, service accounts and their credentials) then
-/// needs a step-up and a stated reason, audited as `platform-override`.
-/// `needed` says whether this is that case; `reason` is the one the admin
-/// pages share for the tenant, and `withReason` adds it to a body when it
-/// applies. `ready` is false, says why and moves to the field, while a
-/// needed reason is empty.
 export function useOverride(slug: () => string) {
   const session = useSession();
   const toast = useToast();

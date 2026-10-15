@@ -1,18 +1,9 @@
-//! Source policies: which events run a pipeline (the `on:` section).
-//!
-//! The policy is deliberately small and server-side: an event is admitted
-//! only when its kind is declared and, for ref-carrying kinds, its branch or
-//! tag matches one of the declared patterns. An empty pattern list means
-//! "every branch" or "every tag" of that kind; a missing kind means the event
-//! never runs this pipeline. Nothing here infers PR metadata from a ref: a
-//! pull request is admitted only through the pull-request policy, and the
-//! adapter that produced the event is responsible for proving it.
+//! Nothing infers pull-request metadata from a ref: the adapter that produced the event must prove it.
 use serde::{Deserialize, Serialize};
 
 pub const MAX_REF_PATTERNS: usize = 32;
 pub const MAX_REF_PATTERN_BYTES: usize = 256;
 
-/// The `on:` section, compiled. `None` means the kind is not declared.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Triggers {
     pub push: Option<RefFilter>,
@@ -21,8 +12,6 @@ pub struct Triggers {
     pub manual: bool,
 }
 
-/// Branch patterns (push, pull_request) or tag patterns (tag). An empty list
-/// admits every ref of the kind.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefFilter {
     pub branches: Vec<String>,
@@ -44,8 +33,6 @@ impl Triggers {
         self.push.is_none() && self.pull_request.is_none() && self.tag.is_none() && !self.manual
     }
 
-    /// Admit `event`, or not. A branch-policy event with a tag ref (and the
-    /// reverse) never matches: the kind and the ref must agree.
     pub fn admits(&self, event: &Event<'_>) -> bool {
         match event.kind {
             EventKind::Push => self
@@ -65,8 +52,6 @@ impl Triggers {
     }
 }
 
-/// The kind of event a run was triggered by. Stored as provenance, so the
-/// names are stable text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EventKind {
     Push = 0,
@@ -85,7 +70,6 @@ impl EventKind {
         }
     }
 
-    /// The wire/storage form; unknown text is refused rather than guessed.
     pub fn parse(text: &str) -> Option<Self> {
         Some(match text {
             "push" => Self::Push,
@@ -97,9 +81,7 @@ impl EventKind {
     }
 }
 
-/// What a policy decision is made about. `ref_name` is the full ref the event
-/// concerns: the pushed ref for push and tag, the *base* branch for a pull
-/// request (the branch whose policy the change targets).
+/// For pull requests this is the base branch, whose policy the change targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Event<'a> {
     pub kind: EventKind,
@@ -144,9 +126,6 @@ impl<'a> Event<'a> {
     }
 }
 
-/// Validate one branch/tag pattern: a bounded, printable, relative ref path
-/// where `*` matches within a segment and `**` matches zero or more whole
-/// segments.
 pub fn valid_pattern(pattern: &str) -> Result<(), &'static str> {
     if pattern.is_empty() || pattern.len() > MAX_REF_PATTERN_BYTES {
         return Err("must be 1-256 bytes");
@@ -170,10 +149,6 @@ pub fn valid_pattern(pattern: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Segment-wise match: `*` matches any run of characters inside one segment,
-/// `**` matches zero or more whole segments. Anchored; the whole value must
-/// match. Iterative with one backtrack point per encountered `**`, so a
-/// pathological pattern cannot explode.
 pub fn pattern_matches(pattern: &str, value: &str) -> bool {
     let p: Vec<&str> = pattern.split('/').collect();
     let v: Vec<&str> = value.split('/').collect();
@@ -219,7 +194,6 @@ mod tests {
         let t = push(&["main"]);
         assert!(t.admits(&Event::push("refs/heads/main")));
         assert!(!t.admits(&Event::push("refs/heads/dev")));
-        // A tag ref is never a push, and a branch is never a tag.
         assert!(!t.admits(&Event::push("refs/tags/v1")));
         assert!(!t.admits(&Event::tag("refs/heads/main")));
         assert!(!t.admits(&Event::manual()));
@@ -259,7 +233,6 @@ mod tests {
         assert!(t.admits(&Event::pull_request("refs/heads/main")));
         assert!(t.admits(&Event::pull_request("refs/heads/release/1.0")));
         assert!(!t.admits(&Event::pull_request("refs/heads/feature")));
-        // A push to main does not become a PR run.
         assert!(!t.admits(&Event::push("refs/heads/main")));
     }
 
@@ -275,7 +248,6 @@ mod tests {
         assert!(pattern_matches("**/hotfix/*", "release/2/hotfix/one"));
         assert!(!pattern_matches("**/hotfix/*", "release/2/hotfix/one/two"));
         assert!(!pattern_matches("main", "maintenance"));
-        // A pattern with many `**` cannot explode: linear time in practice.
         let pattern = "**/".repeat(60) + "end";
         let value = "x/".repeat(80) + "end";
         assert!(pattern_matches(&pattern, &value));

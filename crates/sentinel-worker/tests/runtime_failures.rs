@@ -1,10 +1,4 @@
-//! The container runtime failing under the worker, with `podman` replaced
-//! on `PATH` by a shim: teardown still removes a container whose graceful
-//! stop failed, and recovery refuses to abandon attempts when it
-//! cannot list or remove what the previous process left running.
-//!
-//! The shim's behavior is switched per container name or worker id by
-//! files in its directory, so the tests here run in parallel safely.
+//! Shim behavior is switched per container or worker id, so tests run in parallel.
 
 #![cfg(target_os = "linux")]
 
@@ -41,7 +35,6 @@ case "$1" in
 esac
 "#;
 
-/// The shim directory, first on `PATH` for this whole test binary.
 fn shim() -> &'static PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -94,7 +87,6 @@ fn teardown_removes_the_container_even_when_its_stop_fails() {
         &podman::Store::Shared,
     )
     .unwrap();
-    // The stop's failure is reported, and the removal ran anyway.
     assert!(container.destroy().is_err());
     assert!(removed().contains(&name), "{:?}", removed());
 }
@@ -108,7 +100,6 @@ fn recovery_fails_when_the_runtime_cannot_list_what_it_owns() {
     recovery::mark(root.path(), attempt, Fence(2)).unwrap();
     fs::write(dir.join(format!("fail-ps-{worker}")), "").unwrap();
     assert!(recovery::recover(root.path(), worker).is_err());
-    // The marker stays: nothing was abandoned on a guess.
     assert_eq!(recovery::leftovers(root.path()).unwrap().len(), 1);
 }
 
@@ -125,7 +116,6 @@ fn recovery_fails_when_a_leftover_container_cannot_be_removed() {
     .unwrap();
     fs::write(dir.join(format!("fail-rm-{name}")), "").unwrap();
     assert!(recovery::recover(root.path(), worker).is_err());
-    // And once the runtime can remove it, recovery completes.
     fs::remove_file(dir.join(format!("fail-rm-{name}"))).unwrap();
     let (recovered, _) = recovery::recover(root.path(), worker).unwrap();
     assert_eq!(recovered.containers_removed, 1);

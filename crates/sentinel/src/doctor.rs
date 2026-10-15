@@ -1,24 +1,11 @@
-//! `sentinel doctor`: diagnose how this machine signs in to a
-//! controller. Seven checks, in order — the configuration directory, the
-//! profile, reachability, the issuer, the credential store, the access token
-//! and a refresh — each with the exact command that fixes a failure. Nothing
-//! printed ever holds token material. `--json` (or `--output json|ndjson`)
-//! prints `sentinel.doctor/1`:
-//!
 //! ```json
 //! { "schema": "sentinel.doctor/1", "profile": "default", "server": "https://ci.example.com",
 //!   "ok": false,
 //!   "checks": [ { "name": "health", "ok": false, "detail": "…", "fix": "…" }, … ] }
 //! ```
 //!
-//! A check that could not run because an earlier one failed is `ok: false`
-//! with `"skipped": true` and the earlier failure's fix. Exit 0 when every
-//! check passed; otherwise the exit of the first failure from the stable
-//! table (`docs/cli.md#doctor`), after the report.
-//!
-//! The refresh check spends the stored refresh token once, under the
-//! profile lock, exactly as any command would when its access token runs
-//! low: the profile keeps working with the successor.
+//! Nothing printed ever holds token material. The refresh check spends the stored
+//! refresh token for real, under the profile lock, so the profile keeps working.
 
 use std::{fmt::Write as _, time::Duration};
 
@@ -33,10 +20,7 @@ use crate::{
     profile::{self, Config, Credentials, Profile, now_ms},
 };
 
-/// The `schema` of `sentinel doctor --json`.
 pub const SCHEMA: &str = "sentinel.doctor/1";
-/// Bound on each network check, so an unreachable controller is reported
-/// in seconds rather than after the client's minute.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Args, Debug)]
@@ -45,13 +29,11 @@ pub struct DoctorArgs {
     pub client: ClientArgs,
 }
 
-/// One line of the report.
 #[derive(Debug, Serialize)]
 pub struct Check {
     pub name: &'static str,
     pub ok: bool,
     pub detail: String,
-    /// The command (or change) that fixes a failure; `null` when it passed.
     pub fix: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub skipped: bool,
@@ -59,7 +41,6 @@ pub struct Check {
     exit: Exit,
 }
 
-/// The whole report, in check order.
 #[derive(Debug, Default)]
 pub struct Report {
     pub checks: Vec<Check>,
@@ -90,7 +71,6 @@ impl Report {
         });
     }
 
-    /// Mark `names` as not run because `cause` failed; they repeat its fix.
     fn skip(&mut self, names: &[&'static str], cause: &'static str) {
         let fix = self
             .checks
@@ -113,7 +93,6 @@ impl Report {
         self.checks.iter().any(|c| c.name == name && !c.ok)
     }
 
-    /// The first failure that is not a consequence of an earlier one.
     pub fn first_failure(&self) -> Option<&Check> {
         self.checks.iter().find(|c| !c.ok && !c.skipped)
     }
@@ -162,7 +141,6 @@ pub fn run(args: DoctorArgs) -> Result<(), Error> {
     }
 }
 
-/// Split a message carrying its own `…; fix: COMMAND` into both halves.
 fn split_fix(message: &str) -> (String, Option<String>) {
     match message.split_once("; fix: ") {
         Some((detail, fix)) => (detail.to_owned(), Some(fix.to_owned())),
@@ -197,7 +175,6 @@ fn check_agent() -> ureq::Agent {
     )
 }
 
-/// Run every check. Never fails itself: each problem is a failed check.
 pub fn diagnose(args: &ClientArgs) -> Report {
     let mut report = Report::default();
 
@@ -234,13 +211,11 @@ pub fn diagnose(args: &ClientArgs) -> Report {
     let agent = check_agent();
 
     health(&mut report, &agent, &name, &entry);
-    // The issuer is checked only once the server answers.
     if report.failed("health") {
         report.skip(&["issuer"], "health");
     } else {
         issuer(&mut report, &agent, &name, &entry);
     }
-    // The credential store is local, so it is always checked.
     let stored = credential_store(&mut report, &config, &name, &entry).is_some();
     match ["health", "issuer", "credential_store"]
         .into_iter()
@@ -512,7 +487,6 @@ fn credential_store(
     }
 }
 
-/// What a failed token check should say to do, by exit.
 fn token_fix(error: &Error, name: &str, entry: &Profile) -> String {
     match error.exit {
         Exit::Auth => login(&entry.server, name),

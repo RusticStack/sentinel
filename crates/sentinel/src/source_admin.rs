@@ -1,11 +1,3 @@
-//! Host-local source provisioning, and the store entry points it reuses.
-//!
-//! Repository binding has two legitimate authorities: an authenticated tenant
-//! administrator through the same live authorization layer as every other
-//! client operation, and the controller's own host — the operator who can
-//! already open the database. The CLI is the second; the API route
-//! `POST /tenants/{slug}/repos` is the first. A host-local
-//! operation still records which account it is attributed to.
 use crate::{
     admin::{self, Error},
     cli::{SourceArgs, SourceCommand},
@@ -42,10 +34,7 @@ fn file(path: &Path, limit: usize) -> Result<Vec<u8>, Error> {
     )
 }
 
-/// Read an operator file that holds a secret: opened once without following
-/// a link and judged on the open handle (a regular file, owned by this user,
-/// closed to group and others), exactly as the master key is
-/// ([`sentinel_auth::secret_file`]). The buffer is wiped by the caller.
+/// Judged on the opened handle, not the path, so a link or a swapped file cannot pass.
 /// Errors name `what` and the rule broken, never the path or any content.
 fn secret_input(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, Error> {
     use sentinel_auth::secret_file::{self, Refusal};
@@ -67,30 +56,18 @@ fn secret_input(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, Error>
 struct AppConfig {
     app_id: u64,
     private_key_file: std::path::PathBuf,
-    /// Where GitHub should link a check's details: the API's public base URL.
-    /// Absent means checks carry no `details_url`.
     public_url: Option<String>,
-    /// Another GitHub API endpoint (Enterprise, or a test stub). Absent means
-    /// `https://api.github.com`.
     api_url: Option<String>,
-    /// Seconds between confirmations of a GitHub-backed organization's
-    /// member (60 to 86,400; default 3,600).
     member_recheck_secs: Option<u64>,
-    /// Seconds an unconfirmed member of a GitHub-backed organization keeps
-    /// access while GitHub cannot be asked (300 to 2,592,000, and at least
-    /// twice the recheck interval; default 86,400).
     member_grace_secs: Option<u64>,
 }
 
-/// The App plus the deployment-facing settings beside it.
 pub struct GithubApp {
     pub app: Arc<sentinel_github::app::App>,
     pub public_url: Option<String>,
-    /// Pacing and grace of the GitHub-backed membership lane.
     pub members: sentinel_checks::members::Config,
 }
 
-/// An absolute `http(s)` base URL with no query, fragment or credentials.
 fn public_url(raw: &str) -> Result<String, Error> {
     let trimmed = raw.trim_end_matches('/');
     let rest = trimmed
@@ -157,14 +134,11 @@ struct WebhookConfig {
     secret: String,
 }
 
-/// The GitHub App's webhook secret, when the deployment configured one. The
-/// route only exists with it; without the file there is nothing to verify.
 pub fn load_webhook_secret(root: &Path) -> Result<Option<Arc<[u8]>>, Error> {
     let path = root.join("github-webhook.json");
     if !path.exists() {
         return Ok(None);
     }
-    // The file is the secret's home, so it is judged before it is parsed.
     let mut bytes = secret_input(&path, 4096, "GitHub webhook configuration")?;
     let parsed = serde_json::from_slice::<WebhookConfig>(&bytes);
     sentinel_auth::secret::wipe(&mut bytes);
@@ -184,15 +158,11 @@ pub fn load_webhook_secret(root: &Path) -> Result<Option<Arc<[u8]>>, Error> {
 struct SignInConfig {
     client_id: String,
     client_secret_file: std::path::PathBuf,
-    /// GitHub Enterprise Server: both, or neither for github.com.
     web_url: Option<String>,
     api_url: Option<String>,
 }
 
-/// GitHub web sign-in, when `<data_dir>/github-sign-in.json` exists:
-/// the OAuth app's client ID and an absolute path to an owner-only file
-/// holding its client secret. The secret never enters the configuration
-/// file, the database or a log line; errors name the field, not a value.
+// The client secret never enters the configuration file, the database or a log line.
 pub fn load_sign_in(root: &Path) -> Result<Option<sentinel_api::GithubSignIn>, Error> {
     let path = root.join("github-sign-in.json");
     if !path.exists() {
@@ -203,8 +173,6 @@ pub fn load_sign_in(root: &Path) -> Result<Option<sentinel_api::GithubSignIn>, E
     if !config.client_secret_file.is_absolute() {
         return Err(fail("GitHub sign-in client_secret_file must be absolute"));
     }
-    // `read_secret` opens the file once without following a link and judges
-    // the handle: owner-only, owned by this user, a regular file.
     let client_secret =
         sentinel_github::oauth::read_secret(&config.client_secret_file).map_err(|_| {
             fail(
@@ -262,8 +230,6 @@ struct Forge {
 
 pub fn run(args: &SourceArgs) -> Result<(), Error> {
     let store = admin::open(&args.data, true)?;
-    // The CLI's authority is holding the database file; the actor is
-    // attribution recorded in the audit, not a boundary to guess at.
     let actor: UserId = args.actor.parse().map_err(|_| fail("invalid actor ID"))?;
     let now = UnixMillis::now();
     let host = Authority::HostLocal;
@@ -375,8 +341,7 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                     .writer()
                     .write(move |tx| intake::issue_token(tx, host, repo, now))
                     .map_err(denied)?;
-                // The one presentation: only the secret reaches stdout, so a
-                // shell can redirect it without a parser in between.
+                // Stdout carries only the secret, so a shell can redirect it without a parser.
                 sentinel::outln!("{}", intake::hook_token_text(&secret));
             }
         }
@@ -553,7 +518,6 @@ mod tests {
         );
         assert!(load_sign_in(dir.path()).is_err());
 
-        // A link to an owner-only file is not that file: the open refuses it.
         let link = dir.path().join("client-secret-link");
         std::os::unix::fs::symlink(&secret, &link).unwrap();
         write(
@@ -585,17 +549,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&*secret, b"a-webhook-secret-value");
-        // Group- or world-readable: refused, and the value is not echoed.
         write(&path, body, 0o640);
         let error = load_webhook_secret(dir.path()).err().unwrap();
         assert!(!error.message.contains("a-webhook"), "{}", error.message);
-        // A link to an owner-only file is refused as well.
         let real = dir.path().join("real.json");
         write(&real, body, 0o600);
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&real, &path).unwrap();
         assert!(load_webhook_secret(dir.path()).is_err());
-        // Short secrets are refused after the file passes.
         std::fs::remove_file(&path).unwrap();
         write(&path, r#"{"secret":"short"}"#, 0o600);
         assert!(load_webhook_secret(dir.path()).is_err());

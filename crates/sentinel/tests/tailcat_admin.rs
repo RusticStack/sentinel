@@ -1,6 +1,4 @@
-//! `sentinel admin tailcat`: node-key rotation and allow-list edits through
-//! the real binary, against a fake helper. Keys travel on standard input and
-//! output only; standard error and argv never carry one.
+//! Keys travel on standard input and output only; standard error and argv never carry one.
 
 #![cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]
 
@@ -19,9 +17,6 @@ const OTHER: &str = "fedcba98765432100123456789abcdeffedcba98765432100123456789a
 const ADDRESS: &str = "tcabcdefghijklmnopqrstuvwxyz0123";
 const ADDRESS2: &str = "tczyxwvutsrqponmlkjihgfedcba9876";
 
-/// The helper stand-in: a worker's default key is `KEY`, its rotated one
-/// `OTHER`; a ping with the rotated key succeeds only once `$HOME/admitted`
-/// exists (the controller listing it).
 fn fake_helper(dir: &Path) -> (String, String) {
     let binary = dir.join("helper");
     let script = format!(
@@ -83,7 +78,6 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Standard error names files and workers, never a key or an address.
 fn assert_quiet(output: &Output) {
     let stderr = text(&output.stderr);
     for secret in [KEY, OTHER, ADDRESS, ADDRESS2] {
@@ -143,18 +137,15 @@ fn a_worker_rotation_runs_through_the_admin_commands_with_keys_only_on_stdio() {
     let old_line = format!("nodekey:{KEY} {worker}\n");
     let new_line = format!("nodekey:{OTHER} {worker}\n");
 
-    // The worker's current key is listed on the controller.
     let listed = edit("allow", &old_line);
     assert!(listed.status.success(), "{}", text(&listed.stderr));
     assert_quiet(&listed);
 
-    // Rotate: the staged key's allow-list line alone goes to stdout.
     let rotated = run(worker_args("rotate"), "");
     assert!(rotated.status.success(), "{}", text(&rotated.stderr));
     assert_eq!(text(&rotated.stdout), new_line);
     assert_quiet(&rotated);
 
-    // Not listed yet: the commit is refused and nothing switches.
     let refused = run(worker_args("commit"), "");
     assert_eq!(refused.status.code(), Some(2));
     assert!(
@@ -170,8 +161,6 @@ fn a_worker_rotation_runs_through_the_admin_commands_with_keys_only_on_stdio() {
         format!("nodekey:{KEY}\n")
     );
 
-    // Listed beside the old key (the overlap window) and admitted by the
-    // controller: the commit switches and prints the line to keep.
     let admitted = edit("allow", &text(&rotated.stdout));
     assert!(admitted.status.success(), "{}", text(&admitted.stderr));
     assert_quiet(&admitted);
@@ -190,7 +179,6 @@ fn a_worker_rotation_runs_through_the_admin_commands_with_keys_only_on_stdio() {
         format!("nodekey:{OTHER}\n")
     );
 
-    // Retire: the new key becomes the worker's only one.
     let retired = edit("retire", &text(&committed.stdout));
     assert!(retired.status.success(), "{}", text(&retired.stderr));
     assert!(
@@ -210,7 +198,6 @@ fn a_worker_rotation_runs_through_the_admin_commands_with_keys_only_on_stdio() {
         0o600
     );
 
-    // A malformed line is refused without echoing it.
     let bad = edit("allow", &format!("nodekey:{KEY} wrk_bogus\n"));
     assert_eq!(bad.status.code(), Some(2));
     assert_quiet(&bad);
@@ -218,8 +205,6 @@ fn a_worker_rotation_runs_through_the_admin_commands_with_keys_only_on_stdio() {
     assert_eq!(two.status.code(), Some(2));
     assert_quiet(&two);
 
-    // The controller's rotation stages quietly and cannot commit before a
-    // running controller served the staged key.
     let server_args = |command: &'static str| {
         vec![
             "admin".to_owned(),

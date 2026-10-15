@@ -1,7 +1,3 @@
-//! Durable half: consent choices, approval (every term re-checked in
-//! the writer), and the single-use, PKCE-bound code exchange with replay
-//! revocation.
-
 use sentinel_auth::{oauth::pkce, secret::Secret};
 use sentinel_core::{
     RepoId, TenantId, UnixMillis, UserId,
@@ -36,8 +32,6 @@ struct Ids {
     other_repo: RepoId,
 }
 
-/// A super admin; `dev`, an operator of `acme` (repository `app`) only;
-/// an unrelated tenant `other` with its own repository.
 fn fixture() -> (tempfile::TempDir, Store, Ids) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
@@ -81,7 +75,6 @@ fn privileged(i: Ids) -> Authority {
     }
 }
 
-/// A PKCE pair: (verifier, challenge).
 fn pair() -> (String, String) {
     let verifier = pkce::verifier();
     let challenge = pkce::challenge(&verifier);
@@ -153,9 +146,7 @@ fn consent_offers_the_accounts_active_memberships() {
     ));
 }
 
-/// The consent page's repository lookup never tells a person whether a
-/// name exists in a tenant they do not belong to, nor in their own tenant
-/// when the repository is not theirs to see.
+/// Lookups must not reveal whether a repository name exists to an account that cannot see it.
 #[test]
 fn consent_repository_lookup_hides_what_the_account_cannot_see() {
     let (_dir, store, i) = fixture();
@@ -163,7 +154,6 @@ fn consent_repository_lookup_hides_what_the_account_cannot_see() {
     let foreign_missing = store.read(|c| code::repo_named(c, i.dev, i.other, "missing"));
     assert!(matches!(foreign_existing, Err(Error::NotFound)));
     assert!(matches!(foreign_missing, Err(Error::NotFound)));
-    // An ungranted repository of dev's own tenant is invisible to an operator.
     let hidden = RepoId::new();
     store
         .writer()
@@ -228,8 +218,6 @@ fn a_code_expires_after_its_lifetime_and_is_spent_by_the_attempt() {
         exchange(&store, &code, &verifier, at(oauth::CODE_LIFETIME_MS)),
         Err(CodeError::Invalid)
     ));
-    // The late attempt consumed it; presenting it again is a replay with no
-    // grant to revoke, still audited.
     assert!(matches!(
         exchange(&store, &code, &verifier, at(1)),
         Err(CodeError::Replay)
@@ -242,10 +230,8 @@ fn a_code_expires_after_its_lifetime_and_is_spent_by_the_attempt() {
             .is_empty()
     );
 
-    // One millisecond inside the lifetime still works.
     let code = code::approve(&store, &approval(i.dev, Scopes::RUNS_READ, &challenge), NOW).unwrap();
     assert!(exchange(&store, &code, &verifier, at(oauth::CODE_LIFETIME_MS - 1)).is_ok());
-    // An unknown code is merely invalid.
     assert!(matches!(
         exchange(&store, &Secret::generate(), &verifier, NOW),
         Err(CodeError::Invalid)
@@ -445,7 +431,6 @@ fn approval_only_narrows_what_the_account_and_client_may_hold() {
             Ok(_) => panic!("{what}: approved"),
         }
     }
-    // The registered exact redirect and a super admin's platform scope work.
     assert!(
         code::approve(
             &store,
@@ -465,7 +450,6 @@ fn approval_only_narrows_what_the_account_and_client_may_hold() {
 fn pending_and_suspended_accounts_cannot_approve_or_redeem() {
     let (_dir, store, i) = fixture();
     let (verifier, challenge) = pair();
-    // A pending applicant exists but is not active.
     store
         .writer()
         .write(move |tx| {
@@ -505,8 +489,6 @@ fn pending_and_suspended_accounts_cannot_approve_or_redeem() {
         Err(Error::Forbidden)
     ));
 
-    // Approved while active, then suspended before the exchange: no grant,
-    // and the code is spent.
     let code = code::approve(&store, &approval(i.dev, Scopes::RUNS_READ, &challenge), NOW).unwrap();
     store
         .writer()

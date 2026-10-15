@@ -1,5 +1,3 @@
-//! Versioned MCP wire contracts shared by Sentinel's local and HTTP transports.
-
 use std::sync::OnceLock;
 
 use serde_json::{Map, Value, json};
@@ -13,9 +11,6 @@ pub struct ApiCall {
     pub path: String,
     pub body: Value,
     pub idempotency_key: Option<String>,
-    /// The body's `pipeline` must compile. The controller compiles it
-    /// anyway; a remote transport checks it first to fail without a round
-    /// trip ([`Backend::PREFLIGHT_PIPELINE`]).
     pub carries_pipeline: bool,
 }
 
@@ -24,12 +19,8 @@ pub enum ToolAction {
     ValidatePipeline(String),
 }
 
-/// Transport adapter for the shared MCP tool argument and API mapping.
-/// Both transports go through [`execute_tool`], so argument validation and
-/// the API calls a tool makes are one contract.
 pub trait Backend {
-    /// Compile a dispatched pipeline locally before calling the API. The
-    /// controller's own transport leaves it off: its route compiles once.
+    // The controller's own transport leaves this off: its route already compiles the pipeline.
     const PREFLIGHT_PIPELINE: bool = false;
     fn default_tenant(&self) -> Option<&str>;
     fn call_api(&mut self, call: ApiCall) -> Result<Value, Value>;
@@ -355,16 +346,10 @@ pub fn prepare_tool(
     Ok(result)
 }
 
-/// The store's repository name bound. Secret tools carry the name in the
-/// query string, form-encoded, so an `owner/name` repository is addressable
-/// there; path-addressed tools keep [`safe_segment`].
+// Secret tools carry the repository in the query string, so owner/name stays addressable.
 const MAX_REPOSITORY_NAME: usize = 128;
-/// `JOB/STEP/NAME` of the last binding of a page: two 128-byte selectors
-/// and a 64-byte name.
 const MAX_BINDING_CURSOR: usize = 128 + 1 + 128 + 1 + 64;
 
-/// The store's rule for a repository name (1–128 bytes, no control
-/// characters), checked before a round trip.
 fn repository_name(value: &str) -> Result<(), Value> {
     if value.is_empty() || value.len() > MAX_REPOSITORY_NAME || value.chars().any(char::is_control)
     {
@@ -473,7 +458,6 @@ fn local_error(code: &str, message: &str) -> Value {
     json!({"schema":"sentinel.error/1","code":code,"message":message,"retryable":false})
 }
 
-/// Tool schemas are one contract for both MCP transports.
 pub fn tool_definitions() -> Vec<Value> {
     let text = json!({ "type": "string", "minLength": 1 });
     let tenant = text.clone();
@@ -579,8 +563,6 @@ pub fn tool_definitions() -> Vec<Value> {
     ]
 }
 
-/// MCP tool annotations. Every tool acts only on this deployment, so none
-/// is open-world; only `cancel` destroys work in progress.
 #[derive(Clone, Copy)]
 struct Hints {
     read_only: bool,
@@ -588,25 +570,21 @@ struct Hints {
     idempotent: bool,
 }
 
-/// Reads, and validation, which changes nothing.
 const READ: Hints = Hints {
     read_only: true,
     destructive: false,
     idempotent: true,
 };
-/// Adds a run; the caller's idempotency key makes a repeat the same run.
 const ADDITIVE: Hints = Hints {
     read_only: false,
     destructive: false,
     idempotent: true,
 };
-/// Adds an attempt; a repeat is refused with `conflict`, not repeated.
 const ADDITIVE_ONCE: Hints = Hints {
     read_only: false,
     destructive: false,
     idempotent: false,
 };
-/// Stops work in progress; cancelling again changes nothing more.
 const DESTRUCTIVE: Hints = Hints {
     read_only: false,
     destructive: true,
@@ -690,20 +668,16 @@ pub fn read_resource(uri: &str) -> Option<Value> {
     }))
 }
 
-/// The `tools/list` result, serialized once per process: the catalogue is
-/// static, so a request copies bytes instead of rebuilding JSON.
 pub fn tools_list_json() -> &'static str {
     static TEXT: OnceLock<String> = OnceLock::new();
     TEXT.get_or_init(|| json!({ "tools": tool_definitions() }).to_string())
 }
 
-/// The `resources/list` result, serialized once per process.
 pub fn resources_list_json() -> &'static str {
     static TEXT: OnceLock<String> = OnceLock::new();
     TEXT.get_or_init(|| json!({ "resources": resource_definitions() }).to_string())
 }
 
-/// The `resources/read` result for `uri`, serialized once per process.
 pub fn read_resource_json(uri: &str) -> Option<&'static str> {
     static TEXT: [OnceLock<String>; RESOURCES.len()] = [const { OnceLock::new() }; RESOURCES.len()];
     let at = RESOURCES.iter().position(|resource| resource.uri == uri)?;
@@ -726,7 +700,6 @@ mod tests {
             .clone()
     }
 
-    /// Clients choose confirmation prompts from these hints.
     #[test]
     fn tool_annotations_describe_each_tool_precisely() {
         for tool in tool_definitions() {
@@ -747,9 +720,6 @@ mod tests {
         assert_eq!(hints("cancel"), (false, true, true));
     }
 
-    /// Bindings are listed metadata-only through
-    /// the secret-bindings route, and secret tools address an
-    /// `owner/name` repository by its form-encoded name.
     #[test]
     fn secret_tools_address_owner_slash_name_repositories_in_the_query() {
         let call = |name: &str, args: Value| match prepare_tool(
@@ -798,7 +768,6 @@ mod tests {
         ] {
             assert!(call("list_secret_bindings", bad.clone()).is_err(), "{bad}");
         }
-        // Path-addressed tools keep the strict segment rule.
         assert!(call("list_runs", json!({"repo":"RusticStack/app"})).is_err());
         assert_eq!(annotations("list_secret_bindings")["readOnlyHint"], true);
     }
@@ -816,8 +785,6 @@ mod tests {
         assert!(read_resource_json("sentinel://unknown").is_none());
     }
 
-    /// Both transports share one mapper; a remote one may compile a
-    /// dispatched pipeline first, the controller's own does not.
     #[test]
     fn only_a_preflighting_backend_compiles_dispatched_pipelines_itself() {
         struct Probe<const PRE: bool>(u32);
@@ -846,8 +813,6 @@ mod tests {
         let called = execute_tool(&mut local, "dispatch", args).unwrap();
         assert_eq!(local.0, 0);
         assert_eq!(called["path"], "/api/v1/tenants/acme/repos/app/runs");
-        // Arguments are optional in MCP: a tool with no required argument
-        // runs on an empty object.
         let queue = execute_tool(&mut local, "explain_queue", &Map::new()).unwrap();
         assert_eq!(queue["path"], "/api/v1/queue?tenant=acme&limit=100");
     }

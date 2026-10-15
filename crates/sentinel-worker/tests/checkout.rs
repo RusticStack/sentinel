@@ -1,8 +1,3 @@
-//! Checkout and workspace behavior on Linux with a local repository:
-//! the pinned commit is what ends up checked out even when it is not the
-//! branch head; an unknown revision, a hung fetch and a dirty workspace are
-//! refused; the askpass helper never leaves the secret behind.
-
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -41,7 +36,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-/// A repository with two commits; returns (path, first sha, second sha).
 fn repository(root: &Path) -> (std::path::PathBuf, String, String) {
     let repo = root.join("origin");
     fs::create_dir(&repo).unwrap();
@@ -62,8 +56,6 @@ fn private_https_checkout_checks_ca_rotated_credentials_and_cleanup() {
     use std::process::Stdio;
     let temp = tempfile::tempdir().unwrap();
     let (_, first, _) = repository(temp.path());
-    // Real HTTPS servers commonly need to be told to serve an arbitrary
-    // pinned commit; the fixture grants exactly what the checkout asks for.
     git(
         &temp.path().join("origin"),
         &["config", "uploadpack.allowAnySHA1InWant", "true"],
@@ -150,7 +142,6 @@ fn private_https_checkout_checks_ca_rotated_credentials_and_cleanup() {
             .contains("private-source-token")
     );
     ws.destroy().unwrap();
-    // Upstream revocation is effective on the next checkout; no cached token.
     fs::write(&password, "rotated-source-token").unwrap();
     let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
     let error = checkout::checkout_authorized(ws.path(), &source, &access, Duration::from_secs(20))
@@ -191,7 +182,6 @@ fn the_pinned_commit_is_checked_out_even_when_it_is_not_the_head() {
         "one\n"
     );
     assert_eq!(git(ws.path(), &["rev-parse", "HEAD"]), first);
-    // Depth one: the newer commit was never fetched.
     assert!(
         Command::new("git")
             .args(["cat-file", "-e", &second])
@@ -201,7 +191,6 @@ fn the_pinned_commit_is_checked_out_even_when_it_is_not_the_head() {
             .code()
             != Some(0)
     );
-    // The workspace is never reused; destroying it removes the checkout.
     assert!(matches!(
         Workspace::create(temp.path(), attempt),
         Err(Error::Workspace(_))
@@ -226,11 +215,8 @@ fn unknown_revisions_and_hung_fetches_are_preparation_failures() {
         matches!(&refused, Error::Preparation(what) if what.starts_with("git fetch")),
         "{refused}"
     );
-    // A workspace whose fetch failed holds no checkout.
     assert!(!ws.path().join("file.txt").exists());
 
-    // A repository that never answers: a FIFO stands in for a stalled
-    // transport; the deadline kills the whole process group.
     let stalled = temp.path().join("stalled.git");
     fs::create_dir(&stalled).unwrap();
     let ws2 = Workspace::create(temp.path(), AttemptId::new()).unwrap();
@@ -242,8 +228,6 @@ fn unknown_revisions_and_hung_fetches_are_preparation_failures() {
     .unwrap();
     let started = Instant::now();
     let outcome = checkout::checkout(ws2.path(), &source, None, Duration::from_millis(1500));
-    // `ext::` transports are disabled by default, so this is refused at
-    // once as a preparation failure; a genuinely slow path is the timeout.
     assert!(
         matches!(
             outcome,
@@ -261,8 +245,6 @@ fn unknown_revisions_and_hung_fetches_are_preparation_failures() {
 
 #[test]
 fn ssh_deploy_keys_use_pinned_host_trust_and_leave_no_private_files() {
-    // A real sshd is a host prerequisite, like rootless Podman: `SENTINEL_TEST_SSHD`
-    // or a build under target/source-fixtures; without one the test skips.
     let sshd = std::env::var("SENTINEL_TEST_SSHD").unwrap_or_else(|_| {
         let local = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -278,9 +260,7 @@ fn ssh_deploy_keys_use_pinned_host_trust_and_leave_no_private_files() {
         eprintln!("SSH checkout verification requires sshd; set SENTINEL_TEST_SSHD");
         return;
     }
-    // The served path must be a real, visible directory: the source policy
-    // rejects hidden path segments, and temporary directories start with a
-    // dot. Everything under this root is created and removed by the test.
+    // The served path must be a real, visible directory: the source policy rejects hidden path segments, and temp dirs start with a dot.
     let root = std::path::PathBuf::from(format!("/tmp/sentinel-ssh-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir(&root).unwrap();
@@ -320,14 +300,12 @@ fn ssh_deploy_keys_use_pinned_host_trust_and_leave_no_private_files() {
         let _ = fs::remove_dir_all(&root);
         return;
     }
-    // A root sshd still needs its privilege-separation directory.
     let privsep = std::path::Path::new("/run/sshd");
     if !privsep.exists() && fs::create_dir(privsep).is_err() {
         eprintln!("SSH checkout verification requires /run/sshd; skipping");
         let _ = fs::remove_dir_all(&root);
         return;
     }
-    // The forced command restricts the key to serving this one repository.
     fs::write(
         &forced,
         "#!/bin/sh\nexec /usr/bin/git-shell -c \"$SSH_ORIGINAL_COMMAND\"\n",
@@ -345,7 +323,6 @@ fn ssh_deploy_keys_use_pinned_host_trust_and_leave_no_private_files() {
         ),
     )
     .unwrap();
-    // Pick an unused port from the ephemeral range; sshd refuses `Port 0`.
     let mut listener = None;
     for offset in 0..200u16 {
         let candidate = 49152
@@ -360,7 +337,6 @@ fn ssh_deploy_keys_use_pinned_host_trust_and_leave_no_private_files() {
     }
     let (port, probe) = listener.expect("no free port for the sshd fixture");
     drop(probe);
-    // The sshd_config references its own absolute paths only.
     let config = root.join("sshd_config");
     let log = root.join("sshd.log");
     fs::write(
@@ -439,7 +415,6 @@ fn ssh_deploy_keys_use_pinned_host_trust_and_leave_no_private_files() {
         std::thread::sleep(Duration::from_millis(250));
     }
     assert!(!known_hosts.is_empty(), "ssh-keyscan produced no host key");
-    // ssh URLs carry an absolute path: authority, slash, then the path.
     let remote = format!(
         "ssh://root@127.0.0.1:{port}/{}",
         bare.display().to_string().trim_start_matches('/')
@@ -472,8 +447,7 @@ fn ssh_deploy_keys_use_pinned_host_trust_and_leave_no_private_files() {
             .contains("PRIVATE KEY")
     );
     ws.destroy().unwrap();
-    // The binding, not the run source, decides the authority: a source that
-    // names another host is refused before any transport starts.
+    // The binding, not the run source, decides the authority: another host is refused before any transport starts.
     let mut wrong_host = access.clone();
     wrong_host.binding.remote = remote.replacen("127.0.0.1", "localhost", 1);
     let ws = Workspace::create(&root, AttemptId::new()).unwrap();
@@ -483,8 +457,6 @@ fn ssh_deploy_keys_use_pinned_host_trust_and_leave_no_private_files() {
     ));
     assert!(!ws.path().with_extension("askpass").exists());
     ws.destroy().unwrap();
-    // Host trust is pinned: an empty known_hosts is a preparation failure,
-    // not a prompt or a silent accept.
     access.binding.trust = "127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n".into();
     let ws = Workspace::create(&root, AttemptId::new()).unwrap();
     let error = checkout::checkout_authorized(ws.path(), &source, &access, Duration::from_secs(20))
@@ -513,7 +485,6 @@ fn a_credential_is_delivered_through_askpass_and_removed_afterwards() {
         Duration::from_secs(60),
     )
     .unwrap();
-    // The helper directory is gone, and the secret is nowhere in the workspace.
     assert!(!ws.path().with_extension("askpass").exists());
     let config = fs::read_to_string(ws.path().join(".git/config")).unwrap();
     assert!(!config.contains("ghs_do_not_leak"));

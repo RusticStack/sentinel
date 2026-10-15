@@ -1,15 +1,9 @@
-//! AWS Signature Version 4 for S3, header form.
-//!
-//! The payload hash is always the real SHA-256 of the body: the service then
-//! verifies every byte it received against the signed request, so a part
-//! corrupted in transit is refused rather than stored.
+//! Always the real payload SHA-256, never UNSIGNED-PAYLOAD: the service verifies every body byte it received.
 
 use ring::{digest, hmac};
 
-/// `UNSIGNED-PAYLOAD` is never used; an empty body hashes to this.
 pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-/// Lower-case hex of `bytes`.
 pub fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -28,8 +22,6 @@ fn hmac(key: &[u8], data: &[u8]) -> hmac::Tag {
     hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data)
 }
 
-/// RFC 3986 encoding as SigV4 wants it: unreserved characters kept, every
-/// other byte `%XX` upper-case; `/` kept only when `keep_slash`.
 pub fn uri_encode(text: &str, keep_slash: bool) -> String {
     let mut out = String::with_capacity(text.len());
     for &b in text.as_bytes() {
@@ -49,11 +41,9 @@ pub fn uri_encode(text: &str, keep_slash: bool) -> String {
     out
 }
 
-/// A UTC instant as SigV4 writes it: `(20130524T000000Z, 20130524)`.
 pub fn timestamp(unix_secs: u64) -> (String, String) {
     let days = (unix_secs / 86_400) as i64;
     let rem = unix_secs % 86_400;
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -73,21 +63,14 @@ pub fn timestamp(unix_secs: u64) -> (String, String) {
     (time, date)
 }
 
-/// What one request's signature covers.
 pub struct Request<'a> {
     pub method: &'a str,
-    /// The encoded path, starting with `/`.
     pub path: &'a str,
-    /// Query parameters, unencoded; sorted here.
     pub query: &'a [(&'a str, &'a str)],
-    /// Headers to sign, names lower-case; `host`, `x-amz-date` and
-    /// `x-amz-content-sha256` must be among them.
     pub headers: &'a [(&'a str, &'a str)],
     pub payload_sha256: &'a str,
 }
 
-/// The canonical query string: parameters encoded, sorted by name then
-/// value.
 pub fn canonical_query(query: &[(&str, &str)]) -> String {
     let mut pairs: Vec<(String, String)> = query
         .iter()
@@ -101,9 +84,7 @@ pub fn canonical_query(query: &[(&str, &str)]) -> String {
         .join("&")
 }
 
-/// A header value as the canonical request carries it: trimmed, and every run
-/// of internal whitespace collapsed to one space, as the service does before it
-/// recomputes the signature. (The header itself is sent unchanged.)
+// The service collapses header whitespace before verifying, so the signature must too.
 fn canonical_value(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for word in value.split_ascii_whitespace() {
@@ -115,8 +96,6 @@ fn canonical_value(value: &str) -> String {
     out
 }
 
-/// The `Authorization` header value for `request`, signed at `amz_date`
-/// (`20130524T000000Z`) in `region` with the given credentials.
 pub fn authorization(
     request: &Request<'_>,
     amz_date: &str,
@@ -173,8 +152,6 @@ pub fn authorization(
 mod tests {
     use super::*;
 
-    /// The worked example in AWS's S3 Signature V4 documentation ("GET
-    /// Object"): a range read of `test.txt` from `examplebucket`.
     #[test]
     fn the_published_get_object_example_signs_identically() {
         let headers = [
@@ -209,8 +186,6 @@ mod tests {
         assert_eq!(canonical_value("  a   b\t c  "), "a b c");
         assert_eq!(canonical_value("plain"), "plain");
         assert_eq!(canonical_value("   "), "");
-        // Signing "a   b" and "a b" is the same canonical request, which is
-        // what the service computes from either spelling.
         let sign = |value: &str| {
             let headers = [
                 ("host", "examplebucket.s3.amazonaws.com"),

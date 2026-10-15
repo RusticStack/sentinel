@@ -1,17 +1,4 @@
-//! Job-private writable clones of immutable generations.
-//! Capability-detected reflink (`FICLONE`) with a safe byte-copy fallback;
-//! never writable hardlinks. See `docs/cache.md`.
-//!
-//! A generation's payload is immutable once sealed, so a job never writes
-//! into the store: `tree` materializes a private copy the attempt owns.
-//! On a reflink-capable filesystem each file is an extent share — cost per
-//! file, not per byte — and anywhere else the same tree is produced by a
-//! bounded read/write copy. A sealed payload never holds a symlink —
-//! publication does not encode them and restore refuses a tree that has
-//! one — but `tree` itself recreates any it meets verbatim, never
-//! following it, and anything that is not a directory, regular file or
-//! symlink is skipped and counted. Hardlinks are never created: a shared
-//! inode would let one job's write corrupt the generation for every other.
+//! Never hardlink: a shared inode would let one job's write corrupt the generation for every other.
 
 use std::{
     collections::BTreeMap,
@@ -21,48 +8,26 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-/// The copy buffer: large enough that a big file is a handful of reads,
-/// small enough to stay in cache between them.
 const COPY_BUFFER: usize = 256 << 10;
 
-/// How a payload reaches the job's private view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
-    /// `FICLONE` per file: shared extents, cost per file not per byte.
-    /// A capable filesystem can still refuse an individual file — those
-    /// fall back to the byte copy per file.
     Reflink,
-    /// Bounded read/write copy — correct on any filesystem.
     Copy,
 }
 
-/// What one `tree` did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// Regular files materialized.
     pub files: u64,
-    /// Payload bytes across them.
     pub bytes: u64,
-    /// Bytes physically copied; reflinked files share extents instead.
     pub copied_bytes: u64,
-    /// Files cloned through `FICLONE`.
     pub reflinks: u64,
-    /// Symlinks recreated verbatim.
     pub symlinks: u64,
-    /// Entries that are neither file, dir nor symlink — fifos, sockets,
-    /// devices — skipped: a cache never carries them.
     pub skipped: u64,
 }
 
-/// Probe answers are per filesystem, so they are remembered per cache
-/// root for the life of the process.
 static PROBES: OnceLock<Mutex<BTreeMap<PathBuf, Backend>>> = OnceLock::new();
 
-/// The clone backend `cache_root`'s filesystem gives, probed once per
-/// root and remembered: a probe is two small files and one ioctl — cheap,
-/// but a worker that probed per attempt would pay it forever. A probe
-/// that cannot run answers `Copy` *without* being remembered: a transient
-/// failure at startup must not pin the slow path.
 pub fn detect(cache_root: &Path) -> Backend {
     let key = fs::canonicalize(cache_root).unwrap_or_else(|_| cache_root.to_path_buf());
     let probes = PROBES.get_or_init(|| Mutex::new(BTreeMap::new()));
@@ -81,9 +46,6 @@ pub fn detect(cache_root: &Path) -> Backend {
     }
 }
 
-/// Two files and one `FICLONE` under the real root. `Some` is the
-/// filesystem's answer — `Copy` included — and is remembered; `None`
-/// means the probe itself failed (unwritable root) and nothing is cached.
 fn probe(cache_root: &Path) -> Option<Backend> {
     if fs::create_dir_all(cache_root).is_err() {
         return None;
@@ -104,17 +66,7 @@ fn probe(cache_root: &Path) -> Option<Backend> {
     Some(backend.unwrap_or(Backend::Copy))
 }
 
-/// Materialize `src` under `dst`: directories are 0755, regular files go
-/// through `backend` (reflink, or a byte copy when the filesystem
-/// refuses), symlinks are recreated verbatim. `dst` is created if absent
-/// and must be a directory or nothing; its parent must exist. Checkout
-/// content already under `dst` is kept except on the exact slots a
-/// generation entry claims — which are cleared first, never followed.
-///
-/// Payload digests are deliberately not re-verified: reading every byte
-/// would defeat the reflink path. The `files` blob's digest was verified
-/// against the manifest before materialization — that is the trust split
-/// `docs/cache.md` describes.
+/// Payload digests are not re-verified: reading every byte would defeat the reflink path.
 pub fn tree(src: &Path, dst: &Path, backend: Backend) -> io::Result<Stats> {
     if !fs::symlink_metadata(src)?.is_dir() {
         return Err(io::Error::new(
@@ -123,8 +75,6 @@ pub fn tree(src: &Path, dst: &Path, backend: Backend) -> io::Result<Stats> {
         ));
     }
     let mut stats = Stats::default();
-    // The copy buffer is allocated lazily so an all-reflink clone never
-    // touches the 256 KiB it would not use.
     let mut buf = Vec::new();
     fill(src, dst, backend, &mut stats, &mut buf)?;
     Ok(stats)
@@ -142,8 +92,6 @@ fn fill(
         let entry = entry?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
-        // `DirEntry::metadata` is `symlink_metadata`: the link itself, so
-        // nothing here is ever resolved through a symlink.
         let meta = entry.metadata()?;
         let kind = meta.file_type();
         if kind.is_dir() {
@@ -162,11 +110,7 @@ fn fill(
     Ok(())
 }
 
-/// One regular file: reflink when the backend is `Reflink`, byte-copy on
-/// any refusal — a capable filesystem can still reject an individual
-/// file. Either way the mode the generation recorded (the source's own
-/// permission bits, exec included) is applied: `FICLONE` shares extents,
-/// not inode metadata, and `File::create` defaults to 0666 & umask.
+/// `FICLONE` shares extents, not mode bits, so the mode is set explicitly.
 fn file(
     from: &Path,
     to: &Path,
@@ -191,9 +135,6 @@ fn file(
     Ok(())
 }
 
-/// Byte-copy `from` to `to` through the shared buffer; returns the bytes
-/// written. Never follows a symlink: `from` was classified a regular file
-/// by `symlink_metadata` and `to`'s slot was cleared.
 fn copy(from: &Path, to: &Path, buf: &mut Vec<u8>) -> io::Result<u64> {
     if buf.len() < COPY_BUFFER {
         buf.resize(COPY_BUFFER, 0);
@@ -212,9 +153,6 @@ fn copy(from: &Path, to: &Path, buf: &mut Vec<u8>) -> io::Result<u64> {
     Ok(total)
 }
 
-/// `dst` becomes a real 0755 directory: an existing directory is kept
-/// (and keeps its own mode), anything else in the slot is removed —
-/// a symlink is unlinked, never followed.
 fn ensure_dir(dst: &Path) -> io::Result<()> {
     match fs::symlink_metadata(dst) {
         Ok(meta) if meta.is_dir() => return Ok(()),
@@ -226,9 +164,6 @@ fn ensure_dir(dst: &Path) -> io::Result<()> {
     set_mode(dst, 0o755)
 }
 
-/// Empty `dir` in place — every entry below it removed, never followed —
-/// leaving the directory itself. What a failed materialization answers
-/// with: the miss contract's empty writable target.
 pub(crate) fn empty(dir: &Path) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         clear(&entry?.path())?;
@@ -236,8 +171,6 @@ pub(crate) fn empty(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The generation claims this slot: whatever the checkout left there goes
-/// — a directory whole, a file or symlink by unlink, never followed.
 fn clear(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
@@ -247,9 +180,6 @@ fn clear(path: &Path) -> io::Result<()> {
     }
 }
 
-/// `FICLONE` `to` from `from`: the destination keeps its own inode, so
-/// a write through it can never touch the generation. Any failure is the
-/// caller's signal to copy instead.
 #[cfg(target_os = "linux")]
 fn reflink(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::fd::AsRawFd;
@@ -285,8 +215,6 @@ fn link(_original: &Path, _link: &Path) -> io::Result<()> {
     ))
 }
 
-/// The permission bits worth keeping — the same set `FileEntry::mode`
-/// records.
 #[cfg(unix)]
 fn mode_of(meta: &fs::Metadata) -> u32 {
     use std::os::unix::fs::MetadataExt;
@@ -313,8 +241,6 @@ fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// Every (relative path, content) in `dir`, sorted — what "identical
-    /// trees" means for the assertions below.
     fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
         let mut out = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
@@ -339,8 +265,6 @@ mod tests {
         out
     }
 
-    /// A payload the way publish writes one: nested files with distinct bytes,
-    /// an executable, and symlinks (one dangling, one escaping the tree).
     fn generation() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let src = temp.path().join("gen");
@@ -383,14 +307,9 @@ mod tests {
         let (temp, src) = generation();
         let dst = temp.path().join("dst");
         let stats = tree(&src, &dst, Backend::Reflink).unwrap();
-        // Whether this filesystem took the ioctl or the per-file copy
-        // fallback, the produced tree is the same.
         assert_eq!(contents(&src), contents(&dst));
         assert_eq!(stats.files + stats.symlinks, if cfg!(unix) { 5 } else { 2 });
 
-        // The contract the whole design rests on: a job writing into its
-        // private view cannot alter the sealed generation — on reflink
-        // filesystems by COW, elsewhere by having copied.
         fs::write(dst.join("two"), b"job wrote here").unwrap();
         assert_eq!(fs::read(src.join("two")).unwrap(), vec![7u8; 300_000]);
         fs::write(src.join("two"), b"new seal").unwrap();
@@ -404,7 +323,6 @@ mod tests {
         let a = detect(&root);
         let b = detect(&root);
         assert_eq!(a, b);
-        // A directory that cannot be created is `Copy`, never a panic.
         assert_eq!(detect(Path::new("/proc/definitely-not")), Backend::Copy);
     }
 
@@ -413,26 +331,22 @@ mod tests {
     fn symlinks_are_recreated_never_followed() {
         use std::os::unix::fs::symlink;
         let (temp, src) = generation();
-        // The escape target: a file the link points at outside the tree.
         let outside = temp.path().join("outside");
         fs::write(&outside, b"outside").unwrap();
         let dst = temp.path().join("dst");
         tree(&src, &dst, Backend::Copy).unwrap();
-        // The link is a link, pointing where it pointed — not the file.
         let meta = fs::symlink_metadata(dst.join("escape")).unwrap();
         assert!(meta.file_type().is_symlink());
         assert_eq!(
             fs::read_link(dst.join("escape")).unwrap(),
             Path::new("../outside")
         );
-        // A dangling link clones as a dangling link.
         assert!(
             fs::symlink_metadata(dst.join("dangling"))
                 .unwrap()
                 .file_type()
                 .is_symlink()
         );
-        // And a link whose target is inside the tree stays a link too.
         symlink("a/b/one", src.join("inside")).unwrap();
         tree(&src, &temp.path().join("dst2"), Backend::Copy).unwrap();
         assert!(
@@ -443,7 +357,6 @@ mod tests {
         );
     }
 
-    // `libc` is a Linux-only dependency of this crate.
     #[cfg(target_os = "linux")]
     #[test]
     fn special_files_are_skipped() {
@@ -464,15 +377,12 @@ mod tests {
         use std::os::unix::fs::symlink;
         let (temp, src) = generation();
         let dst = temp.path().join("dst");
-        // A symlink sitting where the generation wants a directory: the
-        // clone must replace the link, not write through it.
         let elsewhere = temp.path().join("elsewhere");
         fs::create_dir(&elsewhere).unwrap();
         fs::create_dir(&dst).unwrap();
         symlink(&elsewhere, dst.join("a")).unwrap();
         tree(&src, &dst, Backend::Copy).unwrap();
         assert!(dst.join("a/b/one").is_file());
-        // `elsewhere` received nothing: the link was replaced, not followed.
         assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
         assert!(
             !fs::symlink_metadata(dst.join("a"))

@@ -1,19 +1,3 @@
-//! The API's bounded HTTP/1.1 layer. One acceptor thread hands accepted
-//! sockets to at most `Tune::connections` reader threads; each connection
-//! parses a head, then takes one of `Tune::handlers` permits before any
-//! route work — so request concurrency is `handlers`, reader threads are
-//! `connections`, and nothing else spawns. A long poll gives its handler
-//! permit back while it is parked ([`Request::yield_handler`]): waiting is
-//! not work, and its own subscriber budget bounds it. Heads and client bodies
-//! are deadline-bounded; a stalled write fails its syscall instead of holding
-//! a handler permit forever. Responses always carry an explicit
-//! `content-length` (routes know their lengths) or close the connection.
-//!
-//! `Conns::close` stops the acceptor, force-closes live sockets so parked
-//! reads fail at once, and waits for every connection permit to come back
-//! — a reader thread still inside a route holds `State`, so shutdown does
-//! not return while one can still touch the store.
-
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
@@ -29,36 +13,17 @@ use std::{
 
 use crate::oauth::limit::{TrustedProxy, client_key, is_proxy};
 
-/// The server's resource bounds and timeouts; `Tune::DEFAULT` is what
-/// `Server` uses — tests inject smaller values.
 #[derive(Clone, Copy)]
 pub(crate) struct Tune {
-    /// Accepted connections held at once; further handshakes wait in the
-    /// listener backlog until a slot frees.
     pub connections: usize,
-    /// Requests being handled at once — the `WORKERS` bound.
     pub handlers: usize,
-    /// Request line plus headers, bytes in total.
     pub head_bytes: usize,
-    /// Total time allowed for one head — also the keep-alive idle window.
     pub head_time: Duration,
-    /// Total time allowed for one client body.
     pub body_time: Duration,
-    /// Unauthenticated bodies read at once, each under no handler permit
-    /// ([`Request::public_body`]); slow ones queue behind each other here (one
-    /// slot per client key), never behind real work.
     pub public_bodies: usize,
-    /// Total time one unauthenticated body may take, waiting for its
-    /// reader slot included.
     pub public_body_time: Duration,
-    /// Connections one peer address may hold at once; a peer past it is
-    /// closed at accept. Trusted proxy networks are exempt.
     pub per_peer: usize,
-    /// Longest a single socket write may stall.
     pub write_stall: Duration,
-    /// Poll granularity for permit waits and the stop flag. The accept
-    /// itself blocks: a new connection is taken the moment it arrives, never
-    /// after a poll sleep.
     pub poll: Duration,
 }
 
@@ -77,8 +42,6 @@ impl Tune {
     };
 }
 
-/// A counting semaphore whose permits release on drop; doubles as the
-/// liveness check for the threads that hold them.
 struct Pool {
     free: Mutex<usize>,
     total: usize,
@@ -94,7 +57,6 @@ impl Pool {
         })
     }
 
-    /// Take a slot; `None` when `stop` is set while parked.
     fn acquire(self: &Arc<Self>, stop: &AtomicBool, poll: Duration) -> Option<Permit> {
         let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -113,7 +75,6 @@ impl Pool {
         }
     }
 
-    /// Take a slot, giving up at `until` (or when `stop` is set).
     fn acquire_until(
         self: &Arc<Self>,
         stop: &AtomicBool,
@@ -138,7 +99,6 @@ impl Pool {
         }
     }
 
-    /// Wait until every issued permit has been dropped.
     fn wait_full(&self, poll: Duration) {
         let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
         while *free != self.total {
@@ -151,26 +111,20 @@ impl Pool {
     }
 }
 
-/// The pools a request's own thread needs after the head: handler
-/// permits, and the small pool unauthenticated bodies are read under.
 struct Gate {
     handlers: Arc<Pool>,
     bodies: Arc<Pool>,
     body_time: Duration,
-    /// Client keys that hold a body slot right now: one slot per client, so
-    /// one host cannot fill the small pool and starve everyone's sign-in.
     readers: Arc<Mutex<HashSet<u128>>>,
     trusted: Vec<TrustedProxy>,
 }
 
-/// A client's one public-body slot, released on drop.
 struct ReaderKey {
     readers: Arc<Mutex<HashSet<u128>>>,
     key: u128,
 }
 
 impl ReaderKey {
-    /// `None` when this client already has a body being read.
     fn take(readers: &Arc<Mutex<HashSet<u128>>>, key: u128) -> Option<ReaderKey> {
         let mut held = readers.lock().unwrap_or_else(|e| e.into_inner());
         held.insert(key).then(|| ReaderKey {
@@ -200,7 +154,6 @@ impl Drop for Permit {
     }
 }
 
-/// A header name; `equiv` matches ASCII-insensitively.
 #[cfg_attr(test, derive(Debug))]
 pub(crate) struct Field(String);
 
@@ -210,7 +163,6 @@ impl Field {
     }
 }
 
-/// A header value; head parsing already required valid UTF-8.
 #[cfg_attr(test, derive(Debug))]
 pub(crate) struct Value(String);
 
@@ -227,9 +179,6 @@ pub(crate) struct Header {
 }
 
 impl Header {
-    /// Header names are tokens and values UTF-8 without CR/LF — the
-    /// response head is built by interpolation, so nothing may inject a
-    /// line.
     pub(crate) fn from_bytes(name: &[u8], value: &[u8]) -> Option<Header> {
         let name = std::str::from_utf8(name).ok()?;
         if name.is_empty() || !name.bytes().all(token) {
@@ -254,8 +203,6 @@ fn token(b: u8) -> bool {
 
 pub(crate) struct StatusCode(pub u16);
 
-/// What a route answers. `len` is declared up front: the wire response is
-/// never chunked, and `None` means the body ends at close.
 pub(crate) struct Response {
     status: u16,
     headers: Vec<Header>,
@@ -338,10 +285,7 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-/// Re-arm the socket's read timeout for the time left before `deadline`,
-/// clamped to `poll` so a `stop` during the wait is seen promptly — a
-/// `shutdown` from `Conns::close` does not reliably wake a timed `recv`
-/// on Windows, so the timeout itself is the wakeup.
+/// Windows: a shutdown does not reliably wake a timed recv, so the timeout itself is the wakeup.
 fn rearm(socket: &TcpStream, deadline: Instant, poll: Duration) -> io::Result<()> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
@@ -350,14 +294,10 @@ fn rearm(socket: &TcpStream, deadline: Instant, poll: Duration) -> io::Result<()
     socket.set_read_timeout(Some(left.min(poll)))
 }
 
-/// `true` for the errors a timed read produces on expiry; on Windows a
-/// timed-out blocking read reports `WouldBlock`.
 fn timed_out(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock
 }
 
-/// One socket read bounded by `deadline`, retried every `poll` until
-/// bytes arrive, `stop` is set, or the deadline passes.
 fn timed_read(
     r: &mut (impl Read + ?Sized),
     socket: &TcpStream,
@@ -379,10 +319,6 @@ fn timed_read(
     }
 }
 
-/// One bounded, deadline-armed CRLF-terminated line. `Ok(None)` is a
-/// clean EOF before any byte; a partial line at EOF is `UnexpectedEof`.
-/// Reads retry every `poll` so `stop` ends a parked read without
-/// waiting out the deadline.
 fn bounded_line(
     r: &mut dyn BufRead,
     socket: &TcpStream,
@@ -423,8 +359,6 @@ fn bounded_line(
     }
 }
 
-/// A body the route reads through `Request::as_reader`: absent, a
-/// declared `content-length`, or `chunked`.
 enum Body<'a> {
     Empty,
     Fixed(Limited<'a>),
@@ -433,7 +367,6 @@ enum Body<'a> {
 }
 
 impl Body<'_> {
-    /// Never let this body run past `deadline`.
     fn cap_deadline(&mut self, deadline: Instant) {
         match self {
             Body::Fixed(f) => f.deadline = f.deadline.min(deadline),
@@ -463,10 +396,6 @@ impl Read for Body<'_> {
     }
 }
 
-/// A `content-length` body: at most `left` bytes before `deadline`. The
-/// reader is type-erased so the borrow's region is just this request —
-/// a `BufReader<&TcpStream>` field would pin the socket's lifetime and
-/// hold the buffer mutable for the whole connection loop.
 struct Limited<'a> {
     r: &'a mut dyn BufRead,
     socket: &'a TcpStream,
@@ -501,13 +430,8 @@ impl Read for Limited<'_> {
     }
 }
 
-/// `transfer-encoding: chunked`, decoded in place; the trailer section
-/// is bounded and discarded. A socket EOF anywhere mid-body is an error
-/// — a truncated stream must not read as a short-but-valid body.
 struct Chunked<'a> {
     l: Limited<'a>,
-    /// 0 = at a size line, 1 = inside chunk data, 2 = data just ended and
-    /// its CRLF is owed, 3 = reading trailers.
     state: u8,
     trailers: usize,
     done: bool,
@@ -618,8 +542,6 @@ impl Read for Chunked<'_> {
     }
 }
 
-/// Why a head failed; `Status` writes a canned refusal then closes, the
-/// others close silently.
 #[cfg_attr(test, derive(Debug))]
 enum HeadErr {
     Closed,
@@ -627,8 +549,6 @@ enum HeadErr {
     Status(u16),
 }
 
-/// One head line under the remaining byte budget; any EOF is `Closed` —
-/// a peer that went away mid-head gets no diagnostic it cannot read.
 fn head_line(
     r: &mut dyn BufRead,
     socket: &TcpStream,
@@ -659,7 +579,6 @@ struct Head {
     expect_continue: bool,
 }
 
-/// Read one request head under `tune.head_bytes`/`tune.head_time`.
 fn head(
     r: &mut BufReader<&TcpStream>,
     socket: &TcpStream,
@@ -681,7 +600,6 @@ fn head(
         Ok(line)
     };
 
-    // A client may precede the request with blank lines; skip them.
     let mut first = next(r)?;
     while first == b"\r\n" {
         first = next(r)?;
@@ -705,8 +623,6 @@ fn head(
         "HTTP/1.0" => true,
         _ => return Err(HeadErr::Status(505)),
     };
-    // Origin-form first; absolute-form (a fronting proxy may send it)
-    // strips scheme and authority down to the path.
     let url = if target.starts_with('/') {
         target
     } else if let Some(rest) = target
@@ -734,7 +650,6 @@ fn head(
             break;
         }
         if !raw.ends_with(b"\r\n") || raw[0].is_ascii_whitespace() {
-            // A bare-LF line or an obs-fold continuation is not a header.
             return Err(HeadErr::Status(400));
         }
         let text = std::str::from_utf8(&raw[..raw.len() - 2]).map_err(|_| HeadErr::Status(400))?;
@@ -769,8 +684,7 @@ fn head(
         headers.push(header);
     }
     if lengths > 1 || (chunked && length.is_some()) {
-        // Duplicate or conflicting length signals are the classic
-        // request-smuggling shape; refuse rather than pick one.
+        // Duplicate or conflicting length signals are the request-smuggling shape: refuse, never pick one.
         return Err(HeadErr::Status(400));
     }
     if version == "HTTP/1.1" && !host {
@@ -790,9 +704,7 @@ fn head(
     })
 }
 
-/// A non-empty run of digits in `radix` and nothing else: `u64::from_str`
-/// also takes a leading `+`, which RFC 9110 does not allow in a length or
-/// a chunk size and a downstream parser may read differently.
+/// Digits only: u64::from_str accepts a leading '+', which RFC 9110 forbids in lengths and chunk sizes.
 fn parse_digits(text: &str, radix: u32) -> Option<u64> {
     if text.is_empty() || !text.bytes().all(|b| (b as char).is_digit(radix)) {
         return None;
@@ -800,10 +712,6 @@ fn parse_digits(text: &str, radix: u32) -> Option<u64> {
     u64::from_str_radix(text, radix).ok()
 }
 
-/// A socket writer whose individual syscalls retry every `poll` and
-/// whose total stall — time without a successful write — is bounded by
-/// `stall`. Keeps a blocked client from holding a handler permit past
-/// the stall budget and lets `stop` end a parked write promptly.
 struct Stall<'a> {
     w: &'a TcpStream,
     stop: &'a AtomicBool,
@@ -842,9 +750,6 @@ impl Write for Stall<'_> {
     }
 }
 
-/// One parsed request head plus its bounded body reader. Borrows the
-/// connection's buffer and write half; the owning connection thread runs
-/// the keep-alive loop, so nothing here crosses a thread boundary.
 pub(crate) struct Request<'a> {
     method: String,
     url: String,
@@ -857,26 +762,16 @@ pub(crate) struct Request<'a> {
     stall: Duration,
     close: bool,
     responded: bool,
-    /// Only set on a child request created after the outer MCP bearer was
-    /// checked. Network requests can never populate this field.
+    /// Set only on a child request made after the outer MCP bearer was checked; network requests never set it.
     trusted_identity: Option<crate::auth::Identity>,
-    /// This request's handler permit, released when the request is done —
-    /// or earlier by [`Request::yield_handler`]. A child request has none
-    /// of its own (its parent holds one).
     handler: Option<Permit>,
-    /// The pools to re-take permits from around an unauthenticated body.
-    /// `None` on a child request.
     gate: Option<&'a Gate>,
-    /// The whole body is already in the connection's buffer (or absent):
-    /// reading it cannot wait on the client.
     ready: bool,
 }
 
-/// Why [`Request::public_body`] gave no body.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BodyErr {
     TooLarge,
-    /// No reader slot freed up in time: answer "busy, retry".
     Busy,
     Unreadable,
 }
@@ -894,18 +789,10 @@ impl Request<'_> {
         &self.headers
     }
 
-    /// The connected peer's address. A `getpeername` per call, so only the
-    /// few routes that key admission by client ask for it.
     pub(crate) fn peer(&self) -> Option<std::net::IpAddr> {
         self.writer.peer_addr().ok().map(|addr| addr.ip())
     }
 
-    /// Whether the client has hung up (end of stream or reset) while its
-    /// request waits: a parked long poll whose caller left — a closed tab,
-    /// a web server that aborted its upstream request — gives its subscriber
-    /// slot back instead of holding it to the poll's deadline. One
-    /// non-blocking `peek`; bytes of a pipelined next request mean the
-    /// client is still there.
     pub(crate) fn peer_gone(&self) -> bool {
         if self.writer.set_nonblocking(true).is_err() {
             return false;
@@ -920,22 +807,10 @@ impl Request<'_> {
         gone
     }
 
-    /// Give the handler permit back before the request is done: a long
-    /// poll about to park does no work while it waits, so it must not keep
-    /// a permit that bounds requests doing work. Whatever it does after
-    /// waking (a store read, the response) is bounded by the store's own
-    /// reader pool and the write-stall deadline.
     pub(crate) fn yield_handler(&mut self) {
         self.handler = None;
     }
 
-    /// Read a whole body of at most `limit` bytes for a route that has no
-    /// credential yet. Unless the body already sits in the connection's
-    /// buffer, the handler permit is given back first and the read runs
-    /// under one of the few [`Tune::public_bodies`] slots and a tight
-    /// [`Tune::public_body_time`] — so clients that trickle a body hold
-    /// no handler permit and, past that small pool, nobody else's turn.
-    /// The permit is taken again before returning.
     pub(crate) fn public_body(&mut self, limit: usize) -> Result<Vec<u8>, BodyErr> {
         if self.length.is_some_and(|n| n > limit as u64) {
             return Err(BodyErr::TooLarge);
@@ -950,8 +825,6 @@ impl Request<'_> {
                 .find(|h| h.field.equiv("x-forwarded-for"))
                 .map(|h| h.value.as_str());
             let key = client_key(self.peer(), forwarded, &gate.trusted);
-            // A client with a body already in flight is turned away at
-            // once: its trickle must not also queue for the shared pool.
             let Some(reader) = ReaderKey::take(&gate.readers, key) else {
                 self.restore_handler(gate)?;
                 return Err(BodyErr::Busy);
@@ -979,7 +852,6 @@ impl Request<'_> {
         Ok(bytes)
     }
 
-    /// Take a handler permit again after a public body read.
     fn restore_handler(&mut self, gate: &Gate) -> Result<(), BodyErr> {
         if self.handler.is_none() {
             self.handler = Some(
@@ -1000,7 +872,6 @@ impl Request<'_> {
         self.trusted_identity
     }
 
-    /// Build a bounded in-process child request after the caller authenticates.
     pub(crate) fn internal(
         &self,
         method: String,
@@ -1033,9 +904,6 @@ impl Request<'_> {
         &mut self.body
     }
 
-    /// Write the response. A body the route never read, an explicit
-    /// `connection: close`, or a close-delimited response all end the
-    /// connection — bytes left unread would desync the next head.
     pub(crate) fn respond(&mut self, response: Response) -> io::Result<()> {
         if self.responded {
             return Err(io::Error::other("responded twice"));
@@ -1073,9 +941,6 @@ impl Request<'_> {
                 Some(len) => io::copy(&mut data.by_ref().take(len), &mut writer),
                 None => io::copy(&mut data, &mut writer),
             };
-            // A body that failed mid-stream (a stall, or a download whose
-            // bytes did not verify) leaves the client short of the declared
-            // length: the connection must end, never serve another head.
             let copied = match copied {
                 Ok(copied) => copied,
                 Err(e) => {
@@ -1085,15 +950,11 @@ impl Request<'_> {
                 }
             };
             writer.flush()?;
-            // A stream that ended early desyncs the client; close rather
-            // than let its next read land on a short body.
             if response.len.is_some_and(|len| copied != len) {
                 self.close = true;
             }
         }
         if close || self.close {
-            // FIN after the response, so a refused-body reply survives
-            // the unread bytes the close is about to abandon.
             let _ = self.writer.shutdown(Shutdown::Write);
             self.close = true;
         }
@@ -1105,9 +966,6 @@ impl Request<'_> {
     }
 }
 
-/// Best-effort canned refusal for an unparseable head, then close. The
-/// write timeout is small: a client we are refusing does not get to
-/// park a connection thread on a stalled send.
 fn refuse(stream: &TcpStream, status: u16) {
     let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
     let mut w = stream;
@@ -1121,23 +979,16 @@ fn refuse(stream: &TcpStream, status: u16) {
     let _ = stream.shutdown(Shutdown::Write);
 }
 
-/// The live side of `listen`: the acceptor plus every open connection's
-/// socket, so `close` can fail parked reads instead of waiting out the
-/// head deadline.
 pub(crate) struct Conns {
     stop: Arc<AtomicBool>,
     sockets: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
     permits: Arc<Pool>,
     poll: Duration,
-    /// Where the listener can be reached from this host, to wake an acceptor
-    /// parked in a blocking accept when the server stops.
     wake: SocketAddr,
     acceptor: Option<JoinHandle<()>>,
 }
 
 impl Conns {
-    /// Stop accepting, force-close every open connection, and wait for
-    /// the reader threads to release their permits.
     pub(crate) fn close(mut self) {
         self.shutdown();
     }
@@ -1153,11 +1004,6 @@ impl Conns {
             let _ = socket.shutdown(Shutdown::Both);
         }
         if let Some(acceptor) = self.acceptor.take() {
-            // The acceptor sleeps in `accept`: a connection to our own
-            // listener ends it, and it sees `stop` before serving anything.
-            // Should the listener refuse even that (it is bound, so only a
-            // pathological host does), the thread is left to end at its next
-            // connection rather than hanging the shutdown.
             let target = match self.wake.ip() {
                 IpAddr::V4(ip) if ip.is_unspecified() => {
                     SocketAddr::from((Ipv4Addr::LOCALHOST, self.wake.port()))
@@ -1188,17 +1034,11 @@ impl Conns {
 }
 
 impl Drop for Conns {
-    /// A `Server` dropped without `shutdown` still owes its threads a
-    /// stop; the steps are idempotent after `close`.
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
-/// Serve `listener` until the returned `Conns` is closed. `stop` is
-/// shared with the rest of the API so routes' long polls end when the
-/// server does. Saturated connection permits park the acceptor so the
-/// kernel backlog — not our memory — absorbs the flood.
 pub(crate) fn listen(
     listener: TcpListener,
     serve: Arc<dyn Fn(&mut Request) + Send + Sync>,
@@ -1206,9 +1046,6 @@ pub(crate) fn listen(
     tune: Tune,
     exempt: Vec<TrustedProxy>,
 ) -> io::Result<Conns> {
-    // A blocking accept: the acceptor wakes when a connection arrives (and
-    // on shutdown, when `Conns::close` connects to it), so no connection
-    // waits out a `poll` sleep.
     listener.set_nonblocking(false)?;
     let wake = listener.local_addr()?;
     let (sockets, permits) = (
@@ -1249,25 +1086,18 @@ pub(crate) fn listen(
 
 static CONN: AtomicU64 = AtomicU64::new(0);
 
-/// Open connections per client key (an IPv4 address or an IPv6 /64), so
-/// one host cannot take every connection slot. At most `connections`
-/// entries exist at once, so the map is bounded by the connection cap.
 struct Peers {
     cap: usize,
     exempt: Vec<TrustedProxy>,
     held: Mutex<HashMap<u128, usize>>,
 }
 
-/// One held per-peer slot, released on drop.
 struct PeerSlot {
     peers: Arc<Peers>,
     key: u128,
 }
 
 impl Peers {
-    /// Count a new connection from `peer`; `None` when that peer already
-    /// holds its share. A reverse proxy's own address is never capped: it
-    /// stands for many clients, which the admission budgets key apart.
     fn admit(self: &Arc<Self>, peer: IpAddr) -> Option<Option<PeerSlot>> {
         if is_proxy(peer, &self.exempt) {
             return Some(None);
@@ -1315,19 +1145,13 @@ fn accept_loop(
         };
         match listener.accept() {
             Ok((stream, addr)) => {
-                // The wake-up connection of a shutdown, or one that raced it:
-                // nothing is served once the server is stopping.
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
                 let Some(peer_slot) = peers.admit(addr.ip()) else {
-                    // This peer holds its share of connections: closing
-                    // at once keeps the rest for everyone else.
                     continue;
                 };
                 let Ok(registered) = stream.try_clone() else {
-                    // A connection the close path cannot supervise is one
-                    // we must not keep.
                     continue;
                 };
                 let id = CONN.fetch_add(1, Ordering::Relaxed);
@@ -1345,9 +1169,7 @@ fn accept_loop(
                     .name("sentinel-api-conn".into())
                     .spawn(move || {
                         connection(stream, &*serve, &gate, &stop, tune);
-                        // Released last: `close`'s `wait_full` must not
-                        // return while a reader still holds `serve` — and
-                        // through it `State` and the store.
+                        // Released last: wait_full must not return while a reader still holds State through serve.
                         drop(serve);
                         drop(gate);
                         drop(peer_slot);
@@ -1366,15 +1188,11 @@ fn accept_loop(
                         .remove(&id);
                 }
             }
-            // Descriptor exhaustion or a peer reset mid-handshake: back off
-            // a poll and keep accepting.
             Err(_) => thread::sleep(tune.poll),
         }
     }
 }
 
-/// One connection's keep-alive loop: head, handler permit, serve, repeat
-/// until close, error, or `stop`.
 fn connection(
     stream: TcpStream,
     serve: &dyn Fn(&mut Request),
@@ -1382,8 +1200,7 @@ fn connection(
     stop: &AtomicBool,
     tune: Tune,
 ) {
-    // Accepted sockets inherit the listener's nonblocking mode on
-    // Windows (POSIX does not inherit); deadlines need blocking reads.
+    // Accepted sockets inherit the listener's nonblocking mode on Windows; deadlines need blocking reads.
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_nodelay(true);
     let stream = &stream;
@@ -1413,8 +1230,6 @@ fn connection(
         let Some(handler) = gate.handlers.acquire(stop, tune.poll) else {
             break;
         };
-        // Whole body already read ahead with the head: reading it cannot
-        // wait on the client.
         let ready = !head.chunked
             && head
                 .length
@@ -1467,8 +1282,6 @@ fn connection(
         let panicked =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve(&mut request))).is_err();
         if panicked || !request.responded {
-            // A route fault — or a handler that never answered — still
-            // owes what can still be written, then closes.
             let _ = request
                 .respond(Response::from_string(String::new()).with_status_code(StatusCode(500)));
             break;
@@ -1484,7 +1297,6 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    /// A connected client/server socket pair on loopback.
     fn pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -1507,8 +1319,6 @@ mod tests {
         }
     }
 
-    /// Parse one head from wire bytes; the client half stays open so the
-    /// server's reads see a live socket.
     fn parse(wire: &[u8], tune: Tune) -> Result<Head, HeadErr> {
         let (mut client, server) = pair();
         client.write_all(wire).unwrap();
@@ -1517,7 +1327,6 @@ mod tests {
         head(&mut reader, &server, tune, &stop)
     }
 
-    /// A `Limited` over the buffered half of a socket pair.
     fn limited<'a>(
         r: &'a mut dyn BufRead,
         socket: &'a TcpStream,
@@ -1548,17 +1357,15 @@ mod tests {
 
         let got = parse(b"GET http://ex.com/p?q=1 HTTP/1.0\r\n\r\n", tune()).unwrap();
         assert_eq!(got.url, "/p?q=1");
-        assert!(got.close); // HTTP/1.0 defaults to close
+        assert!(got.close);
     }
 
     #[test]
     fn head_refuses_smuggling_shapes() {
-        // Two content-lengths, or chunked+length, are refused outright.
         for wire in [
             &b"POST / HTTP/1.1\r\nhost: h\r\ncontent-length: 1\r\ncontent-length: 2\r\n\r\n"[..],
             b"POST / HTTP/1.1\r\nhost: h\r\ncontent-length: 1\r\ntransfer-encoding: chunked\r\n\r\n",
             b"POST / HTTP/1.1\r\nhost: h\r\ntransfer-encoding: gzip\r\n\r\n",
-            // A sign, or no digits, is not a length.
             b"POST / HTTP/1.1\r\nhost: h\r\ncontent-length: +5\r\n\r\n",
             b"POST / HTTP/1.1\r\nhost: h\r\ncontent-length: -0\r\n\r\n",
             b"POST / HTTP/1.1\r\nhost: h\r\ncontent-length:\r\n\r\n",
@@ -1575,7 +1382,6 @@ mod tests {
             Err(HeadErr::Status(417)) => {}
             other => panic!("expected 417, got {other:?}"),
         }
-        // HTTP/1.1 without Host; an unknown version; an obs-fold line.
         for (wire, want) in [
             (&b"GET / HTTP/1.1\r\n\r\n"[..], 400),
             (b"GET / HTTP/9.9\r\nhost: h\r\n\r\n", 505),
@@ -1590,7 +1396,6 @@ mod tests {
 
     #[test]
     fn head_byte_cap_is_cumulative() {
-        // Each line is well under the cap; together they exceed it.
         let mut wire = b"GET / HTTP/1.1\r\nhost: h\r\n".to_vec();
         while wire.len() <= 1024 {
             wire.extend_from_slice(
@@ -1627,7 +1432,6 @@ mod tests {
             .unwrap();
         assert_eq!(got, b"abcd");
 
-        // Declared longer than the peer ever sends: EOF mid-body errors.
         drop(client);
         assert_eq!(
             limited(&mut reader, &server, &stop, 10)
@@ -1657,7 +1461,6 @@ mod tests {
         assert_eq!(got, b"abcdefg");
         assert!(body.done);
 
-        // A trailer section past the cap is refused, not buffered.
         let (mut client, server) = pair();
         let mut wire = b"1\r\na\r\n0\r\n".to_vec();
         wire.extend_from_slice(&vec![b'x'; (8 << 10) + 16]);
@@ -1726,7 +1529,6 @@ mod tests {
         assert!(wire.ends_with("\r\n\r\nhi"));
         assert!(!wire.contains("connection: close"));
 
-        // An unread request body forces the connection closed.
         let (client, server) = pair();
         let mut reader = BufReader::with_capacity(1024, &server);
         let mut request = Request {
@@ -1755,9 +1557,6 @@ mod tests {
         assert!(wire.contains("connection: close\r\n"));
     }
 
-    /// A new connection is accepted when it arrives, not at the next poll:
-    /// with a 100 ms poll (the production value) a polling accept would put
-    /// the median connect-to-response time near 100 ms.
     #[test]
     fn a_new_connection_is_served_without_waiting_for_a_poll() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1791,7 +1590,6 @@ mod tests {
             client.read_to_end(&mut wire).unwrap();
             assert!(wire.starts_with(b"HTTP/1.1 200"), "{wire:?}");
             taken.push(started.elapsed());
-            // Land the next connection at a different phase of any poll.
             thread::sleep(Duration::from_millis(7));
         }
         taken.sort();
@@ -1803,8 +1601,6 @@ mod tests {
         conns.close();
     }
 
-    /// The acceptor sleeps in `accept`, so closing the server must wake it:
-    /// an idle server stops within a moment, not never.
     #[test]
     fn closing_an_idle_server_wakes_its_blocked_acceptor() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1837,17 +1633,15 @@ mod tests {
                 let _ = request.respond(Response::from_string("ok"));
             }),
             stop,
-            tune(), // connections: 2
+            tune(),
             Vec::new(),
         )
         .unwrap();
 
-        // Two idle clients hold both connection permits.
         let _a = TcpStream::connect(addr).unwrap();
         let _b = TcpStream::connect(addr).unwrap();
         thread::sleep(Duration::from_millis(150));
 
-        // A third connects at the kernel but waits for a permit.
         let mut c = TcpStream::connect(addr).unwrap();
         c.write_all(b"GET / HTTP/1.1\r\nhost: h\r\n\r\n").unwrap();
         c.set_read_timeout(Some(Duration::from_millis(200)))
@@ -1855,8 +1649,6 @@ mod tests {
         let mut buf = [0u8; 64];
         assert!(c.read(&mut buf).is_err(), "overflow conn must wait");
 
-        // The idle conns' head deadline frees permits; the queued
-        // request is then served.
         c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let n = c.read(&mut buf).unwrap();
         assert!(n > 0 && buf.starts_with(b"HTTP/1.1 200"));
@@ -1874,8 +1666,6 @@ mod tests {
         let conns = listen(
             listener,
             Arc::new(move |request: &mut Request| {
-                // First handler call parks until released; while it holds
-                // the only handler permit a second request must wait.
                 if entered.fetch_add(1, Ordering::SeqCst) == 0 {
                     let _ = wait
                         .lock()
@@ -1887,7 +1677,7 @@ mod tests {
                 let _ = request.respond(Response::from_string("ok"));
             }),
             stop,
-            tune(), // handlers: 1
+            tune(),
             Vec::new(),
         )
         .unwrap();
@@ -1900,7 +1690,6 @@ mod tests {
             .unwrap();
         thread::sleep(Duration::from_millis(150));
 
-        // `two` cannot get a handler permit while `one` is parked.
         two.set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
         let mut buf = [0u8; 64];
@@ -1910,9 +1699,6 @@ mod tests {
         let n = one.read(&mut buf).unwrap();
         assert!(n > 0 && buf.starts_with(b"HTTP/1.1 200"));
 
-        // `two` then runs, but its body stalls past `body_time` — the
-        // connection dies rather than parking the handler forever. The
-        // response says close and the socket reaches EOF.
         two.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let mut all = Vec::new();
         two.read_to_end(&mut all).unwrap();
@@ -1920,9 +1706,6 @@ mod tests {
         conns.close();
     }
 
-    /// A client that trickles an unauthenticated body holds no handler
-    /// permit: with one permit and one body slot, a stalled `/public`
-    /// body cannot delay a `GET /fast`, and it dies at the body deadline.
     #[test]
     fn stalled_public_bodies_hold_no_handler_permit() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1970,9 +1753,6 @@ mod tests {
         conns.close();
     }
 
-    /// One client holding a body slot does not block a second client, and
-    /// a second body from the same client is turned away at once instead of
-    /// queueing for the shared pool.
     #[test]
     fn a_client_holds_one_public_body_slot_and_others_still_get_theirs() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2020,11 +1800,8 @@ mod tests {
         let _slow = post("198.51.100.1", "x", 100);
         thread::sleep(Duration::from_millis(150));
 
-        // A body that arrived whole needs no slot, so each request here
-        // sends part of its body: it is only read through a slot.
         let same = status(post("198.51.100.1", "o", 2));
         assert!(same.starts_with(b"HTTP/1.1 400"), "got {same:?}");
-        // Another client gets the other slot, and finishes its body.
         let mut other = post("198.51.100.2", "o", 2);
         thread::sleep(Duration::from_millis(100));
         other.write_all(b"k").unwrap();
@@ -2033,8 +1810,6 @@ mod tests {
         conns.close();
     }
 
-    /// One peer address cannot take every connection slot; a trusted
-    /// proxy network is exempt.
     #[test]
     fn a_peer_is_capped_unless_it_is_a_trusted_proxy() {
         for (exempt, capped) in [(Vec::new(), true), (TrustedProxy::loopback(), false)] {
@@ -2093,7 +1868,6 @@ mod tests {
         let start = Instant::now();
         conns.close();
         assert!(start.elapsed() < Duration::from_secs(2));
-        // The force-closed socket fails the client's parked read at once.
         let mut buf = [0u8; 8];
         assert!(idle.read(&mut buf).unwrap_or(0) == 0);
     }

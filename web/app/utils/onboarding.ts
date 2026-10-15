@@ -1,8 +1,3 @@
-// Pure helpers for the first-run wizard, sign-up, email links and
-// organizations. No framework imports, so `node --test` checks them alone.
-
-/** A one-time secret as the controller writes it: 64 hex digits (a setup or
- *  verification token), or `sntl_` and 64 hex digits (an invitation). */
 const HEX64 = /^[0-9a-fA-F]{64}$/;
 const INVITATION = /^sntl_[0-9a-fA-F]{64}$/;
 
@@ -10,10 +5,7 @@ export const isSetupToken = (text: string) => HEX64.test(text.trim());
 export const isVerificationToken = (text: string) => HEX64.test(text);
 export const isInvitationToken = (text: string) => INVITATION.test(text);
 
-/// The `token` of a link's fragment (`#token=…`), where the emailed links put
-/// their secret so it reaches no server log or `Referer`. Anything that is
-/// not exactly one well-formed token is `null`: the page then says the link
-/// is incomplete instead of sending the controller a guess.
+// The token sits in the fragment, so no server log or Referer ever records it.
 export function fragmentToken(hash: string, kind: "verification" | "invitation"): string | null {
   if (!hash.startsWith("#") || hash.length > 512) return null;
   const params = new URLSearchParams(hash.slice(1));
@@ -23,15 +15,10 @@ export function fragmentToken(hash: string, kind: "verification" | "invitation")
   return (kind === "invitation" ? isInvitationToken(token) : isVerificationToken(token)) ? token : null;
 }
 
-/// An invitation secret parked in this tab's session storage across a
-/// GitHub sign-in round trip: the key, its lifetime, and the stored form.
 export const INVITATION_STASH = "sentinel-invitation";
 export const INVITATION_STASH_MS = 10 * 60 * 1000;
 export const stashInvitation = (token: string, now: number) => JSON.stringify({ token, until: now + INVITATION_STASH_MS });
 
-/// The parked secret in `raw`, or `null` when it is absent, malformed, not
-/// an invitation token or past its ten minutes (the caller removes it
-/// either way).
 export function unstashInvitation(raw: string | null, now: number): string | null {
   if (!raw || raw.length > 512) return null;
   try {
@@ -42,16 +29,14 @@ export function unstashInvitation(raw: string | null, now: number): string | nul
   }
 }
 
-/** UTF-8 length, the unit the controller's password bounds use. */
 export const byteLength = (s: string) => new TextEncoder().encode(s).length;
 
 export const PASSWORD_MIN_BYTES = 12;
 export const PASSWORD_MAX_BYTES = 256;
 
 export interface PasswordAdvice {
-  /** The controller would accept it (12–256 bytes, not only spacing). */
   acceptable: boolean;
-  /** 0 (refused) to 4 (strong): guidance only, never a gate beyond `acceptable`. */
+  // Guidance only: the controller's bounds, not the score, decide acceptance.
   score: 0 | 1 | 2 | 3 | 4;
   label: string;
   hints: string[];
@@ -59,9 +44,6 @@ export interface PasswordAdvice {
 
 const COMMON = ["password", "sentinel", "qwerty", "letmein", "welcome", "admin", "123456", "iloveyou", "monkey", "dragon"];
 
-/// Guidance for a new password, judged in the page: the controller's bounds
-/// decide acceptance; length and variety decide the advice. `context` holds
-/// words the password should not lean on (the address, the instance name).
 export function passwordAdvice(password: string, context: string[] = []): PasswordAdvice {
   const bytes = byteLength(password);
   const hints: string[] = [];
@@ -95,9 +77,6 @@ export function passwordAdvice(password: string, context: string[] = []): Passwo
   return { acceptable, score: score as PasswordAdvice["score"], label, hints };
 }
 
-/// Why an organization name would be refused by its shape (2–63 bytes of
-/// `a-z`, `0-9` and `-`, no hyphen at an edge), or `null`. Reserved names are
-/// the controller's to judge.
 export function slugProblem(slug: string): string | null {
   if (slug.length < 2 || slug.length > 63) return "Use 2 to 63 characters.";
   if (!/^[a-z0-9-]+$/.test(slug)) return "Use lowercase letters, digits and hyphens only.";
@@ -105,12 +84,8 @@ export function slugProblem(slug: string): string | null {
   return null;
 }
 
-/// A plausible address for a form's first check; the controller's canonical
-/// form decides.
 export const looksLikeEmail = (s: string) => /^[^\s@]{1,64}@[^\s@]+\.[^\s@]+$/.test(s.trim()) && s.trim().length <= 254;
 
-/// A base URL the wizard may send: an absolute http(s) URL without
-/// credentials, query or fragment; empty means none.
 export function baseUrlProblem(text: string): string | null {
   const value = text.trim();
   if (!value) return null;
@@ -125,8 +100,6 @@ export function baseUrlProblem(text: string): string | null {
 export type RegistrationChoice = "closed" | "invite-only" | "approval-required";
 export type TenantCreationChoice = "super-admin-only" | "approved-users";
 
-/** What the wizard keeps across a refresh: never the setup token, a
- *  password, which live in the page's memory only. */
 export interface WizardDraft {
   step: number;
   email: string;
@@ -159,8 +132,6 @@ const REGISTRATIONS: readonly string[] = ["closed", "invite-only", "approval-req
 const CREATIONS: readonly string[] = ["super-admin-only", "approved-users"];
 const str = (v: unknown, max: number) => (typeof v === "string" ? v.slice(0, max) : "");
 
-/// The draft as stored: only the allowlisted, non-secret fields, whatever
-/// else the caller's object holds.
 export function serializeDraft(draft: WizardDraft): string {
   const keep: WizardDraft = {
     step: draft.step,
@@ -176,8 +147,6 @@ export function serializeDraft(draft: WizardDraft): string {
   return JSON.stringify(keep);
 }
 
-/// A stored draft read back, every field checked; anything malformed falls
-/// back to the empty draft's value. `maxStep` bounds the step.
 export function parseDraft(text: string | null, maxStep: number): WizardDraft {
   const out = emptyDraft();
   if (!text || text.length > 8192) return out;
@@ -200,10 +169,6 @@ export interface GitHubSync { confirmed_ms: number | null; check_due: boolean; u
 
 export type Standing = "confirmed" | "checking" | "unknown" | "unconfirmed";
 
-/// How to describe the caller's own GitHub-derived access: `unknown` when
-/// GitHub has failed to answer (access kept for the grace period, nothing new
-/// granted), `checking` while a check is waiting to run, `confirmed` once
-/// GitHub has confirmed it, `unconfirmed` when it never has.
 export function githubStanding(sync: GitHubSync | undefined | null): Standing {
   if (!sync) return "unconfirmed";
   if (sync.unanswered > 0) return "unknown";

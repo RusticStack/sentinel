@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# B02: drive samples of the lockwell-ci contract's `unit` lane on a GitHub
-# self-hosted runner. Each sample is one push to the bench branch of a
-# Lockwell worktree (an empty commit, or the condition file changing), and
-# waits for the run it triggered.
-#   bench/b02-github-sample.sh WORKTREE CONDITION COUNT
-# Afterwards bench/b02-github-collect.py turns the branch's runs into records.
 set -euo pipefail
 WT=$1
 CONDITION=$2

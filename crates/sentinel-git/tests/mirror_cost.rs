@@ -1,18 +1,7 @@
-//! Measurement, not a check: what one mirrored checkout costs on
-//! the worker's filesystem — wall time of the materialization phase and
-//! the bytes it leaves in the job's `.git` — for a repository with a long
-//! history. Ignored by default; run it in release on the filesystem under
-//! test:
-//!
 //! ```sh
 //! SENTINEL_MIRROR_COST_DIR=/root/bench cargo test --release -p sentinel-git \
 //!     --test mirror_cost -- --ignored --nocapture --test-threads=1
 //! ```
-//!
-//! `SENTINEL_MIRROR_COST_COMMITS`, `_FILES`, `_TOUCH` and `_BYTES` size the
-//! synthetic history (defaults 3,000 commits over 2,000 files, 20 files of
-//! 4 KiB rewritten per commit — about 240 MiB of history behind an 8 MiB
-//! tree). Content is pseudo-random, so neither deltas nor zlib shrink it.
 #![cfg(unix)]
 
 use std::{
@@ -45,8 +34,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-/// A bare origin whose `main` carries `commits` commits, built with
-/// `git fast-import` in one pass.
 fn synthetic_origin(root: &Path, commits: u64, files: u64, touch: u64, bytes: u64) -> String {
     let origin = root.join("origin.git");
     fs::create_dir(&origin).unwrap();
@@ -76,7 +63,6 @@ fn synthetic_origin(root: &Path, commits: u64, files: u64, touch: u64, bytes: u6
         )
         .unwrap();
         writeln!(input, "data 1\nc").unwrap();
-        // The first commit writes every file; later ones rewrite `touch`.
         let (from, count) = if commit == 0 {
             (0, files)
         } else {
@@ -137,7 +123,6 @@ fn mirrored_checkout_cost() {
     let mirrors = Mirrors::open(&temp.path().join("mirrors")).unwrap();
     let repo = RepoId::new();
     let source = PinnedSource::new(origin.to_str().unwrap(), &head, None).unwrap();
-    // The first checkout fills the mirror; only warm ones are measured.
     let ws = temp.path().join("ws-fill");
     fs::create_dir(&ws).unwrap();
     let fill = mirrors
@@ -162,8 +147,7 @@ fn mirrored_checkout_cost() {
     for run in 0..runs {
         let ws = temp.path().join(format!("ws-{run}"));
         fs::create_dir(&ws).unwrap();
-        // Cold page cache is not reachable without root; every run reads a
-        // mirror the previous one already touched, like a busy worker.
+        // No root, so the page cache cannot be dropped: each run reads a mirror the last one warmed.
         let out = mirrors
             .checkout(
                 &ws,
@@ -175,8 +159,7 @@ fn mirrored_checkout_cost() {
             )
             .unwrap();
         assert_eq!(out.sha, head);
-        // What the materialization left dirty still has to reach the disk:
-        // `syncfs` right after it charges that write-back to this run.
+        // sync -f charges the materialization's dirty pages to this run, not the next.
         let sync_started = Instant::now();
         assert!(
             Command::new("sync")

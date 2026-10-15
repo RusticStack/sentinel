@@ -1,10 +1,4 @@
 <script setup lang="ts">
-// A namespace's settings, read-only: what kind it is, where its membership
-// comes from, the caller's own standing with GitHub in a GitHub-managed
-// organization (with a re-check), and — for an administrator — which email
-// domains the operator set to join it automatically. Nothing here is
-// editable: the membership source is an explicit administrator act, and the
-// domain rule is the operator's environment variable.
 const route = useRoute();
 const slug = route.params.slug as string;
 useHead({ title: `Settings · ${slug} · Sentinel` });
@@ -19,15 +13,11 @@ if (import.meta.client) watch(failure, (f) => { if (f?.code === "not_found") ses
 const ROLE_NAMES: Record<string, string> = { reader: "Reader", operator: "Operator", admin: "Admin" };
 const isAdmin = computed(() => data.value?.role === "admin" || !!session.me.value?.super_admin);
 const githubManaged = computed(() => data.value?.membership === "github");
-// An organization with a bound GitHub App installation takes no email
-// invitations even before it is GitHub-managed.
+// Email invitations do not apply once a GitHub App is installed, even before membership is GitHub-managed.
 const invitesApply = computed(() => data.value?.kind === "organization" && !githubManaged.value && !data.value?.github_installation);
 const where = computed(() => githubStanding(data.value?.github_sync));
 const isoDate = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
-// Opening the namespace's repositories asks Sentinel to check the caller
-// with GitHub when the last confirmation is older than five minutes (at
-// most once a minute); the answer arrives in the background.
 const rechecking = ref(false);
 const recheckNote = ref("");
 const { waiting, start: hold } = useRetryWait();
@@ -69,7 +59,6 @@ async function recheck() {
       <USkeleton v-else-if="status === 'pending' && !data" class="h-40 w-full" />
 
       <template v-else-if="data">
-        <!-- What it is -->
         <UCard as="section" aria-labelledby="about-h">
           <template #header>
             <h2 id="about-h" class="text-base font-semibold flex items-center gap-2"><UIcon :name="data.kind === 'personal' ? 'i-lucide-user' : githubManaged ? 'i-lucide-github' : 'i-lucide-building-2'" />About</h2>
@@ -91,7 +80,6 @@ async function recheck() {
           </dl>
         </UCard>
 
-        <!-- Who belongs -->
         <UCard as="section" aria-labelledby="members-h">
           <template #header>
             <h2 id="members-h" class="text-base font-semibold flex items-center gap-2"><UIcon name="i-lucide-users" />Who belongs here</h2>
@@ -133,7 +121,6 @@ async function recheck() {
           </div>
         </UCard>
 
-        <!-- The operator's domain rule (administrators only; never editable) -->
         <UCard v-if="data.auto_join" as="section" aria-labelledby="domains-h">
           <template #header>
             <div class="flex flex-wrap items-center justify-between gap-2">

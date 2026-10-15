@@ -1,9 +1,6 @@
 <script setup lang="ts">
 import type { RepoSync } from "~~/shared/types/api";
 
-// How far GitHub feedback lags: per repository, check runs waiting to
-// reach GitHub and the oldest one's age, refusals in the last 24 hours, the
-// last accepted publication, and deliveries not yet turned into runs.
 const route = useRoute();
 const api = useApi();
 const slug = route.params.slug as string;

@@ -1,11 +1,4 @@
-//! `sentinel auth login|status|logout` and `sentinel context use|show`:
-//! browser (loopback + PKCE) and device sign-in, grant import for agents,
-//! status without token material, logout with server revocation.
-//!
-//! Every sign-in starts from the server's metadata: its `issuer` must be the
-//! normalized `--server` exactly and every endpoint must share its origin,
-//! so a credential is only ever sent where it was issued. Token material
-//! never reaches stdout or stderr; the device code stays in memory.
+//! Every sign-in starts from the server's metadata: the issuer must equal --server exactly and every endpoint must share its origin, so a credential is only sent where it was issued.
 
 use std::{
     io::Read,
@@ -34,13 +27,9 @@ use crate::{
     profile::{self, Config, Credentials, DEFAULT_PROFILE, Profile, now_ms},
 };
 
-/// The scopes a sign-in asks for without `--scope` (`Scopes::CLI_DEFAULT`).
 pub const DEFAULT_SCOPE: &str = "runs:read runs:write logs:read artifacts:read cache:read";
-/// The schema of `sentinel auth status --json`.
 pub const STATUS_SCHEMA: &str = "sentinel.auth-status/1";
-/// Bound on best-effort revocations that must not hold a command up.
 const QUICK: Duration = Duration::from_secs(5);
-/// Largest grant file read.
 const MAX_GRANT_FILE: u64 = 4 << 10;
 
 #[derive(Args, Debug)]
@@ -150,7 +139,6 @@ fn quick_agent() -> ureq::Agent {
     )
 }
 
-/// `scheme://authority` of a normalized URL.
 fn origin(url: &str) -> &str {
     let after = url.find("://").map_or(0, |at| at + 3);
     match url[after..].find('/') {
@@ -159,8 +147,6 @@ fn origin(url: &str) -> &str {
     }
 }
 
-/// Printable ASCII without spaces or quotes: safe to print and to hand to a
-/// browser launcher.
 fn plain(text: &str) -> bool {
     !text.is_empty()
         && text
@@ -168,7 +154,6 @@ fn plain(text: &str) -> bool {
             .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
 }
 
-/// An endpoint the metadata named, accepted only on the issuer's origin.
 fn same_origin(endpoint: &str, issuer: &str) -> bool {
     let origin = origin(issuer);
     plain(endpoint)
@@ -177,8 +162,6 @@ fn same_origin(endpoint: &str, issuer: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Fetch and check the server's metadata: `issuer` must equal `server`
-/// (already normalized) exactly, and every endpoint must be on its origin.
 pub fn discover(agent: &ureq::Agent, server: &str) -> Result<Metadata, Error> {
     let (status, body) = profile::get(agent, &format!("{server}{METADATA_PATH}"), None)?;
     if status != 200 {
@@ -213,7 +196,6 @@ pub fn discover(agent: &ureq::Agent, server: &str) -> Result<Metadata, Error> {
     Ok(meta)
 }
 
-/// The scopes to request, each one the server offers.
 pub fn requested_scope(scope: Option<&str>, meta: &Metadata) -> Result<String, Error> {
     let mut out = String::with_capacity(96);
     for name in scope.unwrap_or(DEFAULT_SCOPE).split_ascii_whitespace() {
@@ -315,11 +297,6 @@ fn browser_login(
     }
 }
 
-/// The device flow (RFC 8628): print the verification URI and user code on
-/// stderr, then poll every `interval` (`slow_down` adds 5), until approval,
-/// denial or expiry. `unit` is one second in production; a smaller unit lets
-/// tests run the schedule quickly. Ctrl-C ends the process with nothing
-/// written.
 pub fn device_login(
     agent: &ureq::Agent,
     meta: &Metadata,
@@ -397,9 +374,7 @@ pub fn device_login(
     }
 }
 
-/// Read a provisioned refresh token (a file, or `-` for stdin) and spend it
-/// at once: the provisioned text is dead afterwards, only the stored
-/// successor works.
+// The provisioned refresh token is single-use: once spent here, only the stored successor works.
 fn import_grant(
     agent: &ureq::Agent,
     meta: &Metadata,
@@ -432,14 +407,12 @@ fn import_grant(
     }
 }
 
-/// `GET /api/v1/me` with an access token: status and parsed body.
 fn whoami(agent: &ureq::Agent, server: &str, access: &str) -> Result<(u16, Value), Error> {
     let (status, body) = profile::get(agent, &format!("{server}/api/v1/me"), Some(access))?;
     let value = serde_json::from_str(&body).unwrap_or(Value::Null);
     Ok((status, value))
 }
 
-/// Revoke a grant by one of its tokens (RFC 7009).
 fn revoke(agent: &ureq::Agent, issuer: &str, token: &str) -> Result<(), Error> {
     let form = profile::form(&[("client_id", CLI_CLIENT_ID), ("token", token)]);
     let (status, _) = profile::post_form(agent, &format!("{issuer}{REVOKE_PATH}"), &form)?;
@@ -452,9 +425,7 @@ fn revoke(agent: &ureq::Agent, issuer: &str, token: &str) -> Result<(), Error> {
     }
 }
 
-/// Store a fresh grant: learn the account, then under the profile lock
-/// replace any previous credential and write the credential before the
-/// profile that points at it.
+// Write the credential before the profile that points at it, under the profile lock.
 fn save_login(
     config: &Config,
     agent: &ureq::Agent,
@@ -483,9 +454,7 @@ fn save_login(
     };
     let _lock = config.lock(name)?;
     if let Some(old) = &previous {
-        // A legacy shared OS-store entry may hold another configuration
-        // directory's sign-in by now; only this profile's own is revoked
-        // and deleted.
+        // A legacy shared store entry may now hold another config directory's sign-in: revoke only ours.
         let (stored, ours) = if old.is_legacy() {
             match config.legacy_owner(&quick_agent(), name, old) {
                 profile::Owner::Ours(stored) => (Some(stored), true),
@@ -550,8 +519,6 @@ fn save_login(
     Ok(())
 }
 
-/// The profile a command addresses: `--profile`/`SENTINEL_PROFILE`, else
-/// the current one; exit 3 with the login hint when there is none.
 fn pick(
     config: &Config,
     name: Option<&str>,
@@ -575,7 +542,6 @@ fn pick(
     Ok((name, entry, profiles))
 }
 
-/// A `--server`/`SENTINEL_SERVER` given with a profile must be its server.
 fn check_server(client: &ClientArgs, name: &str, entry: &Profile) -> Result<(), Error> {
     let explicit = client.server.clone().or_else(|| {
         std::env::var("SENTINEL_SERVER")
@@ -593,7 +559,6 @@ fn check_server(client: &ClientArgs, name: &str, entry: &Profile) -> Result<(), 
     Ok(())
 }
 
-/// `5d 3h`, `2h 10m`, `4m 5s`, `12s`, or `expired`.
 fn remaining(expires_ms: u64, now: u64) -> String {
     if expires_ms <= now {
         return "expired".to_owned();
@@ -722,7 +687,6 @@ fn run_status(args: &StatusArgs) -> Result<(), Error> {
     Ok(())
 }
 
-/// `GET /api/v1/me` through the profile, refreshing once on `401`.
 pub(crate) fn verify(config: &Config, name: &str, agent: &ureq::Agent) -> Result<Value, Error> {
     let handle = config
         .handle(Some(name))?
@@ -767,8 +731,6 @@ fn run_logout(args: &LogoutArgs) -> Result<(), Error> {
         let Some(entry) = config.load()?.profiles.remove(name) else {
             continue;
         };
-        // A legacy shared OS-store entry is revoked and deleted only when it
-        // still holds this profile's own grant.
         let stored = if entry.is_legacy() {
             match config.legacy_owner(&agent, name, &entry) {
                 profile::Owner::Ours(stored) => Some(stored),

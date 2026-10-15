@@ -1,8 +1,3 @@
-//! Dispatch store behavior: the ready queue is the database, reservations are
-//! attempts, placement is pool-scoped and capacity-checked, offers lapse back
-//! to the queue under an advanced fence, renewal and reports are fenced, and
-//! a finished job releases its capacity and decides its dependents.
-
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
     Actor, AttemptId, Event, FailureClass, Fence, JobId, JobState, Outcome, PoolId, RepoId, RunId,
@@ -74,7 +69,6 @@ fn fixture() -> Fixture {
     }
 }
 
-/// Enroll a worker into the pool with the given capacity.
 fn worker(f: &Fixture, pool: PoolId, capacity: Capacity) -> WorkerId {
     let id = WorkerId::new();
     let fp = Secret::generate().digest();
@@ -113,7 +107,6 @@ fn spec(yaml: &str) -> RunSpec {
     .unwrap()
 }
 
-/// Create a run from YAML with every job's image resolved; returns job IDs.
 fn run(f: &Fixture, yaml: &str, now: UnixMillis) -> (RunId, Vec<JobId>) {
     let (tenant, repo, run) = (f.tenant, f.repo, RunId::new());
     let spec = spec(yaml);
@@ -168,7 +161,6 @@ fn placement_is_pool_scoped_capacity_checked_and_reserves_with_the_lease() {
         disk_bytes: 0,
     };
     let w = worker(&f, f.pool, cap);
-    // Nothing queued: nothing offered, and the full capacity is free.
     assert_eq!(place(&f, w, f.pool, at(2_000)), None);
     assert_eq!(
         f.store.read(|c| dispatch::free_capacity(c, w)).unwrap(),
@@ -183,7 +175,6 @@ fn placement_is_pool_scoped_capacity_checked_and_reserves_with_the_lease() {
     assert_eq!(first.image.digest, DIGEST);
     assert_eq!(first.lease_until, at(2_100 + dispatch::DEFAULT_LEASE_MS));
     assert_eq!(state(&f, small), JobState::Leased);
-    // The reservation is the attempt: capacity went with the lease.
     assert_eq!(
         f.store.read(|c| dispatch::free_capacity(c, w)).unwrap(),
         Capacity {
@@ -192,7 +183,6 @@ fn placement_is_pool_scoped_capacity_checked_and_reserves_with_the_lease() {
             disk_bytes: 0
         }
     );
-    // The big job no longer fits this worker while the small one holds it.
     assert_eq!(place(&f, w, f.pool, at(2_200)), None);
     assert_eq!(
         f.store
@@ -207,7 +197,6 @@ fn placement_is_pool_scoped_capacity_checked_and_reserves_with_the_lease() {
         WaitReason::WorkerOffline
     );
 
-    // A worker of a pool the tenant may not use sees nothing at all.
     let other = PoolId::new();
     f.store
         .writer()
@@ -232,7 +221,6 @@ fn placement_is_pool_scoped_capacity_checked_and_reserves_with_the_lease() {
         },
     );
     assert_eq!(place(&f, outsider, other, at(2_300)), None);
-    // Granted, it places the big job; withdrawn, it stops at once.
     let (tenant, pool) = (f.tenant, other);
     f.store
         .writer()
@@ -255,7 +243,6 @@ fn placement_is_pool_scoped_capacity_checked_and_reserves_with_the_lease() {
         WaitReason::Capacity
     ));
 
-    // A job larger than any worker the tenant could ever use says so.
     let (_, huge) = run(
         &f,
         "schema: 1
@@ -277,7 +264,6 @@ jobs:
             memory_short: 56 << 30
         }
     );
-    // A job that fits is passed over only by capacity, never by identity.
     assert_eq!(place(&f, w, f.pool, at(2_900)), None);
 }
 
@@ -297,7 +283,6 @@ fn offers_lapse_back_to_the_queue_and_stale_acknowledgements_are_refused() {
     let small = ids[0];
     let offer = place(&f, w, f.pool, at(2_100)).unwrap();
     let (attempt, fence) = (offer.attempt, offer.fence);
-    // The sweep sees it once the ack timeout has passed, not before.
     assert!(
         f.store
             .read(|c| dispatch::unacknowledged(c, at(2_100 + dispatch::OFFER_ACK_MS - 1)))
@@ -321,8 +306,6 @@ fn offers_lapse_back_to_the_queue_and_stale_acknowledgements_are_refused() {
             .cpu_millis,
         8_000
     );
-    // Late acknowledgement of the lapsed offer is a conflict, and it can't
-    // be lapsed twice or un-released by raw SQL.
     assert!(matches!(
         f.store
             .writer()
@@ -341,7 +324,6 @@ fn offers_lapse_back_to_the_queue_and_stale_acknowledgements_are_refused() {
     });
     assert!(matches!(unrelease, Err(Error::Sqlite(_))));
 
-    // Re-offered under a strictly higher fence; the old fence cannot ack it.
     let again = place(&f, w, f.pool, at(7_400)).unwrap();
     assert_eq!((again.job, again.fence), (small, Fence(2)));
     let (attempt2, fence2) = (again.attempt, again.fence);
@@ -367,7 +349,6 @@ fn offers_lapse_back_to_the_queue_and_stale_acknowledgements_are_refused() {
         .write(move |tx| dispatch::acknowledge(tx, w, attempt2, fence2, at(7_500)))
         .unwrap();
     assert_eq!(until, at(7_400 + dispatch::DEFAULT_LEASE_MS));
-    // A retransmitted acknowledgement is idempotent.
     assert_eq!(
         f.store
             .writer()
@@ -375,7 +356,6 @@ fn offers_lapse_back_to_the_queue_and_stale_acknowledgements_are_refused() {
             .unwrap(),
         until
     );
-    // Acknowledged offers are not swept.
     assert!(
         f.store
             .read(|c| dispatch::unacknowledged(c, at(1 << 40)))
@@ -408,8 +388,6 @@ fn renewal_is_fenced_per_attempt_and_names_what_to_stop() {
         .writer()
         .write(move |tx| dispatch::acknowledge(tx, w, aa, af, at(2_200)))
         .unwrap();
-    // `b` is held but unacknowledged: not renewable, so the worker is told to
-    // stop it (it never started); a foreign attempt likewise.
     let ghost = AttemptId::new();
     let (until, stop) = f
         .store
@@ -437,7 +415,6 @@ fn renewal_is_fenced_per_attempt_and_names_what_to_stop() {
     };
     assert_eq!(lease_of(aa), at(50_000));
     assert_eq!(lease_of(ba), at(2_100 + dispatch::DEFAULT_LEASE_MS));
-    // Renewal never moves a lease backwards, and another worker cannot renew it.
     let (_, stop) = f
         .store
         .writer()
@@ -459,7 +436,6 @@ fn renewal_is_fenced_per_attempt_and_names_what_to_stop() {
         })
         .unwrap();
     assert_eq!(stop, vec![aa]);
-    // The held list is bounded.
     let many = vec![aa; dispatch::MAX_HELD_ATTEMPTS + 1];
     assert!(matches!(
         f.store.writer().write(move |tx| dispatch::renew(
@@ -503,9 +479,6 @@ jobs:
     let (build, test) = (ids[0], ids[1]);
     let offer = place(&f, w, f.pool, at(2_100)).unwrap();
     let (attempt, fence) = (offer.attempt, offer.fence);
-    // Context is refused before the acknowledgement is durable (nothing
-    // may start ahead of it) and to a foreign worker at any time; the
-    // acknowledged holder gets its identity and no dependencies.
     assert!(matches!(
         f.store.read(|c| dispatch::job_context(c, w, attempt)),
         Err(Error::NotFound)
@@ -527,8 +500,6 @@ jobs:
     assert_eq!(context.repo_name, "app");
     assert_eq!(context.sha, SHA);
     assert!(context.needs.is_empty() && !context.cancelled);
-    // A report from a worker that does not hold the attempt is refused;
-    // the holder's terminal report stores the summary exactly once.
     let summary = vec![1u8, 2, 3];
     let stray = summary.clone();
     assert!(matches!(
@@ -593,7 +564,6 @@ jobs:
             .unwrap(),
         Some(attempt)
     );
-    // Neither the machine nor raw SQL replaces it.
     assert!(matches!(
         f.store.writer().write(move |tx| dispatch::report(
             tx,
@@ -612,7 +582,6 @@ jobs:
         Ok(())
     });
     assert!(matches!(overwrite, Err(Error::Sqlite(_))));
-    // The dependent's context names its dependency's outcome.
     let next = place(&f, w, f.pool, at(2_700)).unwrap();
     assert_eq!(next.job, test);
     f.store
@@ -646,11 +615,7 @@ jobs:
     image: alpine:3
     steps: [{ id: s, run: 'true' }]
 ";
-    // `pull_request` scopes a job's caches to pull-request state. Protected
-    // state needs a verified delivery for a ref the binding names exactly
-    // (`sentinel-intake/tests/dispatch.rs` covers that path), so a
-    // push recorded without a delivery, an unknown trigger and no
-    // provenance at all — the manual API — are all unprotected.
+    // Only a verified delivery earns protected cache trust; other triggers and missing provenance stay unprotected.
     for (trigger, trust) in [
         (Some("pull_request"), Trust::PullRequest),
         (Some("push"), Trust::Unprotected),
@@ -701,7 +666,6 @@ jobs:
             .unwrap();
         assert_eq!(context.tenant, f.tenant);
         assert_eq!(context.trust, trust, "{trigger:?}");
-        // Finish the job so the next iteration's run is the one placed.
         f.store
             .writer()
             .write(move |tx| {
@@ -735,7 +699,6 @@ fn cancellation_is_desired_state_immediate_before_start_and_delivered_while_owne
     let (run_id, ids) = run(&f, TWO_JOBS, at(2_000));
     let (small, big) = (ids[0], ids[1]);
     let tenant = f.tenant;
-    // Unstarted: canceled now, never placed, dependents untouched.
     assert_eq!(
         f.store
             .writer()
@@ -751,8 +714,6 @@ fn cancellation_is_desired_state_immediate_before_start_and_delivered_while_owne
             .unwrap(),
         dispatch::Cancelled::AlreadyTerminal
     );
-    // Leased and acknowledged: recorded, and the worker hears it on every
-    // beat until it reports; the job stays the worker's until then.
     let offer = place(&f, w, f.pool, at(2_200)).unwrap();
     assert_eq!(offer.job, small);
     let (attempt, fence) = (offer.attempt, offer.fence);
@@ -787,8 +748,6 @@ fn cancellation_is_desired_state_immediate_before_start_and_delivered_while_owne
             .as_slice(),
         []
     ));
-    // The worker ends it and reports; capacity comes back; a cancelled job
-    // cannot be rerun.
     f.store
         .writer()
         .write(move |tx| {
@@ -818,7 +777,6 @@ fn cancellation_is_desired_state_immediate_before_start_and_delivered_while_owne
             .write(move |tx| runs::rerun_job(tx, tenant, small, at(2_600))),
         Err(Error::Transition(_))
     ));
-    // A whole run: only what is not terminal is touched.
     let (run2, ids2) = run(&f, TWO_JOBS, at(3_000));
     let placed = place(&f, w, f.pool, at(3_100)).unwrap();
     assert_eq!(placed.job, ids2[0]);
@@ -875,14 +833,12 @@ jobs:
         .writer()
         .write(move |tx| dispatch::acknowledge(tx, w, attempt, fence, at(2_200)))
         .unwrap();
-    // Not expired while the lease holds.
     assert!(
         f.store
             .read(|c| dispatch::expired(c, at(2_100 + dispatch::DEFAULT_LEASE_MS)))
             .unwrap()
             .is_empty()
     );
-    // Renewed leases keep it alive past the original deadline.
     f.store
         .writer()
         .write(move |tx| dispatch::renew(tx, w, &[attempt], dispatch::DEFAULT_LEASE_MS, at(20_000)))
@@ -893,8 +849,6 @@ jobs:
             .unwrap()
             .is_empty()
     );
-    // Renewed forever but past the job's timeout plus the grace: the
-    // backstop catches a worker that renews but does not enforce.
     let overrun = at(2_200 + 60_000 + dispatch::EXECUTION_GRACE_MS + 1);
     f.store
         .writer()
@@ -915,8 +869,6 @@ jobs:
         .read(|c| sentinel_store::jobs::get_job(c, f.tenant, build))
         .unwrap();
     assert_eq!(row.failure_class, Some(FailureClass::LeaseExpired));
-    // Capacity back, the dependent ruled out, nothing re-queued, the late
-    // worker report refused, and the sweep does not find it again.
     assert_eq!(
         f.store
             .read(|c| dispatch::free_capacity(c, w))
@@ -945,7 +897,6 @@ jobs:
             .unwrap()
             .is_empty()
     );
-    // The worker is told to stop it on its next beat.
     let (_, stop) = f
         .store
         .writer()
@@ -953,7 +904,6 @@ jobs:
         .unwrap();
     assert_eq!(stop, vec![attempt]);
 
-    // A plain lease lapse (no renewal) expires by the deadline alone.
     let (_, ids) = run(&f, TWO_JOBS, at(100_000));
     let offer = place(&f, w, f.pool, at(100_100)).unwrap();
     let (a2, f2) = (offer.attempt, offer.fence);
@@ -1014,13 +964,9 @@ jobs:
 ",
         at(2_000),
     );
-    // a: acknowledged by `w`, lease lapsed while the controller was down.
     let a = place(&f, w, f.pool, at(2_100)).unwrap();
-    // b: offered by `w`, never acknowledged.
     let _b = place(&f, w, f.pool, at(2_100)).unwrap();
-    // c: acknowledged by `gone`, which was revoked meanwhile.
     let c = place(&f, gone, f.pool, at(2_100)).unwrap();
-    // d: acknowledged by `w`, lease still valid: untouched.
     let d = place(&f, w, f.pool, at(2_100)).unwrap();
     let (aa, af, ca, cf, da, df) = (a.attempt, a.fence, c.attempt, c.fence, d.attempt, d.fence);
     f.store
@@ -1029,9 +975,6 @@ jobs:
             dispatch::acknowledge(tx, w, aa, af, at(2_200))?;
             dispatch::acknowledge(tx, gone, ca, cf, at(2_200))?;
             dispatch::acknowledge(tx, w, da, df, at(2_200))?;
-            // Renewed just before its lease (to 32 100) ran out, so it outlives
-            // both restarts below; a renewal after the deadline would be
-            // refused, and the lease would expire.
             dispatch::renew(tx, w, &[da], dispatch::DEFAULT_LEASE_MS, at(32_000))?;
             workers::revoke(tx, Authority::HostLocal, gone, at(2_300))
         })
@@ -1050,10 +993,6 @@ jobs:
             orphaned: 0
         }
     );
-    // `a` expired; `b` was never acknowledged, so it never ran and lapses
-    // back to the queue however long ago it was offered; `c` would be
-    // orphaned but its lease passed first, so it is `LeaseExpired`.
-    // Restart inside the lease and the classes differ:
     assert_eq!(state(&f, ids[0]), JobState::Terminal(Outcome::InfraFailed));
     assert_eq!(state(&f, ids[1]), JobState::Queued);
     assert_eq!(state(&f, ids[2]), JobState::Terminal(Outcome::InfraFailed));
@@ -1066,9 +1005,6 @@ jobs:
         Some(FailureClass::LeaseExpired)
     );
 
-    // Same shape, restart inside the lease: the unanswered offer lapses by
-    // the ack timeout and the revoked worker's attempt is orphaned. Drain
-    // the first run so its leftover queued job cannot steal created_seq 0.
     let tenant = f.tenant;
     f.store
         .writer()
@@ -1118,9 +1054,6 @@ jobs:
     assert_eq!(state(&f, ids2[1]), JobState::Queued);
     let _ = o2;
 
-    // Abandonment: a worker restarted with `d` in its leftovers hands it
-    // back under the fence; a wrong fence or a foreign worker is refused;
-    // an unacknowledged leftover simply lapses back to the queue.
     assert!(matches!(
         f.store
             .writer()
@@ -1161,7 +1094,6 @@ jobs:
             .unwrap(),
         JobState::Queued
     );
-    // The stale attempt's completion is refused after the reconciliation.
     assert!(matches!(
         f.store.writer().write(move |tx| dispatch::report(
             tx,
@@ -1271,7 +1203,6 @@ jobs:
     );
     let offer = place(&f, w, f.pool, at(2_100)).unwrap();
     assert_eq!(offer.job, build);
-    // Only `build` was placeable; `test` is blocked, not queued.
     assert_eq!(place(&f, w, f.pool, at(2_100)), None);
     let (attempt, fence) = (offer.attempt, offer.fence);
     let worker_actor = Actor::Worker(fence);
@@ -1297,7 +1228,6 @@ jobs:
             )
         })
         .unwrap();
-    // Not terminal yet: the reservation stays.
     assert_eq!(
         f.store
             .read(|c| dispatch::free_capacity(c, w))
@@ -1305,7 +1235,6 @@ jobs:
             .cpu_millis,
         6_000
     );
-    // A stale fence reports nothing.
     assert!(matches!(
         f.store.writer().write(move |tx| dispatch::finish(
             tx,
@@ -1332,7 +1261,6 @@ jobs:
             .cpu_millis,
         8_000
     );
-    // `test` was queued by the completion itself; `deploy` still waits.
     assert_eq!(state(&f, test), JobState::Queued);
     assert_eq!(state(&f, deploy), JobState::Blocked);
     assert!(matches!(
@@ -1347,7 +1275,6 @@ jobs:
         Err(Error::NotFound)
     ));
 
-    // A failed dependency skips what needs it, transitively.
     let offer = place(&f, w, f.pool, at(2_700)).unwrap();
     assert_eq!(offer.job, test);
     let (attempt, fence) = (offer.attempt, offer.fence);
@@ -1370,10 +1297,7 @@ jobs:
     assert_eq!(place(&f, w, f.pool, at(3_000)), None);
 }
 
-/// An offer lapses and the requeued job is then canceled
-/// or times out in the queue before any new lease. The lapsed attempt never
-/// ran, so the job's verdict is not its verdict: it stops being current at
-/// the lapse and stays so, and the job no longer shows the lapsed lease.
+// A lapsed attempt keeps its own verdict: a later outcome of the requeued job is never attributed to it.
 #[test]
 fn a_lapsed_attempt_never_inherits_the_queued_jobs_later_verdict() {
     let f = fixture();
@@ -1405,7 +1329,6 @@ fn a_lapsed_attempt_never_inherits_the_queued_jobs_later_verdict() {
             .unwrap()
     };
 
-    // Lapse, then cancel while queued.
     let offer = place(&f, w, f.pool, at(2_100)).unwrap();
     assert!(status(offer.attempt).current);
     let (attempt, job) = (offer.attempt, offer.job);
@@ -1424,7 +1347,6 @@ fn a_lapsed_attempt_never_inherits_the_queued_jobs_later_verdict() {
     assert!(!lapsed.current);
     assert_eq!((lapsed.state, lapsed.failure_class), (None, None));
 
-    // Lapse, then the queue timeout (the run's other job).
     let offer = place(&f, w, f.pool, at(7_400)).unwrap();
     let (attempt, job) = (offer.attempt, offer.job);
     assert!(ids.contains(&job));
@@ -1443,9 +1365,6 @@ fn a_lapsed_attempt_never_inherits_the_queued_jobs_later_verdict() {
     assert!(!lapsed.current);
     assert_eq!((lapsed.state, lapsed.failure_class), (None, None));
 
-    // Cancel requested while the offer is out: the lapse ends the job
-    // canceled in the same transaction, and that is not the attempt's
-    // verdict either.
     let (_, ids) = run(&f, TWO_JOBS, at(8_000));
     let offer = place(&f, w, f.pool, at(8_100)).unwrap();
     let (attempt, job) = (offer.attempt, offer.job);
@@ -1461,7 +1380,6 @@ fn a_lapsed_attempt_never_inherits_the_queued_jobs_later_verdict() {
     assert_eq!(state(&f, job), JobState::Terminal(Outcome::Canceled));
     assert!(!status(attempt).current);
 
-    // A live lease is still its attempt's: the marker only follows a lapse.
     let other = ids.iter().copied().find(|id| *id != job).unwrap();
     let offer = place(&f, w, f.pool, at(8_400)).unwrap();
     assert_eq!(offer.job, other);

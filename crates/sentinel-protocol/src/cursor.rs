@@ -1,16 +1,8 @@
-//! Event sequences and resumable cursors.
-//!
-//! Every event stream (a run's events, a job attempt's log frames, a tenant's
-//! audit feed) is numbered by a dense per-stream `Seq` assigned by the writer
-//! in commit order, so "everything after seq N" is a single indexed range.
-//! A `Cursor` is the opaque token clients pass back: it binds the tenant and
-//! stream so a cursor from one tenant is rejected for another, and it is
-//! fixed-size so parsing never allocates.
+//! Cursors bind the tenant, so a cursor issued to one tenant is rejected for another.
 use std::fmt;
 
 use sentinel_core::TenantId;
 
-/// Dense, per-stream, starts at 1; `0` means "from the beginning".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct Seq(pub u64);
@@ -48,7 +40,6 @@ impl StreamKind {
 pub struct Cursor {
     pub tenant: TenantId,
     pub kind: StreamKind,
-    /// The run, attempt or tenant ID's raw bytes, depending on `kind`.
     pub stream: [u8; 16],
     pub seq: Seq,
 }
@@ -61,7 +52,6 @@ pub const CURSOR_TEXT_LEN: usize = 2 + RAW_LEN * 2;
 pub enum CursorError {
     Malformed,
     UnsupportedVersion,
-    /// Cursor belongs to a different tenant than the caller.
     WrongTenant,
 }
 
@@ -76,7 +66,6 @@ impl Cursor {
         out
     }
 
-    /// Parse and verify the cursor was issued for `caller`.
     pub fn parse(text: &str, caller: TenantId) -> Result<Self, CursorError> {
         let b = text.as_bytes();
         if b.len() != CURSOR_TEXT_LEN || &b[..2] != b"c1" {
@@ -138,9 +127,6 @@ impl fmt::Debug for Cursor {
     }
 }
 
-/// A page of results. `next` is absent when the stream is exhausted at the
-/// time of the query; `complete` tells log readers whether gaps or truncation
-/// occurred upstream (a separate signal from pagination).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Page {
     pub next: Option<Cursor>,

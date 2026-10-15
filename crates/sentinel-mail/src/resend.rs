@@ -1,23 +1,5 @@
-//! A bounded client for the Resend email API.
-//!
-//! One request per message: `POST https://api.resend.com/emails` with
-//! `Authorization: Bearer <key>` and a JSON body `{from, to, subject, html,
-//! text}`. The host is a constant; no configuration reaches it (a test can
-//! point a client elsewhere only when this crate is built with the
-//! `test-endpoint` feature, which only dev-dependencies enable). The client
-//! follows no redirect (the key would travel with it), ignores proxy
-//! environment variables, uses rustls with the bundled web PKI roots, and
-//! bounds time (connect and whole request) and the response size. Because the
-//! message is a JSON document, a header or line injection through an address
-//! or subject is impossible; they are validated anyway.
-//!
-//! Each message carries an `Idempotency-Key` derived from its outbox row id,
-//! so a retry after a lost response is the same send to Resend, never a second
-//! message. Replies are classified by status: `2xx` delivered; `429`, `5xx`,
-//! `408`, a concurrent-idempotent `409` and every transport failure transient
-//! (`Retry-After` honored); any other `4xx` permanent. An error carries the
-//! status and Resend's error *name* (a fixed vocabulary, sanitized), never its
-//! message (which may quote an address), the key, or the body.
+//! Redirects are not followed and proxies are ignored: the API key must never travel to another host.
+//! Errors carry Resend's error name only, never its message, which may quote an address.
 
 use std::{path::Path, time::Duration};
 
@@ -25,23 +7,17 @@ use sentinel_auth::secret::wipe;
 
 use crate::{Failure, Mail, Transport};
 
-/// The one API endpoint.
 const ENDPOINT: &str = "https://api.resend.com/emails";
-/// The most of a reply read; a larger one is cut off and only its status used.
 pub const MAX_RESPONSE_BYTES: u64 = 16 * 1024;
 const MAX_HEADERS: usize = 16 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
-/// The longest subject accepted.
 pub const MAX_SUBJECT_CHARS: usize = 200;
-/// The largest plain-text body accepted.
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
-/// The longest API key accepted.
 const MAX_KEY_BYTES: usize = 512;
 const MAX_KEY_FILE_BYTES: usize = 4096;
 const MAX_DISPLAY_NAME_CHARS: usize = 64;
 
-/// A Resend API key. Never in `Debug` output or an error; wiped when dropped.
 pub struct ApiKey(Vec<u8>);
 
 impl std::fmt::Debug for ApiKey {
@@ -57,7 +33,6 @@ impl Drop for ApiKey {
 }
 
 impl ApiKey {
-    /// A key of 1-512 visible ASCII characters (it becomes a header value).
     pub fn new(mut bytes: Vec<u8>) -> Result<ApiKey, &'static str> {
         if bytes.is_empty()
             || bytes.len() > MAX_KEY_BYTES
@@ -69,10 +44,6 @@ impl ApiKey {
         Ok(ApiKey(bytes))
     }
 
-    /// Read the key from an operator-controlled file: opened once without
-    /// following a link and judged on the handle (a regular file owned by this
-    /// user, closed to group and others), at most 4 KiB, one trailing newline
-    /// dropped. An error names the problem, never the path or the content.
     pub fn from_file(path: &Path) -> Result<ApiKey, &'static str> {
         const REFUSED: &str = "the Resend API key file must be a regular owner-only file of at most 4 KiB holding the key";
         let mut file = sentinel_auth::secret_file::open(path).map_err(|_| REFUSED)?;
@@ -97,16 +68,12 @@ impl ApiKey {
     }
 }
 
-/// The validated `from` of every message: `addr@domain` or
-/// `Name <addr@domain>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sender {
     header: String,
 }
 
 impl Sender {
-    /// Parse and validate; the address is normalized like every address in
-    /// the store. Errors never echo the input.
     pub fn parse(text: &str) -> Result<Sender, &'static str> {
         const BAD: &str = "the sender must be `addr@example.com` or `Name <addr@example.com>`";
         let text = text.trim();
@@ -161,7 +128,6 @@ fn agent(https_only: bool, total: Duration) -> ureq::Agent {
         .proxy(None)
         .https_only(https_only)
         .max_response_header_size(MAX_HEADERS)
-        // Statuses are data: they are classified, not raised.
         .http_status_as_error(false)
         .user_agent(concat!("sentinel/", env!("CARGO_PKG_VERSION")))
         .build();
@@ -178,7 +144,6 @@ impl Resend {
         }
     }
 
-    /// A client for a local test server (`http://127.0.0.1:port/emails`).
     #[cfg(feature = "test-endpoint")]
     pub fn with_endpoint(key: ApiKey, from: Sender, endpoint: &str) -> Resend {
         Resend {
@@ -189,15 +154,12 @@ impl Resend {
         }
     }
 
-    /// A shorter whole-request deadline, so a timeout test does not wait out
-    /// the production one.
     #[cfg(feature = "test-endpoint")]
     pub fn with_total_timeout(mut self, total: Duration) -> Resend {
         self.agent = agent(false, total);
         self
     }
 
-    /// Send one message. Shared access: the client holds no per-send state.
     pub fn deliver(&self, mail: &Mail<'_>) -> Result<(), Failure> {
         if mail.subject.is_empty()
             || mail.subject.chars().count() > MAX_SUBJECT_CHARS
@@ -208,8 +170,6 @@ impl Resend {
         if mail.body.len() > MAX_BODY_BYTES {
             return Err(Failure::Permanent("the message is too large".into()));
         }
-        // The recipient was normalized when queued; a second look costs
-        // nothing and keeps this client safe on its own.
         if sentinel_store::email::normalize(mail.to).is_err() {
             return Err(Failure::Permanent("the recipient is not an address".into()));
         }
@@ -233,7 +193,6 @@ impl Resend {
         let mut response = self.agent.run(request).map_err(transport)?;
         let status = response.status().as_u16();
         if (200..300).contains(&status) {
-            // Accepted: the reply carries only an id, and is not read.
             return Ok(());
         }
         let retry_after = response
@@ -242,7 +201,6 @@ impl Resend {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(Duration::from_secs);
-        // Only the error's name is used, and only from a reply within bounds.
         let name = response
             .body_mut()
             .with_config()
@@ -260,13 +218,10 @@ impl Transport for Resend {
     }
 }
 
-/// The idempotency key of a message: stable across its retries, unique per
-/// outbox row (Resend accepts up to 256 characters).
 pub fn idempotency_key(mail: &Mail<'_>) -> String {
     format!("sentinel-mail-{}", mail.id)
 }
 
-/// The HTML part: the text, escaped, with line breaks kept.
 fn html(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 64);
     out.push_str("<div style=\"font-family:sans-serif;white-space:normal\">");
@@ -286,8 +241,6 @@ fn html(text: &str) -> String {
     out
 }
 
-/// Resend's error `name` (`validation_error`, `rate_limit_exceeded`, ...)
-/// when the body carries one of plausible shape.
 fn error_name(body: &[u8]) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let name = value.get("name")?.as_str()?;
@@ -298,7 +251,6 @@ fn error_name(body: &[u8]) -> Option<String> {
     plausible.then(|| name.to_owned())
 }
 
-/// Sort a non-success status into retry or give up.
 pub(crate) fn classify(
     status: u16,
     retry_after: Option<Duration>,
@@ -310,8 +262,6 @@ pub(crate) fn classify(
     };
     match status {
         401 | 403 => Err(Failure::Permanent(label("refused the API key"))),
-        // A second request with the same key while the first is in flight:
-        // wait it out. Any other 409 is a conflict retrying cannot resolve.
         409 if name == Some("concurrent_idempotent_requests") => Err(Failure::Transient {
             why: label("is still processing the message"),
             retry_after,
@@ -325,8 +275,6 @@ pub(crate) fn classify(
             retry_after,
         }),
         400..=499 => Err(Failure::Permanent(label("refused the message"))),
-        // Anything else (a redirect, an informational status) is not an
-        // answer to follow; try again later.
         _ => Err(Failure::Transient {
             why: label("answered unexpectedly"),
             retry_after,
@@ -334,7 +282,6 @@ pub(crate) fn classify(
     }
 }
 
-/// Transport failures by kind; `ureq`'s own message can carry the URL.
 fn transport(error: ureq::Error) -> Failure {
     Failure::transient(match error {
         ureq::Error::Timeout(_) => "resend did not answer in time",

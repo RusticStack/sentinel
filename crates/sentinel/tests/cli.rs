@@ -73,8 +73,7 @@ fn pipeline_validate_reports_path_and_exit_code() {
     assert!(String::from_utf8_lossy(&missing.stderr).contains("cannot read"));
 }
 
-/// A character device reports length 0, so only a bound on the read
-/// itself stops `/dev/zero` (valid UTF-8, no end) from exhausting memory.
+/// A character device reports length 0, so only a bound on the read stops `/dev/zero`.
 #[cfg(unix)]
 #[test]
 fn pipeline_validate_bounds_the_read_of_an_endless_device() {
@@ -101,8 +100,6 @@ fn pipeline_validate_bounds_the_read_of_an_endless_device() {
     assert_eq!(document["code"], "invalid_pipeline", "{document}");
 }
 
-/// A reader that has gone (`| head -1`) ends the command quietly with exit 0
-/// instead of a write panic (exit 101).
 #[test]
 fn a_closed_stdout_ends_the_command_quietly_with_exit_zero() {
     let file = fixture("valid/full.yml");
@@ -267,9 +264,6 @@ mod linux {
         assert!(!data.exists());
     }
 
-    /// The spool's free-space reserve and quota belong to a worker with a
-    /// controller; a zero quota would declare every line of output lost
-    /// and is refused.
     #[test]
     fn spool_limits_are_worker_link_settings_and_a_zero_quota_is_refused() {
         let temp = tempdir().unwrap();
@@ -306,8 +300,6 @@ mod linux {
         assert!(!data.exists());
     }
 
-    /// A certificate rotation lists the next controller fingerprints beside
-    /// the current one: well-formed, bounded, and only with a controller.
     #[test]
     fn rotation_fingerprints_are_bounded_worker_link_settings() {
         let temp = tempdir().unwrap();
@@ -528,7 +520,6 @@ mod linux {
                 let format = if signal == "-INT" { "text" } else { "json" };
                 let temp = tempdir().unwrap();
                 let data_dir = temp.path().join("data");
-                // The server binds an ephemeral port so parallel tests never collide.
                 let config = temp.path().join("config.toml");
                 fs::write(
                     &config,
@@ -579,7 +570,6 @@ mod linux {
                     }
                 }
                 assert!(data_dir.is_dir());
-                // Existing data must survive shutdown.
                 let marker = data_dir.join("keep");
                 fs::write(&marker, "retained").unwrap();
                 assert!(
@@ -636,7 +626,6 @@ mod linux {
         }
     }
 
-    /// A JSON-logging child whose stderr is collected on a thread.
     struct Logged {
         child: ChildGuard,
         lines: mpsc::Receiver<String>,
@@ -670,7 +659,6 @@ mod linux {
             }
         }
 
-        /// The first record whose `event` field is `event`, waiting up to 15 s.
         fn event(&mut self, event: &str) -> serde_json::Value {
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
@@ -690,8 +678,6 @@ mod linux {
             }
         }
 
-        /// The `n`th record (1-based) whose `event` field is `event`,
-        /// waiting up to `wait`.
         fn nth_event(&mut self, event: &str, n: usize, wait: Duration) -> serde_json::Value {
             let deadline = Instant::now() + wait;
             loop {
@@ -734,9 +720,6 @@ mod linux {
         }
     }
 
-    /// The whole path through the real binaries: an operator prepares a
-    /// pool and an enrollment on the controller's host, the server listens,
-    /// the worker enrolls on its first hello, and both stop cleanly.
     #[test]
     fn a_worker_process_enrolls_with_a_running_server_process() {
         if !(cfg!(feature = "server") && cfg!(feature = "worker")) {
@@ -755,7 +738,6 @@ mod linux {
                 .stderr(Stdio::piped())
                 .spawn()
                 .unwrap();
-            // Only bootstrap reads it; the others get EOF.
             std::io::Write::write_all(
                 child.stdin.as_mut().unwrap(),
                 b"correct horse battery staple",
@@ -776,9 +758,7 @@ mod linux {
         let secret = admin(&["worker", "enroll", "--pool", "builders"]);
         let enrollment = temp.path().join("enrollment");
         fs::write(&enrollment, &secret).unwrap();
-        // A credential for the CLI, issued host-locally before the server takes
-        // ownership of the database: one controller owns it, and admin
-        // commands run beside a stopped server.
+        // Issued before the server takes ownership of the database.
         let token_file = temp.path().join("token");
         let issued = Command::new(env!("CARGO_BIN_EXE_sentinel"))
             .args([
@@ -828,7 +808,6 @@ mod linux {
             .unwrap()
             .to_owned();
         assert_eq!(fingerprint.len(), 64);
-        // A second controller on the same data directory is refused.
         let second = invoke(&[
             "server",
             "--config",
@@ -867,16 +846,12 @@ mod linux {
         ]);
         let connected = worker.event("link_connected");
         assert_eq!(connected["fields"]["enrolled"], true);
-        // The spent enrollment is removed; the identity and id persist.
         assert!(!enrollment.exists());
         assert!(worker_dir.join("worker.key").exists());
         let id = fs::read_to_string(worker_dir.join("worker.id")).unwrap();
         assert!(id.starts_with("wrk_"));
         assert_eq!(connected["fields"]["worker"].as_str().unwrap(), id.trim());
 
-        // The CLI against the running server: a credential issued host-locally,
-        // `me`, a dispatch of a pinned pipeline, its status, and worker status
-        // showing the connected worker. Text and JSON output both.
         fs::write(&token_file, "not-a-token\n").unwrap();
         let api = |args: &[&str]| {
             Command::new(env!("CARGO_BIN_EXE_sentinel"))
@@ -916,7 +891,6 @@ mod linux {
             "--sha",
             "0123456789abcdef0123456789abcdef01234567",
         ]);
-        // `root` has no membership in acme yet: the repository is not visible.
         assert_eq!(
             no_repo.status.code(),
             Some(4),
@@ -937,17 +911,11 @@ mod linux {
 
         worker.terminate();
         server.terminate();
-        // The worker is enrolled in the pool for good.
         let listed = admin(&["worker", "list", "--pool", "builders"]);
         assert!(listed.contains(id.trim()), "{listed}");
         assert!(listed.contains("builder-1"));
     }
 
-    /// The real binary pair: `sentinel server` with a
-    /// bootstrapped password account, and `sentinel auth login --device`
-    /// approved on the server's `/device` page with a password session.
-    /// Afterwards `auth status` verifies the grant, `doctor` passes every
-    /// check, and no output carries token material.
     #[test]
     fn a_device_login_against_a_running_server_process() {
         if !cfg!(feature = "server") {
@@ -1031,7 +999,6 @@ mod linux {
                 break rest.split_whitespace().next().unwrap().replace('-', "");
             }
         };
-        // The person approves in a browser: a password session, then the page.
         let agent = ureq::Agent::new_with_config(
             ureq::Agent::config_builder()
                 .http_status_as_error(false)
@@ -1130,11 +1097,6 @@ mod linux {
         server.terminate();
     }
 
-    /// Through the binary: a running controller with `[backup]` takes a
-    /// backup when asked over the API, `admin backup verify` passes it,
-    /// `admin restore` rebuilds an empty data directory from it, and a
-    /// controller started on that directory serves the same deployment — the
-    /// credential issued before the backup still works.
     #[cfg(feature = "server")]
     #[test]
     fn a_backup_taken_online_restores_onto_a_new_data_directory_that_serves() {
@@ -1304,8 +1266,6 @@ mod linux {
             "the link identity comes back, so workers keep their pin: {report}"
         );
 
-        // The restored controller serves the same deployment, with the same
-        // link identity and the credential issued before the backup.
         let (mut again, base) = serve(&restored);
         let first = server_fingerprint(&data);
         assert_eq!(server_fingerprint(&restored), first);
@@ -1326,11 +1286,6 @@ mod linux {
         }
     }
 
-    /// Recovery onto a replacement host. A controller with an enrolled,
-    /// connected worker is lost; its last backup is restored into a fresh
-    /// data directory (the new host's), a controller started there on the
-    /// same link address presents the same identity, and the worker — which
-    /// kept its pin and never re-enrolls — reconnects on its own.
     #[test]
     fn a_worker_reconnects_to_a_controller_restored_onto_a_new_host() {
         if !(cfg!(feature = "server") && cfg!(feature = "worker")) {
@@ -1419,8 +1374,6 @@ mod linux {
         assert_eq!(worker.event("link_connected")["fields"]["enrolled"], true);
         let id = fs::read_to_string(worker_dir.join("worker.id")).unwrap();
 
-        // The old host goes: the controller stops, the last backup of its
-        // data directory survives elsewhere.
         server.terminate();
         worker.nth_event("link_lost", 1, Duration::from_secs(15));
         let report: serde_json::Value = serde_json::from_str(&admin(&[
@@ -1450,7 +1403,6 @@ mod linux {
         );
         fs::remove_dir_all(&old_host).unwrap();
 
-        // The new host: restored, then started on the address workers dial.
         let restore = Command::new(env!("CARGO_BIN_EXE_sentinel"))
             .args([
                 "admin",
@@ -1489,7 +1441,6 @@ mod linux {
             "the same identity"
         );
 
-        // The worker comes back by itself, as the worker it was.
         let again = worker.nth_event("link_connected", 2, Duration::from_secs(60));
         assert_eq!(again["fields"]["enrolled"], false, "no second enrollment");
         assert_eq!(again["fields"]["worker"].as_str().unwrap(), id.trim());
@@ -1510,9 +1461,6 @@ mod linux {
     }
 }
 
-/// `admin tenant storage` shows a tenant's policy, effective limits
-/// and usage, changes the settings it is given, and `--inherit` drops them.
-/// Host-local administration exists only in a server build.
 #[cfg(feature = "server")]
 #[test]
 fn admin_tenant_storage_shows_sets_and_inherits() {

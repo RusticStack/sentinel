@@ -1,14 +1,3 @@
-//! Executor-level verification of what the cache layer alone cannot
-//! see: a publication failure is a diagnostic on the attempt — a cache
-//! note and the summary's `publish: "failed"` — never the job's verdict,
-//! and a pull-request attempt can only ever create pull-request scope
-//! state even when protected state already exists under the same repo.
-//!
-//! Both drive the real `attempt::run`: fresh workspace, pinned local
-//! checkout, digest-pinned image, cache restore, rootless Podman steps,
-//! publication. Gated like the rest of the suite:
-//! `SENTINEL_PODMAN_TESTS=1` as a rootless Podman account.
-
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -43,8 +32,6 @@ const DIGEST: &str = "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5
 const KEY: &str = "k09-deps";
 const REPO_NAME: &str = "k09-worker";
 
-/// One cache entry, one step that writes into it — the smallest pipeline
-/// that exercises restore → step → publish end to end.
 const PIPELINE: &str = r#"
 schema: 1
 on: [push]
@@ -95,8 +82,7 @@ fn make_repo(dir: &Path) -> String {
     git(dir, &["rev-parse", "HEAD"])
 }
 
-/// The cache diagnostics the attempt emitted — kept, unlike the default
-/// `Report::cache_note` which drops them.
+/// Keeps the cache notes that the default `Report::cache_note` drops.
 #[derive(Default)]
 struct Notes {
     cache: Mutex<Vec<CacheNote>>,
@@ -110,9 +96,6 @@ impl Report for Notes {
     }
 }
 
-/// The entry directory the attempt's own scope derivation lands on —
-/// recomputed through the public toolchain hash so the test can plant
-/// and inspect state without reaching into the attempt.
 fn entry_dir(worker_dir: &Path, repo: RepoId, trust: Trust) -> PathBuf {
     let image = format!("{IMAGE}@{DIGEST}");
     let scope = Scope::new(
@@ -190,11 +173,6 @@ fn run_attempt(worker_dir: &Path, job: &mut Job) -> (Verdict, AttemptSummary, Ve
     (verdict, summary, notes.cache.lock().unwrap().clone())
 }
 
-/// A publication that cannot proceed — a planted file where the
-/// `writing/` directory must be makes `WriteLock::acquire` fail with
-/// `NotADirectory` — must be a cache note and a `publish: "failed"`
-/// record, never the job's verdict. The attempt still ran its steps on
-/// the hit's restored bytes.
 #[test]
 fn a_failing_publish_is_a_note_never_the_verdict() {
     if !enabled() {
@@ -206,7 +184,6 @@ fn a_failing_publish_is_a_note_never_the_verdict() {
     let repo = RepoId::new();
     let worker_dir = temp.path().join("worker");
 
-    // First attempt: a clean publish seals the protected entry.
     let mut job = make_job(&worker_dir, &repo_dir, &sha, repo, Trust::Protected);
     let (verdict, summary, notes) = run_attempt(&worker_dir, &mut job);
     assert_eq!(verdict, Verdict::Passed);
@@ -215,12 +192,8 @@ fn a_failing_publish_is_a_note_never_the_verdict() {
     assert!(matches!(notes[0].outcome, CacheOutcome::Sealed { .. }));
     let entry = entry_dir(&worker_dir, repo, Trust::Protected);
 
-    // Sabotage the writer lane: `writing` as a file, so the next commit's
-    // lock acquisition fails with a filesystem error.
     fs::write(entry.join(scope::WRITING_NAME), b"not a directory").unwrap();
 
-    // Second attempt: restore still hits — the read path is unaffected —
-    // and the publication failure reports as a note while every step ran.
     let mut job = make_job(&worker_dir, &repo_dir, &sha, repo, Trust::Protected);
     let (verdict, summary, notes) = run_attempt(&worker_dir, &mut job);
     assert_eq!(
@@ -242,10 +215,6 @@ fn a_failing_publish_is_a_note_never_the_verdict() {
     );
 }
 
-/// A pull-request attempt under the same repo cannot read protected
-/// state and cannot create it: its restore is an `absent` miss, its
-/// publish seals under `pull_request` only, and the protected entry is
-/// byte-for-byte what it was before.
 #[test]
 fn a_pull_request_attempt_never_touches_protected_state() {
     if !enabled() {
@@ -257,8 +226,6 @@ fn a_pull_request_attempt_never_touches_protected_state() {
     let repo = RepoId::new();
     let worker_dir = temp.path().join("worker");
 
-    // Protected state exists first: a real publish under the protected
-    // scope, same repo and image.
     let mut job = make_job(&worker_dir, &repo_dir, &sha, repo, Trust::Protected);
     let (verdict, _, _) = run_attempt(&worker_dir, &mut job);
     assert_eq!(verdict, Verdict::Passed);
@@ -266,8 +233,6 @@ fn a_pull_request_attempt_never_touches_protected_state() {
     let pr = entry_dir(&worker_dir, repo, Trust::PullRequest);
     let before = tree_snapshot(&protected);
 
-    // The PR attempt: no restored bytes (`absent`), steps still run, and
-    // the publish can only land under the pull-request scope.
     let mut job = make_job(&worker_dir, &repo_dir, &sha, repo, Trust::PullRequest);
     let (verdict, summary, notes) = run_attempt(&worker_dir, &mut job);
     assert_eq!(verdict, Verdict::Passed);
@@ -276,19 +241,10 @@ fn a_pull_request_attempt_never_touches_protected_state() {
     assert!(matches!(notes[0].outcome, CacheOutcome::Sealed { .. }));
     assert!(pr.is_dir(), "the PR publish sealed under its own scope");
 
-    // The protected entry is untouched — same `current`, same
-    // generations, byte-identical content — and the class's protected
-    // subtree grew nothing.
     assert_eq!(tree_snapshot(&protected), before);
     assert!(pr.join(scope::CURRENT_NAME).exists());
 }
 
-/// Publication reads the job's writable views only after the
-/// container is gone — a background process a step left running (here a
-/// loop that keeps rewriting the cache view) can no longer touch the tree
-/// the walk reads. Proven at the moment of publication: the cache note is
-/// emitted from inside the publish, and at that instant the runtime no
-/// longer knows the attempt's container.
 #[test]
 fn publish_runs_with_the_container_stopped() {
     if !enabled() {
@@ -320,7 +276,6 @@ fn publish_runs_with_the_container_stopped() {
         RepoId::new(),
         Trust::Protected,
     );
-    // The step returns at once but leaves a writer behind in the view.
     let yaml = PIPELINE.replace(
         "run: 'mkdir -p vendor && echo payload > vendor/lib'",
         "run: 'mkdir -p vendor && echo payload > vendor/lib && (while :; do date > vendor/churn; done) >/dev/null 2>&1 &'",
@@ -347,9 +302,6 @@ fn publish_runs_with_the_container_stopped() {
     );
 }
 
-/// An entry tree as relpath → bytes, so "untouched" is checked, not
-/// assumed — two snapshots compare equal only when every name and byte
-/// survived.
 fn tree_snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     let mut out = std::collections::BTreeMap::new();
     let mut stack = vec![dir.to_path_buf()];

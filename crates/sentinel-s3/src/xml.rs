@@ -1,6 +1,4 @@
-//! The few S3 XML responses the adapter reads, flattened: each element's
-//! text by its name, grouped into records under a repeated element. Bounded
-//! by the caller's body limit; entities are resolved, nothing is fetched.
+//! Entities are resolved inline and nothing is fetched, so a response cannot trigger a request.
 
 use quick_xml::{
     Reader,
@@ -30,11 +28,8 @@ fn resolve(reference: &BytesRef<'_>) -> Option<String> {
     })
 }
 
-/// One element's text, by the name of the element that holds it.
 pub type Fields = Vec<(String, String)>;
 
-/// Every leaf element's text in document order, with the path of element
-/// names above it (`ListPartsResult/Part/ETag`).
 fn leaves(xml: &[u8]) -> Result<Vec<(String, String)>> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().check_end_names = true;
@@ -74,7 +69,6 @@ fn leaves(xml: &[u8]) -> Result<Vec<(String, String)>> {
     }
 }
 
-/// The text of the first element named `name`.
 pub fn field(xml: &[u8], name: &str) -> Result<Option<String>> {
     Ok(leaves(xml)?
         .into_iter()
@@ -82,7 +76,6 @@ pub fn field(xml: &[u8], name: &str) -> Result<Option<String>> {
         .map(|(_, v)| v))
 }
 
-/// The fields of every `record` element, each a list of (child, text).
 pub fn records(xml: &[u8], record: &str) -> Result<Vec<Fields>> {
     let mut out: Vec<Fields> = Vec::new();
     let mut open: Option<(String, Fields)> = None;
@@ -104,7 +97,6 @@ pub fn records(xml: &[u8], record: &str) -> Result<Vec<Fields>> {
                 };
                 fields.push((parts[parts.len() - 1].to_owned(), value));
             }
-            // The record element itself closing: flush it.
             Some(i) if i + 1 == parts.len() => {
                 if let Some((_, done)) = open.take() {
                     out.push(done);
@@ -119,7 +111,6 @@ pub fn records(xml: &[u8], record: &str) -> Result<Vec<Fields>> {
     Ok(out)
 }
 
-/// The value of `name` in one record.
 pub fn get<'a>(fields: &'a Fields, name: &str) -> Option<&'a str> {
     fields
         .iter()

@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# F07 probe: can a pinned Tailcat helper run unattended and forward one TCP port?
-# Both ends run on this host; NAT traversal is therefore trivial and only the
-# unattended lifecycle, key persistence, allow-list and tunnel latency are probed.
+# Both ends run on one host, so NAT traversal is not exercised.
 set -uo pipefail
 TC="${TC:-/root/tailcat/tailcat}"
 export HOME="${PROBE_HOME:-/root/f07-tailcat}"; rm -rf "$HOME"; mkdir -p "$HOME"
@@ -10,7 +8,6 @@ cd "$HOME"
 result() { printf '%s %s: %s\n' "$1" "$2" "$3"; }
 echo "tailcat: $($TC --version 2>&1 | head -1) sha256=$(sha256sum "$TC" | cut -c1-16)"
 
-# Local TCP echo service the server side will expose.
 python3 - <<'PY' >"$OUT/echo.log" 2>&1 &
 import socket,threading
 s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(("127.0.0.1",17777)); s.listen(16)
@@ -26,7 +23,6 @@ PY
 ECHO_PID=$!
 sleep 0.5
 
-# 1. Persistent keys on both sides, no prompts, no account.
 $TC genkey --key=default --fixed-region >"$OUT/genkey-server.log" 2>&1; rc1=$?
 $TC genkey --client --key=client-default >"$OUT/genkey-client.log" 2>&1; rc2=$?
 client_key=$(grep -o 'nodekey:[0-9a-f]*' "$OUT/genkey-client.log" | head -1)
@@ -39,15 +35,12 @@ start_server() {
   echo "$addr"
 }
 
-# 2. Server starts unattended and prints an address (bootstrap via DERP).
 t0=$(date +%s%N); ADDR=$(start_server 1); t1=$(date +%s%N); SERVER_PID=$(cat "$OUT/server.pid")
 if [[ -n "$ADDR" ]]; then result PASS serve_start "address obtained in $(( (t1-t0)/1000000 )) ms: $(head -c 12 <<<"$ADDR")... $(grep -i 'relay' "$OUT/serve-1.log" | head -1)"; else result FAIL serve_start "$(head -c 300 "$OUT/serve-1.log" | tr '\n' ' ')"; kill $ECHO_PID; exit 1; fi
 
-# 3. Ping: connectivity and direct vs DERP path.
 $TC ping --until-direct --timeout 20s "$ADDR" >"$OUT/ping.log" 2>&1; rc=$?
 result "$([[ $rc -eq 0 ]] && echo PASS || echo FAIL)" ping_direct "rc=$rc $(tail -2 "$OUT/ping.log" | tr '\n' ' ')"
 
-# 4. Forward a local port through the tunnel and measure round trips.
 $TC forward "$ADDR" 18777:17777 >"$OUT/forward.log" 2>&1 &
 FWD_PID=$!
 for i in $(seq 1 40); do (echo >/dev/tcp/127.0.0.1/18777) 2>/dev/null && break; sleep 0.25; done
@@ -73,12 +66,10 @@ for name,port in (("direct_loopback",17777),("via_tailcat",18777)):
     print(f"{name}: rtt_us median={statistics.median(r)/1000:.0f} p95={r[int(len(r)*0.95)-1]/1000:.0f} max={r[-1]/1000:.0f} echo_MBps={bw(port):.0f}")
 PY
 
-# 5. Allow-list: a second client identity must be rejected.
 $TC genkey --client --key=other >"$OUT/genkey-other.log" 2>&1
 timeout 20 $TC --key=other "$ADDR" 17777 </dev/null >"$OUT/other.log" 2>&1; rc=$?
 if [[ $rc -ne 0 ]]; then result PASS allow_list "unlisted client rejected rc=$rc: $(tail -c 160 "$OUT/other.log" | tr '\n' ' ')"; else result FAIL allow_list "unlisted client connected"; fi
 
-# 6. Restart: address must be identical with the persisted key; forward must reconnect.
 kill $SERVER_PID; wait $SERVER_PID 2>/dev/null
 ADDR2=$(start_server 2); SERVER_PID=$(cat "$OUT/server.pid")
 if [[ "$ADDR2" == "$ADDR" ]]; then result PASS stable_address "same address after server restart"; else result FAIL stable_address "changed: $ADDR -> $ADDR2"; fi

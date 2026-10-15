@@ -1,12 +1,4 @@
-//! The product's tenant model end to end at the store: people who sign up by
-//! email, join organizations by operator-set domain or by invitation, own a
-//! personal namespace, and meet a GitHub-backed organization only through
-//! GitHub's confirmation. Two camps (an owner with `rusticstack`, a colleague
-//! with `mutualismo`) must never see, resolve, guess or change anything of
-//! each other's; the failures worth finding live between the mechanisms, so
-//! they are exercised together. Uniform `NotFound` over `Forbidden` where the
-//! caller has no relationship to the tenant is asserted by value, not by
-//! timing (the store does the same work either way: one keyed probe).
+//! `NotFound` over `Forbidden` is asserted by value, not timing: the store does one keyed probe either way.
 
 use std::thread;
 
@@ -61,12 +53,8 @@ struct World {
     dir: tempfile::TempDir,
     store: Store,
     admin: Principal,
-    /// `owner@rusticstack.com`: first match of the `rusticstack` rule, so its
-    /// administrator; also owns the personal namespace `owner`.
     owner: UserId,
-    /// `ana@mutualismo.pt`: administrator of `mutualismo`, owner of `ana`.
     colleague: UserId,
-    /// `bruno@mutualismo.pt`: joined `mutualismo` by domain, as a reader.
     bruno: UserId,
     rustic: TenantId,
     mutual: TenantId,
@@ -262,8 +250,6 @@ fn the_cast_has_the_roles_the_product_model_promises() {
     assert_eq!(w.role_in(w.mutual, w.bruno), 1, "later matches read");
     assert_eq!(w.role_in(w.owner_home, w.owner), 3);
     assert_eq!(w.role_in(w.colleague_home, w.colleague), 3);
-    // Bruno was never given a personal namespace by joining a domain; he has
-    // exactly the one organization.
     assert_eq!(w.memberships_of(w.bruno), vec![w.mutual]);
     assert_eq!(
         {
@@ -312,7 +298,6 @@ fn every_resolution_of_a_foreign_namespace_is_the_same_answer_as_a_guess() {
                 Err(Error::NotFound)
             ));
         }
-        // Lookalikes and case games do not become a way in.
         for slug in [
             "RusticStack",
             "mutualismo ",
@@ -322,8 +307,6 @@ fn every_resolution_of_a_foreign_namespace_is_the_same_answer_as_a_guess() {
             assert!(!w.can_resolve(who, slug) || mine.contains(&slug), "{slug}");
         }
     }
-    // A domain-joined reader sees his organization and nothing else, not even
-    // the colleague's personal namespace or the other organization.
     assert!(w.can_resolve(w.bruno, "mutualismo"));
     for slug in ["rusticstack", "owner", "ana"] {
         assert!(!w.can_resolve(w.bruno, slug), "{slug}");
@@ -345,7 +328,6 @@ fn repositories_runs_and_listings_never_cross_the_camps() {
         .write(move |tx| jobs::insert_run(tx, rustic, rustic_app, run, "abc", at(40)))
         .unwrap();
 
-    // Positive controls first: each person reaches their own.
     for (who, repo) in [
         (owner, w.rustic_app),
         (owner, w.owner_notes),
@@ -357,7 +339,6 @@ fn repositories_runs_and_listings_never_cross_the_camps() {
             .unwrap();
         w.store.read(|c| auth::get_repo(c, who, repo)).unwrap();
     }
-    // The other camp's repositories, real or guessed, answer alike.
     for (who, foreign) in [
         (colleague, [w.rustic_app, w.owner_notes]),
         (owner, [w.mutual_site, w.colleague_dots]),
@@ -386,9 +367,6 @@ fn repositories_runs_and_listings_never_cross_the_camps() {
             ));
         }
     }
-    // Listings: filtered before pagination, a foreign tenant is simply empty
-    // and the page never says how much was hidden. The domain-joined reader
-    // has no grant yet, so even his own organization lists nothing to him.
     for (who, tenant) in [
         (colleague, w.rustic),
         (colleague, w.owner_home),
@@ -411,8 +389,6 @@ fn repositories_runs_and_listings_never_cross_the_camps() {
             .len(),
         1
     );
-    // A credential narrowed to the colleague's organization cannot reach the
-    // colleague's own personal repositories, either.
     let narrowed = Principal::new(w.colleague, P::ALL, Some(w.mutual), None);
     w.store
         .read(|c| auth::require_repo(c, narrowed, w.mutual_site, P::READ))
@@ -432,8 +408,6 @@ fn administration_is_never_reachable_from_the_other_camp_or_by_joining_a_domain(
         principal(w.colleague),
         principal(w.bruno),
     );
-    // Members, run-control audit and invitations of a tenant: administrators
-    // of that tenant only.
     for (who, tenant) in [
         (colleague, w.rustic),
         (colleague, w.owner_home),
@@ -475,8 +449,6 @@ fn administration_is_never_reachable_from_the_other_camp_or_by_joining_a_domain(
         assert!(members.iter().all(|m| m.user != foreign));
     }
 
-    // Manual changes: a tenant administrator may not touch another tenant, and
-    // an administrator may not turn himself into one elsewhere.
     for (who, tenant, target) in [
         (colleague, w.rustic, w.colleague),
         (colleague, w.owner_home, w.colleague),
@@ -515,8 +487,6 @@ fn administration_is_never_reachable_from_the_other_camp_or_by_joining_a_domain(
             .len(),
         1
     );
-    // The reader who joined by domain stays a reader: he cannot mint
-    // administrators, repositories or grants in his own organization.
     let refused = w
         .store
         .writer()
@@ -567,8 +537,6 @@ fn secrets_are_sealed_per_tenant_and_a_guess_is_not_a_probe() {
         Scope::Repo(w.owner_notes),
         Scope::Tenant(w.owner_home),
     ] {
-        // Reading, listing and writing a foreign scope: one answer, the one a
-        // scope that does not exist gets.
         let missing = match scope {
             Scope::Repo(_) => Scope::Repo(RepoId::new()),
             Scope::Tenant(_) => Scope::Tenant(TenantId::new()),
@@ -596,7 +564,6 @@ fn secrets_are_sealed_per_tenant_and_a_guess_is_not_a_probe() {
             Err(Error::NotFound)
         ));
     }
-    // The planted write changed nothing, and the owner's secret is intact.
     let kept = w
         .store
         .read(|c| secrets::list(c, owner, Scope::Repo(w.rustic_app), "", 10))
@@ -604,8 +571,6 @@ fn secrets_are_sealed_per_tenant_and_a_guess_is_not_a_probe() {
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].name, "TOKEN");
     assert_eq!(kept[0].version, 1);
-    // A reader of the colleague's organization (joined by domain) sees tenant
-    // secret metadata, never the repository secrets he holds no grant for.
     assert!(matches!(
         w.store
             .read(|c| secrets::list(c, bruno, Scope::Repo(w.mutual_site), "", 10)),
@@ -663,7 +628,6 @@ fn pools_and_workers_belong_to_the_tenant_that_owns_or_is_granted_them() {
         names(colleague, w.mutual).unwrap(),
         ["mutual-builders", "shared"]
     );
-    // Asking for the other camp's pools, or for a tenant that is not there.
     for (who, tenant) in [
         (owner, w.mutual),
         (colleague, w.rustic),
@@ -672,7 +636,6 @@ fn pools_and_workers_belong_to_the_tenant_that_owns_or_is_granted_them() {
     ] {
         assert!(matches!(names(who, tenant), Err(Error::NotFound)));
     }
-    // A worker list is the pool's members', whatever tenant the caller names.
     for (who, pool, ok) in [
         (owner, mine, true),
         (owner, theirs, false),
@@ -716,7 +679,6 @@ fn a_cursor_names_its_tenant_and_a_foreign_one_is_refused_before_it_is_read() {
             "{other:?}"
         );
     }
-    // Mangling it never yields another tenant's stream.
     for forged in [
         minted.replacen('1', "2", 1),
         minted.to_uppercase(),
@@ -734,9 +696,6 @@ fn a_cursor_names_its_tenant_and_a_foreign_one_is_refused_before_it_is_read() {
 #[test]
 fn an_invitation_to_one_organization_joins_nothing_else_even_beside_a_domain_match() {
     let w = world();
-    // The owner invites a colleague-domain address into rusticstack. The
-    // person verifies once: the invitation and the domain rule both apply,
-    // each to its own organization and no other.
     let owner = principal(w.owner);
     let rustic = w.rustic;
     let invited = w
@@ -792,8 +751,6 @@ fn an_invitation_to_one_organization_joins_nothing_else_even_beside_a_domain_mat
         held, expected,
         "nothing of the personal namespaces or others"
     );
-    // Spent: another account cannot replay it, the colleague's organization
-    // administrator cannot see or revoke it.
     let other = w.verified("dora@mutualismo.pt");
     assert!(matches!(
         registration::accept_invitation(&w.store, other, &invited.invitation.secret, None, at(83))
@@ -830,8 +787,6 @@ fn an_invitation_cannot_be_redeemed_into_another_tenant_by_tampering_with_who_as
             )
         })
         .unwrap();
-    // The owner presents it: joins mutualismo as a reader and nothing more; his
-    // own administration is untouched and the colleague's world stays closed.
     match registration::accept_invitation(&w.store, w.owner, &link_form.secret, None, at(91))
         .unwrap()
     {
@@ -845,7 +800,6 @@ fn an_invitation_cannot_be_redeemed_into_another_tenant_by_tampering_with_who_as
             .read(|c| views::members(c, principal(w.owner), w.mutual, None, 10)),
         Err(Error::Forbidden)
     ));
-    // As a bare reader he sees no repository there until granted.
     assert!(matches!(
         w.store
             .read(|c| auth::require_repo(c, principal(w.owner), w.mutual_site, P::READ)),
@@ -875,7 +829,6 @@ fn domain_joins_racing_a_rule_change_leave_one_administrator_or_no_organization(
                 email::confirm(store, secret, at(100 + n as i64)).unwrap();
             });
         }
-        // The operator drops the rule while the verifications are in flight.
         scope.spawn(|| {
             auto_join::set_rules(store, &auto_join::parse("").rules).unwrap();
         });
@@ -892,15 +845,12 @@ fn domain_joins_racing_a_rule_change_leave_one_administrator_or_no_organization(
         assert_eq!(roles.iter().filter(|r| **r == 3).count(), 1, "{roles:?}");
         assert!(roles.iter().all(|r| matches!(r, 0 | 1 | 3)), "{roles:?}");
     }
-    // Whatever the interleaving, nobody holds anything outside it.
     for (user, _) in &users {
         assert!(w.memberships_of(*user).len() <= 1);
         assert_eq!(w.role_in(w.rustic, *user), 0);
         assert_eq!(w.role_in(w.mutual, *user), 0);
     }
 }
-
-// --- the GitHub-backed organization ------------------------------------
 
 struct Hub {
     tenant: TenantId,
@@ -1030,7 +980,6 @@ fn a_github_backed_organization_admits_only_people_github_confirmed() {
         .write(move |tx| provisioning::insert_human(tx, unlinked, "no-github", false, at(7)))
         .unwrap();
     confirm_member(&w, &hub, confirmed, 1001, OrgRole::Member, 100);
-    // A hint (a signed webhook about someone) queues a check and grants nothing.
     let tenant = hub.tenant;
     w.store
         .writer()
@@ -1051,8 +1000,6 @@ fn a_github_backed_organization_admits_only_people_github_confirmed() {
             Err(Error::NotFound)
         ));
     }
-    // Neither the colleague's domain rule, nor an email invitation, nor an
-    // administrator's hand adds anyone to it.
     let admin = w.admin;
     let tenant = hub.tenant;
     for attempt in [
@@ -1078,13 +1025,10 @@ fn a_github_backed_organization_admits_only_people_github_confirmed() {
         assert!(attempt.is_err(), "{attempt:?}");
     }
     assert_eq!(w.role_in(hub.tenant, unlinked), 0);
-    // The confirmed member's access is to that organization only: he holds
-    // nothing in either camp, and the camps hold nothing of his.
     assert_eq!(w.memberships_of(confirmed), vec![hub.tenant]);
     for slug in ["rusticstack", "mutualismo", "owner", "ana"] {
         assert!(!w.can_resolve(confirmed, slug), "{slug}");
     }
-    // Not an administrator by being a member, and GitHub's owners are admins.
     assert!(matches!(
         w.store
             .read(|c| views::members(c, principal(confirmed), hub.tenant, None, 10)),
@@ -1105,8 +1049,6 @@ fn a_github_backed_organization_admits_only_people_github_confirmed() {
 fn leaving_github_removes_that_organizations_access_and_only_that() {
     let w = world();
     let hub = github_org(&w);
-    // One account: an email identity that auto-joined mutualismo, plus a
-    // linked GitHub identity that GitHub confirms for ghorg.
     let user = w.verified("eve@mutualismo.pt");
     let (tenant, mutual) = (hub.tenant, w.mutual);
     w.store
@@ -1118,7 +1060,6 @@ fn leaving_github_removes_that_organizations_access_and_only_that() {
     assert_eq!(w.role_in(w.mutual, user), 1);
     assert!(w.can_resolve(user, "ghorg") && w.can_resolve(user, "mutualismo"));
 
-    // GitHub says the person left.
     w.store
         .writer()
         .write(move |tx| github_members::hint(tx, tenant, Some(4004), at(400)))
@@ -1149,8 +1090,6 @@ fn leaving_github_removes_that_organizations_access_and_only_that() {
             .read(|c| auth::require_repo(c, principal(user), hub.app, P::READ)),
         Err(Error::NotFound)
     ));
-    // The organization they joined by domain is untouched, and so is the
-    // account and its sign-in.
     assert_eq!(w.role_in(mutual, user), 1);
     assert!(w.can_resolve(user, "mutualismo"));
     assert!(matches!(
@@ -1164,18 +1103,14 @@ fn leaving_github_removes_that_organizations_access_and_only_that() {
         .unwrap(),
         local_auth::Login::Accepted(_)
     ));
-    // Removing GitHub's side never touches the camps' administrators.
     assert_eq!(w.role_in(w.mutual, w.colleague), 3);
     assert_eq!(w.role_in(w.rustic, w.owner), 3);
     let _ = InstallationId::new();
 }
 
-// --- last-admin recovery in an auto-joined organization -------------------
-
 #[test]
 fn the_last_administrator_of_an_organization_cannot_be_removed_and_recovery_is_by_the_platform() {
     let w = world();
-    // ana administers mutualismo alone; bruno is a reader.
     let colleague = principal(w.colleague);
     let (mutual, ana, bruno) = (w.mutual, w.colleague, w.bruno);
     for attempt in [
@@ -1190,8 +1125,6 @@ fn the_last_administrator_of_an_organization_cannot_be_removed_and_recovery_is_b
     }
     assert_eq!(w.role_in(w.mutual, w.colleague), 3);
 
-    // Promote bruno, then the first administrator may leave; the second is
-    // now the last and gets the same protection.
     w.store
         .writer()
         .write(move |tx| auth::set_membership(tx, colleague, mutual, bruno, Role::TenantAdmin))
@@ -1201,8 +1134,6 @@ fn the_last_administrator_of_an_organization_cannot_be_removed_and_recovery_is_b
         .write(move |tx| auth::remove_membership(tx, colleague, mutual, ana, at(501)))
         .unwrap();
     assert!(!w.can_resolve(w.colleague, "mutualismo"));
-    // ana still has her personal namespace: leaving an organization is not
-    // leaving the product.
     assert!(w.can_resolve(w.colleague, "ana"));
     let bruno_p = principal(w.bruno);
     let refused = w
@@ -1211,8 +1142,6 @@ fn the_last_administrator_of_an_organization_cannot_be_removed_and_recovery_is_b
         .write(move |tx| auth::remove_membership(tx, bruno_p, mutual, bruno, at(502)));
     assert!(matches!(refused, Err(Error::Conflict)));
 
-    // A platform administrator who is no member needs step-up and a reason to
-    // put an administrator back; a bare principal cannot.
     let root = w.admin.user;
     let refused = w.store.writer().write(move |tx| {
         auth::set_membership_as(
@@ -1239,7 +1168,6 @@ fn the_last_administrator_of_an_organization_cannot_be_removed_and_recovery_is_b
         })
         .unwrap();
     assert_eq!(w.role_in(w.mutual, w.colleague), 3);
-    // The recovery touched this organization only.
     assert_eq!(w.role_in(w.rustic, w.colleague), 0);
     assert_eq!(w.role_in(w.owner_home, w.colleague), 0);
 }

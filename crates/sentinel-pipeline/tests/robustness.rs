@@ -1,7 +1,3 @@
-//! Malformed-input verification: every truncation and single-byte mutation of
-//! every fixture must either compile or fail with a structured error, never
-//! panic, and must do so quickly. Plus targeted edge cases the mutation sweep
-//! cannot reach.
 use std::{fs, path::Path, time::Instant};
 
 use sentinel_pipeline::{compile_str, yaml};
@@ -23,11 +19,7 @@ fn fixtures() -> Vec<(String, String)> {
     out
 }
 
-/// Compile `text` (Ok or Err; a panic fails the test) within 500 ms. A
-/// pathological input is slow every time it runs; a loaded machine that
-/// preempts one run is not. So an overrun is measured again and the
-/// fastest of three runs is what is judged: the bound still catches
-/// super-linear work, and a descheduled thread no longer fails the sweep.
+/// Compile within 500 ms; an overrun is re-measured and the fastest run judged, so one preempted run cannot fail the sweep.
 fn check(name: &str, text: &str) {
     let run = || {
         let t = Instant::now();
@@ -64,7 +56,6 @@ fn every_truncation_of_every_fixture_is_handled() {
 
 #[test]
 fn single_byte_mutations_of_every_fixture_are_handled() {
-    // Deterministic xorshift so failures reproduce without a seed file.
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut next = move || {
         state ^= state << 13;
@@ -101,13 +92,11 @@ fn single_byte_mutations_of_every_fixture_are_handled() {
 
 #[test]
 fn hostile_documents_fail_fast_with_structured_errors() {
-    // Billion-laughs style aliasing is rejected at the first anchor.
     let laughs = "a: &a [x, x]\nb: &b [*a, *a]\nc: &c [*b, *b]\nd: [*c, *c]\n";
     assert!(matches!(
         yaml::load(laughs).unwrap_err().kind,
         yaml::YamlErrorKind::Anchor
     ));
-    // Deep flow nesting is stopped by a limit (ours or the scanner's own), not the stack.
     let deep = format!("a: {}{}", "[".repeat(10_000), "]".repeat(10_000));
     let e = yaml::load(&deep).unwrap_err();
     assert!(
@@ -122,13 +111,11 @@ fn hostile_documents_fail_fast_with_structured_errors() {
         yaml::load(&moderately_deep).unwrap_err().kind,
         yaml::YamlErrorKind::TooDeep { .. }
     ));
-    // Huge single scalar is rejected by length, not by trying to store it.
     let big = format!("schema: 1\nrun: {}\n", "x".repeat(200_000));
     assert!(matches!(
         yaml::load(&big).unwrap_err().kind,
         yaml::YamlErrorKind::ScalarTooLong { .. }
     ));
-    // NUL, BOM and CRLF line endings do not crash and produce schema-level errors.
     for text in [
         "\u{feff}schema: 1\r\non: [push]\r\njobs: {}\r\n",
         "schema: 1\non: [push]\njobs: \0\n",
@@ -136,7 +123,6 @@ fn hostile_documents_fail_fast_with_structured_errors() {
         let e = compile_str(text).unwrap_err().to_string();
         assert!(!e.is_empty());
     }
-    // Wide flow mapping with thousands of keys stays within the node budget or errors cleanly.
     let wide = format!(
         "schema: 1\non: [push]\njobs: {{{}}}\n",
         (0..20_000)
@@ -145,9 +131,6 @@ fn hostile_documents_fail_fast_with_structured_errors() {
             .join(", ")
     );
     assert!(compile_str(&wide).is_err());
-    // Bounded work, asserted as work rather than wall-clock time: the loader
-    // stops at the node budget, well before the end of the document, instead
-    // of building all 40,000 nodes and rejecting them afterwards.
     let e = yaml::load(&wide).unwrap_err();
     assert_eq!(
         e.kind,

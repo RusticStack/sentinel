@@ -1,8 +1,6 @@
 <script setup lang="ts">
 import type { TenantStorage } from "~~/shared/types/api";
 
-// A tenant's storage: what it holds against its quota, the limits the
-// platform set, and each repository's usage and narrower policy.
 const props = defineProps<{ slug: string }>();
 const api = useApi();
 const act = useAct();

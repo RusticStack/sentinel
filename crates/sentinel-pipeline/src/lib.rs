@@ -1,7 +1,4 @@
-//! `.sentinel.yml` schema 1: bounded strict loading, typed decoding and
-//! deterministic compilation. Unsupported syntax is an error, never a
-//! silent no-op, so a repository cannot depend on behaviour Sentinel does
-//! not implement.
+//! Unsupported syntax is an error, never a silent no-op.
 
 pub mod compile;
 pub mod explain;
@@ -42,7 +39,6 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
-/// Load, decode and compile one pipeline file under the default policy.
 pub fn compile_str(text: &str) -> Result<CompiledPipeline, Error> {
     compile_with(text, &ResourcePolicy::DEFAULT)
 }

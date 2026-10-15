@@ -1,11 +1,3 @@
-//! GitHub-backed organization membership: what a verified GitHub answer does
-//! to memberships and repository grants, and — as important — what an
-//! unverified, stale, forged or replayed one must not do.
-//!
-//! The network half is the lane in `sentinel-checks`; here the observations it
-//! would hand over are written by hand, so every decision the store makes is
-//! exercised without GitHub.
-
 use rusqlite::{Connection, params};
 use sentinel_auth::sealed::Key;
 use sentinel_core::{
@@ -52,7 +44,6 @@ fn stepped(principal: Principal) -> Authority {
     }
 }
 
-/// Create an organization tenant with a GitHub installation bound to it.
 fn organization(
     store: &Store,
     admin: Principal,
@@ -170,7 +161,6 @@ fn fixture() -> Fixture {
 }
 
 impl Fixture {
-    /// A Sentinel account, optionally with a verified GitHub numeric id linked.
     fn person(&self, name: &'static str, github: Option<&'static str>) -> UserId {
         let user = UserId::new();
         self.store
@@ -224,7 +214,6 @@ impl Fixture {
             .unwrap()
     }
 
-    /// The queued check of one person, as the lane would read it.
     fn check(&self, user: UserId) -> Option<Check> {
         let tenant = self.tenant;
         self.store
@@ -232,7 +221,6 @@ impl Fixture {
             .unwrap()
     }
 
-    /// Commit an observation for the person's queued check.
     fn apply(
         &self,
         user: UserId,
@@ -334,7 +322,6 @@ fn role_of(membership: Option<(i64, Option<i64>)>) -> Option<i64> {
 fn only_a_verified_organization_installation_can_make_a_tenant_github_backed() {
     let f = fixture();
     let tenant = f.tenant;
-    // A personal-account installation is not an organization.
     let (personal, _) = organization(&f.store, f.admin, "solo", 43, 74, true);
     assert!(matches!(
         f.store
@@ -342,7 +329,6 @@ fn only_a_verified_organization_installation_can_make_a_tenant_github_backed() {
             .write(move |tx| github_members::set_backing_trusted(tx, personal, true, at(2))),
         Err(Error::Conflict)
     ));
-    // A tenant with no installation at all is refused the same way.
     let bare = TenantId::new();
     let admin = f.admin;
     f.store
@@ -364,7 +350,6 @@ fn only_a_verified_organization_installation_can_make_a_tenant_github_backed() {
             .write(move |tx| github_members::set_backing_trusted(tx, bare, true, at(2))),
         Err(Error::Conflict)
     ));
-    // An organization installation converts, and converting twice changes nothing.
     f.back();
     let epoch = f.epoch();
     f.back();
@@ -389,7 +374,6 @@ fn conversion_starts_the_grace_clock_of_existing_members_and_queues_their_check(
     f.back();
     assert_eq!(f.membership(alice), Some((2, Some(10))), "clock started");
     assert!(f.check(alice).is_some(), "queued for verification");
-    // Returning the tenant to app-managed keeps the access, locally managed.
     f.store
         .writer()
         .write(move |tx| github_members::set_backing_trusted(tx, tenant, false, at(11)))
@@ -427,8 +411,6 @@ fn an_owner_administers_and_a_demotion_follows_github() {
     assert!(f.can_see_tenant(alice));
     assert_eq!(f.audit("joined"), 1);
 
-    // GitHub demotes the owner to a plain member: the role follows, the
-    // tenant's epoch moves so long-lived readers re-check, and it is audited.
     let epoch = f.epoch();
     let outcome = f
         .apply(
@@ -442,8 +424,6 @@ fn an_owner_administers_and_a_demotion_follows_github() {
     assert_eq!(role_of(f.membership(alice)), Some(2));
     assert!(f.epoch() > epoch);
     assert_eq!(f.audit("role-changed"), 1);
-    // The demoted owner is no longer the tenant's administrator: nothing kept
-    // an administrator in place against GitHub's answer.
     let principal = Principal::new(alice, P::ALL, None, None);
     assert!(
         f.store
@@ -454,7 +434,6 @@ fn an_owner_administers_and_a_demotion_follows_github() {
 
 #[test]
 fn repository_grants_follow_github_and_never_exceed_it() {
-    // The documented table.
     assert_eq!(
         github_members::repo_permissions("admin"),
         P::READ.union(P::RUN).union(P::WRITE_SECRETS)
@@ -509,7 +488,6 @@ fn repository_grants_follow_github_and_never_exceed_it() {
     assert!(grants.contains(&(*app.as_bytes(), 3)));
     assert!(grants.contains(&(*lib.as_bytes(), 1)));
     assert!(f.can_read(bob, app) && f.can_read(bob, lib));
-    // Operator ceiling plus a write grant lets the member run on `app` only.
     let principal = f.principal(bob);
     let ran = f
         .store
@@ -522,8 +500,6 @@ fn repository_grants_follow_github_and_never_exceed_it() {
         .unwrap();
     assert_eq!(ran, (true, false));
 
-    // GitHub lowers `app` to read and removes `lib`: both follow, and a
-    // grant that only changed its confirmation time bumps no epoch.
     let epoch = f.epoch();
     f.apply(
         bob,
@@ -594,8 +570,6 @@ fn a_member_who_left_the_organization_loses_every_trace_of_access() {
     assert!(f.epoch() > epoch, "streams must re-authorize");
     assert!(f.check(carol).is_none(), "nothing left queued");
     assert_eq!(f.audit("removed"), 1);
-    // Leaving this organization touches nothing else: the account and its own
-    // namespace are intact.
     assert!(
         f.store
             .read(move |c| Ok(c
@@ -632,8 +606,6 @@ fn an_unknown_answer_keeps_access_within_grace_grants_nothing_and_expires() {
     .unwrap();
     assert!(f.can_see_tenant(dave));
 
-    // GitHub answers 5xx / 429 for both: dave keeps what he had, erin (who was
-    // never confirmed) gets nothing, and neither is removed or granted early.
     let unreachable = |user: UserId, now: i64| {
         let check = f.check(user).unwrap();
         f.store
@@ -650,7 +622,6 @@ fn an_unknown_answer_keeps_access_within_grace_grants_nothing_and_expires() {
         "stale cache keeps access inside grace"
     );
     assert!(!f.can_see_tenant(erin), "unknown grants nothing new");
-    // A stale `Unknown` observation behaves the same.
     assert_eq!(
         f.apply(
             dave,
@@ -661,7 +632,6 @@ fn an_unknown_answer_keeps_access_within_grace_grants_nothing_and_expires() {
         .unwrap(),
         "kept: unknown"
     );
-    // The unconfirmed candidate is dropped after a bounded number of tries.
     let mut last = "";
     for attempt in 0..6 {
         last = unreachable(erin, 100 + 3 * HOUR + attempt);
@@ -670,7 +640,6 @@ fn an_unknown_answer_keeps_access_within_grace_grants_nothing_and_expires() {
         }
     }
     assert_eq!(last, "dropped: unreachable");
-    // Past the grace period since GitHub last confirmed him, dave is removed.
     let outcome = unreachable(dave, 100 + 24 * HOUR);
     assert_eq!(outcome, "removed: grace expired");
     assert!(!f.can_see_tenant(dave));
@@ -686,8 +655,7 @@ fn an_answer_about_a_different_github_account_is_discarded() {
         .writer()
         .write(move |tx| github_members::hint(tx, tenant, Some(6006), at(20)))
         .unwrap();
-    // A reply computed for id 7007 (a reused or swapped login, a forged
-    // identity) must not admit the account linked to 6006.
+    // Observations match the GitHub numeric id, never the login, so a reused login admits no one.
     let outcome = f
         .apply(
             frank,
@@ -698,8 +666,6 @@ fn an_answer_about_a_different_github_account_is_discarded() {
         .unwrap();
     assert_eq!(outcome, "identity changed");
     assert_eq!(f.membership(frank), None);
-    // Nor does an answer computed before the account was relinked: the link
-    // is read again inside the committing transaction.
     f.store
         .writer()
         .write(move |tx| {
@@ -741,8 +707,6 @@ fn an_observation_older_than_a_signed_event_is_superseded_and_writes_nothing() {
     .unwrap();
     assert!(f.can_see_tenant(nora));
 
-    // The lane read the pair, asked GitHub (still a member) and is about to
-    // commit; meanwhile a signed removal lands.
     let stale_check = f.check(nora).unwrap();
     let removal = Event::Members {
         installation: 42,
@@ -755,8 +719,6 @@ fn an_observation_older_than_a_signed_event_is_superseded_and_writes_nothing() {
         .unwrap();
     assert_eq!(f.membership(nora), None);
 
-    // Committing the older observation must not undo the removal, and the
-    // same holds for an "unreachable" outcome computed from the older read.
     let observation = observed(1616, Membership::Active(OrgRole::Member), vec![]);
     let outcome = f
         .store
@@ -808,7 +770,6 @@ fn opening_a_backed_tenant_with_a_stale_confirmation_asks_for_a_check() {
         "a fresh confirmation asks for nothing"
     );
     assert!(stale(1_000 + ttl), "an old one does");
-    // A person who is not a member never triggers a check by looking.
     let stranger = f.person("stranger", Some("1818"));
     assert!(
         !f.store
@@ -840,8 +801,6 @@ fn a_suspended_tenants_members_keep_honest_clocks() {
             sentinel_store::tenancy::suspend(tx, stepped(admin), tenant, at(40)).map(|_| ())
         })
         .unwrap();
-    // The pair is still checkable while the tenant is suspended: dropping it
-    // would leave the member with no clock and nothing to expire her.
     let check = f.check(pia).unwrap();
     let target = f
         .store
@@ -860,8 +819,6 @@ fn a_renamed_login_keeps_access_and_the_numeric_id_is_the_only_key() {
         .writer()
         .write(move |tx| github_members::hint(tx, tenant, Some(9009), at(20)))
         .unwrap();
-    // The lane resolves the *current* login from the id; the store sees only
-    // the id. A rename between two passes changes nothing here.
     f.apply(
         gina,
         observed(9009, Membership::Active(OrgRole::Member), vec![]),
@@ -879,8 +836,6 @@ fn a_renamed_login_keeps_access_and_the_numeric_id_is_the_only_key() {
         .unwrap();
     assert_eq!(outcome, "confirmed");
     assert_eq!(role_of(f.membership(gina)), Some(2));
-    // Someone else who takes over the old login is a different id with no
-    // link: nothing is queued for it, and a hint about it admits nobody.
     f.store
         .writer()
         .write(move |tx| github_members::hint(tx, tenant, Some(1_234_567), at(50)))
@@ -906,7 +861,6 @@ fn unlinking_github_removes_the_derived_access_and_only_that() {
     let (second, _) = organization(&f.store, f.admin, "beta", 44, 75, false);
     let (admin, tenant) = (f.admin, f.tenant);
     let henry = f.person("henry", Some("1010"));
-    // Derived member of the backed tenant; locally managed member of `beta`.
     f.store
         .writer()
         .write(move |tx| {
@@ -975,7 +929,6 @@ fn people_cannot_be_added_invited_granted_or_removed_by_hand_in_a_backed_tenant(
     let (admin, tenant) = (f.admin, f.tenant);
     let kept = f.person("kept", None);
     let outsider = f.person("outsider", None);
-    // An invitation minted while the tenant was app-managed...
     let invitation = f
         .store
         .writer()
@@ -994,7 +947,6 @@ fn people_cannot_be_added_invited_granted_or_removed_by_hand_in_a_backed_tenant(
         .unwrap();
     f.back();
 
-    // ...no longer admits anyone, and no new one can be written.
     let refused = registration::register(
         &f.store,
         Applicant::Local {
@@ -1023,8 +975,6 @@ fn people_cannot_be_added_invited_granted_or_removed_by_hand_in_a_backed_tenant(
         )),
         Err(Error::Forbidden)
     ));
-    // An invitation that names no tenant still creates an account, which then
-    // has to be a member through GitHub like anyone else.
     assert!(
         f.store
             .writer()
@@ -1032,7 +982,6 @@ fn people_cannot_be_added_invited_granted_or_removed_by_hand_in_a_backed_tenant(
             .is_ok()
     );
 
-    // Manual membership, role, grant and removal are all refused.
     let attempts = f.store.writer().write(move |tx| {
         Ok((
             auth::set_membership(tx, admin, tenant, outsider, Role::Operator),
@@ -1053,7 +1002,6 @@ fn people_cannot_be_added_invited_granted_or_removed_by_hand_in_a_backed_tenant(
     assert!(matches!(grant, Err(Error::Forbidden)));
     assert_eq!(f.membership(outsider), None);
     assert_eq!(f.membership(kept), None);
-    // The refusals changed nothing a stale rollback could leave behind.
     assert!(f.grants(kept).is_empty());
 }
 
@@ -1102,8 +1050,6 @@ fn a_signed_removal_revokes_at_once_and_a_replay_is_a_recorded_no_op() {
         "a check follows, in case the removal was stale"
     );
 
-    // GitHub still lists her (the removal was stale or reversed): the check
-    // restores exactly what GitHub confirms.
     f.apply(
         ivy,
         observed(1111, Membership::Active(OrgRole::Member), vec![]),
@@ -1113,8 +1059,6 @@ fn a_signed_removal_revokes_at_once_and_a_replay_is_a_recorded_no_op() {
     .unwrap();
     assert!(f.can_see_tenant(ivy));
 
-    // A replay of the same delivery is a recorded no-op: it does not remove
-    // her again. The same id with a different body is a conflict.
     let replay = f
         .store
         .writer()
@@ -1137,7 +1081,6 @@ fn membership_events_of_another_installation_or_an_unbacked_tenant_touch_nothing
     let f = fixture();
     let jack = f.person("jack", Some("1212"));
     let (admin, tenant) = (f.admin, f.tenant);
-    // Not yet GitHub-backed: a signed removal for its installation is ignored.
     f.store
         .writer()
         .write(move |tx| auth::set_membership(tx, admin, tenant, jack, Role::Operator))
@@ -1158,8 +1101,7 @@ fn membership_events_of_another_installation_or_an_unbacked_tenant_touch_nothing
     assert_eq!(outcome.0, "not_github_backed");
     assert!(f.membership(jack).is_some());
 
-    // Another organization's installation never reaches this tenant: the
-    // installation id in the signed delivery picks the tenant, not the body.
+    // The signed delivery's installation id picks the tenant, never the body.
     f.back();
     let (_other, _) = organization(&f.store, f.admin, "gamma", 45, 76, false);
     let foreign = Event::Members {
@@ -1196,7 +1138,6 @@ fn a_sign_in_queues_checks_without_waiting_and_cannot_be_used_to_flood() {
     );
     issue(kate, 100);
     let queued = f.check(kate).expect("the sign-in queued a check");
-    // Signing in again moments later is not another request to GitHub.
     issue(kate, 1_000);
     assert_eq!(f.check(kate).unwrap().seq, queued.seq);
 }
@@ -1232,7 +1173,6 @@ fn releasing_the_installation_returns_the_tenant_to_app_managed_membership() {
             .read(move |c| github_members::is_github_backed(c, tenant))
             .unwrap()
     );
-    // Manual changes work again.
     f.store
         .writer()
         .write(move |tx| auth::set_membership(tx, admin, tenant, lena, Role::Reader))
@@ -1252,8 +1192,6 @@ fn a_walk_over_many_repositories_resumes_where_it_stopped() {
     let mut both = [f.app, f.lib];
     both.sort_by_key(|r| *r.as_bytes());
     let (first, second) = (both[0], both[1]);
-    // GitHub throttled the walk after the first repository: the settled
-    // prefix is applied, the rest waits, and the cursor remembers the place.
     let partial = Observed {
         github_id: Some(1515),
         membership: Membership::Active(OrgRole::Member),
@@ -1265,7 +1203,6 @@ fn a_walk_over_many_repositories_resumes_where_it_stopped() {
     let check = f.check(mia).unwrap();
     assert_eq!(check.cursor, Some(first));
     assert_eq!(check.attempts, 1, "a throttled step counts as a failure");
-    // The resumed step sees only what follows the cursor.
     let target = f
         .store
         .read(move |c| github_members::target(c, &check))

@@ -1,17 +1,5 @@
-//! `sentinel admin tailcat`: host-local Tailcat identity operations.
-//!
-//! Rotation has an overlap window on both sides. A worker's new key is staged,
-//! listed on the controller *beside* the old one, and committed only once a
-//! `ping` with it proves the controller admits it; the old key is retired from
-//! the allow list afterwards. A controller's new key is staged and served by a
-//! second helper beside the active one until workers have its address; commit
-//! then switches. Revocation: every allow-list line names its
-//! worker, so revoking a rotating worker withdraws both of its keys.
-//!
-//! Authority is the operating system's, as for every admin command: the
-//! operator can read the role's data directory. Node keys travel on standard
-//! input and output only (never argv), and nothing here writes a key or an
-//! address to standard error.
+//! Node keys travel on standard input and output only, never argv or standard error.
+//! A rotated key is listed beside the old one and committed only after a ping proves admission.
 
 use std::path::Path;
 
@@ -20,8 +8,7 @@ use sentinel_link::tailcat::{self, Admission, NodeKey, Role};
 
 use crate::cli::{TailcatArgs, TailcatCommand, TailcatRole, TailcatRoleConfig};
 
-/// The longest allow-list line accepted on standard input, with room for a
-/// CRLF: `nodekey:` + 64 hex + a space + a worker id.
+/// Allow-list line limit: a nodekey (64 hex) and a worker id, with room for CRLF.
 const LINE_CAP: u64 = 256;
 
 pub fn run(args: &TailcatArgs) -> Result<(), String> {
@@ -72,7 +59,6 @@ fn target(args: &TailcatRoleConfig) -> Result<Target, String> {
 
 fn rotate(args: &TailcatRoleConfig) -> Result<(), String> {
     let Target { role, setup } = target(args)?;
-    // A worker's line needs its id; read it before generating anything.
     let worker = match role {
         Role::Worker => Some(worker_id(&setup.data_dir)?),
         Role::Controller => None,
@@ -155,13 +141,10 @@ fn abandon(args: &TailcatRoleConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// The allow-list line for `key`: the one operator-facing place a node key
-/// is printed, on standard output only.
 fn print_line(key: &NodeKey, worker: WorkerId) {
     sentinel::outln!("{} {worker}", key.expose());
 }
 
-/// The worker's id, fixed at its first start.
 fn worker_id(data_dir: &Path) -> Result<WorkerId, String> {
     let text = sentinel::bounded::text(&data_dir.join("worker.id"), 4 << 10).map_err(|_| {
         "cannot read worker.id in the data directory; start the worker once so it has an id"
@@ -172,8 +155,6 @@ fn worker_id(data_dir: &Path) -> Result<WorkerId, String> {
         .map_err(|_| "worker.id is not a wrk_ identifier".to_owned())
 }
 
-/// One `nodekey:<64 hex> wrk_<id>` line from standard input. Refusals never
-/// echo what was read.
 fn read_admission() -> Result<Admission, String> {
     let bytes = sentinel::bounded::read(std::io::stdin().lock(), LINE_CAP).map_err(|_| {
         "expected one `nodekey:<64 hex> wrk_<id>` line on standard input".to_owned()

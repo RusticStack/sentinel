@@ -1,9 +1,7 @@
 <script setup lang="ts">
 import type { JobStatus } from "~~/shared/types/api";
 
-// Why a job failed: the failed step, the first diagnostics with their
-// evidence, and the output tail — each linking into the log at its frame.
-// The same bounded failure view an agent reads (`/attempts/{id}/failure`).
+// The same bounded failure view an agent reads from /attempts/{id}/failure.
 const props = defineProps<{ job: JobStatus; run: string }>();
 const api = useApi();
 const { data: f, error } = await useAsyncData(`failure-${props.job.attempt}`, () =>

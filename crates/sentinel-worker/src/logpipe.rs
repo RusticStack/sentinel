@@ -1,28 +1,3 @@
-//! One attempt's log pipe: redact, spool, send within the window,
-//! advance on acknowledgement, and close with the end marker.
-//!
-//! Output from the step's reader threads is redacted and appended to the
-//! spool under one lock; frames leave for the controller from the spool's
-//! send cursor, never more than `MAX_UNACKED_LOG_FRAMES` in flight, so a
-//! controller that is slow or absent costs disk on the worker and nothing
-//! else. A frame written while the cursor is caught up is sent straight
-//! from memory; only a backlog is read back. An acknowledgement moves the
-//! cursor; a lost session — or a lost bulk connection, which may have taken
-//! frames with it — rewinds the cursor to the last acknowledgement before
-//! anything else is sent. The spool is synced every `SYNC_EVERY` writes and
-//! at the end: a power loss can take the unsynced ones, and an acknowledged
-//! sequence is never reused, so what the controller holds stays consistent.
-//! The end goes out once every stored frame is acknowledged — a refused
-//! tail is declared, never waited for — and only after the spool holds it
-//! durably, so a restart re-sends the same end. A spool the previous
-//! process left without an end ([`LogPipe::recover`]) was cut short by the
-//! crash, and its end declares the unknown tail as a gap.
-//!
-//! The pipe owns the attempt's redactor: values registered for this attempt
-//! apply to its output only, from the moment they are registered, and go
-//! with it. It counts what the spool refused, by cause, for the worker's
-//! diagnostics; the log itself carries the gaps.
-
 use std::{
     path::Path,
     sync::{Arc, Condvar, Mutex},
@@ -43,61 +18,39 @@ use crate::{
     spool::{MAX_SPOOL_BYTES, Refused, Spool, SpoolSpace},
 };
 
-/// How long finalization waits for the controller to acknowledge and close
-/// the log before the attempt is reported as a publication failure.
 pub const LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(60);
-/// Frames between spool syncs.
 pub const SYNC_EVERY: u32 = 32;
 
 struct PipeState {
     spool: Option<Spool>,
     redactor: Redactor,
     reporter: Option<Reporter>,
-    /// The route frames in flight took; a detachment since then means they
-    /// may be lost with the connection.
     route: Option<Route>,
-    /// Highest sequence handed to the current session.
     sent: u64,
     unsynced: u32,
     ended: bool,
-    /// `LogEnd` was handed to the current session.
     end_sent: bool,
-    /// The controller answered `LogEndAck` (protocol 5): the end marker
-    /// is durable there and the spool may be dropped.
     end_acked: bool,
-    /// The last attached session's protocol answers `LogEnd`.
     end_acked_protocol: bool,
     refused: bool,
-    /// The step whose output came last: held-back bytes are attributed to
-    /// it when they are released.
     last_step: Option<u32>,
-    /// A leftover spool without an end: its end declares the cut tail.
     cut: bool,
-    /// Frames the spool refused, by cause.
     refusals: Refused,
 }
 
 impl PipeState {
-    /// Send from the last acknowledgement again.
     fn resend_from_ack(&mut self) {
         if let Some(spool) = self.spool.as_mut() {
             let acked = spool.acked();
             self.sent = match spool.rewind(acked) {
-                // Resend from the last acknowledgement.
                 Ok(()) => acked,
-                // The send cursor stayed ahead of `acked`; keeping `sent`
-                // there too counts the unread tail as in-flight, so the
-                // window cannot overflow. What was skipped reaches the
-                // controller as a declared gap, never a silent one.
+                // Keeping `sent` at the cursor counts the unread tail as in flight, so the window cannot overflow.
                 Err(_) => spool.last_seq(),
             };
         }
     }
 
-    /// Whether new frames may go out on `reporter`'s current route now. A
-    /// detached bulk connection may have swallowed frames: rewind first. A
-    /// newly attached one could let a new frame overtake frames still in
-    /// flight on control: wait until those are acknowledged.
+    // A newly attached route could let new frames overtake frames still in flight on the old one.
     fn route_ready(&mut self, reporter: &Reporter) -> bool {
         let now = reporter.route();
         match self.route {
@@ -116,7 +69,6 @@ impl PipeState {
         true
     }
 
-    /// Release the held-back tail of both streams as `step`'s output.
     fn flush_carry(&mut self, step: u32) {
         for stream in [Stream::Stdout, Stream::Stderr] {
             let mut rest = self.redactor.flush(stream);
@@ -127,8 +79,6 @@ impl PipeState {
         }
     }
 
-    /// Append one chunk; a refusal is counted by cause (the spool has
-    /// declared its sequence either way).
     fn store(&mut self, step: u32, stream: Stream, chunk: &[u8]) -> Option<u64> {
         let spool = self.spool.as_mut()?;
         match spool.append(step, stream, chunk) {
@@ -150,7 +100,6 @@ pub struct LogPipe {
 }
 
 impl LogPipe {
-    /// A pipe over a spool bounded only by its per-attempt cap.
     pub fn open(
         root: &Path,
         attempt: AttemptId,
@@ -160,7 +109,6 @@ impl LogPipe {
         Self::open_in(&SpoolSpace::unbounded(root), attempt, redactor, reporter)
     }
 
-    /// A live attempt's pipe, its spool in the worker's shared spool space.
     pub fn open_in(
         space: &Arc<SpoolSpace>,
         attempt: AttemptId,
@@ -171,9 +119,6 @@ impl LogPipe {
         Ok(Self::with(attempt, spool, redactor, reporter, false))
     }
 
-    /// The pipe of a spool the previous process left: delivered from its
-    /// cursor and closed. Without an end record the attempt was cut short
-    /// by the crash, and its end says so.
     pub fn recover(
         space: &Arc<SpoolSpace>,
         attempt: AttemptId,
@@ -192,9 +137,6 @@ impl LogPipe {
         cut: bool,
     ) -> LogPipe {
         let sent = spool.acked();
-        // A pipe opened on a live session takes its protocol now, as
-        // `attached` would: on protocol 5 the spool must wait for the end
-        // marker's acknowledgement, not merely for `LogEnd` to be sent.
         let end_acked_protocol = reporter.as_ref().is_some_and(|r| r.protocol() >= 5);
         LogPipe {
             attempt,
@@ -218,7 +160,6 @@ impl LogPipe {
         }
     }
 
-    /// Frames the spool refused so far, by cause.
     pub fn refusals(&self) -> Refused {
         self.lock().refusals
     }
@@ -227,14 +168,10 @@ impl LogPipe {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Redact a registered value from this attempt's output from now on.
-    /// Returns whether it was accepted (non-empty).
     pub fn register_secret(&self, value: &[u8]) -> bool {
         self.lock().redactor.register(value)
     }
 
-    /// Send what the window allows from the spool's cursor, then the end
-    /// marker once everything is acknowledged.
     fn pump(&self, st: &mut PipeState) {
         let Some(reporter) = st.reporter.clone() else {
             return;
@@ -260,14 +197,10 @@ impl LogPipe {
                     Ok(route) => {
                         st.sent = frame.seq;
                         if Some(route) != expected {
-                            // The route moved under this batch: the next
-                            // pump sees it and rewinds or waits.
                             return;
                         }
                     }
                     Err(_) => {
-                        // The session is gone; the next attach rewinds and
-                        // resends.
                         st.reporter = None;
                         return;
                     }
@@ -275,17 +208,11 @@ impl LogPipe {
             }
         }
         let spool = st.spool.as_mut().expect("checked above");
-        // Every stored frame acknowledged: the end can go. Declared gaps are
-        // never acknowledged, so they are not waited for.
         if st.ended && !st.end_sent && spool.acked() >= spool.last_stored() {
             if !spool.ended() {
                 if std::mem::take(&mut st.cut) {
-                    // Past everything the controller acknowledged: never a
-                    // sequence it holds. A failed write still spent it; the
-                    // end record below retries the `declared` file.
                     let _ = spool.declare_cut();
                 }
-                // Durable before it is declared; retried at the next pump.
                 if spool.persist_end().is_err() {
                     return;
                 }
@@ -303,7 +230,6 @@ impl LogPipe {
         }
     }
 
-    /// Frames through `through` are durable on the controller.
     pub fn acked(&self, through: u64) {
         let mut st = self.lock();
         if let Some(spool) = st.spool.as_mut() {
@@ -313,25 +239,18 @@ impl LogPipe {
         self.progress.notify_all();
     }
 
-    /// The controller stores no more of this attempt's log.
     pub fn refused(&self) {
         let mut st = self.lock();
         st.refused = true;
         self.progress.notify_all();
     }
 
-    /// Protocol 5: the controller's end marker is durable.
     pub fn end_acked(&self) {
         let mut st = self.lock();
         st.end_acked = true;
         self.progress.notify_all();
     }
 
-    /// A session is live: resend from the last acknowledgement. The end
-    /// marker goes out again too — it was only ever durable once the
-    /// controller said so. A refusal from the last session is not carried
-    /// over: a permanent one is simply answered again, and one an older
-    /// controller sent for a transient fault gets its retry.
     pub fn attached(&self, reporter: Reporter) {
         let mut st = self.lock();
         st.end_acked_protocol = reporter.protocol() >= 5;
@@ -349,8 +268,6 @@ impl LogPipe {
         self.lock().reporter = None;
     }
 
-    /// The bulk connection went: resend what it may have swallowed before
-    /// anything else goes out on the fallback route.
     pub fn resync(&self) {
         let mut st = self.lock();
         self.pump(&mut st);
@@ -375,8 +292,6 @@ impl Output for LogPipe {
         }
         let st = &mut *st;
         for chunk in out.chunks(MAX_LOG_FRAME_BYTES) {
-            // The frame goes out from memory when nothing older waits and
-            // the window has room; otherwise the pump reads it back later.
             let direct = match st.reporter.clone() {
                 Some(reporter) if !st.refused => {
                     let window = st.spool.as_ref().is_some_and(|spool| {
@@ -391,18 +306,12 @@ impl Output for LogPipe {
             if st.spool.is_none() {
                 return;
             }
-            // Every chunk spends its sequence whether the write lands, a
-            // bound refuses it, or the disk fails — `append` declares what it
-            // could not hold, and the next chunk must still spend its own.
             let Some(seq) = st.store(step, stream, chunk) else {
                 continue;
             };
             let spool = st.spool.as_mut().expect("stored above");
             if let Some(reporter) = direct {
                 match reporter.log_frame(self.attempt, seq, step, stream, chunk) {
-                    // A route that changed under this send is left for the
-                    // next pump, which still holds the old one to compare
-                    // against and rewinds or waits as it must.
                     Ok(_) => {
                         spool.sent_tail(seq);
                         st.sent = seq;
@@ -456,10 +365,7 @@ impl Output for LogPipe {
             let s = &mut *st;
             if let Some(spool) = s.spool.as_mut() {
                 let _ = spool.sync();
-                // The `last_seq` and gaps `LogEnd` declares must survive a
-                // restart unchanged, or a re-sent end would conflict. A
-                // recovered spool's end waits for the controller's
-                // acknowledgements, which may move it (`pump`).
+                // The end record must survive a restart unchanged, or a re-sent end would conflict.
                 if !s.cut {
                     let _ = spool.persist_end();
                 }
@@ -468,8 +374,6 @@ impl Output for LogPipe {
         }
         self.pump(&mut st);
         let deadline = Instant::now() + LOG_FLUSH_TIMEOUT;
-        // Protocol 5 keeps the spool until the controller's end marker is
-        // durable (`LogEndAck`); earlier sessions keep the send boundary.
         while !(st.end_acked || (st.end_sent && !st.end_acked_protocol)) && !st.refused {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -496,7 +400,6 @@ impl Output for LogPipe {
 mod tests {
     use super::*;
 
-    /// Everything the pipe has spooled, as (step, text).
     fn spooled(pipe: &LogPipe) -> Vec<(u32, String)> {
         let mut st = pipe.lock();
         let spool = st.spool.as_mut().unwrap();
@@ -512,8 +415,6 @@ mod tests {
         frames.iter().map(|(_, t)| t.as_str()).collect()
     }
 
-    /// A value registered into a live attempt redacts its output
-    /// from then on, and only that attempt's.
     #[test]
     fn registration_is_per_attempt_and_takes_effect_while_it_runs() {
         let root = tempfile::tempdir().unwrap();
@@ -528,7 +429,6 @@ mod tests {
         b.step_done(0);
         assert_eq!(text(&spooled(&a)), "before tok-1234567890\nafter ***\n");
         assert_eq!(text(&spooled(&b)), "other tok-1234567890\n");
-        // Diagnostics that leave the attempt are redacted the same way.
         assert_eq!(
             a.redact("Error: tok-1234567890 refused".into()),
             "Error: *** refused"
@@ -539,11 +439,6 @@ mod tests {
         );
     }
 
-    /// The excerpt a failed step's detail carries comes from the
-    /// attempt's redactor, applied to the raw stderr tail before any
-    /// transformation — a multi-line file value printed to stderr leaves
-    /// no line of it in the detail, and a tail that filled its ring drops
-    /// its first, cut line.
     #[test]
     fn a_failure_excerpt_is_redacted_before_it_is_cut() {
         let root = tempfile::tempdir().unwrap();
@@ -551,14 +446,10 @@ mod tests {
         pipe.register_secret(b"apiVersion: v1\ntoken: kube-secret-token");
         let excerpt = pipe.excerpt(b"cat config\napiVersion: v1\ntoken: kube-secret-token\n");
         assert!(!excerpt.contains("kube-secret"), "{excerpt}");
-        // A step that printed it over and over: the ring's 64 KiB cut lands
-        // inside a value (64 Ki is not a multiple of its 40 bytes), and
-        // whatever follows the dropped first line is whole.
         let printed = b"apiVersion: v1\ntoken: kube-secret-token\n".repeat(4_000);
         let wrapped = &printed[printed.len() - crate::process::OUTPUT_TAIL_BYTES..];
         let excerpt = pipe.excerpt(wrapped);
         assert!(!excerpt.contains("secret-token"), "{excerpt}");
-        // With nothing registered the excerpt is the plain last line.
         let plain = LogPipe::open(root.path(), AttemptId::new(), Redactor::new(), None).unwrap();
         assert_eq!(plain.excerpt(b"a\nError: nope\n"), "Error: nope");
     }
@@ -575,9 +466,6 @@ mod tests {
         assert_eq!(text(&spooled(&pipe)), "before *** after\n");
     }
 
-    /// Bytes held back as a possible secret prefix are released as
-    /// the step that printed them when it ends, never as another step's
-    /// (or as no step at all).
     #[test]
     fn held_back_bytes_belong_to_the_step_that_printed_them() {
         let root = tempfile::tempdir().unwrap();

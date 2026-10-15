@@ -7,15 +7,10 @@ const route = useRoute();
 const remembered = useCookie<string | null>("sentinel-tenant", { sameSite: "lax", maxAge: 60 * 60 * 24 * 365 });
 const tenant = useState<string | null>("tenant", () => remembered.value ?? null);
 const colorMode = useColorMode();
-// What views announce to screen readers (the log viewer's jumps, folds).
 const announce = useState("announce", () => "");
 
-// The tenant the pages act in: the route's, else the last one used.
 const active = computed(() => (typeof route.params.slug === "string" ? route.params.slug : tenant.value));
 const role = computed(() => session.roleIn(active.value ?? undefined));
-// The switcher keeps the three kinds of namespace apart: the person's own,
-// organizations managed here, and organizations whose membership GitHub
-// manages (marked, so nobody looks here to invite people to them).
 const ROLE_NAMES: Record<string, string> = { reader: "Reader", operator: "Operator", admin: "Admin" };
 const tenantItems = computed(() => {
   const personal: any[] = [];

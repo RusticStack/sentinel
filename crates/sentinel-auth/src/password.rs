@@ -1,34 +1,22 @@
-//! Local password verification with a maintained Argon2id implementation.
-//!
-//! Sentinel does not implement the KDF: `argon2` (RustCrypto) owns the hashing
-//! and the constant-time comparison, and the stored PHC string owns the
-//! parameters so an upgrade can rehash instead of invalidating every account.
-//!
-//! Hashing deliberately costs ~19 MiB and tens of milliseconds. It must never
-//! run inside a database write transaction; callers verify first, then write.
+//! Hashing costs ~19 MiB and tens of milliseconds: never run it inside a database write transaction.
 
 use argon2::{
     Algorithm, Argon2, Params, PasswordHasher, PasswordVerifier, Version,
     password_hash::phc::PasswordHash,
 };
 
-/// OWASP's second Argon2id option: 19 MiB, two passes, one lane. One lane keeps
-/// a login from stealing a whole core's worth of parallel work from job scheduling.
+/// OWASP's second Argon2id option. One lane keeps a login from taking a core from job scheduling.
 const M_COST: u32 = 19 * 1024;
 const T_COST: u32 = 2;
 const P_COST: u32 = 1;
 const SALT_LEN: usize = 16;
 
-/// Bounds checked before hashing. The lower bound is an admission rule, not a
-/// composition rule: no character-class theatre, no silent truncation.
 pub const MIN_LEN: usize = 12;
 pub const MAX_LEN: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PasswordError {
-    /// Shorter than [`MIN_LEN`] bytes, longer than [`MAX_LEN`], or only spacing.
     Unacceptable,
-    /// The maintained implementation refused; never surfaced with the input.
     Hashing,
 }
 
@@ -36,8 +24,6 @@ pub enum PasswordError {
 pub enum Verdict {
     Accepted,
     Rejected,
-    /// The stored record is unreadable (corrupt or written by a newer build).
-    /// Treated as a rejection by callers, but recorded differently.
     Unusable,
 }
 
@@ -46,7 +32,6 @@ fn argon2() -> Argon2<'static> {
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
-/// Reject unusable input before spending the KDF's memory on it.
 pub fn acceptable(password: &[u8]) -> Result<(), PasswordError> {
     if password.len() < MIN_LEN
         || password.len() > MAX_LEN
@@ -57,7 +42,6 @@ pub fn acceptable(password: &[u8]) -> Result<(), PasswordError> {
     Ok(())
 }
 
-/// Hash with a fresh random salt, returning the PHC string to store verbatim.
 pub fn hash(password: &[u8]) -> Result<String, PasswordError> {
     acceptable(password)?;
     let mut salt = [0u8; SALT_LEN];
@@ -68,8 +52,6 @@ pub fn hash(password: &[u8]) -> Result<String, PasswordError> {
     Ok(hash.to_string())
 }
 
-/// Verify a presented password against a stored PHC string. The parameters come
-/// from the record, so records written under older parameters still verify.
 pub fn verify(stored: &str, password: &[u8]) -> Verdict {
     let Ok(parsed) = PasswordHash::new(stored) else {
         return Verdict::Unusable;
@@ -80,8 +62,6 @@ pub fn verify(stored: &str, password: &[u8]) -> Verdict {
     }
 }
 
-/// True when the record was written under weaker parameters than current policy
-/// and should be rewritten after a successful verification.
 pub fn needs_rehash(stored: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(stored) else {
         return true;
@@ -97,14 +77,11 @@ pub fn needs_rehash(stored: &str) -> bool {
     }
 }
 
-/// Verify against this when the account does not exist, so an unknown user and
-/// a wrong password cost the same wall-clock time and reveal nothing.
+/// Makes an unknown account cost the same wall-clock time as a wrong password.
 pub fn spend_equal_work(password: &[u8]) {
     let _ = verify(placeholder(), password);
 }
 
-/// A real Argon2id record under current parameters whose password is unknown
-/// and unreachable: it is generated once per process from fresh entropy.
 fn placeholder() -> &'static str {
     use std::sync::OnceLock;
     static PLACEHOLDER: OnceLock<String> = OnceLock::new();

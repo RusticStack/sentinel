@@ -1,22 +1,4 @@
-//! Authenticated encryption for the few values that must be recoverable.
-//!
-//! Almost everything here is a digest: passwords, sessions, credentials and
-//! invitations are never stored in a form that could be presented back. A TOTP
-//! shared secret is the exception — verifying a code requires the secret — so
-//! it is sealed under a key that lives **outside** the database, in a file the
-//! operator controls. A stolen `metadata.sqlite` then yields no seed and no
-//! ability to mint codes.
-//!
-//! XChaCha20-Poly1305 through RustCrypto: random 192-bit nonces and associated
-//! data binding each ciphertext to its owner. The key file retains retired keys
-//! during rotation; losing one makes its remaining ciphertexts unrecoverable.
-//! [`Key::reseal`] moves a ciphertext to the active key, and [`Key::retire`]
-//! drops every other key once no ciphertext needs it.
-//!
-//! The same key also derives (BLAKE3 `derive_key`) the subkey for
-//! [`Key::fingerprinter`]: request fingerprints stored beside ciphertext must
-//! not be computable from the database alone, or a stored digest of a value
-//! would let a stolen database confirm guesses of that value offline.
+//! The key lives outside the database, so a stolen `metadata.sqlite` yields no TOTP seed and cannot mint codes.
 
 use std::{io::Write, path::Path};
 
@@ -34,13 +16,8 @@ const MAGIC: &[u8; 8] = b"SNTLKEY2";
 const MAX_KEYS: usize = 32;
 const MAX_KEY_FILE: usize = 13 + MAX_KEYS * 36;
 const TAG_LEN: usize = 16;
-/// BLAKE3 `derive_key` context for the subkey that keys stored request
-/// fingerprints. Globally unique and fixed: changing it invalidates every
-/// retained retry record, never a ciphertext.
 const FINGERPRINT_CONTEXT: &str = "sentinel 2026-09-26 stored request fingerprint v1";
 
-/// Unambiguous ownership context for tenant or repository secrets.
-/// The caller validates the name and supplies the durable secret version.
 pub fn secret_context(
     tenant: &[u8; 16],
     repo: Option<&[u8; 16]>,
@@ -67,8 +44,6 @@ pub fn secret_context(
     out
 }
 
-/// The key ID a stored ciphertext needs: format 2 names it, format 1 is the
-/// legacy raw key (ID 0). `None` for anything that is not a sealed value.
 pub fn key_id(sealed: &[u8]) -> Option<u32> {
     match sealed.first() {
         Some(&LEGACY_VERSION) => Some(0),
@@ -81,20 +56,13 @@ pub fn key_id(sealed: &[u8]) -> Option<u32> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SealError {
-    /// The key file is missing, unreadable, or not exactly 32 bytes.
     Key(&'static str),
-    /// The stored value is truncated, of an unknown version, or fails its
-    /// authentication tag — including when it is presented with the wrong
-    /// associated data.
     Unsealable,
 }
 
-/// A loaded master key. Held in memory for the life of the process; never
-/// written to the database, a log or an error.
 pub struct Key {
     active: u32,
     keys: Vec<(u32, chacha20poly1305::Key)>,
-    /// Derived from the active key once at load: keys [`Fingerprinter`].
     fingerprint_key: [u8; 32],
 }
 
@@ -113,8 +81,6 @@ impl Drop for Key {
     }
 }
 
-/// A keyed BLAKE3 MAC over request fields, for idempotency fingerprints that
-/// are stored in the database. Its key state is wiped when it is dropped.
 pub struct Fingerprinter(blake3::Hasher);
 
 impl Fingerprinter {
@@ -123,7 +89,6 @@ impl Fingerprinter {
         self
     }
 
-    /// The first 128 bits of the MAC.
     pub fn finish(self) -> u128 {
         let mut out = [0u8; 16];
         out.copy_from_slice(&self.0.finalize().as_bytes()[..16]);
@@ -137,7 +102,6 @@ impl Drop for Fingerprinter {
     }
 }
 
-/// A key file's bytes, wiped when dropped.
 struct KeyBytes(Vec<u8>);
 
 impl Drop for KeyBytes {
@@ -147,9 +111,6 @@ impl Drop for KeyBytes {
 }
 
 impl Key {
-    /// Read a versioned or legacy 32-byte key from `path`. The file is the deployment's secret: it
-    /// belongs outside the database directory's backups and is the operator's
-    /// to protect, rotate and restore.
     pub fn load(path: &Path) -> Result<Key, SealError> {
         let bytes = read_key_file(path)?;
         Self::decode(&bytes.0)
@@ -215,9 +176,7 @@ impl Key {
         KeyBytes(out)
     }
 
-    /// Write a fresh key, refusing to overwrite an existing one: replacing a
-    /// key makes every sealed value unreadable, which is a decision an operator
-    /// makes deliberately, not a side effect of running a command twice.
+    /// Refuses to overwrite: replacing a key makes every sealed value unreadable.
     pub fn create(path: &Path) -> Result<(), SealError> {
         let mut bytes = [0u8; KEY_LEN];
         getrandom::fill(&mut bytes).expect("operating system entropy");
@@ -238,10 +197,6 @@ impl Key {
         Ok(())
     }
 
-    /// Rotate offline. `backup` is a new owner-only copy of the exact old key
-    /// file. Keep it with the matching database backup; the active key file
-    /// retains retired keys so existing ciphertexts remain readable until
-    /// [`Key::retire`] drops them after a full reseal.
     pub fn rotate(path: &Path, backup: &Path) -> Result<u32, SealError> {
         if backup == path {
             return Err(SealError::Key("the backup must be a different file"));
@@ -271,11 +226,6 @@ impl Key {
         Ok(new_id)
     }
 
-    /// Drop every key but the active one, offline. The caller has proven that
-    /// no stored ciphertext names a retired key ([`Key::reseal`] every row
-    /// first). `backup` receives an exclusive owner-only copy of the file as
-    /// it was, to keep with the matching database snapshot. Returns how many
-    /// keys were removed; zero leaves the file untouched and writes no backup.
     pub fn retire(path: &Path, backup: &Path) -> Result<usize, SealError> {
         if backup == path {
             return Err(SealError::Key("the backup must be a different file"));
@@ -300,31 +250,22 @@ impl Key {
         Ok(retired)
     }
 
-    /// The ID new seals are written under.
     pub fn active_id(&self) -> u32 {
         self.active
     }
 
-    /// How many keys this file holds, the active one included.
     pub fn len(&self) -> usize {
         self.keys.len()
     }
 
-    /// Never true: a loaded key always has an active entry.
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
 
-    /// A keyed MAC for fingerprints stored beside ciphertext. Keyed by a
-    /// subkey of the active key, so a database copy alone cannot compute it;
-    /// after a rotation earlier fingerprints no longer match.
     pub fn fingerprinter(&self) -> Fingerprinter {
         Fingerprinter(blake3::Hasher::new_keyed(&self.fingerprint_key))
     }
 
-    /// Reseal `sealed` under the active key with the same `context`, or
-    /// `None` when it is already a format-2 value of the active key. The
-    /// plaintext is wiped before returning.
     pub fn reseal(&self, context: &[u8], sealed: &[u8]) -> Result<Option<Vec<u8>>, SealError> {
         if sealed.first() == Some(&VERSION) && key_id(sealed) == Some(self.active) {
             return Ok(None);
@@ -338,8 +279,7 @@ impl Key {
     fn active_key(&self) -> &chacha20poly1305::Key {
         &self.keys.last().unwrap().1
     }
-    /// Seal `plaintext`, binding it to `context` (the row's identity). The
-    /// result is `version || key_id || nonce || ciphertext`.
+    /// Result layout: `version || key_id || nonce || ciphertext`.
     pub fn seal(&self, context: &[u8], plaintext: &[u8]) -> Vec<u8> {
         let mut nonce = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce).expect("operating system entropy");
@@ -364,8 +304,6 @@ impl Key {
         out
     }
 
-    /// Open a sealed value. Fails if the key, the context or any byte differs:
-    /// a value sealed for one account cannot be opened as another's.
     pub fn open(&self, context: &[u8], sealed: &[u8]) -> Result<Vec<u8>, SealError> {
         let (id, offset, aad): (u32, usize, &[u8]) = match sealed.first() {
             Some(&LEGACY_VERSION) => (0, 1, context),
@@ -406,10 +344,6 @@ impl Key {
     }
 }
 
-/// Open the key file once and judge the opened handle, so the file checked
-/// is the file read: see [`crate::secret_file`]. The buffer is
-/// sized up front: no reallocation leaves an unwiped copy of key material
-/// behind.
 fn read_key_file(path: &Path) -> Result<KeyBytes, SealError> {
     use crate::secret_file::{self, Refusal};
     let mut file = secret_file::open(path).map_err(|refusal| {
@@ -427,16 +361,12 @@ fn read_key_file(path: &Path) -> Result<KeyBytes, SealError> {
     }
 }
 
-/// `master.key` →`master.key-<id>-pending`, beside the key.
 fn pending_path(path: &Path, id: u32) -> std::path::PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_owned();
     name.push(format!("-{id}-pending"));
     path.with_file_name(name)
 }
 
-/// A staged key file is never active and staging runs under the database
-/// ownership lock, so one left by an interrupted rotation is removed rather
-/// than blocking every later rotation.
 fn clear_pending(staged: &Path) -> Result<(), SealError> {
     match std::fs::remove_file(staged) {
         Ok(()) => Ok(()),
@@ -447,8 +377,6 @@ fn clear_pending(staged: &Path) -> Result<(), SealError> {
     }
 }
 
-/// Stage `encoded` beside `path`, sync it, and atomically replace `path`. A
-/// failure removes the staged file.
 fn replace(path: &Path, staged: &Path, encoded: &KeyBytes) -> Result<(), SealError> {
     if write_private(staged, &encoded.0).is_err() {
         let _ = std::fs::remove_file(staged);
@@ -461,8 +389,7 @@ fn replace(path: &Path, staged: &Path, encoded: &KeyBytes) -> Result<(), SealErr
     sync_parent(path).map_err(|_| SealError::Key("cannot sync key directory"))
 }
 
-/// Create the file owner-only from the start, so the key is never briefly
-/// world-readable between `create` and a later `chmod`.
+/// Created owner-only from the start: the key is never briefly world-readable.
 #[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -485,8 +412,6 @@ fn sync_parent(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Windows is a development platform for Sentinel, not a controller host; the
-/// file inherits the directory's ACL.
 #[cfg(not(unix))]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
@@ -501,7 +426,6 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// A fresh directory for key files, removed when the test ends.
     fn scratch() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
@@ -518,7 +442,6 @@ mod tests {
         assert_eq!(key.open(b"usr_b", &sealed), Err(SealError::Unsealable));
         assert!(!sealed.windows(4).any(|w| w == b"totp"), "plaintext leaked");
 
-        // Two sealings of one value differ: the nonce is fresh each time.
         assert_ne!(sealed, key.seal(b"usr_a", b"a totp seed"));
 
         let other = dir.path().join("other.key");
@@ -654,7 +577,6 @@ mod tests {
             Key::load(&backup).unwrap().open(b"owner", &sealed).unwrap(),
             b"legacy"
         );
-        // The backup is the exact old file: a raw legacy key stays raw.
         assert_eq!(std::fs::read(&backup).unwrap(), bytes);
     }
 
@@ -680,8 +602,6 @@ mod tests {
         }
     }
 
-    /// An interrupted rotation leaves `master.key-N-pending`; the
-    /// next rotation replaces it instead of failing for good.
     #[test]
     fn a_stale_pending_key_file_does_not_block_rotation() {
         let dir = scratch();
@@ -694,9 +614,6 @@ mod tests {
         assert_eq!(Key::load(&path).unwrap().active_id(), 2);
     }
 
-    /// After every ciphertext is resealed, retiring keeps only the
-    /// active key: old ciphertext no longer opens, resealed ciphertext does,
-    /// and rotation is available again however many times it ran before.
     #[test]
     fn reseal_then_retire_drops_old_keys_and_lifts_the_rotation_ceiling() {
         let dir = scratch();
@@ -727,21 +644,16 @@ mod tests {
         assert_eq!(kept.active_id(), full.active_id());
         assert_eq!(kept.open(b"row", &resealed).unwrap(), b"value");
         assert_eq!(kept.open(b"row", &old), Err(SealError::Unsealable));
-        // The backup still opens the retired ciphertext.
         assert_eq!(
             Key::load(&backup).unwrap().open(b"row", &old).unwrap(),
             b"value"
         );
-        // Nothing to retire: no backup is written.
         let again = dir.path().join("again");
         assert_eq!(Key::retire(&path, &again).unwrap(), 0);
         assert!(!again.exists());
         assert!(Key::rotate(&path, &dir.path().join("after-retire")).is_ok());
     }
 
-    /// The stored fingerprint is a MAC under a subkey of the master
-    /// key, so it differs across keys and cannot be recomputed from the
-    /// request alone.
     #[test]
     fn fingerprints_are_keyed_by_the_master_key() {
         let dir = scratch();

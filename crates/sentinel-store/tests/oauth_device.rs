@@ -1,8 +1,3 @@
-//! Device authorization, durable half: pending requests with unique user
-//! codes, approval (with narrowing) or denial by an admitted account,
-//! one-time redemption, expiry, the pending cap, and admission re-checked
-//! at redemption.
-
 use std::collections::HashSet;
 
 use sentinel_auth::{oauth as forms, secret::Secret};
@@ -38,8 +33,6 @@ struct Ids {
     other_repo: RepoId,
 }
 
-/// A super admin, a developer who operates `acme` (and nothing in `other`),
-/// and a repository in each tenant.
 fn fixture() -> (tempfile::TempDir, Store, Ids) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
@@ -141,7 +134,6 @@ fn an_approved_request_redeems_exactly_once() {
 
     let narrowed = Scopes::RUNS_READ.union(Scopes::LOGS_READ);
     device::decide(&store, &start.user_code, i.dev, approve(narrowed), at(3)).unwrap();
-    // Decided: the page no longer finds it and a second decision is refused.
     assert!(matches!(
         store.read(|c| device::view(c, &start.user_code, at(4))),
         Err(Error::NotFound)
@@ -167,7 +159,6 @@ fn an_approved_request_redeems_exactly_once() {
     assert_eq!(grants[0].kind, GrantKind::Device);
     assert_eq!(grants[0].expires, at(5 + oauth::LOGIN_GRANT_MS));
 
-    // Redeemed: never again, by any poll.
     assert!(matches!(
         poll(&store, &start.device, at(7)),
         Err(Error::NotFound)
@@ -260,7 +251,6 @@ fn denial_and_expiry_are_final_answers() {
     let audit = store.read(|c| local_auth::recent_audit(c, 1)).unwrap();
     assert_eq!(audit[0].event, Event::OAuthDeviceDenied);
 
-    // Undecided past its life: expired, and no longer approvable.
     let lapsed = begin(&store, Scopes::CLI_DEFAULT, NOW);
     assert!(matches!(
         poll(&store, &lapsed.device, at(DEVICE_LIFETIME_MS)),
@@ -276,7 +266,6 @@ fn denial_and_expiry_are_final_answers() {
         ),
         Err(Error::NotFound)
     ));
-    // Approved but never redeemed in time: expired too, and nothing issued.
     let unredeemed = begin(&store, Scopes::CLI_DEFAULT, NOW);
     device::decide(
         &store,
@@ -318,7 +307,6 @@ fn the_pending_cap_refuses_new_requests_until_old_ones_expire() {
         ),
         Err(Error::QuotaExceeded)
     ));
-    // A decided request no longer counts as pending.
     let first = first.unwrap();
     device::decide(&store, &first.user_code, i.dev, Decision::Deny, at(1)).unwrap();
     begin(&store, Scopes::RUNS_READ, at(2));
@@ -332,7 +320,6 @@ fn the_pending_cap_refuses_new_requests_until_old_ones_expire() {
         ),
         Err(Error::QuotaExceeded)
     ));
-    // Expired requests stop counting without any purge.
     begin(&store, Scopes::RUNS_READ, at(DEVICE_LIFETIME_MS));
 }
 
@@ -415,7 +402,6 @@ fn only_an_admitted_active_person_can_decide() {
             Err(Error::Forbidden)
         ));
     }
-    // Still pending for somebody who may decide.
     assert!(matches!(
         poll(&store, &start.device, at(2)),
         Ok(Poll::Pending)
@@ -470,7 +456,6 @@ fn approval_only_narrows_within_the_approvers_reach() {
     );
     let code = start.user_code.clone();
     let decide = |user: UserId, d: Decision| device::decide(&store, &code, user, d, at(1));
-    // Wider than asked, or empty.
     assert!(matches!(
         decide(
             i.dev,
@@ -482,7 +467,6 @@ fn approval_only_narrows_within_the_approvers_reach() {
         decide(i.dev, approve(Scopes::NONE)),
         Err(Error::InvalidInput("scope"))
     ));
-    // Platform administration only for a super admin.
     assert!(matches!(
         decide(i.dev, approve(Scopes::PLATFORM_ADMIN)),
         Err(Error::Forbidden)
@@ -492,8 +476,6 @@ fn approval_only_narrows_within_the_approvers_reach() {
         tenant,
         repo,
     };
-    // A tenant the approver is not a member of, a repository outside the
-    // chosen tenant, a repository without a tenant.
     assert!(matches!(
         decide(i.dev, narrow(Some(i.other), None)),
         Err(Error::Forbidden)
@@ -506,7 +488,6 @@ fn approval_only_narrows_within_the_approvers_reach() {
         decide(i.dev, narrow(None, Some(i.repo))),
         Err(Error::InvalidInput(_))
     ));
-    // Nothing above spent the request; a valid narrowing is recorded.
     decide(i.dev, narrow(Some(i.tenant), Some(i.repo))).unwrap();
     let Ok(Poll::Issued(minted)) = poll(&store, &start.device, at(2)) else {
         panic!("not issued");
@@ -519,7 +500,6 @@ fn approval_only_narrows_within_the_approvers_reach() {
     assert_eq!(who.principal.repo, Some(i.repo));
     assert_eq!(who.principal.permissions, P::READ);
 
-    // A super admin may approve platform administration.
     let admin = begin(&store, Scopes::PLATFORM_ADMIN, at(4));
     device::decide(
         &store,

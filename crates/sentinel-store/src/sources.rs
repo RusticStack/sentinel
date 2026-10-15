@@ -1,6 +1,3 @@
-//! Tenant-owned source bindings. All mutations and issuance recheck live
-//! ownership. Sealed credential references are (repo ID, monotonically
-//! increasing version); rotating replaces the previous recoverable value.
 use crate::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::sealed::Key;
@@ -23,17 +20,12 @@ pub(crate) fn context(tenant: TenantId, repo: RepoId, version: u64) -> [u8; 48] 
 
 pub struct Update<'a> {
     pub repo: RepoId,
-    /// Zero creates; every later mutation is compare-and-set.
     pub expected: u64,
     pub binding: &'a Binding,
     pub credential: &'a Credential,
     pub forge: Option<(InstallationId, u64)>,
 }
 
-/// `destinations` is host-local deployment policy, never caller-owned input.
-/// A deploy credential must be provisioned read-only at its Git provider.
-/// A host-local caller records `actor` as attribution in the audit row; a
-/// credentialed caller has its own principal recorded instead.
 pub fn bind(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -49,8 +41,6 @@ pub fn bind(
             crate::auth::require_tenant_admin(tx, principal, tenant)?;
             tenant
         }
-        // The operator already holds the database file; the row still has to
-        // name an active tenant, so a stale identifier fails loudly.
         None => crate::sources::repo_tenant(tx, update.repo)?,
     };
     let destination = sentinel_protocol::source::remote(&update.binding.remote)
@@ -103,9 +93,6 @@ pub fn bind(
     if changed != 1 {
         return Err(Error::Conflict);
     }
-    // A new binding may point at a different remote; poll cursors recorded
-    // against the old one would fabricate transitions, so the next poll
-    // rebuilds its baseline.
     tx.execute(
         "UPDATE poll_configs SET baseline_ms=NULL,updated_ms=?2 WHERE repo_id=?1",
         params![update.repo.as_bytes(), now.0],
@@ -145,7 +132,6 @@ pub fn revoke(
         "DELETE FROM source_intake_tokens WHERE repo_id = ?1",
         [repo.as_bytes()],
     )?;
-    // Nor may its poll configuration keep observing the remote.
     tx.execute(
         "DELETE FROM poll_configs WHERE repo_id = ?1",
         [repo.as_bytes()],
@@ -160,8 +146,6 @@ pub fn revoke(
     Ok(())
 }
 
-/// A repository's tenant, provided the tenant is active. Trusted internal
-/// lookup: authority is decided by the caller before it gets here.
 pub fn repo_tenant(conn: &Connection, repo: RepoId) -> Result<TenantId> {
     let bytes: Option<[u8; 16]> = conn
         .prepare_cached(
@@ -185,9 +169,6 @@ pub fn metadata(conn: &Connection, principal: Principal, repo: RepoId) -> Result
     load_metadata(conn, repo)
 }
 
-/// Host-local metadata read: the caller already holds the database file. The
-/// tenant still has to be active, so a suspended tenant's binding is not
-/// reported as usable.
 pub fn metadata_trusted(conn: &Connection, repo: RepoId) -> Result<Metadata> {
     repo_tenant(conn, repo)?;
     load_metadata(conn, repo)
@@ -211,7 +192,6 @@ pub fn load_metadata(conn: &Connection, repo: RepoId) -> Result<Metadata> {
     })
 }
 
-/// Manual dispatch cannot substitute a remote for a bound repository.
 pub fn validate_source(
     conn: &Connection,
     repo: RepoId,
@@ -226,24 +206,12 @@ pub fn validate_source(
             Ok(())
         }
         Ok(_) => Err(Error::Forbidden),
-        Err(Error::NotFound) => Ok(()), // Explicit legacy/manual mode, no credential grant.
+        Err(Error::NotFound) => Ok(()),
         Err(e) => Err(e),
     }
 }
 
-/// The remote a credentialed client may name for a repository with **no**
-/// binding (the explicit manual mode). The worker fetches it with its own
-/// process identity and no delivered credential, so only an unauthenticated
-/// `https://` remote in the canonical grammar is acceptable: never a local
-/// path or `file://` URL (other repositories and workspaces on the worker
-/// host), never `ssh://` (the worker account's own SSH identity and
-/// configuration), never `git://`, plain `http://`, a remote helper or
-/// userinfo. The host must also be a public DNS name — never an IP literal in
-/// any notation, a bare hostname or a private-use suffix — unless the
-/// deployment explicitly allowlisted the authority
-/// ([`sentinel_protocol::source::MANUAL_DESTINATIONS_ENV`]); the worker
-/// additionally refuses names that resolve to non-public addresses. A bound
-/// repository is judged by [`validate_source`] instead.
+// Manual runs carry no credential, so only an unauthenticated public https remote may be fetched.
 pub fn manual_remote_allowed(remote: &str) -> bool {
     sentinel_protocol::source::manual_destination_allowed(remote)
         || LOCAL_MANUAL_SOURCES.load(std::sync::atomic::Ordering::Relaxed)
@@ -252,19 +220,11 @@ pub fn manual_remote_allowed(remote: &str) -> bool {
 static LOCAL_MANUAL_SOURCES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Test-only escape hatch: let this *process* dispatch manual runs from any
-/// remote, including local paths. Container suites that drive a real worker
-/// against a repository on disk call it once; production code never does,
-/// and nothing can set it from outside the process.
 #[doc(hidden)]
 pub fn permit_any_manual_source_for_tests() {
     LOCAL_MANUAL_SOURCES.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Manual-dispatch admission for a client principal: a bound repository's
-/// source must be exactly its binding ([`validate_source`]), and an unbound
-/// repository's source must pass [`manual_remote_allowed`]. Host-local
-/// callers and the event path do not come through here.
 pub fn validate_manual(
     conn: &Connection,
     repo: RepoId,
@@ -278,8 +238,6 @@ pub fn validate_manual(
     }
 }
 
-/// Fetch authority for one acknowledged, live, preparing attempt. The worker
-/// identity comes from mutual TLS; no tenant/repository is accepted from it.
 pub fn attempt_repo(
     conn: &Connection,
     worker: WorkerId,
@@ -293,8 +251,6 @@ pub fn attempt_repo(
     ))
 }
 
-/// Trusted controller source-resolution operation; callers must have just
-/// authorized a principal or attempt in the same database snapshot.
 pub fn issue(
     conn: &Connection,
     tenant: TenantId,
@@ -302,9 +258,7 @@ pub fn issue(
     key: &Key,
     now: UnixMillis,
 ) -> Result<Access> {
-    // One statement: the terms, the version and the ciphertext come from the
-    // same row image, so a rotation committing mid-issue can never pair one
-    // version's terms with another version's sealed credential.
+    // One statement: the terms, version and ciphertext come from one row image, so a concurrent rotation cannot mix them.
     type Row = (Vec<u8>, i64, bool, Option<[u8; 16]>, Vec<u8>);
     let (binding, version, revoked, installation, sealed): Row = conn
         .prepare_cached(

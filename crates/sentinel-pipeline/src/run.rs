@@ -1,9 +1,3 @@
-//! The immutable per-run specification. A `RunSpec` binds one compiled
-//! pipeline to one exact source revision and records how every image was
-//! pinned. It is written once when the run is created and never edited: a
-//! rerun executes the same bytes as a new attempt; a change of source or
-//! pipeline is a new run. Step commands are derived from the spec so worker
-//! and controller agree on argv, environment and working directory.
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -17,13 +11,10 @@ use crate::{
     schema::{Artifact, Cache, Concurrency, Job, Resources, RunsOn, Shell, Step},
 };
 
-/// Exact source inputs. `sha` is the commit actually checked out; `ref_name`
-/// is provenance only and never used to fetch.
+/// `ref_name` is provenance only; fetches use the pinned `sha`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedSource {
-    /// Clone URL or repository identifier as resolved by the controller.
     pub repo: String,
-    /// Full 40 (SHA-1) or 64 (SHA-256) lowercase hex digits.
     pub sha: String,
     pub ref_name: Option<String>,
 }
@@ -54,10 +45,6 @@ impl PinnedSource {
     }
 }
 
-/// An OCI image reference split into its parts. A reference is *pinned*
-/// when it carries a digest; a tag-only reference is resolved to a digest by
-/// the first worker that pulls it and the digest is then recorded on the run
-/// so every later attempt uses the same bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageRef {
     pub name: String,
@@ -74,7 +61,6 @@ pub enum ImageError {
 }
 
 impl ImageRef {
-    /// Parse `name[:tag][@sha256:hex]` as validated by the schema.
     pub fn parse(reference: &str) -> Result<Self, ImageError> {
         if reference.is_empty() {
             return Err(ImageError::Empty);
@@ -93,7 +79,6 @@ impl ImageRef {
             }
             None => (reference, None),
         };
-        // A colon after the last slash is a tag; before it, a registry port.
         let last_slash = rest.rfind('/').map_or(0, |i| i + 1);
         let (name, tag) = match rest[last_slash..].find(':') {
             Some(i) => {
@@ -124,7 +109,6 @@ impl ImageRef {
         self.digest.is_some()
     }
 
-    /// Record the digest a worker resolved. Refuses to change an existing pin.
     pub fn pin(&mut self, digest: &str) -> Result<(), ImageError> {
         if self.digest.is_some() {
             return Err(ImageError::InvalidDigest);
@@ -148,12 +132,10 @@ impl fmt::Display for ImageRef {
     }
 }
 
-/// Everything a run needs, fixed at creation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSpec {
     pub source: PinnedSource,
     pub pipeline: CompiledPipeline,
-    /// One entry per compiled job, same order; carries the image pin state.
     pub images: Vec<ImageRef>,
 }
 
@@ -164,16 +146,8 @@ pub enum SpecError {
     Decode,
 }
 
-/// Bump when the encoded layout changes; blobs older than
-/// [`SPEC_FORMAT_READ_MIN`] are rejected rather than misread. Layouts: 2 `on`
-/// carries ref filters (`policy::Triggers`); 3 artifacts carry `required`;
-/// 4 caches carry `class`; 5 steps carry secret targets; 6 jobs carry the
-/// tenant registry credential for image pulls.
 pub const SPEC_FORMAT: u8 = 6;
 
-/// The oldest format `decode` still accepts. Format 3 differs from 4 only
-/// in the absent `cache.class`; its caches upgrade to `Dependencies`, what a
-/// `class`-less schema 1 document compiles to.
 pub const SPEC_FORMAT_READ_MIN: u8 = 3;
 
 impl RunSpec {
@@ -192,7 +166,6 @@ impl RunSpec {
         })
     }
 
-    /// Compact binary form for the store: one format byte, then postcard.
     pub fn encode(&self) -> Result<Vec<u8>, SpecError> {
         let mut out = vec![SPEC_FORMAT];
         postcard::to_extend(self, out.split_off(1))
@@ -203,12 +176,6 @@ impl RunSpec {
             .map_err(|_| SpecError::Encode)
     }
 
-    /// The leading format byte alone chooses the layout. Formats 3 through 5
-    /// decode through shadow types: older steps get empty secret targets, old
-    /// jobs have no registry credential, and format 3 caches become
-    /// `Dependencies`. An unknown format byte, an unparsable body or bytes
-    /// left over after the body is `Decode`, so a corrupted or concatenated
-    /// blob is refused rather than half-read.
     pub fn decode(bytes: &[u8]) -> Result<Self, SpecError> {
         fn whole<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, SpecError> {
             match postcard::take_from_bytes(body) {
@@ -225,7 +192,6 @@ impl RunSpec {
         }
     }
 
-    /// Compile a step of a job into the exact process the worker runs.
     pub fn step_command(&self, job: usize, step: usize) -> Option<StepCommand> {
         let j = &self.pipeline.jobs.get(job)?.spec;
         let s = j.steps.get(step)?;
@@ -233,10 +199,7 @@ impl RunSpec {
     }
 }
 
-// Shadow layouts for formats 3 to 5. postcard encodes fields positionally, so
-// reading an old format needs the old type graph, not a `serde(default)`
-// field. Each mirrors the old `Job`/`Step`/`Cache` shape; every other type
-// they touch is unchanged.
+// postcard is positional: reading an old format needs its old type graph, not serde(default).
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheV3 {
@@ -515,23 +478,13 @@ impl From<RunSpecV3> for RunSpec {
     }
 }
 
-/// Failure semantics, identical for every shell: exit 0 passes; any other
-/// exit status is `CommandFailed`; death by signal is `CommandSignaled`;
-/// exceeding the step or job timeout is `ExecutionTimeout`; an OOM kill is
-/// `OutOfMemory`. Output is captured, never interpreted, for the verdict.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StepCommand {
-    /// Executable and arguments; the script is the last element.
     pub argv: Vec<String>,
-    /// Job environment first, step environment overriding by name; the
-    /// worker adds its own `SENTINEL_*` context variables after these so a
-    /// pipeline cannot spoof them.
+    /// Worker SENTINEL_* variables come after these so a pipeline cannot spoof them.
     pub env: Vec<(String, String)>,
-    /// Explicit secret injection targets, kept separate from ordinary env
-    /// so the worker can avoid putting plaintext into process arguments.
     pub secrets: Vec<String>,
     pub secret_files: Vec<crate::schema::SecretFile>,
-    /// Relative to the workspace root; `None` means the root itself.
     pub workdir: Option<String>,
     pub timeout_secs: u64,
 }
@@ -557,8 +510,7 @@ impl StepCommand {
                 None => env.push((k.clone(), v.clone())),
             }
         }
-        // Step workdir is relative to the job workdir; both were validated
-        // as normalised relative paths, so joining cannot escape.
+        // Both workdirs are validated as normalised relative paths, so joining cannot escape.
         let workdir = match (&job.workdir, &step.workdir) {
             (None, None) => None,
             (Some(j), None) => Some(j.clone()),
@@ -595,8 +547,6 @@ mod tests {
         }
     }
 
-    /// Encode `spec` in the format-3 layout: the shadow type graph, format
-    /// byte 3.
     fn encode_v3(spec: &RunSpec) -> Vec<u8> {
         let shadow = RunSpecV3 {
             source: spec.source.clone(),
@@ -644,7 +594,6 @@ mod tests {
         out
     }
 
-    /// Format 4 added cache classes but predates per-step secret targets.
     fn encode_v4(spec: &RunSpec) -> Vec<u8> {
         let shadow = RunSpecV4 {
             source: spec.source.clone(),
@@ -683,7 +632,6 @@ mod tests {
         out
     }
 
-    /// Format 5 added step targets but had no job-level registry auth field.
     fn encode_v5(spec: &RunSpec) -> Vec<u8> {
         let shadow = RunSpecV5 {
             source: spec.source.clone(),
@@ -800,7 +748,6 @@ mod tests {
             Err(SpecError::Decode)
         );
         assert_eq!(RunSpec::decode(&[]), Err(SpecError::Decode));
-        // A format-6 head on a truncated body is not a spec either.
         assert_eq!(
             RunSpec::decode(&bytes[..bytes.len() / 2]),
             Err(SpecError::Decode)
@@ -828,28 +775,22 @@ mod tests {
         let v3 = encode_v3(&spec);
         assert_eq!(v3[0], 3);
         let decoded = RunSpec::decode(&v3).unwrap();
-        // A format-3 blob cannot carry a class: every cache lands on
-        // `dependencies`, the class a class-less schema 1 file compiles to.
-        // The fixture declares none, so the upgrade is lossless.
         for job in &decoded.pipeline.jobs {
             for c in &job.spec.cache {
                 assert_eq!(c.class, Class::Dependencies);
             }
         }
         assert_eq!(decoded, spec);
-        // Truncated or corrupt v3 bodies still fail typed, never panic.
         assert_eq!(RunSpec::decode(&v3[..v3.len() - 1]), Err(SpecError::Decode));
         assert_eq!(RunSpec::decode(&v3[..4]), Err(SpecError::Decode));
         let mut corrupt = v3.clone();
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xFF;
-        let _ = RunSpec::decode(&corrupt); // may decode or not; must not panic
+        let _ = RunSpec::decode(&corrupt);
     }
 
     #[test]
     fn a_blob_with_trailing_bytes_is_not_a_spec() {
-        // Readers reject unknown bytes rather than guess
-        // (docs/compatibility.md), in both readable layouts.
         let spec = full_spec();
         for blob in [spec.encode().unwrap(), encode_v3(&spec)] {
             assert!(RunSpec::decode(&blob).is_ok());

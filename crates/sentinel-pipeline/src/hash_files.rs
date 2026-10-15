@@ -1,6 +1,3 @@
-//! Bounded worker-side hashing. Linux path resolution is rooted in one pinned
-//! directory descriptor; every open rejects symlinks, mount crossings and escape.
-//! This is not a filesystem snapshot: callers hash before starting writable work.
 use crate::expr::HashFilesError;
 
 pub const MAX_HASH_VISITS: usize = 100_000;
@@ -8,8 +5,6 @@ pub const MAX_HASH_DEPTH: usize = 64;
 pub const MAX_HASH_PATH: usize = 4096;
 pub const MAX_HASH_PATTERN: usize = 1024;
 
-/// Hash sorted, unique `path \0 length content` records. No filesystem access
-/// is attempted on non-Linux hosts; offline validate/explain remain portable.
 pub fn hash_files(root: &std::path::Path, patterns: &[&str]) -> Result<String, HashFilesError> {
     #[cfg(target_os = "linux")]
     {
@@ -22,20 +17,14 @@ pub fn hash_files(root: &std::path::Path, patterns: &[&str]) -> Result<String, H
     }
 }
 
-/// What [`resolve_paths`] returns on Linux: the pinned root descriptor and the
-/// sorted unique matches. Entries open beneath the descriptor — never through
-/// a path lookup — so symlinks and mounts cannot be smuggled in by a rename.
 #[cfg(target_os = "linux")]
 pub struct Resolved {
     root: std::fs::File,
-    /// Sorted, de-duplicated relative paths that matched.
     pub paths: Vec<String>,
 }
 
 #[cfg(target_os = "linux")]
 impl Resolved {
-    /// Pin one matched path (`O_PATH`, confined beneath the root) and report
-    /// its metadata. The descriptor classifies the entry; it is not readable.
     pub fn pin(&self, path: &str) -> Result<(std::fs::File, std::fs::Metadata), HashFilesError> {
         let pinned = linux::pin(&self.root, path)?;
         let meta = pinned
@@ -44,15 +33,11 @@ impl Resolved {
         Ok((pinned, meta))
     }
 
-    /// A readable descriptor for a `pin`ned regular file, via procfs.
     pub fn readable(&self, pinned: &std::fs::File) -> Result<std::fs::File, HashFilesError> {
         linux::readable(pinned)
     }
 }
 
-/// Resolve `patterns` under `root` with the same bounded, symlink- and
-/// mount-confined walk `hash_files` uses; `cap` bounds the file count and
-/// `NoMatch` means every pattern resolved to nothing. Linux only.
 #[cfg(target_os = "linux")]
 pub fn resolve_paths(
     root: &std::path::Path,
@@ -128,8 +113,6 @@ mod linux {
             }
             if !seg.contains('*') {
                 let saved = append(path, seg)?;
-                // Only an absent literal is a normal no-match. All other errors
-                // (including a raced-away enumerated entry) invalidate the result.
                 self.visit()?;
                 let fd = openat2(
                     &self.root,
@@ -150,7 +133,6 @@ mod linux {
                 if path.is_empty() { "." } else { path },
                 OFlags::RDONLY | OFlags::DIRECTORY,
             )?;
-            // getdents-backed streaming enumeration: never collect a directory.
             let entries = Dir::new(dir).map_err(io)?;
             for entry in entries {
                 self.visit()?;
@@ -236,10 +218,6 @@ mod linux {
         Ok(saved)
     }
 
-    /// The shared confined walk: validate patterns, pin the root, collect the
-    /// sorted unique matches. `cap` bounds the file count; the returned root
-    /// descriptor lets the caller open entries beneath it without re-walking
-    /// names through the filesystem.
     pub(super) fn resolve(
         root: &Path,
         patterns: &[&str],
@@ -248,7 +226,6 @@ mod linux {
         if patterns.is_empty() || patterns.len() > MAX_HASH_PATTERNS {
             return Err(HashFilesError::InvalidPattern("pattern count".into()));
         }
-        // Validate everything before opening the root or allocating segment vectors.
         for pattern in patterns {
             if pattern.len() > MAX_HASH_PATTERN
                 || !crate::schema::valid_relative_path(pattern)
@@ -281,15 +258,10 @@ mod linux {
         Ok((tree.root, tree.matches.into_iter().collect()))
     }
 
-    /// Pin a resolved entry beneath a resolved root: `O_PATH` beneath the
-    /// pinned descriptor, no symlinks, no mounts. Classify with `metadata`;
-    /// reopen for reading through `/proc/self/fd`.
     pub(super) fn pin(root: &File, path: &str) -> Result<File, HashFilesError> {
         confined(root, path, OFlags::PATH)
     }
 
-    /// A readable descriptor for a pinned entry, via procfs so no pathname is
-    /// re-resolved. Fails for anything but a regular file pinned by `pin`.
     pub(super) fn readable(pinned: &File) -> Result<File, HashFilesError> {
         use std::os::fd::AsRawFd;
         File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd())).map_err(io)
@@ -304,8 +276,7 @@ mod linux {
         let mut remaining = MAX_HASH_BYTES;
         let mut buf = vec![0u8; 64 << 10];
         for path in &matches {
-            // O_PATH classifies special files without opening a device/FIFO for
-            // I/O. Reopen the pinned regular inode via procfs, never its pathname.
+            // O_PATH classifies without opening a FIFO or device; reopen the pinned inode via procfs, never by path.
             let pinned = confined(&root, path, OFlags::PATH)?;
             let before = pinned.metadata().map_err(io)?;
             if !before.is_file() {
@@ -366,8 +337,7 @@ mod linux {
             *remaining -= n as u64;
             hasher.update(&buf[..n]);
         }
-        // A single bounded lookahead detects growth, even for an endless reader.
-        // It is never hashed; at most one byte beyond the total budget is read.
+        // A bounded lookahead detects growth without hashing its byte.
         let mut extra = [0];
         if reader.read(&mut extra).map_err(io)? != 0 {
             return Err(HashFilesError::ChangedFile);
@@ -376,7 +346,6 @@ mod linux {
     }
 
     fn glob_segment(pattern: &str, name: &str) -> bool {
-        // One matcher for refs and files; see `crate::glob`.
         crate::glob::segment(pattern, name)
     }
 

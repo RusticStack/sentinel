@@ -1,7 +1,3 @@
-//! Artifact records: the captured/absent/failed terminal states,
-//! manifest-version invariants, the attempt→job→run→tenant ownership
-//! trigger, and the incremental `Staging` writer that link frames use.
-
 use std::sync::Arc;
 
 use sentinel_auth::secret::Secret;
@@ -84,7 +80,6 @@ fn fixture() -> Fixture {
 }
 
 impl Fixture {
-    /// An enrolled worker holding a placed attempt on `job`.
     fn attempt(&self, job: JobId) -> (WorkerId, sentinel_core::AttemptId) {
         let (worker, pool) = (WorkerId::new(), self.pool);
         self.store
@@ -130,7 +125,6 @@ impl Fixture {
         (worker, offer.attempt)
     }
 
-    /// A run with one job named `build`.
     fn run(&self) -> (RunId, JobId) {
         let (tenant, repo, run) = (self.tenant, self.repo, RunId::new());
         let spec = RunSpec::new(
@@ -163,7 +157,6 @@ fn absent_and_failed_rows_round_trip_without_a_manifest() {
     let (_, attempt) = f.attempt(job);
     let (tenant, name) = (f.tenant, "dist");
 
-    // Captured needs a manifest version; absent/failed must not carry one.
     for (state, version, why) in [
         (artifacts::State::Captured, None, "captured without version"),
         (artifacts::State::Absent, Some(1), "absent with version"),
@@ -221,7 +214,6 @@ fn absent_and_failed_rows_round_trip_without_a_manifest() {
             .read(move |c| artifacts::exists(c, attempt, "dist"))
             .unwrap()
     );
-    // Absent contributes nothing to the run's artifact budget.
     assert_eq!(
         f.store
             .read(move |c| artifacts::run_bytes(c, tenant, run))
@@ -235,7 +227,6 @@ fn absent_and_failed_rows_round_trip_without_a_manifest() {
             .len(),
         1
     );
-    // Foreign tenant or run sees nothing.
     assert!(matches!(
         f.store.read(move |c| artifacts::get(c, f.other, run, id)),
         Err(Error::NotFound)
@@ -302,7 +293,6 @@ fn a_captured_row_commits_with_its_manifest_in_one_transaction() {
         .unwrap();
     assert_eq!(row.state, artifacts::State::Captured);
     assert_eq!((row.entries, row.bytes), (1, len));
-    // The manifest reads back with the same entries.
     let m = f
         .store
         .read(move |c| {
@@ -322,13 +312,11 @@ fn a_captured_row_commits_with_its_manifest_in_one_transaction() {
             .unwrap(),
         len
     );
-    // `captured` resolves by job and artifact name.
     let found = f
         .store
         .read(move |c| artifacts::captured(c, tenant, run, "build", "dist"))
         .unwrap();
     assert_eq!(found.id, id);
-    // A second record under the same (attempt, name) is a conflict.
     let dup = f.store.writer().write(move |tx| {
         artifacts::record(
             tx,
@@ -355,7 +343,6 @@ fn the_ownership_trigger_refuses_a_foreign_tenant_or_attempt() {
     let (_, attempt) = f.attempt(job);
     let (tenant, other) = (f.tenant, f.other);
 
-    // Right attempt, wrong tenant: the trigger joins the chain.
     let wrong_tenant = f.store.writer().write(move |tx| {
         artifacts::record(
             tx,
@@ -374,7 +361,6 @@ fn the_ownership_trigger_refuses_a_foreign_tenant_or_attempt() {
     });
     assert!(wrong_tenant.is_err());
 
-    // Right tenant, an attempt of nothing: the chain has no root.
     let wrong_attempt = f.store.writer().write(move |tx| {
         artifacts::record(
             tx,
@@ -402,9 +388,7 @@ fn staging_streams_in_pieces_and_seals_only_the_declared_total() {
     let mut staging = f.objects.stage_begin(tenant, 11).unwrap();
     f.objects.stage_write(&mut staging, b"hello ").unwrap();
     f.objects.stage_write(&mut staging, b"world").unwrap();
-    // Past the declared limit the write is refused without appending.
     assert!(f.objects.stage_write(&mut staging, b"!").is_err());
-    // A different declared length cannot seal what was written.
     let mut again = f.objects.stage_begin(tenant, 5).unwrap();
     f.objects.stage_write(&mut again, b"hi").unwrap();
     assert!(f.objects.stage_seal(tenant, again, 5).is_err());
@@ -438,8 +422,6 @@ fn a_deduped_stage_never_deletes_the_committed_object() {
         .write(move |tx| objects.commit(tx, &first).map(|_| ()))
         .unwrap();
 
-    // Stage the same bytes again: the seal dedups, so `discard` must leave
-    // the committed object alone.
     let second = f
         .objects
         .stage(tenant, &b"same body"[..], u64::MAX, Expect::default())
@@ -459,8 +441,7 @@ fn a_deduped_stage_never_deletes_the_committed_object() {
     assert_eq!(out, b"same body");
 }
 
-/// The creator of a file discards *after* a deduper of the same
-/// bytes committed — the committed object keeps its file.
+// A creator's discard after a dedup commit must not remove the shared object's file.
 #[test]
 fn a_creator_discarding_after_a_dedup_commit_keeps_the_object() {
     let f = fixture();
@@ -479,7 +460,6 @@ fn a_creator_discarding_after_a_dedup_commit_keeps_the_object() {
         .writer()
         .write(move |tx| objects.commit(tx, &deduper).map(|_| ()))
         .unwrap();
-    // The creator's publication fails later in its stream.
     let objects = Arc::clone(&f.objects);
     let removed = f
         .store
@@ -494,8 +474,7 @@ fn a_creator_discarding_after_a_dedup_commit_keeps_the_object() {
     assert_eq!(out, b"shared bytes");
 }
 
-/// The creator discards while the deduper's commit
-/// is still pending — the live stage's pin keeps the file for it.
+// The live stage's pin keeps the file for a deduper whose commit is still pending.
 #[test]
 fn a_discard_before_a_pending_dedup_commit_keeps_the_file() {
     let f = fixture();
@@ -526,7 +505,6 @@ fn a_discard_before_a_pending_dedup_commit_keeps_the_file() {
         .read(|c| f.objects.read(c, tenant, digest, &mut out))
         .unwrap();
     assert_eq!(out, b"pending bytes");
-    // A lone uncommitted stage, by contrast, is removed by its discard.
     let lone = f
         .objects
         .stage(tenant, &b"nobody else"[..], u64::MAX, Expect::default())
@@ -540,7 +518,6 @@ fn a_discard_before_a_pending_dedup_commit_keeps_the_file() {
     );
 }
 
-/// A deduplicated streaming seal removes its temporary copy.
 #[test]
 fn a_deduped_stage_seal_leaves_nothing_in_tmp() {
     let f = fixture();

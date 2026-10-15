@@ -1,15 +1,3 @@
-//! Who is calling: a bearer credential (`Authorization: Bearer sntl_…`), an
-//! OAuth access token (`Authorization: Bearer sntl_at_…`) or the session
-//! cookie, resolved to a `Principal` and its scopes per request. A cookie
-//! session must also present the CSRF header on every mutation; a bearer
-//! needs no CSRF (no browser sends it ambiently) and can never step up.
-//!
-//! Scopes are a second ceiling beside the principal's permissions. An API
-//! credential and a session carry the scopes their permissions imply
-//! (`Scopes::from_permissions`), so their authority is unchanged; an OAuth
-//! access token carries exactly its grant's scopes. [`require_scope`] is the
-//! per-route check.
-
 use sentinel_auth::{
     cookie,
     oauth::{self, Bearer},
@@ -22,14 +10,10 @@ use sentinel_core::{
 use sentinel_protocol::error::{ApiError, ErrorCode};
 use sentinel_store::{Error as StoreError, Store, auth::Authority, local_auth, tokens};
 
-/// How the caller proved who they are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Via {
-    /// A `sntl_` API credential.
     Bearer,
-    /// The browser session cookie.
     Session,
-    /// A `sntl_at_` OAuth access token.
     OAuth,
 }
 
@@ -39,31 +23,16 @@ pub struct Identity {
     pub user: UserId,
     pub super_admin: bool,
     pub via: Via,
-    /// The session's CSRF digest; mutations must match it.
     pub csrf: Option<sentinel_auth::secret::Digest>,
-    /// What this caller may do by scope. Every route checks its own.
     pub scopes: Scopes,
-    /// The OAuth grant behind an access token.
     pub grant: Option<GrantId>,
-    /// When an OAuth access token stops working.
     pub expires: Option<UnixMillis>,
-    /// A browser session that proved presence within the step-up window.
-    /// Never set for a bearer credential or an OAuth token.
-    ///
-    /// This is what the interface shows; it is **not** what authorizes a
-    /// change. A privileged mutation goes through [`Identity::authority`],
-    /// whose freshness for a session is read again inside the writer
-    /// transaction of the change.
+    /// Display only: privileged changes are authorized through `authority`, not this flag.
     pub stepped_up: bool,
     authority: Authority,
 }
 
 impl Identity {
-    /// The store authority this caller acts with. A browser session's
-    /// step-up is judged against its row at the point of each privileged
-    /// mutation (a session revoked, or whose window closed, since the request
-    /// was identified is refused); a bearer credential or OAuth token is never
-    /// stepped up, so a privileged mutation from it is `StepUpRequired`.
     pub fn authority(&self) -> Authority {
         self.authority
     }
@@ -71,21 +40,13 @@ impl Identity {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// No credential, or one the store does not recognise.
     Unauthenticated,
-    /// A session mutation without its CSRF header.
     Csrf,
-    /// The store was too busy to check the credential (every reader taken,
-    /// or the writer's queue full). Says nothing about the credential, so
-    /// it must never look like `Unauthenticated`: an OAuth client answers a
-    /// `401` by spending its refresh token.
+    /// Not Unauthenticated: an OAuth client answers a 401 by spending its refresh token.
     Busy,
-    /// The store failed while checking the credential.
     Fault,
 }
 
-/// A store error while checking a credential. Only "no such live
-/// credential" is an authentication answer.
 fn refused(e: StoreError) -> Refusal {
     match e {
         StoreError::NotFound => Refusal::Unauthenticated,
@@ -96,16 +57,7 @@ fn refused(e: StoreError) -> Refusal {
     }
 }
 
-/// Resolve the request's credential. `authorization` and `cookie` are the
-/// raw header values; `csrf` the CSRF header, required for mutations from
-/// a session. An `Authorization` header that is present but not a Sentinel
-/// bearer (a refresh token, a code, a GitHub token) is refused by its shape
-/// before any lookup, and never falls back to the cookie.
-///
-/// A session whose idle window is at least `sessions.refresh_after_ms`
-/// spent slides its idle deadline (never past the absolute one): one write
-/// per session per refresh interval, best effort — a refresh the writer
-/// cannot take now does not fail the request it rides on.
+/// A present Authorization header that is not a Sentinel bearer is refused, never falling back to the cookie.
 pub fn identify(
     store: &Store,
     sessions: local_auth::Policy,
@@ -175,8 +127,6 @@ pub fn identify(
     })
 }
 
-/// Authenticate only an OAuth access token issued for the remote MCP
-/// resource. API credentials and browser sessions are not ambient MCP auth.
 pub(crate) fn identify_mcp(
     store: &Store,
     authorization: Option<&str>,
@@ -208,9 +158,6 @@ fn oauth_identity(authenticated: sentinel_store::oauth::Authenticated) -> Identi
     }
 }
 
-/// Require every scope in `required`. The refusal is `forbidden` with
-/// `details.scope` naming what is missing; the response layer turns that
-/// detail into `WWW-Authenticate: Bearer error="insufficient_scope"`.
 pub fn require_scope(identity: &Identity, required: Scopes) -> Result<(), ApiError> {
     if identity.scopes.contains(required) {
         return Ok(());

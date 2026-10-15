@@ -1,9 +1,4 @@
-//! Fault boundaries: a crash can land between any file write and the
-//! transaction that accounts for it, a disk can fill mid-stream, a log can
-//! be torn at any byte, and a tenant can ask for another tenant's bytes.
-//! Every boundary must settle into one of two states — committed and
-//! accounted, or absent and declared — never a row without bytes, a file
-//! without a fate, or a gap nobody reports.
+//! Each crash or fault boundary settles as committed-and-accounted or absent-and-declared.
 use std::{
     fs,
     io::Write,
@@ -106,14 +101,11 @@ fn entry(path: &str, digest: Digest, len: u64) -> Entry {
     }
 }
 
-/// An admission gate whose free-space figure the test drives.
 fn probed(free: &Arc<AtomicU64>, marks: Watermarks) -> Admission {
     let probe = Arc::clone(free);
     Admission::with_probe(marks, move || Ok(probe.load(Ordering::Relaxed))).unwrap()
 }
 
-/// `Admission` caches probe results for a second; changing the figure must
-/// let the cache lapse before the next gate consults it.
 fn refresh() {
     std::thread::sleep(Duration::from_millis(1_100));
 }
@@ -147,17 +139,13 @@ fn a_commit_rolled_back_leaves_an_orphan_the_sweep_collects() {
     let path = fx.object_path(fx.tenant, staged.digest());
     let tx = fx.conn.transaction().unwrap();
     assert!(fx.objects.commit(&tx, &staged).unwrap());
-    // The crash lands here: file durable, transaction rolled back, and
-    // the stage that pinned the file is gone with the process.
     tx.rollback().unwrap();
     drop(staged);
     assert!(path.is_file());
 
-    // Recovery reports it; it is not corrupt and no row is missing.
     let report = fx.objects.recover(&fx.conn).unwrap();
     assert_eq!(report.orphans, vec![path.clone()]);
     assert!(report.corrupt.is_empty() && report.missing.is_empty());
-    // Fresh files are never swept — the grace protects an in-flight commit.
     assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 64).unwrap(), 0);
     age(
         &path,
@@ -165,7 +153,6 @@ fn a_commit_rolled_back_leaves_an_orphan_the_sweep_collects() {
     );
     assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 64).unwrap(), 1);
     assert!(!path.exists());
-    // Nothing was ever owed for it.
     assert_eq!(fx.objects.usage(&fx.conn, fx.tenant).unwrap(), 0);
 }
 
@@ -183,7 +170,6 @@ fn a_manifest_commit_rolled_back_leaves_an_orphan_file() {
             &[entry("a", object, 7)],
         )
         .unwrap();
-    // The file was renamed durable; the row insert rolls back with the tx.
     tx.rollback().unwrap();
     let mut stack = vec![fx.dir.path().join("manifests")];
     let mut found = None;
@@ -206,8 +192,6 @@ fn a_manifest_commit_rolled_back_leaves_an_orphan_file() {
     );
     assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 64).unwrap(), 1);
     assert!(!path.exists());
-    // The object the manifest named is still committed — unreferenced, but
-    // inside the reclamation grace, so nothing collects it yet.
     assert_eq!(fx.objects.meta(&fx.conn, fx.tenant, object).unwrap().len, 7);
 }
 
@@ -222,8 +206,6 @@ fn a_chunk_that_landed_without_its_bookkeeping_still_resumes() {
         .unwrap();
     tx.commit().unwrap();
 
-    // First chunk commits; the second's bytes land but its transaction
-    // rolls back — the crash between write and bookkeeping.
     let tx = fx.conn.transaction().unwrap();
     fx.objects
         .put_chunk(&tx, fx.tenant, id, 0, b"abcd", now)
@@ -235,8 +217,6 @@ fn a_chunk_that_landed_without_its_bookkeeping_still_resumes() {
         .unwrap();
     tx.rollback().unwrap();
 
-    // The store claims four bytes while the file holds eight: sealing now
-    // is incomplete, never corrupt — the resume is the client's to drive.
     let status = fx.objects.upload(&fx.conn, fx.tenant, id).unwrap();
     assert_eq!(status.received, 4);
     let tx = fx.conn.transaction().unwrap();
@@ -245,9 +225,6 @@ fn a_chunk_that_landed_without_its_bookkeeping_still_resumes() {
         Err(Error::InvalidInput("upload incomplete"))
     ));
     tx.rollback().unwrap();
-    // Re-sending the lost range converges: the delta rewrites the same
-    // offsets, the range record catches up, and the seal verifies all of
-    // it against the declared length.
     let tx = fx.conn.transaction().unwrap();
     assert_eq!(
         fx.objects
@@ -267,8 +244,6 @@ fn a_chunk_that_landed_without_its_bookkeeping_still_resumes() {
 #[test]
 fn closed_admission_refuses_object_bytes_but_logs_keep_their_floor() {
     let mut fx = fixture();
-    // free - reserve = 500: under `low` (gate closed to discretionary
-    // bytes) but above `floor` (log evidence still flows).
     let free = Arc::new(AtomicU64::new(2_500));
     let admission = Arc::new(probed(
         &free,
@@ -306,18 +281,15 @@ fn closed_admission_refuses_object_bytes_but_logs_keep_their_floor() {
     ));
     tx.rollback().unwrap();
 
-    // The log floor is a lower bar: frames still land while headroom holds.
     let (run, job, attempt) = (RunId::new(), JobId::new(), AttemptId::new());
     logs.append(run, job, attempt, &frame(1, b"kept\n"))
         .unwrap();
-    free.store(300, Ordering::Relaxed); // raw free < floor: even logs refuse
+    free.store(300, Ordering::Relaxed);
     refresh();
     assert!(matches!(
         logs.append(run, job, attempt, &frame(2, b"lost\n")),
         Err(Error::StorageFull)
     ));
-    // A refused frame records no hole it could later fill wrongly: the tail
-    // is exactly what was stored.
     logs.finish(run, job, attempt, 2, &[]).unwrap();
     let tail = logs.tail(run, job, attempt, 0, 10, None).unwrap();
     assert!(tail.complete);
@@ -330,7 +302,6 @@ fn log_frames_carry_binary_and_the_oversized_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let logs = LogStore::open(dir.path()).unwrap();
     let (run, job, attempt) = (RunId::new(), JobId::new(), AttemptId::new());
-    // Every byte value, NULs and invalid UTF-8 included, round-trips intact.
     let binary: Vec<u8> = (0..=255u8).cycle().take(1_024).collect();
     logs.append(run, job, attempt, &frame(1, &binary)).unwrap();
     let tail = logs.tail(run, job, attempt, 0, 10, None).unwrap();
@@ -338,8 +309,6 @@ fn log_frames_carry_binary_and_the_oversized_are_refused() {
     assert_eq!(tail.frames[0].bytes, binary);
     assert!(!tail.complete);
 
-    // A frame past the wire maximum cannot be encoded; the refusal leaves
-    // the sequence untouched so the next valid frame declares the hole.
     let oversized = frame(
         2,
         &vec![0u8; sentinel_protocol::limits::MAX_LOG_FRAME_BYTES + 1],
@@ -363,8 +332,6 @@ fn log_frames_carry_binary_and_the_oversized_are_refused() {
 #[test]
 fn the_log_cap_refuses_and_the_refusal_is_a_declared_gap() {
     let dir = tempfile::tempdir().unwrap();
-    // Two 30-byte payloads fit under a 100-byte cap (each record is
-    // 18 header bytes + payload); the third cannot.
     let logs = LogStore::open_with_limit(dir.path(), 100).unwrap();
     let (run, job, attempt) = (RunId::new(), JobId::new(), AttemptId::new());
     logs.append(run, job, attempt, &frame(1, &[b'a'; 30]))
@@ -375,7 +342,6 @@ fn the_log_cap_refuses_and_the_refusal_is_a_declared_gap() {
         logs.append(run, job, attempt, &frame(3, &[b'c'; 30])),
         Err(Error::InvalidInput("log size"))
     ));
-    // What the cap refused is missing for good: the end marker declares it.
     logs.finish(run, job, attempt, 3, &[]).unwrap();
     assert!(logs.has_end(run, job, attempt));
     let tail = logs.tail(run, job, attempt, 0, 10, None).unwrap();
@@ -399,12 +365,9 @@ fn a_torn_tail_never_reaches_a_reader_and_is_cut_on_reopen() {
             logs.append(run, job, attempt, &frame(i, b"line\n"))
                 .unwrap();
         }
-        // A reader mid-stream pages within its window; it sees complete
-        // records only, in order.
         let tail = logs.tail(run, job, attempt, 0, 2, None).unwrap();
         assert_eq!(tail.frames.len(), 2);
         assert!(!tail.complete);
-        // The crash lands mid-record: half a header past the third frame.
         let seg = attempt_dir.join("seg-000000");
         let torn_at = fs::metadata(&seg).unwrap().len();
         fs::OpenOptions::new()
@@ -413,12 +376,8 @@ fn a_torn_tail_never_reaches_a_reader_and_is_cut_on_reopen() {
             .unwrap()
             .write_all(&[1, 9, 0])
             .unwrap();
-        // A live reader sees the torn bytes as the end of the stream, not
-        // as a record.
         let tail = logs.tail(run, job, attempt, 0, 10, None).unwrap();
         assert_eq!(tail.frames.len(), 3);
-        // Reopening folds the segment back: the torn tail is cut and the
-        // writer continues exactly where the complete prefix ended.
         drop(logs);
         let seg_len = torn_at;
         let logs = LogStore::open(dir.path()).unwrap();
@@ -449,14 +408,10 @@ fn a_lost_end_marker_is_rewritten_from_the_stream() {
         logs.append(run, job, attempt, &frame(1, b"x\n")).unwrap();
         logs.finish(run, job, attempt, 1, &[]).unwrap();
     }
-    // The end record is in the sealed segment but the marker file is lost —
-    // the crash between the rename and the directory sync, or disk loss.
     fs::remove_file(attempt_dir.join("end")).unwrap();
     {
         let logs = LogStore::open(dir.path()).unwrap();
         assert!(!logs.has_end(run, job, attempt));
-        // Touching the writer folds the segment back, sees the end record,
-        // and rewrites the marker; appends still refuse a finished log.
         assert!(matches!(
             logs.append(run, job, attempt, &frame(2, b"late\n")),
             Err(Error::Conflict)
@@ -472,7 +427,6 @@ fn a_lost_end_marker_is_rewritten_from_the_stream() {
 fn foreign_tenant_bytes_are_indistinguishable_from_absent() {
     let mut fx = fixture();
     let digest = fx.put(fx.tenant, b"alice's bytes");
-    // Every read surface answers NotFound under a foreign tenant.
     for result in [
         fx.objects.meta(&fx.conn, fx.other, digest).map(|_| ()),
         fx.objects.open_read(&fx.conn, fx.other, digest).map(|_| ()),
@@ -482,8 +436,6 @@ fn foreign_tenant_bytes_are_indistinguishable_from_absent() {
     ] {
         assert!(matches!(result, Err(Error::NotFound)));
     }
-    // A manifest that names another tenant's committed digest cannot
-    // launder a reference to it — the ref commits only for owned rows.
     let tx = fx.conn.transaction().unwrap();
     assert!(matches!(
         fx.objects.commit_manifest(
@@ -496,7 +448,6 @@ fn foreign_tenant_bytes_are_indistinguishable_from_absent() {
         Err(Error::InvalidInput("uncommitted object"))
     ));
     tx.rollback().unwrap();
-    // And the same digest under its own tenant stays reachable.
     let mut out = Vec::new();
     fx.objects
         .read(&fx.conn, fx.tenant, digest, &mut out)
@@ -504,8 +455,6 @@ fn foreign_tenant_bytes_are_indistinguishable_from_absent() {
     assert_eq!(out, b"alice's bytes");
 }
 
-/// An aged orphan adopted by a dedup stage is not swept between
-/// the stage and its commit.
 #[test]
 fn the_orphan_sweep_never_takes_a_file_a_stage_adopted() {
     let mut fx = fixture();
@@ -519,13 +468,12 @@ fn the_orphan_sweep_never_takes_a_file_a_stage_adopted() {
         )
         .unwrap();
     let digest = orphan.digest();
-    drop(orphan); // its commit never happened
+    drop(orphan);
     let path = fx.object_path(fx.tenant, digest);
     age(
         &path,
         Duration::from_millis(objects::FILE_ORPHAN_GRACE_MS as u64 + 60_000),
     );
-    // The same content again (a rerun): dedup onto the aged file.
     let again = fx
         .objects
         .stage(
@@ -535,7 +483,6 @@ fn the_orphan_sweep_never_takes_a_file_a_stage_adopted() {
             Expect::default(),
         )
         .unwrap();
-    // The maintenance pass runs between the stage and its commit.
     assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 64).unwrap(), 0);
     let tx = fx.conn.transaction().unwrap();
     assert!(fx.objects.commit(&tx, &again).unwrap());
@@ -546,12 +493,10 @@ fn the_orphan_sweep_never_takes_a_file_a_stage_adopted() {
         .read(&fx.conn, fx.tenant, digest, &mut out)
         .unwrap();
     assert_eq!(out, b"orphaned then reused");
-    // Committed, it stays through later sweeps too.
     assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 64).unwrap(), 0);
 }
 
-/// Reclamation commits a row delete, then the same bytes are
-/// staged again before the unlink runs — the unlink keeps the file.
+// A row delete followed by re-staging the same bytes before the unlink runs: the unlink must keep the file.
 #[test]
 fn a_reclaim_unlink_spares_bytes_staged_again_meanwhile() {
     let mut fx = fixture();
@@ -561,7 +506,6 @@ fn a_reclaim_unlink_spares_bytes_staged_again_meanwhile() {
     let reclaimed = fx.objects.reclaim(&tx, later, 256).unwrap();
     tx.commit().unwrap();
     assert_eq!(reclaimed.objects, 1);
-    // Today's identical build streams while the unlink is still pending.
     let again = fx
         .objects
         .stage(
@@ -581,7 +525,6 @@ fn a_reclaim_unlink_spares_bytes_staged_again_meanwhile() {
         .read(&fx.conn, fx.tenant, digest, &mut out)
         .unwrap();
     assert_eq!(out, b"expired yesterday, built again today");
-    // After that commit a stale unlink of the same file is refused too.
     let tx = fx.conn.transaction().unwrap();
     assert_eq!(fx.objects.unlink(&tx, &reclaimed.doomed).unwrap(), 0);
     tx.commit().unwrap();
