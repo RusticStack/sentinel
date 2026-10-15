@@ -727,7 +727,6 @@ impl LogStore {
         if w.ended.is_some() {
             return Err(Error::Conflict);
         }
-        // Persist hole changes before any resend is acked as a duplicate over a forgettable hole.
         persist_holes(w)?;
         if frame.seq <= w.last_seq && !in_hole(&w.holes, frame.seq) {
             sync_dirty(w)?;

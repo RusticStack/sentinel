@@ -115,7 +115,6 @@ impl Drop for Lane {
         let (lock, cv) = &*self.settled;
         *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
         cv.notify_all();
-        // The lane may sleep on the commit notifier instead of the condvar.
         self.store.changes().nudge();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -184,8 +183,6 @@ fn run(
     let mut parked: HashMap<u64, i64> = HashMap::new();
     let mut poison: HashMap<CheckId, u32> = HashMap::new();
     loop {
-        // Read the generation before the stop flag and the outbox: a commit or
-        // shutdown after this point makes the sleep below return at once.
         let seen = store.changes().generation();
         if stop.load(Ordering::Acquire) {
             break;

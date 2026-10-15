@@ -34,7 +34,6 @@ impl Capabilities {
     pub const REFLINK: Capabilities = Capabilities(1 << 5);
     pub const TAILCAT: Capabilities = Capabilities(1 << 6);
     pub const NETWORK_NONE: Capabilities = Capabilities(1 << 7);
-    // Without this bit the controller cannot read an unanswered close as undelivered.
     pub const HANDOFF_ANSWER: Capabilities = Capabilities(1 << 8);
     pub const SECRET_DELIVERY: Capabilities = Capabilities(1 << 9);
 
@@ -73,8 +72,7 @@ impl Arch {
     }
 }
 
-// Postcard is not self-describing: a new trailing Hello field makes every older worker undecodable.
-// The Protocol 7 scheduling extras therefore travel in ClientMessage::Profile instead.
+// Postcard is not self-describing: a new trailing Hello field breaks older workers, so extras go in ClientMessage::Profile.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub protocol_min: ProtocolVersion,

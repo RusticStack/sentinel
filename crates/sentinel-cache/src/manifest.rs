@@ -1,5 +1,3 @@
-//! The `files` listing is a separate blob so lookups never pay for a large listing.
-
 use std::path::Path;
 
 use sentinel_core::{RepoId, TenantId, UnixMillis};
@@ -316,7 +314,6 @@ impl FilesBlob {
         }
         for e in &blob.entries {
             if !valid_relative_path(&e.path) {
-                // Escaping paths must never reach materialization.
                 return Err(Miss::Invalid);
             }
         }

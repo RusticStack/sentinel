@@ -320,7 +320,6 @@ fn run_facts(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Option<R
     let Some((head_sha, repo, forge, trigger)) = row else {
         return Ok(None);
     };
-    // A manual run's inline pipeline is diagnostic and must never satisfy the required aggregate.
     let event_driven = matches!(trigger.as_deref(), Some("push" | "tag" | "pull_request"));
     if forge == 0 || !event_driven {
         return Ok(None);

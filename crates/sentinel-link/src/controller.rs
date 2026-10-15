@@ -160,13 +160,10 @@ const DEFERRED_MAX_AGE: Duration = Duration::from_secs(300);
 enum Received {
     /// The store took it.
     Applied,
-    /// A verdict already waiting for this attempt; a worker resends it until the controller
-    /// counts the attempt as released, and a copy adds nothing.
+    /// A verdict already waiting for this attempt; a resend adds nothing.
     Copy,
-    /// Another message of the attempt is waiting, so this one waits behind it; `kept` is
-    /// `false` when the full queue refused it.
+    /// Waits behind an earlier message of the attempt; `kept` is `false` when the full queue refused it.
     Queued { kept: bool },
-    /// The store failed for a reason that says nothing about the message.
     Transient {
         error: sentinel_store::Error,
         kept: bool,
@@ -880,7 +877,6 @@ impl Inner {
     }
 
     fn placement_pass(&self) {
-        // Below the low watermark no new work is placed: a job must not hold capacity it cannot store output for.
         if !self.objects.admission().is_none_or(|a| a.is_open()) {
             return;
         }
@@ -891,7 +887,6 @@ impl Inner {
             .iter()
             .map(|(w, p)| (*w, Arc::clone(p)))
             .collect();
-        // A peer mid-write on another thread is skipped, never waited for, so one stuck peer cannot block the others.
         peers.retain(|(_, p)| session::is_free(&p.sender));
         if peers.is_empty() {
             return;
@@ -1224,7 +1219,6 @@ impl Inner {
         Ok(Some(scope))
     }
 
-    /// Asked before a terminal write so the writer thread never waits on log I/O.
     fn log_has_end(&self, worker: WorkerId, attempt: AttemptId) -> bool {
         match self.log_scope(worker, attempt) {
             Ok(Some((run, job))) => self.logs.has_end(run, job, attempt),
@@ -1658,7 +1652,6 @@ impl Admission for Inner {
         let Some(secret) = enrollment else {
             return Err(Rejection::NotEnrolled);
         };
-        // Unknown-certificate secret attempts are budgeted before the single writer; Unavailable lets them retry.
         if let Some(source) = source
             && !self.enrollments.allow(source, Instant::now())
         {
