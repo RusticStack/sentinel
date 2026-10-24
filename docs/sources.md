@@ -1,0 +1,290 @@
+# Sources: bindings, credentials and forge associations
+
+A **repository** in Sentinel is a tenant-owned row. A **source binding** is
+what makes that repository executable and fetchable: an administrator-approved
+clone URL, the refs runs may use, the pipeline path, a credential reference,
+and — optionally — the forge installation the repository belongs to. A
+repository with no binding runs in manual mode: a dispatch names its own
+remote and gets no credential.
+
+The worker fetches a manual remote with its own process identity, outside
+any job container, so the remote a client may name there is narrow: an
+unauthenticated `https://host[:port]/path` in the same canonical grammar a
+binding uses. `POST …/runs` on an unbound repository answers `400
+invalid_request` ("invalid manual source remote") — after authorization, so
+an outsider learns nothing — for a local path or `file://` URL (other
+repositories, mirrors and workspaces on the worker host), `ssh://` or scp
+syntax (the worker account's own SSH identity and configuration), `git://`,
+plain `http://`, remote helpers (`ext::`) and userinfo. A bound repository's
+dispatch must name exactly its binding.
+
+**Manual destinations are public names.** Because the worker fetches an
+unbound remote from inside the deployment's network, the host must also be a
+public DNS name: an IP literal in any notation (`169.254.169.254`,
+`2130706433`, `0x7f.0.0.1`), a bare hostname (`metadata`) and private-use
+suffixes (`.local`, `.internal`, `.lan`, `.home`, `.corp`, `.localhost`, …)
+are refused at admission with the same `invalid_request`. The worker applies
+the policy itself, so a spec that bypassed the API meets it too: it resolves
+the name, refuses it unless **every** address is globally routable (not
+loopback, link-local, private, shared, multicast, reserved, or an IPv6 form
+embedding one), and then pins Git's connection to exactly those addresses
+(`http.curloptResolve`), so a second DNS answer cannot rebind the name after
+the check. The option needs Git 2.37; an older or unreadable Git refuses
+unbound remotes rather than fetch them unpinned. A deployment that really
+needs an internal manual destination lists its exact authorities,
+comma-separated, in `SENTINEL_MANUAL_DESTINATIONS` (for example
+`https://git.corp.internal:8443`) in **both** the controller's and the
+worker's environment; a listed authority skips the check and the pin. Every
+refusal or failure of an unbound remote surfaces as one message ("the manual
+remote was refused or could not be fetched") — never Git's own stderr — so
+neither the policy nor the worker's network is an oracle. A bound
+repository's verdicts keep Git's bounded excerpt. Independently, every Git
+fetch that carries no source access runs with `protocol.allow=never` plus
+only `https` and local paths (worker-local mirrors and tests use the
+latter), no redirects and no credential helper, so even a spec that bypassed
+the API could not reach `ssh`, `git://` or plain HTTP.
+
+## Two transports, one authority
+
+| | Generic binding | GitHub App association |
+|---|---|---|
+| Remote | `https://host[:port]/path` or `ssh://user@host[:port]/path` | `https://github.com/owner/repo.git` |
+| Credential | `Public`, an HTTPS username/token, or an SSH deploy key | short-lived App installation token, `contents: read` |
+| Trust | PEM roots (HTTPS) or `known_hosts` lines (SSH) | GitHub's public CA |
+| Lifecycle | explicit bind/rotate/revoke with compare-and-set versions | App + installation lifecycle, checked live |
+
+Both paths are approved by the same deployment destination allowlist
+(`<data_dir>/source-destinations.json`): transport, host and explicit port,
+with no userinfo, query or fragment. A run's spec can never substitute a
+remote that is not the binding's exact URL, so neither pipeline YAML nor an
+event can point a job at somebody else's server.
+
+Refs are limited to `refs/heads/` and `refs/tags/`; a trailing `*` in an
+allowed ref is a prefix match (`refs/tags/v*`). The bound ref on a run must be
+allowed for the binding.
+
+## Credentials are sealed, delivered per attempt, and never persisted
+
+The credential reference is **not** a run-spec field. It is sealed with the
+key-outside-database mechanism ([sealed storage](sealed-storage.md), the same
+`master.key` as [second-factor seeds](local-authentication.md)) and its associated data binds the ciphertext to
+*(tenant, repository, version)*: a row copied to another repository or tenant
+fails to open. The **version** advances on every bind, rotate and revoke, and
+mutations are compare-and-set, so two administrators cannot silently overwrite
+each other.
+
+`admin key create` provisions `<data_dir>/master.key`; a deployment that
+never binds a credential never needs it. A stolen database therefore yields no deploy token and no private key, and a
+rotated credential's ciphertext is replaced, not appended to.
+
+Delivery is scoped to one attempt:
+
+1. The worker asks for the spec (`NeedSpec`) **after** its `Ack` is on the
+   wire, so the attempt is acknowledged under a live lease.
+2. The controller re-checks, in the database, that the attempt is held by
+   that worker under its current fence, that the lease has not expired, that
+   the job is preparing or running, that cancellation is not desired, and that
+   the tenant and pool may still run it. Any failure is `NoSpec`.
+3. The credential is opened and sent as a `Source` message ahead of the spec
+   chunks, together with the event facts the spec's expressions may read —
+   **protocol 3**. A worker below protocol 3 is served `NoSpec` instead:
+   checking out a bound repository without its credential would either fail
+   or, worse, succeed against a public mirror, and a worker that cannot decode
+   the context must not misread it.
+
+The token never reaches a URL, `.git/config`, the job environment or a log
+line. Errors carry one bounded, control-character-free line of Git/SSH output
+with the credential itself replaced before it can be interpolated.
+
+## Checkout on the worker
+
+The controller issues an access that expires 60 s after issue, and that
+instant is on the controller's wall clock. A worker never compares it with its
+own clock (a worker minutes ahead would otherwise drop the link on every bound
+spec): on receipt it checks only the access's shape and restates the expiry as
+`now + 12 min` on its own clock — one checkout deadline (`CHECKOUT_TIMEOUT`,
+10 min) plus two minutes before the checkout starts — so the direct fallback
+after a mirror lock wait or timeout still holds a valid access. The access
+exists only in the attempt's in-memory context, bounded by the attempt's fence
+and lease, and is never persisted or re-sent.
+
+`checkout::checkout_authorized` validates the access object (expiry, exact
+remote, allowed ref) before starting Git, then:
+
+- **HTTPS with CA trust** writes the PEM roots to an owner-only file outside
+  the workspace and passes `GIT_SSL_CAINFO`; an SSH transport additionally
+  writes `known_hosts` and refuses unless it has one.
+- **HTTPS credentials** use the askpass helper.
+- **SSH deploy keys** write the private key `0600` and an `GIT_SSH` wrapper
+  that pins `ssh -F /dev/null`, `BatchMode`, `IdentitiesOnly`,
+  `StrictHostKeyChecking=yes` and `UserKnownHostsFile` to the bound trust, so
+  nothing from the host's SSH configuration or agent is consulted.
+- Git is pinned to a single protocol (`protocol.allow=never` plus exactly one
+  of `protocol.https.allow=always` / `protocol.ssh.allow=always`), follow
+  redirects are off, and the credential helper list is empty.
+
+Everything the checkout installs lives in a sibling `*-askpass` directory
+created `0700` and removed on every path, including failure. On the worker
+the fetch itself usually runs against the repository's [local
+mirror](mirrors.md) — the same access object authorizes it, fetched under
+the mirror's serialized writer lock, with only the binding's allowed refs
+ever becoming mirror refs.
+
+## GitHub App association
+
+`<data_dir>/github-app.json` names the App and an absolute, owner-only PEM
+key file:
+
+```json
+{"app_id": 1234, "private_key_file": "/etc/sentinel/github-app.pem"}
+```
+
+The App key is read at startup (and by `admin source`), never stored in
+SQLite. For an associated repository, the controller:
+
+1. `GET /app/installations/{id}` with a `RS256` JWT and requires the account
+   is the one bound, the installation is not suspended, `checks: write` is
+   present and `contents` is at least readable. Unchanged `lifecycle_version`
+   is compared after the round trip, so a webhook observed in the meantime is
+   never overwritten by a stale response.
+2. `POST /app/installations/{id}/access_tokens` with `repository_ids` (the
+   immutable numeric ID) and `permissions: {contents: read}` — explicitly
+   narrowed, never inherited from the App.
+3. `GET /repositories/{id}` **with that token** and requires the ID, the
+   owner's account ID and the exact clone URL to match what was bound. A
+   rename is a mismatch, not a silent rebind.
+
+Only then is the spec released. Installation lifecycle is a local snapshot
+refreshed from GitHub's API (`admin source refresh-installation`) and
+invalidated by `admin source remove-installation`; a webhook is a hint
+to refresh, never authority to revive an installation that was removed or
+transferred.
+
+The same access is what event resolution uses ([intake](intake.md)): before it
+reads the pipeline from the bound remote, the controller mints the sealed
+credential or the App token exactly as above, rechecks the binding's version
+and lifecycle after any round trip, and then discards the credential with the
+resolution's scratch directory. A generic repository's events never touch the
+App, and a forge-associated one never falls back to a generic credential.
+
+Every controller-side fetch — worker spec delivery, event resolution and ref
+polling — rechecks the binding against the destination allowlist as it is
+*now*, not only at bind time: narrowing `source-destinations.json` stops
+resolution with `failed:destination_refused` and backs a poll off with the
+same reason, before any credential is minted or remote contacted. A binding
+that authorizes nothing any more — its tenant suspended, its installation
+suspended or without the permissions it needs (`access_removed`), the binding
+revoked (including a `repository` rename that revoked it) — is a typed answer
+that settles or parks that one delivery or poll; it never fails a lane's pass
+for other tenants. A credential rotation that commits between the lookup and
+the issuance is retried under a fresh lookup (`retried:source_changed`), and
+a store fault while issuing is transient (`retried:store_unavailable`);
+only a sealed credential that cannot be opened is a permanent
+`failed:source_unavailable`. Version and ciphertext are read in one statement.
+
+## Commands
+
+These host-local commands are authorized by holding the database file, not by `--actor`, which is only the attribution recorded in the audit trail; adding an actor check expecting it to gate access would not change who can run them. The authenticated tenant-administrator path is the API route `POST /tenants/{slug}/repos`.
+
+```sh
+# A tenant-owned repository row, then its binding
+sentinel admin source create --data-dir "$DATA" --actor usr_... \
+  --tenant tnt_... --name app
+printf '%s' '{"binding":{"remote":"https://git.example:8443/team/repo.git",
+  "allowed_refs":["refs/heads/main"],"pipeline_path":".sentinel.yml",
+  "trust":"<pem>"},"credential":{"Https":{"username":"deploy","secret":"..."}},
+  "forge":null}' | sentinel admin source bind --data-dir "$DATA" \
+  --actor usr_... --repo rep_... --expected 0
+sentinel admin source show   --data-dir "$DATA" --actor usr_... --repo rep_...
+sentinel admin source revoke --data-dir "$DATA" --actor usr_... --repo rep_... --expected 1
+
+# The repository's intake hook secret (shown once; rotates on the next call)
+sentinel admin source hook-token --data-dir "$DATA" --actor usr_... --repo rep_...
+sentinel admin source hook-token --data-dir "$DATA" --actor usr_... --repo rep_... --revoke
+
+# Opt-in ref polling; the first poll records a baseline and admits nothing
+sentinel admin source poll --data-dir "$DATA" --actor usr_... --repo rep_... \
+  --interval 60s --refs 'refs/heads/main,refs/tags/v*'
+sentinel admin source poll --data-dir "$DATA" --actor usr_... --repo rep_... --disable
+
+# GitHub App lifecycle (platform administration)
+sentinel admin source refresh-installation --data-dir "$DATA" --actor usr_... \
+  --external-id 12345678 --expected 0
+sentinel admin source bind-installation   --data-dir "$DATA" --actor usr_... \
+  --installation ins_... --tenant tnt_...
+sentinel admin source remove-installation --data-dir "$DATA" --actor usr_... \
+  --installation ins_...
+# Make an organization tenant GitHub-backed (members = whoever GitHub confirms
+# for their linked account), or app-managed again with --off
+sentinel admin source github-backing --data-dir "$DATA" --actor usr_... \
+  --tenant tnt_... [--off]
+```
+
+A tenant whose installation is a GitHub **organization** can be made
+GitHub-backed: its members and their per-repository access then come from
+GitHub rather than from invitations
+([GitHub sign-in](github-sign-in.md#github-backed-organizations)). That needs
+the organization permission **Members: read** on the App and the
+`organization`, `membership`, `member` and `team` webhook events.
+
+`sentinel admin intake list --data-dir "$DATA" --repo rep_… [--state …]` shows
+the newest event deliveries and `admin intake purge --older-than 7d` retires
+settled ones ([intake](intake.md)). The `post-receive` hook and its relay live
+in `examples/hooks/`, and `admin source poll` opts a bound repository into
+`git ls-remote` observation where no hook can be installed
+([intake](intake.md#ref-polling)). A GitHub App installation is bound with
+`admin source bind-installation`; its webhook secret is the operator's to set
+in `<data_dir>/github-webhook.json`.
+
+`show` reports the binding, version, revocation and forge association —
+metadata only, never credential material. `bind` reads its JSON from standard
+input; there is no argument form that would put a deploy token in the process
+list or shell history. The CLI runs on the controller's own host, so its
+authority is the same filesystem access that already lets an operator open the
+database: `--actor` names the account the audit attributes the change to, and
+it is recorded verbatim, not re-authorized. The store also carries a
+credentialed path (`Authority::credential`) that rechecks administration of
+*that* tenant through the live authorization layer; the store tests exercise
+both.
+
+Deploy credentials must be provisioned **read-only** at the Git provider.
+Sentinel stores and delivers them, and cannot make a write-capable token safe.
+
+## Compatibility
+
+Migration 017 adds `source_bindings` and `source_audit` and extends
+`installations`; migration 018 adds `source_intake_tokens` and
+`webhook_deliveries` ([intake](intake.md)); migration 019 adds the resolved
+delivery states and per-run provenance ([intake](intake.md)). Repositories
+stay unbound until bound. Protocol 2 adds the `Source` message and protocol 3
+the event context; a worker below protocol 3 is served `NoSpec`. Intake uses
+`POST /api/v1/hooks/github` and `POST /api/v1/intake/{repo}`. See
+[compatibility](compatibility.md).
+
+## Verification
+
+- `crates/sentinel-store/tests/sources.rs`: binding without a forge row;
+  sealed ciphertext unusable from another repository/tenant; rotation and
+  revocation with compare-and-set; ref and destination policy; installation
+  lifecycle including suspension, transfer and deletion; migration from
+  version 16 preserving repositories with no invented binding.
+- `crates/sentinel-store/tests/intake.rs`: hook secrets and the delivery
+  lifecycle ([intake](intake.md#verification)).
+- `crates/sentinel-worker/tests/checkout.rs`: a private HTTPS checkout against
+  a loopback server with CA trust, a rotated credential and a removed CA, with
+  no credential file left behind; a real `sshd` deployment-key checkout with
+  pinned host trust and a refused wrong host, both proving the private
+  directory is removed and the key never reaches `.git/config`.
+- `crates/sentinel-link/tests/source_delivery.rs`: a bound source reaches a
+  protocol-2 worker with its credential only after acknowledgement, its
+  validity restated on the worker's clock to cover a whole checkout, and a
+  protocol-1 worker receives `NoSpec` rather than running without it.
+- `crates/sentinel-store/tests/sources.rs`, `crates/sentinel-protocol`
+  (`source.rs` unit tests) and `crates/sentinel-git/tests/manual_destination.rs`:
+  manual remotes naming IP literals, bare hostnames or private suffixes are
+  refused at admission and at the worker with one message; address
+  classification, Git version parsing and the unreadable-`HOME` guarantee are
+  unit tested.
+- `crates/sentinel-github` unit tests: installation identity, account type,
+  suspension, permission validity, a read-only scoped token, lifetime bounds
+  and redacted debug output.

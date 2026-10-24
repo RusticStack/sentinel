@@ -1,0 +1,42 @@
+# The ripgrep pilot's Sentinel pipeline (B06/B10): ci.yml's `test` job,
+# stable x86_64 Linux row, same cargo commands. Crates come from crates.io
+# through an egress worker; the registry and target directory are Sentinel
+# caches. The zsh-completion step stays on Actions (the image has no zsh).
+schema: 1
+on:
+  push: {branches: [master]}
+  pull_request: {branches: [master]}
+jobs:
+  test-stable:
+    image: docker.io/library/rust:1.99.1-trixie@sha256:a5ab4292e80567dc92f642e2a7d63773ebd695b82b56e8f06dc8d6ecc5600b76
+    runs_on: { labels: [egress] }
+    resources: { cpu: 10, memory: 26GiB }
+    timeout: 90m
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_HOME: /cache/cargo-home
+      CARGO_TARGET_DIR: /cache/target
+      RUST_BACKTRACE: "1"
+      HOME: /tmp
+    cache:
+      - name: registry
+        class: downloads
+        key: "rg-registry-${{ hash_files('Cargo.lock') }}"
+        paths: [/cache/cargo-home]
+      - name: target
+        class: compiler
+        key: "rg-target-${{ hash_files('Cargo.lock') }}"
+        paths: [/cache/target]
+    steps:
+      - id: build
+        run: cargo build --verbose --workspace
+      - id: build-pcre2
+        run: cargo build --verbose --workspace --features pcre2
+      - id: test-index
+        run: cargo test --verbose --workspace --features unstable-index
+      - id: test-pcre2
+        run: cargo test --verbose --workspace --features pcre2
+      - id: print-hostname
+        run: cargo test --manifest-path crates/cli/Cargo.toml --lib print_hostname -- --nocapture
+      - id: available-shorts
+        run: cargo test --bin rg flags::defs::tests::available_shorts -- --nocapture

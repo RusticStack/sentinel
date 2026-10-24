@@ -1,0 +1,3846 @@
+use std::{
+    sync::{Arc, Barrier},
+    thread,
+    time::Duration,
+};
+
+use sentinel_core::{
+    AttemptId, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
+    auth::{Namespace, Permissions as P, Principal},
+};
+use sentinel_link::{controller::Controller, identity::Identity};
+use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
+use sentinel_protocol::{
+    logs::{Frame, Stream},
+    negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion},
+    source::{Binding, Credential},
+};
+use sentinel_store::{
+    Durability, Store, artifacts,
+    auth::{self, Authority, NamespaceKind, provisioning},
+    dispatch::{self, Capacity},
+    intake, local_auth,
+    logs::LogStore,
+    objects::{Entry, Expect, Kind, Objects},
+    registration, runs,
+    sources::{self, Update},
+    sources_forge,
+    tenancy::{self, PoolKind},
+    tokens::{self, Grant},
+    workers::{self, Presentation},
+};
+
+const DIGEST: &str = "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
+const WEBHOOK_SECRET: &[u8] = b"a-webhook-secret-value";
+const GITHUB_REPO_ID: u64 = 91;
+
+struct Deployment {
+    _dir: tempfile::TempDir,
+    store: Arc<Store>,
+    logs: Arc<LogStore>,
+    _controller: Controller,
+    server: Option<sentinel_api::Server>,
+    base: String,
+    token: String,
+    hook_token: String,
+    tenant: TenantId,
+    repo: RepoId,
+    github_repo: RepoId,
+    intake_repo: RepoId,
+    root: UserId,
+}
+
+fn deployment() -> Deployment {
+    deployment_with(local_auth::Policy::default())
+}
+
+fn deployment_with(sessions: local_auth::Policy) -> Deployment {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
+    let logs = Arc::new(LogStore::open(dir.path().join("logs")).unwrap());
+    let key_path = dir.path().join("master.key");
+    sentinel_auth::sealed::Key::create(&key_path).unwrap();
+    let key = sentinel_auth::sealed::Key::load(&key_path).unwrap();
+    let (tenant, repo, github_repo, intake_repo, pool) = (
+        TenantId::new(),
+        RepoId::new(),
+        RepoId::new(),
+        RepoId::new(),
+        PoolId::new(),
+    );
+    let root = local_auth::bootstrap(
+        &store,
+        "root",
+        "Root",
+        b"correct horse battery staple",
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let now = UnixMillis::now();
+    store
+        .writer()
+        .write(move |tx| {
+            auth::create_namespace(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                Namespace::parse("acme").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )?;
+            auth::set_membership(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                root,
+                sentinel_core::auth::Role::TenantAdmin,
+            )?;
+            auth::create_repo(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                repo,
+                "app",
+                now,
+            )?;
+            auth::create_repo(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                github_repo,
+                "widget",
+                now,
+            )?;
+            auth::create_repo(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                intake_repo,
+                "hooked",
+                now,
+            )?;
+            let generic = Binding {
+                remote: "https://git.example:8443/team/repo.git".into(),
+                allowed_refs: vec!["refs/heads/main".into()],
+                pipeline_path: ".sentinel.yml".into(),
+                trust: String::new(),
+            };
+            sources::bind(
+                tx,
+                Authority::HostLocal,
+                Some(root),
+                Update {
+                    repo: intake_repo,
+                    expected: 0,
+                    binding: &generic,
+                    credential: &Credential::Https {
+                        username: "deploy".into(),
+                        secret: "deploy-token".into(),
+                    },
+                    forge: None,
+                },
+                &["https://git.example:8443".into()],
+                &key,
+                now,
+            )?;
+            let installation = sources_forge::refresh(
+                tx,
+                sources_forge::Snapshot {
+                    external_id: 42,
+                    account_id: 73,
+                    login: "account",
+                    personal: false,
+                    suspended: false,
+                    permissions_valid: true,
+                    expected: 0,
+                },
+                now,
+            )?;
+            registration::bind_installation_trusted(tx, installation, tenant, now)?;
+            let forge = Binding {
+                remote: "https://github.com/account/widget.git".into(),
+                allowed_refs: vec!["refs/heads/main".into()],
+                pipeline_path: ".sentinel.yml".into(),
+                trust: String::new(),
+            };
+            sources::bind(
+                tx,
+                Authority::HostLocal,
+                Some(root),
+                Update {
+                    repo: github_repo,
+                    expected: 0,
+                    binding: &forge,
+                    credential: &Credential::Public,
+                    forge: Some((installation, GITHUB_REPO_ID)),
+                },
+                &["https://github.com".into()],
+                &key,
+                now,
+            )?;
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                pool,
+                "builders",
+                PoolKind::Dedicated(tenant),
+                now,
+            )
+        })
+        .unwrap();
+    let hook_token = {
+        let secret = store
+            .writer()
+            .write(move |tx| intake::issue_token(tx, Authority::HostLocal, intake_repo, now))
+            .unwrap();
+        intake::hook_token_text(&secret)
+    };
+    let granted = tokens::provision(
+        &store,
+        Grant {
+            user: root,
+            name: "test",
+            permissions: P::ALL,
+            tenant: None,
+            repo: None,
+            lifetime_ms: 60_000,
+        },
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let objects = Arc::new(Objects::open(dir.path()).unwrap());
+    let api_secret_key = Arc::new(sentinel_auth::sealed::Key::load(&key_path).unwrap());
+    let controller = Controller::start(
+        Arc::clone(&store),
+        Arc::clone(&logs),
+        Arc::clone(&objects),
+        Identity::generate("controller").unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
+    let server = sentinel_api::Server::start(sentinel_api::Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        store: Arc::clone(&store),
+        logs: Arc::clone(&logs),
+        objects,
+        controller: controller.handle(),
+        secret_key: Some(api_secret_key),
+        sessions,
+        github_webhook_secret: Some(Arc::from(WEBHOOK_SECRET)),
+        intake: None,
+        public_url: None,
+        github_sign_in: None,
+        trusted_proxies: sentinel_api::TrustedProxy::loopback(),
+    })
+    .unwrap();
+    let base = format!("http://{}", server.local_addr());
+    let _ = provisioning::insert_human;
+    Deployment {
+        _dir: dir,
+        store,
+        logs,
+        _controller: controller,
+        server: Some(server),
+        base,
+        token: sentinel_auth::token::format(&granted.secret),
+        hook_token,
+        tenant,
+        repo,
+        github_repo,
+        intake_repo,
+        root,
+    }
+}
+
+impl Drop for Deployment {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.take() {
+            server.shutdown();
+        }
+    }
+}
+
+fn call(
+    d: &Deployment,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    auth: Option<&str>,
+    extra: &[(&str, &str)],
+) -> (u16, serde_json::Value) {
+    let url = format!("{}{path}", d.base);
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let mut request = match method {
+        "GET" => agent.get(&url).force_send_body(),
+        "POST" => agent.post(&url),
+        _ => unreachable!(),
+    };
+    if let Some(auth) = auth {
+        request = request.header("authorization", auth);
+    }
+    for (k, v) in extra {
+        request = request.header(*k, *v);
+    }
+    let response = match body {
+        Some(body) => request
+            .header("content-type", "application/json")
+            .send(body.to_string().as_bytes())
+            .unwrap(),
+        None => request.send_empty().unwrap(),
+    };
+    let status = response.status().as_u16();
+    let text = response.into_body().read_to_string().unwrap();
+    let json = if text.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+    };
+    (status, json)
+}
+
+fn call_bytes(
+    d: &Deployment,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    auth: &str,
+    extra: &[(&str, &str)],
+) -> (u16, serde_json::Value) {
+    let url = format!("{}{path}", d.base);
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let mut request = match method {
+        "POST" => agent.post(&url),
+        "PUT" => agent.put(&url),
+        "DELETE" => agent.delete(&url).force_send_body(),
+        _ => unreachable!(),
+    }
+    .header("authorization", auth)
+    .header("content-type", "application/octet-stream");
+    for (key, value) in extra {
+        request = request.header(*key, *value);
+    }
+    let response = request.send(body).unwrap();
+    let status = response.status().as_u16();
+    let text = response.into_body().read_to_string().unwrap();
+    let json = if text.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+    };
+    (status, json)
+}
+
+fn bearer(d: &Deployment) -> String {
+    format!("Bearer {}", d.token)
+}
+
+fn member_bearer(d: &Deployment, name: &'static str) -> String {
+    let (root, tenant) = (d.root, d.tenant);
+    let user = UserId::new();
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            provisioning::insert_human(tx, user, name, false, now)?;
+            let admin = Principal::new(root, P::ALL, None, None);
+            auth::set_membership(
+                tx,
+                admin,
+                tenant,
+                user,
+                sentinel_core::auth::Role::TenantAdmin,
+            )
+        })
+        .unwrap();
+    let granted = tokens::provision(&d.store, Grant::new(user, name, P::READ), now).unwrap();
+    format!("Bearer {}", sentinel_auth::token::format(&granted.secret))
+}
+
+const PIPELINE: &str = "schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+    steps: [{ id: s, run: 'true' }]
+  test:
+    image: docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+    needs: [build]
+    steps: [{ id: s, run: 'true' }]
+";
+
+fn dispatch_body() -> serde_json::Value {
+    serde_json::json!({
+        "pipeline": PIPELINE,
+        "source": { "repo": "https://github.com/o/r.git", "sha": "0123456789abcdef0123456789abcdef01234567", "ref": "main" }
+    })
+}
+
+#[test]
+fn credentials_are_required_and_errors_are_structured() {
+    let d = deployment();
+    let (status, body) = call(&d, "GET", "/api/v1/me", None, None, &[]);
+    assert_eq!(status, 401);
+    assert_eq!(body["schema"], "sentinel.error/1");
+    assert_eq!(body["code"], "unauthenticated");
+    assert_eq!(body["retryable"], false);
+    let (status, body) = call(&d, "GET", "/api/v1/me", None, Some("Bearer sntl_nope"), &[]);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (401, Some("unauthenticated"))
+    );
+    let (status, body) = call(&d, "GET", "/api/v1/me", None, Some(&bearer(&d)), &[]);
+    assert_eq!(status, 200);
+    assert_eq!(body["user"], d.root.to_string());
+    assert_eq!(body["via"], "bearer");
+    assert_eq!(body["super_admin"], true);
+    let (status, body) = call(&d, "GET", "/api/v1/nope", None, Some(&bearer(&d)), &[]);
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    let (status, _) = call(&d, "GET", "/api/v1/health", None, None, &[]);
+    assert_eq!(status, 200);
+    let (status, page) = call(&d, "GET", "/", None, None, &[]);
+    assert_eq!((status, page["code"].as_str()), (404, Some("not_found")));
+}
+
+#[test]
+fn secret_http_writes_are_versioned_idempotent_and_metadata_only() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let path = "/api/v1/tenants/acme/secrets/ACCESS_TOKEN";
+    let value = b"binary-secret-\xff";
+    let create_headers = [
+        ("if-match", "0"),
+        ("idempotency-key", "create-access-token"),
+    ];
+
+    let (status, created) = call_bytes(&d, "PUT", path, value, &auth, &create_headers);
+    assert_eq!(status, 200);
+    assert_eq!(created["secret"]["version"], 1);
+    assert_eq!(created["secret"]["active"], true);
+    assert!(
+        !serde_json::to_string(&created)
+            .unwrap()
+            .contains("binary-secret")
+    );
+
+    let (status, replay) = call_bytes(&d, "PUT", path, value, &auth, &create_headers);
+    assert_eq!(status, 200);
+    assert_eq!(replay, created);
+
+    let changed = [
+        ("if-match", "0"),
+        ("idempotency-key", "create-access-token"),
+    ];
+    let (status, conflict) = call_bytes(&d, "PUT", path, b"different-secret", &auth, &changed);
+    assert_eq!(status, 422);
+    assert_eq!(conflict["code"], "idempotency_mismatch");
+    assert!(
+        !serde_json::to_string(&conflict)
+            .unwrap()
+            .contains("different-secret")
+    );
+
+    let stale = [("if-match", "0"), ("idempotency-key", "stale-access-token")];
+    assert_eq!(
+        call_bytes(&d, "PUT", path, b"replacement", &auth, &stale).0,
+        409
+    );
+
+    let rotate = [
+        ("if-match", "1"),
+        ("idempotency-key", "rotate-access-token"),
+    ];
+    let (status, rotated) = call_bytes(&d, "PUT", path, b"replacement", &auth, &rotate);
+    assert_eq!(status, 200);
+    assert_eq!(rotated["secret"]["version"], 2);
+
+    let (status, listed) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/secrets?limit=100",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(listed["secrets"][0]["name"], "ACCESS_TOKEN");
+    assert!(
+        !serde_json::to_string(&listed)
+            .unwrap()
+            .contains("replacement")
+    );
+
+    let delete_headers = [
+        ("if-match", "2"),
+        ("idempotency-key", "delete-access-token"),
+    ];
+    let (status, deleted) = call_bytes(&d, "DELETE", path, b"", &auth, &delete_headers);
+    assert_eq!(status, 200);
+    assert_eq!(deleted["secret"]["active"], false);
+
+    let (root, tenant) = (d.root, d.tenant);
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            let other = sentinel_core::UserId::new();
+            let admin = Principal::new(root, P::ALL, None, None);
+            auth::provisioning::insert_human(tx, other, "Other admin", false, now)?;
+            auth::set_membership(
+                tx,
+                admin,
+                tenant,
+                other,
+                sentinel_core::auth::Role::TenantAdmin,
+            )?;
+            auth::remove_membership(tx, admin, tenant, root, now)
+        })
+        .unwrap();
+    let (status, _) = call_bytes(&d, "PUT", path, value, &auth, &create_headers);
+    assert_eq!(status, 404, "a saved response cannot outlive its authority");
+}
+
+#[test]
+fn secret_import_is_atomic_and_replays_metadata_only() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let secret_path = "/api/v1/tenants/acme/secrets/DB_PASS";
+    let create = [("if-match", "0"), ("idempotency-key", "initial-db-pass")];
+    assert_eq!(
+        call_bytes(&d, "PUT", secret_path, b"initial", &auth, &create).0,
+        200
+    );
+
+    let import_path = "/api/v1/tenants/acme/secrets/import";
+    let body = b"DB_PASS=rotated\nAPI_KEY=new-key\n";
+    let stale = [
+        ("if-match", "DB_PASS=1,API_KEY=9"),
+        ("idempotency-key", "atomic-secret-import"),
+    ];
+    let (status, failure) = call_bytes(&d, "POST", import_path, body, &auth, &stale);
+    assert_eq!(status, 409);
+    assert!(!serde_json::to_string(&failure).unwrap().contains("rotated"));
+
+    let (status, db_pass) = call(&d, "GET", secret_path, None, Some(&auth), &[]);
+    assert_eq!(status, 200);
+    assert_eq!(db_pass["secret"]["version"], 1);
+    assert_eq!(
+        call(
+            &d,
+            "GET",
+            "/api/v1/tenants/acme/secrets/API_KEY",
+            None,
+            Some(&auth),
+            &[],
+        )
+        .0,
+        404
+    );
+
+    let expected = [
+        ("if-match", "DB_PASS=1,API_KEY=0"),
+        ("idempotency-key", "atomic-secret-import"),
+    ];
+    let (status, imported) = call_bytes(&d, "POST", import_path, body, &auth, &expected);
+    assert_eq!(status, 200);
+    assert_eq!(imported["secrets"].as_array().unwrap().len(), 2);
+    assert!(
+        !serde_json::to_string(&imported)
+            .unwrap()
+            .contains("rotated")
+    );
+    let (status, replay) = call_bytes(&d, "POST", import_path, body, &auth, &expected);
+    assert_eq!(status, 200);
+    assert_eq!(replay, imported);
+}
+
+#[test]
+fn concurrent_secret_import_retries_and_version_races_are_atomic() {
+    fn request(
+        base: String,
+        auth: String,
+        barrier: Arc<Barrier>,
+        body: &'static [u8],
+        expected: &'static str,
+        idempotency: &'static str,
+    ) -> (u16, serde_json::Value) {
+        barrier.wait();
+        let response = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .build(),
+        )
+        .post(&format!("{base}/api/v1/tenants/acme/secrets/import"))
+        .header("authorization", &auth)
+        .header("content-type", "application/octet-stream")
+        .header("if-match", expected)
+        .header("idempotency-key", idempotency)
+        .send(body)
+        .unwrap();
+        let status = response.status().as_u16();
+        let text = response.into_body().read_to_string().unwrap();
+        (status, serde_json::from_str(&text).unwrap())
+    }
+
+    let d = deployment();
+    let auth = bearer(&d);
+    let base = d.base.clone();
+    let barrier = Arc::new(Barrier::new(3));
+    let retries: Vec<_> = [0, 1]
+        .into_iter()
+        .map(|_| {
+            let (base, auth, barrier) = (base.clone(), auth.clone(), Arc::clone(&barrier));
+            thread::spawn(move || {
+                request(
+                    base,
+                    auth,
+                    barrier,
+                    b"RACE_RETRY=one-value\n",
+                    "RACE_RETRY=0",
+                    "same-import-retry",
+                )
+            })
+        })
+        .collect();
+    barrier.wait();
+    let replies: Vec<_> = retries
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(replies[0].0, 200);
+    assert_eq!(replies[1].0, 200);
+    assert_eq!(replies[0].1, replies[1].1);
+    assert!(
+        replies
+            .iter()
+            .all(|(_, body)| !body.to_string().contains("one-value"))
+    );
+
+    let barrier = Arc::new(Barrier::new(3));
+    let competitors: Vec<_> = [
+        (
+            b"RACE_LEFT=alpha\nRACE_RIGHT=bravo\n" as &'static [u8],
+            "import-left",
+        ),
+        (
+            b"RACE_LEFT=charlie\nRACE_RIGHT=delta\n" as &'static [u8],
+            "import-right",
+        ),
+    ]
+    .into_iter()
+    .map(|(body, idempotency)| {
+        let (base, auth, barrier) = (base.clone(), auth.clone(), Arc::clone(&barrier));
+        thread::spawn(move || {
+            request(
+                base,
+                auth,
+                barrier,
+                body,
+                "RACE_LEFT=0,RACE_RIGHT=0",
+                idempotency,
+            )
+        })
+    })
+    .collect();
+    barrier.wait();
+    let replies: Vec<_> = competitors
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(
+        replies.iter().filter(|(status, _)| *status == 200).count(),
+        1
+    );
+    assert_eq!(
+        replies.iter().filter(|(status, _)| *status == 409).count(),
+        1
+    );
+    assert!(replies.iter().all(|(_, body)| {
+        let body = body.to_string();
+        !body.contains("alpha")
+            && !body.contains("bravo")
+            && !body.contains("charlie")
+            && !body.contains("delta")
+    }));
+
+    let (retry_version, race_rows): (i64, (i64, i64, i64)) = d
+        .store
+        .read(|conn| {
+            let retry = conn.query_row(
+                "SELECT current_version FROM secrets
+                 WHERE tenant_id=?1 AND scope_repo_id IS NULL AND name='RACE_RETRY'",
+                [d.tenant.as_bytes()],
+                |row| row.get(0),
+            )?;
+            let race = conn.query_row(
+                "SELECT count(*),min(current_version),max(current_version) FROM secrets
+                 WHERE tenant_id=?1 AND scope_repo_id IS NULL AND name IN ('RACE_LEFT','RACE_RIGHT')",
+                [d.tenant.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            Ok((retry, race))
+        })
+        .unwrap();
+    assert_eq!(retry_version, 1, "the racing retry writes one version");
+    assert_eq!(
+        race_rows,
+        (2, 1, 1),
+        "the losing import leaves no partial version"
+    );
+}
+
+/// Workers fetch with their own identity, so only unauthenticated https remotes are admissible.
+#[test]
+fn manual_dispatch_refuses_local_and_ambient_credential_remotes() {
+    let d = deployment();
+    let auth = bearer(&d);
+    for remote in [
+        "file:///var/lib/sentinel/worker/mirrors/rep_x",
+        "/var/lib/sentinel/worker/mirrors/rep_x",
+        "../other-attempt",
+        "ssh://git@github.com/o/r.git",
+        "git@github.com:o/r.git",
+        "git://github.com/o/r.git",
+        "http://169.254.169.254/latest",
+        "https://user:pass@github.com/o/r.git",
+        "ext::sh -c touch% /tmp/pwned",
+    ] {
+        let body = serde_json::json!({
+            "pipeline": PIPELINE,
+            "source": { "repo": remote, "sha": "0123456789abcdef0123456789abcdef01234567" }
+        });
+        let (status, answer) = call(
+            &d,
+            "POST",
+            "/api/v1/tenants/acme/repos/app/runs",
+            Some(&body),
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(
+            (status, answer["code"].as_str()),
+            (400, Some("invalid_request")),
+            "{remote}: {answer}"
+        );
+    }
+    let (status, _) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&dispatch_body()),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201);
+    let (status, page) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/repos/app/runs",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(page["runs"].as_array().unwrap().len(), 1, "{page}");
+}
+
+#[test]
+fn manual_dispatch_refuses_a_pipeline_that_declares_secrets() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let image = "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
+    for job_extra in [
+        "    secrets: [TOKEN]\n    steps: [{ id: s, run: 'true', secrets: [TOKEN] }]\n",
+        "    secrets: [CERT]\n    steps: [{ id: s, run: 'true', secret_files: { CERT: cert.pem } }]\n",
+        "    secrets: [OCI]\n    registry_auth: OCI\n    steps: [{ id: s, run: 'true' }]\n",
+    ] {
+        let pipeline =
+            format!("schema: 1\non: [push]\njobs:\n  build:\n    image: {image}\n{job_extra}");
+        let mut body = dispatch_body();
+        body["pipeline"] = serde_json::Value::String(pipeline);
+        let (status, answer) = call(
+            &d,
+            "POST",
+            "/api/v1/tenants/acme/repos/app/runs",
+            Some(&body),
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(
+            (status, answer["code"].as_str()),
+            (403, Some("forbidden")),
+            "{job_extra}: {answer}"
+        );
+        assert!(
+            answer["message"].as_str().unwrap().contains("secrets"),
+            "{answer}"
+        );
+    }
+    let (status, page) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/repos/app/runs",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert!(page["runs"].as_array().unwrap().is_empty(), "{page}");
+}
+
+#[test]
+fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let unpinned = serde_json::json!({
+        "pipeline": PIPELINE.replace("@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662", ":latest"),
+        "source": { "repo": "https://github.com/o/r.git", "sha": "0123456789abcdef0123456789abcdef01234567" }
+    });
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&unpinned),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("pinned by digest")
+    );
+    let broken = serde_json::json!({ "pipeline": "schema: 1\njobs: []", "source": { "repo": "x", "sha": "0123456789abcdef0123456789abcdef01234567" } });
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&broken),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+    let (status, repos) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/repos",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200, "{repos}");
+    let names: Vec<&str> = repos["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(names.contains(&"app"), "{names:?}");
+    let (status, list) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/repos/app/runs",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200, "{list}");
+    assert!(list["runs"].as_array().unwrap().is_empty());
+    let key = [("idempotency-key", "run-1")];
+    let (status, run) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&dispatch_body()),
+        Some(&auth),
+        &key,
+    );
+    assert_eq!(status, 201, "{run}");
+    let run_id = run["id"].as_str().unwrap().to_owned();
+    assert_eq!(run["state"], "pending");
+    assert_eq!(run["jobs"].as_array().unwrap().len(), 2);
+    assert_eq!(run["jobs"][0]["name"], "build");
+    assert_eq!(run["jobs"][0]["state"], "queued");
+    assert_eq!(run["jobs"][1]["state"], "blocked");
+    let (status, again) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&dispatch_body()),
+        Some(&auth),
+        &key,
+    );
+    assert_eq!((status, again["id"].as_str()), (200, Some(run_id.as_str())));
+    let mut other = dispatch_body();
+    other["source"]["ref"] = serde_json::json!("develop");
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&other),
+        Some(&auth),
+        &key,
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (422, Some("idempotency_mismatch"))
+    );
+    let (status, list) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/repos/app/runs?limit=10",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(list["runs"][0]["id"], run_id);
+    let (status, view) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run_id}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, view["state"].as_str()), (200, Some("pending")));
+    let (status, pipeline) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run_id}/pipeline"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, pipeline["schema"].as_str()),
+        (200, Some("sentinel.explain/1"))
+    );
+    assert_eq!(pipeline["jobs"].as_array().unwrap().len(), 2);
+    assert_eq!(pipeline["digest"].as_str().map(str::len), Some(32));
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{}", sentinel_core::RunId::new()),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    let (status, body) = call(&d, "GET", "/api/v1/runs/not-an-id", None, Some(&auth), &[]);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+    let (root, globex) = (d.root, TenantId::new());
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::create_namespace(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                globex,
+                Namespace::parse("globex").unwrap(),
+                NamespaceKind::Organization,
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+    let outsider = tokens::provision(
+        &d.store,
+        Grant {
+            user: d.root,
+            name: "globex-only",
+            permissions: P::ALL,
+            tenant: Some(globex),
+            repo: None,
+            lifetime_ms: 60_000,
+        },
+        UnixMillis::now(),
+    )
+    .expect("a credential of a real second tenant");
+    let foreign = format!("Bearer {}", sentinel_auth::token::format(&outsider.secret));
+    let build = run["jobs"][0]["id"].as_str().unwrap().to_owned();
+    for (method, path) in [
+        ("GET", format!("/api/v1/runs/{run_id}")),
+        ("GET", format!("/api/v1/runs/{run_id}/pipeline")),
+        ("POST", format!("/api/v1/jobs/{build}/cancel")),
+        ("POST", format!("/api/v1/jobs/{build}/rerun")),
+        ("POST", format!("/api/v1/runs/{run_id}/cancel")),
+    ] {
+        let body = (method == "POST").then(|| serde_json::json!({}));
+        let (status, answer) = call(&d, method, &path, body.as_ref(), Some(&foreign), &[]);
+        assert_eq!(
+            (status, answer["code"].as_str()),
+            (404, Some("not_found")),
+            "{method} {path}"
+        );
+    }
+
+    let (status, body) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/jobs/{build}/cancel"),
+        Some(&serde_json::json!({})),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, body["outcome"].as_str()), (200, Some("terminal")));
+    let (status, view) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run_id}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(view["jobs"][0]["state"], "canceled");
+    assert_eq!(view["jobs"][0]["failure_class"], "canceled");
+    assert_eq!(view["jobs"][1]["state"], "skipped");
+    assert_eq!(view["state"], "canceled");
+    assert!(view["jobs"][0]["log_state"].is_null());
+    let (status, body) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/jobs/{build}/rerun"),
+        Some(&serde_json::json!({})),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (409, Some("conflict")));
+    let (status, body) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/runs/{run_id}/cancel"),
+        Some(&serde_json::json!({})),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, body["canceled"].as_u64()), (200, Some(0)));
+    let (status, view) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run_id}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(view["state"], "canceled");
+
+    let (status, run2) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&dispatch_body()),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201);
+    let (tenant, repo) = (d.tenant, d.repo);
+    let _ = repo;
+    let worker = sentinel_core::WorkerId::new();
+    let run_id: RunId = run2["id"].as_str().unwrap().parse().unwrap();
+    let job_id: sentinel_core::JobId = run2["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
+    let attempt = d
+        .store
+        .writer()
+        .write(move |tx| {
+            let (attempt, _) = sentinel_store::jobs::lease(
+                tx,
+                tenant,
+                job_id,
+                worker,
+                UnixMillis(i64::MAX / 2),
+                UnixMillis::now(),
+            )?;
+            Ok(attempt)
+        })
+        .unwrap();
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/attempts/{attempt}/logs"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    let frame = |seq, text: &str, stream| Frame {
+        seq,
+        step: 0,
+        stream,
+        bytes: text.as_bytes().to_vec(),
+    };
+    d.logs
+        .append(
+            run_id,
+            job_id,
+            attempt,
+            &frame(1, "hello\n", Stream::Stdout),
+        )
+        .unwrap();
+    d.logs
+        .append(run_id, job_id, attempt, &frame(2, "warn\n", Stream::Stderr))
+        .unwrap();
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/attempts/{attempt}/logs?after=1"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["complete"], false);
+    assert_eq!(body["frames"].as_array().unwrap().len(), 1);
+    assert_eq!(body["frames"][0]["stream"], "stderr");
+    assert_eq!(body["frames"][0]["text"], "warn\n");
+    for query in ["after=abc", "step=x", "after=-1"] {
+        let (status, body) = call(
+            &d,
+            "GET",
+            &format!("/api/v1/attempts/{attempt}/logs?{query}"),
+            None,
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("invalid_request")),
+            "{query}"
+        );
+    }
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/attempts/{attempt}/logs"),
+        None,
+        Some(&foreign),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    let logs = Arc::clone(&d.logs);
+    let store = Arc::clone(&d.store);
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(400));
+        logs.append(
+            run_id,
+            job_id,
+            attempt,
+            &Frame {
+                seq: 3,
+                step: 1,
+                stream: Stream::Stdout,
+                bytes: b"late\n".to_vec(),
+            },
+        )
+        .unwrap();
+        logs.finish(run_id, job_id, attempt, 3, &[]).unwrap();
+        store
+            .writer()
+            .write(move |tx| sentinel_store::dispatch::log_ended(tx, attempt))
+            .unwrap();
+    });
+    let started = std::time::Instant::now();
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/attempts/{attempt}/logs?after=2&wait=1"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    writer.join().unwrap();
+    assert_eq!(status, 200);
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(body["frames"][0]["text"], "late\n");
+    assert_eq!(body["frames"][0]["step"], 1);
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/attempts/{attempt}/logs?after=3&wait=1"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, body["complete"].as_bool()), (200, Some(true)));
+    let (status, view) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run_id}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, view["jobs"][0]["log_state"].as_str()),
+        (200, Some("complete"))
+    );
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/attempts/{attempt}/logs?step=1"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["frames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![3]
+    );
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/attempts/{}/logs", AttemptId::new()),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+
+    let (status, body) = call(
+        &d,
+        "GET",
+        "/api/v1/workers?tenant=acme",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["pools"][0]["name"], "builders");
+    assert_eq!(body["pools"][0]["workers"].as_array().unwrap().len(), 0);
+    let (status, body) = call(&d, "GET", "/api/v1/workers", None, Some(&auth), &[]);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+}
+
+#[test]
+fn a_password_session_needs_the_csrf_header_for_mutations() {
+    let d = deployment();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/login",
+        Some(&serde_json::json!({ "username": "root", "password": "wrong password here" })),
+        None,
+        &[],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (401, Some("unauthenticated"))
+    );
+    let url = format!("{}/api/v1/login", d.base);
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let response = agent
+        .post(&url)
+        .header("content-type", "application/json")
+        .send(
+            serde_json::json!({ "username": "root", "password": "correct horse battery staple" })
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let cookie = response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(cookie.starts_with("__Host-sentinel_session="));
+    assert!(cookie.contains("HttpOnly"));
+    let cookie_value = cookie.split(';').next().unwrap().to_owned();
+    let body: serde_json::Value =
+        serde_json::from_str(&response.into_body().read_to_string().unwrap()).unwrap();
+    let csrf = body["csrf"].as_str().unwrap().to_owned();
+    assert_eq!(body["user"], d.root.to_string());
+    let (status, me) = call(
+        &d,
+        "GET",
+        "/api/v1/me",
+        None,
+        None,
+        &[("cookie", &cookie_value)],
+    );
+    assert_eq!((status, me["via"].as_str()), (200, Some("session")));
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&dispatch_body()),
+        None,
+        &[("cookie", &cookie_value)],
+    );
+    assert_eq!((status, body["code"].as_str()), (403, Some("forbidden")));
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&dispatch_body()),
+        None,
+        &[("cookie", &cookie_value), ("x-sentinel-csrf", &csrf)],
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, _) = call(
+        &d,
+        "POST",
+        "/api/v1/logout",
+        Some(&serde_json::json!({})),
+        None,
+        &[("cookie", &cookie_value), ("x-sentinel-csrf", &csrf)],
+    );
+    assert_eq!(status, 200);
+    let (status, body) = call(
+        &d,
+        "GET",
+        "/api/v1/me",
+        None,
+        None,
+        &[("cookie", &cookie_value)],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (401, Some("unauthenticated"))
+    );
+    let _ = DIGEST;
+}
+
+fn push_payload(repository: u64) -> serde_json::Value {
+    serde_json::json!({
+        "ref": "refs/heads/main",
+        "before": "a".repeat(40),
+        "after": "b".repeat(40),
+        "created": false,
+        "deleted": false,
+        "forced": false,
+        "installation": {"id": 42},
+        "repository": {"id": repository, "full_name": "account/widget"},
+    })
+}
+
+fn pr_payload(action: &str, head_repo: u64, merge: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "action": action,
+        "number": 7,
+        "installation": {"id": 42},
+        "repository": {"id": GITHUB_REPO_ID, "full_name": "account/widget"},
+        "pull_request": {
+            "draft": false,
+            "head": {"ref": "feature", "sha": "c".repeat(40), "repo": {"id": head_repo}},
+            "base": {"ref": "main", "sha": "d".repeat(40)},
+            "merge_commit_sha": merge,
+        },
+    })
+}
+
+fn webhook_signature(body: &[u8]) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, WEBHOOK_SECRET);
+    let tag = ring::hmac::sign(&key, body);
+    let mut out = String::from("sha256=");
+    for byte in tag.as_ref() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn hook_bearer(d: &Deployment) -> String {
+    format!("Bearer {}", d.hook_token)
+}
+
+fn delivery_state(d: &Deployment, id: &str) -> intake::State {
+    let id: sentinel_core::DeliveryId = id.parse().unwrap();
+    d.store.read(move |c| intake::get(c, id)).unwrap().state
+}
+
+#[test]
+fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
+    let d = deployment();
+
+    let update = |delivery: &str| {
+        serde_json::json!({
+            "delivery_id": delivery,
+            "ref": "refs/heads/main",
+            "old_sha": "a".repeat(40),
+            "new_sha": "b".repeat(40),
+        })
+    };
+    let intake_path = format!("/api/v1/intake/{}", d.intake_repo);
+    let (status, body) = call(&d, "POST", &intake_path, Some(&update("hook-1")), None, &[]);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (401, Some("unauthenticated"))
+    );
+    let (status, _) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&update("hook-1")),
+        Some("Bearer sentinel_hook_0000"),
+        &[],
+    );
+    assert_eq!(status, 401);
+    let (status, _) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/intake/{}", RepoId::new()),
+        Some(&update("hook-1")),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(status, 401, "a repository is never enumerable by intake");
+
+    let (status, body) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&serde_json::json!({ "delivery_id": "hook-2" })),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+    let oversize = serde_json::json!({
+        "delivery_id": "hook-3",
+        "ref": "refs/heads/main",
+        "old_sha": "a".repeat(40),
+        "new_sha": "b".repeat(40),
+        "padding": "x".repeat(70_000),
+    });
+    let (status, body) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&oversize),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (413, Some("payload_too_large"))
+    );
+
+    let (status, first) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&update("hook-4")),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(
+        (status, first["duplicate"].as_bool()),
+        (202, Some(false)),
+        "{first}"
+    );
+    let id = first["delivery"].as_str().unwrap().to_owned();
+    assert_eq!(delivery_state(&d, &id), intake::State::Pending);
+    let (status, again) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&update("hook-4")),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(
+        (
+            status,
+            again["duplicate"].as_bool(),
+            again["delivery"].as_str()
+        ),
+        (202, Some(true), Some(id.as_str()))
+    );
+    let (status, body) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&serde_json::json!({
+            "delivery_id": "hook-4",
+            "ref": "refs/heads/other",
+            "old_sha": "a".repeat(40),
+            "new_sha": "b".repeat(40),
+        })),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (409, Some("conflict")));
+
+    let payload = push_payload(GITHUB_REPO_ID);
+    let raw = payload.to_string();
+    let signed = webhook_signature(raw.as_bytes());
+    let (status, _) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&payload),
+        None,
+        &[],
+    );
+    assert_eq!(status, 401, "no signature");
+    let (status, _) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&payload),
+        None,
+        &[
+            ("x-hub-signature-256", "sha256=00"),
+            ("x-github-event", "push"),
+            ("x-github-delivery", "gh-1"),
+        ],
+    );
+    assert_eq!(status, 401, "wrong signature length");
+    let ping = serde_json::json!({ "zen": "Keep it logically awesome." });
+    let ping_raw = ping.to_string();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&ping),
+        None,
+        &[
+            (
+                "x-hub-signature-256",
+                &webhook_signature(ping_raw.as_bytes()),
+            ),
+            ("x-github-event", "ping"),
+        ],
+    );
+    assert_eq!((status, body["pong"].as_bool()), (200, Some(true)));
+
+    let unbound = push_payload(92);
+    let unbound_raw = unbound.to_string();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&unbound),
+        None,
+        &[
+            (
+                "x-hub-signature-256",
+                &webhook_signature(unbound_raw.as_bytes()),
+            ),
+            ("x-github-event", "push"),
+            ("x-github-delivery", "gh-2"),
+        ],
+    );
+    assert_eq!(
+        (status, body["ignored"].as_str()),
+        (200, Some("unbound_repository"))
+    );
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&payload),
+        None,
+        &[("x-hub-signature-256", &signed), ("x-github-event", "push")],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+    let (status, first) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&payload),
+        None,
+        &[
+            ("x-hub-signature-256", &signed),
+            ("x-github-event", "push"),
+            ("x-github-delivery", "gh-3"),
+        ],
+    );
+    assert_eq!(
+        (status, first["duplicate"].as_bool()),
+        (202, Some(false)),
+        "{first}"
+    );
+    let id = first["delivery"].as_str().unwrap().to_owned();
+    assert_eq!(delivery_state(&d, &id), intake::State::Pending);
+    let (status, again) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&payload),
+        None,
+        &[
+            ("x-hub-signature-256", &signed),
+            ("x-github-event", "push"),
+            ("x-github-delivery", "gh-3"),
+        ],
+    );
+    assert_eq!((status, again["duplicate"].as_bool()), (202, Some(true)));
+    assert_eq!(again["delivery"].as_str(), Some(id.as_str()));
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&payload),
+        None,
+        &[
+            ("x-hub-signature-256", &signed),
+            ("x-github-event", "workflow_run"),
+            ("x-github-delivery", "gh-4"),
+        ],
+    );
+    assert_eq!(
+        (status, body["ignored"].as_str()),
+        (200, Some("unsupported_event"))
+    );
+    let pr = pr_payload("opened", GITHUB_REPO_ID, Some(&"e".repeat(40)));
+    let pr_raw = pr.to_string();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&pr),
+        None,
+        &[
+            ("x-hub-signature-256", &webhook_signature(pr_raw.as_bytes())),
+            ("x-github-event", "pull_request"),
+            ("x-github-delivery", "gh-5"),
+        ],
+    );
+    assert_eq!(
+        (status, body["duplicate"].as_bool()),
+        (202, Some(false)),
+        "{body}"
+    );
+    let pr_id = body["delivery"].as_str().unwrap().to_owned();
+    assert_eq!(delivery_state(&d, &pr_id), intake::State::Pending);
+    let labeled = pr_payload("labeled", GITHUB_REPO_ID, Some(&"e".repeat(40)));
+    let labeled_raw = labeled.to_string();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&labeled),
+        None,
+        &[
+            (
+                "x-hub-signature-256",
+                &webhook_signature(labeled_raw.as_bytes()),
+            ),
+            ("x-github-event", "pull_request"),
+            ("x-github-delivery", "gh-6"),
+        ],
+    );
+    assert_eq!((status, body["ignored"].as_str()), (200, Some("pr_action")));
+    let broken = serde_json::json!({ "action": "opened", "number": 7 });
+    let broken_raw = broken.to_string();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&broken),
+        None,
+        &[
+            (
+                "x-hub-signature-256",
+                &webhook_signature(broken_raw.as_bytes()),
+            ),
+            ("x-github-event", "pull_request"),
+            ("x-github-delivery", "gh-7"),
+        ],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+    let suite = serde_json::json!({
+        "action": "rerequested",
+        "installation": {"id": 42},
+        "repository": {"id": GITHUB_REPO_ID},
+        "check_suite": {"id": 777, "head_sha": "e".repeat(40)},
+    });
+    let suite_raw = suite.to_string();
+    let suite_headers = |raw: &str, delivery: &str| {
+        [
+            ("x-hub-signature-256", webhook_signature(raw.as_bytes())),
+            ("x-github-event", "check_suite".to_owned()),
+            ("x-github-delivery", delivery.to_owned()),
+        ]
+    };
+    let suite_headers = suite_headers(&suite_raw, "gh-8");
+    let suite_headers: Vec<(&str, &str)> = suite_headers
+        .iter()
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&suite),
+        None,
+        &suite_headers,
+    );
+    assert_eq!(
+        (
+            status,
+            body["controlled"].as_str(),
+            body["duplicate"].as_bool()
+        ),
+        (200, Some("unknown_check"), Some(false)),
+        "{body}"
+    );
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&suite),
+        None,
+        &suite_headers,
+    );
+    assert_eq!(
+        (
+            status,
+            body["controlled"].as_str(),
+            body["duplicate"].as_bool()
+        ),
+        (200, Some("unknown_check"), Some(true)),
+        "a replayed receipt answers what the first attempt did"
+    );
+    let renamed = serde_json::json!({
+        "action": "renamed",
+        "installation": {"id": 42},
+        "repository": {"id": GITHUB_REPO_ID},
+    });
+    let renamed_raw = renamed.to_string();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&renamed),
+        None,
+        &[
+            (
+                "x-hub-signature-256",
+                &webhook_signature(renamed_raw.as_bytes()),
+            ),
+            ("x-github-event", "repository"),
+            ("x-github-delivery", "gh-8"),
+        ],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("conflict")),
+        "{body}"
+    );
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&renamed),
+        None,
+        &[
+            (
+                "x-hub-signature-256",
+                &webhook_signature(renamed_raw.as_bytes()),
+            ),
+            ("x-github-event", "repository"),
+            ("x-github-delivery", "gh-9"),
+        ],
+    );
+    assert_eq!(
+        (status, body["controlled"].as_str()),
+        (200, Some("repository_rebind_required")),
+        "{body}"
+    );
+    let revoked: bool = d
+        .store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT revoked FROM source_bindings WHERE repo_id=?1",
+                [d.github_repo.as_bytes()],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert!(revoked, "the rename revoked the binding");
+    let (status, _) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/intake/{}", d.github_repo),
+        Some(&update("hook-5")),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(status, 401);
+
+    let repo = d.intake_repo;
+    let tenant = d.tenant;
+    let received = UnixMillis::now().0;
+    d.store
+        .writer()
+        .write(move |tx| {
+            for index in 0..sentinel_store::intake::MAX_PENDING_PER_REPO {
+                let id = sentinel_core::DeliveryId::new();
+                let filler = format!("filler-{index}");
+                let (old, new) = ("a".repeat(40), "b".repeat(40));
+                tx.execute(
+                    "INSERT INTO webhook_deliveries(id, tenant_id, repo_id, provider, external_id,
+                        event, ref_name, old_sha, new_sha, state, received_ms)
+                     VALUES (?1, ?2, ?3, 'generic', ?4, 'ref_update', ?5, ?6, ?7, 0, ?8)",
+                    (
+                        id.as_bytes().as_slice(),
+                        tenant.as_bytes().as_slice(),
+                        repo.as_bytes().as_slice(),
+                        filler.as_str(),
+                        "refs/heads/main",
+                        old.as_str(),
+                        new.as_str(),
+                        received,
+                    ),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let (status, body) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&update("hook-6")),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (429, Some("rate_limited")),
+        "{body}"
+    );
+    let (status, again) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&update("hook-4")),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!((status, again["duplicate"].as_bool()), (202, Some(true)));
+}
+
+fn raw(
+    d: &Deployment,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    auth: Option<&str>,
+    extra: &[(&str, &str)],
+) -> (u16, Vec<u8>, Option<String>) {
+    let url = format!("{}{path}", d.base);
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let mut request = match method {
+        "GET" => agent.get(&url).force_send_body(),
+        "PUT" => agent.put(&url),
+        "POST" => agent.post(&url),
+        "DELETE" => agent.delete(&url).force_send_body(),
+        _ => unreachable!(),
+    };
+    if let Some(auth) = auth {
+        request = request.header("authorization", auth);
+    }
+    for (k, v) in extra {
+        request = request.header(*k, *v);
+    }
+    let response = match body {
+        Some(bytes) => request.send(bytes).unwrap(),
+        None => request.send_empty().unwrap(),
+    };
+    let status = response.status().as_u16();
+    let range = response
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let bytes = response.into_body().read_to_vec().unwrap();
+    (status, bytes, range)
+}
+
+fn held_upload(d: &Deployment, path: &str, auth: &str, len: usize) -> std::net::TcpStream {
+    use std::io::Write as _;
+    let addr = d.base.strip_prefix("http://").unwrap().to_owned();
+    let mut socket = std::net::TcpStream::connect(addr).unwrap();
+    write!(
+        socket,
+        "PUT {path} HTTP/1.1\r\nhost: sentinel\r\nauthorization: {auth}\r\ncontent-length: {len}\r\n\r\nx"
+    )
+    .unwrap();
+    socket
+}
+
+#[test]
+fn uploads_resume_commit_and_downloads_range_through_the_api() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let content: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    let digest = blake3::hash(&content).to_hex().to_string();
+
+    let (status, begin) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": content.len(), "digest": digest })),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, begin["state"].as_str()), (201, Some("open")));
+    assert_eq!(begin["received"], 0);
+    let upload = begin["upload"].as_str().unwrap().to_owned();
+
+    let (status, _, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}?offset=30000"),
+        Some(&content[30_000..]),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    let (status, ack, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}?offset=30000"),
+        Some(&content[30_000..]),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&ack).unwrap()["received"],
+        10_000
+    );
+    let (status, st) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/uploads/{upload}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(st["received"], 10_000);
+    assert_eq!(st["ranges"][0][0], 30_000);
+
+    let (status, body) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/uploads/{upload}/commit"),
+        Some(&serde_json::json!({})),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+    let (status, _body, _) = raw(
+        &d,
+        "GET",
+        &format!("/api/v1/tenants/acme/objects/{digest}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 404);
+
+    let (status, _, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}"),
+        Some(&content[..1]),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 400);
+    let (status, _, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}?offset={}", content.len() - 1),
+        Some(&content[..2]),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 400);
+
+    let (status, _, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}?offset=0"),
+        Some(&content[..30_000]),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    let (status, sealed) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/uploads/{upload}/commit"),
+        Some(&serde_json::json!({})),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, sealed["digest"].as_str()),
+        (200, Some(digest.as_str()))
+    );
+    let (status, sealed) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/uploads/{upload}/commit"),
+        Some(&serde_json::json!({})),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, sealed["digest"].as_str()),
+        (200, Some(digest.as_str()))
+    );
+
+    let object = format!("/api/v1/tenants/acme/objects/{digest}");
+    let (status, bytes, range) = raw(&d, "GET", &object, None, Some(&auth), &[]);
+    assert_eq!(status, 200);
+    assert_eq!(bytes, content);
+    assert!(range.is_none());
+
+    let (status, bytes, range) = raw(
+        &d,
+        "GET",
+        &object,
+        None,
+        Some(&auth),
+        &[("range", "bytes=10-19")],
+    );
+    assert_eq!(status, 206);
+    assert_eq!(bytes, content[10..20]);
+    assert_eq!(range.as_deref(), Some("bytes 10-19/40000"));
+
+    let (status, bytes, _) = raw(
+        &d,
+        "GET",
+        &object,
+        None,
+        Some(&auth),
+        &[("range", "bytes=-7")],
+    );
+    assert_eq!(status, 206);
+    assert_eq!(bytes, content[39_993..]);
+
+    for spec in ["bytes=99-4", "bytes=40000-", "items=0-1", "bytes=0-1,4-5"] {
+        let (status, _, _) = raw(&d, "GET", &object, None, Some(&auth), &[("range", spec)]);
+        assert_eq!(status, 400, "{spec} must be refused");
+    }
+
+    for (method, path) in [
+        ("POST", "/api/v1/tenants/acme/uploads"),
+        ("GET", &format!("/api/v1/uploads/{upload}")),
+        ("PUT", &format!("/api/v1/uploads/{upload}?offset=0")),
+        ("DELETE", &format!("/api/v1/uploads/{upload}")),
+        ("GET", &object),
+    ] {
+        let (status, _, _) = raw(&d, method, path, None, None, &[]);
+        assert_eq!(status, 401, "{method} {path}");
+    }
+
+    let other_tenant = TenantId::new();
+    let root = d.root;
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::create_namespace(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                other_tenant,
+                Namespace::parse("other").unwrap(),
+                NamespaceKind::Organization,
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+    let outsider = tokens::provision(
+        &d.store,
+        Grant {
+            user: d.root,
+            name: "foreign",
+            permissions: P::ALL,
+            tenant: Some(other_tenant),
+            repo: None,
+            lifetime_ms: 60_000,
+        },
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let foreign = format!("Bearer {}", sentinel_auth::token::format(&outsider.secret));
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/uploads/{upload}"),
+        None,
+        Some(&foreign),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    let (status, _, _) = raw(&d, "GET", &object, None, Some(&foreign), &[]);
+    assert_eq!(status, 404);
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": 4 })),
+        Some(&foreign),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+
+    let (status, begin) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": 4 })),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201);
+    let doomed = begin["upload"].as_str().unwrap().to_owned();
+    let (status, _, _) = raw(
+        &d,
+        "DELETE",
+        &format!("/api/v1/uploads/{doomed}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    let (status, body, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{doomed}?offset=0"),
+        Some(b"ab"),
+        Some(&auth),
+        &[],
+    );
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!((status, body["code"].as_str()), (409, Some("conflict")));
+}
+
+#[test]
+fn transfer_slots_are_bounded() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let content = b"downloadable".repeat(64);
+    let digest = blake3::hash(&content).to_hex().to_string();
+    let (status, begin) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": content.len(), "digest": digest })),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201);
+    let upload = begin["upload"].as_str().unwrap().to_owned();
+    let (status, _, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}?offset=0"),
+        Some(&content),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    let (status, _) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/uploads/{upload}/commit"),
+        Some(&serde_json::json!({})),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+
+    let (status, begin) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": 4 << 20 })),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201);
+    let pending = begin["upload"].as_str().unwrap().to_owned();
+    let held: Vec<std::net::TcpStream> = (0..sentinel_api::TRANSFERS)
+        .map(|_| {
+            held_upload(
+                &d,
+                &format!("/api/v1/uploads/{pending}?offset=0"),
+                &auth,
+                4 << 20,
+            )
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(300));
+    let object = format!("/api/v1/tenants/acme/objects/{digest}");
+    let (status, body, _) = raw(&d, "GET", &object, None, Some(&auth), &[]);
+    assert_eq!(status, 429);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
+        "rate_limited"
+    );
+    drop(held);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let (status, bytes) = loop {
+        let (status, bytes, _) = raw(&d, "GET", &object, None, Some(&auth), &[]);
+        if status == 200 || std::time::Instant::now() > deadline {
+            break (status, bytes);
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(status, 200);
+    assert_eq!(bytes.len(), content.len());
+}
+
+#[test]
+fn artifact_routes_are_authorized_and_scoped() {
+    let d = deployment();
+    let (tenant, repo) = (d.tenant, d.intake_repo);
+    let now = UnixMillis::now();
+    let run = RunId::new();
+    let spec = RunSpec::new(
+        PinnedSource::new(
+            "https://git.example:8443/team/repo.git",
+            "0123456789abcdef0123456789abcdef01234567",
+            Some("refs/heads/main"),
+        )
+        .unwrap(),
+        compile_str(
+            "schema: 1\non: [push]\njobs:\n  build:\n    image: alpine:3\n    steps: [{ id: s, run: 'true' }]\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let job = d
+        .store
+        .writer()
+        .write(move |tx| {
+            let ids = runs::create_run(tx, tenant, repo, run, &spec, now)?;
+            for job in &ids {
+                runs::resolve_image(tx, tenant, *job, DIGEST, "linux/amd64")?;
+            }
+            Ok(ids[0])
+        })
+        .unwrap();
+    let (pool, worker) = (PoolId::new(), WorkerId::new());
+    d.store
+        .writer()
+        .write(move |tx| {
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                pool,
+                "artifacts",
+                PoolKind::Dedicated(tenant),
+                now,
+            )?;
+            let issued = workers::issue_enrollment(tx, Authority::HostLocal, pool, 60_000, now)?;
+            let mut text = String::new();
+            issued.secret.expose(&mut text);
+            workers::enroll(
+                tx,
+                &sentinel_auth::secret::Secret::parse(&text).unwrap(),
+                Presentation {
+                    worker,
+                    fingerprint: sentinel_auth::secret::Secret::generate().digest(),
+                    name: "w",
+                    negotiated: Negotiated {
+                        protocol: ProtocolVersion(4),
+                        capabilities: Capabilities::REQUIRED,
+                        arch: Arch::X86_64,
+                    },
+                },
+                now,
+            )?;
+            dispatch::report_capacity(
+                tx,
+                worker,
+                Capacity {
+                    cpu_millis: 4_000,
+                    memory_bytes: 8 << 30,
+                    disk_bytes: 0,
+                },
+            )
+        })
+        .unwrap();
+    let offer = d
+        .store
+        .writer()
+        .write(move |tx| dispatch::place(tx, worker, pool, dispatch::DEFAULT_LEASE_MS, now))
+        .unwrap()
+        .expect("the queued job was placed");
+    assert_eq!((offer.run, offer.job), (run, job));
+    let objects = Objects::open(d._dir.path()).unwrap();
+    let staged = objects
+        .stage(tenant, &b"report-bytes"[..], u64::MAX, Expect::default())
+        .unwrap();
+    let (captured, absent) = {
+        let objects = Objects::open(d._dir.path()).unwrap();
+        d.store
+            .writer()
+            .write(move |tx| {
+                objects.commit(tx, &staged)?;
+                let version = objects.commit_manifest(
+                    tx,
+                    tenant,
+                    Kind::Artifact,
+                    &artifacts::manifest_name(job, "report"),
+                    &[Entry {
+                        path: "out/report.txt".into(),
+                        digest: staged.digest(),
+                        len: staged.len(),
+                        mode: 0o644,
+                    }],
+                )?;
+                let captured = artifacts::record(
+                    tx,
+                    tenant,
+                    run,
+                    job,
+                    offer.attempt,
+                    "report",
+                    artifacts::State::Captured,
+                    Some(version),
+                    1,
+                    staged.len(),
+                    UnixMillis(now.0 + 7 * 86_400_000),
+                    now,
+                )?;
+                let absent = artifacts::record(
+                    tx,
+                    tenant,
+                    run,
+                    job,
+                    offer.attempt,
+                    "coverage",
+                    artifacts::State::Absent,
+                    None,
+                    0,
+                    0,
+                    UnixMillis(now.0 + 7 * 86_400_000),
+                    now,
+                )?;
+                Ok((captured, absent))
+            })
+            .unwrap()
+    };
+    let auth = bearer(&d);
+    let (status, rows) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run}/artifacts"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    let rows = rows["artifacts"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let (status, detail) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run}/artifacts/{captured}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(detail["state"], "captured");
+    assert_eq!(detail["name"], "report");
+    let manifest = &detail["manifest"];
+    assert_eq!(manifest["version"], 1);
+    let entries = manifest["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["path"], "out/report.txt");
+    assert_eq!(entries[0]["len"], 12);
+    let (status, detail) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run}/artifacts/{absent}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, detail["state"].as_str()), (200, Some("absent")));
+    assert!(detail.get("manifest").is_none() || detail["manifest"].is_null());
+    for path in [
+        format!("/api/v1/runs/{run}/artifacts"),
+        format!("/api/v1/runs/{run}/artifacts/{captured}"),
+    ] {
+        let (status, _) = call(&d, "GET", &path, None, None, &[]);
+        assert_eq!(status, 401, "{path}");
+    }
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!(
+            "/api/v1/runs/{run}/artifacts/{}",
+            sentinel_core::ArtifactId::new()
+        ),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+
+    let digest = entries[0]["digest"].as_str().unwrap().to_owned();
+    let object = format!("/api/v1/tenants/acme/objects/{digest}");
+    let (status, bytes, _) = raw(&d, "GET", &object, None, Some(&auth), &[]);
+    assert_eq!((status, bytes.as_slice()), (200, &b"report-bytes"[..]));
+    let reader = UserId::new();
+    let root = d.root;
+    d.store
+        .writer()
+        .write(move |tx| {
+            provisioning::insert_human(tx, reader, "Rita", false, now)?;
+            auth::set_membership(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                reader,
+                sentinel_core::auth::Role::Reader,
+            )
+        })
+        .unwrap();
+    let reader_auth = format!(
+        "Bearer {}",
+        sentinel_auth::token::format(
+            &tokens::provision(
+                &d.store,
+                Grant {
+                    user: reader,
+                    name: "rita",
+                    permissions: P::READ,
+                    tenant: None,
+                    repo: None,
+                    lifetime_ms: 60_000,
+                },
+                now,
+            )
+            .unwrap()
+            .secret
+        )
+    );
+    let unknown = format!("/api/v1/tenants/acme/objects/{}", "0".repeat(64));
+    let (status, missing, _) = raw(&d, "GET", &unknown, None, Some(&reader_auth), &[]);
+    assert_eq!(status, 404);
+    let (status, refused, _) = raw(&d, "GET", &object, None, Some(&reader_auth), &[]);
+    assert_eq!(
+        status, 404,
+        "a reader without a grant read another repo's bytes"
+    );
+    let code =
+        |body: &[u8]| serde_json::from_slice::<serde_json::Value>(body).unwrap()["code"].clone();
+    assert_eq!(code(&refused), code(&missing), "an existence oracle");
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::set_repo_grant(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                repo,
+                reader,
+                P::READ,
+            )
+        })
+        .unwrap();
+    let (status, _, _) = raw(&d, "GET", &object, None, Some(&reader_auth), &[]);
+    assert_eq!(status, 200);
+    let beta = TenantId::new();
+    let foreign = {
+        let objects = Objects::open(d._dir.path()).unwrap();
+        let staged = objects
+            .stage(beta, &b"beta bytes"[..], u64::MAX, Expect::default())
+            .unwrap();
+        let digest = staged.digest();
+        d.store
+            .writer()
+            .write(move |tx| {
+                auth::create_namespace(
+                    tx,
+                    Principal::new(root, P::ALL, None, None),
+                    beta,
+                    Namespace::parse("beta").unwrap(),
+                    NamespaceKind::Organization,
+                    now,
+                )?;
+                objects.commit(tx, &staged).map(|_| ())
+            })
+            .unwrap();
+        digest
+    };
+    let (status, _, _) = raw(
+        &d,
+        "GET",
+        &format!("/api/v1/tenants/beta/objects/{foreign}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 404, "platform scope read a tenant's bytes");
+}
+
+fn upload_object(d: &Deployment, auth: &str, content: &[u8]) -> String {
+    let digest = blake3::hash(content).to_hex().to_string();
+    let (status, begin) = call(
+        d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": content.len(), "digest": digest })),
+        Some(auth),
+        &[],
+    );
+    assert_eq!(status, 201, "{begin}");
+    let upload = begin["upload"].as_str().unwrap().to_owned();
+    for (i, chunk) in content.chunks(sentinel_api::MAX_UPLOAD_CHUNK).enumerate() {
+        let offset = i * sentinel_api::MAX_UPLOAD_CHUNK;
+        let (status, _, _) = raw(
+            d,
+            "PUT",
+            &format!("/api/v1/uploads/{upload}?offset={offset}"),
+            Some(chunk),
+            Some(auth),
+            &[],
+        );
+        assert_eq!(status, 200);
+    }
+    let (status, sealed) = call(
+        d,
+        "POST",
+        &format!("/api/v1/uploads/{upload}/commit"),
+        Some(&serde_json::json!({})),
+        Some(auth),
+        &[],
+    );
+    assert_eq!(status, 200, "{sealed}");
+    digest
+}
+
+fn stalled_get(d: &Deployment, path: &str, auth: &str) -> std::net::TcpStream {
+    use std::io::Write as _;
+    let addr = d.base.strip_prefix("http://").unwrap().to_owned();
+    let mut socket = std::net::TcpStream::connect(addr).unwrap();
+    write!(
+        socket,
+        "GET {path} HTTP/1.1\r\nhost: sentinel\r\nauthorization: {auth}\r\n\r\n"
+    )
+    .unwrap();
+    socket
+}
+
+#[test]
+fn downloads_hold_their_slot_and_control_requests_keep_handlers() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let content: Vec<u8> = (0..(24u32 << 20)).map(|i| (i % 253) as u8).collect();
+    let digest = upload_object(&d, &auth, &content);
+    let object = format!("/api/v1/tenants/acme/objects/{digest}");
+    let stalled: Vec<_> = (0..sentinel_api::TRANSFERS)
+        .map(|_| stalled_get(&d, &object, &auth))
+        .collect();
+    thread::sleep(Duration::from_millis(500));
+    let (status, body, _) = raw(&d, "GET", &object, None, Some(&auth), &[]);
+    assert_eq!(status, 429, "downloads are not bounded while they stream");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
+        "rate_limited"
+    );
+    let (status, run) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&dispatch_body()),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201, "{run}");
+    let run = run["id"].as_str().unwrap().to_owned();
+    let (_, first) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run}/wait"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    let version = first["version"].as_str().unwrap().to_owned();
+    const NAMES: [&str; 8] = [
+        "holder-0", "holder-1", "holder-2", "holder-3", "holder-4", "holder-5", "holder-6",
+        "holder-7",
+    ];
+    let users = sentinel_api::SUBSCRIBERS.div_ceil(sentinel_api::SUBSCRIBERS_PER_USER);
+    let holders: Vec<String> = NAMES[..users]
+        .iter()
+        .map(|n| member_bearer(&d, n))
+        .collect();
+    let waits: Vec<_> = (0..sentinel_api::SUBSCRIBERS)
+        .map(|i| {
+            let who = &holders[i / sentinel_api::SUBSCRIBERS_PER_USER];
+            let (base, auth, run, version) =
+                (d.base.clone(), who.clone(), run.clone(), version.clone());
+            thread::spawn(move || {
+                let agent = ureq::Agent::new_with_config(
+                    ureq::Agent::config_builder()
+                        .http_status_as_error(false)
+                        .build(),
+                );
+                agent
+                    .get(format!(
+                        "{base}/api/v1/runs/{run}/wait?since={version}&timeout_ms=3000"
+                    ))
+                    .header("authorization", &auth)
+                    .call()
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(500));
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let (status, _) = call(&d, "GET", "/api/v1/health", None, None, &[]);
+        assert_eq!(status, 200);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "health waited {:?} behind long-held permits",
+            started.elapsed()
+        );
+    }
+    for wait in waits {
+        assert_eq!(wait.join().unwrap(), 200);
+    }
+    drop(stalled);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        let (status, bytes, _) = raw(
+            &d,
+            "GET",
+            &object,
+            None,
+            Some(&auth),
+            &[("range", "bytes=0-9")],
+        );
+        if status == 206 || std::time::Instant::now() > deadline {
+            assert!(status != 206 || bytes == content[..10]);
+            break status;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(status, 206);
+}
+
+#[test]
+fn a_rotted_object_is_never_served_whole() {
+    use std::io::Read as _;
+    let d = deployment();
+    let auth = bearer(&d);
+    let content = b"bytes that will rot on disk".repeat(1000);
+    let digest = upload_object(&d, &auth, &content);
+    let path = d
+        ._dir
+        .path()
+        .join("objects")
+        .join(d.tenant.to_string())
+        .join(&digest[..2])
+        .join(&digest);
+    let mut rotten = content.clone();
+    rotten[5000] ^= 0xff;
+    std::fs::write(&path, &rotten).unwrap();
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let response = agent
+        .get(format!("{}/api/v1/tenants/acme/objects/{digest}", d.base))
+        .header("authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let mut got = Vec::new();
+    let read = response.into_body().into_reader().read_to_end(&mut got);
+    assert!(
+        read.is_err() || got.len() < content.len(),
+        "a corrupt object arrived whole ({} bytes)",
+        got.len()
+    );
+    let (status, _, _) = raw(
+        &d,
+        "GET",
+        &format!("/api/v1/tenants/acme/objects/{digest}"),
+        None,
+        Some(&auth),
+        &[("range", "bytes=0-9")],
+    );
+    assert_eq!(status, 206);
+}
+
+#[test]
+fn touching_an_expired_upload_retires_it() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let (status, begin) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": 8, "ttl_ms": 1 })),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201);
+    let upload = begin["upload"].as_str().unwrap().to_owned();
+    thread::sleep(Duration::from_millis(20));
+    let (status, _, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}?offset=0"),
+        Some(b"abcdefgh"),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 400);
+    let (status, state) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/uploads/{upload}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, state["state"].as_str()),
+        (200, Some("aborted")),
+        "{state}"
+    );
+    assert!(
+        !d._dir.path().join("incoming").join(&upload).exists(),
+        "the staging file outlived the retirement"
+    );
+}
+
+#[test]
+fn log_pages_are_bounded_and_positions_are_validated() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let (status, run) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&dispatch_body()),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201, "{run}");
+    let run_id: RunId = run["id"].as_str().unwrap().parse().unwrap();
+    let job_id: sentinel_core::JobId = run["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
+    let attempt = attempt_for(&d, job_id);
+    let full = vec![b'z'; 32 * 1024];
+    for seq in 1..=100u64 {
+        d.logs
+            .append(
+                run_id,
+                job_id,
+                attempt,
+                &Frame {
+                    seq,
+                    step: 0,
+                    stream: Stream::Stdout,
+                    bytes: full.clone(),
+                },
+            )
+            .unwrap();
+    }
+    let logs = format!("/api/v1/attempts/{attempt}");
+    for bad in ["after=abc", "after=-1", "limit=many", "step=x"] {
+        let (status, body) = call(
+            &d,
+            "GET",
+            &format!("{logs}/logs?{bad}"),
+            None,
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("invalid_request")),
+            "{bad}: {body}"
+        );
+    }
+    for bad in [
+        "c1zz".to_owned(),
+        sentinel_protocol::cursor::Cursor {
+            tenant: TenantId::new(),
+            kind: sentinel_protocol::cursor::StreamKind::AttemptLog,
+            stream: *attempt.as_bytes(),
+            seq: sentinel_protocol::cursor::Seq(0),
+        }
+        .to_string(),
+        sentinel_protocol::cursor::Cursor {
+            tenant: d.tenant,
+            kind: sentinel_protocol::cursor::StreamKind::AttemptLog,
+            stream: *AttemptId::new().as_bytes(),
+            seq: sentinel_protocol::cursor::Seq(0),
+        }
+        .to_string(),
+    ] {
+        let (status, body) = call(
+            &d,
+            "GET",
+            &format!("{logs}/logs?cursor={bad}"),
+            None,
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("invalid_cursor")),
+            "{body}"
+        );
+    }
+    let mut seen = Vec::new();
+    let mut next: Option<String> = None;
+    loop {
+        let query = match &next {
+            None => "after=0".to_owned(),
+            Some(cursor) => format!("cursor={cursor}"),
+        };
+        let (status, page) = call(
+            &d,
+            "GET",
+            &format!("{logs}/logs?{query}&limit=500"),
+            None,
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(status, 200, "{page}");
+        let frames = page["frames"].as_array().unwrap();
+        let bytes: usize = frames
+            .iter()
+            .map(|f| f["text"].as_str().unwrap().len())
+            .sum();
+        assert!(
+            bytes <= sentinel_store::logs::PAGE_BYTES as usize,
+            "{bytes}"
+        );
+        seen.extend(frames.iter().map(|f| f["seq"].as_u64().unwrap()));
+        assert!(page["next"].as_str().unwrap().starts_with("c1"));
+        if page["next_after"].is_null() {
+            break;
+        }
+        next = Some(page["next"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(seen, (1..=100).collect::<Vec<_>>());
+}
+
+fn attempt_for(d: &Deployment, job: sentinel_core::JobId) -> AttemptId {
+    let (tenant, now) = (d.tenant, UnixMillis::now());
+    let (pool, worker) = (PoolId::new(), WorkerId::new());
+    d.store
+        .writer()
+        .write(move |tx| {
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                pool,
+                "logs",
+                PoolKind::Dedicated(tenant),
+                now,
+            )?;
+            let issued = workers::issue_enrollment(tx, Authority::HostLocal, pool, 60_000, now)?;
+            let mut text = String::new();
+            issued.secret.expose(&mut text);
+            workers::enroll(
+                tx,
+                &sentinel_auth::secret::Secret::parse(&text).unwrap(),
+                Presentation {
+                    worker,
+                    fingerprint: sentinel_auth::secret::Secret::generate().digest(),
+                    name: "w",
+                    negotiated: Negotiated {
+                        protocol: ProtocolVersion(4),
+                        capabilities: Capabilities::REQUIRED,
+                        arch: Arch::X86_64,
+                    },
+                },
+                now,
+            )?;
+            dispatch::report_capacity(
+                tx,
+                worker,
+                Capacity {
+                    cpu_millis: 4_000,
+                    memory_bytes: 8 << 30,
+                    disk_bytes: 0,
+                },
+            )
+        })
+        .unwrap();
+    let offer = d
+        .store
+        .writer()
+        .write(move |tx| dispatch::place(tx, worker, pool, dispatch::DEFAULT_LEASE_MS, now))
+        .unwrap()
+        .expect("the queued job was placed");
+    assert_eq!(offer.job, job);
+    offer.attempt
+}
+
+fn raw_login(
+    d: &Deployment,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> (u16, Option<String>, String) {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let mut request = agent.post(&format!("{}/api/v1/login", d.base));
+    for (k, v) in headers {
+        request = request.header(*k, *v);
+    }
+    let response = request.send(body.as_bytes()).unwrap();
+    let status = response.status().as_u16();
+    let cookie = response
+        .headers()
+        .get("set-cookie")
+        .map(|v| v.to_str().unwrap().to_owned());
+    (
+        status,
+        cookie,
+        response.into_body().read_to_string().unwrap(),
+    )
+}
+
+#[test]
+fn login_refuses_a_text_plain_body() {
+    let d = deployment();
+    let forged = r#"{"username":"root","password":"correct horse battery=staple"}"#;
+    let (status, cookie, body) = raw_login(&d, forged, &[("content-type", "text/plain")]);
+    assert_eq!(status, 400, "{body}");
+    assert!(cookie.is_none());
+    let (status, cookie, _) = raw_login(&d, forged, &[]);
+    assert_eq!(status, 400);
+    assert!(cookie.is_none());
+}
+
+#[test]
+fn login_refuses_a_foreign_origin() {
+    let d = deployment();
+    let good = r#"{"username":"root","password":"correct horse battery staple"}"#;
+    let (status, cookie, _) = raw_login(
+        &d,
+        good,
+        &[
+            ("content-type", "application/json"),
+            ("origin", "https://attacker.example"),
+        ],
+    );
+    assert_eq!(status, 403);
+    assert!(cookie.is_none());
+    let own = d.base.clone();
+    let (status, cookie, _) = raw_login(
+        &d,
+        good,
+        &[
+            ("content-type", "application/json; charset=utf-8"),
+            ("origin", &own),
+        ],
+    );
+    assert_eq!(status, 200);
+    assert!(cookie.is_some());
+    let (status, _, _) = raw_login(&d, good, &[("content-type", "application/json")]);
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn a_foreign_tenant_slug_lists_as_not_found() {
+    let d = deployment();
+    let (member, globex) = (UserId::new(), TenantId::new());
+    let root = d.root;
+    let now = UnixMillis::now();
+    let tenant = d.tenant;
+    d.store
+        .writer()
+        .write(move |tx| {
+            let admin = Principal::new(root, P::ALL, None, None);
+            provisioning::insert_human(tx, member, "Member", false, now)?;
+            auth::create_namespace(
+                tx,
+                admin,
+                globex,
+                Namespace::parse("globex").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )?;
+            auth::set_membership(tx, admin, tenant, member, sentinel_core::auth::Role::Reader)
+        })
+        .unwrap();
+    let granted = tokens::provision(
+        &d.store,
+        Grant {
+            user: member,
+            name: "member",
+            permissions: P::REPOSITORY,
+            tenant: None,
+            repo: None,
+            lifetime_ms: 60_000,
+        },
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let auth = format!("Bearer {}", sentinel_auth::token::format(&granted.secret));
+    let (own, _) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/repos",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(own, 200);
+    let foreign = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/globex/repos",
+        None,
+        Some(&auth),
+        &[],
+    );
+    let missing = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/nowhere/repos",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(foreign.0, 404, "{}", foreign.1);
+    assert_eq!(foreign, missing);
+}
+
+#[test]
+fn an_active_session_outlives_its_first_idle_deadline() {
+    let policy = local_auth::Policy {
+        idle_ms: 6_000,
+        refresh_after_ms: 1_000,
+        ..local_auth::Policy::default()
+    };
+    let d = deployment_with(policy);
+    let deadlines = || -> (i64, i64) {
+        d.store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT created_ms, idle_deadline_ms FROM sessions
+                     WHERE revoked_ms IS NULL ORDER BY created_ms DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap()
+    };
+    let past = |ms: i64| {
+        while UnixMillis::now().0 <= ms {
+            let left = (ms + 1 - UnixMillis::now().0).max(1) as u64;
+            thread::sleep(Duration::from_millis(left));
+        }
+    };
+    let (status, cookie, _) = raw_login(
+        &d,
+        r#"{"username":"root","password":"correct horse battery staple"}"#,
+        &[("content-type", "application/json")],
+    );
+    assert_eq!(status, 200);
+    let cookie = cookie.unwrap();
+    let max_age = format!("Max-Age={}", policy.absolute_ms / 1000);
+    assert!(cookie.contains(&max_age), "{cookie}");
+    let cookie = cookie.split(';').next().unwrap().to_owned();
+    let me = || call(&d, "GET", "/api/v1/me", None, None, &[("cookie", &cookie)]).0;
+    let (created, first) = deadlines();
+    assert_eq!(first, created + 6_000);
+    past(created + 4_000);
+    assert_eq!(me(), 200);
+    let (_, slid) = deadlines();
+    assert!(slid > first, "slid from {first} to {slid}");
+    past(first);
+    assert_eq!(me(), 200);
+    let (_, last) = deadlines();
+    assert!(last > slid, "slid again from {slid} to {last}");
+    past(last);
+    assert_eq!(me(), 401);
+}
+
+fn person(
+    d: &Deployment,
+    name: &'static str,
+    role: Option<sentinel_core::auth::Role>,
+    permissions: P,
+) -> (UserId, String) {
+    let (root, tenant) = (d.root, d.tenant);
+    let user = UserId::new();
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            provisioning::insert_human(tx, user, name, false, now)?;
+            if let Some(role) = role {
+                auth::set_membership(
+                    tx,
+                    Principal::new(root, P::ALL, None, None),
+                    tenant,
+                    user,
+                    role,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let granted = tokens::provision(&d.store, Grant::new(user, name, permissions), now).unwrap();
+    (
+        user,
+        format!("Bearer {}", sentinel_auth::token::format(&granted.secret)),
+    )
+}
+
+fn globex(d: &Deployment) -> (TenantId, RepoId) {
+    let (root, globex, hidden) = (d.root, TenantId::new(), RepoId::new());
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            let admin = Principal::new(root, P::ALL, None, None);
+            auth::create_namespace(
+                tx,
+                admin,
+                globex,
+                Namespace::parse("globex").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )?;
+            auth::set_membership(
+                tx,
+                admin,
+                globex,
+                root,
+                sentinel_core::auth::Role::TenantAdmin,
+            )?;
+            auth::create_repo(tx, admin, globex, hidden, "hidden", now)
+        })
+        .unwrap();
+    (globex, hidden)
+}
+
+fn status_code(reply: (u16, serde_json::Value)) -> (u16, String) {
+    (reply.0, reply.1["code"].as_str().unwrap_or("").to_owned())
+}
+
+#[test]
+fn a_foreign_tenant_or_repo_is_not_found_on_every_secret_route() {
+    let d = deployment();
+    globex(&d);
+    let (_, auth) = person(
+        &d,
+        "member",
+        Some(sentinel_core::auth::Role::Reader),
+        P::READ.union(P::WRITE_SECRETS),
+    );
+    type Case<'a> = (&'a str, &'a str, &'a [u8], &'a [(&'a str, &'a str)]);
+    let requests: &[Case] = &[
+        ("GET", "secrets?limit=0", b"", &[]),
+        ("GET", "secrets", b"", &[]),
+        ("GET", "secrets/TOKEN", b"", &[]),
+        (
+            "PUT",
+            "secrets/TOKEN",
+            b"",
+            &[("if-match", "0"), ("idempotency-key", "k")],
+        ),
+        (
+            "PUT",
+            "secrets/TOKEN",
+            b"v",
+            &[("if-match", "x"), ("idempotency-key", "k")],
+        ),
+        (
+            "PUT",
+            "secrets/TOKEN",
+            b"v",
+            &[("if-match", "0"), ("idempotency-key", "k")],
+        ),
+        (
+            "DELETE",
+            "secrets/TOKEN",
+            b"",
+            &[("if-match", "1"), ("idempotency-key", "k")],
+        ),
+        (
+            "POST",
+            "secrets/import",
+            b"A=1\n",
+            &[("if-match", "A=0"), ("idempotency-key", "k")],
+        ),
+        (
+            "POST",
+            "secrets/import",
+            b"A=\n",
+            &[("if-match", "A=0"), ("idempotency-key", "k")],
+        ),
+        ("GET", "secrets/TOKEN/allow", b"", &[]),
+        ("POST", "secrets/TOKEN/versions/1/revoke", b"", &[]),
+        ("GET", "secret-bindings?limit=0", b"", &[]),
+        ("PUT", "secret-bindings/TOKEN", b"", &[]),
+        ("DELETE", "secret-bindings/TOKEN", b"", &[]),
+    ];
+    let send = |method: &str, path: &str, body: &[u8], headers: &[(&str, &str)]| {
+        status_code(match method {
+            "GET" => call(&d, "GET", path, None, Some(&auth), headers),
+            _ => call_bytes(&d, method, path, body, &auth, headers),
+        })
+    };
+    let with_repo = |path: &str, repo: &str| {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        format!("{path}{sep}repo={repo}")
+    };
+    for (method, path, body, headers) in requests {
+        let foreign = send(
+            method,
+            &format!("/api/v1/tenants/globex/{path}"),
+            body,
+            headers,
+        );
+        let missing = send(
+            method,
+            &format!("/api/v1/tenants/nope/{path}"),
+            body,
+            headers,
+        );
+        assert_eq!(foreign, missing, "{method} {path}");
+        let base = format!("/api/v1/tenants/acme/{path}");
+        let hidden = send(method, &with_repo(&base, "widget"), body, headers);
+        let absent = send(method, &with_repo(&base, "no-such-repo"), body, headers);
+        assert_eq!(hidden, absent, "{method} {path} ?repo");
+        let foreign_repo = send(
+            method,
+            &with_repo(&format!("/api/v1/tenants/globex/{path}"), "hidden"),
+            body,
+            headers,
+        );
+        let missing_repo = send(
+            method,
+            &with_repo(&format!("/api/v1/tenants/nope/{path}"), "hidden"),
+            body,
+            headers,
+        );
+        assert_eq!(foreign_repo, missing_repo, "{method} {path} foreign repo");
+    }
+}
+
+#[test]
+fn secret_bindings_allowlists_and_revocation_are_served_over_http() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let put = |path: &str, body: &[u8], key: &str, version: &str| {
+        call_bytes(
+            &d,
+            "PUT",
+            path,
+            body,
+            &auth,
+            &[("if-match", version), ("idempotency-key", key)],
+        )
+    };
+    assert_eq!(
+        put(
+            "/api/v1/tenants/acme/secrets/SHARED",
+            b"shared-v1",
+            "s1",
+            "0"
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        put(
+            "/api/v1/tenants/acme/secrets/OWN?repo=app",
+            b"own-v1",
+            "o1",
+            "0"
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        put(
+            "/api/v1/tenants/acme/secrets/OWN?repo=app",
+            b"own-v2",
+            "o2",
+            "1"
+        )
+        .0,
+        200
+    );
+
+    let bind_shared = "/api/v1/tenants/acme/secret-bindings/SHARED?repo=app&job=build";
+    let tenant_source = br#"{"from_tenant":true}"#;
+    assert_eq!(
+        call_bytes(&d, "PUT", bind_shared, tenant_source, &auth, &[]).0,
+        404
+    );
+    for _ in 0..2 {
+        let (status, allowed) = call_bytes(
+            &d,
+            "PUT",
+            "/api/v1/tenants/acme/secrets/SHARED/allow?repo=app",
+            b"",
+            &auth,
+            &[],
+        );
+        assert_eq!(status, 200, "{allowed}");
+        assert_eq!(allowed["allowed"], true);
+    }
+    let (status, listed) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/secrets/SHARED/allow",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(listed["repos"][0]["name"], "app");
+    let (status, bound) = call_bytes(&d, "PUT", bind_shared, tenant_source, &auth, &[]);
+    assert_eq!(status, 200, "{bound}");
+    assert_eq!(bound["binding"]["job"], "build");
+    let (status, own) = call_bytes(
+        &d,
+        "PUT",
+        "/api/v1/tenants/acme/secret-bindings/OWN?repo=app",
+        b"",
+        &auth,
+        &[],
+    );
+    assert_eq!(status, 200, "{own}");
+    let (status, page) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/secret-bindings?repo=app&limit=1",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(page["bindings"].as_array().unwrap().len(), 1);
+    assert_eq!(page["bindings"][0]["name"], "OWN");
+    let next = page["next"].as_str().unwrap().to_owned();
+    let (_, rest) = call(
+        &d,
+        "GET",
+        &format!(
+            "/api/v1/tenants/acme/secret-bindings?repo=app&after={}",
+            next.replace('/', "%2F")
+        ),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(rest["bindings"][0]["name"], "SHARED");
+    assert!(!serde_json::to_string(&rest).unwrap().contains("shared-v1"));
+
+    let (globex_tenant, _) = globex(&d);
+    let (outsider, outsider_auth) = person(
+        &d,
+        "outsider",
+        None,
+        P::READ.union(P::WRITE_SECRETS).union(P::TENANT_ADMIN),
+    );
+    let root = d.root;
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::set_membership(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                globex_tenant,
+                outsider,
+                sentinel_core::auth::Role::TenantAdmin,
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        call_bytes(&d, "PUT", bind_shared, tenant_source, &outsider_auth, &[]).0,
+        404
+    );
+    assert_eq!(
+        call(
+            &d,
+            "GET",
+            "/api/v1/tenants/acme/secret-bindings?repo=app",
+            None,
+            Some(&outsider_auth),
+            &[]
+        )
+        .0,
+        404
+    );
+
+    let (writer, writer_auth) = person(
+        &d,
+        "writer",
+        Some(sentinel_core::auth::Role::Reader),
+        P::READ.union(P::WRITE_SECRETS),
+    );
+    let (repo, tenant) = (d.repo, d.tenant);
+    let _ = tenant;
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::set_repo_grant(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                repo,
+                writer,
+                P::READ.union(P::WRITE_SECRETS),
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        put(
+            "/api/v1/tenants/acme/secrets/OWN2?repo=widget",
+            b"x",
+            "w1",
+            "0"
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        call_bytes(
+            &d,
+            "PUT",
+            "/api/v1/tenants/acme/secret-bindings/OWN2?repo=widget",
+            b"",
+            &writer_auth,
+            &[]
+        )
+        .0,
+        404
+    );
+    assert_eq!(
+        call_bytes(
+            &d,
+            "DELETE",
+            "/api/v1/tenants/acme/secret-bindings/OWN?repo=app",
+            b"",
+            &writer_auth,
+            &[]
+        )
+        .0,
+        200
+    );
+
+    let reader = member_bearer(&d, "reader");
+    let (status, denied) = call_bytes(&d, "PUT", bind_shared, tenant_source, &reader, &[]);
+    assert_eq!((status, denied["code"].as_str()), (403, Some("forbidden")));
+
+    for _ in 0..2 {
+        let (status, revoked) = call_bytes(
+            &d,
+            "POST",
+            "/api/v1/tenants/acme/secrets/OWN/versions/1/revoke?repo=app",
+            b"",
+            &auth,
+            &[],
+        );
+        assert_eq!(status, 200, "{revoked}");
+        assert_eq!(revoked["revoked_version"], 1);
+        assert_eq!(revoked["secret"]["version"], 2);
+        assert_eq!(revoked["secret"]["active"], true);
+    }
+    assert_eq!(
+        call_bytes(
+            &d,
+            "POST",
+            "/api/v1/tenants/acme/secrets/OWN/versions/3/revoke?repo=app",
+            b"",
+            &auth,
+            &[]
+        )
+        .0,
+        404
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            call_bytes(&d, "DELETE", bind_shared, b"", &auth, &[]).0,
+            200
+        );
+    }
+    let (status, denied) = call_bytes(
+        &d,
+        "DELETE",
+        "/api/v1/tenants/acme/secrets/SHARED/allow?repo=app",
+        b"",
+        &auth,
+        &[],
+    );
+    assert_eq!((status, denied["allowed"].as_bool()), (200, Some(false)));
+}
+
+#[test]
+fn a_repository_name_with_a_slash_is_addressed_by_its_decoded_name() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let (root, tenant, repo) = (d.root, d.tenant, RepoId::new());
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::create_repo(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                repo,
+                "acme/app",
+                now,
+            )
+        })
+        .unwrap();
+    let (status, created) = call_bytes(
+        &d,
+        "PUT",
+        "/api/v1/tenants/acme/secrets/TOKEN?repo=acme%2Fapp",
+        b"value",
+        &auth,
+        &[("if-match", "0"), ("idempotency-key", "slash")],
+    );
+    assert_eq!(status, 200, "{created}");
+    assert_eq!(created["secret"]["repo"], repo.to_string());
+    let (status, listed) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/secrets?repo=acme%2Fapp",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(listed["secrets"][0]["name"], "TOKEN");
+    assert_eq!(
+        call(
+            &d,
+            "GET",
+            "/api/v1/tenants/acme/secrets?repo=acme%252Fapp",
+            None,
+            Some(&auth),
+            &[],
+        )
+        .0,
+        404
+    );
+}
+
+/// The retry record keeps a keyed MAC, not an unkeyed hash that a database copy could brute-force.
+#[test]
+fn the_stored_retry_fingerprint_is_not_an_unkeyed_digest_of_the_value() {
+    fn unkeyed(scope: &[u8], name: &str, expected: u64, body: &[u8]) -> [u8; 16] {
+        let mut hash: u128 = 0x6c62272e07bb014262b821756295c58d;
+        let mut feed = |bytes: &[u8]| {
+            for &byte in bytes {
+                hash ^= byte as u128;
+                hash = hash.wrapping_mul(0x0000000001000000000000000000013B);
+            }
+        };
+        feed(scope);
+        feed(&(name.len() as u32).to_be_bytes());
+        feed(name.as_bytes());
+        feed(&8u32.to_be_bytes());
+        feed(&expected.to_be_bytes());
+        feed(&(body.len() as u64).to_be_bytes());
+        feed(body);
+        hash.to_le_bytes()
+    }
+    let d = deployment();
+    let auth = bearer(&d);
+    let (status, _) = call_bytes(
+        &d,
+        "PUT",
+        "/api/v1/tenants/acme/secrets/PIN",
+        b"1234",
+        &auth,
+        &[("if-match", "0"), ("idempotency-key", "pin")],
+    );
+    assert_eq!(status, 200);
+    let stored: Vec<u8> = d
+        .store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT fingerprint FROM secret_idempotency WHERE key='pin'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    let mut scope = vec![0u8];
+    scope.extend_from_slice(d.tenant.as_bytes());
+    assert_eq!(stored.len(), 16);
+    assert_ne!(stored, unkeyed(&scope, "PIN", 0, b"1234"));
+    for guess in 0..10_000u32 {
+        let guess = format!("{guess:04}");
+        assert_ne!(stored, unkeyed(&scope, "PIN", 0, guess.as_bytes()));
+    }
+}
+
+fn mcp_session(
+    d: &Deployment,
+    client_id: &'static str,
+    scopes: sentinel_core::auth::Scopes,
+) -> (String, String) {
+    use sentinel_auth::oauth::{self as auth_oauth, Kind, pkce};
+    use sentinel_core::auth::{Audience, Scopes};
+    sentinel_store::oauth::register_mcp_client(
+        &d.store,
+        &sentinel_store::oauth::McpClientSpec {
+            id: client_id,
+            name: "Binding reader",
+            max_scopes: Scopes::MCP,
+            kind: sentinel_store::oauth::McpRegistrationKind::Dynamic,
+            metadata_url: None,
+        },
+        &["http://127.0.0.1:49152/callback"],
+    )
+    .unwrap();
+    let verifier = pkce::verifier();
+    let challenge = pkce::challenge(&verifier);
+    let code = sentinel_store::oauth::code::approve(
+        &d.store,
+        &sentinel_store::oauth::code::Approval {
+            client_id,
+            redirect_uri: "http://127.0.0.1:49152/callback",
+            code_challenge: &challenge,
+            user: d.root,
+            scopes,
+            tenant: None,
+            repo: None,
+            audience: Audience::Mcp,
+        },
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let grant = sentinel_store::oauth::code::exchange(
+        &d.store,
+        client_id,
+        &code,
+        "http://127.0.0.1:49152/callback",
+        &verifier,
+        Some(Audience::Mcp),
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let authorization = format!("Bearer {}", auth_oauth::format(Kind::Access, &grant.access));
+    let (status, headers, body) = mcp_post(
+        d,
+        &serde_json::json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize",
+            "params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"bindings-test","version":"1"}}
+        }),
+        &authorization,
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    let session = headers
+        .into_iter()
+        .find(|(key, _)| key == "mcp-session-id")
+        .unwrap()
+        .1;
+    let (status, _, body) = mcp_post(
+        d,
+        &serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        &authorization,
+        &[
+            ("mcp-protocol-version", "2025-11-25"),
+            ("mcp-session-id", session.as_str()),
+        ],
+    );
+    assert_eq!(status, 202, "{body}");
+    (authorization, session)
+}
+
+fn mcp_post(
+    d: &Deployment,
+    body: &serde_json::Value,
+    authorization: &str,
+    extra: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>, serde_json::Value) {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build(),
+    );
+    let mut request = agent
+        .post(format!("{}/mcp", d.base))
+        .header("accept", "application/json, text/event-stream")
+        .header("authorization", authorization)
+        .header("content-type", "application/json");
+    for (name, value) in extra {
+        request = request.header(*name, *value);
+    }
+    let response = request.send(body.to_string().as_bytes()).unwrap();
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_ascii_lowercase(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let text = response.into_body().read_to_string().unwrap();
+    let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+    (status, headers, body)
+}
+
+#[test]
+fn mcp_lists_a_slash_named_repositorys_secret_bindings_as_metadata_only() {
+    use sentinel_core::auth::Scopes;
+    let d = deployment();
+    let auth = bearer(&d);
+    let (root, tenant, repo) = (d.root, d.tenant, RepoId::new());
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::create_repo(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                repo,
+                "acme/app",
+                now,
+            )
+        })
+        .unwrap();
+    let (status, created) = call_bytes(
+        &d,
+        "PUT",
+        "/api/v1/tenants/acme/secrets/DEPLOY_TOKEN?repo=acme%2Fapp",
+        b"bindings-mcp-secret-value",
+        &auth,
+        &[("if-match", "0"), ("idempotency-key", "mcp-bind")],
+    );
+    assert_eq!(status, 200, "{created}");
+    let (status, bound) = call_bytes(
+        &d,
+        "PUT",
+        "/api/v1/tenants/acme/secret-bindings/DEPLOY_TOKEN?repo=acme%2Fapp&job=deploy&step=push",
+        b"",
+        &auth,
+        &[],
+    );
+    assert_eq!(status, 200, "{bound}");
+
+    let tool = |session: &(String, String), arguments: serde_json::Value| {
+        mcp_post(
+            &d,
+            &serde_json::json!({
+                "jsonrpc":"2.0", "id":2, "method":"tools/call",
+                "params":{"name":"list_secret_bindings","arguments":arguments}
+            }),
+            &session.0,
+            &[
+                ("mcp-protocol-version", "2025-11-25"),
+                ("mcp-session-id", session.1.as_str()),
+            ],
+        )
+    };
+    let reader = mcp_session(&d, "bindings-reader", Scopes::SECRETS_METADATA);
+    let (status, _, body) = tool(
+        &reader,
+        serde_json::json!({"tenant":"acme","repo":"acme/app"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["isError"], false, "{body}");
+    let listed = &body["result"]["structuredContent"];
+    assert_eq!(listed["repo"], repo.to_string());
+    let bindings = listed["bindings"].as_array().unwrap();
+    assert_eq!(bindings.len(), 1, "{listed}");
+    assert_eq!(bindings[0]["name"], "DEPLOY_TOKEN");
+    assert_eq!(bindings[0]["job"], "deploy");
+    assert_eq!(bindings[0]["step"], "push");
+    assert!(
+        !body.to_string().contains("bindings-mcp-secret-value"),
+        "{body}"
+    );
+    let (status, _, body) = tool(
+        &reader,
+        serde_json::json!({"tenant":"acme","repo":"Invalid\nName"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    assert_eq!(
+        body["result"]["structuredContent"]["message"],
+        "repository names are 1 to 128 bytes without control characters"
+    );
+
+    let runs_only = mcp_session(&d, "bindings-runs-only", Scopes::RUNS_READ);
+    let (status, headers, body) = tool(
+        &runs_only,
+        serde_json::json!({"tenant":"acme","repo":"acme/app"}),
+    );
+    assert_eq!(status, 403, "{body}");
+    let challenge = headers
+        .iter()
+        .find(|(key, _)| key == "www-authenticate")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default();
+    assert!(challenge.contains("insufficient_scope"), "{challenge}");
+}

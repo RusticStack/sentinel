@@ -1,0 +1,7 @@
+# expect: on.push.branches[0]: must not contain `**` inside a segment or forbidden characters
+schema: 1
+on:
+  push:
+    branches: ["re**lease", "main"]
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}]}

@@ -1,0 +1,119 @@
+//! Non-Unix hosts: every entry point refuses, so callers still compile everywhere.
+use std::{
+    path::Path,
+    process::Command,
+    time::{Duration, Instant},
+};
+
+use sentinel_pipeline::PinnedSource;
+use sentinel_protocol::source::Access;
+
+use crate::{Error, Merge, RefTip, Result};
+
+pub const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+pub struct Credential {
+    pub username: String,
+    pub secret: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Checkout {
+    pub sha: String,
+    pub fetch_ns: u64,
+    pub materialize_ns: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct FetchedFile {
+    pub commit: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct Output {
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl Output {
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
+pub fn run(_: Command, _: Instant, _: &'static str) -> Result<Output> {
+    Err(Error::UnsupportedPlatform)
+}
+
+pub fn cancel_scope<T>(
+    _: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    f: impl FnOnce() -> T,
+) -> T {
+    f()
+}
+
+pub fn checkout(
+    _: &Path,
+    _: &PinnedSource,
+    _: Option<&Credential>,
+    _: Duration,
+) -> Result<Checkout> {
+    Err(Error::UnsupportedPlatform)
+}
+
+pub fn checkout_authorized(
+    _: &Path,
+    _: &PinnedSource,
+    _: &Access,
+    _: Duration,
+) -> Result<Checkout> {
+    Err(Error::UnsupportedPlatform)
+}
+
+pub fn file_at(
+    _: &Path,
+    _: &str,
+    _: Option<&Access>,
+    _: &str,
+    _: &str,
+    _: usize,
+    _: Duration,
+) -> Result<FetchedFile> {
+    Err(Error::UnsupportedPlatform)
+}
+
+pub fn file_at_merge(
+    _: &Path,
+    _: &str,
+    _: Option<&Access>,
+    _: Merge<'_>,
+    _: &str,
+    _: usize,
+    _: Duration,
+) -> Result<FetchedFile> {
+    Err(Error::UnsupportedPlatform)
+}
+
+pub fn ls_remote(
+    _: &Path,
+    _: &str,
+    _: Option<&Access>,
+    _: usize,
+    _: Duration,
+) -> Result<Vec<RefTip>> {
+    Err(Error::UnsupportedPlatform)
+}
+
+pub fn is_ancestor(
+    _: &Path,
+    _: &str,
+    _: Option<&Access>,
+    _: &str,
+    _: &str,
+    _: u32,
+    _: Duration,
+) -> Result<bool> {
+    Err(Error::UnsupportedPlatform)
+}

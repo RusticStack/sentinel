@@ -1,0 +1,8 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+k07a = "=0.1.0"
+k07b = "=0.1.1"

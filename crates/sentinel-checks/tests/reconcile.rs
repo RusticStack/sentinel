@@ -1,0 +1,554 @@
+use std::{
+    collections::VecDeque,
+    io::{Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+use sentinel_auth::sealed::Key;
+use sentinel_checks::reconcile::{Config, Reconcile};
+use sentinel_core::{RepoId, TenantId, UnixMillis, UserId};
+use sentinel_protocol::source::{Binding, Credential};
+use sentinel_store::{
+    Durability, Store,
+    sources::{self},
+    sources_forge::{self, Snapshot},
+};
+
+/// A test-only RSA key, generated for this suite; it authenticates nothing.
+const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDf6rEvjDV4LPW4
+lLht6MWXLarjIFjXnB53o9UxkubIhOGY4RuGq7L2hz8Be5pLy+dA79JbgdoyCzrW
+wR8IGVVdWFeSLC3U4RK+AvYhejVxForWyHIjb60GltbZN2pIADLCx2jS7KZK+3sP
+fQQa7YxkRCAoZmqqEMV/JqNuFebmICrwN+Zm2NCRIsqxcjbbefIdhlHShveZ6ulS
+QLxBN/ZFnCEWSZvZ5D5HDbJx3KHSFGpPZJ4Hyoghv20dYOmv8J2O2U246x9hq46Z
+zeutnBkTY11jrYKTJnSt4Oc8Alsf75G9V+Q/nSbmbS2nje8y0qtpKIosSoqEd6Rb
+e2+UrQSRAgMBAAECggEAAbj+T9iFGwmEAq10uYY9WmlT16tamZ6KKrcWQ1tPJpbk
+niqprbydi+lclAonlMqS2vBZYsI2C7VjyI4L60HYIvekdVO9DsakQHVY/8cPGRGQ
+hABe5exElVDU4m8LZJZJTa+vbBN9YEVs5ACtBtjB4C3YvjzS+F/YiB7TyiuVlxq/
+r265ZXQdqjy/Hl5G8gwIEVWPF8diR1fQi5nfqKjybSe5DL5kdo3CDHvm6UbY1arI
+0j7n/CDCERP/j4XnkS97vbKML3j2l2PFzQ42bgU6GuEtAlJLKHZKja1NiDfmCX2+
+0zH6ueVcqVO9iZnxthWznJeUnVWp1V3NeUa8eN1HIQKBgQD8YzEzbpHmXFLd5CCG
+i19bgpGIN0bPUpPF6Ipb73j8NW1dXdENRYgPKizWRdBQZygUmwvfuzsUnN+MZMgw
+ic09xbw/slO75bDhLtnBDZ34hFloCjJHSXlxeKqlQCkifKmhcS2vkKgVoO3TMp1Z
+iyZh2jvCVNOm9U+JfEE4y0+C8QKBgQDjHy0vNtnIvN65DHWsuJWoqrIORDcluExv
+50tMySPQ6l/5t6zYW3GNdnUUkXdtjworvIunp7yCnM0FTL/mpFHOkruwr2fJXMIg
+GOn0nzcGxKdyy9tFDx7FmJzwUiMow18qXptIdCQJZo0JO+w0iJYBX1pZYtvQSAjd
+TJqXdiBboQKBgAQUCkB9gegKB+DEBe6GpATTiEx+MCu7dt3U0x+HMBpLNrgyguVH
+AVrVYKIZwLL7577lfnygBuVfX5FiM4XtRB7CajdRR18a6A/LdQNUl//jC5rNx2A1
+hLvbqk4/SirfftI4BPf4S28GCbHG+Jnw0K72Gs8aFc1121IqatdjGabRAoGAekkQ
+9PjdbZ1zdcLloOeJfNTbJZ9I6gA+94lbG664oAVxQ2zHnX4ut3HuO/LOkKiRW1cb
+AlvnvZNbN91I/Y+/lC+g6tKmWN6ejtWbMeB/qh874S0tlBM+CDnRVfuDfrEijhd+
+GBagSId0rGIdHXPlADws0y/NFmmSjERwf9hUN8ECgYAlWpgQzrKS7xkaYaCngYgr
+sDhna8Obj+EC26+CgQs5BEXE+xkfrGXrPnsjcKpYHXATzMc9wnlWbuTzqWbqkvM7
+ya49XtXpSauI28m06lYEfdjXXItrna7u1Kxn02j/ZdJPmLT4KOy2QeDGJopezxB2
+N1m0wYzl/x50+EWUWQ1veg==
+-----END PRIVATE KEY-----";
+
+const INSTALLATION: u64 = 42;
+const ACCOUNT: u64 = 73;
+const GITHUB_REPO: u64 = 91;
+const REMOTE: &str = "https://github.com/account/app.git";
+const REF: &str = "refs/heads/main";
+
+#[derive(Default)]
+struct Data {
+    scripted: VecDeque<(String, String, u16, serde_json::Value)>,
+    installation_status: Option<u16>,
+    installation: Option<serde_json::Value>,
+    listed: Option<Vec<serde_json::Value>>,
+    repository: Option<serde_json::Value>,
+    requests: Vec<String>,
+}
+
+struct Stub {
+    addr: SocketAddr,
+    data: Arc<Mutex<Data>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Stub {
+    fn start() -> Stub {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data = Arc::new(Mutex::new(Data::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (data, stop) = (Arc::clone(&data), Arc::clone(&stop));
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let data = Arc::clone(&data);
+                            thread::spawn(move || serve(stream, &data));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        Stub {
+            addr,
+            data,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn script(&self, method: &str, path: &str, status: u16, body: serde_json::Value) {
+        self.data.lock().unwrap().scripted.push_back((
+            method.to_owned(),
+            path.to_owned(),
+            status,
+            body,
+        ));
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.data.lock().unwrap().requests.clone()
+    }
+}
+
+impl Drop for Stub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn serve(mut stream: TcpStream, data: &Arc<Mutex<Data>>) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    loop {
+        let Some((method, path)) = read_request(&mut stream) else {
+            return;
+        };
+        let (status, body) = {
+            let mut data = data.lock().unwrap();
+            data.requests.push(format!("{method} {path}"));
+            data.scripted
+                .iter()
+                .position(|(m, p, _, _)| *m == method && (p.is_empty() || path.contains(p)))
+                .map(|index| {
+                    let (_, _, status, body) = data.scripted.remove(index).unwrap();
+                    (status, body)
+                })
+                .unwrap_or_else(|| default_reply(&data, &method, &path))
+        };
+        let text = body.to_string();
+        let response = format!(
+            "HTTP/1.1 {status} X\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: keep-alive\r\n\r\n",
+            text.len()
+        );
+        if stream.write_all(response.as_bytes()).is_err()
+            || stream.write_all(text.as_bytes()).is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn read_request(stream: &mut TcpStream) -> Option<(String, String)> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+        }
+        if let Some(position) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            break position;
+        }
+    };
+    let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+    let mut lines = head.lines();
+    let mut parts = lines.next().unwrap_or_default().split_whitespace();
+    let (method, path) = (
+        parts.next().unwrap_or_default().to_owned(),
+        parts.next().unwrap_or_default().to_owned(),
+    );
+    // Consume the body too: on a keep-alive connection it would otherwise start the next request.
+    let mut length = buffer.len() - (header_end + 4);
+    let mut wanted = 0usize;
+    for line in lines {
+        if let Some((key, value)) = line.split_once(':')
+            && key.trim().eq_ignore_ascii_case("content-length")
+        {
+            wanted = value.trim().parse().unwrap_or(0);
+        }
+    }
+    while length < wanted {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => length += n,
+        }
+    }
+    Some((method, path))
+}
+
+fn default_reply(data: &Data, method: &str, path: &str) -> (u16, serde_json::Value) {
+    let expires = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    let expires = expires
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    if method == "GET" && path.contains(&format!("/app/installations/{INSTALLATION}")) {
+        if let Some(status) = data.installation_status {
+            return (status, serde_json::json!({"message": "Not Found"}));
+        }
+        return (
+            200,
+            data.installation.clone().unwrap_or_else(|| {
+                serde_json::json!({
+                    "id": INSTALLATION,
+                    "app_id": 1234,
+                    "account": {"id": ACCOUNT, "login": "account", "type": "Organization"},
+                    "suspended_at": null,
+                    "permissions": {"contents": "read", "checks": "write"},
+                })
+            }),
+        );
+    }
+    if method == "POST" && path.contains("/access_tokens") {
+        return (
+            201,
+            serde_json::json!({
+                "token": "ghs_reconcile",
+                "expires_at": expires,
+                "permissions": {"contents": "read", "metadata": "read"},
+            }),
+        );
+    }
+    if method == "GET" && path.contains("/installation/repositories") {
+        let repos = data.listed.clone().unwrap_or_else(|| {
+            vec![serde_json::json!({"id": GITHUB_REPO, "full_name": "account/app", "archived": false})]
+        });
+        return (200, serde_json::json!({"repositories": repos}));
+    }
+    if method == "GET" && path.contains(&format!("/repositories/{GITHUB_REPO}")) {
+        let body = data.repository.clone().unwrap_or_else(|| {
+            serde_json::json!({
+                "id": GITHUB_REPO,
+                "owner": {"id": ACCOUNT},
+                "clone_url": REMOTE,
+            })
+        });
+        return (200, body);
+    }
+    (404, serde_json::json!({"message": "not found"}))
+}
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    store: Arc<Store>,
+    stub: Stub,
+    app: Arc<sentinel_github::app::App>,
+    repo: RepoId,
+}
+
+fn fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("master.key");
+    Key::create(&key_path).unwrap();
+    let key = Key::load(&key_path).unwrap();
+    let store =
+        Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
+    let stub = Stub::start();
+    let app = Arc::new(
+        sentinel_github::app::App::new(1234, TEST_KEY)
+            .unwrap()
+            .with_endpoint(&stub.endpoint())
+            .unwrap(),
+    );
+    let (tenant, repo) = (TenantId::new(), RepoId::new());
+    let alice = UserId::new();
+    let now = UnixMillis::now();
+    store
+        .writer()
+        .write(move |tx| {
+            sentinel_store::auth::provisioning::insert_human(tx, alice, "alice", true, now)?;
+            sentinel_store::auth::create_namespace(
+                tx,
+                sentinel_core::auth::Principal::new(
+                    alice,
+                    sentinel_core::auth::Permissions::ALL,
+                    None,
+                    None,
+                ),
+                tenant,
+                sentinel_core::auth::Namespace::parse("acme").unwrap(),
+                sentinel_store::auth::NamespaceKind::Personal(alice),
+                now,
+            )?;
+            sentinel_store::auth::create_repo(
+                tx,
+                sentinel_core::auth::Principal::new(
+                    alice,
+                    sentinel_core::auth::Permissions::ALL,
+                    None,
+                    None,
+                ),
+                tenant,
+                repo,
+                "app",
+                now,
+            )?;
+            let installation = sources_forge::refresh(
+                tx,
+                Snapshot {
+                    external_id: INSTALLATION,
+                    account_id: ACCOUNT,
+                    login: "account",
+                    personal: false,
+                    suspended: false,
+                    permissions_valid: true,
+                    expected: 0,
+                },
+                now,
+            )?;
+            sentinel_store::registration::bind_installation_trusted(tx, installation, tenant, now)?;
+            sources::bind(
+                tx,
+                sentinel_store::registration::Authority::HostLocal,
+                Some(alice),
+                sources::Update {
+                    repo,
+                    expected: 0,
+                    binding: &Binding {
+                        remote: REMOTE.into(),
+                        allowed_refs: vec![REF.into()],
+                        pipeline_path: ".sentinel.yml".into(),
+                        trust: String::new(),
+                    },
+                    credential: &Credential::Public,
+                    forge: Some((installation, GITHUB_REPO)),
+                },
+                &["https://github.com".into()],
+                &key,
+                now,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    Fixture {
+        _dir: dir,
+        store,
+        stub,
+        app,
+        repo,
+    }
+}
+
+fn start(f: &Fixture, notices: Arc<Mutex<Vec<String>>>) -> Reconcile {
+    Reconcile::start(
+        Arc::clone(&f.store),
+        Arc::clone(&f.app),
+        Config {
+            idle: Duration::from_millis(20),
+            ..Config::default()
+        },
+        move |notice| {
+            eprintln!("reconcile[{}]: {}", notice.kind, notice.outcome);
+            notices.lock().unwrap().push(notice.outcome.clone());
+        },
+    )
+}
+
+fn binding_revoked(f: &Fixture) -> bool {
+    f.store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT revoked FROM source_bindings WHERE repo_id=?1",
+                [f.repo.as_bytes()],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+fn installation_disabled(f: &Fixture) -> bool {
+    f.store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT suspended AND NOT permissions_valid FROM installations",
+                [],
+                |r| r.get::<_, bool>(0),
+            )?)
+        })
+        .unwrap()
+}
+
+fn until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn until_stub(f: &Fixture, what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !done() {
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for {what}\nrequests: {:?}",
+                f.stub.requests()
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn notices_have(notices: &Arc<Mutex<Vec<String>>>, outcome: &str) -> bool {
+    notices.lock().unwrap().iter().any(|o| o == outcome)
+}
+
+#[test]
+fn a_healthy_installation_and_repository_verify() {
+    let f = fixture();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let lane = start(&f, Arc::clone(&notices));
+    let f_ref = &f;
+    until_stub(f_ref, "the periodic refresh", || {
+        notices_have(&notices, "refreshed") && notices_have(&notices, "verified")
+    });
+    assert!(!binding_revoked(&f));
+    assert!(
+        f.stub
+            .requests()
+            .iter()
+            .any(|r| r.starts_with("GET") && r.contains("/installation/repositories")),
+        "{:?}",
+        f.stub.requests()
+    );
+    drop(lane);
+}
+
+#[test]
+fn a_renamed_or_dropped_repository_loses_its_binding() {
+    let f = fixture();
+    f.stub.data.lock().unwrap().listed = Some(vec![
+        serde_json::json!({"id": GITHUB_REPO, "full_name": "other/renamed", "archived": false}),
+    ]);
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let lane = start(&f, Arc::clone(&notices));
+    until("the rename revoke", || binding_revoked(&f));
+    until("the revoke notice", || {
+        notices
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| o.contains("revoked"))
+    });
+    assert!(
+        notices
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| o.contains("revoked")),
+        "{:?}",
+        notices.lock().unwrap()
+    );
+    drop(lane);
+
+    let f = fixture();
+    f.stub.data.lock().unwrap().listed = Some(Vec::new());
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let lane = start(&f, Arc::clone(&notices));
+    until("the removal revoke", || binding_revoked(&f));
+    drop(lane);
+
+    let f = fixture();
+    f.stub.data.lock().unwrap().repository = Some(serde_json::json!({
+        "id": GITHUB_REPO,
+        "owner": {"id": ACCOUNT},
+        "clone_url": "https://github.com/other/moved.git",
+    }));
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let lane = start(&f, Arc::clone(&notices));
+    until("the transfer revoke", || binding_revoked(&f));
+    drop(lane);
+}
+
+#[test]
+fn a_gone_installation_disables_issuance_and_revokes_bindings() {
+    let f = fixture();
+    f.stub.data.lock().unwrap().installation_status = Some(404);
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let lane = start(&f, Arc::clone(&notices));
+    until("the installation removal", || {
+        installation_disabled(&f) && binding_revoked(&f)
+    });
+    drop(lane);
+}
+
+#[test]
+fn a_suspended_installation_stays_disabled_until_the_api_clears_it() {
+    let f = fixture();
+    f.stub.data.lock().unwrap().installation = Some(serde_json::json!({
+        "id": INSTALLATION,
+        "app_id": 1234,
+        "account": {"id": ACCOUNT, "login": "account", "type": "Organization"},
+        "suspended_at": "2026-01-01T00:00:00Z",
+        "permissions": {"contents": "read", "checks": "write"},
+    }));
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let lane = start(&f, Arc::clone(&notices));
+    until("the suspended refresh", || {
+        notices_have(&notices, "refreshed")
+    });
+    until("the suspended repository pass", || {
+        notices_have(&notices, "installation refresh scheduled")
+    });
+    drop(lane);
+    let suspended: bool = f
+        .store
+        .read(|c| Ok(c.query_row("SELECT suspended FROM installations", [], |r| r.get(0))?))
+        .unwrap();
+    assert!(suspended, "the API's suspension is durable");
+    assert!(!binding_revoked(&f), "suspension alone does not revoke");
+}
+
+#[test]
+fn a_transient_failure_retries_without_revoking() {
+    let f = fixture();
+    f.stub.script(
+        "GET",
+        "/repositories/",
+        500,
+        serde_json::json!({"message": "boom"}),
+    );
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let lane = start(&f, Arc::clone(&notices));
+    until("the retried repository pass", || {
+        notices_have(&notices, "verified")
+    });
+    let seen = notices.lock().unwrap().clone();
+    assert!(seen.contains(&"retry".to_owned()), "{seen:?}");
+    assert!(!binding_revoked(&f), "a 500 is not proof of removal");
+    drop(lane);
+}
+
+#[test]
+fn dropping_the_lane_joins_its_thread() {
+    let f = fixture();
+    let lane = start(&f, Arc::new(Mutex::new(Vec::new())));
+    let started = Instant::now();
+    drop(lane);
+    assert!(started.elapsed() < Duration::from_secs(2));
+}

@@ -1,0 +1,6 @@
+# expect: concurrency.group: may only use event, repo and run context
+schema: 1
+on: [push]
+concurrency: {group: "${{ hash_files('x') }}"}
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}]}

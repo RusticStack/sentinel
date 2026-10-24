@@ -1,0 +1,5 @@
+# expect: jobs.a.steps[0].if: invalid expression
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, steps: [{id: s, if: "exec('rm -rf /')", run: x}]}

@@ -1,0 +1,706 @@
+use std::time::Duration;
+
+use clap::{Args, Subcommand};
+use serde_json::Value;
+
+use crate::client::{self, Client, ClientArgs, Error, Output};
+
+mod artifacts;
+mod fleet;
+mod logs;
+mod runs;
+mod secrets;
+
+pub const MAX_ITEMS: usize = 10_000;
+const PAGE: usize = 500;
+const DEFAULT_ITEMS: usize = 20;
+
+#[derive(Args, Debug)]
+pub struct RunArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+    #[command(subcommand)]
+    pub command: RunCommand,
+}
+
+/// `--limit`, `--before`, `--all` for listings that page.
+#[derive(Args, Clone, Debug, Default)]
+pub struct Paging {
+    /// Items to list (default 20, at most 10000)
+    #[arg(long, conflicts_with = "all")]
+    pub limit: Option<usize>,
+    /// Start after this item (the `next` of a previous listing)
+    #[arg(long, value_name = "CURSOR")]
+    pub before: Option<String>,
+    /// Every item, page by page, up to 10000
+    #[arg(long)]
+    pub all: bool,
+}
+
+impl Paging {
+    /// How many items to print at most.
+    fn cap(&self) -> Result<usize, Error> {
+        match (self.all, self.limit) {
+            (true, _) => Ok(MAX_ITEMS),
+            (false, None) => Ok(DEFAULT_ITEMS),
+            (false, Some(n)) if (1..=MAX_ITEMS).contains(&n) => Ok(n),
+            (false, Some(_)) => Err(Error::usage(format!(
+                "--limit must be 1..{MAX_ITEMS}; use --all for everything"
+            ))),
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RunCommand {
+    /// Dispatch a pipeline file against a pinned source revision
+    Dispatch {
+        /// Tenant slug (default: the profile's context)
+        #[arg(long, value_name = "SLUG")]
+        tenant: Option<String>,
+        #[arg(long)]
+        repo: String,
+        /// The `.sentinel.yml` to run; every image must be pinned by digest
+        #[arg(long, value_name = "FILE")]
+        pipeline: std::path::PathBuf,
+        /// Clone URL or path the workers fetch from
+        #[arg(long)]
+        source: String,
+        /// Full commit SHA to check out
+        #[arg(long)]
+        sha: String,
+        /// Ref name kept as provenance
+        #[arg(long)]
+        r#ref: Option<String>,
+        /// Idempotency key so a retried dispatch creates one run
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// A run and its jobs
+    Status { run: String },
+    /// Runs of a repository, newest first
+    List {
+        /// Tenant slug (default: the profile's context)
+        #[arg(long, value_name = "SLUG")]
+        tenant: Option<String>,
+        #[arg(long)]
+        repo: String,
+        #[command(flatten)]
+        paging: Paging,
+    },
+    /// Record cancellation for a run
+    Cancel { run: String },
+    /// Wait until a run finishes: exit 0 passed, 8 not passed, 7 deadline
+    Wait {
+        run: String,
+        /// Give up after this long, such as 90s, 10m or 1h (default: no limit)
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct StatusArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+    pub run: String,
+}
+
+#[derive(Args, Debug)]
+pub struct WaitArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+    pub run: String,
+    /// Give up after this long, such as 90s, 10m or 1h (default: no limit)
+    #[arg(long, value_name = "DURATION")]
+    pub timeout: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct JobArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+    #[command(subcommand)]
+    pub command: JobCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum JobCommand {
+    /// Record cancellation for one job
+    Cancel { job: String },
+    /// A new attempt of a finished job
+    Rerun { job: String },
+}
+
+#[derive(Args, Debug)]
+pub struct LogArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+    #[command(subcommand)]
+    pub command: LogCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LogCommand {
+    /// An attempt's log; --follow waits until it is complete
+    Show {
+        attempt: String,
+        #[arg(long)]
+        follow: bool,
+        /// Only this step's frames
+        #[arg(long)]
+        step: Option<u32>,
+    },
+    /// Find a literal string in an attempt's log
+    Search {
+        attempt: String,
+        /// The literal to find (1..256 bytes, case-sensitive)
+        #[arg(long)]
+        text: String,
+        /// Matching lines to print (default 100, at most 10000)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct WorkersArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+    #[command(subcommand)]
+    pub command: WorkersCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WorkersCommand {
+    /// Pools and workers a tenant may use, with connection state
+    List {
+        /// Tenant slug (default: the profile's context)
+        #[arg(long, value_name = "SLUG")]
+        tenant: Option<String>,
+    },
+    /// Stop one worker taking new attempts (platform admin)
+    Drain { worker: String },
+    /// Offer a drained worker work again (platform admin)
+    Undrain { worker: String },
+}
+
+#[derive(Args, Debug)]
+pub struct QueueArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+    /// Tenant slug (default: the profile's context)
+    #[arg(long, value_name = "SLUG")]
+    pub tenant: Option<String>,
+    /// Waiting jobs to show (default 100, at most 500); the total is still reported
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+pub struct ArtifactArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+    #[command(subcommand)]
+    pub command: ArtifactCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ArtifactCommand {
+    /// Every artifact of a run
+    List { run: String },
+    /// One artifact and its manifest
+    Show { run: String, artifact: String },
+    /// Download one manifest entry, checking its length and digest
+    Download {
+        run: String,
+        artifact: String,
+        /// The entry's path inside the artifact
+        #[arg(long)]
+        path: String,
+        /// Where to write it; replaced only once the bytes verify
+        #[arg(long, value_name = "FILE")]
+        out: std::path::PathBuf,
+        /// Tenant slug that owns the run (default: the one the server names)
+        #[arg(long, value_name = "SLUG")]
+        tenant: Option<String>,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct CacheArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+    #[command(subcommand)]
+    pub command: CacheCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CacheCommand {
+    /// Cache records of one attempt
+    Show { attempt: String },
+}
+
+#[derive(Debug)]
+pub enum Invocation {
+    Run(RunArgs),
+    Status(StatusArgs),
+    Wait(WaitArgs),
+    Job(JobArgs),
+    Log(LogArgs),
+    Workers(WorkersArgs),
+    Queue(QueueArgs),
+    Artifact(ArtifactArgs),
+    Cache(CacheArgs),
+    Secret(SecretArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SecretArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+    #[command(subcommand)]
+    pub command: SecretCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SecretCommand {
+    /// Create or replace a secret using hidden prompt, stdin or a protected file
+    Set {
+        name: String,
+        #[command(flatten)]
+        scope: SecretScopeArgs,
+        #[arg(long, conflicts_with = "stdin")]
+        file: Option<std::path::PathBuf>,
+        #[arg(long, conflicts_with = "file")]
+        stdin: bool,
+        /// Expected current version (0 creates); omitted means read then compare-and-set
+        #[arg(long)]
+        if_version: Option<u64>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Replace an existing secret at exactly this current version
+    Rotate {
+        name: String,
+        #[command(flatten)]
+        scope: SecretScopeArgs,
+        #[arg(long, conflicts_with = "stdin")]
+        file: Option<std::path::PathBuf>,
+        #[arg(long, conflicts_with = "file")]
+        stdin: bool,
+        #[arg(long, required = true)]
+        if_version: u64,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// List metadata only
+    List {
+        #[command(flatten)]
+        scope: SecretScopeArgs,
+    },
+    /// Describe one secret without retrieving its value
+    Describe {
+        name: String,
+        #[command(flatten)]
+        scope: SecretScopeArgs,
+    },
+    /// Permanently revoke a secret and every retained version
+    Delete {
+        name: String,
+        #[command(flatten)]
+        scope: SecretScopeArgs,
+        #[arg(long, required = true)]
+        if_version: u64,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Atomically import literal NAME=value records from an env file
+    Import {
+        #[command(flatten)]
+        scope: SecretScopeArgs,
+        #[arg(long, value_name = "PATH", required = true)]
+        env_file: std::path::PathBuf,
+        /// Show names, observed versions and the --if-versions pin only; make no changes
+        #[arg(long, conflicts_with = "if_versions")]
+        preview: bool,
+        /// Expected versions as printed by --preview (NAME=V,...); refuses if any changed
+        #[arg(long, value_name = "NAME=V,...")]
+        if_versions: Option<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Bind a secret to a repository, optionally to one job or one job step
+    Bind {
+        name: String,
+        #[command(flatten)]
+        target: SecretRepoArgs,
+        /// Job ID; omit for every job that declares the name
+        #[arg(long)]
+        job: Option<String>,
+        /// Step ID within --job; omit for every step of the job
+        #[arg(long, requires = "job")]
+        step: Option<String>,
+        /// Bind the tenant secret of this name (it must be allowed in the repository)
+        #[arg(long, conflicts_with = "override_tenant")]
+        from_tenant: bool,
+        /// Let the repository secret win over an allowed tenant secret of the same name
+        #[arg(long)]
+        override_tenant: bool,
+    },
+    /// Remove one binding; removing an absent binding succeeds
+    Unbind {
+        name: String,
+        #[command(flatten)]
+        target: SecretRepoArgs,
+        #[arg(long)]
+        job: Option<String>,
+        #[arg(long, requires = "job")]
+        step: Option<String>,
+    },
+    /// List a repository's bindings (metadata only)
+    Bindings {
+        #[command(flatten)]
+        target: SecretRepoArgs,
+    },
+    /// Allow a tenant secret in one repository
+    Allow {
+        name: String,
+        #[command(flatten)]
+        target: SecretRepoArgs,
+    },
+    /// Stop allowing a tenant secret in a repository; removes its bindings there
+    Deny {
+        name: String,
+        #[command(flatten)]
+        target: SecretRepoArgs,
+    },
+    /// List the repositories a tenant secret is allowed in
+    Allowed {
+        name: String,
+        /// Tenant slug (default: profile context)
+        #[arg(long, value_name = "SLUG")]
+        tenant: Option<String>,
+    },
+    /// Permanently revoke one version; the current version number is unchanged
+    RevokeVersion {
+        name: String,
+        /// The version to revoke
+        #[arg(value_name = "VERSION")]
+        revoke: u64,
+        #[command(flatten)]
+        scope: SecretScopeArgs,
+    },
+}
+
+#[derive(Args, Clone, Debug, Default)]
+pub struct SecretScopeArgs {
+    /// Tenant slug (default: profile context)
+    #[arg(long, value_name = "SLUG")]
+    pub tenant: Option<String>,
+    /// Repository name; omit for tenant-wide secrets
+    #[arg(long)]
+    pub repo: Option<String>,
+}
+
+#[derive(Args, Clone, Debug, Default)]
+pub struct SecretRepoArgs {
+    /// Tenant slug (default: profile context)
+    #[arg(long, value_name = "SLUG")]
+    pub tenant: Option<String>,
+    /// Repository name
+    #[arg(long, required = true)]
+    pub repo: String,
+}
+
+pub fn run(invocation: Invocation) -> Result<(), client::Error> {
+    match invocation {
+        Invocation::Run(args) => {
+            let (client, output) = connect(&args.client)?;
+            match args.command {
+                RunCommand::Dispatch {
+                    tenant,
+                    repo,
+                    pipeline,
+                    source,
+                    sha,
+                    r#ref,
+                    idempotency_key,
+                } => runs::dispatch(
+                    &client,
+                    output,
+                    &runs::Dispatch {
+                        tenant,
+                        repo,
+                        pipeline,
+                        source,
+                        sha,
+                        ref_name: r#ref,
+                        idempotency_key,
+                    },
+                ),
+                RunCommand::Status { run } => runs::status(&client, output, &run),
+                RunCommand::List {
+                    tenant,
+                    repo,
+                    paging,
+                } => runs::list(&client, output, tenant, &repo, &paging),
+                RunCommand::Cancel { run } => runs::cancel(&client, output, &run),
+                RunCommand::Wait { run, timeout } => {
+                    runs::wait(&client, output, &run, timeout.as_deref())
+                }
+            }
+        }
+        Invocation::Status(args) => {
+            let (client, output) = connect(&args.client)?;
+            runs::status(&client, output, &args.run)
+        }
+        Invocation::Wait(args) => {
+            let (client, output) = connect(&args.client)?;
+            runs::wait(&client, output, &args.run, args.timeout.as_deref())
+        }
+        Invocation::Job(args) => {
+            let (client, output) = connect(&args.client)?;
+            match args.command {
+                JobCommand::Cancel { job } => fleet::job(&client, output, &job, false),
+                JobCommand::Rerun { job } => fleet::job(&client, output, &job, true),
+            }
+        }
+        Invocation::Log(args) => {
+            let (client, output) = connect(&args.client)?;
+            match args.command {
+                LogCommand::Show {
+                    attempt,
+                    follow,
+                    step,
+                } => logs::show(&client, output, &attempt, follow, step),
+                LogCommand::Search {
+                    attempt,
+                    text,
+                    limit,
+                } => logs::search(&client, output, &attempt, &text, limit),
+            }
+        }
+        Invocation::Workers(args) => {
+            let (client, output) = connect(&args.client)?;
+            match args.command {
+                WorkersCommand::List { tenant } => fleet::workers(&client, output, tenant),
+                WorkersCommand::Drain { worker } => fleet::drain(&client, output, &worker, true),
+                WorkersCommand::Undrain { worker } => fleet::drain(&client, output, &worker, false),
+            }
+        }
+        Invocation::Queue(args) => {
+            let (client, output) = connect(&args.client)?;
+            fleet::queue(&client, output, args.tenant, args.limit)
+        }
+        Invocation::Artifact(args) => {
+            let (client, output) = connect(&args.client)?;
+            match args.command {
+                ArtifactCommand::List { run } => artifacts::list(&client, output, &run),
+                ArtifactCommand::Show { run, artifact } => {
+                    artifacts::show(&client, output, &run, &artifact)
+                }
+                ArtifactCommand::Download {
+                    run,
+                    artifact,
+                    path,
+                    out,
+                    tenant,
+                } => artifacts::download(&client, output, &run, &artifact, &path, &out, tenant),
+            }
+        }
+        Invocation::Cache(args) => {
+            let (client, output) = connect(&args.client)?;
+            match args.command {
+                CacheCommand::Show { attempt } => artifacts::cache(&client, output, &attempt),
+            }
+        }
+        Invocation::Secret(args) => {
+            let (client, output) = connect(&args.client)?;
+            secrets::run(&client, output, args.command)
+        }
+    }
+}
+
+/// Resolve the output mode first so a connection failure is still reported the way the user asked.
+fn connect(args: &ClientArgs) -> Result<(Client, Output), Error> {
+    let output = args.output();
+    Ok((Client::connect(args)?, output))
+}
+
+fn tenant(client: &Client, flag: Option<String>) -> Result<String, Error> {
+    let slug = flag
+        .or_else(|| client.default_tenant().map(str::to_owned))
+        .ok_or_else(|| {
+            Error::usage("give --tenant SLUG, or choose one with: sentinel context use SLUG")
+        })?;
+    segment("tenant", &slug)?;
+    Ok(slug)
+}
+
+/// Identifiers are refused locally unless they match `[A-Za-z0-9._-]`; escaping would reach a different request.
+fn segment<'a>(what: &str, value: &'a str) -> Result<&'a str, Error> {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return Err(Error::usage(format!("malformed {what}: {value:?}")));
+    }
+    Ok(value)
+}
+
+fn parse_duration(text: &str) -> Result<Duration, Error> {
+    let invalid = || Error::usage(format!("malformed duration {text:?}; use 90s, 10m or 1h"));
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let n: u64 = number.parse().map_err(|_| invalid())?;
+    let duration = match unit {
+        "ms" => Duration::from_millis(n),
+        "" | "s" => Duration::from_secs(n),
+        "m" => Duration::from_secs(n.checked_mul(60).ok_or_else(invalid)?),
+        "h" => Duration::from_secs(n.checked_mul(3600).ok_or_else(invalid)?),
+        _ => return Err(invalid()),
+    };
+    if duration.is_zero() {
+        return Err(invalid());
+    }
+    Ok(duration)
+}
+
+fn text<'a>(value: &'a Value, key: &str) -> &'a str {
+    value[key].as_str().unwrap_or("")
+}
+
+fn busy_backoff(error: &Error) -> Option<Duration> {
+    let api = error.api.as_ref()?;
+    if api["code"] != "rate_limited" {
+        return None;
+    }
+    Some(client::named_backoff(
+        client::server_backoff(error).unwrap_or(1_000),
+    ))
+}
+
+struct List {
+    output: Output,
+    items: Vec<Value>,
+}
+
+impl List {
+    fn new(output: Output) -> List {
+        List {
+            output,
+            items: Vec::new(),
+        }
+    }
+
+    fn item(&mut self, value: Value, text: impl FnOnce() -> String) {
+        match self.output {
+            Output::Json => self.items.push(value),
+            output => client::emit_item(output, &value, text),
+        }
+    }
+
+    fn finish(self, key: &str, extra: serde_json::Map<String, Value>) {
+        if self.output == Output::Json {
+            let mut doc = serde_json::Map::with_capacity(extra.len() + 1);
+            doc.insert(key.to_owned(), Value::Array(self.items));
+            doc.extend(extra);
+            client::emit(Output::Json, &Value::Object(doc), String::new);
+        }
+    }
+}
+
+fn jobs_text(run: &Value) -> String {
+    let mut out = String::new();
+    for job in run["jobs"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "  {:<24} {:<12} {}{}\n",
+            text(job, "name"),
+            text(job, "state"),
+            text(job, "failure_class"),
+            job["attempt"]
+                .as_str()
+                .map(|a| format!(" {a}"))
+                .unwrap_or_default()
+        ));
+    }
+    out
+}
+
+fn passed(run: &Value) -> bool {
+    matches!(text(run, "state"), "passed" | "skipped")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::Exit;
+
+    #[test]
+    fn durations_parse_with_units_and_refuse_nonsense() {
+        assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+        assert_eq!(parse_duration("10m").unwrap(), Duration::from_secs(600));
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
+        for bad in ["", "0s", "s", "1d", "-5s", "1.5m", "99999999999999999999h"] {
+            assert_eq!(parse_duration(bad).unwrap_err().exit, Exit::Usage, "{bad}");
+        }
+    }
+
+    #[test]
+    fn path_values_are_refused_rather_than_escaped() {
+        assert!(segment("run", "run_0123").is_ok());
+        assert!(segment("repo", "my.repo-name_2").is_ok());
+        for bad in ["", "a/b", "a?b", "a#b", "a%2F", "a b", "..\u{e9}"] {
+            assert_eq!(segment("x", bad).unwrap_err().exit, Exit::Usage, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_rate_limited_answers_back_off_with_jitter() {
+        let limited = Error {
+            message: String::new(),
+            exit: Exit::Busy,
+            api: Some(serde_json::json!({
+                "code": "rate_limited", "details": { "retry_after_ms": 1000 }
+            })),
+        };
+        let wait = busy_backoff(&limited).unwrap();
+        assert!(wait >= Duration::from_millis(1000) && wait <= Duration::from_millis(1501));
+        let huge = Error {
+            api: Some(serde_json::json!({
+                "code": "rate_limited", "details": { "retry_after_ms": u64::MAX }
+            })),
+            ..Error::remote("x")
+        };
+        let cap = client::MAX_SERVER_BACKOFF;
+        let wait = busy_backoff(&huge).unwrap();
+        assert!(wait >= cap && wait <= cap + cap / 2, "{wait:?}");
+        let other = Error {
+            api: Some(serde_json::json!({ "code": "internal" })),
+            ..Error::remote("x")
+        };
+        assert!(busy_backoff(&other).is_none());
+        assert!(busy_backoff(&Error::remote("x")).is_none());
+    }
+
+    #[test]
+    fn listing_caps_are_bounded() {
+        let paging = |limit, all| Paging {
+            limit,
+            before: None,
+            all,
+        };
+        assert_eq!(paging(None, false).cap().unwrap(), DEFAULT_ITEMS);
+        assert_eq!(paging(None, true).cap().unwrap(), MAX_ITEMS);
+        assert_eq!(paging(Some(7), false).cap().unwrap(), 7);
+        assert!(paging(Some(0), false).cap().is_err());
+        assert!(paging(Some(MAX_ITEMS + 1), false).cap().is_err());
+    }
+}

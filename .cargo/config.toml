@@ -1,0 +1,20 @@
+[alias]
+fmt-check = "fmt --all -- --check"
+lint = "clippy --locked --workspace --all-targets -- -D warnings"
+# Tests use cargo-nextest, which runs test binaries in parallel (cargo test does not).
+test-cli = "nextest run --locked --workspace --no-fail-fast"
+release-cli = "build --locked --workspace --release"
+
+# Linux-only role commands; portable checks above intentionally omit role features.
+lint-linux = "clippy --locked --workspace --all-targets --all-features -- -D warnings"
+test-server = "nextest run --locked --workspace --no-fail-fast --features server"
+test-worker = "nextest run --locked --workspace --no-fail-fast --features worker"
+test-linux = "nextest run --locked --workspace --no-fail-fast --all-features"
+release-linux = "build --locked --workspace --release --all-features"
+
+dev-server = "run --locked --package sentinel --features server -- server"
+dev-worker = "run --locked --package sentinel --features worker -- worker"
+
+bench-noop = "run --locked --package sentinel-bench --release --"
+
+probe = "run --locked --package sentinel-probes --release --"

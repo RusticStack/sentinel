@@ -1,0 +1,142 @@
+{
+  "format": "sentinel.bench-contract/1",
+  "id": "pilots-ci",
+  "revision": 4,
+  "frozen": "2026-10-24",
+  "purpose": "Anonymized publication snapshot of the representative required checks measured in Part 14: one Linux lane of each pilot workload, run through its live Sentinel pipeline with operator-granted egress at a pinned commit and under the allocation legacy-go-ci froze. Live mirror URLs and account details stay in private runner configuration; this snapshot's digest differs from the historical measurement contract.",
+  "reference_host": {
+    "description": "kvm-host: x86_64 bare-metal reference host with Sentinel and baseline workloads isolated in separate systemd slices",
+    "cpu_model": "AMD Ryzen 9 7900 12-Core Processor",
+    "cpus_online": 24,
+    "mem_total_kib_min": 128000000,
+    "filesystem": "ext4",
+    "cgroup": "v2; rootless Podman under the benchmark account's systemd user manager; baseline runners use system units",
+    "podman": "podman version 5.7.0",
+    "cpu_governor": "powersave (amd-pstate), left as the host runs it",
+    "user": "benchmark"
+  },
+  "allocation": {
+    "total": {
+      "cpus": "10",
+      "memory": "26g"
+    },
+    "note": "Concurrent jobs of one lane share the total: each job's resources cap is its share, and the caps of jobs that can run together add up to at most 10 CPUs. Sentinel's lane and the GitHub Actions baseline each get the total on their own CCD (six cores, twelve threads, own L3), so the two may run at the same time; one pilot at a time per side.",
+    "placement": {
+      "sentinel": "worker user slice pinned to CCD0, AllowedCPUs 0-5,12-17 (runtime property)",
+      "github_baseline": "baseline system slice pinned to CCD1, AllowedCPUs 6-11,18-23, CPUQuota 1000%, MemoryMax 26G, MemorySwapMax 0 (transient runtime unit)"
+    }
+  },
+  "sources": [
+    {
+      "name": "cli",
+      "repository": "https://pilot.invalid/cli",
+      "upstream": "https://github.com/cli/cli",
+      "commit": "4f2cfe92e3499f8581bf39db77e0a1431fa7b55c",
+      "namespace": "personal"
+    },
+    {
+      "name": "ripgrep",
+      "repository": "https://pilot.invalid/ripgrep",
+      "upstream": "https://github.com/BurntSushi/ripgrep",
+      "commit": "3fce3b5bb0236da2df6d99672afb8a719642eca7",
+      "namespace": "organization"
+    },
+    {
+      "name": "gson",
+      "repository": "https://pilot.invalid/gson",
+      "upstream": "https://github.com/google/gson",
+      "commit": "e2292f9c9f2e07a4791827e8eea34aa7d80545d6",
+      "namespace": "organization"
+    }
+  ],
+  "images": {
+    "go": "docker.io/library/golang:1.27.3-trixie@sha256:8aa2821993207ae840ce09e4223217efcd14e01f71525db734faf4232bd59999",
+    "rust": "docker.io/library/rust:1.99.1-trixie@sha256:a5ab4292e80567dc92f642e2a7d63773ebd695b82b56e8f06dc8d6ecc5600b76",
+    "maven-17": "docker.io/library/maven:3.9-eclipse-temurin-17@sha256:1a352420f7aba21f5ad08df31bab55f74c013fb491f1ae8ab1dd7ff9ed698584",
+    "maven-21": "docker.io/library/maven:3.9-eclipse-temurin-21@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320",
+    "maven-25": "docker.io/library/maven:3.9-eclipse-temurin-25@sha256:93b8a14ea2f412782e4e842651273b4d903e35cc496284f178fbbe2d67d00976"
+  },
+  "freshness": {
+    "rules": [
+      "Every required test executes on every sample: the cli lane sets GOFLAGS=-count=1 so Go's test cache serves nothing (stricter than the workflow, whose restored GOCACHE can), and cargo test and mvn verify always run their tests. Build caches are kept; test results never are.",
+      "A sample counts only when every job of the lane passes; a failing sample aborts the record.",
+      "A record belongs to one contract revision. Changing a source commit, image digest, command, allocation or condition procedure makes a new revision.",
+      "Comparisons use records taken on the reference host with CPU pressure (some, avg60) under 2 % at the start of each sample."
+    ],
+    "max_record_age_days": 30
+  },
+  "conditions": {
+    "cold": {
+      "description": "Worker cache directory removed and the worker restarted before the sample; images present. Dependencies are downloaded by the job through the worker's operator-granted egress, as a GitHub job downloads them: a cold sample depends on the network and its timing is reported with that."
+    },
+    "warm": {
+      "description": "Unchanged tree (an empty commit); caches kept from the previous sample of the same lane, after one unrecorded warm-up."
+    },
+    "small-edit": {
+      "description": "One line appended to a compiled source of the lane's main package (cli internal/ghcmd/cmd.go, ripgrep crates/searcher/src/lib.rs, gson JsonNull.java), caches kept."
+    }
+  },
+  "lanes": [
+    {
+      "id": "cli",
+      "workflow": ".github/workflows/go.yml job build, matrix row ubuntu-latest",
+      "required": true,
+      "pipeline": "examples/pilots/cli.sentinel.yml",
+      "jobs": [
+        "build-linux"
+      ]
+    },
+    {
+      "id": "ripgrep",
+      "workflow": ".github/workflows/ci.yml job test, matrix row stable",
+      "required": true,
+      "pipeline": "examples/pilots/ripgrep.sentinel.yml",
+      "jobs": [
+        "test-stable"
+      ]
+    },
+    {
+      "id": "gson",
+      "workflow": ".github/workflows/build.yml job build, rows JDK 17, 21, 25 (jdk)",
+      "required": true,
+      "pipeline": "examples/pilots/gson.sentinel.yml",
+      "jobs": [
+        "build-jdk17",
+        "build-jdk21",
+        "build-jdk25"
+      ]
+    }
+  ],
+  "not_measured": [
+    {
+      "ci_job": "cli build rows on Windows and macOS, integration-tests (attestation commands), lint, govulncheck, CodeQL, acceptance",
+      "reason": "non-Linux runners; integration-tests and acceptance need a GitHub token; the rest are other workflows"
+    },
+    {
+      "ci_job": "ripgrep test matrix rows other than stable x86_64 (beta, nightly, MSRV, cross targets, macOS, Windows), zsh completion step, wasm, rustfmt, docs",
+      "reason": "cross and non-Linux runners; the image lacks zsh"
+    },
+    {
+      "ci_job": "gson JDK 11 row, JDK 25 jdk+jmods row, build-gson-subset, API/Android compatibility, CodeQL, fuzz, scorecard",
+      "reason": "the image JDK carries no jmods; other workflows are advisory or need network"
+    }
+  ],
+  "revision_history": [
+    {
+      "revision": 1,
+      "note": "lanes ran offline from vendored dependencies (bench/pilots/, retired); records stay history"
+    },
+    {
+      "revision": 2,
+      "note": "lanes are the forks' live pipelines (examples/pilots/) on an egress worker; cold samples include dependency downloads, as the GitHub baseline's do"
+    },
+    {
+      "revision": 3,
+      "note": "the Go lane is cli (go.yml build, ubuntu row) instead of bbolt, whose fsync-heavy suite ran about 50 minutes and was OOM-killed under its 4 GiB unit caps; no revision 2 record completed"
+    },
+    {
+      "revision": 4,
+      "note": "reference host kvm-host instead of reference-host, with Sentinel and the GitHub baseline pinned to separate CCDs and run concurrently; revision 3 completed no record on reference-host (its cli samples stay unrecorded)"
+    }
+  ]
+}

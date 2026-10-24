@@ -1,0 +1,42 @@
+schema: 1
+on: [push, pull_request, manual]
+concurrency:
+  group: "${{ repo.id }}:${{ event.key }}"
+  cancel_in_progress: true
+jobs:
+  test:
+    image: rust:1-bookworm
+    runs_on: {arch: amd64, labels: [linux]}
+    resources: {cpu: 4, memory: 8GiB, disk: 20GiB}
+    timeout: 20m
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    cache:
+      - name: cargo-registry
+        key: "cargo-${{ hash_files('Cargo.lock') }}"
+        paths: [/usr/local/cargo/registry, /usr/local/cargo/git]
+      - name: cargo-target
+        key: "target-${{ hash_files('Cargo.lock') }}"
+        paths: [target]
+    steps:
+      - id: fmt
+        run: cargo fmt --all -- --check
+        timeout: 5m
+      - id: test
+        run: cargo test --locked
+        shell: bash
+        workdir: crates/app
+  build:
+    needs: [test]
+    image: rust:1-bookworm
+    resources: {cpu: "0.5", memory: 512MiB}
+    timeout: 1h30m
+    steps:
+      - id: build
+        run: cargo build --release --locked
+    artifacts:
+      - name: release
+        paths: [target/release/app]
+        when: success
+        retain: 7d

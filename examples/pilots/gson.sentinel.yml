@@ -1,0 +1,57 @@
+# The gson pilot's Sentinel pipeline (B06/B10): build.yml's `build` rows for
+# Temurin JDK 17, 21 and 25 with `mvn verify javadoc:jar`. Artifacts come from
+# Maven Central through an egress worker; the local repository is a Sentinel
+# downloads cache. The JDK 11 and jdk+jmods rows stay on Actions.
+schema: 1
+on:
+  push: {branches: [main]}
+  pull_request: {branches: [main]}
+jobs:
+  build-jdk17:
+    image: docker.io/library/maven:3.9-eclipse-temurin-17@sha256:1a352420f7aba21f5ad08df31bab55f74c013fb491f1ae8ab1dd7ff9ed698584
+    runs_on: { labels: [egress] }
+    resources: { cpu: 3, memory: 8GiB }
+    timeout: 90m
+    env:
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress -Dmaven.repo.local=/cache/m2
+      HOME: /tmp
+    cache:
+      - name: m2
+        class: downloads
+        key: "m2-jdk17-${{ hash_files('**/pom.xml') }}"
+        paths: [/cache/m2]
+    steps:
+      - id: build
+        run: mvn verify javadoc:jar
+  build-jdk21:
+    image: docker.io/library/maven:3.9-eclipse-temurin-21@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320
+    runs_on: { labels: [egress] }
+    resources: { cpu: 4, memory: 8GiB }
+    timeout: 90m
+    env:
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress -Dmaven.repo.local=/cache/m2
+      HOME: /tmp
+    cache:
+      - name: m2
+        class: downloads
+        key: "m2-jdk21-${{ hash_files('**/pom.xml') }}"
+        paths: [/cache/m2]
+    steps:
+      - id: build
+        run: mvn verify javadoc:jar
+  build-jdk25:
+    image: docker.io/library/maven:3.9-eclipse-temurin-25@sha256:93b8a14ea2f412782e4e842651273b4d903e35cc496284f178fbbe2d67d00976
+    runs_on: { labels: [egress] }
+    resources: { cpu: 3, memory: 8GiB }
+    timeout: 90m
+    env:
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress -Dmaven.repo.local=/cache/m2
+      HOME: /tmp
+    cache:
+      - name: m2
+        class: downloads
+        key: "m2-jdk25-${{ hash_files('**/pom.xml') }}"
+        paths: [/cache/m2]
+    steps:
+      - id: build
+        run: mvn verify javadoc:jar

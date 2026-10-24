@@ -1,0 +1,28 @@
+schema: 1
+# The mapping form of `on`: each kind's ref filter is optional, `**`/`*`
+# patterns are anchored relative ref paths, and an empty filter admits every
+# ref of the kind.
+on:
+  push:
+    branches: [main, "release/*"]
+  tag:
+    tags: ["v*"]
+  pull_request:
+    branches: [main, "release/**"]
+  manual: true
+concurrency:
+  group: "${{ repo.id }}:${{ event.key }}"
+  cancel_in_progress: true
+jobs:
+  test:
+    image: rust:1-bookworm
+    steps:
+      - id: test
+        run: cargo test --locked
+  release:
+    image: rust:1-bookworm
+    needs: [test]
+    if: starts_with(event.ref, 'refs/tags/')
+    steps:
+      - id: package
+        run: cargo package --locked

@@ -1,0 +1,1498 @@
+use sentinel_auth::secret::Secret;
+use sentinel_core::{
+    Event, JobId, JobState, Outcome, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
+    auth::{Namespace, Permissions as P, Principal},
+};
+use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
+use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
+use sentinel_store::{
+    Durability, Error, Store,
+    auth::{self, Authority, NamespaceKind, provisioning},
+    dispatch::{self, Capacity, WaitReason},
+    jobs,
+    provenance::{self, Provenance},
+    runs,
+    tenancy::{self, PoolKind},
+    workers::{self, Presentation},
+};
+
+const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+const NOW: UnixMillis = UnixMillis(1_000);
+const HOST: [u8; 16] = [7u8; 16];
+
+fn at(ms: i64) -> UnixMillis {
+    UnixMillis(ms)
+}
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    store: Store,
+    root: UserId,
+    tenant: TenantId,
+    repo: RepoId,
+    pool: PoolId,
+}
+
+fn fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
+    let (root, tenant, repo, pool) = (UserId::new(), TenantId::new(), RepoId::new(), PoolId::new());
+    store
+        .writer()
+        .write(move |tx| {
+            provisioning::insert_human(tx, root, "Root", true, NOW)?;
+            auth::create_namespace(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                Namespace::parse("acme").unwrap(),
+                NamespaceKind::Organization,
+                NOW,
+            )?;
+            jobs::insert_repo(tx, tenant, repo, "app", NOW)?;
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                pool,
+                "builders",
+                PoolKind::Shared,
+                NOW,
+            )?;
+            tenancy::grant_pool(tx, Authority::HostLocal, pool, tenant, NOW)
+        })
+        .unwrap();
+    Fixture {
+        _dir: dir,
+        store,
+        root,
+        tenant,
+        repo,
+        pool,
+    }
+}
+
+fn other_tenant(f: &Fixture, slug: &str) -> (TenantId, RepoId) {
+    let (root, tenant, repo, pool) = (f.root, TenantId::new(), RepoId::new(), f.pool);
+    let slug = slug.to_owned();
+    f.store
+        .writer()
+        .write(move |tx| {
+            auth::create_namespace(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                Namespace::parse(&slug).unwrap(),
+                NamespaceKind::Organization,
+                NOW,
+            )?;
+            jobs::insert_repo(tx, tenant, repo, "app", NOW)?;
+            tenancy::grant_pool(tx, Authority::HostLocal, pool, tenant, NOW)
+        })
+        .unwrap();
+    (tenant, repo)
+}
+
+// Disk 0 means not reported (protocol 6), so the worker is not disk-admitted.
+#[allow(clippy::too_many_arguments)]
+fn worker(
+    f: &Fixture,
+    pool: PoolId,
+    cpu_millis: i64,
+    memory_bytes: i64,
+    disk_bytes: i64,
+    labels: &[&str],
+    host_id: Option<[u8; 16]>,
+    avail_images: &[[u8; 8]],
+) -> WorkerId {
+    worker_with(
+        f,
+        pool,
+        (cpu_millis, memory_bytes, disk_bytes),
+        labels,
+        host_id,
+        avail_images,
+        Capabilities::REQUIRED,
+    )
+}
+
+/// A worker on protocol 12 stating `capabilities` (with `REQUIRED`).
+fn runtime_worker(f: &Fixture, capabilities: Capabilities) -> WorkerId {
+    worker_with(
+        f,
+        f.pool,
+        (8_000, 16 << 30, 20 << 30),
+        &[],
+        None,
+        &[],
+        Capabilities::REQUIRED.union(capabilities),
+    )
+}
+
+fn worker_with(
+    f: &Fixture,
+    pool: PoolId,
+    (cpu_millis, memory_bytes, disk_bytes): (i64, i64, i64),
+    labels: &[&str],
+    host_id: Option<[u8; 16]>,
+    avail_images: &[[u8; 8]],
+    capabilities: Capabilities,
+) -> WorkerId {
+    let id = WorkerId::new();
+    let fp = Secret::generate().digest();
+    let labels: Vec<String> = labels.iter().map(|l| (*l).to_owned()).collect();
+    let images = avail_images.to_vec();
+    f.store
+        .writer()
+        .write(move |tx| {
+            let issued = workers::issue_enrollment(tx, Authority::HostLocal, pool, 60_000, NOW)?;
+            let mut text = String::new();
+            issued.secret.expose(&mut text);
+            workers::enroll(
+                tx,
+                &Secret::parse(&text).unwrap(),
+                Presentation {
+                    worker: id,
+                    fingerprint: fp,
+                    name: "w",
+                    negotiated: Negotiated {
+                        protocol: ProtocolVersion(7),
+                        capabilities,
+                        arch: Arch::X86_64,
+                    },
+                },
+                NOW,
+            )?;
+            dispatch::report_capacity(
+                tx,
+                id,
+                Capacity {
+                    cpu_millis,
+                    memory_bytes,
+                    disk_bytes,
+                },
+            )?;
+            dispatch::report_profile(
+                tx,
+                id,
+                &dispatch::ReportedProfile {
+                    labels: labels.as_slice(),
+                    host_id,
+                    avail_images: images.as_slice(),
+                    cache_bytes: Some(0),
+                    load_ns: Some(0),
+                },
+            )
+        })
+        .unwrap();
+    id
+}
+
+fn spec(yaml: &str) -> RunSpec {
+    RunSpec::new(
+        PinnedSource::new("https://github.com/o/r.git", SHA, Some("main")).unwrap(),
+        compile_str(yaml).unwrap(),
+    )
+    .unwrap()
+}
+
+fn run(
+    f: &Fixture,
+    tenant: TenantId,
+    repo: RepoId,
+    yaml: &str,
+    now: UnixMillis,
+) -> (RunId, Vec<JobId>) {
+    let spec = spec(yaml);
+    let run = RunId::new();
+    let ids = f
+        .store
+        .writer()
+        .write(move |tx| {
+            let ids = runs::create_run(tx, tenant, repo, run, &spec, now)?;
+            for job in &ids {
+                runs::resolve_image(tx, tenant, *job, DIGEST, "linux/amd64")?;
+            }
+            Ok(ids)
+        })
+        .unwrap();
+    (run, ids)
+}
+
+fn record_event(f: &Fixture, tenant: TenantId, repo: RepoId, run: RunId, trigger: &str) {
+    let provenance = Provenance {
+        tenant,
+        repo,
+        trigger: trigger.to_owned(),
+        delivery: None,
+        provider: None,
+        ref_name: Some("refs/pull/7/merge".to_owned()),
+        old_sha: None,
+        new_sha: None,
+        head_sha: None,
+        base_sha: None,
+        merge_sha: None,
+        pipeline_sha: SHA.to_owned(),
+        pipeline_path: None,
+        pipeline_digest: [0u8; 16],
+        pr_number: Some(7),
+    };
+    f.store
+        .writer()
+        .write(move |tx| {
+            provenance::insert(tx, &provenance, run, NOW)?;
+            runs::apply_concurrency(tx, tenant, run, NOW)
+        })
+        .unwrap();
+}
+
+fn place(f: &Fixture, w: WorkerId, pool: PoolId, now: UnixMillis) -> Option<dispatch::Offer> {
+    f.store
+        .writer()
+        .write(move |tx| dispatch::place(tx, w, pool, dispatch::DEFAULT_LEASE_MS, now))
+        .unwrap()
+}
+
+fn reason(f: &Fixture, job: JobId, connected: &[WorkerId]) -> WaitReason {
+    let tenant = f.tenant;
+    let connected = connected.to_vec();
+    f.store
+        .read(move |c| dispatch::wait_reason(c, tenant, job, &connected))
+        .unwrap()
+}
+
+fn state(f: &Fixture, job: JobId) -> JobState {
+    let tenant = f.tenant;
+    f.store
+        .read(|c| jobs::get_job(c, tenant, job))
+        .unwrap()
+        .state
+}
+
+fn named(f: &Fixture, run: RunId, name: &str) -> JobId {
+    let (tenant, name) = (f.tenant, name.to_owned());
+    f.store
+        .read(move |c| {
+            let bytes: [u8; 16] = c.query_row(
+                "SELECT id FROM jobs WHERE run_id = ?1 AND tenant_id = ?2 AND name = ?3",
+                rusqlite::params![run.as_bytes(), tenant.as_bytes(), name],
+                |r| r.get(0),
+            )?;
+            JobId::from_bytes(bytes).map_err(|_| Error::Corrupt("job_id"))
+        })
+        .unwrap()
+}
+
+fn finish(f: &Fixture, w: WorkerId, offer: &dispatch::Offer, now: UnixMillis) {
+    let (attempt, fence) = (offer.attempt, offer.fence);
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::acknowledge(tx, w, attempt, fence, now)?;
+            for (offset, event) in [
+                Event::PreparationStarted,
+                Event::StepsStarted,
+                Event::FinalizationStarted,
+                Event::Passed,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                dispatch::report(
+                    tx,
+                    w,
+                    attempt,
+                    fence,
+                    event,
+                    None,
+                    at(now.0 + offset as i64 + 1),
+                    None,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn single_job(cpu: u32, memory: &str, disk: &str) -> String {
+    format!(
+        "schema: 1
+on: [push]
+jobs:
+  one:
+    image: alpine:3
+    resources: {{ cpu: {cpu}, memory: {memory}, disk: {disk} }}
+    steps: [{{ id: s, run: 'true' }}]
+"
+    )
+}
+
+#[test]
+fn unsatisfiable_jobs_name_the_constraint_that_blocks_them() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &["linux"], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (run_id, all) = run(
+        &f,
+        tenant,
+        repo,
+        "schema: 1
+on: [push]
+jobs:
+  arm:
+    image: alpine:3
+    runs_on: { arch: arm64 }
+    steps: [{ id: s, run: 'true' }]
+  gpu:
+    image: alpine:3
+    runs_on: { labels: [gpu] }
+    steps: [{ id: s, run: 'true' }]
+  huge:
+    image: alpine:3
+    resources: { cpu: 32, memory: 64GiB }
+    steps: [{ id: s, run: 'true' }]
+  scratch:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB, disk: 40GiB }
+    steps: [{ id: s, run: 'true' }]
+  fits:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+",
+        at(2_000),
+    );
+    assert_eq!(all.len(), 5);
+    let (arm, gpu) = (named(&f, run_id, "arm"), named(&f, run_id, "gpu"));
+    let (huge, scratch) = (named(&f, run_id, "huge"), named(&f, run_id, "scratch"));
+    let fits = named(&f, run_id, "fits");
+    assert_eq!(reason(&f, arm, &[w]), WaitReason::ArchMismatch);
+    assert_eq!(reason(&f, gpu, &[w]), WaitReason::LabelMissing);
+    assert_eq!(
+        reason(&f, huge, &[w]),
+        WaitReason::NoMatchingWorker {
+            cpu_short: 24_000,
+            memory_short: 48 << 30,
+        }
+    );
+    assert_eq!(
+        reason(&f, scratch, &[w]),
+        WaitReason::DiskShort {
+            disk_short: 20 << 30,
+        }
+    );
+    let page = f
+        .store
+        .read(move |c| dispatch::list_queue(c, tenant, &[w], 100))
+        .unwrap();
+    assert_eq!(page.total, 5);
+    let queue = page.jobs;
+    assert_eq!(queue.len(), 5);
+    assert_eq!(queue[0].job, arm);
+    assert_eq!(queue[0].reason, WaitReason::ArchMismatch);
+    assert_eq!(queue[1].job, fits);
+    assert_eq!(queue[1].reason, WaitReason::Ready);
+    assert_eq!(queue[3].job, huge);
+    assert_eq!(queue[4].job, scratch);
+    assert!(queue.iter().all(|entry| entry.age_ms > 0));
+    let two = f
+        .store
+        .read(move |c| dispatch::list_queue(c, tenant, &[w], 2))
+        .unwrap();
+    assert_eq!(two.total, 5);
+    assert_eq!(
+        two.jobs.iter().map(|j| j.job).collect::<Vec<_>>(),
+        vec![arm, fits]
+    );
+    let offer = place(&f, w, pool, at(2_100)).unwrap();
+    assert_eq!(offer.job, fits);
+}
+
+#[test]
+fn the_fair_queue_serves_the_tenant_time_favours() {
+    let f = fixture();
+    let (other, other_repo) = other_tenant(&f, "beta");
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let backlog = "schema: 1
+on: [push]
+jobs:
+  a:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+  b:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+";
+    let (mine, _) = run(&f, tenant, repo, backlog, at(2_000));
+    let (_, theirs) = run(
+        &f,
+        other,
+        other_repo,
+        single_job(1, "1GiB", "1GiB").as_str(),
+        at(2_100),
+    );
+    let (first_job, second_job) = (named(&f, mine, "a"), named(&f, mine, "b"));
+    let first = place(&f, w, pool, at(2_200)).unwrap();
+    assert_eq!(first.tenant, tenant);
+    assert_eq!(first.job, first_job);
+    let second = place(&f, w, pool, at(2_300)).unwrap();
+    assert_eq!(second.tenant, other);
+    assert_eq!(second.job, theirs[0]);
+    let third = place(&f, w, pool, at(2_400)).unwrap();
+    assert_eq!(third.tenant, tenant);
+    assert_eq!(third.job, second_job);
+}
+
+#[test]
+fn a_waiting_large_job_keeps_its_path() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (_, first) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(2, "2GiB", "2GiB").as_str(),
+        at(2_000),
+    );
+    let (_, large) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(8, "8GiB", "8GiB").as_str(),
+        at(2_100),
+    );
+    let (_, small) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(1, "1GiB", "1GiB").as_str(),
+        at(2_200),
+    );
+    let offer = place(&f, w, pool, at(2_300)).unwrap();
+    assert_eq!(offer.job, first[0]);
+    assert_eq!(place(&f, w, pool, at(2_400)), None);
+    assert_eq!(reason(&f, small[0], &[w]), WaitReason::FairnessHold);
+    finish(&f, w, &offer, at(2_500));
+    let placed = place(&f, w, pool, at(3_000)).unwrap();
+    assert_eq!(placed.job, large[0]);
+    assert_eq!(placed.cpu_millis, 8_000);
+}
+
+#[test]
+fn pull_request_feedback_keeps_a_quarter_of_the_host() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (_, manual) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(7, "7GiB", "7GiB").as_str(),
+        at(2_000),
+    );
+    let (pr, pr_jobs) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(4, "4GiB", "4GiB").as_str(),
+        at(2_100),
+    );
+    record_event(&f, tenant, repo, pr, "pull_request");
+    assert_eq!(reason(&f, manual[0], &[w]), WaitReason::FairnessHold);
+    let offer = place(&f, w, pool, at(2_200)).unwrap();
+    assert_eq!(offer.job, pr_jobs[0]);
+}
+
+#[test]
+fn a_shared_host_is_not_oversubscribed_by_two_identities() {
+    let f = fixture();
+    let w1 = worker(&f, f.pool, 4_000, 8 << 30, 20 << 30, &[], Some(HOST), &[]);
+    let w2 = worker(&f, f.pool, 4_000, 8 << 30, 20 << 30, &[], Some(HOST), &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (run_id, _) = run(
+        &f,
+        tenant,
+        repo,
+        "schema: 1
+on: [push]
+jobs:
+  a:
+    image: alpine:3
+    resources: { cpu: 3, memory: 4GiB }
+    steps: [{ id: s, run: 'true' }]
+  b:
+    image: alpine:3
+    resources: { cpu: 2, memory: 4GiB }
+    steps: [{ id: s, run: 'true' }]
+",
+        at(2_000),
+    );
+    let (job_a, job_b) = (named(&f, run_id, "a"), named(&f, run_id, "b"));
+    let first = place(&f, w1, pool, at(2_100)).unwrap();
+    assert_eq!(first.job, job_a);
+    let free1 = f
+        .store
+        .read(move |c| dispatch::free_capacity(c, w1))
+        .unwrap();
+    let free2 = f
+        .store
+        .read(move |c| dispatch::free_capacity(c, w2))
+        .unwrap();
+    assert_eq!(free1.cpu_millis, 1_000);
+    assert_eq!(free2.cpu_millis, 1_000);
+    assert_eq!(free1.memory_bytes, 4 << 30);
+    assert_eq!(place(&f, w2, pool, at(2_200)), None);
+    assert_eq!(reason(&f, job_b, &[w2]), WaitReason::Capacity);
+}
+
+#[test]
+fn drain_stops_new_offers_until_undrained() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (_, ids) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(1, "1GiB", "1GiB").as_str(),
+        at(2_000),
+    );
+    f.store
+        .writer()
+        .write(move |tx| workers::drain(tx, Authority::HostLocal, w, at(2_100)))
+        .unwrap();
+    f.store
+        .writer()
+        .write(move |tx| workers::drain(tx, Authority::HostLocal, w, at(2_200)))
+        .unwrap();
+    assert_eq!(place(&f, w, pool, at(2_300)), None);
+    assert_eq!(reason(&f, ids[0], &[w]), WaitReason::Drain);
+    f.store
+        .writer()
+        .write(move |tx| workers::undrain(tx, Authority::HostLocal, w))
+        .unwrap();
+    assert_eq!(place(&f, w, pool, at(2_400)).unwrap().job, ids[0]);
+    f.store
+        .writer()
+        .write(move |tx| workers::undrain(tx, Authority::HostLocal, w))
+        .unwrap();
+    f.store
+        .writer()
+        .write(move |tx| workers::revoke(tx, Authority::HostLocal, w, at(2_500)))
+        .unwrap();
+    assert!(matches!(
+        f.store
+            .writer()
+            .write(move |tx| workers::drain(tx, Authority::HostLocal, w, at(2_500))),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        f.store
+            .writer()
+            .write(move |tx| workers::undrain(tx, Authority::HostLocal, w)),
+        Err(Error::NotFound)
+    ));
+}
+
+#[test]
+fn a_warm_worker_is_waited_for_only_inside_the_bound() {
+    let f = fixture();
+    let key = [0xaa_u8; 8];
+    let cold = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let warm = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[key]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (_, filler) = run(
+        &f,
+        tenant,
+        repo,
+        "schema: 1
+on: [push]
+jobs:
+  one:
+    image: alpine:3
+    timeout: 20s
+    resources: { cpu: 1, memory: 1GiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+",
+        at(2_000),
+    );
+    let (_, target) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(4, "4GiB", "4GiB").as_str(),
+        at(2_100),
+    );
+    let held = place(&f, warm, pool, at(2_200)).unwrap();
+    assert_eq!(held.job, filler[0]);
+    assert_eq!(place(&f, cold, pool, at(2_300)), None);
+    let late = at(2_100 + dispatch::LOCALITY_WAIT_MS);
+    assert_eq!(place(&f, cold, pool, late).unwrap().job, target[0]);
+}
+
+#[test]
+fn a_new_run_supersedes_the_live_run_it_replaces() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let deploy = "schema: 1
+on: [push]
+concurrency: { group: deploy, cancel_in_progress: true }
+jobs:
+  a:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+  b:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+";
+    let (_, old) = run(&f, tenant, repo, deploy, at(2_000));
+    let (new_run, new) = run(&f, tenant, repo, deploy, at(2_100));
+    for job in &old {
+        assert_eq!(state(&f, *job), JobState::Terminal(Outcome::Canceled));
+    }
+    for job in &new {
+        assert_eq!(state(&f, *job), JobState::Queued);
+    }
+    let replacement = named(&f, new_run, "a");
+    assert_eq!(place(&f, w, pool, at(2_200)).unwrap().job, replacement);
+    let serial = "schema: 1
+on: [push]
+concurrency: { group: serial }
+jobs:
+  a:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+";
+    let (_, earlier) = run(&f, tenant, repo, serial, at(2_300));
+    let (_, later) = run(&f, tenant, repo, serial, at(2_400));
+    assert_eq!(state(&f, earlier[0]), JobState::Queued);
+    assert_eq!(state(&f, later[0]), JobState::Queued);
+    assert_eq!(reason(&f, later[0], &[w]), WaitReason::ConcurrencyLimit);
+}
+
+fn job_of(cpu: &str, memory: &str) -> String {
+    format!(
+        "schema: 1
+on: [push]
+jobs:
+  one:
+    image: alpine:3
+    resources: {{ cpu: \"{cpu}\", memory: {memory}, disk: 1GiB }}
+    steps: [{{ id: s, run: 'true' }}]
+"
+    )
+}
+
+fn fill(f: &Fixture, w: WorkerId, elsewhere: Capacity, now: UnixMillis) -> Vec<dispatch::Offer> {
+    let pool = f.pool;
+    f.store
+        .writer()
+        .write(move |tx| {
+            let mut placed = Vec::new();
+            while let Some(offer) = dispatch::place_in_fleet(
+                tx,
+                w,
+                pool,
+                Some(elsewhere),
+                dispatch::DEFAULT_LEASE_MS,
+                now,
+            )? {
+                placed.push(offer);
+            }
+            Ok(placed)
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_job_only_the_largest_worker_fits_is_not_stranded_by_small_work() {
+    let f = fixture();
+    let (other, other_repo) = other_tenant(&f, "beta");
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let edge = worker(&f, pool, 2_500, 2 << 30, 64 << 30, &[], None, &[]);
+    let standard = worker(&f, pool, 5_000, 8 << 30, 128 << 30, &[], None, &[]);
+    let large = worker(&f, pool, 7_000, 16 << 30, 256 << 30, &[], None, &[]);
+    for i in 0..8 {
+        run(&f, tenant, repo, &job_of("0.25", "128MiB"), at(2_000 + i));
+    }
+    run(&f, other, other_repo, &job_of("0.25", "128MiB"), at(2_010));
+    run(&f, other, other_repo, &job_of("1", "512MiB"), at(2_020));
+    run(&f, tenant, repo, &job_of("1", "512MiB"), at(2_030));
+    let heavy = run(&f, tenant, repo, &job_of("6", "2GiB"), at(2_100)).1[0];
+    let cap = |cpu_millis: i64, memory_bytes: i64, disk_bytes: i64| Capacity {
+        cpu_millis,
+        memory_bytes,
+        disk_bytes,
+    };
+    let (small, mid, big) = (
+        cap(2_500, 2 << 30, 64 << 30),
+        cap(5_000, 8 << 30, 128 << 30),
+        cap(7_000, 16 << 30, 256 << 30),
+    );
+
+    let on_large = fill(&f, large, mid, at(3_000));
+    let on_edge = fill(&f, edge, big, at(3_000));
+    let on_standard = fill(&f, standard, big, at(3_000));
+    assert_eq!(
+        state(&f, heavy),
+        JobState::Leased,
+        "the six-core job is placed"
+    );
+    assert_eq!(on_large[0].job, heavy, "the exclusive job goes first");
+    assert_eq!(
+        on_large.len() + on_edge.len() + on_standard.len(),
+        12,
+        "every job of the burst is leased"
+    );
+    for (offers, room) in [(&on_large, big), (&on_edge, small), (&on_standard, mid)] {
+        let used: i64 = offers.iter().map(|o| o.cpu_millis).sum();
+        assert!(used <= room.cpu_millis);
+    }
+}
+
+fn fill_all(f: &Fixture, w: WorkerId, pool: PoolId, now: UnixMillis) -> Vec<dispatch::Offer> {
+    let mut out = Vec::new();
+    while let Some(offer) = place(f, w, pool, now) {
+        out.push(offer);
+        assert!(
+            out.len() <= dispatch::MAX_HELD_ATTEMPTS,
+            "runaway placement"
+        );
+    }
+    out
+}
+
+fn n_jobs(n: usize, cpu: &str, extra: &str) -> String {
+    let mut yaml = String::from("schema: 1\non: [push]\njobs:\n");
+    for i in 0..n {
+        yaml.push_str(&format!(
+            "  j{i:03}:\n    image: alpine:3\n{extra}    resources: {{ cpu: \"{cpu}\", memory: 128MiB, disk: 1GiB }}\n    steps: [{{ id: s, run: 'true' }}]\n"
+        ));
+    }
+    yaml
+}
+
+fn isolated_tenant(f: &Fixture, slug: &str) -> (TenantId, RepoId, PoolId) {
+    let (root, tenant, repo, pool) = (f.root, TenantId::new(), RepoId::new(), PoolId::new());
+    let slug = slug.to_owned();
+    f.store
+        .writer()
+        .write(move |tx| {
+            auth::create_namespace(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                Namespace::parse(&slug).unwrap(),
+                NamespaceKind::Organization,
+                NOW,
+            )?;
+            jobs::insert_repo(tx, tenant, repo, "app", NOW)?;
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                pool,
+                "private",
+                PoolKind::Dedicated(tenant),
+                NOW,
+            )
+        })
+        .unwrap();
+    (tenant, repo, pool)
+}
+
+const SERIAL: &str = "schema: 1
+on: [push]
+concurrency: { group: serial }
+jobs:
+  a:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+";
+
+#[test]
+fn two_queued_runs_of_a_serial_group_both_run_in_order() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (_, earlier) = run(&f, tenant, repo, SERIAL, at(2_300));
+    let (_, later) = run(&f, tenant, repo, SERIAL, at(2_400));
+    assert_eq!(reason(&f, earlier[0], &[w]), WaitReason::Ready);
+    assert_eq!(reason(&f, later[0], &[w]), WaitReason::ConcurrencyLimit);
+    let first = place(&f, w, pool, at(2_500)).expect("the older run places");
+    assert_eq!(first.job, earlier[0]);
+    assert_eq!(place(&f, w, pool, at(2_600)), None);
+    assert_eq!(reason(&f, later[0], &[w]), WaitReason::ConcurrencyLimit);
+    finish(&f, w, &first, at(2_700));
+    let second = place(&f, w, pool, at(3_000)).expect("then the newer run places");
+    assert_eq!(second.job, later[0]);
+}
+
+#[test]
+fn a_concurrency_group_is_held_per_repository() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let sibling = RepoId::new();
+    f.store
+        .writer()
+        .write(move |tx| jobs::insert_repo(tx, tenant, sibling, "lib", NOW))
+        .unwrap();
+    let (_, mine) = run(&f, tenant, repo, SERIAL, at(2_300));
+    let (_, theirs) = run(&f, tenant, sibling, SERIAL, at(2_400));
+    let placed: Vec<JobId> = fill_all(&f, w, pool, at(2_500))
+        .iter()
+        .map(|o| o.job)
+        .collect();
+    assert_eq!(placed.len(), 2, "{placed:?}");
+    assert!(placed.contains(&mine[0]) && placed.contains(&theirs[0]));
+}
+
+#[test]
+fn same_millisecond_superseding_runs_leave_exactly_one() {
+    let f = fixture();
+    let (tenant, repo) = (f.tenant, f.repo);
+    let deploy = "schema: 1
+on: [push]
+concurrency: { group: deploy, cancel_in_progress: true }
+jobs:
+  a:
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }]
+";
+    let (_, first) = run(&f, tenant, repo, deploy, at(2_000));
+    let (_, second) = run(&f, tenant, repo, deploy, at(2_000));
+    assert_eq!(
+        state(&f, first[0]),
+        JobState::Terminal(Outcome::Canceled),
+        "the run applied first is superseded"
+    );
+    assert_eq!(state(&f, second[0]), JobState::Queued);
+}
+
+#[test]
+fn a_large_job_in_another_pool_reserves_nothing_here() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 16_000, 64 << 30, 100 << 30, &[], None, &[]);
+    let (y, y_repo, _) = isolated_tenant(&f, "other");
+    run(&f, y, y_repo, &single_job(8, "8GiB", "8GiB"), at(2_000));
+    run(&f, f.tenant, f.repo, &n_jobs(16, "1", ""), at(2_100));
+    assert_eq!(fill_all(&f, w, f.pool, at(2_200)).len(), 16);
+}
+
+#[test]
+fn an_unrunnable_large_job_reserves_nothing() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 16_000, 64 << 30, 100 << 30, &[], None, &[]);
+    run(
+        &f,
+        f.tenant,
+        f.repo,
+        &n_jobs(1, "8", "    runs_on: { arch: arm64 }\n"),
+        at(2_000),
+    );
+    run(&f, f.tenant, f.repo, &n_jobs(16, "1", ""), at(2_100));
+    assert_eq!(fill_all(&f, w, f.pool, at(2_200)).len(), 16);
+}
+
+#[test]
+fn an_unrunnable_pull_request_job_reserves_nothing() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], None, &[]);
+    let (pr, _) = run(
+        &f,
+        f.tenant,
+        f.repo,
+        &n_jobs(1, "1", "    runs_on: { labels: [gpu] }\n"),
+        at(2_000),
+    );
+    record_event(&f, f.tenant, f.repo, pr, "pull_request");
+    run(&f, f.tenant, f.repo, &n_jobs(8, "1", ""), at(2_100));
+    assert_eq!(fill_all(&f, w, f.pool, at(2_200)).len(), 8);
+}
+
+#[test]
+fn the_pull_request_reserve_counts_the_host_once() {
+    let f = fixture();
+    let w1 = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], Some(HOST), &[]);
+    let _w2 = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], Some(HOST), &[]);
+    run(&f, f.tenant, f.repo, &n_jobs(8, "1", ""), at(2_000));
+    let (pr, _) = run(&f, f.tenant, f.repo, &n_jobs(1, "1", ""), at(2_100));
+    record_event(&f, f.tenant, f.repo, pr, "pull_request");
+    let placed = fill_all(&f, w1, f.pool, at(2_200));
+    let before_pr = placed.iter().take_while(|o| o.run != pr).count();
+    assert_eq!(before_pr, 6, "{} placed in all", placed.len());
+    assert!(placed.iter().any(|o| o.run == pr));
+}
+
+// The explanation weighs every worker of the pool (`connected` only says which are online), so each refusal
+// is checked before a worker that could take the job exists.
+#[test]
+fn a_stated_runtime_needs_a_worker_that_states_it() {
+    let f = fixture();
+    let windows = runtime_worker(
+        &f,
+        Capabilities::OS_WINDOWS.union(Capabilities::ISOLATION_NATIVE),
+    );
+    let (run_id, _) = run(
+        &f,
+        f.tenant,
+        f.repo,
+        "schema: 1
+on: [push]
+jobs:
+  plain:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+  vm:
+    image: alpine:3
+    runs_on: { isolation: microvm }
+    resources: { cpu: 1, memory: 1GiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+  linux:
+    image: alpine:3
+    runs_on: { os: linux }
+    resources: { cpu: 1, memory: 1GiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+  win:
+    image: alpine:3
+    runs_on: { os: windows, isolation: microvm }
+    resources: { cpu: 1, memory: 1GiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+",
+        at(2_000),
+    );
+    let job = |name| named(&f, run_id, name);
+    let linux = Capabilities::OS_LINUX.0 as i64;
+    let microvm = Capabilities::OS_LINUX
+        .union(Capabilities::ISOLATION_MICROVM)
+        .0 as i64;
+    let windows_microvm = Capabilities::OS_WINDOWS
+        .union(Capabilities::ISOLATION_MICROVM)
+        .0 as i64;
+    // A Windows-only pool runs no Linux job, stated or not.
+    assert_eq!(
+        reason(&f, job("plain"), &[windows]),
+        WaitReason::RuntimeMissing { runtime: 0 }
+    );
+    assert_eq!(
+        reason(&f, job("linux"), &[windows]),
+        WaitReason::RuntimeMissing { runtime: linux }
+    );
+    // A worker that predates the runtime bits runs unstated jobs only: it could not read a stated spec.
+    let legacy = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    assert_eq!(reason(&f, job("plain"), &[legacy]), WaitReason::Ready);
+    assert_eq!(
+        reason(&f, job("linux"), &[legacy]),
+        WaitReason::RuntimeMissing { runtime: linux }
+    );
+    let podman = runtime_worker(
+        &f,
+        Capabilities::OS_LINUX.union(Capabilities::ISOLATION_CONTAINER),
+    );
+    assert_eq!(reason(&f, job("plain"), &[podman]), WaitReason::Ready);
+    assert_eq!(reason(&f, job("linux"), &[podman]), WaitReason::Ready);
+    assert_eq!(
+        reason(&f, job("vm"), &[legacy, podman, windows]),
+        WaitReason::RuntimeMissing { runtime: microvm }
+    );
+    // Placement agrees: none of these takes the microVM or the Windows job.
+    for w in [legacy, podman, windows] {
+        while let Some(offer) = place(&f, w, f.pool, at(3_000)) {
+            assert!(w != windows, "a Windows-only worker took a Linux job");
+            assert_ne!(offer.job, job("vm"));
+            assert_ne!(offer.job, job("win"));
+        }
+    }
+    let kvm = runtime_worker(
+        &f,
+        Capabilities::OS_LINUX
+            .union(Capabilities::ISOLATION_CONTAINER)
+            .union(Capabilities::ISOLATION_MICROVM)
+            .union(Capabilities::KVM),
+    );
+    assert_eq!(reason(&f, job("vm"), &[kvm]), WaitReason::Ready);
+    assert_eq!(
+        reason(&f, job("win"), &[kvm, windows]),
+        WaitReason::RuntimeMissing {
+            runtime: windows_microvm
+        }
+    );
+    let offer =
+        place(&f, kvm, f.pool, at(3_100)).expect("the microVM job places on the KVM worker");
+    assert_eq!(offer.job, job("vm"));
+    assert!(
+        place(&f, kvm, f.pool, at(3_200)).is_none(),
+        "the Windows job waits"
+    );
+}
+
+// Labels filter the candidate scan, not a per-tenant LIMIT after it, or forty gpu jobs hide a plain job.
+#[test]
+fn label_mismatched_jobs_never_hide_a_fitting_one() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], None, &[]);
+    run(
+        &f,
+        f.tenant,
+        f.repo,
+        &n_jobs(40, "0.25", "    runs_on: { labels: [gpu] }\n"),
+        at(2_000),
+    );
+    let (_, plain) = run(&f, f.tenant, f.repo, &n_jobs(1, "0.25", ""), at(2_100));
+    assert_eq!(reason(&f, plain[0], &[w]), WaitReason::Ready);
+    let offer = place(&f, w, f.pool, at(2_200)).expect("the plain job places");
+    assert_eq!(offer.job, plain[0]);
+}
+
+#[test]
+fn locality_held_jobs_never_hide_a_placeable_one() {
+    let f = fixture();
+    let key = [0xaa_u8; 8];
+    let cold = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], None, &[]);
+    let _warm = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], None, &[key]);
+    let (tenant, repo) = (f.tenant, f.repo);
+    run(&f, tenant, repo, &n_jobs(40, "0.25", ""), at(2_000));
+    let spec = spec(&n_jobs(1, "0.25", ""));
+    let other = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let fresh = f
+        .store
+        .writer()
+        .write(move |tx| {
+            let ids = runs::create_run(tx, tenant, repo, RunId::new(), &spec, at(2_100))?;
+            runs::resolve_image(tx, tenant, ids[0], other, "linux/amd64")?;
+            Ok(ids[0])
+        })
+        .unwrap();
+    let offer = place(&f, cold, f.pool, at(2_200)).expect("the fresh-image job places");
+    assert_eq!(offer.job, fresh);
+}
+
+#[test]
+fn a_repository_backlog_does_not_starve_its_siblings() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 64_000, 64 << 30, 100 << 30, &[], None, &[]);
+    let (tenant, repo) = (f.tenant, f.repo);
+    let sibling = RepoId::new();
+    f.store
+        .writer()
+        .write(move |tx| jobs::insert_repo(tx, tenant, sibling, "lib", NOW))
+        .unwrap();
+    run(&f, tenant, repo, &n_jobs(20, "1", ""), at(2_000));
+    let (_, theirs) = run(&f, tenant, sibling, &n_jobs(1, "1", ""), at(2_500));
+    let first = place(&f, w, f.pool, at(3_000)).unwrap();
+    let second = place(&f, w, f.pool, at(3_000)).unwrap();
+    assert_ne!(first.job, theirs[0], "the oldest head goes first");
+    assert_eq!(second.job, theirs[0], "then the idle repository");
+}
+
+#[test]
+fn a_noisy_tenant_does_not_crowd_out_a_quiet_one() {
+    let f = fixture();
+    let (quiet, quiet_repo) = other_tenant(&f, "quiet");
+    let w = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], None, &[]);
+    run(&f, f.tenant, f.repo, &n_jobs(40, "1", ""), at(2_000));
+    run(&f, quiet, quiet_repo, &n_jobs(4, "1", ""), at(2_500));
+    let placed = fill_all(&f, w, f.pool, at(3_000));
+    assert_eq!(placed.len(), 8);
+    assert_eq!(placed.iter().filter(|o| o.tenant == quiet).count(), 4);
+}
+
+#[test]
+fn a_busy_warm_worker_with_long_work_does_not_hold_a_cold_job() {
+    let f = fixture();
+    let key = [0xaa_u8; 8];
+    let cold = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let warm = worker(&f, f.pool, 4_000, 16 << 30, 20 << 30, &[], None, &[key]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (_, long) = run(&f, tenant, repo, &single_job(4, "4GiB", "4GiB"), at(2_000));
+    assert_eq!(place(&f, warm, pool, at(2_100)).unwrap().job, long[0]);
+    let (_, target) = run(&f, tenant, repo, &single_job(4, "4GiB", "4GiB"), at(2_200));
+    assert_eq!(reason(&f, target[0], &[cold, warm]), WaitReason::Ready);
+    assert_eq!(place(&f, cold, pool, at(2_300)).unwrap().job, target[0]);
+}
+
+#[test]
+fn a_revoked_worker_holds_nothing_and_its_attempts_are_settled() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    run(&f, tenant, repo, &n_jobs(2, "1", ""), at(2_000));
+    let acked = place(&f, w, pool, at(2_100)).unwrap();
+    let offered = place(&f, w, pool, at(2_100)).unwrap();
+    let (aa, af, oa, of) = (acked.attempt, acked.fence, offered.attempt, offered.fence);
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::acknowledge(tx, w, aa, af, at(2_200))?;
+            dispatch::report(
+                tx,
+                w,
+                aa,
+                af,
+                Event::PreparationStarted,
+                None,
+                at(2_250),
+                None,
+            )?;
+            workers::revoke(tx, Authority::HostLocal, w, at(2_300))
+        })
+        .unwrap();
+    let store = &f.store;
+    assert!(!store.read(|c| dispatch::is_held(c, w, aa)).unwrap());
+    assert!(matches!(
+        store.writer().write(move |tx| dispatch::renew(
+            tx,
+            w,
+            &[aa],
+            dispatch::DEFAULT_LEASE_MS,
+            at(2_400)
+        )),
+        Err(Error::Forbidden)
+    ));
+    assert!(matches!(
+        store
+            .writer()
+            .write(move |tx| dispatch::acknowledge(tx, w, oa, of, at(2_400))),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        store.writer().write(move |tx| dispatch::report(
+            tx,
+            w,
+            aa,
+            af,
+            Event::StepsStarted,
+            None,
+            at(2_400),
+            None
+        )),
+        Err(Error::NotFound)
+    ));
+    assert!(store.read(|c| dispatch::attempt_scope(c, w, aa)).is_err());
+    let settled = store
+        .writer()
+        .write(|tx| dispatch::reconcile_revoked(tx, at(2_500), None))
+        .unwrap();
+    assert_eq!(settled, 2);
+    assert_eq!(
+        state(&f, acked.job),
+        JobState::Terminal(Outcome::InfraFailed)
+    );
+    assert_eq!(state(&f, offered.job), JobState::Queued);
+    assert_eq!(
+        store
+            .writer()
+            .write(|tx| dispatch::reconcile_revoked(tx, at(2_600), None))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn a_revoked_worker_gets_no_spec_hand_back_or_cache_boundary() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    run(&f, tenant, repo, &n_jobs(1, "1", ""), at(2_000));
+    let offer = place(&f, w, pool, at(2_100)).unwrap();
+    let (a, fence) = (offer.attempt, offer.fence);
+    f.store
+        .writer()
+        .write(move |tx| dispatch::acknowledge(tx, w, a, fence, at(2_200)).map(|_| ()))
+        .unwrap();
+    let store = &f.store;
+    assert_eq!(
+        store.read(|c| dispatch::spec_gate(c, w, a)).unwrap(),
+        dispatch::SpecGate::Ready
+    );
+    assert!(store.read(|c| dispatch::spec_bytes(c, w, a)).is_ok());
+    assert!(store.read(|c| dispatch::job_context(c, w, a)).is_ok());
+    assert!(store.read(|c| dispatch::cache_scope(c, w, a, None)).is_ok());
+    store
+        .writer()
+        .write(move |tx| workers::revoke(tx, Authority::HostLocal, w, at(2_300)))
+        .unwrap();
+    assert_eq!(
+        store.read(|c| dispatch::spec_gate(c, w, a)).unwrap(),
+        dispatch::SpecGate::NotHeld
+    );
+    assert!(matches!(
+        store.read(|c| dispatch::spec_bytes(c, w, a)),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        store.read(|c| dispatch::job_context(c, w, a)),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        store.read(|c| dispatch::cache_scope(c, w, a, Some(at(0)))),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        store
+            .writer()
+            .write(move |tx| dispatch::decline(tx, w, a, fence, at(2_400))),
+        Err(Error::NotFound)
+    ));
+    assert_eq!(state(&f, offer.job), JobState::Leased);
+    assert_eq!(
+        store
+            .writer()
+            .write(|tx| dispatch::reconcile_revoked(tx, at(2_500), None))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn a_passed_lease_stays_expired_and_a_renewed_one_is_not_expired() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    run(&f, tenant, repo, &n_jobs(2, "1", ""), at(2_000));
+    let a = place(&f, w, pool, at(2_100)).unwrap();
+    let b = place(&f, w, pool, at(2_100)).unwrap();
+    let (aa, af, ba, bf) = (a.attempt, a.fence, b.attempt, b.fence);
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::acknowledge(tx, w, aa, af, at(2_200))?;
+            dispatch::acknowledge(tx, w, ba, bf, at(2_200)).map(|_| ())
+        })
+        .unwrap();
+    let lapsed = at(2_100 + dispatch::DEFAULT_LEASE_MS + 1);
+    let (_, stop) = f
+        .store
+        .writer()
+        .write(move |tx| dispatch::renew(tx, w, &[aa], dispatch::DEFAULT_LEASE_MS, lapsed))
+        .unwrap();
+    assert_eq!(stop, vec![aa]);
+    f.store
+        .writer()
+        .write(move |tx| dispatch::renew(tx, w, &[ba], dispatch::DEFAULT_LEASE_MS, at(20_000)))
+        .unwrap();
+    assert!(matches!(
+        f.store
+            .writer()
+            .write(move |tx| dispatch::expire(tx, ba, lapsed, None)),
+        Err(Error::Conflict)
+    ));
+    assert_eq!(state(&f, b.job), JobState::Leased);
+    f.store
+        .writer()
+        .write(move |tx| dispatch::expire(tx, aa, lapsed, None))
+        .unwrap();
+    assert_eq!(state(&f, a.job), JobState::Terminal(Outcome::InfraFailed));
+}
+
+fn hints(f: &Fixture, workers: &[WorkerId]) -> Vec<(WorkerId, Vec<String>)> {
+    let workers = workers.to_vec();
+    f.store
+        .read(move |c| dispatch::prefetch_hints(c, &workers))
+        .unwrap()
+}
+
+fn digest_of(nibble: char) -> String {
+    format!("sha256:{}", nibble.to_string().repeat(64))
+}
+
+fn pinned_run(
+    f: &Fixture,
+    tenant: TenantId,
+    repo: RepoId,
+    images: &[(&str, String, &str)],
+    now: UnixMillis,
+) -> Vec<JobId> {
+    let mut yaml = String::from("schema: 1\non: [push]\njobs:\n");
+    for (i, (name, digest, extra)) in images.iter().enumerate() {
+        yaml.push_str(&format!(
+            "  j{i:03}:\n    image: {name}@{digest}\n{extra}    resources: {{ cpu: 1, memory: 128MiB, disk: 1GiB }}\n    steps: [{{ id: s, run: 'true' }}]\n"
+        ));
+    }
+    let spec = spec(&yaml);
+    let digests: Vec<String> = images.iter().map(|(_, d, _)| d.clone()).collect();
+    f.store
+        .writer()
+        .write(move |tx| {
+            let ids = runs::create_run(tx, tenant, repo, RunId::new(), &spec, now)?;
+            for (job, digest) in ids.iter().zip(&digests) {
+                runs::resolve_image(tx, tenant, *job, digest, "linux/amd64")?;
+            }
+            Ok(ids)
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_prefetch_hint_warms_the_idle_worker_a_locality_hold_passed_over() {
+    let f = fixture();
+    let key = [0xaa_u8; 8];
+    let cold = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let warm = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[key]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (_, filler) = run(
+        &f,
+        tenant,
+        repo,
+        "schema: 1
+on: [push]
+jobs:
+  one:
+    image: alpine:3
+    timeout: 20s
+    resources: { cpu: 1, memory: 1GiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+",
+        at(2_000),
+    );
+    let (_, target) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(4, "4GiB", "4GiB").as_str(),
+        at(2_100),
+    );
+    assert_eq!(place(&f, warm, pool, at(2_200)).unwrap().job, filler[0]);
+    assert_eq!(place(&f, cold, pool, at(2_300)), None, "held for locality");
+
+    let reference = format!("alpine@{DIGEST}");
+    assert_eq!(
+        hints(&f, &[warm, cold]),
+        vec![(warm, vec![]), (cold, vec![reference])],
+        "only the worker without the image is told to pull it"
+    );
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::report_profile(
+                tx,
+                cold,
+                &dispatch::ReportedProfile {
+                    labels: &[],
+                    host_id: None,
+                    avail_images: &[key],
+                    cache_bytes: Some(0),
+                    load_ns: Some(0),
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        place(&f, cold, pool, at(2_400)).unwrap().job,
+        target[0],
+        "placed well inside the locality window"
+    );
+    const { assert!(2_400 - 2_100 < dispatch::LOCALITY_WAIT_MS) };
+    assert_eq!(
+        hints(&f, &[warm, cold]),
+        vec![(warm, vec![]), (cold, vec![])]
+    );
+}
+
+#[test]
+fn prefetch_hints_follow_placement_eligibility_and_stay_bounded() {
+    let f = fixture();
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (other, other_repo, private) = isolated_tenant(&f, "private");
+    let small = worker(&f, pool, 2_000, 4 << 30, 20 << 30, &[], None, &[]);
+    let big = worker(&f, pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let gpu = worker(&f, pool, 4_000, 8 << 30, 20 << 30, &["gpu"], None, &[]);
+    let stranger = worker(&f, private, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+
+    let arm = digest_of('1');
+    let labeled = digest_of('2');
+    pinned_run(
+        &f,
+        tenant,
+        repo,
+        &[
+            (
+                "docker.io/library/arm",
+                arm.clone(),
+                "    runs_on: { arch: arm64 }\n",
+            ),
+            (
+                "docker.io/library/gpu",
+                labeled.clone(),
+                "    runs_on: { labels: [gpu] }\n",
+            ),
+        ],
+        at(2_000),
+    );
+    let plain: Vec<String> = ('3'..='8').map(digest_of).collect();
+    let listed: Vec<(&str, String, &str)> = plain
+        .iter()
+        .map(|d| ("docker.io/library/plain", d.clone(), ""))
+        .collect();
+    pinned_run(&f, tenant, repo, &listed, at(2_100));
+    let secret = digest_of('9');
+    pinned_run(
+        &f,
+        other,
+        other_repo,
+        &[("registry.example/secret", secret.clone(), "")],
+        at(2_200),
+    );
+
+    let got = hints(&f, &[small, big, gpu, stranger]);
+    let of = |w: WorkerId| got.iter().find(|(id, _)| *id == w).unwrap().1.clone();
+    for (w, hinted) in &got {
+        assert!(
+            hinted.len() <= dispatch::MAX_PREFETCH_HINTS,
+            "{w:?}: {hinted:?}"
+        );
+        assert!(
+            !hinted.iter().any(|h| h.ends_with(&arm)),
+            "no worker is arm64"
+        );
+    }
+    assert_eq!(
+        of(stranger),
+        vec![format!("registry.example/secret@{secret}")]
+    );
+    for w in [small, big, gpu] {
+        assert!(!of(w).iter().any(|h| h.ends_with(&secret)));
+    }
+    assert_eq!(
+        of(gpu).first(),
+        Some(&format!("docker.io/library/gpu@{labeled}")),
+        "the labeled job goes to the labeled worker: {got:?}"
+    );
+    assert!(!of(big).iter().any(|h| h.ends_with(&labeled)));
+    for digest in &plain {
+        let reached = [small, big, gpu]
+            .iter()
+            .filter(|w| of(**w).iter().any(|h| h.ends_with(digest)))
+            .count();
+        assert!(reached <= dispatch::PREFETCH_FANOUT, "{digest}: {reached}");
+    }
+    assert_eq!(of(big).len(), dispatch::MAX_PREFETCH_HINTS);
+    assert!(
+        of(big)[0].ends_with(&plain[0]),
+        "queue order: {:?}",
+        of(big)
+    );
+
+    f.store
+        .writer()
+        .write(move |tx| workers::drain(tx, Authority::HostLocal, big, NOW))
+        .unwrap();
+    let tiny = worker(&f, pool, 1_000, 4 << 30, 20 << 30, &[], None, &[]);
+    assert!(!hints(&f, &[tiny])[0].1.is_empty(), "idle, it is hinted");
+    let busy = place(&f, tiny, pool, at(3_000)).unwrap();
+    assert_eq!(busy.cpu_millis, 1_000);
+    let got = hints(&f, &[tiny, big, gpu]);
+    assert_eq!(got[0], (tiny, vec![]), "a full worker");
+    assert_eq!(got[1], (big, vec![]), "a draining worker");
+    assert!(!got[2].1.is_empty());
+}

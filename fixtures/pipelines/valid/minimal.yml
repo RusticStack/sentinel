@@ -1,0 +1,8 @@
+schema: 1
+on: [push]
+jobs:
+  test:
+    image: rust:1-bookworm
+    steps:
+      - id: test
+        run: cargo test --locked

@@ -1,0 +1,42 @@
+# The cli pilot's Sentinel pipeline (B06/B10): go.yml's `build` job, ubuntu-latest
+# row, same go commands. Modules come from proxy.golang.org through an egress
+# worker; the module store and build cache are Sentinel caches. GOFLAGS=-count=1
+# keeps every test fresh; TMPDIR is on the workspace disk because a job's /tmp
+# is a 1 GiB tmpfs. The integration-tests job stays on Actions (it needs a
+# GitHub token).
+schema: 1
+on:
+  push: {branches: [trunk]}
+  pull_request: {branches: [trunk]}
+jobs:
+  build-linux:
+    image: docker.io/library/golang:1.27.3-trixie@sha256:8aa2821993207ae840ce09e4223217efcd14e01f71525db734faf4232bd59999
+    runs_on: { labels: [egress] }
+    resources: { cpu: 10, memory: 26GiB }
+    timeout: 90m
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -count=1
+      GOMODCACHE: /cache/gomod
+      GOCACHE: /cache/gocache
+      GOPATH: /tmp/gopath
+      HOME: /tmp
+      TMPDIR: /workspace/.bench-tmp
+    cache:
+      - name: gomod
+        class: downloads
+        key: "go-mod-${{ hash_files('go.sum') }}"
+        paths: [/cache/gomod]
+      - name: gocache
+        class: compiler
+        key: "go-build-${{ hash_files('go.sum') }}"
+        paths: [/cache/gocache]
+    steps:
+      - id: download
+        run: mkdir -p "$TMPDIR" && go mod download
+      - id: test
+        run: go test -race -tags=integration ./...
+      - id: build
+        run: go build -v ./cmd/gh
+      - id: build-ghdebug
+        run: go build -v -tags=ghdebug ./cmd/gh

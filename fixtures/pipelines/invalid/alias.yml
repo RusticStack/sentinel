@@ -1,0 +1,6 @@
+# expect: anchors are not allowed
+schema: 1
+on: [push]
+jobs:
+  a: &j {image: busybox, steps: [{id: s, run: x}]}
+  b: *j

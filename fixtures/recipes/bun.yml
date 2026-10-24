@@ -1,0 +1,37 @@
+# K07 recipe — Bun. `BUN_INSTALL_CACHE_DIR` lands bun's package cache on
+# the downloads mount; file: tarball deps (checked in under pkgs/) stand
+# in for registry fetches and still flow through the cache dir.
+#
+#   bun-cache    (downloads)    — bun's install cache; stem-served across
+#                                 bun.lock edits.
+#   node-modules (dependencies) — the exact materialization of the lock.
+#   app-build    (compiler)     — bundler-style output under `cc-normal-`.
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/oven/bun:1-alpine
+    resources: { cpu: 1, memory: 512MiB }
+    timeout: 5m
+    env:
+      BUN_INSTALL_CACHE_DIR: /dl/bun
+    cache:
+      - name: bun-cache
+        class: downloads
+        key: "bun-dl-${{ hash_files('bun.lock') }}"
+        paths: [/dl/bun]
+      - name: node-modules
+        class: dependencies
+        key: "bun-deps-${{ hash_files('bun.lock') }}"
+        paths: [node_modules]
+      - name: app-build
+        class: compiler
+        key: "cc-normal-${{ hash_files('bun.lock') }}"
+        paths: [dist]
+    steps:
+      - id: install
+        run: bun install
+      - id: build
+        run: bun tools/build.js
+      - id: test
+        run: bun test/check.js

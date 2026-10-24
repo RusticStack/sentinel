@@ -1,0 +1,5 @@
+# expect: jobs.a.resources.memory: must be between
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, resources: {memory: 1MiB}, steps: [{id: s, run: x}]}

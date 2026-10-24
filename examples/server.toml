@@ -1,0 +1,19 @@
+# Controller data directory; the --data-dir flag overrides it.
+data_dir = "/var/lib/sentinel"
+log_format = "text"
+log_level = "info"
+# Worker link address; loopback by default.
+listen = "127.0.0.1:7443"
+# API address, proxied by sentinel-web; put TLS in front before exposing it.
+api_listen = "127.0.0.1:7080"
+
+# Optional NAT-traversing transport; without it (or with enabled = false) the link uses direct TLS.
+# The tc… address in <data_dir>/tailcat/address is a credential (owner-only).
+# [tailcat]
+# enabled = true
+# binary = "/usr/local/bin/tailcat"
+# sha256 = "d46582137d21f03d15345e2be425d6317d49e5b8c8bb4f6fc56037f4c08cce73"  # pinned v0.6.0
+# derpmap_url = "https://derp.example.com/derp.json"  # operator-owned DERP map
+# region = "derp.example.com"     # region name in that map; omit to fix a region
+# listen_port = 7443              # the link port the helper serves; match `listen`
+# Admitted workers: <data_dir>/tailcat-allow, one `nodekey:<hex> wrk_<worker id>` per line (owner-only); an empty list admits none.

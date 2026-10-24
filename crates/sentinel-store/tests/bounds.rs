@@ -1,0 +1,227 @@
+use std::{
+    sync::{Arc, Barrier},
+    thread,
+    time::{Duration, Instant},
+};
+
+use sentinel_core::{TenantId, UnixMillis};
+use sentinel_store::{
+    Durability, Error, READ_ADMISSION, READER_LIMIT, Shutdown, Store, WRITE_WAIT, jobs,
+};
+
+fn store() -> (tempfile::TempDir, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
+    (dir, store)
+}
+
+fn tenant_count(store: &Store) -> i64 {
+    store
+        .read(|c| {
+            c.query_row("SELECT COUNT(*) FROM tenants", [], |r| r.get(0))
+                .map_err(Error::from)
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_checkpoint_blocked_by_a_reader_returns_within_its_budget() {
+    let (_dir, store) = store();
+    let store = Arc::new(store);
+    let seen = Arc::clone(&store);
+    let (partial, took) = store
+        .read(move |c| {
+            c.execute_batch("BEGIN; SELECT COUNT(*) FROM tenants;")?;
+            let tenant = TenantId::new();
+            seen.writer()
+                .write(move |tx| jobs::insert_tenant(tx, tenant, "outrun", UnixMillis(1)))?;
+            let started = Instant::now();
+            let outcome = seen.checkpoint()?;
+            let took = started.elapsed();
+            c.execute_batch("COMMIT")?;
+            Ok((outcome == sentinel_store::Checkpointed::Partial, took))
+        })
+        .unwrap();
+    assert!(partial, "the open snapshot kept part of the log");
+    assert!(
+        took < Duration::from_secs(2),
+        "the writer was held for {took:?}, past the budget"
+    );
+    let tenant = TenantId::new();
+    store
+        .writer()
+        .write(move |tx| jobs::insert_tenant(tx, tenant, "after", UnixMillis(2)))
+        .unwrap();
+    assert_eq!(
+        store.checkpoint().unwrap(),
+        sentinel_store::Checkpointed::Complete
+    );
+}
+
+#[test]
+fn one_process_owns_the_database_and_ownership_ends_with_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.sqlite");
+    let first = Store::open(&path, Durability::Normal).unwrap();
+    assert!(matches!(
+        Store::open(&path, Durability::Normal),
+        Err(Error::AlreadyOwned)
+    ));
+    Store::open(dir.path().join("other.sqlite"), Durability::Normal).unwrap();
+    assert_eq!(first.shutdown(Duration::from_secs(5)), Shutdown::Drained);
+    Store::open(&path, Durability::Normal).unwrap();
+}
+
+#[test]
+fn a_panicking_write_rolls_back_and_the_writer_keeps_serving() {
+    let (_dir, store) = store();
+    let tenant = TenantId::new();
+    let outcome = store.writer().write(move |tx| {
+        jobs::insert_tenant(tx, tenant, "half", UnixMillis(1))?;
+        panic!("closure bug");
+        #[allow(unreachable_code)]
+        Ok(())
+    });
+    assert!(matches!(outcome, Err(Error::WriterPanicked)), "{outcome:?}");
+    assert_eq!(
+        tenant_count(&store),
+        0,
+        "the partial transaction rolled back"
+    );
+
+    let tenant = TenantId::new();
+    store
+        .writer()
+        .write(move |tx| jobs::insert_tenant(tx, tenant, "whole", UnixMillis(2)))
+        .unwrap();
+    assert_eq!(tenant_count(&store), 1);
+    store.checkpoint().unwrap();
+}
+
+#[test]
+fn a_stalled_write_is_reported_as_ambiguous_not_as_failed() {
+    let (_dir, store) = store();
+    let tenant = TenantId::new();
+    let started = Instant::now();
+    let outcome = store.writer().write(move |tx| {
+        jobs::insert_tenant(tx, tenant, "slow", UnixMillis(1))?;
+        thread::sleep(WRITE_WAIT + Duration::from_millis(500));
+        Ok(())
+    });
+    let waited = started.elapsed();
+    assert!(matches!(outcome, Err(Error::WriteAmbiguous)), "{outcome:?}");
+    assert!(waited >= WRITE_WAIT && waited < WRITE_WAIT + Duration::from_secs(2));
+
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(tenant_count(&store), 1);
+}
+
+#[test]
+fn readers_are_bounded_and_an_exhausted_pool_sheds_within_the_admission_window() {
+    let (_dir, store) = store();
+    let store = Arc::new(store);
+    let hold = Arc::new(Barrier::new(READER_LIMIT + 1));
+    let release = Arc::new(Barrier::new(READER_LIMIT + 1));
+    let holders: Vec<_> = (0..READER_LIMIT)
+        .map(|_| {
+            let (store, hold, release) =
+                (Arc::clone(&store), Arc::clone(&hold), Arc::clone(&release));
+            thread::spawn(move || {
+                store
+                    .read(|_| {
+                        hold.wait();
+                        release.wait();
+                        Ok(())
+                    })
+                    .unwrap();
+            })
+        })
+        .collect();
+    hold.wait();
+
+    let started = Instant::now();
+    assert!(matches!(
+        tenant_count_result(&store),
+        Err(Error::Overloaded)
+    ));
+    let waited = started.elapsed();
+    assert!(waited >= READ_ADMISSION && waited < READ_ADMISSION + Duration::from_secs(1));
+
+    release.wait();
+    for holder in holders {
+        holder.join().unwrap();
+    }
+    assert_eq!(tenant_count(&store), 0);
+    let concurrent: Vec<_> = (0..READER_LIMIT * 4)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            thread::spawn(move || tenant_count(&store))
+        })
+        .collect();
+    for c in concurrent {
+        assert_eq!(c.join().unwrap(), 0);
+    }
+}
+
+fn tenant_count_result(store: &Store) -> Result<i64, Error> {
+    store.read(|c| {
+        c.query_row("SELECT COUNT(*) FROM tenants", [], |r| r.get(0))
+            .map_err(Error::from)
+    })
+}
+
+#[test]
+fn a_panicking_read_returns_its_connection_to_the_pool() {
+    let (_dir, store) = store();
+    for _ in 0..READER_LIMIT + 1 {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.read(|_| -> Result<(), Error> { panic!("read bug") });
+        }));
+        assert!(panicked.is_err());
+    }
+    assert_eq!(tenant_count(&store), 0);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = store.read(|_| -> Result<(), Error> { panic!("read bug") });
+    }));
+    assert!(
+        panicked
+            .unwrap_err()
+            .downcast_ref::<&'static str>()
+            .is_some_and(|m| *m == "read bug")
+    );
+}
+
+#[test]
+fn shutdown_drains_accepted_work_and_reports_a_stall_honestly() {
+    let (dir, store) = store();
+    let path = dir.path().join("metadata.sqlite");
+    let tenant = TenantId::new();
+    store
+        .writer()
+        .write(move |tx| jobs::insert_tenant(tx, tenant, "queued", UnixMillis(1)))
+        .unwrap();
+    assert_eq!(store.shutdown(Duration::from_secs(5)), Shutdown::Drained);
+    let reopened = Store::open(&path, Durability::Normal).unwrap();
+    assert_eq!(tenant_count(&reopened), 1);
+
+    // Accepted work is never discarded at shutdown: a stalled write still completes once its disk answers.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let tenant = TenantId::new();
+    let outcome = reopened.writer().write(move |tx| {
+        jobs::insert_tenant(tx, tenant, "stalled", UnixMillis(2))?;
+        let _ = release_rx.recv();
+        Ok(())
+    });
+    assert!(matches!(outcome, Err(Error::WriteAmbiguous)));
+    assert_eq!(
+        reopened.shutdown(Duration::from_millis(300)),
+        Shutdown::Stalled
+    );
+    release_tx.send(()).unwrap();
+    // A stalled shutdown keeps ownership until its writer exits, so a second controller cannot start.
+    thread::sleep(Duration::from_millis(300));
+    assert!(matches!(
+        Store::open(&path, Durability::Normal),
+        Err(Error::AlreadyOwned)
+    ));
+}

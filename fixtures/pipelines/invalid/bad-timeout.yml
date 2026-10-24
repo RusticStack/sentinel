@@ -1,0 +1,5 @@
+# expect: jobs.a.timeout: expected a positive duration
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, timeout: "20", steps: [{id: s, run: x}]}

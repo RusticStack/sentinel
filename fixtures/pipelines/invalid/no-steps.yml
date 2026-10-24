@@ -1,0 +1,5 @@
+# expect: jobs.a.steps: required
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox}

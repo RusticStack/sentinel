@@ -1,0 +1,97 @@
+# OAuth, CLI/MCP access, and secret management
+
+Contract for Sentinel's integrated authorization server, the CLI profiles, secret management and the MCP transports ([OAuth](oauth.md), [CLI](cli.md), [MCP](mcp.md), [secrets](secrets.md)). Remote MCP supports bounded DCR/CIMD client registration. The conformance fixtures are hand-written callback profiles, not real MCP client applications. Consent and device pages sign in with a local password or, when configured, through GitHub. Humans and coding agents use the same scoped operations with little repeated setup; the multi-tenant roles and registration policy are in [plan.md](../plan.md).
+
+## 1. Identities and tokens
+
+Keep three relationships separate:
+
+1. **Sign-in identity:** GitHub or local account authenticates a human to Sentinel.
+2. **Sentinel authorization:** a CLI/MCP client receives a token for Sentinel, limited to approved tenants/repos/actions.
+3. **Forge/workload credentials:** GitHub App installation tokens, registry tokens, deployment keys, and other job secrets are separately managed. A GitHub login token is not a Sentinel access token, and a Sentinel token is not passed through to GitHub.
+
+Sentinel exposes its own OAuth authorization service as an integrated server module, built using maintained protocol/crypto libraries. There is no external authorization server. Admission/invite policy still applies after OAuth sign-in; authenticating must not bypass super-admin registration controls.
+
+Scopes include `runs:read`, `runs:write`, `logs:read`, `artifacts:read`, `cache:read`, `cache:write`, `secrets:metadata`, `secrets:write`, and administrative scopes. Effective authority is scope intersected with current membership, tenant/repo grants, client policy, and resource ownership. Holding `secrets:write` for one repo grants no authority in another.
+
+## 2. CLI OAuth
+
+Commands:
+
+```text
+sentinel auth login --server https://ci.example
+sentinel auth login --device --server https://ci.example
+sentinel auth status --json
+sentinel auth logout
+sentinel context use alpha
+```
+
+- Normal login: system browser, authorization code with PKCE S256 and state, loopback IP redirect on an ephemeral port. CLI is a public client with no embedded client secret. Validate redirects/code verifier; bind state to server/client/request. Do not collect the user's GitHub password in CLI or an embedded webview.
+- Headless/remote login: device authorization grant, with a verification URL and short user code on another device. Never print the private device code. Respect server polling interval, `authorization_pending`, `slow_down`, expiry, denial, and cancellation. This polling is only the standardized login flow, not job monitoring.
+- Consent shows deployment, client, requested scopes, and tenant/repo grants. Existing authorized agent sessions can reuse a grant; there is no login or confirmation ceremony per CI command.
+- Short-lived access tokens, rotating refresh tokens with replay detection and revocation. Bound absolute/idle lifetimes; logout and account suspension revoke relevant grants. Refresh is serialized locally to avoid concurrent CLI processes invalidating each other's tokens; retry ambiguous failures conservatively.
+- Store refresh credentials in OS credential storage when available (Windows Credential Manager; Linux has no OS store yet); otherwise an owner-only credentials file outside repositories, with an explicit deployment/profile namespace. Access tokens and secret values never appear in `auth status`, shell completion, debug logs, or errors.
+- Noninteractive agents use a previously authorized local profile or an explicitly provisioned expiring service-account grant. OAuth cannot create unattended authority without an initial authorization or service identity. The agent need not read the credential material to invoke authorized CLI operations.
+
+Support authorization-server metadata, token/revocation endpoints, PKCE, and device authorization with release conformance fixtures. Use opaque high-entropy access/refresh tokens hashed at rest initially for simple server-side revocation. Fast indexed validation/short bounded auth caching must still honor revocation versions; do not call GitHub membership APIs for every log frame.
+
+## 3. Remote MCP OAuth
+
+The remote Streamable HTTP transport pins protocol revision **2025-11-25**. The API conformance fixtures cover two client callback profiles and stdio's non-redirect behavior. The following contracts apply:
+
+- OAuth Protected Resource Metadata (RFC 9728) advertising authorization server(s); useful HTTP 401 `WWW-Authenticate` discovery.
+- Authorization server discovery/metadata; authorization code + PKCE for public clients.
+- Resource indicators and token audience validation for the intended MCP endpoint. Reject a token intended for another API/resource even if issued by the same deployment. No upstream token passthrough.
+- The first-party CLI remains pre-registered. Remote MCP supports Client ID Metadata Documents (the default instance policy) and, when the operator's policy allows it, anonymous Dynamic Client Registration, with registrations that are bounded per address, reclaimed when unused and disabled without SQL, bounded HTTPS retrieval, redirects disabled, public-address DNS filtering/pinning, and an MCP-only client/scope/resource policy. Client registration does not register users or approve tenants.
+- Exact permitted redirect URI validation, explicit consent/grants, scope errors, refresh/revocation, origin/session handling, and per-resource tenant authorization.
+- HTTP conformance fixtures for Visual Studio Code's loopback callback and Claude's remote callback cover discovery, registration, login/consent, refresh, insufficient scopes, revoke, and reconnect. The tests do not launch the client GUIs or real browser windows. API tests separately cover refused privileged scopes/redirects; the audience and session suites cover wrong audiences in both directions (an API token at `/mcp`, an MCP token at `/api/v1`), origin checks, revocation, and an expired MCP token.
+
+Stdio is different: `sentinel mcp` retrieves the local CLI credential profile and talks to the API. It does not implement OAuth redirects over stdio. The tools use repository-scoped reads and writes plus metadata-only secret inspection; see [MCP](mcp.md). Environment-based credentials may be supported for explicit automation, but prefer local credential handles to copying tokens into MCP configuration or model messages.
+
+## 4. Secrets through CLI and API
+
+The AI can add/update secrets using CLI once authorized. Give it a protected file/input stream or an existing credential-source handle; do not require the plaintext to be pasted into a conversation or command argument.
+
+Commands:
+
+```text
+sentinel secret set REGISTRY_TOKEN --tenant alpha --repo acme/app --stdin
+sentinel secret set SIGNING_KEY --repo acme/app --file <protected-path>
+sentinel secret import --repo acme/app --env-file <protected-path>
+sentinel secret list --repo acme/app --json
+sentinel secret describe REGISTRY_TOKEN --repo acme/app --json
+sentinel secret bind REGISTRY_TOKEN --repo acme/app --job build
+sentinel secret delete REGISTRY_TOKEN --repo acme/app --if-version <version>
+```
+
+- `set` creates or rotates a version; default interactive input is hidden. Reject conflicting sources. Values do not appear in argv, output, HTTP request logs, audit, telemetry, or exception text. Return only name/scope/version/timestamps.
+- Support multiline/binary secrets with explicit transport encoding, size limits, and newline semantics: file/stdin preserve bytes; interactive input strips its prompt terminator. Validate formats without printing content. File input does not delete or rewrite the supplied file.
+- Bulk env import is explicitly parsed data, never `source`/`eval`; define quoting/duplicate/name errors, preview names only, and commit all-or-nothing. No silent dotenv expansion or shell execution. Conflict control uses versions/idempotency so agent retries do not rotate twice unexpectedly.
+- Secret visibility scopes: tenant secret with repo allowlist, repository secret, and explicitly granted job/step usage. Clear precedence: repo binding overrides tenant binding only when configured; ambiguous names fail validation. No implicit distribution of every secret to every job.
+- `list`/`describe` return metadata only. No general plaintext read-back API. `secrets:write` is delegable independently of deployment administration; tenant owners/admins can grant repo-bound secret-writer authority to a user/service account. Existing repo operator permissions do not automatically include it.
+- Metadata-only MCP tools list a repository's bindings (`list_secret_bindings`, which also addresses `owner/name` repositories) and secret versions (`list_secret_metadata`, `get_secret_metadata`); a run's declared secrets are in `get_pipeline`, so a missing binding is the difference between the two. Value ingestion uses CLI secure input; no requirement to expose an unrestricted secret-value field to the model. Ordinary CLI writes are authorized operations, not gated by an extra artificial confirmation flag.
+
+## 5. Storage and job injection
+
+Encryption, key format, rotation and restore are in [sealed storage](sealed-storage.md). Secret records, delegation, allowlists, bindings and the metadata audit are in [scoped secrets](secrets.md).
+
+- Authenticated encryption with a maintained AEAD implementation; versioned ciphertext, unique nonces, and authenticated tenant/repo/name/version context. Master key outside SQLite under operator-controlled permissions; document rotation, backup, and restore. Never build our own cryptography.
+- Resolve allowed bindings at job preparation and record version IDs, not values. Every new attempt, including a rerun, uses the current active version ([scoped secrets](secrets.md)); an unavailable or revoked version fails the attempt explicitly, naming the secret and why, rather than silently changing provenance.
+- Prefer job-local read-only mounted files for multiline/large secrets; allow explicit step environment bindings when a tool requires them. Short-lived delivery over authenticated worker sessions, scoped to attempt and worker identity. Prevent later unrelated steps from inheriting undeclared secrets: all steps share one container, so before a secret-bearing step starts and again when it ends the worker kills every process in the container but its keepalive — nothing an earlier step left running can watch it, and nothing it started runs on into a later one. Environment values reach the step through a private file its wrapper shell sources, never through the runtime's own (on-disk) exec spec.
+- Register dynamic redaction before execution/output, including per-run generated credentials where scripts request it. Handle boundary-spanning values, and redact before all persistence. Arbitrary encodings/exfiltration cannot be solved by a log filter; repository code allowed to use a secret is within that secret's trust policy.
+- Exclude secret files/configs from workspace caches/artifacts by default; output allowlists and validations protect common mistakes. No secrets in image layers, build arguments, shared compiler caches, or public cache-key hashes. Tools requiring build secrets use their secret-mount mechanisms.
+- Remove injection files/processes during finalization/cancel/restart recovery. Minimize lifetime/copies and best-effort clear owned buffers; do not promise perfect RAM erasure across child processes or the OS — core dumps are disabled for the controller, the worker and job containers instead.
+- Audit who created/rotated/deleted/bound/used each version, tenant/repo/attempt, and result; no values or value-derived public fingerprints. Permission tests cover cross-tenant writes, path/body/log leakage, revoked grants, bulk retry, scope confusion, and cancellation cleanup.
+
+## 6. Developer and agent experience
+
+`pipeline validate` explains missing bindings by name and scope. `secret set --stdin --json` returns compact metadata suitable for agent verification. `auth status` explains deployment/identity/scopes/expiry and the exact login command when renewal is needed. `doctor` diagnoses auth/connectivity without dumping credentials. Existing grants make routine status/log/secret commands fast; step-up is limited to genuinely privileged auth/platform policy changes.
+
+Examples/cookbooks must show credential files/handles and stdin, never real values in shell history. All surfaces use the same authorization rules; a browser role restriction cannot be bypassed through CLI/MCP.
+
+## Sources
+
+- [OAuth native apps, RFC 8252](https://www.rfc-editor.org/rfc/rfc8252): external browser, public clients, PKCE and loopback redirects.
+- [Device authorization, RFC 8628](https://www.rfc-editor.org/rfc/rfc8628): separate verification/user and device codes, polling interval, slowdown and expiration.
+- [MCP authorization 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization): discovery, protected resource metadata, client metadata/registration, PKCE, resource audience, no token passthrough.
+- [MCP base protocol](https://modelcontextprotocol.io/specification/2025-11-25/basic): HTTP authorization versus local stdio credential handling. This document does not claim OAuth certification.

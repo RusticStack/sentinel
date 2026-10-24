@@ -1,0 +1,35 @@
+<script setup lang="ts">
+// Step-up prompts come from the controller's refusals, not from this page.
+const route = useRoute();
+const session = useSession();
+if (!session.me.value?.super_admin) throw createError({ statusCode: 404, statusMessage: "Not found" });
+const section = computed(() => (route.params.section as string) || "registrations");
+const tabs = computed(() => [
+  { label: "Registrations", icon: "i-lucide-user-check", to: "/platform/registrations", active: section.value === "registrations" },
+  { label: "Tenants", icon: "i-lucide-building-2", to: "/platform/tenants", active: section.value === "tenants" },
+  { label: "Pools", icon: "i-lucide-server", to: "/platform/pools", active: section.value === "pools" },
+  { label: "Storage", icon: "i-lucide-hard-drive", to: "/platform/storage", active: section.value === "storage" },
+  { label: "Policy", icon: "i-lucide-scale", to: "/platform/policy", active: section.value === "policy" },
+  { label: "Audit", icon: "i-lucide-scroll-text", to: "/platform/audit", active: section.value === "audit" },
+]);
+useHead({ title: "Platform · Sentinel" });
+</script>
+
+<template>
+  <SPage id="platform" title="Platform">
+    <template #toolbar>
+      <UDashboardToolbar>
+        <UNavigationMenu :items="tabs" highlight class="-mx-1 flex-1" aria-label="Sections" />
+      </UDashboardToolbar>
+    </template>
+    <PlatformRegistrations v-if="section === 'registrations'" />
+    <PlatformTenants v-else-if="section === 'tenants'" />
+    <PlatformPools v-else-if="section === 'pools'" />
+    <template v-else-if="section === 'storage'">
+      <PlatformStorage />
+      <PlatformBackups />
+    </template>
+    <PlatformPolicy v-else-if="section === 'policy'" />
+    <PlatformAudit v-else />
+  </SPage>
+</template>

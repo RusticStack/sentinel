@@ -1,0 +1,55 @@
+# Crash and restart reconciliation
+
+Implemented in `sentinel-store::dispatch` (`reconcile_startup`, `abandon`), `Controller::start` (which runs the former before admitting anyone), `sentinel-worker::recovery` with the attempt markers the executor keeps, and the `Abandon` message of the [worker link](worker-link.md).
+
+## The rows are the truth
+
+Nothing about a lease, a reservation, an offer or a log lives only in memory. A controller that restarts reads the same rows the last one wrote, so reconciliation is not a rebuild — it is settling, once, what could only have moved with a controller running:
+
+| Found at start | Settled as |
+|---|---|
+| an acknowledged attempt whose lease passed while the controller was down | `LeaseExpired` → `infra_failed`, capacity released, dependents decided |
+| an offer never acknowledged within the ack timeout | lapsed back to the queue (it never ran, so replaying it is safe) |
+| an acknowledged attempt of a worker revoked meanwhile | `Reconciled` → `infra_failed` (no session will ever report it) |
+| an acknowledged attempt whose lease still holds | left alone: the worker may reconnect within it and keep renewing |
+
+One transaction, before the listener binds. `Controller::reconciled()` reports the counts and `link_listening` logs them. Log files with a torn tail are cut on first open ([logs](logs.md)) and the worker, whose cursor never passed the missing frame, resends it.
+
+**Nothing found this way is re-queued if it may have run.** The plan forbids replaying uncertain side-effecting work; an infrastructure failure with a rerun available to the operator is the honest outcome.
+
+## The worker keeps a marker
+
+Before an attempt's thread spawns — before checkout starts — the executor writes `<data_dir>/attempts/<attempt>` holding the fence and syncs it — the file, then `attempts/` (the marker's entry) and the data directory (the entry of `attempts/`), so a power cut cannot take a marker whose attempt went on to run; an attempt whose marker cannot be written durably is refused (`Failed(Publication)`) rather than run unrecoverable, since a crash would leave a spool with no marker that recovery would discard as reported. The marker outlives the attempt's end: it is removed only once the terminal report has actually been **sent** — a crash between "passed" and "delivered" is a crash the next process must reconcile, not one to forget. When finalization gets the log's end out (acknowledged under protocol 5, sent on earlier protocols), `mark_ended` adds a synced `ended` line to the marker — the signal that lets a marker without a spool tell "delivered, then lost" apart from "lost before delivery".
+
+On start, before a single offer is taken, `recovery::recover`:
+
+1. removes every container the runtime still holds under this worker's label (a container running unobserved is not a job; it is a leak). This step is not best-effort: if the runtime cannot list what the worker owns, or one of those containers cannot be removed, recovery fails and the executor does not start — abandoning attempts whose containers may still be running would let their steps go on after the controller recorded them reconciled;
+2. destroys every leftover workspace (and the askpass helper of a checkout that was under way) — a fresh attempt gets a fresh one;
+3. discards a spool that has no marker (its attempt's end was reported; only the spool removal was cut short);
+4. keeps every marker with its fence and its spool, if any, as a **leftover**.
+
+Once the session is up, each leftover is handed to the controller on a recovery thread: the spool's frames are delivered from the cursor and the log closed (the attempt is still held, so they are accepted — or refused if its lease already expired, in which case the spool is dropped), then `Abandon { attempt, fence }`, then the marker goes. `Notice::Abandoned { log_delivered }` says what happened — and says it truthfully: a leftover whose spool is missing reports `true` only when its marker carried `ended`, never by default. If the session is lost midway, the leftover waits for the next attach.
+
+`dispatch::abandon` requires the attempt to be held by that worker under that fence — a stale claim or a foreign worker is refused — and then: an attempt that was **acknowledged** is `Reconciled` (`infra_failed`); one that was only offered lapses back to the queue (or ends `canceled` if that was requested meanwhile). The steps are never run again by this path.
+
+The spool keeps what it needs across the restart: gaps it declared (a bound, a failed write) are recovered from the sequence jumps between stored frames and from a small `declared` file for a refused tail, so a truncated log is never delivered as complete; and the next sequence is never below one the controller acknowledged, whose frame an unsynced tail may have lost — the controller would otherwise take a new frame for a duplicate. A process crash loses nothing the spool wrote; a power cut can take what was written since the last sync (at most `SYNC_EVERY` writes), and a tail it left zero-filled is cut like a torn one.
+
+A leftover spool is delivered through `LogPipe::recover`. If it holds its end record, the attempt had finished its output and the same end is sent again. If it does not, the crash cut the attempt short: whatever it printed after its last durable frame — unsynced frames a power cut took, output of a step the dead process could no longer read — is unknown. Its end therefore declares one more sequence as a gap, past everything stored, declared or acknowledged (an acknowledgement answering the resend can move that point past frames the controller holds and the worker lost), and the end is written into the spool before it is sent, so a second crash re-sends exactly it. The log of a reconciled attempt ends in a gap; it never reads as complete over lost output.
+
+## Limits
+
+The spool is the only resumable upload, and it resumes from its cursor; artifact uploads and cache publication do not resume. A worker whose data directory was lost has nothing to reconcile with: its held attempts expire on the controller.
+
+## Verification
+
+`crates/sentinel-store/tests/dispatch.rs`: a start after the lease passed expires the acknowledged attempts (including a revoked worker's), lapses the unanswered offer back to the queue and leaves the live one; a start inside the lease lapses the unanswered offer by the ack timeout and reconciles the revoked worker's attempt; abandonment is refused for a wrong fence and a foreign worker, reconciles an acknowledged attempt, lapses an unacknowledged one, and the stale completion is refused afterwards.
+
+`crates/sentinel-worker/tests/runtime_failures.rs` (any Linux, `podman` shimmed): recovery fails, keeping the marker, when the runtime cannot list its containers or remove one, and completes once it can. `src/spool.rs`'s tests: a reopened spool keeps its declared gaps and never reuses an acknowledged sequence; a spool with its end record reopens to exactly that end and one without declares its cut tail; a zeroed tail is cut.
+
+`crates/sentinel-worker/tests/crash_consistency.rs` checks the marker and the spool (with the controller's log store) after a crash at every point of a recorded run under a POSIX-strict persistence model, and after real power cuts on ext4 and XFS over `dm-flakey` ([logs](logs.md#bounds)). Before the directory syncs above, the model lost the marker, the whole spool after it synced, and the controller's `logs` directory.
+
+`crates/sentinel-worker/tests/recovery.rs` (any Linux, against a `podman` shim that owns nothing): markers record fences; recovery destroys workspaces and an askpass helper, discards the spool without a marker, keeps the marked attempt's spool with its frames and returns it as pending — and a marker without a spool reports `ended` exactly when `mark_ended` ran, so a lost spool is never reported delivered.
+
+`crates/sentinel-link/tests/link.rs`: over the link, an abandonment under the wrong fence is counted stale and changes nothing; under the right one the job is `infra_failed`.
+
+`crates/sentinel-worker/tests/end_to_end.rs` (as `benchmark`): with a held, acknowledged attempt whose marker, running container, half-written workspace and spool were left by "the previous process", a new executor removes the container and the workspace before taking any offer, connects under the same identity, delivers the pre-crash frame and closes the log with the cut declared as a gap after it, abandons the attempt — the job ends `infra_failed` with class `Reconciled`, nothing re-ran — and leaves no marker, spool or container behind.

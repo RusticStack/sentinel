@@ -1,0 +1,2 @@
+k07a @ file:///workspace/pkgs/sdist/k07a-1.0.0.tar.gz
+k07b @ file:///workspace/pkgs/sdist/k07b-1.0.0.tar.gz

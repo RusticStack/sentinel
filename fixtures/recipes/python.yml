@@ -1,0 +1,47 @@
+# K07 recipe — Python. requirements.txt pins sdists by file: URL;
+# setuptools/wheel/packaging bootstrap wheels are vendored under
+# pkgs/wheels so `pip install --no-build-isolation` builds the sdists
+# offline — and pip caches each built wheel in PIP_CACHE_DIR.
+#
+#   pip-cache (downloads)    — pip's wheel cache; stem-served across
+#                              requirements.txt edits (a cached wheel is
+#                              keyed by its origin URL, so a new sdist
+#                              still builds — the stem serves what it can).
+#   venv      (dependencies) — the .venv materialization; exact on the
+#                              requirements hash.
+#   app-build (compiler)     — build output under `cc-normal-`.
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/library/python:3.13-alpine
+    resources: { cpu: 1, memory: 512MiB }
+    timeout: 5m
+    env:
+      PIP_CACHE_DIR: /dl/pip
+      VIRTUAL_ENV: /workspace/.venv
+      PATH: /workspace/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    cache:
+      - name: pip-cache
+        class: downloads
+        key: "pip-dl-${{ hash_files('requirements.txt') }}"
+        paths: [/dl/pip]
+      - name: venv
+        class: dependencies
+        key: "py-deps-${{ hash_files('requirements.txt') }}"
+        paths: [.venv]
+      - name: app-build
+        class: compiler
+        key: "cc-normal-${{ hash_files('requirements.txt') }}"
+        paths: [dist]
+    steps:
+      - id: venv
+        run: test -x .venv/bin/python || python -m venv .venv
+      - id: install
+        run: |
+          pip install --no-index --find-links pkgs/wheels setuptools wheel packaging
+          pip install --no-build-isolation -r requirements.txt
+      - id: build
+        run: python tools/build.py
+      - id: test
+        run: python app.py

@@ -1,0 +1,17 @@
+/target/
+/.firecrawl/
+/.env
+/.env.*
+!/.env.example
+/data/
+/.local/
+/.claude/
+/VPS-Credentials/
+vps-credentials*
+/.cargo/credentials
+/.cargo/credentials.toml
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

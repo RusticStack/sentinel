@@ -1,0 +1,34 @@
+[package]
+name = "sentinel-store"
+description = "Local SQLite metadata store: migrations, single durable writer, fenced job transitions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+blake3 = "1.8"
+flate2 = "1.1"
+idna = "1.1"
+memchr = "2.7"
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+serde_json = "1.0"
+rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+sentinel-auth = { path = "../sentinel-auth" }
+sentinel-core = { path = "../sentinel-core" }
+sentinel-pipeline = { path = "../sentinel-pipeline" }
+sentinel-protocol = { path = "../sentinel-protocol" }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[lints]
+workspace = true

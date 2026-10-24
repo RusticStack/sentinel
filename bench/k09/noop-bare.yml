@@ -1,0 +1,13 @@
+# K09 no-op baseline: the smallest legal pipeline — one step, no cache
+# declarations. Paired with noop-cache.yml it isolates what the cache
+# path itself costs a job that does nothing.
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/library/busybox:1.36
+    resources: { cpu: 1, memory: 128MiB }
+    timeout: 5m
+    steps:
+      - id: noop
+        run: 'true'

@@ -1,0 +1,5 @@
+# expect: on[0]: expected push, pull_request, tag or manual
+schema: 1
+on: [deploy]
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}]}

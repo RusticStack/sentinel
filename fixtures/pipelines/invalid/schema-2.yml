@@ -1,0 +1,5 @@
+# expect: schema 2 is not supported
+schema: 2
+on: [push]
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}]}

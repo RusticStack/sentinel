@@ -1,0 +1,5 @@
+# expect: environment names must match
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, env: {"1BAD": x}, steps: [{id: s, run: x}]}

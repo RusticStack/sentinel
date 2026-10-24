@@ -1,0 +1,155 @@
+# Registration and admission
+
+Implemented in `sentinel-store::registration` and `sentinel admin policy|invite|account`, with metadata migration **8**. Verified email identity, email invitations and the mail outbox ([below](#email-identity-and-email-invitations)) are `sentinel-store::email`, the `sentinel-mail` crate and migration **50**. First-run setup ([below](#first-run-setup)) is migration **52**. Operator-configured email-domain auto-join ([below](#domain-auto-join)) is `sentinel-store::auto_join` and migration **53**.
+
+Four decisions are kept apart, because conflating them is how a CI system ends up granting compute to whoever clicked "install":
+
+| Decision | Who makes it |
+|---|---|
+| An account exists | The deployment's registration policy, plus an invitation if one is required |
+| The account is admitted | An invitation, or a platform admin approving a pending application |
+| A namespace exists | A super admin, or — under policy — an approved account creating its own personal namespace |
+| A forge installation belongs to a tenant | A platform admin, or — under policy — an admin of *that* tenant |
+
+Authenticating is none of them. [Local login](local-authentication.md) and [GitHub sign-in](github-sign-in.md) establish who you are; this document is about whether that gets you anything.
+
+## Registration policy
+
+One row, super-admin controlled, audited, read inside the transaction that decides an application — so a policy change that commits while an application is in flight is the one that applies.
+
+- **`invite-only`** (the default): an unspent, unexpired invitation is required. The invitation *is* the approval, so the account is active immediately.
+- **`approval-required`**: anyone may apply. Without an invitation the account is created **pending** and waits for a decision.
+- **`closed`**: no new accounts, invitation or not. Outstanding invitations do not survive closing — closed means closed, and they expire on their own. Everybody already admitted keeps signing in normally: closing registration is not a lockout of the people you already have.
+
+Two further settings: `tenant_creation` (`super-admin-only` by default, or `approved-users`, which also lets an approved account create organizations: [self-service](#self-service-organizations)) and `installation_binding` (`tenant-admins` by default, or `super-admin-only`).
+
+```sh
+sentinel admin policy show --data-dir <PATH>
+sentinel admin policy set --data-dir <PATH> --registration approval-required
+```
+
+## Pending, approved, rejected
+
+`users.status` is pending (0), approved (1) or rejected (2), and a database trigger enforces that only an approved account can be `active`. That matters more than it sounds: `active` is the predicate every authorization query in [authorization](authorization.md) already joins on, so a pending account holds no session, no tenant data and no worker access **by construction**, not because each query remembered to ask.
+
+A pending account may *hold* the credential it registered with — otherwise approving it would leave it with no way to sign in — but holding is not using: every authentication path still requires an active account. A rejected account keeps its username and identity claimed, so a rejected applicant cannot simply reapply, and its sessions, API credentials and OAuth grants are revoked in the same transaction as the rejection. Rejection is permanent — a rejected account can be neither approved nor reactivated — so rejecting an account that was already **approved** requires a recent [step-up](step-up.md), exactly like suspending it with `set_active`; refusing a pending application needs platform administration only.
+
+```sh
+sentinel admin account pending --data-dir <PATH>
+sentinel admin account approve --data-dir <PATH> --user alice
+sentinel admin account reject  --data-dir <PATH> --user alice
+```
+
+## Invitations
+
+A 256-bit secret stored only as its digest, presented exactly once and delivered out of band — there is no mandatory mail server, and no way to show the link again. An invitation may bind, all optional:
+
+- **A tenant and a role**, granted as membership on acceptance. Both or neither.
+- **A verified identity** (`provider:subject`), so only the person holding that GitHub account can redeem it. A local applicant cannot redeem an identity-bound invitation, and neither can a different GitHub account.
+- **A mailbox** (an email address), so the invitation is for one person and is redeemed only once that mailbox is verified: see [email invitations](#email-invitations).
+- **An expiry**, 1 second to 30 days, 7 by default. There is no open-ended invitation.
+
+Redemption is one-use and happens in the same transaction as the account it creates, so a lost race creates nothing. The terms are immutable, and a spent or revoked invitation never becomes unspent. A platform admin may invite to any tenant or to none; a tenant admin may invite only into the tenant they administer, and cannot mint a deployment-wide invitation.
+
+An invitation delegates its creator's authority, so it is only as good as that authority is **at redemption**. The redeeming statement re-checks the creator in the same transaction: still an active account, and still a super admin or still an admin of the tenant the invitation grants membership of. Removing the creator's membership, suspending or rejecting the account, downgrading their role or demoting a super admin therefore voids every unspent invitation they minted — without any bookkeeping, and before anything is written — and the applicant sees the ordinary "invitation unusable" refusal. (Restoring the authority restores the invitation, if it has not expired.) Host-local invitations have no creator and carry the database file's authority.
+
+```sh
+sentinel admin invite create --data-dir <PATH> --tenant acme --role operator --expires-in 7d > invite
+sentinel admin invite list --data-dir <PATH>
+sentinel admin invite revoke --data-dir <PATH> --id inv_...
+```
+
+The secret is the only thing on stdout, as with [API credentials](api-credentials.md); the identifier and expiry go to stderr.
+
+## Email identity and email invitations
+
+An account may hold **one email address**. Holding is not proving: the address is a claim until a single-use token delivered to that mailbox is presented, and only a *verified* address does anything — it signs in, it matches an email-bound invitation, and it excludes every other account from verifying the same address. Migration **50** adds `users.email` and `users.email_verified_ms`, `email_verifications`, `mail_outbox` and `mail_settings`, and an `email` term on invitations.
+
+**Addresses.** `sentinel-store::email::normalize` is the one place an address is compared: the local part is ASCII and lower-cased (1–64 bytes of RFC 5322 `atext` and dots, no leading, trailing or doubled dot), the domain is lower-cased and converted to punycode with UTS 46 under the STD3 rules (two or more labels, none empty or over 63 bytes, no hyphen at a label's edge, a last label that is not all digits, so `a@localhost`, `a@127.0.0.1` and `a@[::1]` are refused), and the whole is at most 254 bytes. An address with a non-ASCII local part is refused rather than mangled. `normalize_domain` is the same rule for a bare domain, so a deployment's allowed domains and an address's domain are one comparison: exact, never by suffix, never by subdomain. No error echoes the input.
+
+**Uniqueness is among verified addresses.** A plain `UNIQUE` on a claimed address would let anyone claim a victim's address first and lock the owner out of registering it. So the unique index covers verified addresses only: several accounts may *claim* an address, the first to prove it owns it, and that proof clears the other accounts' claim (their pending links then refuse). A claim never signs in and never blocks anyone.
+
+**Sign-up.** `POST /api/v1/register` (see [API](api.md)) creates an account by address and password when the [registration policy](#registration-policy) allows it: under `invite-only` an invitation is required, under `approval-required` the account waits as pending, under `closed` nothing is created. The account also gets a generated username (`user-` and twelve hex digits) so every local account has one; the address is its login identifier once verified. The answer is the same `202` for a new address, an address another account already verified and one that is merely claimed: whether an address has an account is not something the API tells. Policy refusals (`403`: closed, invitation needed, invitation unusable) say nothing about the address. One residual remains under `invite-only`: whether an invitation is still usable after a probe tells the prober whether the probed address was verified elsewhere (the probe spends nothing on an `AlreadyRegistered` refusal), at the cost of one administrator-issued invitation per probe, which is the price of holding any invitation at all. Both paths pay the same password hash before the transaction, so timing does not tell them apart beyond the writer's small difference. Self-service sign-up draws on its own per-client admission budget (burst 5, one more per 20 s, 2 per second across clients) before anything is read or hashed.
+
+**Sign-in.** `POST /api/v1/login` and `local_auth::login` take either a username or an address (an identifier with an `@` is an address; no username can hold one). An address signs in only when verified, an unknown or unverified one costs the same work as a wrong password, a rejected attempt never records the address, and the per-client guard keys on the canonical form so spelling variants are one account. Existing username accounts keep working unchanged and can add an address with `POST /api/v1/me/email`.
+
+**Verification.** A token is 256 random bits stored only as its digest, valid for 24 hours, single-use, and tied to the address it was minted for. Minting a new one voids the account's earlier unused ones. `POST /api/v1/email/verify {token}` spends it: the address becomes the account's verified address (`EmailVerified` audit row) in the same transaction, and an unknown, spent, expired, voided or "verified elsewhere first" token is one `invalid_request`. A presented token is spent either way. Changing the address (`POST /me/email` again) **does not transfer trust**: the old verified address stays the account's identity until the new one is proved, and the new one does not sign in before. A resend (`POST /me/email/resend`, or `POST /email/resend {email}` for the "I never got it" form, always `202`) is limited to **5 links per account per hour** (`POST /me/email/resend` answers `429`; `POST /me/email` and `POST /invitations/accept` always answer alike, so neither reveals whether an address is held by another account) and to **5 messages per recipient per hour** across every account and invitation, so the deployment cannot be used to bury a mailbox; the mail routes also draw on a per-client budget (burst 8, one more per 15 s).
+
+**Delivery is a durable outbox, never inline.** The transaction that mints a token also writes the message to `mail_outbox` (at most 2,000 undelivered at once), and the `sentinel-mail` lane drains it on the single-writer pattern the [checks](checks.md) outbox uses: read a due batch, send with no store transaction open, write the outcome back, sleep on the commit notifier and the earliest retry. A transient failure (Resend unreachable or slow, `429`, `5xx`) is retried with backoff doubling from 60 s to 15 min, at most 8 attempts and never past the message's own expiry, waiting at least the `Retry-After` the service sent (at most an hour), and pauses the pass so a dead service costs one request per pause; each retry carries the same `Idempotency-Key` (derived from the row id), so a lost reply never double-sends. A refusal (`401`/`403` key problems, `422` and every other `4xx`) is recorded and not retried. A message that cannot be sent or opened is given up with an audit row (`mail-abandoned`, kind and reason, never the address). Because the message carries a one-time link, its **body is sealed with `master.key`** and **deleted the moment the row settles**: the link exists readable only between minting and handing over to Resend. A body sealed under a key later retired cannot be opened and is given up (the message lives until it expires: 24 hours for a verification, the invitation's lifetime otherwise). Tokens are digest-stored; only this short-lived queued body holds a readable link, and only when Resend is configured and the master key exists.
+
+**Without Resend nobody is locked out.** Configure delivery in [`[mail]` or `SENTINEL_RESEND_API_KEY_FILE` and `SENTINEL_EMAIL_FROM`](configuration.md#email-delivery); without it (or without a master key) nothing is queued and the verification and invitation links are minted by the host-local CLI, which prints them on stdout once and never logs them:
+
+```sh
+sentinel admin account email-link --data-dir <PATH> --user alice@example.com > link   # a fresh verification link
+sentinel admin account email-link --data-dir <PATH> --user alice --email alice@example.com
+sentinel admin account email-verify --data-dir <PATH> --user alice                       # the operator vouches for it
+sentinel admin invite create --data-dir <PATH> --tenant acme --role reader --email bob@example.com
+sentinel admin mail status --data-dir <PATH>                                              # delivery on/off, outbox counts
+```
+
+`--user` accepts a username, a `usr_` identifier or an address. `email-link` voids the account's earlier links and is audited as host-local; it and `email-verify` take the authority of the database file, so neither may be exposed over HTTP. The controller records at every start whether it delivers mail (`mail_settings`), so a request queues a message only when a lane will drain it; the response tells the person which to expect (`"verification": "email"` or `"operator"`).
+
+### Email invitations
+
+`sentinel admin invite create --email` and `POST /api/v1/tenants/{slug}/invitations {email, role?, expires_in_secs?}` let an organization administrator invite a person by address to an **app-created** organization:
+
+- The role is the invitation's term (default `reader`, the lowest) and the inviter must already administer the organization, checked live like every invitation; the creator's authority is re-checked at redemption, so removing, demoting or suspending the inviter voids their unspent invitations.
+- A **GitHub-backed organization is refused** (`400`: its members come from GitHub): an organization is GitHub-backed when a GitHub App installation is bound to its tenant. The refusal holds at creation and again at redemption, whoever the inviter is, platform administrators included. A link-form invitation without an address is unchanged by this.
+- An organization may create 50 email invitations per hour.
+- With mail delivery the message is queued (`"delivery": "email"`) and no secret is shown; without it the response carries the one-time `token` for the inviter to pass on (`"delivery": "link"`). An administrator lists them (`GET`, never a secret) and revokes one of their own tenant's (`DELETE`; another tenant's is `not_found`).
+
+Accepting needs the **mailbox proved**, in one of two ways, and never grants anything before it is:
+
+1. **Verified address matching the invitation.** A signed-in account whose verified address is the invited one presents the secret (`POST /api/v1/invitations/accept {token}`) and joins at once.
+2. **The link token plus verifying.** Anyone presenting the secret with that address — registering with it (`POST /register {…, invitation}`), or an existing account without a verified address accepting — gets the address as a claim and a verification link; the invitation rides on that link's token and is redeemed, with its membership, only when that token verifies exactly that address. A new account registered this way waits as **pending** (no session, no membership) until that proof, which is its admission, so a leaked link alone yields no active account; if the invitation is revoked or expires meanwhile the proof verifies the address and admits nothing. An applicant who proves a different address, or none (a GitHub or username applicant), is refused; an account holding a *different* verified address must change it first.
+
+Redemption is one-use and race-safe: the invitation is spent in the same transaction that verifies the address and writes the membership, and an existing membership keeps its role. A link-form invitation (no address) is accepted by an existing account with the secret alone and still admits a new account at registration. Every step is audited: `invitation-created` (detail `email`), `email-verification-requested`, `email-verified`, `invitation-redeemed`.
+
+The emailed links are `<public_url>/verify-email#token=<secret>` and `<public_url>/invitations/accept#token=<secret>` (the secret in the fragment, so it reaches no server log or `Referer`). The web interface serves both pages: each reads the secret from the fragment once, removes it from the address bar and posts it to the routes above only when the person confirms ([web interface](web-ui.md#sign-up-and-email-links)).
+
+## First-run setup
+
+`sentinel admin bootstrap` needs a shell on the host. The web wizard does the same job for an operator who prefers a browser, **without "first visitor wins"**: whoever reaches the port first gets nothing, because setup is gated by a credential only someone with the host can read.
+
+- **The token.** At every start while no super admin exists, the controller mints a setup token (256 random bits, stored only as its BLAKE3 digest in `setup_token`, valid for one hour) and shows it once: a `0600` file `<data_dir>/setup-token` and one `setup_required` log line on the host console. A restart mints a new token and voids the old one. The file is removed when the token expires or setup closes (maintenance, every ten minutes), and no token is issued once an administrator exists. The token is the only secret the log is ever allowed to carry; do not run an open-setup controller where its console is collected.
+- **The status route.** `GET /api/v1/setup` answers `{open}` and nothing else, so the web interface knows whether to show the wizard ([web interface](web-ui.md#first-run-setup)).
+- **One commit.** `POST /api/v1/setup` judges the token, hashes the password outside the writer, then in one transaction re-judges the token and the latch and creates the super admin (address stored verified: the token is the operator's proof), the registration policy and `tenant_creation` choice, the instance name and base URL (`instance_settings`; links keep using the configured `public_url`), the optional personal namespace and first organization (the administrator administers it), closes the **existing `bootstrap` latch**, deletes the token and issues the administrator's session. Any failure (a taken address or name) rolls everything back and leaves the token usable. An optional mail test (`POST /api/v1/setup/mail-test`) sends one message to an address the person typed through the configured Resend sender (`not_configured` when there is none); its failure blocks nothing and stores nothing. Second-factor enrollment is offered, not forced: the session the wizard returns enrolls one through the account routes.
+- **One latch.** The wizard and `sentinel admin bootstrap` write the same `bootstrap` row, and `bootstrap` also deletes the token, so whichever commits second finds the latch closed (`404` over HTTP, refusal in the CLI). Two wizards racing admit exactly one.
+- **Brute force.** Wrong tokens are throttled twice: the API admits a client a burst of 5 attempts and then one per 10 s (1 per second across clients), and five wrong guesses of a well-formed token, from anyone, lock setup for five minutes, the right token included. The lock can delay setup, never complete it, and does not touch `admin bootstrap`. A wrong, expired, absent and locked-out token are one indistinguishable `403`; a malformed one is refused before it reaches the store and counts for nothing.
+- **Audit.** The administrator's creation is a host-local `bootstrap` row, the policy a host-local `policy-changed`, and each namespace a `namespace-created`.
+
+## Self-service organizations
+
+`tenant_creation` (`super-admin-only` by default) decides who may create a namespace. Under `approved-users`, an approved account creates its own personal namespace **and** organizations with `POST /api/v1/orgs {slug}`; the creator becomes the organization's administrator, in the same transaction that creates it, and both steps are audited (`namespace-created`, `membership-set`). A platform administrator always may. Bounds:
+
+- **Names** are 2–63 bytes of `a-z`, `0-9` and `-` (no hyphen at an edge) and must not be one of the reserved names (`sentinel_store::organizations::RESERVED_SLUGS`: the product's own paths such as `api`, `login`, `settings`, `setup`, `admin`, `oauth`). Personal namespaces and the platform's own namespace creation keep the older rules.
+- **Quotas.** An account may create 3 organizations an hour and 10 in all through this route (`quota_exceeded`); `tenants.created_by` records who, for earlier or platform-created tenants it is empty and counts against nobody.
+- **No enumeration beyond the slug check.** A taken name is `409`, which a slug check inherently says; the route draws on a per-client budget (burst 5, one per 10 s) before anything is read, and every other refusal is independent of whether a name exists. A namespace a caller cannot see is `not_found` on every read route, a guess included.
+- **Read-only settings.** `GET /api/v1/tenants/{slug}/settings` shows a namespace's kind (`personal`, `organization`), its membership source (`app`-managed or `github`-backed), whether a GitHub installation is bound and, to an administrator, whether email-domain auto-join applies. The auto-join rule itself is the operator's environment variable (`SENTINEL_AUTO_JOIN_DOMAINS`), never a setting a tenant edits, and it never applies to a personal namespace or a GitHub-backed organization.
+
+## Domain auto-join
+
+The operator can map mail domains to app-created organizations with `SENTINEL_AUTO_JOIN_DOMAINS` ([configuration](configuration.md#domain-auto-join)). This is the only automatic membership for an app-created organization besides email invitations. Everyone still gets their own personal namespace; it is independent of this.
+
+- **When.** In the transaction that verifies an address (the link, `sentinel admin account email-verify`, the verification that redeems an email invitation or follows an address change), and at every sign-in for an address that was verified before its domain was listed. One idempotent join: an existing membership keeps its role and is not audited again.
+- **Who.** Only a **verified** address, matched exactly on the part after the `@` in its canonical form (case-insensitive, IDN as punycode; no suffix, no subdomain), by an account that is admitted and active: a domain match is not an approval, so an account waiting under `approval-required` joins at its first sign-in after the operator approves it.
+- **Role.** The lowest, `reader`. The one exception is the first matching person for an organization that does not exist yet: the organization is created on that first match and that person administers it. An organization that already exists (created by the operator or earlier) is only ever joined as a reader. The two-account race is settled by the single writer, so the organization is created once.
+- **Never.** A GitHub-backed organization (a bound GitHub App installation, or membership source GitHub) is not joined: its members come from GitHub only, so neither this nor an email invitation applies. The same holds for a personal namespace and a suspended organization. The refusal is made when the rules are recorded at start (the entry is dropped and logged by position) and again in the joining transaction, because an organization can be bound to GitHub later.
+- **Audit.** `domain-auto-joined` (event 74; detail the organization and `reader` or `admin`, never the address), plus `namespace-created` when the match created the organization.
+- **Removing a domain** stops new joins; nobody who joined is removed. An administrator who removes a member will see them rejoin at their next sign-in while the domain is listed.
+
+## Who is deciding
+
+Platform administration has two legitimate sources, and the audit trail tells them apart. `Authority::Credential { principal, stepped_up }` is an authenticated caller, checked live, carrying whether its session recently proved a second factor. `Authority::HostLocal` is an operator on the controller's own host, whose authority is the database file itself — the same authority that admits the first administrator. The host-local variant exists so `sentinel admin` does not have to fabricate a `Principal` for somebody who never authenticated, and every host-local decision is recorded as such.
+
+## Installations
+
+Seeing an installation is not trusting it. `record_installation` is trusted intake for webhook handling and is idempotent, because deliveries repeat; the row it writes is **known, unbound and inactive**, resolving to no tenant. Installing the App on GitHub cannot create a tenant or allocate compute.
+
+`bind_installation` is the decision that makes it usable, and requires administration of *that* tenant (or platform administration) plus the deployment's binding policy. An installation already bound elsewhere must be explicitly unbound first, so a repository's owner never changes underneath running work. Unbinding returns it to the known-but-inactive state rather than deleting it.
+
+## Verification
+
+Tests: `crates/sentinel-store/tests/registration.rs` (policy, invitations, approval and rejection, installations), `email_identity.rs` (email identity, outbox, email invitations), `setup.rs` (first-run setup, self-service organizations), `auto_join.rs` (domain auto-join); `crates/sentinel-api/tests/email.rs` and `setup.rs` (the same over HTTP); `crates/sentinel-mail` (the Resend client and the delivery lane against scripted servers).
+
+Policy changes require a recent [step-up](step-up.md).

@@ -1,0 +1,1671 @@
+use std::{
+    fmt, fs,
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use sentinel_core::{RepoId, TenantId};
+use sentinel_protocol::{
+    cache::{Class, Trust},
+    negotiate::Arch,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    attach::{self, Attached},
+    lease::{self, Lease},
+    manifest::{FileEntry, FilesBlob, MAX_FILES_BLOB_BYTES, MAX_MANIFEST_BYTES, Manifest, Request},
+    outcome::{Hit, Miss},
+    publish,
+    restore::{self, Context},
+    scope::{self, Os, Platform, Scope},
+};
+
+const STREAM_MAGIC: &[u8; 12] = b"snc.cache.b1";
+const STREAM_FORMAT: u8 = 1;
+const STREAM_HEAD: usize = 40;
+const BLOCK_BYTES: usize = 256 << 10;
+pub const BUDGET_MAX: Duration = Duration::from_secs(5);
+pub const MAX_BUNDLE_BYTES: u64 = 64 << 30;
+pub const MAX_CHUNK_BYTES: usize = 1 << 20;
+/// One chunk per frame: a split chunk could not carry the running digest its pieces extend.
+const CHUNK_BYTES: usize = 48 << 10;
+pub const OFFER_BUDGET: Duration = Duration::from_secs(30);
+const RATE_SAMPLE: Duration = Duration::from_millis(250);
+const STAGE_NAME: &str = "remote.stage";
+const PREFIX_NAME: &str = "prefix.part";
+const LEGACY_PART: &str = "remote.part";
+pub const MAX_RESUME_HASH: u64 = 1 << 30;
+pub const STORE_BUDGET_BYTES: u64 = 50 << 30;
+pub const STALE_UPLOAD: Duration = Duration::from_secs(60 * 60);
+pub const STORE_FREE_RESERVE: u64 = 1 << 30;
+
+pub const OS_LINUX: u8 = 0;
+pub const ARCH_X86_64: u8 = 0;
+pub const ARCH_AARCH64: u8 = 1;
+
+pub fn platform_code(platform: Platform) -> (u8, u8) {
+    let os = match platform.os {
+        Os::Linux => OS_LINUX,
+    };
+    let arch = match platform.arch {
+        Arch::X86_64 => ARCH_X86_64,
+        Arch::Aarch64 => ARCH_AARCH64,
+    };
+    (os, arch)
+}
+
+pub fn platform_of(os: u8, arch: u8) -> Option<Platform> {
+    if os != OS_LINUX {
+        return None;
+    }
+    let arch = match arch {
+        ARCH_X86_64 => Arch::X86_64,
+        ARCH_AARCH64 => Arch::Aarch64,
+        _ => return None,
+    };
+    Some(Platform {
+        os: Os::Linux,
+        arch,
+    })
+}
+
+/// `key` is the entry key, not the rendered key: it alone names the entry directory on both sides.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Need {
+    pub attempt: [u8; 16],
+    pub tenant: [u8; 16],
+    pub repo: [u8; 16],
+    pub class: u8,
+    pub trust: u8,
+    pub os: u8,
+    pub arch: u8,
+    pub toolchain: [u8; 32],
+    pub name: String,
+    pub key: String,
+    pub offset: u64,
+    pub have: [u8; 32],
+}
+
+impl Need {
+    pub fn of(attempt: [u8; 16], scope: &Scope, key: &str, offset: u64, have: [u8; 32]) -> Need {
+        let (os, arch) = platform_code(scope.platform);
+        Need {
+            attempt,
+            tenant: *scope.tenant.as_bytes(),
+            repo: *scope.repo.as_bytes(),
+            class: scope.class.to_u8(),
+            trust: scope.trust.to_u8(),
+            os,
+            arch,
+            toolchain: scope.toolchain,
+            name: scope.name.clone(),
+            key: key.to_owned(),
+            offset,
+            have,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Upload {
+    pub attempt: [u8; 16],
+    pub tenant: [u8; 16],
+    pub repo: [u8; 16],
+    pub class: u8,
+    pub trust: u8,
+    pub os: u8,
+    pub arch: u8,
+    pub toolchain: [u8; 32],
+    pub name: String,
+    pub key: String,
+    pub total: u64,
+    pub digest: [u8; 32],
+}
+
+impl Upload {
+    pub fn of(attempt: [u8; 16], scope: &Scope, key: &str, total: u64, digest: [u8; 32]) -> Upload {
+        let (os, arch) = platform_code(scope.platform);
+        Upload {
+            attempt,
+            tenant: *scope.tenant.as_bytes(),
+            repo: *scope.repo.as_bytes(),
+            class: scope.class.to_u8(),
+            trust: scope.trust.to_u8(),
+            os,
+            arch,
+            toolchain: scope.toolchain,
+            name: scope.name.clone(),
+            key: key.to_owned(),
+            total,
+            digest,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grant {
+    pub attempt: [u8; 16],
+    pub total: u64,
+    pub offset: u64,
+    pub prefix: [u8; 32],
+    pub digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Chunk {
+    pub attempt: [u8; 16],
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+    pub prefix: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Push {
+    pub attempt: [u8; 16],
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct End {
+    pub attempt: [u8; 16],
+    pub digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refused {
+    pub attempt: [u8; 16],
+    pub code: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    NoBundle = 1,
+    Denied = 2,
+    WrongScope = 3,
+    Busy = 4,
+    TooLarge = 5,
+    Store = 6,
+    Aborted = 7,
+}
+
+impl Refusal {
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_code(code: u8) -> Option<Refusal> {
+        match code {
+            1 => Some(Self::NoBundle),
+            2 => Some(Self::Denied),
+            3 => Some(Self::WrongScope),
+            4 => Some(Self::Busy),
+            5 => Some(Self::TooLarge),
+            6 => Some(Self::Store),
+            7 => Some(Self::Aborted),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoBundle => "no_bundle",
+            Self::Denied => "denied",
+            Self::WrongScope => "wrong_scope",
+            Self::Busy => "busy",
+            Self::TooLarge => "too_large",
+            Self::Store => "store",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub trait Remote: Send + Sync {
+    fn fetch(&self, need: &Need, deadline: Instant, sink: &mut dyn Sink) -> Result<(), Refusal>;
+
+    fn offer(
+        &self,
+        upload: &Upload,
+        deadline: Instant,
+        source: &mut dyn Read,
+    ) -> Result<[u8; 32], Refusal>;
+
+    fn digest_at_end(&self) -> bool {
+        false
+    }
+}
+
+pub const DIGEST_AT_END: [u8; 32] = [0; 32];
+
+pub trait Sink {
+    fn plan(&mut self, grant: &Grant) -> Result<(), Refusal>;
+    fn chunk(&mut self, chunk: &Chunk) -> Result<(), Refusal>;
+}
+
+#[derive(Clone, Copy)]
+pub struct Policy<'a> {
+    pub source: &'a dyn Remote,
+    pub attempt: [u8; 16],
+    /// One deadline per job, so every cache restored by an attempt shares one hydration budget.
+    pub deadline: Instant,
+}
+
+impl Policy<'_> {
+    pub fn budget(job_timeout: Duration) -> Duration {
+        (job_timeout / 4).min(BUDGET_MAX)
+    }
+
+    pub fn deadline_for(job_timeout: Duration) -> Instant {
+        Instant::now() + Self::budget(job_timeout)
+    }
+}
+
+pub(crate) enum Hydro {
+    Served(Box<Hydrated>),
+    Nothing,
+    Refused(Miss),
+}
+
+pub(crate) struct Hydrated {
+    pub hit: Hit,
+    pub generation: String,
+    pub lease: Lease,
+}
+
+const TRANSFER_MISS: Miss = Miss::Unavailable;
+
+pub(crate) fn hydrate(
+    env: &Context<'_>,
+    attached: &mut Attached,
+    owner: &str,
+    policy: Policy<'_>,
+) -> Hydro {
+    let deadline = policy.deadline;
+    let started = Instant::now();
+    if started >= deadline {
+        return Hydro::Nothing;
+    }
+    let entry_key = attach::entry_key(attached.scope.class, &attached.key);
+    let entry = attached.scope.entry_dir(env.cache_root, entry_key);
+    let Ok(Some(_staging)) = lease::WriteLock::acquire(&entry, owner) else {
+        return Hydro::Nothing;
+    };
+    let Ok(lease) = Lease::acquire(&entry, owner, lease::DEFAULT_TTL) else {
+        return Hydro::Nothing;
+    };
+    let writing = entry.join(scope::WRITING_NAME);
+    let _ = fs::remove_file(writing.join(LEGACY_PART));
+    let stage = writing.join(STAGE_NAME);
+    let request = Req {
+        scope: attached.scope.clone(),
+        key: attached.key.clone(),
+        compat: attached.compat.clone(),
+        targets: attached.targets.len(),
+    };
+    let copies = env.backend == crate::clone::Backend::Copy;
+    let Ok(mut sink) = Stager::open(stage.clone(), request, copies, deadline, started) else {
+        return Hydro::Nothing;
+    };
+    let need = Need::of(
+        policy.attempt,
+        &attached.scope,
+        entry_key,
+        sink.offset,
+        sink.have(),
+    );
+    let fetched = policy.source.fetch(&need, deadline, &mut sink);
+    attached.stats.remote_ns = Some(ns(started));
+    attached.stats.remote_bytes = sink.received;
+    attached.stats.remote_from = sink.grant.map(|g| g.offset).filter(|o| *o > 0);
+    let halt = sink.halt;
+    let drop_stage = || {
+        let _ = fs::remove_dir_all(&stage);
+    };
+
+    match fetched {
+        Ok(()) => {}
+        Err(Refusal::NoBundle) => {
+            drop(sink);
+            drop_stage();
+            return Hydro::Nothing;
+        }
+        Err(Refusal::Denied) | Err(Refusal::Busy) => {
+            let empty = sink.offset == 0;
+            drop(sink);
+            if empty {
+                drop_stage();
+            }
+            return Hydro::Nothing;
+        }
+        Err(_) => {
+            return match halt {
+                Some(Halt::Corrupt) => {
+                    drop(sink);
+                    drop_stage();
+                    Hydro::Refused(Miss::Corrupt)
+                }
+                Some(Halt::Refused(miss)) => {
+                    drop(sink);
+                    drop_stage();
+                    Hydro::Refused(miss)
+                }
+                Some(Halt::Budget | Halt::Io) | None => Hydro::Refused(TRANSFER_MISS),
+            };
+        }
+    }
+    let complete = sink.grant.is_some_and(|grant| {
+        sink.offset == grant.total && sink.hasher.clone().finalize().as_bytes() == &grant.digest
+    });
+    let layout = sink.finished();
+    let (true, Some(layout)) = (complete, layout) else {
+        drop_stage();
+        return Hydro::Refused(Miss::Corrupt);
+    };
+
+    if Instant::now() >= deadline {
+        return Hydro::Refused(TRANSFER_MISS);
+    }
+    attached.stats.reflink = env.backend == crate::clone::Backend::Reflink;
+    let blob = match restore::materialize(
+        &stage,
+        &layout.manifest,
+        &attached.targets,
+        env.backend,
+        &mut attached.stats,
+    ) {
+        Ok(blob) => blob,
+        Err(miss) => {
+            drop_stage();
+            return Hydro::Refused(miss);
+        }
+    };
+    attached.stats.first_touch_ns = restore::first_touch(&blob, &attached.targets);
+    let generation = scope::gen_name(layout.manifest.sealed_ms as i64, lease::rand_u32());
+    if promote(&entry, &stage, &generation).is_err() {
+        drop_stage();
+    }
+    let bytes = layout.bytes;
+    Hydro::Served(Box::new(Hydrated {
+        hit: Hit {
+            manifest: layout.manifest,
+            bytes,
+        },
+        generation,
+        lease,
+    }))
+}
+
+fn ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn empty_digest() -> [u8; 32] {
+    *blake3::Hasher::new().finalize().as_bytes()
+}
+
+fn hash_prefix(
+    file: &mut fs::File,
+    len: u64,
+    deadline: Option<Instant>,
+) -> io::Result<blake3::Hasher> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = blake3::Hasher::new();
+    hash_into(file, len, &mut hasher, None, deadline)?;
+    Ok(hasher)
+}
+
+fn hash_into(
+    file: &mut fs::File,
+    len: u64,
+    hasher: &mut blake3::Hasher,
+    mut also: Option<&mut blake3::Hasher>,
+    deadline: Option<Instant>,
+) -> io::Result<()> {
+    let mut buf = vec![0u8; BLOCK_BYTES.min(usize::try_from(len).unwrap_or(BLOCK_BYTES))];
+    let mut left = len;
+    while left > 0 {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "resume hash out of budget",
+            ));
+        }
+        let want = left.min(buf.len() as u64) as usize;
+        let read = file.read(&mut buf[..want])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "partial ended early",
+            ));
+        }
+        hasher.update(&buf[..read]);
+        if let Some(also) = also.as_deref_mut() {
+            also.update(&buf[..read]);
+        }
+        left -= read as u64;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Halt {
+    Budget,
+    Io,
+    Corrupt,
+    Refused(Miss),
+}
+
+struct Req {
+    scope: Scope,
+    key: String,
+    compat: crate::manifest::Compat,
+    targets: usize,
+}
+
+struct Layout {
+    manifest: Manifest,
+    entries: Vec<FileEntry>,
+    bytes: u64,
+    prefix: u64,
+    payload: u64,
+}
+
+struct Cursor {
+    index: usize,
+    file: Option<fs::File>,
+    left: u64,
+    hasher: Box<blake3::Hasher>,
+}
+
+enum Phase {
+    Prefix { buf: Vec<u8>, file: fs::File },
+    Payload(Box<Layout>, Cursor),
+    Done(Box<Layout>),
+    Broken,
+}
+
+struct Stager {
+    dir: PathBuf,
+    request: Req,
+    phase: Phase,
+    hasher: blake3::Hasher,
+    offset: u64,
+    total: u64,
+    grant: Option<Grant>,
+    copies: bool,
+    deadline: Instant,
+    started: Instant,
+    received: u64,
+    halt: Option<Halt>,
+}
+
+impl Stager {
+    fn open(
+        dir: PathBuf,
+        request: Req,
+        copies: bool,
+        deadline: Instant,
+        started: Instant,
+    ) -> io::Result<Stager> {
+        fs::create_dir_all(&dir)?;
+        let mut stager = Stager {
+            dir,
+            request,
+            phase: Phase::Broken,
+            hasher: blake3::Hasher::new(),
+            offset: 0,
+            total: 0,
+            grant: None,
+            copies,
+            deadline,
+            started,
+            received: 0,
+            halt: None,
+        };
+        match stager.resume() {
+            Ok(true) => {}
+            Ok(false) => stager.reset()?,
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err(e),
+            Err(_) => stager.reset()?,
+        }
+        Ok(stager)
+    }
+
+    fn have(&self) -> [u8; 32] {
+        *self.hasher.clone().finalize().as_bytes()
+    }
+
+    fn resume(&mut self) -> io::Result<bool> {
+        let manifest_path = self.dir.join(scope::MANIFEST_NAME);
+        let files_path = self.dir.join(scope::FILES_NAME);
+        if !manifest_path.exists() || !files_path.exists() {
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .create(true)
+                .open(self.dir.join(PREFIX_NAME))?;
+            let len = file.metadata()?.len();
+            if len > STREAM_HEAD as u64 + MAX_MANIFEST_BYTES + MAX_FILES_BLOB_BYTES {
+                return Ok(false);
+            }
+            let mut buf = Vec::with_capacity(len as usize);
+            file.read_to_end(&mut buf)?;
+            self.hasher.update(&buf);
+            self.offset = buf.len() as u64;
+            self.phase = Phase::Prefix { buf, file };
+            return Ok(true);
+        }
+        let _ = fs::remove_file(self.dir.join(PREFIX_NAME));
+        let manifest_raw = read_bounded(&manifest_path, MAX_MANIFEST_BYTES)?;
+        let files_raw = read_bounded(&files_path, MAX_FILES_BLOB_BYTES)?;
+        let Ok(layout) = self.layout(&manifest_raw, &files_raw) else {
+            return Ok(false);
+        };
+        let head = head_bytes(
+            manifest_raw.len() as u64,
+            files_raw.len() as u64,
+            layout.payload,
+        );
+        self.hasher.update(&head);
+        self.hasher.update(&manifest_raw);
+        self.hasher.update(&files_raw);
+        self.offset = layout.prefix;
+        let deadline = Some(self.deadline);
+        for index in 0..layout.entries.len() {
+            let entry = &layout.entries[index];
+            let path = self.dir.join(&entry.path);
+            let len = match fs::metadata(&path) {
+                Ok(meta) => meta.len(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    self.phase = Phase::Payload(
+                        Box::new(layout),
+                        Cursor {
+                            index,
+                            file: None,
+                            left: 0,
+                            hasher: Box::default(),
+                        },
+                    );
+                    return Ok(true);
+                }
+                Err(e) => return Err(e),
+            };
+            if len > entry.size {
+                return Ok(false);
+            }
+            let mut file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
+            if len == entry.size {
+                hash_into(&mut file, len, &mut self.hasher, None, deadline)?;
+                self.offset += len;
+                continue;
+            }
+            let mut own = blake3::Hasher::new();
+            hash_into(&mut file, len, &mut self.hasher, Some(&mut own), deadline)?;
+            self.offset += len;
+            let left = entry.size - len;
+            self.phase = Phase::Payload(
+                Box::new(layout),
+                Cursor {
+                    index,
+                    file: Some(file),
+                    left,
+                    hasher: Box::new(own),
+                },
+            );
+            return Ok(true);
+        }
+        self.phase = Phase::Done(Box::new(layout));
+        Ok(true)
+    }
+
+    fn reset(&mut self) -> io::Result<()> {
+        self.phase = Phase::Broken;
+        match fs::remove_dir_all(&self.dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        fs::create_dir_all(&self.dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join(PREFIX_NAME))?;
+        self.phase = Phase::Prefix {
+            buf: Vec::new(),
+            file,
+        };
+        self.hasher = blake3::Hasher::new();
+        self.offset = 0;
+        Ok(())
+    }
+
+    fn layout(&self, manifest_raw: &[u8], files_raw: &[u8]) -> Result<Layout, Miss> {
+        let manifest = Manifest::decode(manifest_raw)?;
+        if !manifest.sealed() {
+            return Err(Miss::Unsealed);
+        }
+        // Wrong scope, key or compat never serves, whatever the controller claimed.
+        let bytes = manifest.compatible(&Request {
+            scope: &self.request.scope,
+            key: &self.request.key,
+            compat: &self.request.compat,
+        })?;
+        if blake3::hash(files_raw).as_bytes() != &manifest.files_digest {
+            return Err(Miss::Corrupt);
+        }
+        let blob = FilesBlob::decode(files_raw)?;
+        if blob.entries.len() as u32 != manifest.files {
+            return Err(Miss::Corrupt);
+        }
+        let mut entries = blob.entries;
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut payload = 0u64;
+        for entry in &entries {
+            if !sentinel_pipeline::schema::valid_relative_path(&entry.path) {
+                return Err(Miss::Invalid);
+            }
+            if !payload_index(&entry.path).is_some_and(|index| index < self.request.targets) {
+                return Err(Miss::Invalid);
+            }
+            payload = payload.checked_add(entry.size).ok_or(Miss::Corrupt)?;
+        }
+        let prefix = STREAM_HEAD as u64 + manifest_raw.len() as u64 + files_raw.len() as u64;
+        Ok(Layout {
+            manifest,
+            entries,
+            bytes,
+            prefix,
+            payload,
+        })
+    }
+
+    fn finished(&mut self) -> Option<Layout> {
+        match std::mem::replace(&mut self.phase, Phase::Broken) {
+            Phase::Done(layout) => Some(*layout),
+            _ => None,
+        }
+    }
+
+    fn feed(&mut self, mut bytes: &[u8]) -> Result<(), Halt> {
+        while !bytes.is_empty() {
+            match &mut self.phase {
+                Phase::Prefix { buf, file } => {
+                    let want = prefix_want(buf, self.total)?;
+                    let take = want.min(bytes.len());
+                    buf.extend_from_slice(&bytes[..take]);
+                    file.write_all(&bytes[..take]).map_err(|_| Halt::Io)?;
+                    bytes = &bytes[take..];
+                    if buf.len() >= STREAM_HEAD && prefix_want(buf, self.total)? == 0 {
+                        self.enter_payload()?;
+                    }
+                }
+                Phase::Payload(layout, cursor) => {
+                    let entry = &layout.entries[cursor.index];
+                    if cursor.file.is_none() {
+                        let path = self.dir.join(&entry.path);
+                        if let Some(parent) = path.parent() {
+                            fs::create_dir_all(parent).map_err(|_| Halt::Io)?;
+                        }
+                        cursor.file = Some(fs::File::create(&path).map_err(|_| Halt::Io)?);
+                        cursor.left = entry.size;
+                        cursor.hasher.reset();
+                    }
+                    let take = usize::try_from(cursor.left)
+                        .unwrap_or(usize::MAX)
+                        .min(bytes.len());
+                    if let Some(file) = cursor.file.as_mut() {
+                        file.write_all(&bytes[..take]).map_err(|_| Halt::Io)?;
+                    }
+                    cursor.hasher.update(&bytes[..take]);
+                    cursor.left -= take as u64;
+                    bytes = &bytes[take..];
+                    if cursor.left == 0 {
+                        self.close_file()?;
+                    }
+                }
+                Phase::Done(_) | Phase::Broken => return Err(Halt::Corrupt),
+            }
+        }
+        Ok(())
+    }
+
+    fn enter_payload(&mut self) -> Result<(), Halt> {
+        let Phase::Prefix { buf, .. } = std::mem::replace(&mut self.phase, Phase::Broken) else {
+            return Err(Halt::Corrupt);
+        };
+        let manifest_len = u64_at(&buf, 16) as usize;
+        let manifest_raw = &buf[STREAM_HEAD..STREAM_HEAD + manifest_len];
+        let files_raw = &buf[STREAM_HEAD + manifest_len..];
+        let layout = self
+            .layout(manifest_raw, files_raw)
+            .map_err(Halt::Refused)?;
+        if u64_at(&buf, 32) != layout.payload
+            || layout.prefix.checked_add(layout.payload) != Some(self.total)
+        {
+            return Err(Halt::Corrupt);
+        }
+        fs::write(self.dir.join(scope::MANIFEST_NAME), manifest_raw).map_err(|_| Halt::Io)?;
+        fs::write(self.dir.join(scope::FILES_NAME), files_raw).map_err(|_| Halt::Io)?;
+        let _ = fs::remove_file(self.dir.join(PREFIX_NAME));
+        self.phase = Phase::Payload(
+            Box::new(layout),
+            Cursor {
+                index: 0,
+                file: None,
+                left: 0,
+                hasher: Box::default(),
+            },
+        );
+        self.skip_empty()
+    }
+
+    fn close_file(&mut self) -> Result<(), Halt> {
+        self.seal_current()?;
+        self.skip_empty()
+    }
+
+    fn seal_current(&mut self) -> Result<(), Halt> {
+        let Phase::Payload(layout, cursor) = &mut self.phase else {
+            return Err(Halt::Corrupt);
+        };
+        let entry = &layout.entries[cursor.index];
+        cursor.file = None;
+        if cursor.hasher.finalize().as_bytes() != &entry.digest {
+            return Err(Halt::Corrupt);
+        }
+        publish::stamp_mode(&self.dir.join(&entry.path), entry.mode).map_err(|_| Halt::Io)?;
+        cursor.index += 1;
+        Ok(())
+    }
+
+    fn skip_empty(&mut self) -> Result<(), Halt> {
+        loop {
+            let Phase::Payload(layout, cursor) = &mut self.phase else {
+                return Ok(());
+            };
+            match layout.entries.get(cursor.index) {
+                None => {
+                    if let Phase::Payload(layout, _) =
+                        std::mem::replace(&mut self.phase, Phase::Broken)
+                    {
+                        self.phase = Phase::Done(layout);
+                    }
+                    return Ok(());
+                }
+                Some(entry) if entry.size > 0 => return Ok(()),
+                Some(entry) => {
+                    let path = self.dir.join(&entry.path);
+                    cursor.hasher.reset();
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent).map_err(|_| Halt::Io)?;
+                    }
+                    fs::File::create(&path).map_err(|_| Halt::Io)?;
+                    self.seal_current()?;
+                }
+            }
+        }
+    }
+}
+
+fn prefix_want(buf: &[u8], total: u64) -> Result<usize, Halt> {
+    if buf.len() < STREAM_HEAD {
+        return Ok(STREAM_HEAD - buf.len());
+    }
+    if &buf[..12] != STREAM_MAGIC || buf[13..16] != [0, 0, 0] {
+        return Err(Halt::Corrupt);
+    }
+    if buf[12] != STREAM_FORMAT {
+        return Err(Halt::Refused(Miss::UnsupportedVersion));
+    }
+    let manifest_len = u64_at(buf, 16);
+    let files_len = u64_at(buf, 24);
+    if manifest_len > MAX_MANIFEST_BYTES || files_len > MAX_FILES_BLOB_BYTES {
+        return Err(Halt::Corrupt);
+    }
+    let whole = STREAM_HEAD as u64 + manifest_len + files_len;
+    if whole > total {
+        return Err(Halt::Corrupt);
+    }
+    Ok((whole - buf.len() as u64) as usize)
+}
+
+fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    if file.metadata()?.len() > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "oversize"));
+    }
+    let mut out = Vec::new();
+    file.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+impl Sink for Stager {
+    fn plan(&mut self, grant: &Grant) -> Result<(), Refusal> {
+        if grant.total > MAX_BUNDLE_BYTES || grant.offset > grant.total {
+            return Err(Refusal::TooLarge);
+        }
+        if grant.offset > self.offset {
+            self.halt = Some(Halt::Corrupt);
+            return Err(Refusal::Aborted);
+        }
+        if grant.offset < self.offset {
+            if grant.offset != 0 {
+                self.halt = Some(Halt::Corrupt);
+                return Err(Refusal::Aborted);
+            }
+            self.reset().map_err(|_| Refusal::Store)?;
+        }
+        if self.have() != grant.prefix {
+            self.halt = Some(Halt::Corrupt);
+            return Err(Refusal::Aborted);
+        }
+        self.total = grant.total;
+        self.grant = Some(*grant);
+        let fits = match &self.phase {
+            Phase::Payload(layout, _) | Phase::Done(layout) => {
+                layout.prefix.checked_add(layout.payload) == Some(grant.total)
+            }
+            Phase::Prefix { buf, .. } => prefix_want(buf, grant.total).is_ok(),
+            Phase::Broken => false,
+        };
+        if !fits {
+            self.halt = Some(Halt::Corrupt);
+            return Err(Refusal::Aborted);
+        }
+        if let Phase::Prefix { buf, .. } = &self.phase
+            && buf.len() >= STREAM_HEAD
+            && prefix_want(buf, grant.total) == Ok(0)
+            && let Err(halt) = self.enter_payload()
+        {
+            self.halt = Some(halt);
+            return Err(Refusal::Aborted);
+        }
+        Ok(())
+    }
+
+    fn chunk(&mut self, chunk: &Chunk) -> Result<(), Refusal> {
+        if chunk.offset != self.offset || chunk.bytes.len() > MAX_CHUNK_BYTES {
+            return Err(Refusal::Store);
+        }
+        let next = self
+            .offset
+            .checked_add(chunk.bytes.len() as u64)
+            .ok_or(Refusal::TooLarge)?;
+        if next > self.total {
+            return Err(Refusal::Store);
+        }
+        self.hasher.update(&chunk.bytes);
+        if self.have() != chunk.prefix {
+            self.halt = Some(Halt::Corrupt);
+            return Err(Refusal::Aborted);
+        }
+        if let Err(halt) = self.feed(&chunk.bytes) {
+            self.halt = Some(halt);
+            return Err(if halt == Halt::Io {
+                Refusal::Store
+            } else {
+                Refusal::Aborted
+            });
+        }
+        self.offset = next;
+        self.received += chunk.bytes.len() as u64;
+        let now = Instant::now();
+        if now >= self.deadline {
+            self.halt = Some(Halt::Budget);
+            return Err(Refusal::Aborted);
+        }
+        let elapsed = now.duration_since(self.started).as_nanos();
+        if elapsed >= RATE_SAMPLE.as_nanos() && self.received > 0 {
+            // Integer ns-per-byte would truncate to zero on a fast link, so the check cross-multiplies.
+            let install = if self.copies { self.total } else { 0 };
+            let remaining = u128::from(self.total - self.offset) + u128::from(install);
+            let left = self.deadline.saturating_duration_since(now).as_nanos();
+            if remaining.saturating_mul(elapsed) > left.saturating_mul(u128::from(self.received)) {
+                self.halt = Some(Halt::Budget);
+                return Err(Refusal::Aborted);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `current` is swapped only after the generation is in place, so readers see the old or the new one.
+fn promote(entry: &Path, staging: &Path, generation: &str) -> io::Result<()> {
+    fs::rename(staging, entry.join(generation))?;
+    publish::sync_dir(entry)?;
+    let tmp = entry.join(publish::CURRENT_TMP);
+    publish::write_synced(&tmp, generation.as_bytes())?;
+    fs::rename(&tmp, entry.join(scope::CURRENT_NAME))?;
+    publish::sync_dir(entry)?;
+    Ok(())
+}
+
+fn payload_index(path: &str) -> Option<usize> {
+    let rest = path.strip_prefix("payload/")?;
+    let (index, rel) = rest.split_once('/')?;
+    if rel.is_empty() {
+        return None;
+    }
+    index.parse().ok()
+}
+
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&bytes[at..at + 8]);
+    u64::from_be_bytes(raw)
+}
+
+pub fn offer_generation(
+    cache_root: &Path,
+    attached: &Attached,
+    generation: &str,
+    attempt: [u8; 16],
+    source: &dyn Remote,
+    deadline: Instant,
+    cancel: &dyn Fn() -> bool,
+) -> Result<[u8; 32], Refusal> {
+    if !generation.starts_with("gen-") || generation.contains(['/', '\\']) {
+        return Err(Refusal::Store);
+    }
+    let entry = attached.scope.entry_dir(
+        cache_root,
+        attach::entry_key(attached.scope.class, &attached.key),
+    );
+    let generation_dir = entry.join(generation);
+    let bundle = bundle_of(&generation_dir).map_err(|_| Refusal::Store)?;
+    let total = bundle.total().ok_or(Refusal::Store)?;
+    let digest = if source.digest_at_end() {
+        DIGEST_AT_END
+    } else {
+        stream_digest(&bundle, &generation_dir, deadline, cancel).map_err(|miss| {
+            if miss == Miss::Unavailable {
+                Refusal::Aborted
+            } else {
+                Refusal::Store
+            }
+        })?
+    };
+    if cancel() {
+        return Err(Refusal::Aborted);
+    }
+    let key = attach::entry_key(attached.scope.class, &attached.key);
+    let upload = Upload::of(attempt, &attached.scope, key, total, digest);
+    let mut reader = BundleReader {
+        bundle,
+        dir: generation_dir,
+        part: 0,
+        cur: None,
+        cancel,
+    };
+    source.offer(&upload, deadline, &mut reader)
+}
+
+fn stream_digest(
+    bundle: &Bundle,
+    generation_dir: &Path,
+    deadline: Instant,
+    cancel: &dyn Fn() -> bool,
+) -> Result<[u8; 32], Miss> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&bundle.head);
+    hasher.update(&bundle.manifest);
+    hasher.update(&bundle.files);
+    let mut buf = vec![0u8; BLOCK_BYTES];
+    for entry in &bundle.entries {
+        if cancel() || Instant::now() >= deadline {
+            return Err(Miss::Unavailable);
+        }
+        let mut file =
+            fs::File::open(generation_dir.join(&entry.path)).map_err(|_| Miss::Corrupt)?;
+        let mut left = entry.size;
+        while left > 0 {
+            if cancel() || Instant::now() >= deadline {
+                return Err(Miss::Unavailable);
+            }
+            let want = left.min(buf.len() as u64) as usize;
+            let read = file.read(&mut buf[..want]).map_err(|_| Miss::Corrupt)?;
+            if read == 0 {
+                return Err(Miss::Corrupt);
+            }
+            hasher.update(&buf[..read]);
+            left -= read as u64;
+        }
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+struct Bundle {
+    head: [u8; STREAM_HEAD],
+    manifest: Vec<u8>,
+    files: Vec<u8>,
+    entries: Vec<FileEntry>,
+    payload: u64,
+}
+
+impl Bundle {
+    fn total(&self) -> Option<u64> {
+        (STREAM_HEAD as u64)
+            .checked_add(self.manifest.len() as u64)
+            .and_then(|total| total.checked_add(self.files.len() as u64))
+            .and_then(|total| total.checked_add(self.payload))
+            .filter(|total| *total <= MAX_BUNDLE_BYTES)
+    }
+}
+
+fn bundle_of(generation_dir: &Path) -> Result<Bundle, Miss> {
+    let manifest =
+        fs::read(generation_dir.join(scope::MANIFEST_NAME)).map_err(|_| Miss::Corrupt)?;
+    if manifest.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(Miss::Corrupt);
+    }
+    let files = fs::read(generation_dir.join(scope::FILES_NAME)).map_err(|_| Miss::Corrupt)?;
+    if files.len() as u64 > MAX_FILES_BLOB_BYTES {
+        return Err(Miss::Corrupt);
+    }
+    let blob = FilesBlob::decode(&files)?;
+    let mut entries = blob.entries;
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let payload = entries
+        .iter()
+        .try_fold(0u64, |total, entry| total.checked_add(entry.size))
+        .ok_or(Miss::Corrupt)?;
+    let head = head_bytes(manifest.len() as u64, files.len() as u64, payload);
+    Ok(Bundle {
+        head,
+        manifest,
+        files,
+        entries,
+        payload,
+    })
+}
+
+fn head_bytes(manifest_len: u64, files_len: u64, payload_len: u64) -> [u8; STREAM_HEAD] {
+    let mut head = [0u8; STREAM_HEAD];
+    head[..12].copy_from_slice(STREAM_MAGIC);
+    head[12] = STREAM_FORMAT;
+    head[16..24].copy_from_slice(&manifest_len.to_be_bytes());
+    head[24..32].copy_from_slice(&files_len.to_be_bytes());
+    head[32..40].copy_from_slice(&payload_len.to_be_bytes());
+    head
+}
+
+struct BundleReader<'a> {
+    bundle: Bundle,
+    dir: PathBuf,
+    part: usize,
+    cur: Option<Cur>,
+    cancel: &'a dyn Fn() -> bool,
+}
+
+enum Cur {
+    Mem(usize, usize),
+    File(fs::File, u64),
+}
+
+impl BundleReader<'_> {
+    fn next_part(&mut self) -> io::Result<bool> {
+        self.cur = match self.part {
+            part @ 0..=2 => Some(Cur::Mem(part, 0)),
+            n => match self.bundle.entries.get(n - 3) {
+                Some(entry) => Some(Cur::File(
+                    fs::File::open(self.dir.join(&entry.path))?,
+                    entry.size,
+                )),
+                None => None,
+            },
+        };
+        self.part += 1;
+        Ok(self.cur.is_some())
+    }
+
+    fn mem(&self, part: usize) -> &[u8] {
+        match part {
+            0 => &self.bundle.head,
+            1 => &self.bundle.manifest,
+            _ => &self.bundle.files,
+        }
+    }
+}
+
+impl Read for BundleReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if (self.cancel)() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "offer canceled"));
+        }
+        loop {
+            match self.cur.take() {
+                None => {
+                    if !self.next_part()? {
+                        return Ok(0);
+                    }
+                }
+                Some(Cur::Mem(part, at)) => {
+                    let bytes = self.mem(part);
+                    if at >= bytes.len() {
+                        continue;
+                    }
+                    let n = (bytes.len() - at).min(buf.len());
+                    buf[..n].copy_from_slice(&bytes[at..at + n]);
+                    self.cur = Some(Cur::Mem(part, at + n));
+                    return Ok(n);
+                }
+                Some(Cur::File(mut file, left)) => {
+                    if left == 0 {
+                        continue;
+                    }
+                    let want = left.min(buf.len() as u64) as usize;
+                    let read = file.read(&mut buf[..want])?;
+                    if read == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "bundle file ended early",
+                        ));
+                    }
+                    self.cur = Some(Cur::File(file, left - read as u64));
+                    return Ok(read);
+                }
+            }
+        }
+    }
+}
+
+fn hex32(id: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in id {
+        out.push(char::from_digit((byte >> 4) as u32, 16).expect("nibble"));
+        out.push(char::from_digit((byte & 0x0F) as u32, 16).expect("nibble"));
+    }
+    out
+}
+
+fn unhex32(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = text.as_bytes()[i * 2];
+        let lo = text.as_bytes()[i * 2 + 1];
+        *byte = (hex_nibble(hi)? << 4) | hex_nibble(lo)?;
+    }
+    Some(out)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+struct Entry {
+    tenant: [u8; 16],
+    repo: [u8; 16],
+    class: u8,
+    trust: u8,
+    os: u8,
+    arch: u8,
+    toolchain: [u8; 32],
+    name: String,
+    key: String,
+}
+
+impl Entry {
+    fn of_need(need: &Need) -> Entry {
+        Entry {
+            tenant: need.tenant,
+            repo: need.repo,
+            class: need.class,
+            trust: need.trust,
+            os: need.os,
+            arch: need.arch,
+            toolchain: need.toolchain,
+            name: need.name.clone(),
+            key: need.key.clone(),
+        }
+    }
+
+    fn of_upload(upload: &Upload) -> Entry {
+        Entry {
+            tenant: upload.tenant,
+            repo: upload.repo,
+            class: upload.class,
+            trust: upload.trust,
+            os: upload.os,
+            arch: upload.arch,
+            toolchain: upload.toolchain,
+            name: upload.name.clone(),
+            key: upload.key.clone(),
+        }
+    }
+
+    fn dir(&self, root: &Path) -> Result<PathBuf, Refusal> {
+        if self.key.is_empty() || self.key.len() > attach::MAX_KEY_BYTES {
+            return Err(Refusal::WrongScope);
+        }
+        let platform = platform_of(self.os, self.arch).ok_or(Refusal::WrongScope)?;
+        let tenant = TenantId::from_bytes(self.tenant).map_err(|_| Refusal::WrongScope)?;
+        let repo = RepoId::from_bytes(self.repo).map_err(|_| Refusal::WrongScope)?;
+        let class = Class::from_u8(self.class).ok_or(Refusal::WrongScope)?;
+        let trust = Trust::from_u8(self.trust).ok_or(Refusal::WrongScope)?;
+        let scope = Scope::new(
+            tenant,
+            repo,
+            class,
+            trust,
+            platform,
+            self.toolchain,
+            &self.name,
+        )
+        .map_err(|_| Refusal::WrongScope)?;
+        Ok(scope.entry_dir(root, &self.key))
+    }
+}
+
+fn read_current(entry: &Path) -> Option<[u8; 32]> {
+    let raw = fs::read_to_string(entry.join(scope::CURRENT_NAME)).ok()?;
+    unhex32(raw.trim())
+}
+
+fn bundle_path(entry: &Path, id: &[u8; 32]) -> PathBuf {
+    entry.join(format!("{}.bundle", hex32(id)))
+}
+
+pub struct Serving {
+    file: fs::File,
+    plan: Grant,
+    hasher: blake3::Hasher,
+    offset: u64,
+}
+
+impl Serving {
+    pub fn open(store_root: &Path, need: &Need) -> Result<Serving, Refusal> {
+        let entry = Entry::of_need(need).dir(store_root)?;
+        let id = read_current(&entry).ok_or(Refusal::NoBundle)?;
+        let mut file = fs::File::open(bundle_path(&entry, &id)).map_err(|_| Refusal::NoBundle)?;
+        let total = file.metadata().map_err(|_| Refusal::Store)?.len();
+        if total > MAX_BUNDLE_BYTES {
+            return Err(Refusal::Store);
+        }
+        let requested = need.offset.min(total);
+        let (offset, prefix, hasher) = if requested == 0 || requested > MAX_RESUME_HASH {
+            (0, empty_digest(), blake3::Hasher::new())
+        } else {
+            let hasher = hash_prefix(&mut file, requested, None).map_err(|_| Refusal::Store)?;
+            let prefix = *hasher.clone().finalize().as_bytes();
+            if prefix == need.have {
+                (requested, prefix, hasher)
+            } else {
+                (0, empty_digest(), blake3::Hasher::new())
+            }
+        };
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|_| Refusal::Store)?;
+        crate::gc::touch(&entry);
+        Ok(Serving {
+            file,
+            plan: Grant {
+                attempt: need.attempt,
+                total,
+                offset,
+                prefix,
+                digest: id,
+            },
+            hasher,
+            offset,
+        })
+    }
+
+    pub fn plan(&self) -> Grant {
+        self.plan
+    }
+
+    pub fn next_chunk(&mut self) -> Result<Option<Chunk>, Refusal> {
+        let mut chunk = Chunk {
+            attempt: self.plan.attempt,
+            offset: 0,
+            bytes: Vec::new(),
+            prefix: [0; 32],
+        };
+        Ok(self.next_chunk_into(&mut chunk)?.then_some(chunk))
+    }
+
+    pub fn next_chunk_into(&mut self, chunk: &mut Chunk) -> Result<bool, Refusal> {
+        if self.offset >= self.plan.total {
+            return Ok(false);
+        }
+        let remaining = usize::try_from(self.plan.total - self.offset).unwrap_or(usize::MAX);
+        let want = CHUNK_BYTES.min(remaining);
+        chunk.bytes.resize(want, 0);
+        let read = loop {
+            match self.file.read(&mut chunk.bytes[..want]) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                other => break other.map_err(|_| Refusal::Store)?,
+            }
+        };
+        if read == 0 {
+            return Err(Refusal::Store);
+        }
+        chunk.bytes.truncate(read);
+        chunk.attempt = self.plan.attempt;
+        chunk.offset = self.offset;
+        self.hasher.update(&chunk.bytes);
+        self.offset += read as u64;
+        chunk.prefix = *self.hasher.clone().finalize().as_bytes();
+        Ok(true)
+    }
+}
+
+pub struct Receiving {
+    _lock: lease::WriteLock,
+    file: fs::File,
+    part: PathBuf,
+    entry: PathBuf,
+    id: [u8; 32],
+    total: u64,
+    offset: u64,
+    hasher: blake3::Hasher,
+    done: bool,
+}
+
+impl Drop for Receiving {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = fs::remove_file(&self.part);
+        }
+    }
+}
+
+impl Receiving {
+    pub fn begin(store_root: &Path, upload: &Upload) -> Result<Option<Receiving>, Refusal> {
+        let entry = Entry::of_upload(upload).dir(store_root)?;
+        if upload.total > MAX_BUNDLE_BYTES {
+            return Err(Refusal::TooLarge);
+        }
+        let at_end = upload.digest == DIGEST_AT_END;
+        if !at_end && bundle_path(&entry, &upload.digest).is_file() {
+            return Ok(None);
+        }
+        if let Some((free, total)) = store_space(store_root)
+            && free
+                < upload
+                    .total
+                    .saturating_add((total / 20).min(STORE_FREE_RESERVE))
+        {
+            return Err(Refusal::TooLarge);
+        }
+        let Some(lock) =
+            lease::WriteLock::acquire(&entry, "remote-offer").map_err(|_| Refusal::Store)?
+        else {
+            return Err(Refusal::Busy);
+        };
+        let name = if at_end {
+            let mut attempt = [0u8; 32];
+            attempt[..16].copy_from_slice(&upload.attempt);
+            format!("offer-{}.part", hex32(&attempt))
+        } else {
+            format!("{}.part", hex32(&upload.digest))
+        };
+        let part = entry.join(scope::WRITING_NAME).join(name);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&part)
+            .map_err(|_| Refusal::Store)?;
+        Ok(Some(Receiving {
+            _lock: lock,
+            file,
+            part,
+            entry,
+            id: upload.digest,
+            total: upload.total,
+            offset: 0,
+            hasher: blake3::Hasher::new(),
+            done: false,
+        }))
+    }
+
+    pub fn grant(&self, upload: &Upload) -> Grant {
+        Grant {
+            attempt: upload.attempt,
+            total: self.total,
+            offset: self.offset,
+            prefix: empty_digest(),
+            digest: self.id,
+        }
+    }
+
+    pub fn push(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Refusal> {
+        if offset != self.offset || bytes.len() > MAX_CHUNK_BYTES {
+            return Err(Refusal::Store);
+        }
+        let next = self
+            .offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(Refusal::TooLarge)?;
+        if next > self.total {
+            return Err(Refusal::Store);
+        }
+        self.file.write_all(bytes).map_err(|_| Refusal::Store)?;
+        self.hasher.update(bytes);
+        self.offset = next;
+        Ok(())
+    }
+
+    pub fn end(&mut self, digest: [u8; 32]) -> Result<(), Refusal> {
+        if self.id == DIGEST_AT_END {
+            if digest == DIGEST_AT_END {
+                return Err(Refusal::Store);
+            }
+            self.id = digest;
+        }
+        if digest != self.id
+            || self.offset != self.total
+            || self.hasher.finalize().as_bytes() != &self.id
+        {
+            return Err(Refusal::Store);
+        }
+        self.file.sync_all().map_err(|_| Refusal::Store)?;
+        let previous = read_current(&self.entry).filter(|id| *id != self.id);
+        fs::rename(&self.part, bundle_path(&self.entry, &self.id)).map_err(|_| Refusal::Store)?;
+        self.done = true;
+        publish::sync_dir(&self.entry).map_err(|_| Refusal::Store)?;
+        let tmp = self.entry.join(publish::CURRENT_TMP);
+        publish::write_synced(&tmp, hex32(&self.id).as_bytes()).map_err(|_| Refusal::Store)?;
+        fs::rename(&tmp, self.entry.join(scope::CURRENT_NAME)).map_err(|_| Refusal::Store)?;
+        publish::sync_dir(&self.entry).map_err(|_| Refusal::Store)?;
+        if let Some(previous) = previous {
+            let _ = fs::remove_file(bundle_path(&self.entry, &previous));
+        }
+        Ok(())
+    }
+}
+
+fn store_space(root: &Path) -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let st = rustix::fs::statvfs(root).ok()?;
+        Some((
+            st.f_bavail.saturating_mul(st.f_frsize),
+            st.f_blocks.saturating_mul(st.f_frsize),
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        None
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StoreSweep {
+    pub entries: u64,
+    pub bytes: u64,
+    pub bundles_removed: u64,
+    pub parts_removed: u64,
+    pub entries_evicted: u64,
+    pub bytes_freed: u64,
+    pub errors: u64,
+}
+
+pub fn sweep_store(root: &Path, budget_bytes: u64, max_entries: u64, now_ms: i64) -> StoreSweep {
+    let mut out = StoreSweep::default();
+    let mut kept: Vec<(i64, u64, PathBuf)> = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0u32)];
+    while let Some((dir, depth)) = stack.pop() {
+        if out.entries >= max_entries {
+            break;
+        }
+        if depth == 7 {
+            out.entries += 1;
+            if lease::writing_lock_live(&dir, now_ms) {
+                continue;
+            }
+            if let Some(entry) = sweep_entry(&dir, now_ms, &mut out) {
+                kept.push(entry);
+            }
+            continue;
+        }
+        let Ok(children) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for child in children.flatten() {
+            if child.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push((child.path(), depth + 1));
+            }
+        }
+    }
+    let mut total: u64 = kept.iter().map(|(_, bytes, _)| bytes).sum();
+    if total > budget_bytes {
+        kept.sort_unstable_by_key(|(used, _, _)| *used);
+        for (_, bytes, entry) in kept {
+            if total <= budget_bytes {
+                break;
+            }
+            if lease::writing_lock_live(&entry, now_ms) {
+                continue;
+            }
+            match fs::remove_dir_all(&entry) {
+                Ok(()) => {
+                    out.entries_evicted += 1;
+                    out.bytes_freed += bytes;
+                    total -= bytes;
+                }
+                Err(_) => out.errors += 1,
+            }
+        }
+    }
+    out.bytes = total;
+    out
+}
+
+fn sweep_entry(entry: &Path, now_ms: i64, out: &mut StoreSweep) -> Option<(i64, u64, PathBuf)> {
+    let stale_ms = STALE_UPLOAD.as_millis() as i64;
+    let mtime_ms = |m: &fs::Metadata| {
+        m.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as i64)
+    };
+    if let Ok(parts) = fs::read_dir(entry.join(scope::WRITING_NAME)) {
+        for part in parts.flatten() {
+            let name = part.file_name();
+            let is_part = name.to_str().is_some_and(|n| n.ends_with(".part"));
+            if is_part
+                && part
+                    .metadata()
+                    .is_ok_and(|m| mtime_ms(&m) + stale_ms <= now_ms)
+            {
+                match fs::remove_file(part.path()) {
+                    Ok(()) => out.parts_removed += 1,
+                    Err(_) => out.errors += 1,
+                }
+            }
+        }
+    }
+    let current = read_current(entry);
+    let mut kept = None;
+    for child in fs::read_dir(entry).ok()?.flatten() {
+        let name = child.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".bundle"))
+            .and_then(unhex32)
+        else {
+            continue;
+        };
+        let Ok(meta) = child.metadata() else {
+            continue;
+        };
+        if Some(id) == current {
+            kept = Some(meta.len());
+            continue;
+        }
+        match fs::remove_file(child.path()) {
+            Ok(()) => {
+                out.bundles_removed += 1;
+                out.bytes_freed += meta.len();
+            }
+            Err(_) => out.errors += 1,
+        }
+    }
+    let used = fs::metadata(entry.join(scope::CURRENT_NAME))
+        .map(|m| mtime_ms(&m))
+        .unwrap_or(0);
+    match kept {
+        Some(bytes) => Some((used, bytes, entry.to_path_buf())),
+        None => {
+            let _ = fs::remove_dir_all(entry);
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusal_codes_round_trip_and_nothing_new_decodes() {
+        for code in [1u8, 2, 3, 4, 5, 6, 7] {
+            let refusal = Refusal::from_code(code).unwrap();
+            assert_eq!(refusal.code(), code);
+        }
+        for code in [0u8, 8, 255] {
+            assert!(Refusal::from_code(code).is_none());
+        }
+    }
+
+    #[test]
+    fn stream_head_is_big_endian_and_zero_reserved() {
+        let head = head_bytes(1, 2, 3);
+        assert_eq!(&head[..12], STREAM_MAGIC);
+        assert_eq!(head[12], STREAM_FORMAT);
+        assert_eq!(&head[13..16], &[0, 0, 0]);
+        assert_eq!(u64_at(&head, 16), 1);
+        assert_eq!(u64_at(&head, 24), 2);
+        assert_eq!(u64_at(&head, 32), 3);
+    }
+
+    #[test]
+    fn bundle_ids_round_trip_through_hex() {
+        let id = *blake3::hash(b"bundle").as_bytes();
+        assert_eq!(unhex32(&hex32(&id)), Some(id));
+        assert!(unhex32("nope").is_none());
+        assert!(unhex32(&"z".repeat(64)).is_none());
+    }
+}

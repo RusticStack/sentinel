@@ -1,0 +1,14 @@
+# expect: expected downloads, dependencies or compiler
+schema: 1
+on: [push]
+jobs:
+  a:
+    image: busybox
+    cache:
+      - name: c
+        class: everything
+        key: k
+        paths: [target]
+    steps:
+      - id: s
+        run: echo hi

@@ -1,0 +1,29 @@
+[package]
+name = "sentinel-github"
+description = "GitHub sign-in: bounded HTTPS client, OAuth code exchange and verified identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = "0.23"
+ring = "0.17"
+sentinel-auth = { path = "../sentinel-auth" }
+time = { version = "0.3", features = ["parsing", "formatting"] }
+serde_json = "1.0"
+ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip"] }
+
+[features]
+# A GitHub-shaped OAuth server on loopback, for other crates' tests.
+fake = []
+
+[dev-dependencies]
+sentinel-core = { path = "../sentinel-core" }
+sentinel-store = { path = "../sentinel-store" }
+tempfile = "3.20"
+
+[lints]
+workspace = true

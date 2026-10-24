@@ -1,0 +1,5 @@
+# expect: jobs.a.artifacts[0].paths[0]: must be a normalised relative path
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}], artifacts: [{name: out, paths: [../etc/passwd]}]}

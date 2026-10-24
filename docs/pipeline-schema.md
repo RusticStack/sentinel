@@ -1,0 +1,191 @@
+# Pipeline schema 1 (C04)
+
+`crates/sentinel-pipeline` turns a `.sentinel.yml` into a compiled, immutable pipeline in three stages, each strict: bounded YAML loading, typed decoding, deterministic compilation. Anything the schema does not define is an error, never a silent no-op, so a repository can only rely on behaviour Sentinel implements. Fixtures live under [`fixtures/pipelines`](../fixtures/pipelines); every valid one must compile and every invalid one must fail with the message in its `# expect:` header.
+
+## Loading limits
+
+The YAML event stream feeds a receiver that enforces limits as events arrive, so hostile input is rejected before it is materialised.
+
+| Limit | Value |
+|---|---|
+| File size | 256 KiB (`MAX_PIPELINE_FILE_BYTES`) |
+| Nesting depth | 16 |
+| Nodes | 10,000 |
+| Key length | 128 bytes |
+| Scalar length | 4,096 bytes |
+| Documents | exactly one |
+
+Anchors, aliases, tags, non-string keys and duplicate keys are errors with line and column; the duplicate-key message names the position, never the key (diagnostics do not echo parser payloads). Plain scalars resolve only `null`, `true`/`false` and decimal integers; `yes`, `on`, octal, hex and floats stay strings, so nothing is coerced behind the author's back.
+
+## Document shape
+
+```yaml
+schema: 1                       # required, exactly 1
+on: [push, pull_request, tag, manual]   # 1–4 distinct triggers
+# or the filtered form:
+# on:
+#   push: {branches: [main, "release/*"]}
+#   tag: {tags: ["v*"]}
+#   pull_request: {branches: [main]}
+#   manual: true
+concurrency:                    # optional
+  group: "${{ repo.id }}:${{ event.key }}"
+  cancel_in_progress: true
+jobs:                           # 1–64, names [a-z0-9][a-z0-9_-]{0,63}
+  test:
+    image: rust:1-bookworm      # required OCI reference
+    needs: [other]              # ≤ 32 job names
+    runs_on: {arch: amd64|arm64, labels: [linux], os: linux|windows, isolation: container|microvm|native}   # ≤ 8 labels; os and isolation optional, see below
+    resources: {cpu: 4, memory: 8GiB, disk: 20GiB}  # see policy
+    timeout: 20m                # default 1h, max 24h
+    env: {NAME: value}          # ≤ 64, names [A-Za-z_][A-Za-z0-9_]*
+    workdir: crates/app         # relative, normalised
+    steps:                      # required, 1–64
+      - id: test                # unique within the job
+        run: cargo test         # ≤ 4 KiB
+        shell: sh|bash          # default sh
+        env: {…}
+        workdir: …
+        timeout: 5m             # ≤ job timeout
+    cache:                      # ≤ 8, unique names
+      - {name: cargo, key: "cargo-${{ hash_files('Cargo.lock') }}", paths: [/usr/local/cargo/registry, target]}
+      - {name: registry, class: downloads, key: "dl-${{ hash_files('Cargo.lock') }}", paths: [/usr/local/cargo/registry]}
+    artifacts:                  # ≤ 8, unique names
+      - {name: release, paths: [target/release/app], when: success|failure|always, retain: 7d, required: false}
+    secrets: [DEPLOY_TOKEN]     # ≤ 16 names [A-Z_][A-Z0-9_]*; values never appear in YAML
+```
+
+Unknown keys anywhere are rejected with their path, for example `jobs.test: unknown key `imgae``. Durations are `<int>s|m|h` sums such as `1h30m`. Sizes use binary units only, `MiB` or `GiB`. CPU is whole cores or a quoted decimal such as `"0.5"`, stored as millicores: plain digits only (no sign), at most three decimals, so `"+4"`, `"0.+5"` and `"0.5555"` are errors rather than being read or truncated. Paths are normalised relative paths with no `..`, `//`, leading `./` or trailing `/`; cache paths may also be absolute inside the container but never `/`. `concurrency.group` and cache `key` are templates; job and step `if` are expressions (see below).
+
+**`runs_on.os` and `runs_on.isolation`.** Unstated, a job is a Linux job run on whatever executor its worker uses by default (rootless Podman, or a microVM on a KVM host once that executor is set up; [plan 16.8](../plan.md#168-microvm-execution-on-kvm-hosts)), and any Linux worker may take it, including one that predates these fields. Stated, the job goes only to a worker that states it runs that OS and isolation; otherwise it waits with the reason `runtime_missing` ([API](api.md)). Linux jobs take `container` or `microvm`; Windows jobs take `microvm` (a Windows guest) or `native`, so `os: linux` with `native` and `os: windows` with `container` are errors. A spec with either field is stored as run spec format 7 ([compatibility](compatibility.md)).
+
+## Source policies (`on:`)
+
+`on:` is either the list form above (every ref of those kinds) or a mapping
+that names kinds with optional ref filters:
+
+```yaml
+on:                                  # every branch, every tag, manual only
+  push:                              # `branches` patterns; empty = every branch
+    branches: [main, "release/*"]
+  tag:
+    tags: ["v*"]                     # `tags` patterns; empty = every tag
+  pull_request:
+    branches: [main]                 # matched against the base branch
+  manual: true                       # `true` or the key is omitted
+```
+
+Filter rules, enforced strictly:
+
+- the list form takes 1–4 distinct kinds and no filters; the mapping form names
+  at most those four kinds, and at least one must be present;
+- a kind takes only its own key (`branches` for `push` and `pull_request`,
+  `tags` for `tag`); the other is an unknown key;
+- at most 32 patterns of at most 256 bytes each. `*` matches any run of
+  characters inside one path segment and `**` matches zero or more whole
+  segments, anchored to the whole branch or tag name (`release/*` does not
+  match `release/1.0/x`; `release/**` does). An empty list is an error — omit
+  the key to admit every ref;
+- `manual: true` declares the trigger the API's explicit dispatch uses; an
+  event-driven delivery never matches it, and a `manual` pipeline never runs
+  from a push.
+
+Which ref a policy is judged against is fixed by the event: a push is judged
+against its branch, a tag against its tag, and a pull request against its
+**base** branch. An event whose kind and ref disagree (a tag ref arriving as a
+push) never matches, and neither does an event the pipeline does not declare.
+The decision is made by the controller when it resolves the delivery
+([intake](intake.md)); a mismatch is `ignored:no_trigger`, not a failure.
+
+## Resource policy
+
+Absent resource fields take the policy defaults so every compiled job has a finite, enforceable budget; explicit values must fall inside the policy bounds.
+
+| Field | Default | Minimum | Maximum |
+|---|---|---|---|
+| cpu | 2 cores | 0.25 | 64 |
+| memory | 4 GiB | 128 MiB | 256 GiB |
+| disk | 10 GiB | 1 GiB | 1000 GiB |
+
+The policy is a value passed to `compile_with`, so tenants or pools can carry their own without changing the parser.
+
+## Compilation
+
+The compiler validates cross-job references and produces a canonical form:
+
+- `needs` must name existing, distinct, other jobs; cycles are reported with the jobs involved.
+- Step IDs, cache names and artifact names are unique per job; a step timeout cannot exceed its job's timeout; at most 1,024 steps in total.
+- Jobs are sorted by name, then ordered by Kahn's algorithm with a name-ordered ready set, so the execution order is a pure function of the DAG and does not change when unrelated jobs are edited. `needs` become ascending indices into that order, every one smaller than the job's own index.
+- A 128-bit digest over the canonical form identifies the compiled pipeline. Reordering job declarations or `needs` lists yields the same digest; any semantic change yields a different one. The digest is FNV-1a, for equality only, never for trust.
+
+## Run specification (C05)
+
+> Execution admission: a job's image digest **and** platform must be durably recorded on the job (`runs::resolve_image`, migration 12) before `jobs::lease` will hand it to a worker; a tag-only or digest-only reference is not executable.
+
+`RunSpec` binds one compiled pipeline to one exact source and is written once per run, never edited. It holds a `PinnedSource` (repository, full lowercase hex SHA-1 or SHA-256, optional ref name kept as provenance only), the `CompiledPipeline`, and one `ImageRef` per job. An image reference is parsed into name, tag and digest; it is *pinned* when it carries a `sha256` digest. Tag-only references are resolved by the first worker to pull them and the digest is recorded on the run, so every later attempt uses the same bytes; a pin can be set once and never changed.
+
+The spec is persisted as one format byte plus a postcard-encoded blob in the store's `run_specs` table alongside the run, in the same transaction that creates the job rows. Jobs with no dependencies and no `if` are created `Queued`, the rest `Blocked` (a job with an `if` waits even with nothing to depend on, because its condition reads the run's event, which is recorded after the run row); dependency indices are read from the spec, not duplicated in rows. `get_run_spec` returns exactly what was written and rejects blobs with an unknown format byte instead of misreading them.
+
+**Rerun versus new dispatch.** A rerun is a new attempt of an existing job under the same spec: the job goes from any terminal state back to `Queued`, its attempt history and failure class are cleared, and the fence is kept so the next lease advances it and any late report from the old attempt is stale. A job with cancellation desired cannot be rerun. A rerun also resumes the run it belongs to: the run's own cancel flag is cleared, and every job downstream of the rerun job that ended `skipped` (following a chain of skipped jobs only) goes back to `Blocked` and is decided again when the new attempt finishes, so a dependent skipped for a failure that a passing rerun replaces runs, and one skipped by its own `if` is evaluated again. A dependent that already ran keeps its result. Without this, a passed rerun would leave a required downstream job skipped and the run `passed`. This revival is a controller-only store operation (it is not a state-machine edge; see [core contracts](core-contracts.md#job-states-and-events)). A different source revision or pipeline is a new run with its own spec and its own IDs.
+
+`RunSpec::step_command(job, step)` derives the exact process a worker runs: argv, merged environment and working directory, plus the effective timeout (step timeout, else job timeout).
+
+## Expressions (C06)
+
+`${{ … }}` in templates and the `if:` keys use one bounded grammar, parsed once at compile time into an AST stored with the run spec:
+
+- Literals: `'single quoted'` (`''` escapes a quote), integers, `true`, `false`, `null`.
+- Context paths: `event.name|ref|base_ref|sha|key|pr_number`, `repo.id|name`, `run.id`, `job.id|name`, `needs.<job>.result`. Any other root or field is a compile error, so a typo cannot evaluate to null.
+- Operators: `==`, `!=` (same-type only, `null` compares with anything), `!`, `&&`, `||` (short-circuit, boolean operands only), parentheses. Comparisons do not chain.
+- Functions: `success()`, `failure()`, `always()`, `cancelled()`, `contains(a, b)`, `starts_with(a, b)`, `ends_with(a, b)`, `hash_files('pattern', …)`. Nothing else: no arithmetic, no string building, no user functions, no network.
+- Limits: 1,024 bytes, 256 tokens, depth 16, 8 arguments, 4 path segments.
+
+The event paths are real values recorded as the run's immutable provenance
+([intake](intake.md)), not defaults:
+
+| Path | Value |
+|---|---|
+| `event.name` | `push`, `tag`, `pull_request` or `manual` |
+| `event.sha` | the checked-out revision (the pushed commit, the peeled tag commit, the tested merge) |
+| `event.ref` | the pushed ref, the tag ref, or `refs/pull/<n>/merge` for a pull request |
+| `event.base_ref` | the pull request's base branch (`main`); `null` for anything else |
+| `event.pr_number` | the pull request number; `null` for anything else |
+| `event.key` | a short, stable key: the branch or tag name, `pr-<n>`, or `manual` |
+
+Evaluation is phased. Each path and function has a minimum phase, and an expression evaluated earlier yields an `Unresolved` error rather than a default: `event`, `repo`, `run`, `job` and `cancelled()` at **dispatch**; `needs.*`, `success()`, `failure()`, `always()` at **schedule** (once every dependency is terminal); `hash_files` at **worker** (after the pinned checkout). The compiler enforces placement: `concurrency.group` may only use dispatch context; a job `if` may not use `hash_files` and may only name jobs in its own `needs`; step `if` and cache keys may use everything but also only name jobs in `needs`. A condition must be a boolean: the compiler types every `if` and rejects, with the path of the key, a comparison between types that can never match (`event.ref == 7`, `event.pr_number == 'x'`), a boolean operator or function over a value that is not always a boolean (`!event.ref`, `event.base_ref || true`), and a result that is not a boolean (`if: event.ref`). `null` compares with anything. A condition that compiled therefore cannot fail with a type error when it is evaluated. `success()` and `failure()` summarise dependency outcomes (`failure()` is true when any dependency did not succeed, `success()` when all passed or were skipped by their own condition); `always()` is true unless the run is cancelled.
+
+**Job conditions.** A job's `if` is evaluated by the controller at the schedule phase, once every job in `needs` is terminal, with the run's event, repository, run and job facts, `needs.<job>.result` and the dependency summary (the same values the worker later gives a step's `if`; `hash_files` is a compile error there). A job with an `if` always starts `Blocked`, even with no `needs`, and is decided as soon as its event is recorded. The decision:
+
+| Job | Starts when | Otherwise |
+|---|---|---|
+| no `if` (policy `on_success`) | every dependency passed or was skipped by its own condition | skipped as soon as one dependency did not succeed |
+| `if` without a status function | the dependencies all succeeded **and** the condition is true | skipped |
+| `if` that calls `success()`, `failure()` or `always()` | the condition is true, whatever the dependencies did | skipped |
+
+So `cleanup: {needs: [test], if: always()}` runs after a failed `test` and `notify: {needs: [test], if: failure()}` runs only after one, while `deploy: {needs: [test], if: event.ref == 'refs/heads/main'}` runs only on `main` and only when `test` succeeded. `always()` and `failure()` are false once the run's cancel flag is set, and a cancelled run's unstarted jobs end `canceled` anyway. The core policies map as `on_success` = no `if`, `always` = `if: always()`, `on_failure` = `if: failure()`. A skip caused by a failure upstream is a failure for what follows: a job skipped because its dependency failed does not satisfy `on_success` for its own dependents, whereas a job skipped by its own false condition does (an optional branch not taken does not drag the DAG); the worker's step conditions see each dependency's recorded outcome (`skipped`), not this propagation. A condition that nevertheless cannot be evaluated when the dependencies finish ends the job `infra_failed` with failure class `preparation` and never runs or skips it on a guess.
+
+Templates render each interpolation as string, integer or boolean; `null` is an error, and output is bounded (256 bytes for concurrency keys and cache keys).
+
+`hash_files(root, patterns)` resolves on Linux workers against a pinned checkout root: segments may contain `*` or be `**` (zero or more directories); a terminal `**` includes regular files recursively. Unique matches are sorted by UTF-8 path bytes; the result remains the BLAKE3 hex of `path \0 little-endian-u64-length content` records. No match is an error, not an empty key. Overlapping patterns do not consume the unique-file budget twice.
+
+The [resolver contract](hash-files.md) provides streaming directory enumeration, shared traversal and depth budgets, actual read accounting, and descriptor-rooted no-symlink/no-mount access. Matching symlinks and special files fail closed; filesystem failures are not silently treated as absent input. Secure resolution requires Linux `openat2` and host procfs; other platforms return `UnsupportedPlatform`. Portable offline validation/explanation still reports runtime hashes as unresolved.
+
+## Bindings and offline validation (C07)
+
+Three kinds of binding connect a job to state outside its container, and each is declared by name so grants can be checked before anything runs:
+
+- **cache**: a name, an optional `class`, a key template and container paths. The worker materialises the named cache scope for the rendered key; the key is unknown offline whenever it interpolates runtime context. `class` is `downloads`, `dependencies` or `compiler` (default `dependencies`); the class chooses the validity rule the entry follows — see [cache classes](cache.md).
+- **artifacts**: named path sets published after the job's steps under a `when` policy (`success`, `failure` or `always`, matched against the step verdict) and a `retain` period of `1d`–`365d` (default `7d`). `paths` use the `hash_files` pattern language resolved against the job workspace: a declaration that resolves to no files is recorded `absent`; one that cannot resolve or publish is recorded `failed`. `required: true` (default `false`) turns an absent or failed outcome into a publication-class job failure; an optional artifact never changes the verdict. Each artifact publishes as an immutable manifest of content-addressed objects (D03); per-artifact and per-run byte and entry budgets are enforced during capture.
+- **secrets**: names only. A job declares the names it may use; each step selects environment or file targets, while optional `registry_auth` selects a host-only OCI auth value for that job's image pull. The file never carries a value. A missing or revoked binding fails preparation instead of starting with an empty variable.
+
+`sentinel pipeline validate <file>` runs the same loader, decoder and compiler as the server on any platform, prints nothing on success, and on failure prints `<file>: <stage>: <path>: <message>` and exits 1. `sentinel pipeline explain <file> [--json]` prints the compiled view: digest, triggers (with their ref filters), concurrency, every job in execution order with its dependencies, image and pin status, condition, budgets, steps, caches, artifacts and secrets; a **requires** section (repository read, secret names to grant, cache scopes, artifact storage, registry access for unpinned images); and an **unresolved until runtime** list naming each expression with the phase that resolves it. Nothing unresolved is given a value: `hash_files` keys are shown as their template, secrets as names, and unpinned images as needing resolution at first pull. `--json` emits the `sentinel.explain/1` shape for tools and agents; `trigger_filters` lists each declared kind's patterns (empty for an unfiltered kind).
+
+## Shell semantics
+
+`sh` runs `/bin/sh -e -c <script>` so the first failing command fails the step. `bash` runs `bash -e -o pipefail -c <script>` and requires an image that provides bash. Failure classes are identical for both: exit 0 passes; any other exit status is `command_failed`; death by signal is `command_signaled`; exceeding the step or job timeout is `execution_timeout`; a cgroup memory kill is `out_of_memory`. Output is captured for diagnostics and never interpreted for the verdict. Environment precedence is job `env`, then step `env` overriding by name, then the worker's own `SENTINEL_*` context variables appended last so a pipeline cannot spoof them. A step `workdir` is joined under the job `workdir`; both are validated relative paths so the join cannot escape the workspace. Steps of one job run sequentially in one container and workspace; jobs share nothing implicitly.
+
+## Verification
+
+Unit tests cover secret-name validation, registry-auth delivery requirements, and the explanation model (requirements, unresolved inputs, no invented values), the expression grammar (precedence, rejected constructs, phase gating, typing, templates), the `hash_files` resolver (globbing, ordering, sensitivity, cross-root stability), scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Fixture tests compile every valid fixture, check the invalid fixtures against their expected messages, evaluate the conditions example across dispatch, schedule and worker phases, decode every field of the full example, and prove determinism on a diamond DAG under reordering.
+
+Not in this schema version: named pipelines, schedules, manual inputs, matrices, service containers, extra checkouts (Part 16 and later parts). Files using them fail at `unknown key`.

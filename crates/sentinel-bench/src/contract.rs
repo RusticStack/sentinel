@@ -1,0 +1,308 @@
+use std::{collections::BTreeMap, fs, path::Path};
+
+use serde::{Deserialize, Serialize};
+
+pub const FORMAT: &str = "sentinel.bench-contract/1";
+
+#[derive(Deserialize)]
+pub struct Contract {
+    pub format: String,
+    pub id: String,
+    pub revision: u32,
+    pub reference_host: ReferenceHost,
+    pub allocation: Allocation,
+    pub sources: Vec<SourcePin>,
+    pub images: BTreeMap<String, String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    pub freshness: Freshness,
+    pub conditions: BTreeMap<String, Condition>,
+    pub lanes: Vec<Lane>,
+}
+
+#[derive(Deserialize)]
+pub struct ReferenceHost {
+    pub cpu_model: String,
+    pub cpus_online: usize,
+    pub mem_total_kib_min: u64,
+    pub podman: String,
+}
+
+#[derive(Deserialize)]
+pub struct Allocation {
+    pub total: Caps,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct Caps {
+    pub cpus: String,
+    pub memory: String,
+}
+
+#[derive(Deserialize)]
+pub struct SourcePin {
+    pub name: String,
+    pub commit: String,
+    pub path: String,
+}
+
+#[derive(Deserialize)]
+pub struct Freshness {
+    pub max_record_age_days: u32,
+}
+
+#[derive(Deserialize)]
+pub struct Condition {
+    pub prepare: String,
+    pub samples: u32,
+}
+
+#[derive(Deserialize)]
+pub struct Lane {
+    pub id: String,
+    pub image: String,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub run: String,
+}
+
+#[derive(Serialize)]
+pub struct Stamp {
+    pub id: String,
+    pub revision: u32,
+    pub blake3: String,
+    pub lane: String,
+    pub condition: String,
+    pub max_record_age_days: u32,
+    /// CPU pressure (`some`, avg60, percent) when sampling started.
+    pub cpu_pressure_avg60: Option<f64>,
+    pub sources: BTreeMap<String, String>,
+    pub image: Option<String>,
+}
+
+/// Contract lane pressure bound: a contended start is not a baseline.
+pub const MAX_START_PRESSURE: f64 = 5.0;
+
+pub struct Loaded {
+    pub contract: Contract,
+    pub blake3: String,
+}
+
+pub fn load(path: &Path) -> Result<Loaded, String> {
+    let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let contract: Contract = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("{} is not a bench contract: {e}", path.display()))?;
+    if contract.format != FORMAT {
+        return Err(format!(
+            "{} is `{}`, not `{FORMAT}`",
+            path.display(),
+            contract.format
+        ));
+    }
+    Ok(Loaded {
+        contract,
+        blake3: blake3::hash(&bytes).to_hex().to_string(),
+    })
+}
+
+impl Contract {
+    pub fn lane(&self, id: &str) -> Result<&Lane, String> {
+        self.lanes.iter().find(|l| l.id == id).ok_or_else(|| {
+            let ids: Vec<&str> = self.lanes.iter().map(|l| l.id.as_str()).collect();
+            format!(
+                "no lane `{id}` in contract {}; lanes: {}",
+                self.id,
+                ids.join(", ")
+            )
+        })
+    }
+
+    pub fn condition(&self, id: &str) -> Result<&Condition, String> {
+        self.conditions
+            .get(id)
+            .ok_or_else(|| format!("no condition `{id}` in contract {}", self.id))
+    }
+
+    /// Replace `{root}` and `{commit:<source>}`; the runner fills `{sample_nonce}` in per sample.
+    pub fn expand(&self, text: &str, root: &str) -> String {
+        let mut out = text.replace("{root}", root);
+        for source in &self.sources {
+            out = out.replace(&format!("{{commit:{}}}", source.name), &source.commit);
+        }
+        out
+    }
+
+    pub fn env(&self, lane: &Lane, root: &str) -> BTreeMap<String, String> {
+        let mut env: BTreeMap<String, String> = self
+            .environment
+            .iter()
+            .map(|(k, v)| (k.clone(), self.expand(v, root)))
+            .collect();
+        for (k, v) in &lane.env {
+            env.insert(k.clone(), self.expand(v, root));
+        }
+        env
+    }
+}
+
+pub fn drift(
+    contract: &Contract,
+    host: &crate::Host,
+    podman: Option<&str>,
+    image_digest: Option<&str>,
+    lane: &Lane,
+    root: &Path,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let want = &contract.reference_host;
+    if host.cpu_model.as_deref() != Some(want.cpu_model.as_str()) {
+        out.push(format!(
+            "cpu model {:?}, contract {:?}",
+            host.cpu_model, want.cpu_model
+        ));
+    }
+    if host.cpus_online != Some(want.cpus_online) {
+        out.push(format!(
+            "{:?} CPUs online, contract {}",
+            host.cpus_online, want.cpus_online
+        ));
+    }
+    if host
+        .mem_total_kib
+        .is_none_or(|m| m < want.mem_total_kib_min)
+    {
+        out.push(format!(
+            "memory {:?} KiB, contract at least {}",
+            host.mem_total_kib, want.mem_total_kib_min
+        ));
+    }
+    if let Some(podman) = podman
+        && podman != want.podman
+    {
+        out.push(format!("{podman:?}, contract {:?}", want.podman));
+    }
+    if let Some(pinned) = contract.images.get(&lane.image) {
+        let want_digest = pinned.rsplit_once('@').map(|(_, d)| d);
+        if image_digest.is_some() && image_digest != want_digest {
+            out.push(format!(
+                "image {} has digest {image_digest:?}, contract {want_digest:?}",
+                lane.image
+            ));
+        }
+    } else {
+        out.push(format!(
+            "lane image `{}` is not pinned in images",
+            lane.image
+        ));
+    }
+    for source in &contract.sources {
+        let dir = root.join(&source.path);
+        let at = crate::command_line(&[
+            "git",
+            "-C",
+            &dir.display().to_string(),
+            "rev-parse",
+            &format!("{}^{{commit}}", source.commit),
+        ]);
+        if at.as_deref() != Some(source.commit.as_str()) {
+            out.push(format!(
+                "source {} at {} does not hold commit {}",
+                source.name,
+                dir.display(),
+                source.commit
+            ));
+        }
+    }
+    out
+}
+
+pub fn cpu_pressure() -> Option<f64> {
+    cpu_pressure_field("avg60=")
+}
+
+pub fn cpu_pressure_field(key: &str) -> Option<f64> {
+    pressure_field("cpu", "some", key)
+}
+
+pub fn pressure_field(resource: &str, kind: &str, key: &str) -> Option<f64> {
+    let text = fs::read_to_string(format!("/proc/pressure/{resource}")).ok()?;
+    pressure_value(&text, kind, key)
+}
+
+/// `key` is `avg10=`, `avg60=` or `total=`; a line or field the kernel omits is `None`.
+pub fn pressure_value(text: &str, kind: &str, key: &str) -> Option<f64> {
+    let line = text
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some(kind))?;
+    line.split_whitespace()
+        .find_map(|f| f.strip_prefix(key))?
+        .parse()
+        .ok()
+}
+
+pub fn systemd_memory(memory: &str) -> String {
+    memory.to_ascii_uppercase()
+}
+
+pub fn cpu_quota(cpus: &str) -> Result<String, String> {
+    let n: f64 = cpus
+        .parse()
+        .map_err(|_| format!("--cpus {cpus:?} is not a number"))?;
+    if !n.is_finite() || n <= 0.0 {
+        return Err("--cpus must be positive".into());
+    }
+    Ok(format!("{}%", (n * 100.0).round() as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONTRACT: &str = include_str!("../../../bench/contracts/legacy-go-ci.json");
+
+    #[test]
+    fn pressure_lines_read_by_kind_and_a_missing_one_is_absent() {
+        let io = "some avg10=1.50 avg60=0.25 avg300=0.10 total=900\nfull avg10=0.75 avg60=0.12 avg300=0.05 total=400\n";
+        assert_eq!(pressure_value(io, "some", "avg10="), Some(1.5));
+        assert_eq!(pressure_value(io, "full", "total="), Some(400.0));
+        let cpu = "some avg10=2.00 avg60=1.00 avg300=0.50 total=77\n";
+        assert_eq!(pressure_value(cpu, "full", "avg10="), None);
+        assert_eq!(pressure_value(cpu, "some", "nope="), None);
+        assert_eq!(pressure_value("", "some", "avg10="), None);
+    }
+
+    #[test]
+    fn the_committed_contract_parses_and_expands() {
+        let contract: Contract = serde_json::from_str(CONTRACT).unwrap();
+        assert_eq!(contract.format, FORMAT);
+        let lane = contract.lane("unit").unwrap();
+        assert!(lane.run.contains("-count=1"));
+        for lane in &contract.lanes {
+            assert!(contract.images.contains_key(&lane.image), "{}", lane.id);
+            assert!(
+                contract.images[&lane.image].contains("@sha256:"),
+                "images are pinned by digest"
+            );
+        }
+        let edit = contract.condition("small-edit").unwrap();
+        let a = contract.expand(&edit.prepare, "/b");
+        assert!(
+            a.contains("{sample_nonce}"),
+            "the runner fills a fresh nonce into every sample's edit: {a}"
+        );
+        assert!(!a.contains("{root}") && !a.contains("{commit:"), "{a}");
+        assert!(a.contains("cbe48fc712dc510ca77bfa4de7efe8101c7cc521"));
+        let env = contract.env(lane, "/b");
+        assert_eq!(env["GOTOOLCHAIN"], "local");
+        assert_eq!(env["GOCACHE"], "/b/cache/gocache");
+        assert!(contract.lane("nope").is_err());
+    }
+
+    #[test]
+    fn caps_translate_to_systemd() {
+        assert_eq!(cpu_quota("10").unwrap(), "1000%");
+        assert_eq!(cpu_quota("1.5").unwrap(), "150%");
+        assert!(cpu_quota("0").is_err());
+        assert_eq!(systemd_memory("26g"), "26G");
+    }
+}

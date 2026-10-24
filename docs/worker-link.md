@@ -1,0 +1,287 @@
+# Worker link: enrollment, sessions and dispatch
+
+Implemented in `sentinel-link` (identity, pinned TLS, full-duplex framing, hello/heartbeat, the `controller` dispatch loop and the `worker` reconnect loop), `sentinel-store::workers` (enrollment, identity, liveness, revocation), `sentinel-store::dispatch` (ready queue, reservations, fenced offers and leases) and `sentinel admin worker`, with append-only metadata migrations **13** and **14**. The `sentinel server` and `sentinel worker` processes open the link as described in [configuration](configuration.md).
+
+## Identity is a key you hold
+
+There is no certificate authority. A worker generates its own self-signed TLS certificate (`Identity::generate`: ECDSA P-256 via `rcgen`); the **fingerprint** — BLAKE3 of the certificate DER — is its identity. The controller stores only that fingerprint; the private key never leaves the machine it was made on, is saved owner-only, and regenerating it means becoming a different worker. The two PEM files are each written whole to a synced sibling and renamed into place, key first and certificate last, so neither is ever half-written; a start that finds exactly one of them (a save cut short between the two, or a file lost since) removes the orphan and generates a new identity, logging `identity_recovered` because the new fingerprint has to be enrolled afresh, instead of failing every later start.
+
+The trust runs both ways and both ways are pinned:
+
+- The controller demands a client certificate and, at the TLS layer, accepts any well-formed one whose holder proves possession in the handshake. *Which* fingerprints are live workers is decided afterwards by the store — `workers::authenticate` — with the certificate in hand.
+- The worker accepts only the server fingerprints it is configured with: the one it was handed with its enrollment (`controller_fingerprint`) and, during a certificate rotation, the further ones the operator lists in `controller_fingerprint_also` (at most three, `tls::MAX_PINS` = 4 in all). A wrong controller never reaches the hello, and the enrollment is never presented to it.
+
+No root store is consulted on either side, so a compromised public CA cannot insert itself, and trust changes only by an explicit configuration edit, never silently. TLS 1.3 only.
+
+**Rotating the controller certificate** needs no re-enrollment and no outage. (1) Read the new fingerprint (generate the replacement `controller.crt|.key` aside, or note what the restarted controller will log at `link_listening`); (2) add it to every worker as `controller_fingerprint_also` and restart the workers, which now pin both; (3) replace the controller's certificate and restart it: workers reconnect on the new one within one back-off; (4) once every worker has reconnected, make the new fingerprint `controller_fingerprint` and drop the old one from the list. The overlap is exactly as wide as the operator keeps it: a pin is a trust decision, so a fingerprint left in the list stays trusted.
+
+## Enrollment is one-time, expiring and pool-bound
+
+`sentinel admin worker enroll --pool builders` issues a secret (an hour by default, a day at most), stored only as a digest, and prints it once on stdout. The operator delivers it to the machine out of band. On its **first** session the worker presents the secret with its hello; `workers::enroll` redeems it exactly once, binding the presented fingerprint and the worker-generated `wrk_` identifier to **the pool the enrollment was issued for**. A worker never chooses or changes its pool: moving one means revoking and enrolling again.
+
+Refusals are typed and audited: an unknown, spent, expired or revoked secret (recorded as `WorkerEnrollmentRefused`; the controller redeems through `workers::redeem`, which returns the refusal as a value so the audit row commits); a pool that is not active; a reused identifier or fingerprint (`Conflict`, leaving the enrollment unspent for the real machine). Pool access for *placement* is `require_pool_access`, checked per tenant at dispatch; enrollment decides which pool's capacity a machine is.
+
+## Sessions
+
+A session is one TLS connection, framed as big-endian `u32` length + postcard message, capped at `MAX_CONTROL_MESSAGE_BYTES` before any allocation. The first exchange is `Hello` → `Welcome` or `Reject`:
+
+- `Hello` carries `negotiate::Hello` (protocol range, capabilities, arch), the worker's identifier and name, and optionally the enrollment secret.
+- The controller runs `negotiate::negotiate` (highest common version, required capabilities) on **every** hello, then asks its `Admission` policy: a known fingerprint is welcomed, and what this hello negotiated is recorded (`workers::renegotiate`, in the same write as its capacity) — an upgraded worker gets the newer protocol and so sends its profile, a rolled-back one a version it speaks; dropping below protocol 7 clears the profile-only placement facts (labels, warm images). A known fingerprint presenting another architecture is refused `Identity`. An unknown one with a valid enrollment is enrolled and welcomed; anything else is a typed `Rejection` the worker must not retry unchanged — except `Unavailable`, the controller's "try again later" (its store could not answer), which the worker retries with jittered back-off. That includes an unknown certificate presenting an enrollment secret past its budget: such attempts are limited to 5 per source (then one per 12 s) and 20 per 60 s overall (`Stats::enrollment_limited`), because each refused secret commits a `WorkerEnrollmentRefused` audit row on the single writer; the budget bounds what unauthenticated peers can write to the audit log, at the price of a real enrollment waiting out a flood. A known fingerprint never touches it.
+- `Welcome` returns the negotiated set and the heartbeat interval. The worker refuses a welcome at a version outside the range its hello offered.
+- `Error::Internal` carries only a static string such as `store write` or `log store`: the controller store's own error text never crosses the wire. The session ends and the worker reconnects, so adding store detail to that variant would leak controller internals to workers.
+- The handshake and the hello together must finish within `HANDSHAKE_DEADLINE` (10 s, absolute: a peer dripping a byte just inside each read timeout is still cut), and at most `MAX_PENDING` (256) connections may be in that phase at once, a separate cap from the 1024 sessions. The pool is accounted by source address before TLS (`admission::Pending`): a source holds at most 8 slots (64 once it has authenticated a worker; IPv6 sources count by /64; loopback, which a Tailcat helper carries every tunnelled worker from, has no per-source share), and the last quarter of the pool is a reserve only sources that have authenticated a worker in the last day may use, so a flood from unknown addresses fills at most 192 slots and a known worker's reconnect still finds one. The decision uses the address alone, and the known set lives in memory: after a controller restart every source is a stranger until its worker has connected once, so a restart under a flood admits the fleet through the unreserved 192 slots only. The session cap is also bounded by the process's descriptor limit (each session holds two descriptors, so the soft `RLIMIT_NOFILE` is raised toward the hard one at start and the cap lowered to what remains after 256 reserved descriptors), and an accept error that is not one peer's doing (`EMFILE`, `ENFILE`, `ENOMEM`) makes the acceptor back off from 10 ms to 250 ms instead of spinning. Connections turned away by either cap are counted in `Stats::shed`.
+- Every link socket has a write timeout of `HEARTBEAT_DEADLINE`, and a failed or timed-out write closes the connection: a peer that stops reading cannot hold a sender, the connection lock or a spec resolver. A session's sockets (control and bulk) are closed when it ends, whatever ended it. The dispatcher's own pushes (offers, prefetch hints) never wait on one peer: it skips a worker whose control connection another thread is mid-write on (a spec stream to a slow reader) until the next pass, and writes to the rest under 250 ms (`DISPATCH_WRITE_BOUND`) instead of the full write timeout; a push that times out closes that session and its offer is lapsed back to the queue, while a push that merely found the connection taken lapses the offer without closing it.
+
+The session is full duplex on one TLS connection: the rustls state sits behind a mutex held only while bytes move between it and a buffer, never across a socket call, so one thread reads the socket while any thread — the dispatcher — writes. An offer therefore reaches a worker the moment it is placed, not at its next beat.
+
+The worker sends `Ping { seq, held }` every `HEARTBEAT_INTERVAL` (5 s; the interval the controller announces in `Welcome` is clamped to 1 s – 7.5 s by the worker, so a hostile or broken controller can neither flood it with pings nor stretch the beat past the deadline), where `held` names the attempts it still holds (at most `MAX_LIST_ITEMS`). The controller answers `Pong { seq, lease_until_ms, stop, cancel }`: the leases of every held attempt it recognises are renewed to `now + DEFAULT_LEASE_MS` (30 s, never backwards — the protocol constant `limits::LEASE_MS`; the worker measures the same 30 s on its own monotonic clock from the moment it sent that `Ping`, never by comparing `lease_until_ms` with its wall clock), and `stop` lists what the worker must end at once because the controller no longer counts it as held — lapsed, finished elsewhere, or never its. Liveness is recorded at most once per `SEEN_RECORD_INTERVAL_MS` (60 s), and a beat with nothing to renew and liveness fresh costs no write at all. Either side that hears nothing for `HEARTBEAT_DEADLINE` (15 s, two missed beats: one delayed packet must not tear down a session carrying live work) reports `Lost`. A second hello, an out-of-sequence pong, an oversized frame or a held list over the bound is a protocol violation that ends the session.
+
+`workers::revoke` refuses the fingerprint at its next authentication, and the identity can never enroll again. Revocation also ends the **live** session and fences its work: from the moment the row says revoked, the store refuses that worker's acknowledgements, renewals (`dispatch::renew` answers `Forbidden`, which ends the session at its next beat), reports, log frames, artifact publication and cache transfers (`is_held`, `attempt_scope` and `attempt_log_scope` join the live worker). Revocation is written by the host-local admin command, another process, so the dispatcher compares one indexed fingerprint of the revoked set (`dispatch::revocations`, the `workers_revoked` index) on every pass; when it moves, the controller closes every connected session of a revoked worker (`Stats::revoked_sessions`) and `dispatch::reconcile_revoked` settles everything a revoked worker holds — acknowledged attempts `Reconciled` (never replayed), unacknowledged offers lapsed back to the queue — in sweep batches. The effect is therefore within one reconciliation interval (2 s) of the revocation, not at lease expiry; controller start runs the same sweep.
+
+## Control and bulk (protocol 7)
+
+One session, two TLS connections, one identity. The first connection is the
+**control** connection: negotiation, heartbeats, offers, acknowledgements,
+reports, abandons — everything whose latency decides whether live work
+survives. A protocol-7 worker then dials a second connection to the same
+address with the same certificate and opens it with `BulkHello { worker }`;
+the controller attaches it only when a live control session presents the same
+fingerprint and serves it at the protocol that control session negotiated.
+
+- Bulk classes: `NeedSpec`/`Spec`/`Context`/`Source`/`NoSpec`, `Log`,
+  `LogEnd`, `LogAck`/`LogRefused`/`LogEndAck`, the artifact messages and the
+  cache transfer messages.
+- Control classes: `Ping`/`Pong`, `Offer`/`Ack`/`Decline`, `Report`,
+  `Abandon`, `Profile`, `Transport`, `Bye`.
+- A control-class message on a bulk connection is a protocol violation and
+  closes it. Bulk-class messages on the control connection are accepted as a
+  **fallback**: if the second connection cannot be established (a firewall
+  between the worker and the controller, a helper that is down), the worker
+  keeps working over control and retries the bulk dial with doubling
+  back-off (1 s to 30 s, ±25 % jitter from its own per-worker stream) while
+  the session lasts. The back-off wait watches the session's stop flag in
+  50 ms slices: the control session joins the bulk thread before it returns,
+  so an uninterruptible sleep there would hold a lost session's reconnect for
+  up to 30 s, longer than a lease.
+- A bulk connection lives exactly as long as its control session: it has no
+  heartbeat of its own, so the controller keeps an idle one open for as long
+  as that session is registered and closes it when the session ends. When a
+  bulk connection is lost, frames handed to it may never have arrived; every
+  log pipe rewinds to its last acknowledgement before it sends anything on
+  the fallback route (the route change is visible to it as a `Route` count),
+  so no frame is acknowledged past without having been stored.
+
+The point of the split is that neither direction of bulk traffic can delay a
+beat. Each connection owns its own rustls state behind its own mutex, so a
+log flood, a slow artifact reader or a multi-hundred-megabyte cache stream
+can never hold the lock a pong or an offer needs; the control connection
+stays a few frames per beat. The worker's `Reporter` prefers the bulk
+connection for bulk-class sends the moment it is attached and falls back to
+control when it is not; reports and abandons always go control.
+
+`session::accept` therefore answers an enum: `Accepted::Control(WorkerSession)`
+(an ordinary session) or `Accepted::Bulk(BulkSession)`. The controller
+counts attached bulk connections (`Stats::bulk_attached`) and refusals
+(`Stats::bulk_refused`: no live control session with that certificate).
+
+## The worker profile and transport telemetry (protocol 7)
+
+Immediately after `Welcome`, a protocol-7 worker sends `Profile`: the
+scheduling labels it selects work by (`labels`, at most
+`MAX_PROFILE_LABELS` = 16), the machine identity it shares with sibling
+worker processes (`host_id`, all zero when unknown), the scratch disk it
+offers jobs (`disk_bytes`, zero = not measured), and its availability
+(`images`, `cache_bytes`, `load_ns`; zero = not measured). The extras are a
+**message**, not new `Hello` fields, on purpose: postcard is not
+self-describing, a struct decodes exactly the field list its reader knows, so
+a trailing `Hello` field would make every older worker undecodable and
+`#[serde(default)]` would never fire. `Profile` (with `#[serde(default)]`
+fields of its own) is append-only like every other wire addition, and it is
+sent only when the negotiated version carries it.
+
+The controller records the profile together with the capacity in one
+transaction (`dispatch::report_capacity` + `dispatch::report_profile`), which
+is why a protocol-7 hello defers its own capacity write until then: placement
+never sees a disk of zero for a worker that is about to report one. A
+protocol-6 worker sends no profile, so its labels stay empty — jobs that
+select labels never place there — and it cannot state a disk, so disk is not
+part of its admission: it is admitted on CPU and memory alone. From protocol 7 the profile is the worker's whole statement
+for the session and replaces the stored labels, warm images and disk, and
+zero disk means **none offered** (a platform that could not measure it): no
+job that declares scratch disk, which every compiled job does, is placed on
+that worker. A hello below protocol 7 clears the disk figure with the labels
+and warm images it can no longer refresh.
+
+`Transport` carries what the process measured about its own path: `path`
+(`Direct` without a helper; with one, what the helper's `tailcat ping`
+reported at start — `Relay` for a pong via DERP, `Direct` for one from an
+`ip:port` — and `Unknown` when no probe measured it), `rtt_ns` (a
+control-session Ping/Pong pair; before the first beat, the latency that
+`tailcat ping` itself reported, else absent), `reconnects` (control sessions
+opened since process start), `helper_version` (the Tailcat helper's version, absent
+without one), and `bytes_in`/`bytes_out` (cumulative counters over the
+session's control connection and every bulk connection it has had, so a
+bulk redial never restarts them; throughput is their rate between two
+reports). It is
+sent once per session after `Profile` and refreshed every 12 beats. The worker
+process hands the link a live source (`worker::Handle::set_transport_source`,
+fed from the helper's `Forward::telemetry()`): each session starts from the
+path and latency the helper's **latest** probe measured, and each 12-beat
+resend refreshes the path and helper version from it (round-trip time stays the
+session's own beat), so a path that changed after process start is reported.
+The controller keeps the latest per session (`Handle::transport(worker)`) and
+`GET /api/v1/workers` shows it per connected worker as `transport` ([API](api.md));
+a field nothing measured stays absent — never a zero claim.
+
+## Cache transfers (protocol 7; cancel and refresh from 8; digest at the end from 9)
+
+Remote cache hydration prefers the bulk connection, in both directions,
+with the cache crate owning the objects and the link owning framing; a
+worker whose bulk connection is down sends the same messages on the control
+connection (the bulk-class fallback):
+
+- `CacheNeed(Need)` asks for one object by scope (tenant/repo/class/trust/
+  platform/toolchain/name/key), with `offset` and `have` so a retry resumes
+  instead of restarting. `CacheOffer(Upload)` offers an object the worker
+  holds, `CachePush`/`CachePushEnd` stream it.
+- `CacheGrant(Grant)` accepts a transfer at an offset, `CacheChunk` carries
+  ordered chunks with a running digest, `CacheEnd` is terminal both ways, and
+  `CacheRefused(Refused)` carries a stable refusal code.
+- Protocol 8: `CacheCancel { attempt }` tells the controller the worker
+  abandoned the attempt's transfer. A serve stops at its next chunk and
+  answers `CacheRefused` with `aborted` as its terminal; an upload is dropped
+  with its staging file and entry lock and answered once. The worker keeps
+  the attempt *draining* until that terminal arrives and refuses a new
+  transfer of it (`busy`) meanwhile, so a stale tail is never routed into the
+  next stream; answers queue at most 64 deep per transfer and a caller that
+  falls behind abandons the transfer instead of buffering without bound.
+- Protocol 9: a `CacheOffer` may name the all-zero digest
+  (`DIGEST_AT_END`) and state the real one in `CachePushEnd`. The worker
+  then reads the generation once, hashing each chunk as it pushes it, and
+  the controller verifies the stated digest against its running hash
+  before storing. A session below 9 keeps the digest up front, and its
+  controller refuses an all-zero one (`store`). Pushes are encoded from the
+  read buffer (`PushRef`), byte-for-byte the owned `CachePush`.
+- Authorization is the **fenced attempt**, never the request
+  (`dispatch::cache_scope`): the attempt must be owned by that worker — held
+  for a fetch, or released within 10 minutes for an offer, which always
+  follows the terminal report — and the transfer's tenant and repository must
+  equal the attempt's while its trust is one the job's class admits (a
+  protocol-6/7 worker names `pull_request` for an `unprotected` job). A
+  worker cannot name a boundary it does not hold; refusals are `denied` and
+  counted (`Stats::cache_denied`).
+- The link caps one cache chunk at `MAX_CACHE_CHUNK_BYTES` (48 KiB, so the
+  frame fits `MAX_CONTROL_MESSAGE_BYTES`) and refuses anything larger as
+  `TooLarge` rather than splitting it: a chunk's running digest cannot be
+  recomputed for a piece. The receiver moves decrypted plaintext out of
+  rustls whenever its buffer fills, so a burst of full frames never
+  overflows it.
+- Downloads are streamed off the session thread (at most
+  `MAX_CACHE_TRANSFERS` at a time per connection, one reused chunk buffer
+  each) so a large hydration never stalls the reader; uploads (at most
+  `MAX_CACHE_TRANSFERS` per connection, dropped after 60 s without a push)
+  are fed frame by frame into the cache crate's receiving state, which
+  hashes as bytes land and verifies the whole stream's digest before
+  promoting it.
+
+A local cache hit never touches the link. The controller serves from
+`<data_dir>/remote-cache` when it has one (`Controller::set_remote_cache`,
+which also starts that store's reclamation); without one every need is
+refused `denied`.
+
+**Profile refresh (protocol 8).** The worker opens every session with a
+`Profile` whose availability is the executor's own record — the newest
+held image keys (at most 64) and the cache store's estimated bytes — and,
+from protocol 8, sends a later `Profile` whenever that record's version
+moves (checked once per heartbeat). A protocol-7 controller accepts one
+profile per session; a protocol-8 one treats a later one as a refresh.
+
+## Image prefetch hints (protocol 9)
+
+An offer carries only the image digest, so a worker cannot start a pull
+before it is placed. From protocol 9 the controller hints instead:
+`Prefetch { images }` on the control connection names the image references
+(`name@sha256:…`, at most `MAX_PREFETCH_IMAGES` = 8 of at most 512 bytes;
+the controller sends at most 4) the worker should pull ahead of an offer. It
+is the whole wanted set and replaces the last one; a reference that left it
+is stale and its prefetch stops. The controller computes it after each
+dispatch pass, at most every `PREFETCH_INTERVAL` (500 ms), with one store
+read (`dispatch::prefetch_hints`, see [executor](executor.md#the-image-pull)
+for the eligibility rules), and sends it to a session only when its set
+changed; a new session always gets the current set, empty or not. Counted
+in `Stats::prefetch_hints`.
+
+- A worker on protocol 8 or older is never hinted: its session negotiated
+  no such message. A worker refuses a `Prefetch` below protocol 9, or one
+  over the bounds, as a protocol violation, and a `Prefetch` on the bulk
+  connection is a control-class message there.
+- The worker reports what it prefetched the same way as any pull: the held
+  set grows, the next profile refresh (checked once per heartbeat) carries
+  it, and a stored profile wakes the dispatcher, so a worker that just
+  became warm is placed at once rather than at the next reconciliation.
+- `Executor::prefetch(&[String])` is the executor's side, a no-op by
+  default.
+
+## Secret delivery (protocol 10)
+
+A job with environment secrets, secret files or a private registry auth binding can be placed only on a worker that negotiated protocol 10 and advertised capability bit 9, `SECRET_DELIVERY`: placement and the queue explanation check both, so a session that sets the bit on an older protocol is never offered such a job. Migration 40 stores that requirement on the job, so an older worker still runs ordinary jobs but never receives a secret-bearing one.
+
+After the offer is durably acknowledged, the worker requests its spec. The controller checks the worker, attempt, live lease and fence under the store writer transaction, resolves only the secret names declared in that job, opens their current active versions and records value-free `use` audit rows. The response sends `SecretBegin { attempt, fence, length }`, then ordered `SecretChunk { attempt, fence, seq, last, bytes }` frames before `Spec`. The bundle is capped at 1 MiB, one value at 64 KiB and one chunk at 48 KiB. A retry or re-offer uses the new attempt fence; a stale request cannot receive values. A new attempt, including a rerun, selects current versions again.
+
+The secret transfer travels with the spec response — on the bulk connection when one is attached, on control otherwise. It is bound to the fence of the offer the worker acknowledged, whichever session that offer arrived on: a session lost between acknowledgement and spec re-asks on the next one and receives the bundle there. A transfer naming a fence the worker does not hold the attempt under is dropped together with its spec, without ending the link; the attempt, if still waiting, asks again or is handed back. A spec refused because a declared secret is revoked, deleted, unbound or ambiguous settles the attempt on the controller as `Failed(Preparation)` with the value-free detail `secret NAME: reason`, and audits the denied use in the same transaction. Its payload is marked sensitive for frame encoding and has a redacted debug view. The worker rejects a transfer with the wrong fence, incomplete or out-of-order chunks, oversized data, an invalid auth JSON shape, or any target set that differs from the stored run spec. It registers every value with the log redactor before execution; env and file targets are materialized only for the declared step. Private registry auth stays on the host for that attempt's `podman pull` and never enters the container. Worker cleanup removes secret files on normal completion, failure, cancellation and panic, and restart recovery reaps leftovers. See [scoped secrets](secrets.md) and [executor](executor.md#the-image-pull).
+
+## Pushed cancellation (protocol 11)
+
+A cancel recorded through the API, a manual dispatch or a superseding intake run sets the controller's cancel hint and wakes the dispatch pass. That pass reads, for each connected protocol-11 session, the attempts it holds whose job has cancellation desired, and sends them as one `Cancel { attempts }` frame on the control connection, so the worker starts terminating at once instead of on its next heartbeat (up to 5 s later). The heartbeat still carries every pending cancel; a push that fails to send, or a cancel recorded where no hint is set (host-local `sentinel admin cancel`, tenant suspension), arrives that way. `sentinel_link_events_total{event="cancels_pushed"}` counts the attempt ids pushed.
+
+## Dispatch
+
+**The ready queue is the database.** A job is queued when its row says so (`jobs_ready`, the partial index on `(priority, created_seq) WHERE state_code = 1`); nothing in memory has to be rebuilt after a restart. Its resource needs (`cpu_millis`, `memory_bytes`) are copied from the compiled spec at run creation so placement never decodes a spec blob.
+
+**A reservation is an attempt.** `dispatch::place` finds the next ready job, in the tenant and repository fair order ([storage](storage.md#fleet-placement-q01q04)), that the worker's pool may serve — the `require_pool_access` rule inline: tenant active, pool active, tenant its owner or explicitly granted — whose image is resolved and which fits the worker's free capacity (its reported capacity less the sum of the attempts it holds, read over `attempts_held_by_worker`). It then calls `jobs::lease`: the `Leased` transition under the next fence and the attempt row, carrying the reservation, commit together or not at all. There is no separate reservation table to forget.
+
+**Offers are fenced and acknowledged.** The controller pushes `Offer { attempt, tenant, run, job, fence, lease_until, resources, image }` through the session. The worker answers `Ack` or `Decline` with the fence; the link dedups by attempt within a session, so a repeated offer of an accepted attempt is re-acknowledged and never re-executed. `dispatch::acknowledge` is compare-and-set on worker and fence — a repeat is idempotent, a stale one is `Conflict`. A decline, or no acknowledgement within `OFFER_ACK_MS` (5 s, found by the dispatcher's sweep over `attempts_pending_ack`), lapses the offer: the reservation is released and the job goes back to the queue through the core edge `OfferLapsed` (`leased → queued`, fence unchanged), so a late acknowledgement or report from that attempt is stale by construction and the next lease strictly advances the fence. A declined job is not re-placed on the spot but at the next reconciliation, which bounds a worker that keeps refusing to one offer per interval. A `Decline` is fenced on its sender: only the worker holding the offer, under its fence, can give it back (`dispatch::decline`). A cancel recorded while the offer was out settles the job `canceled` the moment the offer goes back, dependents decided, rather than leaving it queued until the queue timeout.
+
+**Wake, don't poll.** The dispatcher thread sleeps on a condition variable. Anything that changes the answer to "is there work for a connected worker?" wakes it: a worker arriving, `Controller::wake()` after an enqueue or completion, a decline. Each pass expires overdue leases, times out queued jobs and lapses unacknowledged offers — one writer transaction per sweep, every row re-checked inside it under its own savepoint, so a renewal that commits after the sweep read the attempt as due wins — runs the revocation check, then places. Placement first asks one question — is any job ready at all (`dispatch::any_ready`, one index seek)? — and does nothing more when none is, so a wake with an empty queue costs no writer round trip. Otherwise it places in **rounds**: each round ranks the connected workers and offers each of them one job, all in one writer transaction; a worker with nothing to take leaves the pass, and rounds repeat until none is left (at most `MAX_HELD_ATTEMPTS`). The ranking is the share of the worker's reported CPU its held attempts already take (least committed first, read once per pass with `dispatch::held_by_worker` and kept current in memory), then its measured load per reported millicore (`load_ns` from its protocol-7 profile — the host's own busy time, so work that is not ours counts), then more warm cache (`cache_bytes`) first, then the smaller worker (best fit), then its id. A burst therefore spreads over identical workers one job each instead of filling whichever worker comes first, and the writer sees one round trip per round rather than one per worker. Each worker is also told what the rest of its pool can hold (`dispatch::place_in_fleet`), so a job only that worker can run is offered there before work a smaller worker could take, and the only large worker cannot fill with small jobs and strand a large one. Image locality is a hold, not a rank: a cold worker passes a job whose image a warm worker will free for within `LOCALITY_WAIT_MS` ([storage](storage.md#fleet-placement-q01q04)). Load and cache are what the worker's latest profile reported: the one that opened the session and, on protocol 8, each availability refresh it sends when its held images or cache bytes change. A store failure in any sweep or placement is counted (`Stats::sweep_errors`, `Stats::placement_errors`) and logged by error kind only, at most once a minute per class; a failed round is retried a worker per transaction so one worker's failure cannot stall the fleet. `RECONCILE_INTERVAL` (2 s) is the safety net for a missed wake, not the clock; heartbeats never drive dispatch.
+
+**Completion frees capacity and decides dependents in one transaction.** `dispatch::finish` applies the worker's report through the state machine under its fence; when the job reaches terminal, the reservation is released and every blocked job of the run whose dependencies have all finished is queued (`DependenciesSatisfied`) or ruled out (`Skip`, when a dependency did not succeed — transitively). The spec is read once, and only when the run still has a blocked job.
+
+**Every queued job has a reason.** `dispatch::wait_reason` answers `Dependency`, `Policy` (image unresolved, cancel requested), `NoMatchingWorker { cpu_short, memory_short }` (no enrolled worker of a pool the tenant may use could ever fit it), `WorkerOffline` (such workers exist but none is connected), or `Capacity` (a connected worker fits it once its current work releases).
+
+**Reports and specs.** After acknowledging, a worker asks for the run spec (`NeedSpec` → `Source` (protocol 2 only, bound sources) + `Context` + `Spec` chunks of `SPEC_CHUNK_BYTES`, reassembled up to `MAX_SPEC_BYTES`) and then reports each phase with `Report { attempt, fence, event }`. Nothing that could start work is served before the acknowledgement is durable: `job_context` and `spec_bytes` require `acked_ms`, and a request that raced ahead of its `Ack` (the bulk connection is not ordered with control) waits briefly for it; an offer whose ack write failed lapses without ever having run. Resolution — which may mint a GitHub token — runs on at most eight resolver threads fed by a bounded queue (per worker, no more than it may hold; fleet-wide 4096; a duplicate request is not queued twice), so a burst of placements is served in turn, never refused. A transient fault (reader overload, a busy writer, a token-mint timeout) is retried with back-off and otherwise left unanswered; the worker asks again every 10 s and, if the spec never arrives within 60 s, hands the attempt back with `Decline` — it never started, so it returns to the queue instead of ending `infra_failed`. `NoSpec` is definitive: the attempt is not the worker's, it was settled `canceled` (a cancel recorded before it started), or its source or spec is refused for good — the worker then reports `Failed(Preparation)` at once rather than leaving the lease to expire. The controller runs every report through `dispatch::report`: the attempt must be held by that worker under that fence, then the state machine decides; a stale or foreign report changes nothing and is counted in `stale_reports`. A terminal report releases the reservation, decides dependents and wakes the dispatcher. **A report or acknowledgement the store refuses transiently is not stale.** The link answers a `Report` with nothing, so a refusal the worker cannot see must not be a verdict: only the store's own answers about the row (stale fence, unknown or foreign attempt, terminal duplicate) drop a message and count in `stale_reports`. A writer that is unavailable, a write of unknown outcome, reader overload or a busy database keeps the message (`deferred_worker_messages`; at most 256, each at most 5 minutes, in arrival order so a report never overtakes its acknowledgement, a second copy of a waiting report not queued), the head of every dispatch pass applies the queue before it reads leases, and the expiry sweep skips an attempt whose verdict is waiting, since its worker finished and can no longer renew. On the worker side a terminal verdict that went out stays in the heartbeat's `held` list until the controller stops counting the attempt (it is then named in `Pong.stop`, which is the confirmation) and is sent again every 5 s meanwhile (10 minutes at most), so the lease stays renewed and a verdict lost with a controller restart or a dropped connection is delivered again. Memory held for this is bounded by 256 summaries on the controller and by the attempts a worker finished and the controller has not yet released on the worker. A controller that restarts while a verdict only it holds is waiting settles the attempt by expiry, as for any report that never arrived. The summary of a terminal report over `MAX_SUMMARY_BYTES` (32 KiB, below the 64 KiB control frame) is dropped by the controller, and the session is not closed for it: the verdict is applied and the attempt records no summary. The `Executor` trait the worker implements is in [executor](executor.md). Log frames (`Log`/`LogEnd`, answered with `LogAck`/`LogRefused`) are acknowledged only once durable; a sequence jump is stored with its hole recorded rather than refused; see [logs](logs.md). `LogRefused` is permanent and sent only for a permanent cause — not the worker's attempt, a log already ended, the size cap, no disk reserve for evidence. A transient controller fault (a store read, a writer call, log I/O) is answered by closing the connection that carried the frame, so the worker rewinds to its last acknowledgement and resends; it never turns a passing job into a publication failure. Their scope is wider than a report's: any attempt the worker owns, released or not (`attempt_log_scope`) — a retransmission after the verdict still lands, since late bytes only complete the evidence and the verdict itself is sealed. Artifact publication stays held-only. `Abandon { attempt, fence }` is how a restarted worker hands back an attempt it found in its leftovers; see [reconciliation](reconciliation.md).
+
+**Log end acknowledgement (protocol 5).** `LogEnd` is answered by `LogEndAck { attempt }` once the controller's `end` marker file is durable **and the attempt's `log_state` row says so** — the acknowledgement covers both commits, so `Executor::log_ended` releasing the spool never races a database that has not recorded it. A `LogEnd` the controller refuses (`last_seq` below what it stored, or an attempt the worker does not own) is answered `LogRefused` instead, on every protocol version. An unacknowledged `LogEnd` is resent on the next session; the controller's `finish` is idempotent, so the retransmit is answered the same way. A worker on protocol 4 or lower gets no answer to `LogEnd` and the spool drops at the send boundary; their terminal report may then stamp `incomplete` until the in-flight end lands and heals the row.
+
+**Artifacts (protocol 4).** A worker on protocol 4 publishes declared artifacts during finalization, before the terminal `Report`: `ArtifactBegin { attempt, name, retain_secs }` is answered with `ArtifactGrant` (`granted`, or `refused`/`disabled` for a protocol-3 link, a stale attempt, an undeclared name, a duplicate row or a spent run budget). Granted, the worker streams `ArtifactFile { path, len, mode }` then `ArtifactData { seq, bytes }` frames (per-file sequences, ≤ `MAX_ARTIFACT_CHUNK_BYTES` each), ending with `ArtifactEnd`; `ArtifactAbsent` is the no-match outcome and also abandons a half-sent artifact. One artifact is in flight per attempt, entry paths are validated, and committed plus in-flight bytes count against `MAX_RUN_ARTIFACT_BYTES`. The controller's terminal answer is `ArtifactVerdict { name, code }`: `stored` means object rows, the `{job}/{name}` manifest and the artifact row committed in one transaction; `absent`/`failed` record the outcome durably; anything short of `stored` makes a `required` artifact a publication failure. A session drop mid-stream resolves the worker's wait as `stored`-only-if-committed — the controller's writer transaction is the verdict, not the socket.
+
+**Tailcat hand-off.** When the controller's Tailcat helper must restart for a new allow list, `controller::Handle::hand_off` first closes, through the still-running helper, every connection whose socket's other end that helper owns (read from `/proc`; direct-TLS sessions are untouched). A session is closed with `Sender::close_notify`: a `close_notify` alert and a FIN on the controller's write half, after which frames the session thread still sends are dropped so a late reply cannot reset the socket before the worker reads the close. A connection still in its TLS handshake or hello is closed the same way by its own thread: the controller keeps a `session::Arrival` for each loopback connection until it is registered as a session, `accept_arriving` then reads in 20 ms steps (the socket's read timeout, so a prompt peer costs nothing extra) and, once a hand-off claimed it, sends the alert and the FIN and reads until the worker's end. A connection whose hello already arrived cannot be claimed; the hand-off waits for it to be registered and closes it as a session. The helper is replaced once every closed connection has ended at the worker's side (the close was delivered) plus 100 ms, or after 600 ms, below the worker's shortest back-off. When every closed session's worker advertised `HANDOFF_ANSWER` (capability bit 8), a close still unanswered then was not delivered, and the old helper, the only one that can resend it, is kept for up to 3 s (`HANDOFF_RESEND_BOUND`; measured live, with 800 ms of loss the closes were answered 0.95–1.40 s after they were sent, and a close sent directly was lost for good when the helper was replaced at 600 ms, so the bound must not shrink below that retransmission window); a new loopback arrival in that time makes the controller read the helper's connections again and close any redial into it. The worker sees `Error::Closed`, before or after its welcome, and redials after about 1 s; the change costs about the restarted helper's start, 3.3–4.6 s live instead of the 18.0–21.0 s heartbeat detection ([configuration](configuration.md#optional-tailcat-transport)). No message is added and no protocol version changes: `close_notify` is TLS, bit 8 is masked by an older controller, and an older worker reads the close as the end of its connection.
+
+**Worker side.** `worker::run` connects, presents the enrollment on its first hello only (spent once welcomed, whatever happens afterwards), serves the session, and on loss reconnects with back-off doubling from 1 s to 30 s with ±25 % jitter, reset after a session that lasted 30 s. The bulk connection redials on the same back-off and, likewise, earns the short step back only after a connection that served for 30 s: one that opens and drops at once keeps the back-off growing. A session the controller ended with a TLS `close_notify` ends with `Error::Closed` instead of `Lost`: that close is deliberate, so the back-off returns to its shortest step whatever the session's length, and also when it came before the welcome, as a hand-off closes a connection still in its handshake (`tests/handoff.rs`). Such a close is encrypted under the handshake that verified the pinned controller certificate, so it cannot be forged on the path. A typed rejection is final — the loop returns rather than retrying an unchanged hello — except `Unavailable`, which is retried on the same jittered back-off so a fleet reconnecting after a controller restart does not stop on a busy store. The `Executor` trait ([executor](executor.md)) is what the worker's runtime implements: take an offer or not, stop an attempt, report what is held, learn the renewed deadline. `Handle::stop` closes the socket from the process's thread, so shutdown never waits for a beat.
+
+## Processes
+
+`sentinel server` opens `<data_dir>/metadata.sqlite`, loads or generates `<data_dir>/controller.crt|.key`, listens on `listen` (default `127.0.0.1:7443`) and logs `link_listening` with the fingerprint workers must pin. `sentinel worker` with `controller` and `controller_fingerprint` configured loads or generates `<data_dir>/worker.crt|.key` and `<data_dir>/worker.id`, reads `enrollment_file` if present (removed once spent), measures its capacity (every core; total memory less a host reserve of one eighth clamped to 512 MiB–2 GiB; both overridable) and its profile (labels from config, host id derived from the machine id, scratch disk = free space of the data directory less a one-eighth reserve clamped to 512 MiB–2 GiB, CPU busy time over a 100 ms window; see [configuration](configuration.md)), and runs the loop above. With `[tailcat] enabled = true` the server runs the pinned helper for its link port before it serves, writes its `tc…` address to the owner-only `<data_dir>/tailcat/address` and logs only that path as `tailcat_listening`, and keeps the admitted node keys current from `<data_dir>/tailcat-allow` (`nodekey:… wrk_…` lines; a revoked worker's key is withdrawn within 10 s, and an empty list admits no peer); the worker runs its own helper, dials `127.0.0.1:<listen_port>`, advertises `HANDOFF_ANSWER`, replaces the helper 200 ms after the controller closed a connection cleanly (a hand-off, whatever the helper's age), and replaces it at once when a control session is lost otherwise, unless that helper started less than 10 s ago (see [configuration](configuration.md#optional-tailcat-transport) for what an allow-list change costs). Self-hosted DERP relays, their certificates and reachability are covered in [configuration](configuration.md#optional-tailcat-transport). Without the section — or with `enabled = false` — both use direct TLS. With rootless Podman available the worker runs offers through the [executor](executor.md); without it every offer is declined (`executor_unavailable`, `offer_declined`), so jobs stay queued rather than sitting leased on a machine that cannot start them. Shutdown stops the Tailcat helper supervisor first, because its refresher thread holds a store handle and the store drain would otherwise wait on it until the deadline passed; it then closes sessions and stops the dispatcher within 2 s, then drains the store within 5 s; a stalled store is reported and exits 1 ([storage](storage.md#bounds-and-failure-behavior)).
+
+```sh
+sentinel admin worker enroll --data-dir <PATH> --pool builders --expires-in 1h > enrollment
+sentinel admin worker list   --data-dir <PATH> --pool builders
+sentinel admin worker revoke --data-dir <PATH> --id wrk_...
+```
+
+## Lease expiry
+
+Lease expiry, cancellation and timeouts are in [cancellation](cancellation.md): an acknowledged lease of a worker that never returns expires at its deadline and the job ends `infra_failed`, never replayed.
+
+## Verification
+
+- `crates/sentinel-store/tests/dispatch.rs`: placement is pool-scoped (a granted shared pool places, a withdrawn grant stops at once), capacity-checked (the job that no longer fits waits with reason `Capacity`, or `WorkerOffline` with no session, or `NoMatchingWorker` with the exact shortfall) and reserves with the lease; an offer lapses back to `Queued` under its advanced fence only after `OFFER_ACK_MS`, a late acknowledgement is `Conflict`, a lapse cannot repeat or be undone by raw SQL, and the re-offer carries fence 2 which the old fence cannot acknowledge; renewal is fenced per attempt, never moves a lease backwards, names unacknowledged and foreign attempts to stop, refuses another worker and bounds the list; finishing keeps the reservation until terminal, refuses a stale fence, releases capacity and queues the dependent in the same transaction, and a failed dependency skips transitively.
+- `crates/sentinel-store/tests/workers.rs`: enrollment needs platform administration, an active pool and a bounded lifetime; a spent, expired or revoked enrollment is refused and cannot be un-spent by raw SQL; a reused identifier or fingerprint conflicts while the fresh enrollment stays usable; a worker authenticates by fingerprint only, liveness moves forward at the bounded cadence and never backwards, pool and fingerprint are immutable by trigger, listing is gated on the platform or an admitted tenant's membership, revocation is final and not repeatable.
+- `crates/sentinel-store/tests/execution.rs`: cancel decides dependents, a cancel recorded while offered settles on lapse or decline, decline is fenced and hands back an acknowledged, unstarted attempt to the queue, specs wait for the acknowledgement, expiry re-checks the lease, a worker `canceled` without a request is recorded as a runtime failure, renegotiation is recorded, and a refused enrollment is audited.
+- `crates/sentinel-store/tests/fleet.rs` covers the prefetch hint's eligibility (pool access, architecture, labels, capacity, drain, a full worker) and its bounds, and the placement it pays for; `dispatch::tests::placement_statements_plan_their_indexes` pins its statement to `jobs_queued_since`.
+- `crates/sentinel-link/tests/link.rs`, over real TLS on loopback with the store as admission: an unknown certificate without an enrollment is `NotEnrolled`; with one it is welcomed with the negotiated protocol, beats are recorded, the enrollment is then spent for an impostor, the enrolled identity reconnects with no enrollment at all, and after revocation the same certificate is `NotEnrolled` and cannot re-enroll under its identity; a wrong server fingerprint fails in the handshake before the hello and leaves the enrollment unspent; an unsupported protocol version and an expired enrollment are typed refusals; every server-side session ends in a clean refusal or goodbye. A run enqueued while a worker is connected has both ready jobs offered within half the reconciliation interval, acknowledged and reserved, the blocked job withheld; completion queues the dependent and the wake places it; the lease deadline the worker sees moves with its beats; a decline lapses and is re-offered under fence 2 at the next reconciliation; an offer left unread lapses after the ack timeout and the late acknowledgement is stale while the fresh one lands; a worker whose controller stops reconnects with back-off to the restarted controller under the same pin, presenting no enrollment the second time; stopping a worker closes its session without waiting for a beat; a worker pins a set of controller fingerprints (either accepted, neither refused, empty and oversized sets refused). The log stream is exercised end to end: frames of a held attempt are acknowledged once durable, a resend is not duplicated, a jump lands with its hole, a foreign attempt and a short `LogEnd` are refused, and under protocol 5 `LogEndAck` reaches `Executor::log_ended` with the marker durable while a protocol-3 session never sees one. `sentinel-link` unit tests cover PEM round-trip with a stable fingerprint and base64 correctness.
+- `crates/sentinel-link/tests/hardening.rs`: a worker refused `Unavailable` twice backs off and connects on the third hello while any other rejection stays final; a welcome outside the hello's range is refused; a transient log fault closes the connection and is never answered `LogRefused`; an idle bulk connection outlives the heartbeat deadline and ends with its session; a worker enrolled at protocol 6 is welcomed at 7 when it offers 7 (recorded, and its profile's disk reaches placement) and at 5 when rolled back; with the pre-admission cap full a new connection is shed, a dripping handshake is cut at its absolute deadline, and an enrolled worker is then admitted. Enrollment-secret guessing by an unknown certificate is cut off after its per-source budget (`enrollment_limited`) while an enrolled worker still reconnects. Unit tests cover the per-source and reserve accounting of the pre-admission pool, the enrollment budget, the accept back-off and the heartbeat clamp; controller unit tests drive a burst of twenty spec requests through the eight-resolver desk (all served in order, none refused, duplicates and per-worker overflow held back); session unit tests prove a borrowed log frame encodes byte-for-byte like the owned message and that a peer which never reads fails a sender within its write timeout.
+- `crates/sentinel-link/tests/prefetch.rs`: a protocol-9 worker that a locality hold passes over is hinted the held job's image (`alpine@sha256:…`), "pulls" it, reports it warm and is offered the job within half the hold; a protocol-8 worker is never hinted (the ignored `prefetch_placement_latency` measures both).
+- `crates/sentinel-link/tests/priority.rs`: with the bulk connection connected but stalled (its peer never reads, so the worker's bulk writes block on TCP backpressure), the next control beat still gets its `Pong` within the deadline, and the stalled bulk traffic then completes once the peer drains; a bulk message on the control connection is served, not rejected; `a_failing_bulk_redial_never_delays_the_control_teardown` fails the bulk redials until the back-off is 4 s and closes the control connection, and the session returns within 1.5 s.
+- `crates/sentinel/tests/cli.rs` (Linux, both role features): `admin bootstrap|tenant create|pool create|worker enroll`, then the real `sentinel server` listens on an ephemeral port and logs its fingerprint, a second server on the same data directory is refused, `sentinel worker --check` reports its link, the worker process enrolls on its first hello (`link_connected` with `enrolled: true`, the enrollment file removed, `worker.id` persisted), both stop cleanly on `SIGTERM`, and `admin worker list` shows the worker afterwards.
+
+See [tenancy](tenancy.md) for pools and grants and [protocol contracts](protocol.md) for negotiation and size limits.

@@ -1,0 +1,5 @@
+# expect: jobs.a.steps[0].run: expected string, found integer
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, steps: [{id: s, run: 1}]}

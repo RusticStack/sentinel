@@ -1,0 +1,10 @@
+tailcat: v0.6.0 sha256=d46582137d21f03d
+PASS genkey: server+client keys created unattended; client=nodekey:<redacted>
+PASS serve_start: address obtained in 505 ms: tc<redacted>... # Selected bootstrap relay region 303, Frankfurt
+PASS ping_direct: rc=0 pong in 110µs via 10.255.255.254:59388 
+direct_loopback: rtt_us median=43 p95=87 max=392 echo_MBps=429
+via_tailcat: rtt_us median=301 p95=527 max=20664 echo_MBps=36
+PASS allow_list: unlisted client rejected rc=1: 2026/09/13 22:16:26 tailcat Ping: context deadline exceeded 
+PASS stable_address: same address after server restart
+FAIL forward_reconnect: forward did not recover within 30 s
+logs in /root/f07-tailcat/out

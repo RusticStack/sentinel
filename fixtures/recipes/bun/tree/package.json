@@ -1,0 +1,9 @@
+{
+  "name": "app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "k07a": "file:pkgs/k07a-1.0.0.tgz",
+    "k07b": "file:pkgs/k07b-1.0.0.tgz"
+  }
+}

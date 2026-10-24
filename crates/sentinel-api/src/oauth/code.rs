@@ -1,0 +1,444 @@
+mod consent;
+
+use sentinel_auth::{
+    cookie,
+    oauth::{self as forms, Kind, pkce},
+};
+use sentinel_core::{
+    TenantId, UnixMillis,
+    auth::{Audience, Scopes},
+};
+use sentinel_protocol::oauth::OAuthErrorCode;
+use sentinel_store::oauth::{
+    self as grants, Client,
+    code::{self as codes, Approval, CodeError},
+};
+
+use super::{Form, client, html};
+use crate::{
+    State,
+    auth::Identity,
+    http::Request,
+    routes::{self, Reply, Route},
+};
+
+const MAX_STATE_BYTES: usize = 512;
+
+pub(crate) fn authorize(state: &State, request: &mut Request, method: &str, query: &str) -> Route {
+    Ok(match method {
+        "POST" => decide(state, request),
+        _ => show(state, request, query),
+    })
+}
+
+pub(super) struct Params<'a> {
+    pub client: Client,
+    pub redirect_uri: &'a str,
+    pub state: &'a str,
+    pub code_challenge: &'a str,
+    pub scopes: Scopes,
+    pub audience: Audience,
+    pub resource: Option<&'a str>,
+}
+
+// Refusals to a registered (DCR/CIMD) client are never redirects before sign-in
+// (RFC 9700 4.11.2), or this endpoint becomes an open redirector.
+// Anonymous requests make no CIMD metadata fetch.
+fn show(state: &State, request: &Request, query: &str) -> Reply {
+    let Ok(form) = Form::parse(query.as_bytes()) else {
+        return html::error_page(400, "The authorization request is malformed.");
+    };
+    let session = signed_in(state, request);
+    if session.is_none()
+        && form
+            .get("client_id")
+            .is_some_and(|id| id.starts_with("https://"))
+        && form.get("redirect_uri").is_some()
+    {
+        return sign_in(state, query, None);
+    }
+    let (client, redirect_uri) = match establish(state, request, &form) {
+        Ok(established) => established,
+        Err(reply) => return reply,
+    };
+    let Some((who, csrf)) = session else {
+        if !client.registered
+            && let Err(reply) = validate_rest(state, &form, client.clone(), redirect_uri)
+        {
+            return reply;
+        }
+        return sign_in(state, query, Some(&client.name));
+    };
+    let params = match validate_rest(state, &form, client, redirect_uri) {
+        Ok(params) => params,
+        Err(reply) => return reply,
+    };
+    if let Err(reply) = eligible(state, &params, &who) {
+        return reply;
+    }
+    let token = cookie::form_token(&state.oauth.form_key, &csrf);
+    consent::page(state, &params, &who, &token, None)
+}
+
+fn sign_in(state: &State, query: &str, client_name: Option<&str>) -> Reply {
+    let mut message = String::with_capacity(64);
+    match client_name {
+        Some(name) => {
+            message.push_str("Sign in to continue to ");
+            message.push_str(name);
+            message.push('.');
+        }
+        None => message.push_str("Sign in to continue to the application."),
+    }
+    let here = format!("/oauth/authorize?{query}");
+    let github = state
+        .github
+        .as_ref()
+        .map(|g| (g.start_url.as_str(), here.as_str()));
+    html::sign_in_page(
+        &state.oauth.login_url,
+        github,
+        "Sign in to Sentinel",
+        &message,
+    )
+}
+
+fn decide(state: &State, request: &mut Request) -> Reply {
+    if routes::header_value(request, "origin").is_some_and(|o| o != state.oauth.origin) {
+        return html::error_page(403, "This form was submitted from another site.");
+    }
+    let Ok(form) = super::read_form(request) else {
+        return html::error_page(400, "The consent form is malformed.");
+    };
+    let Some((who, csrf)) = signed_in(state, request) else {
+        return html::error_page(
+            401,
+            "Your session has ended. Start signing in again from the application.",
+        );
+    };
+    if !cookie::form_token_accepted(&state.oauth.form_key, &csrf, form.get("form_token")) {
+        return html::error_page(
+            403,
+            "This consent form has expired. Start signing in again from the application.",
+        );
+    }
+    let params = match validate(state, request, &form) {
+        Ok(params) => params,
+        Err(reply) => return reply,
+    };
+    if let Err(reply) = eligible(state, &params, &who) {
+        return reply;
+    }
+    match form.get("decision") {
+        Some("approve") => approve(state, &form, &params, &who),
+        Some("deny") => match codes::deny(&state.store, &params.client.id, who.user) {
+            Ok(()) => refuse(
+                state,
+                &params,
+                OAuthErrorCode::AccessDenied,
+                "the account declined the request",
+            ),
+            Err(e) => unavailable(&e),
+        },
+        _ => html::error_page(400, "Choose approve or deny."),
+    }
+}
+
+fn approve(state: &State, form: &Form, params: &Params<'_>, who: &Identity) -> Reply {
+    let tenant = match form.get("tenant").map(str::parse::<TenantId>) {
+        None => None,
+        Some(Ok(tenant)) => Some(tenant),
+        Some(Err(_)) => return html::error_page(400, "The selected tenant is malformed."),
+    };
+    let again = |notice: &str| {
+        let token = form.get("form_token").unwrap_or_default();
+        consent::page_status(state, params, who, token, Some(notice), 400)
+    };
+    let repo = match (form.get("repo"), tenant) {
+        (None, _) => None,
+        (Some(_), None) => return again("Choose a tenant to limit access to one repository."),
+        (Some(name), Some(tenant)) => {
+            match state
+                .store
+                .read(|c| codes::repo_named(c, who.user, tenant, name))
+            {
+                Ok(repo) => Some(repo),
+                Err(sentinel_store::Error::NotFound) => {
+                    return again("That tenant has no repository of that name.");
+                }
+                Err(e) => return unavailable(&e),
+            }
+        }
+    };
+    let approval = Approval {
+        client_id: &params.client.id,
+        redirect_uri: params.redirect_uri,
+        code_challenge: params.code_challenge,
+        user: who.user,
+        scopes: params.scopes,
+        tenant,
+        repo,
+        audience: params.audience,
+    };
+    match codes::approve(&state.store, &approval, UnixMillis::now()) {
+        Ok(code) => {
+            let code = forms::format(Kind::Code, &code);
+            back(
+                params.redirect_uri,
+                &[
+                    ("code", code.as_str()),
+                    ("state", params.state),
+                    ("iss", &state.oauth.issuer),
+                ],
+            )
+        }
+        Err(sentinel_store::Error::Forbidden) => refuse(
+            state,
+            params,
+            OAuthErrorCode::AccessDenied,
+            "the account cannot grant this access",
+        ),
+        Err(sentinel_store::Error::InvalidInput(_) | sentinel_store::Error::NotFound) => refuse(
+            state,
+            params,
+            OAuthErrorCode::InvalidRequest,
+            "the request can no longer be approved",
+        ),
+        Err(e) => unavailable(&e),
+    }
+}
+
+fn signed_in(
+    state: &State,
+    request: &Request,
+) -> Option<(Identity, sentinel_auth::secret::Digest)> {
+    let who = super::session(state, request)?;
+    let csrf = who.csrf?;
+    Some((who, csrf))
+}
+
+fn validate<'a>(state: &State, request: &Request, form: &'a Form) -> Result<Params<'a>, Reply> {
+    let (client, redirect_uri) = establish(state, request, form)?;
+    validate_rest(state, form, client, redirect_uri)
+}
+
+fn establish<'a>(
+    state: &State,
+    request: &Request,
+    form: &'a Form,
+) -> Result<(Client, &'a str), Reply> {
+    let Some(client_id) = form.get("client_id") else {
+        return Err(html::error_page(400, "The request names no client."));
+    };
+    let Some(redirect_uri) = form.get("redirect_uri") else {
+        return Err(html::error_page(400, "The request names no redirect URI."));
+    };
+    let client = client::resolve(state, request, client_id)?;
+    let allowed = state
+        .store
+        .read(|connection| grants::redirect_allowed(connection, &client, redirect_uri))
+        .map_err(|error| unavailable(&error))?;
+    if !allowed {
+        return Err(html::error_page(
+            400,
+            "The redirect URI is not registered for this client.",
+        ));
+    }
+    Ok((client, redirect_uri))
+}
+
+fn validate_rest<'a>(
+    state: &State,
+    form: &'a Form,
+    client: Client,
+    redirect_uri: &'a str,
+) -> Result<Params<'a>, Reply> {
+    let state_param = form.get("state").filter(|s| s.len() <= MAX_STATE_BYTES);
+    let fail = |code: OAuthErrorCode, description: &str| {
+        Err(redirect_error(
+            state,
+            redirect_uri,
+            state_param,
+            code,
+            description,
+        ))
+    };
+    match form.get("response_type") {
+        Some("code") => {}
+        Some(_) => {
+            return fail(
+                OAuthErrorCode::UnsupportedResponseType,
+                "response_type must be code",
+            );
+        }
+        None => return fail(OAuthErrorCode::InvalidRequest, "response_type is required"),
+    }
+    let Some(state_value) = state_param else {
+        return fail(
+            OAuthErrorCode::InvalidRequest,
+            "state is required (at most 512 bytes)",
+        );
+    };
+    if form.get("code_challenge_method") != Some("S256") {
+        return fail(
+            OAuthErrorCode::InvalidRequest,
+            "PKCE with code_challenge_method=S256 is required",
+        );
+    }
+    let Some(code_challenge) = form
+        .get("code_challenge")
+        .filter(|c| pkce::challenge_valid(c))
+    else {
+        return fail(
+            OAuthErrorCode::InvalidRequest,
+            "code_challenge must be an S256 challenge",
+        );
+    };
+    let scopes = match form.get("scope") {
+        None => {
+            let default = if client.resource == Audience::Mcp {
+                Scopes::MCP_DEFAULT
+            } else {
+                Scopes::CLI_DEFAULT
+            };
+            default.intersect(client.max_scopes)
+        }
+        Some(text) => match Scopes::parse(text) {
+            Ok(scopes) => scopes,
+            Err(_) => return fail(OAuthErrorCode::InvalidScope, "unknown scope"),
+        },
+    };
+    if scopes.is_empty() || !client.max_scopes.contains(scopes) {
+        return fail(
+            OAuthErrorCode::InvalidScope,
+            "scope is empty or beyond what this client may hold",
+        );
+    }
+    let resource = form.get("resource");
+    let audience = match resource {
+        None => Audience::Api,
+        Some(resource) => match state.oauth.resource_audience(resource) {
+            Some(audience) => audience,
+            None => return fail(OAuthErrorCode::InvalidTarget, "resource is not served here"),
+        },
+    };
+    if audience != client.resource {
+        return fail(
+            OAuthErrorCode::InvalidTarget,
+            "resource is not permitted for this client",
+        );
+    }
+    Ok(Params {
+        client,
+        redirect_uri,
+        state: state_value,
+        code_challenge,
+        scopes,
+        audience,
+        resource,
+    })
+}
+
+fn eligible(state: &State, params: &Params<'_>, who: &Identity) -> Result<(), Reply> {
+    if params.scopes.contains(Scopes::PLATFORM_ADMIN) && !who.super_admin {
+        return Err(refuse(
+            state,
+            params,
+            OAuthErrorCode::InvalidScope,
+            "platform:admin requires a super admin",
+        ));
+    }
+    Ok(())
+}
+
+fn refuse(state: &State, params: &Params<'_>, code: OAuthErrorCode, description: &str) -> Reply {
+    redirect_error(
+        state,
+        params.redirect_uri,
+        Some(params.state),
+        code,
+        description,
+    )
+}
+
+fn redirect_error(
+    state: &State,
+    redirect_uri: &str,
+    state_param: Option<&str>,
+    code: OAuthErrorCode,
+    description: &str,
+) -> Reply {
+    let mut pairs = [
+        ("error", code.as_str()),
+        ("error_description", description),
+        ("iss", &state.oauth.issuer),
+        ("state", ""),
+    ];
+    let used = match state_param {
+        Some(value) => {
+            pairs[3].1 = value;
+            4
+        }
+        None => 3,
+    };
+    back(redirect_uri, &pairs[..used])
+}
+
+fn back(redirect_uri: &str, pairs: &[(&str, &str)]) -> Reply {
+    let mut url = String::with_capacity(redirect_uri.len() + 192);
+    url.push_str(redirect_uri);
+    url.push(if redirect_uri.contains('?') { '&' } else { '?' });
+    let start = url.len();
+    let url = form_urlencoded::Serializer::for_suffix(url, start)
+        .extend_pairs(pairs)
+        .finish();
+    html::redirect(&url)
+}
+
+fn unavailable(e: &sentinel_store::Error) -> Reply {
+    match e {
+        sentinel_store::Error::WriterUnavailable
+        | sentinel_store::Error::Overloaded
+        | sentinel_store::Error::WriteAmbiguous => {
+            html::error_page(503, "Sentinel is busy. Try again in a moment.")
+        }
+        _ => html::error_page(500, "Sentinel could not complete this request."),
+    }
+}
+
+pub(crate) fn token(
+    state: &State,
+    client: &Client,
+    form: &Form,
+    resource: Option<Audience>,
+) -> Reply {
+    let (Some(code), Some(redirect_uri), Some(verifier)) = (
+        form.get("code"),
+        form.get("redirect_uri"),
+        form.get("code_verifier"),
+    ) else {
+        return super::error(
+            OAuthErrorCode::InvalidRequest,
+            "code, redirect_uri and code_verifier are required",
+        );
+    };
+    let Some(code) = forms::parse(Kind::Code, code) else {
+        return super::error(OAuthErrorCode::InvalidGrant, "code is not valid");
+    };
+    let now = UnixMillis::now();
+    match codes::exchange(
+        &state.store,
+        &client.id,
+        &code,
+        redirect_uri,
+        verifier,
+        resource,
+        now,
+    ) {
+        Ok(minted) => super::token_reply(&minted, now),
+        Err(CodeError::Invalid | CodeError::Replay) => {
+            super::error(OAuthErrorCode::InvalidGrant, "code is not valid")
+        }
+        Err(CodeError::Store(e)) => super::store_failure(e),
+    }
+}

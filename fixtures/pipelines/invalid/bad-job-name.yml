@@ -1,0 +1,5 @@
+# expect: jobs.Test: job names must match
+schema: 1
+on: [push]
+jobs:
+  Test: {image: busybox, steps: [{id: s, run: x}]}

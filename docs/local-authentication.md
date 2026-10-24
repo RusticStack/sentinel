@@ -1,0 +1,92 @@
+# Local authentication
+
+Implemented in `sentinel-auth` (password hashing, opaque secrets, cookie/CSRF policy), `sentinel-store::local_auth` (bootstrap, credentials, sessions, audit) and the host-local `sentinel admin` command, with append-only metadata migration **5**.
+
+This is authentication only. Admission is the [authorization layer](authorization.md): a validated session produces a `Principal`, and every repository, tenant and platform decision is still a live membership/grant check. [API credentials](api-credentials.md) and [GitHub sign-in](github-sign-in.md) are the other sources of that `Principal`. Registration and invitations are in [admission](admission.md); second factors, step-up and session administration are in [step-up](step-up.md).
+
+## First-admin bootstrap
+
+`sentinel admin bootstrap --data-dir <PATH> --username <NAME>` opens the controller's `metadata.sqlite` directly and creates one super admin with a local password. Its authority is the operating system's: only a user who can already open that file can run it. There is no network route to it, the server process does not expose it, and "first visitor wins" is not implemented anywhere.
+
+- The password is read from standard input as raw bytes, minus one trailing newline. It never appears in argv, the process list, shell history, diagnostics or an error message. A terminal stdin is refused with the redirect form instead.
+- Bootstrap is how the first account exists at all: the deployment's registration policy ([admission](admission.md)) governs every later one.
+- Bootstrap refuses once the single-row `bootstrap` latch exists **or** any active super admin exists, so restoring a backup or provisioning an admin another way also closes it. The check is repeated inside the writing transaction; the user, its credential and the latch are one commit.
+- `sentinel admin status --data-dir <PATH>` reports bootstrap availability, active super admins, live sessions and the last ten audit records. It refuses to create a database, so a mistyped path says so rather than answering about a new empty one.
+
+## Passwords
+
+Argon2id through the maintained RustCrypto `argon2` crate at OWASP's 19 MiB / t=2 / p=1 profile. Sentinel implements no cryptography: the crate owns the KDF and the constant-time comparison, and the stored PHC string owns the parameters.
+
+- Records are per-account salted (16 bytes of OS entropy). Parameters come from the record on verification, so accounts written under older parameters still verify; `needs_rehash` rewrites them after a successful login, outside the writer transaction.
+- Passwords are 12–256 bytes and may not be only spacing. That is an admission rule, not a composition rule: no character-class requirements, no silent truncation, no normalization of the bytes supplied.
+- One lane (`p=1`) deliberately: a login must not take a whole core of parallel work away from job scheduling. Verification never runs inside a database transaction.
+- An unknown or malformed username still pays for a verification against an unreachable placeholder record, so account existence is not revealed by response or by time. Every attempt is audited, with no subject for an unknown name.
+- Through the API, the lock that stops a guesser is per client and account (`login_guard`): ten failures from one client against one account refuse that client for the lockout window, without a hash or an audit row, and one failure after the window locks it again; nobody else is affected. The account-wide lock below then applies at four times the policy's threshold, so it takes several clients together to reach it, and a stranger cannot lock the super admin out alone. Guesses at names that do not exist, and attempts against a locked account, add at most five audit rows per ten seconds each: the audit record is append-only, so a flood must not be able to grow it without bound. Host-local `sentinel admin` commands are unaffected.
+- Ten consecutive failures lock an account for fifteen minutes (the store's account-wide lock; the API raises its threshold as above). The failure is counted only against the exact record that was tested, so a concurrent password change is not miscounted. The lockout is a window, not a standing debt: once it has ended, the next failure starts the count again at one, so one wrong guess (or one typo) after a lockout does not lock the account again — keeping an account locked takes a full run of ten failures per window, each of them audited. A successful login resets the count; host-local recovery clears the lockout immediately.
+
+## Signing in with an email address
+
+The login identifier is a **username or a verified email address** (migration 50; the full model is in [admission](admission.md#email-identity-and-email-invitations)). An identifier containing `@` is an address — no username can hold one — and is canonicalized (ASCII local part lower-cased, IDN domain in punycode) before it is looked up, so every spelling of a verified address is one account.
+
+- Only a **verified** address signs in. A claimed-but-unproved address identifies nobody, so someone who registers a victim's address cannot sign in as, or lock out, the owner; verifying proves control of the mailbox with a single-use, expiring (24 h), digest-stored token delivered to it.
+- An unknown, unverified or malformed address pays the same placeholder verification as an unknown username, takes the same single `unauthenticated` answer, and records a rejected-login row **without the address** (a username attempt records its name; an address is personal data and spraying must not fill the audit log with them).
+- The password, the lockout and the sessions are the account's, not the identifier's: signing in by username and by address are the same credential, and failures count against the same record. The API's per-client guard keys on the canonical address.
+- An account created by address (`POST /api/v1/register`) has a generated `user-…` username as well, so every local account keeps a username for host-local administration; it can sign in by either once its address is verified.
+- Changing the address keeps the old verified one as the identity until the new one is proved; verification never carries over to a different address ([admission](admission.md#email-identity-and-email-invitations)).
+- Without a Resend key and sender the operator mints the verification link on the host: `sentinel admin account email-link --user <name-or-address>`, so an operator is never locked out of a deployment that cannot send mail ([configuration](configuration.md#email-delivery)).
+
+## Sessions
+
+Opaque 256-bit secrets from the OS CSPRNG, stored only as their BLAKE3 digest. A stolen database snapshot yields no usable cookie, and validation is one 32-byte primary-key probe.
+
+- Two deadlines, both absolute instants recorded at issuance: idle (8 h) and absolute (7 days). Expiry, revocation and the account's live `kind`/`active` state are predicates of the single validation statement, so a suspended account's cookie stops working immediately without waiting for a sweep.
+- Sliding the idle deadline is a write, so it happens only after `refresh_after_ms` (5 min) of the window is spent, and never past the absolute deadline. A session pinned to its absolute deadline is never refreshed again. The API slides it as part of authenticating a request (`sentinel-api::auth::identify`, best effort: a refresh the writer cannot take right now does not fail the request), so an active user stays signed in until the absolute deadline. The cookie's `Max-Age` is the absolute lifetime, not the idle window: the browser keeps the cookie as long as the session could live, and the server decides when it has gone idle.
+- Login issues a new session; it does not reuse one. Logout revokes one session, logout-all revokes every live session of the account, and a password change, super-admin demotion or suspension revokes them in the same transaction as the change. Whenever every live session of an account is revoked this way, the service grants that account minted since its oldest unrevoked session began are revoked in the same transaction, and revoking one session by name revokes those minted since it began, so a credential a hijacked session minted does not outlive the response ([step-up](step-up.md#service-credentials-minted-by-a-session)). The database refuses to un-revoke a session, to move its absolute deadline or to change its user, CSRF secret or creation time.
+- `purge_expired` deletes revoked and expired rows in bounded batches; it is maintenance, not the expiry mechanism.
+- A session's `Principal` carries repository bits plus `TENANT_ADMIN`, and `PLATFORM_ADMIN` only for an actual super admin. It is not a capability: `auth` still verifies membership and grants per tenant, per query. Privileged policy changes that use the platform bit also require [step-up](step-up.md).
+
+## Cookies and CSRF
+
+- `__Host-sentinel_session`, with `Path=/; Secure; HttpOnly; SameSite=Strict` and no `Domain`, so a sibling hostname can neither set nor read it.
+- `SameSite=Strict` rather than `Lax`: Sentinel has no cross-site entry flow that must arrive authenticated, and top-level GET navigation mutates nothing.
+- State-changing requests must echo the session's own CSRF secret in the `x-sentinel-csrf` header — a header cross-site form posts cannot set. The secret is per session, compared by digest in constant time; another session's secret, and the session cookie itself, are both rejected.
+- Cookie parsing refuses a duplicated or malformed cookie rather than taking the first match: two cookies of that name mean something is injecting them.
+- The HTTP API ([API](api.md)) uses exactly these bytes and this decision on every route: login, logout, every session mutation, and the OAuth consent and device pages (which add a form token and an `Origin` check).
+- Login itself is guarded against login CSRF — a cross-site page signing the victim into the attacker's account. `POST /api/v1/login` accepts only `content-type: application/json`, which a cross-site form cannot send (an `enctype="text/plain"` body can be shaped to parse as JSON) and a cross-site `fetch` cannot send without a CORS preflight the server never grants; and a present `Origin` must be the issuer's origin.
+
+## Changing a password
+
+`POST /api/v1/password {current, new}` ([API](api.md)) is the self-service change, for a browser session with its CSRF header. The rules:
+
+- The **current password** is always required. A wrong one (or an account that has no local password) is one `forbidden`, audited as a failed proof (`step-up-failed`) and counted against the **session**: five revoke it. It is never counted against the account's second factor, so a stolen cookie cannot lock the real factor out by guessing.
+- With a **second factor enrolled**, a fresh [step-up](step-up.md) is also required, asked for (`details.step_up`) before the password is judged: the password alone is the weaker proof.
+- On success the hash is replaced only if it is still the one that was verified (a concurrent change is `conflict`), the login lockout is cleared, and **every** session and OAuth grant of the account is revoked in the same transaction — this session included. The response clears the cookie; the person signs in again with the new password. API credentials do not depend on the password and stay live. `password-changed` is audited.
+- The request draws on the sign-in admission budget before any hash. A new password outside 12–256 bytes, or only spacing, is `invalid_request`.
+- Setting a first password for a GitHub-only account is `provision_credential`, a step-up change, not this route. Host-locally, `sentinel admin recover` is the password change: it resets the password, clears both lockouts and revokes sessions and grants.
+
+## Recovery and the last super admin
+
+`sentinel admin recover --data-dir <PATH> --username <NAME>` resets a local password, clears the login lockout and the second-factor lockout ([step-up](step-up.md)) and revokes the account's sessions and OAuth grants (API credentials do not depend on the password and stay live), so an operator locked out — or stranded by a GitHub outage — is never permanently shut out. Every use is recorded as host-local in the audit table.
+
+`auth_audit` is append-only: updates and deletes are refused by trigger, as are updates and deletes of the bootstrap latch. Records carry the event, actor, subject, host-local flag and at most 128 bytes of bounded detail (a login name) — never a password, hash, digest or cookie value.
+
+The deployment must keep one reachable super admin. `set_super_admin` and `set_active` take an `Authority`, require platform administration with a recent [step-up](step-up.md), and audit the change, and database triggers refuse any update or delete that would empty the active super-admin set — including a raw controller statement or a repair script. Demotion and suspension revoke the account's sessions in the same transaction, and suspension revokes its [API credentials](api-credentials.md) too.
+
+## Cost
+
+Measured on `development-host` (i7-13700KF, Ubuntu 24.04 WSL2, ext4), release build, database at `synchronous=FULL`:
+
+| Operation | Mean |
+|---|---|
+| Session validation (`authenticate`) | 1.3 µs |
+| Accepted login (Argon2id + durable commit) | 13.8 ms |
+| Rejected login | 14.5 ms |
+| Unknown username | 15.3 ms |
+
+Verification dominates by design, and the three login outcomes cost the same order of magnitude, which is the point of the placeholder record. Session validation is what every authenticated request pays: one primary-key probe and one key join, guarded by a query-plan test that rejects table scans and temporary sort trees. Sliding an idle deadline is the only write a read-only request can trigger, and only after five minutes.
+
+No `bench/` record or harness holds these means, so their sample count and spread are unknown and they cannot be reproduced from what is committed. WSL2 is a development reference, not a production qualification.
+
+## Verification
+
+`crates/sentinel-store/tests/local_auth.rs` covers bootstrap admitting exactly one admin and then refusing itself (latch and pre-existing admin alike), password acceptance and rejection, unknown and wrongly-cased usernames, forged cookies, the database holding no usable cookie value, idle and absolute expiry with refresh bounded by the absolute deadline, logout and logout-all, refusal to un-revoke by raw SQL, lockout and its expiry (a single failure after an ended window counts one, not a new lockout), host-local recovery resetting and revoking, password change requiring the current password and rotating sessions, last-super-admin protection through the API and through raw `UPDATE`/`DELETE`, suspension invalidating live cookies at once, credentials refused for service principals, administration requiring explicit platform scope rather than a session alone, append-only audit carrying no credential material, and bounded purging. `sentinel-auth` unit tests cover hashing, rehash detection, input bounds, secret round-tripping and rejection, cookie attributes, ambiguous cookie headers and CSRF binding. Over HTTP, `crates/sentinel-api/tests/api.rs` covers login refusing a `text/plain` (or untyped) body and a foreign `Origin` without setting a cookie (`login_refuses_a_text_plain_body`, `login_refuses_a_foreign_origin`) and an active session outliving its first idle deadline (the session tests schedule their sleeps and refresh checks from the deadlines the server recorded, on the wall clock the server checks them against, not from when the test sent its request: a loaded server that handles a request late moves the deadline the assertion depends on, so scheduling from send time would make them flaky), with the cookie's `Max-Age` at the absolute lifetime (`an_active_session_outlives_its_first_idle_deadline`).

@@ -1,0 +1,16 @@
+[package]
+name = "b05"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.7"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+# Its own workspace: the fixture runs inside a Sentinel checkout, whose root manifest would otherwise claim it.
+[workspace]

@@ -1,0 +1,6 @@
+# expect: dependency cycle through a -> b
+schema: 1
+on: [push]
+jobs:
+  a: {needs: [b], image: busybox, steps: [{id: s, run: x}]}
+  b: {needs: [a], image: busybox, steps: [{id: s, run: x}]}
