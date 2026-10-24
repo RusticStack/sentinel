@@ -103,9 +103,11 @@ A second recent successful PR run (`34756646843`) spans approximately 12m08s by 
 
 Removing `needs: test` alone could overlap some work but cannot make a 303-second command finish in 45 seconds. More parallel jobs on the same saturated machine can make it worse. The next actionable evidence is per-package/test wall time, process CPU time, compiler execution, allocation/GC, I/O wait, cgroup throttling, and host-level placement across all concurrent runners.
 
-## 4. Engineering the five-minute -> sub-minute target
+## 4. Engineering the end-to-end performance targets
 
-**Target:** representative warm PR required-check completion p95 < 60 seconds using the same hardware and total allocated CPU/RAM/disk, the same declared assertions/coverage, and the same cache/result-freshness policy. Report first useful failure and long acceptance/audit completion separately. Do not rename partial feedback “all checks passed.”
+**Primary relative target (B11):** trigger-to-required-check p95 at most 0.50 × Blacksmith's p95 for the same SHA, commands, assertions, freshness policy, required outputs, condition and resource envelope. Use the paired contract and confidence gate in [benchmark contracts](benchmark-contracts.md#b11-the-2-blacksmith-gate); actual Blacksmith access is a prerequisite, and startup-only observations are not evidence.
+
+**Independent absolute target (B08):** representative warm PR required-check completion p95 < 60 seconds using the same hardware and total allocated CPU/RAM/disk, the same declared assertions/coverage, and the same cache/result-freshness policy, against a qualifying >=300-second baseline. Report first useful failure and long acceptance/audit completion separately. Do not rename partial feedback “all checks passed.” Revision-4 pilot records currently satisfy neither the baseline qualification nor a Blacksmith comparison.
 
 Approximate model:
 

@@ -23,7 +23,7 @@ built in Rust for teams that want control of their hardware and their data.
 
 Sentinel is a purpose-built CI engine, not a dashboard around another runner. It combines the controller, worker protocol, pipeline compiler, cache and log storage in one auditable system, with performance measured against real CI workloads on the same hardware.
 
-The goal is **sub-minute warm pull-request checks on hardware where the equivalent CI previously took five minutes or more**. That is a target, not a published result. Current measurements and their exact conditions live in the [benchmark records](bench/) and [benchmark contracts](docs/benchmark-contracts.md).
+The primary target is **trigger-to-required-check p95 in at most half of Blacksmith's time for the same checks and conditions**. The independent absolute target remains **sub-minute warm pull-request checks on hardware where the equivalent CI previously took five minutes or more**. Both are unmet targets, not published results: current pilot records have no qualifying five-minute baseline and no Blacksmith comparison. Measurements and their exact conditions live in the [benchmark records](bench/) and [benchmark contracts](docs/benchmark-contracts.md).
 
 ## What you get
 
@@ -57,7 +57,7 @@ The goal is **sub-minute warm pull-request checks on hardware where the equivale
    +-------------+ +-------------+
 ```
 
-The controller never executes jobs. Workers run as separate processes, receive only work they are authorized and equipped to run, and report logs and outcomes through durable, fenced attempts.
+The controller never executes jobs. Workers run as separate processes, receive only work they are authorized and equipped to run, and report logs and outcomes through durable, fenced attempts. The intended Q11/Q12 host model adds UI-generated worker-only Tailcat enrollment, controller-approved host CPU/RAM/storage ceilings and fastest-eligible placement with an explicit operator priority override; those flows are not yet implemented.
 
 ## A pipeline looks like this
 
@@ -109,16 +109,18 @@ Then follow [operator first run](docs/development.md#operator-first-run) to crea
 
 | Area | State |
 |---|---|
-| Native pipeline compiler and validation | Implemented; pre-release |
-| Linux controller and rootless-Podman workers | Implemented; pre-release |
-| Multi-tenancy, authentication, OAuth and secrets | Implemented; pre-release |
-| Logs, artifacts, caches, recovery and retention | Implemented; pre-release |
-| Web interface, CLI, MCP and GitHub Checks | Implemented; pre-release |
-| Same-hardware optimization and pilot measurements | In progress |
-| Firecracker microVMs for Linux jobs | In development |
-| GitHub Actions runner mode and Windows jobs | Planned after v0.1 |
+| Native pipeline compiler and validation | Implemented; current-tree revalidation open |
+| Linux controller and rootless-Podman workers | Implemented; correctness revalidation open |
+| Multi-tenancy, authentication, OAuth and secrets | Implemented; authorization/admission rework open |
+| Logs, artifacts, caches, recovery and retention | Implemented; durability and cache rework open |
+| Web interface, CLI, MCP and GitHub Checks | Implemented; current verification open |
+| UI worker enrollment, host caps and host priority | Planned as Q11–Q13 |
+| Same-hardware optimization and pilot measurements | Revision-4 records exist; B08 unmet |
+| 2× Blacksmith comparison | B11 blocked by benchmark access |
+| Firecracker microVMs for Linux jobs | Implemented; networking, snapshots and verification open |
+| GitHub Actions runner mode and Windows jobs | Planned after v0.1 unless separately promoted |
 
-The v0.1 release still requires the remaining benchmark and pilot work, a full re-audit and the release gates. [TODO.md](TODO.md) is the authoritative task tracker; [plan.md](plan.md) explains the architecture and longer-term direction.
+The v0.1 release still requires Part 24 correctness rework, deployment packaging, Q11–Q13, required microVM gaps, pilot/benchmark work, B09, B11 and the release gates. [TODO.md](TODO.md) is the authoritative task tracker; [plan.md](plan.md) explains the architecture and longer-term direction.
 
 ## Documentation
 

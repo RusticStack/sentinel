@@ -656,6 +656,37 @@ fn an_email_invitation_joins_only_when_its_mailbox_is_verified() {
 }
 
 #[test]
+fn suspending_an_account_before_confirmation_verifies_nothing_and_redeems_no_invitation() {
+    let f = fixture();
+    let invited = f.email_invitation("held@example.com");
+    let user = match f.sign_up("held@example.com", &invited.invitation.secret, None) {
+        Admission::Pending(user) => user,
+        other => panic!("{other:?}"),
+    };
+    let link = f.link(user, None, 20);
+    f.store
+        .writer()
+        .write(move |tx| {
+            registration::approve(tx, Authority::HostLocal, user, at(21))?;
+            local_auth::set_active(tx, Authority::HostLocal, user, false, at(22))
+        })
+        .unwrap();
+    assert_eq!(f.confirm(&link, 23), Confirmation::Refused);
+    assert_eq!(
+        f.address_of(user),
+        Some(("held@example.com".to_owned(), false))
+    );
+    assert_eq!(f.role_in(f.tenant, user), 0);
+    assert!(!f.sign_in("held@example.com"));
+    assert!(!f.events().contains(&Event::InvitationRedeemed));
+    let vouched = f
+        .store
+        .writer()
+        .write(move |tx| email::verify_host_local(tx, Authority::HostLocal, user, at(24)));
+    assert!(matches!(vouched, Err(Error::NotFound)));
+}
+
+#[test]
 fn an_existing_account_accepts_an_invitation_by_proving_the_mailbox() {
     let f = fixture();
     let user = f.user_of(f.sign_up("member@example.com", &f.admission(), None));

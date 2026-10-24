@@ -59,7 +59,7 @@ The public contract is an anonymized publication snapshot. Its source URLs and h
 
 Every required test runs on every sample. The cli lane sets `GOFLAGS=-count=1`; Cargo and Maven tests always execute. A sample counts only when every declared job passes. Cold samples include network dependency downloads and must be interpreted with that condition.
 
-The ≥300-second same-hardware baseline target remains a target, not an assumed result. If no selected lane reaches that baseline, report the measured results without claiming the target or changing the workload to fit it.
+The ≥300-second same-hardware B08 baseline target remains a target, not an assumed result. Revision-4 records have no qualifying lane, so B08 is unmet; do not change the workload to fit it. B11 separately requires trigger-to-required-check p95 at most half of actual Blacksmith's p95 under its [paired contract](benchmark-contracts.md#b11-the-2-blacksmith-gate). GitHub self-hosted baselines and shadow observations are not Blacksmith evidence.
 
 ## Performance and parity gates
 

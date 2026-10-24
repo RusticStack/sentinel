@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use rusqlite::{Connection, OptionalExtension, Transaction, named_params, params};
 use sentinel_core::{
     Actor, AttemptId, DependencyPolicy, Event, FailureClass, Fence, JobId, JobState, Outcome,
-    PoolId, RepoId, RunId, TenantId, UnixMillis, WorkerId, dependency_decision,
+    PoolId, RepoId, RunId, TenantId, UnixMillis, WorkerId,
+    auth::{Permissions, Principal},
+    dependency_decision,
 };
 use sentinel_pipeline::{
     expr::{Context, DependencySummary, HashFilesError, Lookup, Phase, Value},
@@ -15,6 +17,7 @@ use sentinel_protocol::{limits::MAX_LIST_ITEMS, summary::MAX_SUMMARY_BYTES};
 
 use crate::{
     Error, Result, artifacts,
+    auth::repo_query,
     codec::{READY, TERMINAL_BASE, decode_state},
     jobs,
     logs::LogStore,
@@ -1907,10 +1910,16 @@ pub fn expire_batch(
     Ok(swept)
 }
 
-pub fn lapse_due(tx: &Transaction<'_>, now: UnixMillis) -> Result<Swept> {
+pub fn lapse_due(
+    tx: &Transaction<'_>,
+    now: UnixMillis,
+    deferred: impl Fn(AttemptId) -> bool,
+) -> Result<Swept> {
     let mut swept = Swept::default();
     for attempt in unacknowledged(tx, now)? {
-        swept.record(isolated(tx, || lapse(tx, attempt, now)));
+        if !deferred(attempt) {
+            swept.record(isolated(tx, || lapse(tx, attempt, now)));
+        }
     }
     Ok(swept)
 }
@@ -2596,18 +2605,35 @@ macro_rules! waiting_columns {
     };
 }
 
+macro_rules! waiting_visibility {
+    () => {
+        concat!(
+            "EXISTS (",
+            repo_query!("1", "AND r.id = j.repo_id AND r.tenant_id = j.tenant_id"),
+            ")"
+        )
+    };
+}
+
 const QUEUED_PAGE_SQL: &str = concat!(
     waiting_columns!(),
-    "WHERE j.tenant_id = ?1 AND j.state_code IN (0, 1) AND j.queued_ms IS NOT NULL
-     ORDER BY j.queued_ms, j.created_seq LIMIT ?2"
+    "WHERE j.tenant_id = ?5 AND j.state_code IN (0, 1) AND j.queued_ms IS NOT NULL
+     AND ",
+    waiting_visibility!(),
+    " ORDER BY j.queued_ms, j.created_seq LIMIT ?6"
 );
 const BLOCKED_PAGE_SQL: &str = concat!(
     waiting_columns!(),
-    "WHERE j.tenant_id = ?1 AND j.state_code IN (0, 1) AND j.queued_ms IS NULL
-     ORDER BY j.queued_ms, j.created_seq LIMIT ?2"
+    "WHERE j.tenant_id = ?5 AND j.state_code IN (0, 1) AND j.queued_ms IS NULL
+     AND ",
+    waiting_visibility!(),
+    " ORDER BY j.queued_ms, j.created_seq LIMIT ?6"
 );
-const WAITING_COUNT_SQL: &str =
-    "SELECT COUNT(*) FROM jobs WHERE tenant_id = ?1 AND state_code IN (0, 1)";
+const WAITING_COUNT_SQL: &str = concat!(
+    "SELECT COUNT(*) FROM jobs j WHERE j.tenant_id = ?5 AND j.state_code IN (0, 1)
+     AND ",
+    waiting_visibility!()
+);
 const WAITING_ONE_SQL: &str = concat!(waiting_columns!(), "WHERE j.id = ?1 AND j.tenant_id = ?2");
 const GROUP_HELD_SQL: &str = concat!(
     "SELECT NOT ",
@@ -2901,13 +2927,22 @@ impl<'c> Explainer<'c> {
 
 pub fn list_queue(
     conn: &Connection,
+    principal: Principal,
     tenant: TenantId,
     connected: &[WorkerId],
     limit: usize,
 ) -> Result<QueuePage> {
-    let total: i64 = conn
-        .prepare_cached(WAITING_COUNT_SQL)?
-        .query_row([tenant.as_bytes()], |r| r.get(0))?;
+    crate::auth::repo_scope(principal, Permissions::READ)?;
+    let total: i64 = conn.prepare_cached(WAITING_COUNT_SQL)?.query_row(
+        params![
+            principal.user.as_bytes(),
+            Permissions::READ.bits(),
+            principal.tenant.as_ref().map(TenantId::as_bytes),
+            principal.repo.as_ref().map(RepoId::as_bytes),
+            tenant.as_bytes()
+        ],
+        |r| r.get(0),
+    )?;
     let mut rows: Vec<Waiting> = Vec::with_capacity(limit.min(total.max(0) as usize));
     for sql in [QUEUED_PAGE_SQL, BLOCKED_PAGE_SQL] {
         let left = limit - rows.len();
@@ -2915,9 +2950,17 @@ pub fn list_queue(
             break;
         }
         let mut stmt = conn.prepare_cached(sql)?;
-        let page = stmt.query_map(params![tenant.as_bytes(), left as i64], |r| {
-            waiting_row(tenant, r)
-        })?;
+        let page = stmt.query_map(
+            params![
+                principal.user.as_bytes(),
+                Permissions::READ.bits(),
+                principal.tenant.as_ref().map(TenantId::as_bytes),
+                principal.repo.as_ref().map(RepoId::as_bytes),
+                tenant.as_bytes(),
+                left as i64
+            ],
+            |r| waiting_row(tenant, r),
+        )?;
         for row in page {
             rows.push(row??);
         }
@@ -3085,6 +3128,13 @@ mod tests {
                     NamespaceKind::Organization,
                     now,
                 )?;
+                auth::set_membership(
+                    tx,
+                    Principal::new(root, P::ALL, None, None),
+                    tenant,
+                    root,
+                    sentinel_core::auth::Role::TenantAdmin,
+                )?;
                 jobs::insert_repo(tx, tenant, repo, "app", now)?;
                 tenancy::create_pool(
                     tx,
@@ -3145,6 +3195,9 @@ mod tests {
             .unwrap();
         let job: [u8; 16] = conn
             .query_row("SELECT id FROM jobs LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let user: [u8; 16] = conn
+            .query_row("SELECT id FROM users LIMIT 1", [], |r| r.get(0))
             .unwrap();
         let bounds = named_params! {
             ":pool": pool.as_bytes(),
@@ -3233,20 +3286,23 @@ mod tests {
             FREE_CAPACITY_SQL,
             &[("?1", &worker.as_bytes().to_vec())],
         );
-        assert_eq!(
-            run(
-                "queued page",
-                QUEUED_PAGE_SQL,
-                &[("?1", &t), ("?2", &100i64)]
-            ),
-            100
+        let (user, read, no_repo, limit) = (
+            user.to_vec(),
+            P::READ.bits(),
+            Option::<Vec<u8>>::None,
+            100i64,
         );
-        run(
-            "blocked page",
-            BLOCKED_PAGE_SQL,
-            &[("?1", &t), ("?2", &100i64)],
-        );
-        run("waiting count", WAITING_COUNT_SQL, &[("?1", &t)]);
+        let queue_params: &[(&str, &dyn rusqlite::ToSql)] = &[
+            ("?1", &user),
+            ("?2", &read),
+            ("?3", &t),
+            ("?4", &no_repo),
+            ("?5", &t),
+            ("?6", &limit),
+        ];
+        assert_eq!(run("queued page", QUEUED_PAGE_SQL, queue_params), 100);
+        run("blocked page", BLOCKED_PAGE_SQL, queue_params);
+        run("waiting count", WAITING_COUNT_SQL, &queue_params[..5]);
         run("group held", GROUP_HELD_SQL, &[("?1", &job.to_vec())]);
     }
 

@@ -1213,7 +1213,7 @@ fn identity(data_dir: &Path, stem: &str) -> Result<sentinel_link::identity::Iden
         Origin::Recovered => tracing::warn!(
             event = "identity_recovered",
             stem,
-            "a {stem} identity file was found without its pair, so a new identity was generated; enroll its new fingerprint"
+            "a {stem} private key was found without its certificate, so a new identity was generated; enroll its new fingerprint"
         ),
     }
     Ok(identity)

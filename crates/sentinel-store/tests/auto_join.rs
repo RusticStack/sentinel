@@ -355,6 +355,26 @@ fn an_account_waiting_for_approval_joins_only_once_admitted() {
 }
 
 #[test]
+fn a_suspended_account_cannot_confirm_an_address_or_auto_join() {
+    let f = fixture();
+    assert!(f.rules("example.com").is_empty());
+    let user = f.claim("ana@example.com");
+    let secret = f.link(user);
+    f.store
+        .writer()
+        .write(move |tx| local_auth::set_active(tx, Authority::HostLocal, user, false, at(12)))
+        .unwrap();
+    assert_eq!(
+        email::confirm(&f.store, &secret, at(20)).unwrap(),
+        Confirmation::Refused
+    );
+    assert_eq!(f.memberships_of(user), 0);
+    assert_eq!(f.tenants_named(SLUG), 0);
+    assert_eq!(f.count(Event::EmailVerified), 0);
+    assert_eq!(f.count(Event::DomainAutoJoined), 0);
+}
+
+#[test]
 fn a_github_backed_organization_is_never_joined_by_domain() {
     let f = fixture();
     let tenant = f.organization("example-com");

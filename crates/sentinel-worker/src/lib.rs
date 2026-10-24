@@ -101,7 +101,7 @@ pub(crate) fn private_dir_all(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let meta = std::fs::metadata(dir)?;
+        let meta = std::fs::symlink_metadata(dir)?;
         if meta.is_dir() && meta.uid() == euid() && meta.mode() & 0o077 != 0 {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(meta.mode() & 0o7700))?;
         }
@@ -141,4 +141,28 @@ pub(crate) fn euid() -> u32 {
 pub fn cache_reflink(data_dir: &std::path::Path) -> bool {
     sentinel_cache::clone::detect(&data_dir.join(sentinel_cache::attach::ROOT_DIR))
         == sentinel_cache::clone::Backend::Reflink
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use super::*;
+
+    #[test]
+    fn private_dir_all_preserves_a_symlink_targets_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        private_dir_all(&link).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
 }

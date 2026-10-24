@@ -601,7 +601,6 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
         ));
     }
     let dir = target.join(id);
-    fs::create_dir_all(data_dir)?;
     let (got, _) = hash_file(&dir.join(METADATA))?;
     if manifest["metadata"]["blake3"].as_str() != Some(got.to_string().as_str()) {
         return Err(Error::Corrupt("backup metadata checksum"));
@@ -621,8 +620,15 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
     };
     let snapshot = open_snapshot(&dir.join(METADATA))?;
     if let Some(key) = &loaded {
+        let required = crate::reseal::key_ids(&snapshot)?;
+        if !required.iter().all(|id| key.contains(*id)) {
+            return Err(Error::InvalidInput(
+                "the master key file does not contain every key the backup needs",
+            ));
+        }
         crate::reseal::verify_key(&snapshot, key)?;
     }
+    fs::create_dir_all(data_dir)?;
     let mut out = Restored {
         key_checked: loaded.is_some(),
         ..Restored::default()

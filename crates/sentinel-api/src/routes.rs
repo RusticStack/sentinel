@@ -709,7 +709,7 @@ pub(crate) fn route(
                 .read(|c| {
                     let tenant = lookup::tenant_by_slug(c, &slug)?;
                     authz::require_tenant_member(c, who.principal, tenant, false)?;
-                    dispatch::list_queue(c, tenant, &connected, limit)
+                    dispatch::list_queue(c, who.principal, tenant, &connected, limit)
                 })
                 .map_err(store_error)?;
             let storage = state.objects.admission().filter(|a| !a.is_open()).map(|a| {

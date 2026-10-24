@@ -6,7 +6,7 @@ use std::{
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
     Event, FailureClass, JobId, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
-    auth::{Namespace, Permissions as P, Principal},
+    auth::{Namespace, Permissions as P, Principal, Role},
 };
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
 use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
@@ -418,7 +418,13 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
 fn listing_a_five_thousand_job_queue_explains_only_the_page() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
-    let (root, tenant, repo, pool) = (UserId::new(), TenantId::new(), RepoId::new(), PoolId::new());
+    let (root, reader, tenant, repo, pool) = (
+        UserId::new(),
+        UserId::new(),
+        TenantId::new(),
+        RepoId::new(),
+        PoolId::new(),
+    );
     let spec = RunSpec::new(
         PinnedSource::new("https://github.com/o/r.git", SHA, Some("refs/heads/main")).unwrap(),
         compile_str(&run_yaml(false)).unwrap(),
@@ -437,6 +443,11 @@ fn listing_a_five_thousand_job_queue_explains_only_the_page() {
                 NOW,
             )?;
             sentinel_store::jobs::insert_repo(tx, tenant, repo, "app", NOW)?;
+            provisioning::insert_human(tx, reader, "Reader", false, NOW)?;
+            let admin = Principal::new(root, P::ALL, None, None);
+            auth::set_membership(tx, admin, tenant, root, Role::TenantAdmin)?;
+            auth::set_membership(tx, admin, tenant, reader, Role::Reader)?;
+            auth::set_repo_grant(tx, admin, repo, reader, P::READ)?;
             tenancy::create_pool(
                 tx,
                 Authority::HostLocal,
@@ -487,18 +498,26 @@ fn listing_a_five_thousand_job_queue_explains_only_the_page() {
         })
         .unwrap();
     let mut report = serde_json::Map::new();
-    for limit in [100usize, 500] {
-        let connected = connected.clone();
-        let started = Instant::now();
-        let page = store
-            .read(move |c| dispatch::list_queue(c, tenant, &connected, limit))
-            .unwrap();
-        let took = started.elapsed();
-        assert_eq!((page.jobs.len(), page.total), (limit, 5_000));
-        report.insert(
-            format!("limit_{limit}_us"),
-            serde_json::json!(took.as_micros() as u64),
-        );
+    for (scope, principal) in [
+        ("tenant_admin", Principal::new(root, P::ALL, None, None)),
+        (
+            "repository_reader",
+            Principal::new(reader, P::READ, Some(tenant), None),
+        ),
+    ] {
+        for limit in [100usize, 500] {
+            let connected = connected.clone();
+            let started = Instant::now();
+            let page = store
+                .read(move |c| dispatch::list_queue(c, principal, tenant, &connected, limit))
+                .unwrap();
+            let took = started.elapsed();
+            assert_eq!((page.jobs.len(), page.total), (limit, 5_000));
+            report.insert(
+                format!("{scope}_limit_{limit}_us"),
+                serde_json::json!(took.as_micros() as u64),
+            );
+        }
     }
     let report = serde_json::json!({
         "test": "sentinel-store/tests/fleet_load.rs::listing",

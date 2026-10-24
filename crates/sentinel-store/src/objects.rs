@@ -424,6 +424,25 @@ pub fn remote_key(tenant: TenantId, digest: &Digest) -> String {
     format!("objects/{tenant}/{}/{hex}", &hex[..2])
 }
 
+fn content_matches(path: &Path, len: u64, digest: Digest, buf: &mut [u8]) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut got_total = 0u64;
+    loop {
+        match file.read(buf) {
+            Ok(0) => break,
+            Ok(got) => {
+                got_total += got as u64;
+                hasher.update(&buf[..got]);
+            }
+            Err(_) => return false,
+        }
+    }
+    got_total == len && Digest(*hasher.finalize().as_bytes()) == digest
+}
+
 struct Hashing<'a> {
     file: &'a mut File,
     hasher: blake3::Hasher,
@@ -1300,6 +1319,7 @@ impl Objects {
         }
         drop(query);
         drop(rows);
+        let mut buf = vec![0u8; CHUNK];
         let objects = self.objects_root();
         for entry in fs::read_dir(&objects)? {
             let entry = entry?;
@@ -1311,7 +1331,7 @@ impl Objects {
                 report.orphans.push(entry.path());
                 continue;
             };
-            self.walk_objects(&entry.path(), tenant, &mut committed, &mut report)?;
+            self.walk_objects(&entry.path(), tenant, &mut committed, &mut report, &mut buf)?;
         }
         for ((tenant, digest), (_, evicted)) in committed {
             if !evicted {
@@ -1347,6 +1367,7 @@ impl Objects {
         tenant: TenantId,
         committed: &mut HashMap<(TenantId, Digest), (u64, bool)>,
         report: &mut Recovery,
+        buf: &mut [u8],
     ) -> Result<()> {
         for prefix in fs::read_dir(dir)? {
             let prefix = prefix?;
@@ -1365,7 +1386,11 @@ impl Objects {
                 let digest = Digest::parse(&name.to_string_lossy());
                 match (valid_name, digest) {
                     (true, Ok(digest)) => match committed.remove(&(tenant, digest)) {
-                        Some((len, _)) if entry.metadata()?.len() == len => {}
+                        Some((len, _)) if entry.metadata()?.len() == len => {
+                            if !content_matches(&path, len, digest, buf) {
+                                report.corrupt.push(path);
+                            }
+                        }
                         Some(_) => report.corrupt.push(path),
                         None => report.orphans.push(path),
                     },
@@ -1432,29 +1457,7 @@ impl Objects {
         let mut buf = vec![0u8; CHUNK];
         for (tenant, digest, len) in listed {
             let path = self.object_path(tenant, &digest);
-            let bad = match File::open(&path) {
-                Err(_) => true,
-                Ok(mut file) => {
-                    let mut hasher = blake3::Hasher::new();
-                    let mut got_total = 0u64;
-                    let mut failed = false;
-                    loop {
-                        match file.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(got) => {
-                                got_total += got as u64;
-                                hasher.update(&buf[..got]);
-                            }
-                            Err(_) => {
-                                failed = true;
-                                break;
-                            }
-                        }
-                    }
-                    failed || got_total != len || Digest(*hasher.finalize().as_bytes()) != digest
-                }
-            };
-            if bad {
+            if !content_matches(&path, len, digest, &mut buf) {
                 corrupt.push(Corrupt {
                     tenant,
                     digest,

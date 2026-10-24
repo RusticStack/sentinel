@@ -1,7 +1,7 @@
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
     Event, JobId, JobState, Outcome, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
-    auth::{Namespace, Permissions as P, Principal},
+    auth::{Namespace, Permissions as P, Principal, Role},
 };
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
 use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
@@ -49,6 +49,13 @@ fn fixture() -> Fixture {
                 Namespace::parse("acme").unwrap(),
                 NamespaceKind::Organization,
                 NOW,
+            )?;
+            auth::set_membership(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                root,
+                Role::TenantAdmin,
             )?;
             jobs::insert_repo(tx, tenant, repo, "app", NOW)?;
             tenancy::create_pool(
@@ -331,7 +338,7 @@ jobs:
 fn unsatisfiable_jobs_name_the_constraint_that_blocks_them() {
     let f = fixture();
     let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &["linux"], None, &[]);
-    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (root, tenant, repo, pool) = (f.root, f.tenant, f.repo, f.pool);
     let (run_id, all) = run(
         &f,
         tenant,
@@ -383,7 +390,15 @@ jobs:
     );
     let page = f
         .store
-        .read(move |c| dispatch::list_queue(c, tenant, &[w], 100))
+        .read(move |c| {
+            dispatch::list_queue(
+                c,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                &[w],
+                100,
+            )
+        })
         .unwrap();
     assert_eq!(page.total, 5);
     let queue = page.jobs;
@@ -397,7 +412,9 @@ jobs:
     assert!(queue.iter().all(|entry| entry.age_ms > 0));
     let two = f
         .store
-        .read(move |c| dispatch::list_queue(c, tenant, &[w], 2))
+        .read(move |c| {
+            dispatch::list_queue(c, Principal::new(root, P::ALL, None, None), tenant, &[w], 2)
+        })
         .unwrap();
     assert_eq!(two.total, 5);
     assert_eq!(
@@ -406,6 +423,103 @@ jobs:
     );
     let offer = place(&f, w, pool, at(2_100)).unwrap();
     assert_eq!(offer.job, fits);
+}
+
+#[test]
+fn the_queue_applies_repository_grants_before_counting_and_paging() {
+    let f = fixture();
+    let (root, tenant, repo, hidden_repo, reader, platform) = (
+        f.root,
+        f.tenant,
+        f.repo,
+        RepoId::new(),
+        UserId::new(),
+        UserId::new(),
+    );
+    f.store
+        .writer()
+        .write(move |tx| {
+            provisioning::insert_human(tx, reader, "Reader", false, NOW)?;
+            provisioning::insert_human(tx, platform, "Platform", true, NOW)?;
+            let admin = Principal::new(root, P::ALL, None, None);
+            auth::set_membership(tx, admin, tenant, reader, Role::Reader)?;
+            auth::create_repo(tx, admin, tenant, hidden_repo, "hidden", NOW)?;
+            auth::set_repo_grant(tx, admin, repo, reader, P::READ)
+        })
+        .unwrap();
+    let pipeline = single_job(1, "1GiB", "1GiB");
+    let mut visible = Vec::new();
+    for index in 0..5 {
+        let (_, jobs) = run(
+            &f,
+            tenant,
+            if index % 2 == 0 { hidden_repo } else { repo },
+            &pipeline,
+            at(2_000 + index),
+        );
+        if index % 2 == 1 {
+            visible.push(jobs[0]);
+        }
+    }
+    let first = f
+        .store
+        .read(move |c| {
+            dispatch::list_queue(
+                c,
+                Principal::new(reader, P::READ, Some(tenant), None),
+                tenant,
+                &[],
+                1,
+            )
+        })
+        .unwrap();
+    assert_eq!(first.total, 2);
+    assert_eq!(first.jobs.len(), 1);
+    assert_eq!(first.jobs[0].job, visible[0]);
+    let all = f
+        .store
+        .read(move |c| {
+            dispatch::list_queue(
+                c,
+                Principal::new(reader, P::READ, Some(tenant), Some(repo)),
+                tenant,
+                &[],
+                100,
+            )
+        })
+        .unwrap();
+    assert_eq!(all.total, 2);
+    assert_eq!(
+        all.jobs.iter().map(|job| job.job).collect::<Vec<_>>(),
+        visible
+    );
+    let admin = f
+        .store
+        .read(move |c| {
+            dispatch::list_queue(
+                c,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                &[],
+                100,
+            )
+        })
+        .unwrap();
+    assert_eq!(admin.total, 5);
+    let no_ambient_access = f
+        .store
+        .read(move |c| {
+            dispatch::list_queue(
+                c,
+                Principal::new(platform, P::ALL, None, None),
+                tenant,
+                &[],
+                100,
+            )
+        })
+        .unwrap();
+    assert_eq!(no_ambient_access.total, 0);
+    assert!(no_ambient_access.jobs.is_empty());
 }
 
 #[test]

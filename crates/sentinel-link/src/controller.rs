@@ -147,12 +147,8 @@ impl DeferredQueue {
             .any(|m| m.attempt == attempt && matches!(m.what, Deferred::Report { .. }))
     }
 
-    fn awaiting_reports(&self) -> HashSet<AttemptId> {
-        self.items
-            .iter()
-            .filter(|m| matches!(m.what, Deferred::Report { .. }))
-            .map(|m| m.attempt)
-            .collect()
+    fn attempts(&self) -> HashSet<AttemptId> {
+        self.items.iter().map(|m| m.attempt).collect()
     }
 }
 
@@ -244,6 +240,12 @@ fn retry_with(
 fn shield(due: &mut Vec<(AttemptId, RunId, JobId)>, waiting: &HashSet<AttemptId>) {
     if !waiting.is_empty() {
         due.retain(|(attempt, _, _)| !waiting.contains(attempt));
+    }
+}
+
+fn shield_stop(stop: &mut Vec<AttemptId>, waiting: &HashSet<AttemptId>) {
+    if !waiting.is_empty() {
+        stop.retain(|attempt| !waiting.contains(attempt));
     }
 }
 
@@ -742,7 +744,7 @@ impl Inner {
             .store
             .read(|c| dispatch::expired_scoped(c, now))
             .map(|mut due| {
-                shield(&mut due, &self.awaiting_report());
+                shield(&mut due, &self.deferred_attempts());
                 due
             }) {
             Ok(due) if !due.is_empty() => {
@@ -774,7 +776,10 @@ impl Inner {
             }
             Err(e) => self.failed(false, "queue_timeout", &e),
         }
-        match self.write_store(move |tx| dispatch::lapse_due(tx, now)) {
+        let deferred = self.deferred_attempts();
+        match self.write_store(move |tx| {
+            dispatch::lapse_due(tx, now, |attempt| deferred.contains(&attempt))
+        }) {
             Ok(swept) => {
                 self.stats
                     .lapsed
@@ -1373,11 +1378,11 @@ impl Inner {
         );
     }
 
-    fn awaiting_report(&self) -> HashSet<AttemptId> {
+    fn deferred_attempts(&self) -> HashSet<AttemptId> {
         self.deferred
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .awaiting_reports()
+            .attempts()
     }
 
     fn record_artifact(
@@ -1803,12 +1808,14 @@ impl SessionHandler for Inner {
         }
         let held = held.to_vec();
         let wanted = held.clone();
-        let (lease_until, stop) = self.write(move |tx| {
+        let (lease_until, mut stop) = self.write(move |tx| {
             if record_seen {
                 workers::seen(tx, worker, wall)?;
             }
             dispatch::renew(tx, worker, &held, dispatch::DEFAULT_LEASE_MS, now)
         })?;
+        let deferred = self.deferred_attempts();
+        shield_stop(&mut stop, &deferred);
         if record_seen && let Some(peer) = peer {
             peer.seen_recorded_ms.store(wall.0, Ordering::Relaxed);
         }
@@ -3147,10 +3154,10 @@ mod tests {
         let mut queue = DeferredQueue::default();
         assert!(queue.push(message(1, a, Deferred::Ack)));
         assert!(queue.holds(a) && !queue.holds(b));
-        assert!(queue.awaiting_reports().is_empty());
+        assert_eq!(queue.attempts(), HashSet::from([a]));
         assert!(queue.push(message(2, a, report())));
         assert!(queue.push(message(3, b, report())));
-        assert_eq!(queue.awaiting_reports(), HashSet::from([a, b]));
+        assert_eq!(queue.attempts(), HashSet::from([a, b]));
         assert_eq!(queue.head().map(|m| m.id), Some(1));
         queue.settle(2);
         assert_eq!(queue.head().map(|m| m.id), Some(1));
@@ -3216,7 +3223,7 @@ mod tests {
                 .collect()
         };
         let mut sweep = due(&[a, other]);
-        shield(&mut sweep, &q.lock().unwrap().awaiting_reports());
+        shield(&mut sweep, &q.lock().unwrap().attempts());
         assert_eq!(
             sweep.iter().map(|d| d.0).collect::<Vec<_>>(),
             vec![other],
@@ -3245,7 +3252,7 @@ mod tests {
         assert_eq!(*seen.borrow(), 1);
         assert!(ids(&q).is_empty());
         let mut sweep = due(&[a]);
-        shield(&mut sweep, &q.lock().unwrap().awaiting_reports());
+        shield(&mut sweep, &q.lock().unwrap().attempts());
         assert_eq!(sweep.len(), 1, "settled: the lease owns it again");
     }
 
@@ -3291,6 +3298,26 @@ mod tests {
         );
         assert_eq!(*calls.borrow(), vec![1, 1, 2]);
         assert!(ids(&q).is_empty());
+    }
+
+    #[test]
+    fn a_deferred_ack_is_shielded_from_lapse_and_stop_confirmation() {
+        let q = queue();
+        let (a, other) = (AttemptId::new(), AttemptId::new());
+        let got = receive_with(&q, &message(1, a, Deferred::Ack), |_| {
+            Err(StoreError::WriterUnavailable)
+        });
+        assert!(matches!(got, Received::Transient { kept: true, .. }));
+        let mut due = vec![
+            (a, RunId::new(), JobId::new()),
+            (other, RunId::new(), JobId::new()),
+        ];
+        shield(&mut due, &q.lock().unwrap().attempts());
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, other);
+        let mut stop = vec![a, other];
+        shield_stop(&mut stop, &q.lock().unwrap().attempts());
+        assert_eq!(stop, vec![other]);
     }
 
     #[test]

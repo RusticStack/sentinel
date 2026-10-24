@@ -8,9 +8,10 @@ use std::{
 use sentinel_core::{
     ArtifactId, AttemptId, JobId, PoolId, RepoId, RunId, TenantId, UnixMillis, UploadId, UserId,
     WorkerId,
-    auth::{Namespace, Permissions as P, Role},
+    auth::{Namespace, Permissions as P, Principal, Role},
 };
 use sentinel_link::{controller::Controller, identity::Identity};
+use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
 use sentinel_protocol::{
     logs::{Frame, Stream},
     negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion},
@@ -23,6 +24,7 @@ use sentinel_store::{
     logs::LogStore,
     objects::{Entry, Expect, Kind, Objects},
     registration::{self, Admission, Applicant, Terms},
+    runs,
     tenancy::{self, PoolKind},
     tokens::{self, Grant},
     workers::{self, Presentation},
@@ -776,6 +778,69 @@ fn sweep(d: &Deployment, attacker: &Camp, victim: &Camp) {
         );
         assert_eq!(anonymous.0, 401, "{label}");
     }
+}
+
+#[test]
+fn a_same_tenant_reader_sees_only_authorized_repositories_in_the_queue() {
+    let d = deployment();
+    let reader = local_user(&d.store, "reader");
+    let (org, visible, hidden) = (d.owner.org, RepoId::new(), RepoId::new());
+    let admin = Principal::new(d.owner.user, P::ALL, None, None);
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::set_membership(tx, admin, org, reader, Role::Reader)?;
+            auth::create_repo(tx, admin, org, visible, "visible", UnixMillis::now())?;
+            auth::create_repo(tx, admin, org, hidden, "hidden", UnixMillis::now())?;
+            auth::set_repo_grant(tx, admin, visible, reader, P::READ)
+        })
+        .unwrap();
+    let spec = RunSpec::new(
+        PinnedSource::new(
+            "https://github.com/o/r.git",
+            "0123456789abcdef0123456789abcdef01234567",
+            Some("main"),
+        )
+        .unwrap(),
+        compile_str(PIPELINE).unwrap(),
+    )
+    .unwrap();
+    d.store
+        .writer()
+        .write(move |tx| {
+            runs::create_run(tx, org, visible, RunId::new(), &spec, UnixMillis::now())?;
+            runs::create_run(tx, org, hidden, RunId::new(), &spec, UnixMillis::now())
+        })
+        .unwrap();
+    let bearer = bearer_of(&d.store, reader, P::READ);
+    let (status, page) = send(
+        &d.base,
+        "GET",
+        "/api/v1/queue?tenant=alpha&limit=1",
+        &Body::None,
+        Some(&bearer),
+        &[],
+    );
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["truncated"], true);
+    let jobs = page["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0]["repo"], visible.to_string());
+    assert!(!page.to_string().contains(&hidden.to_string()));
+    let (_, page) = send(
+        &d.base,
+        "GET",
+        "/api/v1/queue?tenant=alpha&limit=500",
+        &Body::None,
+        Some(&bearer),
+        &[],
+    );
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["truncated"], false);
+    let jobs = page["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs.iter().all(|job| job["repo"] == visible.to_string()));
 }
 
 #[test]
