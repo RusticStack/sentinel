@@ -1,13 +1,14 @@
 use std::{fs, sync::Arc, time::Duration};
 
 use sentinel_auth::sealed::Key;
-use sentinel_core::{AttemptId, JobId, RunId, UnixMillis};
+use sentinel_core::{AttemptId, JobId, RunId, UnixMillis, UserId};
 use sentinel_store::{
     Durability, Error, Store, backup,
     local_auth::{self, Policy},
     logs::LogStore,
     mfa,
     objects::{Digest, Entry, Expect, Kind, Objects},
+    reseal,
 };
 
 const PASSWORD: &[u8] = b"an operator password";
@@ -311,6 +312,53 @@ fn an_online_backup_verifies_and_restores_byte_for_byte_with_its_key() {
     assert_eq!(tail.frames.len(), 1);
     assert!(tail.complete);
     assert!(backup::restore(&f.target(), &report.id, &fresh, Some(&f.key)).is_err());
+}
+
+#[test]
+fn rotated_key_restore_requires_the_full_pre_retire_keyring_before_creating_metadata() {
+    let f = fixture();
+    let rotation_backup = f.dir.path().join("pre-rotate.key");
+    Key::rotate(&f.key, &rotation_backup).unwrap();
+    let rotated = Key::load(&f.key).unwrap();
+    let other = UserId::new();
+    let now = UnixMillis::now();
+    f.store
+        .writer()
+        .write(move |tx| {
+            sentinel_store::auth::provisioning::insert_human(tx, other, "Other", false, now)
+        })
+        .unwrap();
+    mfa::begin_enrollment_host_local(&f.store, &rotated, other, "Sentinel", "other", now).unwrap();
+    let report = f.backup();
+    assert_eq!(
+        report.key_ids.iter().copied().collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+
+    let progress = reseal::reseal_all(&f.store, Arc::new(rotated)).unwrap();
+    assert_eq!(progress.resealed, 1);
+    let pre_retire = f.dir.path().join("pre-retire.key");
+    assert_eq!(Key::retire(&f.key, &pre_retire).unwrap(), 1);
+    assert_eq!(Key::load(&f.key).unwrap().len(), 1);
+
+    let fresh = f.dir.path().join("restored");
+    let refused = backup::restore(&f.target(), &report.id, &fresh, Some(&f.key));
+    assert!(
+        matches!(refused, Err(Error::InvalidInput(message)) if message.contains("every key")),
+        "{refused:?}"
+    );
+    assert!(
+        !fresh.exists(),
+        "key validation precedes directory creation"
+    );
+    let pre_retire_key = Key::load(&pre_retire).unwrap();
+    let restored = backup::restore(&f.target(), &report.id, &fresh, Some(&pre_retire)).unwrap();
+    assert!(restored.key_checked);
+    assert!(fresh.join("metadata.sqlite").is_file());
+    let store = Store::open(fresh.join("metadata.sqlite"), Durability::Normal).unwrap();
+    store
+        .read(|conn| reseal::verify_key(conn, &pre_retire_key))
+        .unwrap();
 }
 
 #[test]

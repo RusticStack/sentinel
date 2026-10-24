@@ -49,6 +49,7 @@ struct Fake {
     uploads: Mutex<HashMap<String, Upload>>,
     down: AtomicBool,
     refused: AtomicBool,
+    head_without_metadata: AtomicBool,
     fail_part: AtomicU32,
     parts_sent: AtomicU32,
     next_id: AtomicU32,
@@ -174,12 +175,20 @@ impl Bucket for Fake {
     }
     fn head(&self, key: &str) -> BucketResult<Option<(u64, Option<String>)>> {
         self.up()?;
+        let without_metadata = self.head_without_metadata.load(Ordering::Relaxed);
         Ok(self
             .objects
             .lock()
             .unwrap()
             .get(key)
-            .map(|(b, m)| (b.len() as u64, m.clone())))
+            .map(|(body, metadata)| {
+                let metadata = if without_metadata {
+                    None
+                } else {
+                    metadata.clone()
+                };
+                (body.len() as u64, metadata)
+            }))
     }
     fn get(&self, key: &str, out: &mut dyn Write) -> BucketResult<u64> {
         self.up()?;
@@ -452,6 +461,31 @@ fn objects_are_copied_verified_evicted_and_fetched_back_verified() {
     assert!(!f.local(a));
     let report = f.store.read(|c| f.objects.recover(c)).unwrap();
     assert!(report.missing.is_empty(), "{:?}", report.missing);
+}
+
+#[test]
+fn a_head_without_blake3_metadata_leaves_the_object_unreplicated_and_local() {
+    let f = fixture();
+    let digest = f.put(b"the stored copy needs exact digest metadata");
+    f.bucket
+        .head_without_metadata
+        .store(true, Ordering::Relaxed);
+    let r = f.replicator(SETTINGS);
+    let error = r.pass().unwrap_err();
+    assert!(error.contains("stored copy"), "{error}");
+
+    let remote_ms: Option<i64> = f
+        .store
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT remote_ms FROM objects WHERE tenant_id = ?1 AND digest = ?2",
+                rusqlite::params![f.tenant.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert!(remote_ms.is_none());
+    assert!(f.local(digest));
 }
 
 #[test]

@@ -905,6 +905,7 @@ impl Sender {
         self.send_inner(message, false, Some(within))
     }
 
+    #[cfg(feature = "controller")]
     pub(crate) fn send_sensitive<M: Serialize>(&self, message: &M) -> Result<()> {
         self.send_inner(message, true, None)
     }

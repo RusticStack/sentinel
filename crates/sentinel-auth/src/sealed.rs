@@ -254,6 +254,12 @@ impl Key {
         self.active
     }
 
+    pub fn contains(&self, id: u32) -> bool {
+        self.keys
+            .binary_search_by_key(&id, |(candidate, _)| *candidate)
+            .is_ok()
+    }
+
     pub fn len(&self) -> usize {
         self.keys.len()
     }

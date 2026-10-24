@@ -366,9 +366,7 @@ impl Replicator {
         drop(buffer);
         outcome?;
         match self.bucket.head(&key)? {
-            Some((got, meta)) if got == len && meta.as_deref().is_none_or(|m| m == blake3) => {
-                Ok(())
-            }
+            Some((got, Some(meta))) if got == len && meta == blake3 => Ok(()),
             _ => Err(Fault::Bucket(BucketError {
                 transient: true,
                 not_found: false,

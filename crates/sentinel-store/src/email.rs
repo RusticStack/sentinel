@@ -295,7 +295,7 @@ pub enum Requested {
 fn live_user(tx: &Connection, user: UserId) -> Result<bool> {
     Ok(tx
         .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND kind = 0 AND status != 2)",
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND kind = 0 AND status != 2 AND (active = 1 OR status = 0))",
         )?
         .query_row([user.as_bytes()], |r| r.get(0))?)
 }
@@ -419,7 +419,7 @@ fn request_canonical(
 fn pending_for(conn: &Connection, user: UserId) -> Result<Option<(String, Option<InvitationId>)>> {
     let current: Option<(Option<String>, Option<i64>)> = conn
         .prepare_cached(
-            "SELECT email, email_verified_ms FROM users WHERE id = ?1 AND kind = 0 AND status != 2",
+            "SELECT email, email_verified_ms FROM users WHERE id = ?1 AND kind = 0 AND status != 2 AND (active = 1 OR status = 0)",
         )?
         .query_row([user.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
@@ -474,7 +474,7 @@ pub fn resend_for_address(
     let user: Option<[u8; 16]> = tx
         .prepare_cached(
             "SELECT id FROM users WHERE email = ?1 AND email_verified_ms IS NULL AND kind = 0
-             AND status != 2 ORDER BY created_ms DESC, id LIMIT 1",
+             AND status != 2 AND (active = 1 OR status = 0) ORDER BY created_ms DESC, id LIMIT 1",
         )?
         .query_row([&email], |r| r.get(0))
         .optional()?;
@@ -526,7 +526,7 @@ pub fn verify_host_local(
     authority.require_platform(tx)?;
     let email: Option<String> = tx
         .prepare_cached(
-            "SELECT email FROM users WHERE id = ?1 AND kind = 0 AND status != 2
+            "SELECT email FROM users WHERE id = ?1 AND kind = 0 AND status != 2 AND (active = 1 OR status = 0)
              AND email_verified_ms IS NULL",
         )?
         .query_row([user.as_bytes()], |r| r.get(0))

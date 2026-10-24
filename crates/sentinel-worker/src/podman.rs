@@ -657,7 +657,13 @@ impl Container {
         };
         let mut start = podman_in(store);
         start.args(["start", "--", &container.name]);
-        let started = process::run(start, deadline(CONTAINER_START_TIMEOUT), "podman start")?;
+        let started = match process::run(start, deadline(CONTAINER_START_TIMEOUT), "podman start") {
+            Ok(started) => started,
+            Err(error) => {
+                let _ = container.remove();
+                return Err(error);
+            }
+        };
         if !started.success() {
             let why = started.stderr_excerpt();
             let _ = container.remove();

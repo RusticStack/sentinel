@@ -26,7 +26,9 @@ macro_rules! repo_query {
     };
 }
 
-fn repo_scope(principal: Principal, required: Permissions) -> Result<()> {
+pub(crate) use repo_query;
+
+pub(crate) fn repo_scope(principal: Principal, required: Permissions) -> Result<()> {
     if required == Permissions::NONE
         || !Permissions::REPOSITORY.contains(required)
         || !principal.permissions.contains(required)

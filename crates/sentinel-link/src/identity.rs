@@ -66,14 +66,14 @@ impl Identity {
         if has_cert && has_key {
             return Ok((Identity::load(cert_path, key_path)?, Origin::Loaded));
         }
-        let origin = if has_cert || has_key {
-            for orphan in [cert_path, key_path] {
-                match std::fs::remove_file(orphan) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
+        if has_cert {
+            return Err(Error::Identity(
+                "certificate exists without its private key; restore the matching key or remove the certificate to generate a new identity"
+                    .into(),
+            ));
+        }
+        let origin = if has_key {
+            std::fs::remove_file(key_path)?;
             Origin::Recovered
         } else {
             Origin::Generated
@@ -225,20 +225,33 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_file_from_an_interrupted_save_is_replaced() {
-        for lost in ["worker.crt", "worker.key"] {
-            let dir = scratch("torn");
-            let (cert, key) = (dir.join("worker.crt"), dir.join("worker.key"));
-            Identity::generate("w").unwrap().save(&cert, &key).unwrap();
-            std::fs::remove_file(dir.join(lost)).unwrap();
-            let (identity, origin) = Identity::load_or_generate("w", &cert, &key).unwrap();
-            assert_eq!(origin, Origin::Recovered);
-            assert_eq!(
-                Identity::load(&cert, &key).unwrap().fingerprint(),
-                identity.fingerprint()
-            );
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
+    fn a_lone_key_from_an_interrupted_save_is_replaced() {
+        let dir = scratch("torn-key");
+        let (cert, key) = (dir.join("worker.crt"), dir.join("worker.key"));
+        Identity::generate("w").unwrap().save(&cert, &key).unwrap();
+        std::fs::remove_file(&cert).unwrap();
+        let (identity, origin) = Identity::load_or_generate("w", &cert, &key).unwrap();
+        assert_eq!(origin, Origin::Recovered);
+        assert_eq!(
+            Identity::load(&cert, &key).unwrap().fingerprint(),
+            identity.fingerprint()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_lone_certificate_is_preserved_and_needs_operator_action() {
+        let dir = scratch("torn-cert");
+        let (cert, key) = (dir.join("worker.crt"), dir.join("worker.key"));
+        Identity::generate("w").unwrap().save(&cert, &key).unwrap();
+        std::fs::remove_file(&key).unwrap();
+        let certificate = std::fs::read(&cert).unwrap();
+        let error = Identity::load_or_generate("w", &cert, &key).unwrap_err();
+        assert!(matches!(error, Error::Identity(_)));
+        assert!(error.to_string().contains("restore the matching key"));
+        assert_eq!(std::fs::read(&cert).unwrap(), certificate);
+        assert!(!key.exists(), "no replacement key was created");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

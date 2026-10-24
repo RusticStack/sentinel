@@ -25,6 +25,18 @@ Every Part 14 number is measured under a **frozen contract**. A contract is a JS
 
 Freshness: every required test runs on every sample (the cli lane sets `GOFLAGS=-count=1`, stricter than the workflow, whose restored `GOCACHE` can serve results; `cargo test` and `mvn verify` always run); build caches are kept, test results never are. A sample counts only when every job passes. Comparisons use records from the reference host with CPU pressure (`some`, avg60) under 2 % at the start of each sample, at most 30 days old.
 
+**Current B08 assessment (2026-10-24): unmet.** The largest recorded GitHub baselines are 109 s (cli), 88 s (gson) and 30 s (ripgrep), so no lane has the required >=300 s baseline. Sentinel warm nearest-rank p95 over ten non-warmup samples is 64.08 s (cli), 44.02 s (gson) and 21.39 s (ripgrep), computed from `bench/p14-pilot-*.jsonl`. These small samples are development evidence, not a release-grade tail. Do not change the baseline threshold or substitute another comparison to close B08.
+
+## B11: the 2× Blacksmith gate
+
+B11 is the primary relative target and uses a separate frozen contract, not a reinterpretation of revision-4 GitHub self-hosted records. For every selected lane and condition, `Sentinel trigger-to-required-check p95 / Blacksmith trigger-to-required-check p95 <= 0.50`.
+
+- Use identical source SHA, commands, assertions, freshness policy, required jobs/artifacts and resource envelope. Keep cold, warm and small-edit series independent.
+- Interleave 100 paired release samples per lane/condition. Publish raw samples, distributions and variance, plus a one-sided 95% bootstrap upper confidence bound on the paired log-duration ratio below 0.50. Smaller samples may guide optimization but cannot pass the release gate.
+- Count any incorrect or failed required check as a gate failure; never remove failures to improve the distribution. Report job-start-to-finish and phase costs beside the end-to-end clock.
+- Use actual Blacksmith executions and timestamps. Disclose hosted hardware/network differences and call the result a hosted-service comparison, not a same-hardware architectural win, when equivalent hardware cannot be provided.
+- Vendor multipliers, GitHub self-hosted results and the one-run Blacksmith startup probe are not B11 evidence. **Blocked by: Blacksmith benchmark access.** Part 24 and V06 remain open until B11 passes.
+
 ## The runner
 
 `sentinel-bench --contract FILE --lane ID --condition cold|warm|small-edit --root DIR --runtime scoped|podman` behaves as follows:
@@ -173,7 +185,7 @@ B02's phase record ([`b02-sentinel.jsonl`](../bench/b02-sentinel.jsonl)) is the 
 | Image pull | 1.03 s | a registry manifest request for an image already resident (fixed in [B03](latency-budgets.md#before-and-after-the-two-fixes)) |
 | Container start | 0.31 s | |
 
-**Pipeline resolution.** The controller reads the pipeline through a partial clone: the commit and its trees (`--filter=blob:none`), then the pipeline's own blob by its id. What the records show is the phase it sits in: intake → dispatch fell from 4.23 s (median of 10 warm B02 runs) to 0.48 s (median of 4 warm runs after the change). The isolated fetch figures quoted when the change was made (3.6 s and 75 MB before, 0.3 s and 0.2 MB after) appear in the commit message only, with no raw output committed: **not recorded in the repo**, so they are not evidence here; re-measure them with the fetch alone, on the reference host, before citing them. A server that ignores the filter sends everything, and a failure anywhere on the partial path falls back to the whole depth-one fetch, so every server still works (`sentinel-git` `file_at`; test `a_filtering_server_sends_only_the_pipeline_blob`). The bench repository's server has `uploadpack.allowFilter` enabled, as GitHub's does. Pull-request resolution through a merge ref (`file_at_merge`) still fetches the whole tree.
+**Pipeline resolution.** The controller reads the pipeline through a partial clone: the commit and its trees (`--filter=blob:none`), then the pipeline's own blob by its id. What the records show is the phase it sits in: intake → dispatch fell from 4.23 s (median of 10 warm B02 runs) to 0.48 s (median of 4 warm runs after the change). The isolated fetch figures quoted when the change was made (3.6 s and 75 MB before, 0.3 s and 0.2 MB after) appear in the commit message only, with no raw output committed: **not recorded in the repo**, so they are not evidence here; re-measure them with the fetch alone, on the reference host, before citing them. A server that ignores the filter sends everything, and a failure anywhere on the partial path falls back to the whole depth-one fetch, so every server still works (`sentinel-git` `file_at`; test `a_filtering_server_sends_only_the_pipeline_blob`). The bench repository's server has `uploadpack.allowFilter` enabled, as GitHub's does. At the time of this historical record, pull-request resolution through a merge ref still fetched the whole tree; B03a later moved it to the same blob-less partial-clone path. Current-tree revalidation is required before treating the B03-family figures as current.
 
 **After** ([`b04-pipeline-fetch.jsonl`](../bench/b04-pipeline-fetch.jsonl), 4 warm samples and a warm-up, same lane, host and caps):
 

@@ -372,7 +372,7 @@ fn recovery_sweeps_staging_and_reports_orphans_corrupt_and_missing() {
 }
 
 #[test]
-fn verify_catches_content_rot_that_recovery_cannot_see() {
+fn recover_verify_and_read_catch_same_length_content_rot() {
     let mut fx = fixture();
     let digest = fx.put(fx.tenant, b"original content");
     let hex = digest.to_string();
@@ -385,7 +385,7 @@ fn verify_catches_content_rot_that_recovery_cannot_see() {
         .join(&hex);
     std::fs::write(&path, b"original contenX").unwrap();
     let report = fx.objects.recover(&fx.conn).unwrap();
-    assert!(report.corrupt.is_empty());
+    assert_eq!(report.corrupt, vec![path]);
     let corrupt = fx.objects.verify(&fx.conn).unwrap();
     assert_eq!(corrupt.len(), 1);
     assert_eq!(corrupt[0].digest, digest);
