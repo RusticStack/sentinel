@@ -14,7 +14,7 @@ pub struct Cli {
 pub enum Command {
     /// Start the Linux controller: metadata store, worker link and dispatcher
     Server(ServiceArgs),
-    /// Start the separate Linux worker: connects to its controller (execution lands with W03)
+    /// Start the separate Linux worker: connects to its controller and executes assigned jobs
     Worker(ServiceArgs),
     /// Validate or explain a `.sentinel.yml` offline, on any platform
     Pipeline(PipelineArgs),
@@ -335,7 +335,7 @@ pub enum SourceCommand {
         #[arg(long)]
         revoke: bool,
     },
-    /// Opt this repository into bounded `git ls-remote` ref polling (G07); the
+    /// Opt this repository into bounded `git ls-remote` ref polling; the
     /// first poll only records the baseline
     Poll {
         #[arg(long)]
@@ -766,15 +766,12 @@ pub enum MfaCommand {
         user: String,
     },
     /// Confirm an enrollment begun with `enroll` using a current code from
-    /// the app; the ten recovery codes are printed on stdout once
+    /// the app, read from standard input; the ten recovery codes are printed once
     Confirm {
         #[command(flatten)]
         data: DataDir,
         #[arg(long)]
         user: String,
-        /// The six-digit code the app shows now
-        #[arg(long)]
-        code: String,
     },
     /// Replace an enrolled account's recovery codes: the old set stops
     /// working and the new ten are printed on stdout once

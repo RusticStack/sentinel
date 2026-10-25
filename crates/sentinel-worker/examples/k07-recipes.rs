@@ -240,6 +240,7 @@ mod imp {
             },
             images,
             caches: Vec::new(),
+            cache_budget_bytes: sentinel_cache::gc::DEFAULT_BUDGET_BYTES,
             secret_bundle: sentinel_protocol::secrets::DeliveryBundle::empty(),
             mirrors: None,
             prepare_hold: Duration::ZERO,

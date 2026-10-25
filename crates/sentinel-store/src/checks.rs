@@ -159,6 +159,19 @@ pub struct Publication {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Default)]
+pub struct Due {
+    pub publications: Vec<Publication>,
+    /// Durable IDs whose rows could not be decoded. The batch limit bounds both vectors.
+    pub corrupt: Vec<[u8; 16]>,
+}
+
+impl Due {
+    pub fn is_empty(&self) -> bool {
+        self.publications.is_empty() && self.corrupt.is_empty()
+    }
+}
+
 pub fn create_identity(external_id: &str, seq: i64) -> String {
     format!("{external_id}:{seq}")
 }
@@ -664,7 +677,7 @@ pub fn record_delivery(
     )
 }
 
-pub fn due(conn: &Connection, now: UnixMillis, limit: u16) -> Result<Vec<Publication>> {
+pub fn due(conn: &Connection, now: UnixMillis, limit: u16) -> Result<Due> {
     let mut stmt = conn.prepare_cached(concat!(
         "SELECT ",
         columns!(),
@@ -673,8 +686,22 @@ pub fn due(conn: &Connection, now: UnixMillis, limit: u16) -> Result<Vec<Publica
            AND (next_attempt_ms IS NULL OR next_attempt_ms <= ?1)
          ORDER BY created_ms, id LIMIT ?2"
     ))?;
-    let rows = stmt.query_map(params![now.0, limit], decode_row)?;
-    rows.map(|row| decode(row?)).collect()
+    let mut rows = stmt.query(params![now.0, limit])?;
+    let mut due = Due::default();
+    while let Some(row) = rows.next()? {
+        // Keep the durable key even when the typed ID or any other column is corrupt.
+        let id = row.get(0)?;
+        match decode_row(row) {
+            Ok(fields) => match decode(fields) {
+                Ok(publication) => due.publications.push(publication),
+                Err(Error::Corrupt(_)) => due.corrupt.push(id),
+                Err(error) => return Err(error),
+            },
+            // Row extraction only decodes SQLite values; stepping errors above remain lane faults.
+            Err(_) => due.corrupt.push(id),
+        }
+    }
+    Ok(due)
 }
 
 pub fn next_due_ms(conn: &Connection) -> Result<Option<i64>> {
@@ -916,6 +943,22 @@ pub fn defer(
         "UPDATE check_publications SET next_attempt_ms = ?3, updated_ms = ?4
          WHERE id = ?1 AND seq = ?2 AND state = 0",
         params![id.as_bytes(), seq, until, now.0],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Park an undecodable row without trusting any of its other columns, including its typed ID.
+pub fn defer_raw(
+    tx: &Transaction<'_>,
+    id: &[u8; 16],
+    now: UnixMillis,
+    until_ms: i64,
+) -> Result<bool> {
+    let until = until_ms.min(now.0.saturating_add(MAX_DEFER_MS));
+    let changed = tx.execute(
+        "UPDATE check_publications SET next_attempt_ms = ?2, updated_ms = ?3
+         WHERE id = ?1 AND state = 0 AND published_seq < seq",
+        params![id, until, now.0],
     )?;
     Ok(changed == 1)
 }

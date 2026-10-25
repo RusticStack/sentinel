@@ -1222,14 +1222,11 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
     }
     let compiled = compile_str(&dispatch.pipeline)
         .map_err(|e| err(ErrorCode::InvalidRequest, format!("pipeline: {e}")))?;
-    if compiled.jobs.iter().any(|job| {
-        job.spec.registry_auth.is_some()
-            || job
-                .spec
-                .steps
-                .iter()
-                .any(|step| !step.secrets.is_empty() || !step.secret_files.is_empty())
-    }) {
+    if compiled
+        .jobs
+        .iter()
+        .any(|job| job.spec.requires_secret_delivery())
+    {
         return Err(err(
             ErrorCode::Forbidden,
             "a manually dispatched pipeline cannot use secrets; \

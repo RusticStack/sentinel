@@ -14,8 +14,9 @@ const tabs = computed(() => [
 useHead({ title: `Tenant admin · ${slug} · Sentinel` });
 const { needed: override, reason } = useOverride(() => slug);
 // Where membership comes from decides whether people are added here at all.
-const { data: settings } = await useNamespaceSettings(slug);
+const { data: settings, refresh: refreshSettings } = await useNamespaceSettings(slug);
 const namespace = computed(() => settings.value?.settings ?? null);
+const settingsFailure = computed(() => settings.value?.failure ?? null);
 </script>
 
 <template>
@@ -33,7 +34,7 @@ const namespace = computed(() => settings.value?.settings ?? null);
       </UFormField>
     </section>
     <AdminMembers v-if="section === 'members'" :slug="slug" :settings="namespace" />
-    <AdminInvitations v-else-if="section === 'invitations'" :slug="slug" :settings="namespace" />
+    <AdminInvitations v-else-if="section === 'invitations'" :slug="slug" :settings="namespace" :settings-failure="settingsFailure" :retry-settings="refreshSettings" />
     <AdminRepos v-else-if="section === 'repos'" :slug="slug" />
     <AdminServiceAccounts v-else-if="section === 'service-accounts'" :slug="slug" />
     <AdminSecrets v-else-if="section === 'secrets'" :slug="slug" />

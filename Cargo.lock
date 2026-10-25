@@ -1286,6 +1286,7 @@ dependencies = [
 name = "sentinel-checks"
 version = "0.1.0-dev"
 dependencies = [
+ "rusqlite",
  "sentinel-auth",
  "sentinel-core",
  "sentinel-github",

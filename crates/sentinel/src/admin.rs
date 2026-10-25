@@ -37,6 +37,27 @@ pub(crate) fn fail(message: impl Into<String>) -> Error {
     }
 }
 
+fn read_mfa_code() -> Result<String, Error> {
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Err(fail(
+            "read the six-digit code from standard input, for example: sentinel admin mfa confirm ... < code-file",
+        ));
+    }
+    let mut code = sentinel::bounded::read(stdin.lock(), 8)
+        .map_err(|_| fail("the code on standard input must be six ASCII digits"))?;
+    if code.last() == Some(&b'\n') {
+        code.pop();
+        if code.last() == Some(&b'\r') {
+            code.pop();
+        }
+    }
+    if code.len() != 6 || !code.iter().all(u8::is_ascii_digit) {
+        return Err(fail("the code on standard input must be six ASCII digits"));
+    }
+    String::from_utf8(code).map_err(|_| fail("the code on standard input must be six ASCII digits"))
+}
+
 fn read_password() -> Result<Vec<u8>, Error> {
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
@@ -1405,12 +1426,13 @@ fn second_factor(args: &MfaArgs, now: UnixMillis) -> Result<(), Error> {
             );
             sentinel::outln!("{}", enrollment.provisioning_uri);
         }
-        MfaCommand::Confirm { data, user, code } => {
+        MfaCommand::Confirm { data, user } => {
+            let code = read_mfa_code()?;
             let store = open(data, true)?;
             let key = master_key(data)?;
             let user = resolve_user(&store, user)?;
-            let codes = mfa::confirm_enrollment_host_local(&store, &key, user, code, now).map_err(
-                |error| match error {
+            let codes = mfa::confirm_enrollment_host_local(&store, &key, user, &code, now)
+                .map_err(|error| match error {
                     sentinel_store::Error::Forbidden => {
                         fail("that code is not valid now; use the one the app shows at this moment")
                     }
@@ -1418,8 +1440,7 @@ fn second_factor(args: &MfaArgs, now: UnixMillis) -> Result<(), Error> {
                         fail("no enrollment is waiting; run `sentinel admin mfa enroll` first")
                     }
                     other => fail(format!("cannot confirm enrollment: {other}")),
-                },
-            )?;
+                })?;
             eprintln!("second factor enrolled for {user}; the recovery codes are shown once");
             for code in &codes {
                 sentinel::outln!("{}", code.expose());

@@ -53,6 +53,7 @@ struct Fake {
     fail_part: AtomicU32,
     parts_sent: AtomicU32,
     next_id: AtomicU32,
+    on_delete: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 fn transient(message: &str) -> BucketError {
@@ -207,6 +208,9 @@ impl Bucket for Fake {
     fn delete(&self, key: &str) -> BucketResult<()> {
         self.up()?;
         self.objects.lock().unwrap().remove(key);
+        if let Some(hook) = self.on_delete.lock().unwrap().take() {
+            hook();
+        }
         Ok(())
     }
     fn list(&self, prefix: &str) -> BucketResult<Vec<String>> {
@@ -793,6 +797,51 @@ fn a_queued_delete_never_removes_the_copy_of_content_committed_again() {
         .unwrap();
     assert_eq!(queued, 0, "the stale delete was dropped, not left to retry");
     assert_eq!(f.read(digest).unwrap(), b"same bytes twice");
+}
+
+#[test]
+fn delete_then_replicate_heals_content_recommitted_during_the_remote_delete() {
+    let f = fixture();
+    let digest = f.put(b"recommitted during delete");
+    let r = f.replicator(SETTINGS);
+    r.pass().unwrap();
+    let key = objects::remote_key(f.tenant, &digest);
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "DELETE FROM objects WHERE tenant_id = ?1 AND digest = ?2",
+                rusqlite::params![tenant.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let store = Arc::clone(&f.store);
+    let objects = Arc::clone(&f.objects);
+    *f.bucket.on_delete.lock().unwrap() = Some(Box::new(move || {
+        let staged = objects
+            .stage(
+                tenant,
+                &b"recommitted during delete"[..],
+                u64::MAX,
+                Expect::default(),
+            )
+            .unwrap();
+        assert_eq!(staged.digest(), digest);
+        store
+            .writer()
+            .write(move |tx| objects.commit(tx, &staged))
+            .unwrap();
+    }));
+    let pass = r.pass().unwrap();
+    assert_eq!((pass.deleted, pass.replicated), (1, 1));
+    assert_eq!(
+        f.bucket.objects.lock().unwrap()[&key].0,
+        b"recommitted during delete"
+    );
+    assert_eq!(f.read(digest).unwrap(), b"recommitted during delete");
 }
 
 #[test]

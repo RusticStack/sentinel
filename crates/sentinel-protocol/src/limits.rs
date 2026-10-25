@@ -1,5 +1,4 @@
 pub const MAX_API_BODY_BYTES: usize = 1 << 20;
-pub const MAX_WEBHOOK_BODY_BYTES: usize = 25 << 20;
 pub const MAX_PIPELINE_FILE_BYTES: usize = 256 << 10;
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 << 10;
 pub const MAX_LOG_FRAME_BYTES: usize = 32 << 10;

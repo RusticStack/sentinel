@@ -18,7 +18,7 @@ struct Cli {
     /// Ignored with `--contract`, whose lane is the workload
     #[arg(long, value_enum, default_value_t = Workload::Noop)]
     workload: Workload,
-    /// A frozen benchmark contract (`sentinel.bench-contract/1`, B01): the
+    /// A frozen benchmark contract (`sentinel.bench-contract/1`): the
     /// runner measures its `--lane` under `--condition`, and only when the
     /// host, image and sources match it
     #[arg(long, requires_all = ["lane", "condition"])]
@@ -94,7 +94,7 @@ enum Runtime {
     Direct,
     /// The workload as a direct process in a systemd user scope holding the
     /// same CPU and memory caps a container would get: identical isolation
-    /// without a container (B01)
+    /// without a container
     Scoped,
     Podman,
 }

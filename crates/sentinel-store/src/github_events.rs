@@ -229,11 +229,11 @@ fn rerequest(
         if stale {
             continue;
         }
-        let jobs = runs::run_jobs(tx, tenant, run)?;
+        let jobs = crate::jobs::for_run(tx, tenant, run)?;
         if jobs.is_empty()
             || jobs
                 .iter()
-                .any(|(_, s)| !matches!(s, JobState::Terminal(_)))
+                .any(|(_, row)| !matches!(row.state, JobState::Terminal(_)))
         {
             continue;
         }
@@ -242,24 +242,30 @@ fn rerequest(
         if jobs.len() != spec.pipeline.jobs.len() {
             return Err(Error::Corrupt("run jobs"));
         }
+        let run_cancel: bool = tx.query_row(
+            "SELECT cancel_requested FROM runs WHERE id=?1 AND tenant_id=?2",
+            params![run.as_bytes(), tenant.as_bytes()],
+            |row| row.get(0),
+        )?;
         // Queued on the steady clock that queue timeouts are judged against, not `now`.
         let queued = UnixMillis::steady();
-        for ((job, seen), compiled) in jobs.iter().zip(&spec.pipeline.jobs) {
+        for ((job, row), compiled) in jobs.iter().zip(&spec.pipeline.jobs) {
             let ready = compiled.needs.is_empty() && compiled.spec.condition.is_none();
             let state = if ready {
                 JobState::Queued
             } else {
                 JobState::Blocked
             };
-            let reset = tx.execute("UPDATE jobs SET state_code=?1,cancel_requested=0,failure_class=NULL,queued_ms=?2,leased_ms=NULL,preparing_ms=NULL,running_ms=NULL,finalizing_ms=NULL,terminal_ms=NULL WHERE id=?3 AND state_code=?4",params![crate::codec::encode_state(state),if ready{Some(queued.0)}else{None},job.as_bytes(),crate::codec::encode_state(*seen)])?;
-            if reset != 1 {
-                return Err(Error::Corrupt("run job state"));
-            }
+            runs::reset_terminal_job(tx, tenant, *job, row, state, queued, true)?;
         }
-        tx.execute(
-            "UPDATE runs SET cancel_requested=0 WHERE id=?1 AND tenant_id=?2",
-            params![run.as_bytes(), tenant.as_bytes()],
+        let cleared = tx.execute(
+            "UPDATE runs SET cancel_requested=0
+             WHERE id=?1 AND tenant_id=?2 AND cancel_requested=?3",
+            params![run.as_bytes(), tenant.as_bytes(), run_cancel],
         )?;
+        if cleared != 1 {
+            return Err(Error::Conflict);
+        }
         crate::dispatch::release_dependents(tx, tenant, run, now)?;
         checks::record_run(tx, tenant, run, now)?;
         reran = true;

@@ -70,12 +70,7 @@ pub fn create_run(
             job_arch(job.spec.runs_on.arch),
             dispatch::encode_labels(&job.spec.runs_on.labels)?,
             group,
-            job.spec.registry_auth.is_some()
-                || job
-                    .spec
-                    .steps
-                    .iter()
-                    .any(|step| { !step.secrets.is_empty() || !step.secret_files.is_empty() }),
+            job.spec.requires_secret_delivery(),
             dispatch::job_runtime(&job.spec.runs_on),
         ])?;
         if let Ok(image) = sentinel_pipeline::run::ImageRef::parse(&job.spec.image) {
@@ -406,25 +401,48 @@ pub fn rerun_job(
         cancel_requested: row.cancel_requested,
     };
     let next = control.apply(Actor::Controller, Event::Rerun)?;
+    reset_terminal_job(tx, tenant, job, &row, next, now, false)?;
+    crate::checks::record_job(tx, tenant, job, now)?;
+    revive_skipped_dependents(tx, tenant, job, now)?;
+    Ok(next)
+}
+
+/// Reset one observed terminal job without rewriting its attempt history.
+pub(crate) fn reset_terminal_job(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    job: JobId,
+    observed: &jobs::JobRow,
+    next: JobState,
+    now: UnixMillis,
+    clear_cancel: bool,
+) -> Result<()> {
+    if !matches!(observed.state, JobState::Terminal(_))
+        || !matches!(next, JobState::Queued | JobState::Blocked)
+    {
+        return Err(Error::InvalidInput("terminal job reset"));
+    }
     let changed = tx.execute(
         "UPDATE jobs SET state_code = ?1, failure_class = NULL, queued_ms = ?2,
-            leased_ms = NULL, preparing_ms = NULL, running_ms = NULL, finalizing_ms = NULL, terminal_ms = NULL
-         WHERE id = ?3 AND tenant_id = ?4 AND state_code = ?5 AND fence = ?6",
+            leased_ms = NULL, preparing_ms = NULL, running_ms = NULL, finalizing_ms = NULL,
+            terminal_ms = NULL, cancel_requested = ?3
+         WHERE id = ?4 AND tenant_id = ?5 AND state_code = ?6 AND fence = ?7
+           AND cancel_requested = ?8",
         params![
             encode_state(next),
-            now.0,
+            (next == JobState::Queued).then_some(now.0),
+            !clear_cancel && observed.cancel_requested,
             job.as_bytes(),
             tenant.as_bytes(),
-            encode_state(row.state),
-            row.fence.0 as i64,
+            encode_state(observed.state),
+            observed.fence.0 as i64,
+            observed.cancel_requested,
         ],
     )?;
     if changed != 1 {
         return Err(Error::Conflict);
     }
-    crate::checks::record_job(tx, tenant, job, now)?;
-    revive_skipped_dependents(tx, tenant, job, now)?;
-    Ok(next)
+    Ok(())
 }
 
 fn revive_skipped_dependents(
@@ -487,4 +505,82 @@ fn revive_skipped_dependents(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+    use sentinel_core::Outcome;
+
+    use super::*;
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn terminal_job(cancel_requested: bool) -> (Connection, TenantId, JobId) {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        crate::migrate(&mut conn).unwrap();
+        let (tenant, repo, run, job) = (TenantId::new(), RepoId::new(), RunId::new(), JobId::new());
+        let tx = conn.transaction().unwrap();
+        jobs::insert_tenant(&tx, tenant, "acme", UnixMillis(1)).unwrap();
+        jobs::insert_repo(&tx, tenant, repo, "app", UnixMillis(1)).unwrap();
+        jobs::insert_run(&tx, tenant, repo, run, SHA, UnixMillis(1)).unwrap();
+        jobs::insert_job(&tx, tenant, run, job, "build", 5, 1).unwrap();
+        tx.execute(
+            "UPDATE jobs SET state_code=?1, fence=7, cancel_requested=?2 WHERE id=?3",
+            params![
+                encode_state(JobState::Terminal(Outcome::Canceled)),
+                cancel_requested,
+                job.as_bytes()
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        (conn, tenant, job)
+    }
+
+    #[test]
+    fn a_terminal_reset_rejects_a_stale_fence_snapshot() {
+        let (mut conn, tenant, job) = terminal_job(false);
+        let observed = jobs::get_job(&conn, tenant, job).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute("UPDATE jobs SET fence=8 WHERE id=?1", [job.as_bytes()])
+            .unwrap();
+        assert!(matches!(
+            reset_terminal_job(
+                &tx,
+                tenant,
+                job,
+                &observed,
+                JobState::Queued,
+                UnixMillis(2),
+                false,
+            ),
+            Err(Error::Conflict)
+        ));
+    }
+
+    #[test]
+    fn a_terminal_reset_rejects_a_stale_cancel_snapshot() {
+        let (mut conn, tenant, job) = terminal_job(true);
+        let observed = jobs::get_job(&conn, tenant, job).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "UPDATE jobs SET cancel_requested=0 WHERE id=?1",
+            [job.as_bytes()],
+        )
+        .unwrap();
+        assert!(matches!(
+            reset_terminal_job(
+                &tx,
+                tenant,
+                job,
+                &observed,
+                JobState::Queued,
+                UnixMillis(2),
+                true,
+            ),
+            Err(Error::Conflict)
+        ));
+    }
 }

@@ -882,7 +882,7 @@ fn nothing_the_other_camp_tried_changed_anything() {
         let t = &camp.target;
         let get = |path: String| send(&d.base, "GET", &path, &Body::None, Some(&camp.bearer), &[]);
         let (_, run) = get(format!("/api/v1/runs/{}", t.run));
-        assert!(!run["cancel_requested"].as_bool().unwrap_or(false), "{run}");
+        assert!(!run["cancel_requested"].as_bool().unwrap(), "{run}");
         assert_ne!(run["state"], "canceled", "{run}");
         let (_, runs) = get(format!("/api/v1/tenants/{}/repos/{}/runs", t.org, t.repo));
         assert_eq!(runs["runs"].as_array().unwrap().len(), 1, "{runs}");
@@ -908,7 +908,7 @@ fn nothing_the_other_camp_tried_changed_anything() {
         let (_, repos) = get(format!("/api/v1/tenants/{}/repos", t.org));
         assert_eq!(repos["repos"].as_array().unwrap().len(), 1, "{repos:?}");
         let (_, upload) = get(format!("/api/v1/uploads/{}", t.upload));
-        assert_eq!(upload["received"].as_u64().unwrap_or(0), 0, "{upload}");
+        assert_eq!(upload["received"].as_u64().unwrap(), 0, "{upload}");
         assert!(members.iter().all(|m| m["user"] != other.target.user));
     }
 }

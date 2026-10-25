@@ -396,6 +396,21 @@ fn changing_a_password_requires_the_current_one_and_rotates_every_session() {
         )
         .unwrap()
     );
+    assert!(
+        matches!(
+            local_auth::change_password(
+                &store,
+                &issued.session,
+                &session,
+                Policy::default(),
+                OTHER,
+                b"short",
+                at(2_250)
+            ),
+            Err(Error::InvalidInput("password"))
+        ),
+        "an invalid replacement is refused before the current password is judged"
+    );
     assert!(matches!(
         local_auth::change_password(
             &store,

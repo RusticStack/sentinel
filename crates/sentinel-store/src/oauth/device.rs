@@ -322,6 +322,7 @@ fn redeem(
         name: None,
         lifetime_ms: LOGIN_GRANT_MS,
         created_by: None,
+        created_session: None,
     };
     const REDEEM: &str =
         "UPDATE oauth_device_codes SET status = 3, grant_id = ?2 WHERE device_digest = ?1";

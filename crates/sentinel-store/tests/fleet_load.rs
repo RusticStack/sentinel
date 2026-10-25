@@ -249,7 +249,7 @@ fn fleet() -> Fleet {
 }
 
 #[test]
-#[ignore = "Q09 10k-job load: cargo test --release -p sentinel-store --test fleet_load -- --ignored --nocapture"]
+#[ignore = "10k-job load: cargo test --release -p sentinel-store --test fleet_load -- --ignored --nocapture"]
 fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
     let f = fleet();
     assert_eq!(f.jobs, JOBS);
@@ -414,7 +414,7 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
 }
 
 #[test]
-#[ignore = "P08-8 listing cost: cargo test --release -p sentinel-store --test fleet_load -- --ignored --nocapture"]
+#[ignore = "queue listing cost: cargo test --release -p sentinel-store --test fleet_load -- --ignored --nocapture"]
 fn listing_a_five_thousand_job_queue_explains_only_the_page() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();

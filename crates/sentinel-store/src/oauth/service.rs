@@ -73,6 +73,7 @@ pub fn issue_service_grant(
             name: Some(name),
             lifetime_ms,
             created_by: Some(principal.user),
+            created_session: authority.created_session(),
         },
         now,
     )?;

@@ -314,6 +314,7 @@ fn redeem(
         name: None,
         lifetime_ms: LOGIN_GRANT_MS,
         created_by: None,
+        created_session: None,
     };
     // Suspended since approval: the insert trigger refuses it; the code stays spent.
     let grant = match insert_grant(tx, &grant, now) {

@@ -137,6 +137,7 @@ fn the_pull_overlaps_the_checkout() {
         images: images.clone(),
         secret_bundle: sentinel_protocol::secrets::DeliveryBundle::empty(),
         caches: Vec::new(),
+        cache_budget_bytes: sentinel_cache::gc::DEFAULT_BUDGET_BYTES,
         mirrors: None,
         prepare_hold: Duration::ZERO,
         network: sentinel_worker::podman::Network::None,

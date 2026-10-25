@@ -32,7 +32,9 @@ fn trusted_proxy_valid(entry: &str) -> bool {
 fn trusted_proxy_valid(_: &str) -> bool {
     true
 }
+#[cfg(feature = "server")]
 const LINK_SHUTDOWN: Duration = Duration::from_secs(2);
+#[cfg(feature = "server")]
 const STORE_SHUTDOWN: Duration = Duration::from_secs(5);
 #[cfg(feature = "worker")]
 const WORKER_SHUTDOWN: Duration = Duration::from_secs(20);
@@ -132,6 +134,7 @@ impl RemoteCacheFile {
     }
 }
 
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct S3File {
@@ -267,6 +270,7 @@ fn valid_label(label: &str) -> bool {
 const EGRESS_LABEL: &str = "egress";
 const MAX_LABELS: usize = 16;
 
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StorageFile {
@@ -378,6 +382,7 @@ impl StorageFile {
 }
 
 /// `[microvm]` as the worker reads it; turned into the executor's setup where it is Linux-only.
+#[cfg_attr(not(feature = "worker"), allow(dead_code))]
 #[derive(Clone)]
 struct MicrovmSetup {
     firecracker: PathBuf,
@@ -385,6 +390,31 @@ struct MicrovmSetup {
     agent: PathBuf,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum NetworkSetting {
+    None,
+    Egress,
+}
+
+#[derive(Clone, Copy)]
+enum IsolationSetting {
+    Auto,
+    Container,
+    Microvm,
+}
+
+impl IsolationSetting {
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "auto" => Some(Self::Auto),
+            "container" => Some(Self::Container),
+            "microvm" => Some(Self::Microvm),
+            _ => None,
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "worker"), allow(dead_code))]
 #[derive(Clone)]
 struct WorkerLink {
     controller: SocketAddr,
@@ -396,8 +426,8 @@ struct WorkerLink {
     memory_bytes: Option<u64>,
     git_mirrors: bool,
     labels: Vec<String>,
-    job_network: sentinel_worker::podman::Network,
-    isolation: sentinel_worker::host::Preference,
+    job_network: NetworkSetting,
+    isolation: IsolationSetting,
     microvm: Option<MicrovmSetup>,
     disk_bytes: Option<u64>,
     spool_reserve_bytes: Option<u64>,
@@ -410,6 +440,7 @@ struct WorkerLink {
 }
 
 // One value per process, built once: the size difference costs nothing, and boxing either side only moves the lint.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 #[allow(clippy::large_enum_variant)]
 enum Role {
     Server {
@@ -696,8 +727,8 @@ impl Config {
                         ));
                     }
                     let job_network = match file.job_network.as_deref() {
-                        None | Some("none") => sentinel_worker::podman::Network::None,
-                        Some("egress") => sentinel_worker::podman::Network::Egress,
+                        None | Some("none") => NetworkSetting::None,
+                        Some("egress") => NetworkSetting::Egress,
                         Some(_) => {
                             return Err(Error::config(
                                 "job_network must be \"none\" or \"egress\"",
@@ -705,7 +736,7 @@ impl Config {
                         }
                     };
                     // Advertised, so a pipeline that needs the network selects it with `runs_on.labels: [egress]`.
-                    if job_network == sentinel_worker::podman::Network::Egress
+                    if job_network == NetworkSetting::Egress
                         && !labels.iter().any(|label| label == EGRESS_LABEL)
                     {
                         if labels.len() == MAX_LABELS {
@@ -716,14 +747,12 @@ impl Config {
                         labels.push(EGRESS_LABEL.to_owned());
                     }
                     let isolation = match file.isolation.as_deref() {
-                        None => sentinel_worker::host::Preference::Auto,
-                        Some(text) => {
-                            sentinel_worker::host::Preference::parse(text).ok_or_else(|| {
-                                Error::config(
-                                    "isolation must be \"auto\", \"container\" or \"microvm\"",
-                                )
-                            })?
-                        }
+                        None => IsolationSetting::Auto,
+                        Some(text) => IsolationSetting::parse(text).ok_or_else(|| {
+                            Error::config(
+                                "isolation must be \"auto\", \"container\" or \"microvm\"",
+                            )
+                        })?,
                     };
                     if file.disk_bytes == Some(0) {
                         return Err(Error::config("disk_bytes must be positive when set"));
@@ -2519,7 +2548,12 @@ mod worker_role {
                 kernel: m.kernel.clone(),
                 agent: m.agent.clone(),
             });
-        let selection = runtime_selection(link.isolation, setup.as_ref())?;
+        let preference = match link.isolation {
+            IsolationSetting::Auto => sentinel_worker::host::Preference::Auto,
+            IsolationSetting::Container => sentinel_worker::host::Preference::Container,
+            IsolationSetting::Microvm => sentinel_worker::host::Preference::Microvm,
+        };
+        let selection = runtime_selection(preference, setup.as_ref())?;
         capabilities = capabilities.union(runtime_capabilities(&selection));
         let runtime = sentinel_worker::attempt::Runtime {
             default: Some(selection.default),
@@ -2583,13 +2617,17 @@ mod worker_role {
         let enrollment_file = link.enrollment_file.clone();
         let metrics = Arc::new(crate::worker_metrics::Metrics::default());
         let events = Arc::clone(&metrics);
+        let network = match link.job_network {
+            NetworkSetting::None => sentinel_worker::podman::Network::None,
+            NetworkSetting::Egress => sentinel_worker::podman::Network::Egress,
+        };
         let executor = executor(
             &config.data_dir,
             worker,
             link.git_mirrors,
             (link.spool_reserve_bytes, link.spool_quota_bytes),
             link.budgets,
-            link.job_network,
+            network,
             runtime,
             Arc::clone(&metrics),
         );

@@ -108,6 +108,7 @@ pub enum Event {
     GithubMemberRemoved = 72,
     TenantBackingChanged = 73,
     DomainAutoJoined = 74,
+    MfaEnrollmentStarted = 75,
 }
 
 impl Event {
@@ -179,6 +180,7 @@ impl Event {
             Event::GithubMemberRemoved => "github-member-removed",
             Event::TenantBackingChanged => "tenant-backing-changed",
             Event::DomainAutoJoined => "domain-auto-joined",
+            Event::MfaEnrollmentStarted => "mfa-enrollment-started",
         }
     }
 
@@ -250,6 +252,7 @@ impl Event {
             72 => Event::GithubMemberRemoved,
             73 => Event::TenantBackingChanged,
             74 => Event::DomainAutoJoined,
+            75 => Event::MfaEnrollmentStarted,
             _ => return None,
         })
     }
@@ -770,9 +773,7 @@ pub fn revoke_all(tx: &Transaction<'_>, user: UserId, now: UnixMillis) -> Result
             "SELECT MIN(created_ms) FROM sessions WHERE user_id = ?1 AND revoked_ms IS NULL",
         )?
         .query_row(params![user.as_bytes()], |r| r.get(0))?;
-    if let Some(since) = since {
-        crate::oauth::revoke_minted_since(tx, user, UnixMillis(since), now)?;
-    }
+    crate::oauth::revoke_all_minted(tx, user, since.map(UnixMillis), now)?;
     let revoked = tx.execute(
         "UPDATE sessions SET revoked_ms = ?2 WHERE user_id = ?1 AND revoked_ms IS NULL",
         params![user.as_bytes(), now.0],
@@ -798,6 +799,7 @@ pub fn change_password(
     new: &[u8],
     now: UnixMillis,
 ) -> Result<bool> {
+    password::acceptable(new).map_err(|_| Error::InvalidInput("password"))?;
     let user = session.user;
     let (enrolled, stored) = store.read(|conn| {
         conn.prepare_cached(
@@ -1040,7 +1042,6 @@ pub fn revoke_session(
     if revoked == 0 {
         return Err(Error::NotFound);
     }
-    crate::oauth::revoke_minted_since(tx, user, UnixMillis(created), now)?;
     audit(
         tx,
         Event::SessionRevoked,
@@ -1048,7 +1049,9 @@ pub fn revoke_session(
         Some(user),
         authority.host_local(),
         None,
-    )
+    )?;
+    crate::oauth::revoke_minted_for_session(tx, user, session, UnixMillis(created), now)?;
+    Ok(())
 }
 
 pub fn revoke_all_host_local(store: &Store, user: UserId, now: UnixMillis) -> Result<usize> {

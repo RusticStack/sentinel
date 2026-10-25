@@ -794,6 +794,11 @@ impl Executor {
             let state = self.state();
             (state.prepare_hold, state.network, state.runtime.clone())
         };
+        let cache_budget_bytes = self
+            .budgets
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cache_bytes;
         let mut job = Job {
             worker: self.worker,
             attempt: offer.attempt,
@@ -804,6 +809,7 @@ impl Executor {
             context,
             images: self.images.clone(),
             caches: Vec::new(),
+            cache_budget_bytes,
             mirrors: self.mirrors.clone(),
             prepare_hold,
             network,

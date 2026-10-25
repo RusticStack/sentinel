@@ -260,6 +260,60 @@ fn workers_report_capacity_reservations_labels_and_drain() {
 }
 
 #[test]
+fn zero_disk_is_explicit_for_profile_workers_and_absent_for_legacy_workers() {
+    let f = Fixture::new(1);
+    f.store
+        .writer()
+        .write(|tx| {
+            tx.execute("UPDATE workers SET protocol = 6, disk_bytes = 0", [])?;
+            Ok(())
+        })
+        .unwrap();
+    let (_, legacy) = get(&f, "/api/v1/workers?tenant=acme", &f.auth);
+    let legacy = &legacy["pools"][0]["workers"][0];
+    assert!(legacy["capacity"].get("disk_bytes").is_none());
+    assert!(legacy["free"].get("disk_bytes").is_none());
+    let (_, _, metrics) = call(
+        &f.base,
+        "GET",
+        "/metrics",
+        None,
+        &[("authorization", &f.auth)],
+    );
+    assert!(
+        metrics
+            .as_str()
+            .unwrap()
+            .contains("sentinel_workers{state=\"no_disk\"} 0")
+    );
+
+    f.store
+        .writer()
+        .write(|tx| {
+            tx.execute("UPDATE workers SET protocol = 7", [])?;
+            Ok(())
+        })
+        .unwrap();
+    let (_, profile) = get(&f, "/api/v1/workers?tenant=acme", &f.auth);
+    let profile = &profile["pools"][0]["workers"][0];
+    assert_eq!(profile["capacity"]["disk_bytes"], 0);
+    assert_eq!(profile["free"]["disk_bytes"], 0);
+    let (_, _, metrics) = call(
+        &f.base,
+        "GET",
+        "/metrics",
+        None,
+        &[("authorization", &f.auth)],
+    );
+    assert!(
+        metrics
+            .as_str()
+            .unwrap()
+            .contains("sentinel_workers{state=\"no_disk\"} 1")
+    );
+}
+
+#[test]
 fn sync_reports_pending_check_lag_per_repository() {
     let f = Fixture::new(1);
     let (status, body) = get(&f, "/api/v1/tenants/acme/sync", &f.auth);

@@ -60,7 +60,7 @@ No metric has a tenant, repository, user or worker label, so a scrape never name
 | `sentinel_jobs_waiting{state}` | gauge | `queued` (ready) and `blocked` jobs |
 | `sentinel_jobs_oldest_queued_seconds` | gauge | age of the oldest ready job |
 | `sentinel_attempts_held` | gauge | attempts not yet released |
-| `sentinel_workers{state}` | gauge | `enrolled`, `connected`, `draining` |
+| `sentinel_workers{state}` | gauge | `enrolled`, `connected`, `draining`, and `no_disk` (profile-protocol workers reporting zero disk) |
 | `sentinel_link_events_total{event}` | counter | the worker link's counters: admissions, offers, lapses, expiries, log frames and refusals, placement and sweep errors, revoked sessions … |
 | `sentinel_remote_cache_bytes`, `sentinel_log_writers_open` | gauge | the remote cache store and open attempt log writers |
 | `sentinel_storage_free_bytes`, `_reserve_bytes`, `_inflight_bytes`, `_admission_open`, `_metadata_bytes`, `_stored_bytes` | gauge | disk, reserve, admission ([retention](retention.md)) |
@@ -68,7 +68,7 @@ No metric has a tenant, repository, user or worker label, so a scrape never name
 | `sentinel_backup_last_success_seconds`, `sentinel_backup_last_failed` | gauge | the backup scheduler, when configured ([backup](backup.md)) |
 | `sentinel_github_check_publications{state}`, `sentinel_github_oldest_pending_seconds` | gauge | the GitHub Checks outbox: `pending` and `refused` publications, and the age of the oldest pending one ([checks](checks.md)) |
 
-Suggested alerts: `sentinel_storage_admission_open == 0`; `sentinel_s3_healthy == 0` for 15 minutes; `time() - sentinel_backup_last_success_seconds` above twice the backup interval; `sentinel_jobs_oldest_queued_seconds` above your queue objective while `sentinel_workers{state="connected"} > 0`; `sentinel_github_oldest_pending_seconds > 600`; a 5xx rate above zero.
+Suggested alerts: `sentinel_storage_admission_open == 0`; `sentinel_s3_healthy == 0` for 15 minutes; `sentinel_workers{state="no_disk"} > 0`; `time() - sentinel_backup_last_success_seconds` above twice the backup interval; `sentinel_jobs_oldest_queued_seconds` above your queue objective while `sentinel_workers{state="connected"} > 0`; `sentinel_github_oldest_pending_seconds > 600`; a 5xx rate above zero.
 
 ## Worker metrics
 

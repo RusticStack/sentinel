@@ -685,7 +685,35 @@ fn publish_opens_files_nofollow() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn publish_refuses_a_generation_over_the_byte_cap() {
+fn publish_refuses_a_generation_over_a_small_configured_budget() {
+    const BUDGET: u64 = 1 << 30;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cache");
+    let view = tmp.path().join("view");
+    fs::create_dir_all(&view).unwrap();
+    let huge = fs::File::create(view.join("huge")).unwrap();
+    huge.set_len(BUDGET / 4 + 1).unwrap();
+    let a = attached(test_scope(Trust::Protected), vec![target(view)]);
+    let out = sentinel_cache::publish::commit_with_budget(
+        &root,
+        BUDGET,
+        &a,
+        Trust::Protected,
+        UnixMillis(1_000),
+        deadline(),
+        &never(),
+    );
+    assert!(
+        matches!(out, Err(PublishError::TooLarge)),
+        "a generation over one quarter of the configured budget must be refused, got {out:?}"
+    );
+    assert!(current_gen(&entry_of(&root, &a)).is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn default_budget_refuses_a_generation_over_the_byte_cap() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("cache");
     let view = tmp.path().join("view");

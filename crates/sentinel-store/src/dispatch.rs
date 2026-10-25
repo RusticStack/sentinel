@@ -2731,6 +2731,7 @@ struct Explainer<'c> {
     workers: Option<Vec<(WorkerId, WorkerFacts)>>,
     free: HashMap<WorkerId, Capacity>,
     fairness: HashMap<WorkerId, Fairness>,
+    condition_only: HashMap<RunId, Vec<bool>>,
     locality: LocalityCache,
 }
 
@@ -2744,13 +2745,41 @@ impl<'c> Explainer<'c> {
             workers: None,
             free: HashMap::new(),
             fairness: HashMap::new(),
+            condition_only: HashMap::new(),
             locality: LocalityCache::default(),
         }
     }
 
     fn explain(&mut self, w: &Waiting) -> Result<WaitReason> {
         match decode_state(w.state).ok_or(Error::Corrupt("state_code"))? {
-            JobState::Blocked => return Ok(WaitReason::Dependency),
+            JobState::Blocked => {
+                let index =
+                    usize::try_from(w.pick.spec_index).map_err(|_| Error::Corrupt("spec_index"))?;
+                let conditions = match self.condition_only.get(&w.run) {
+                    Some(conditions) => conditions,
+                    None => {
+                        let spec = runs::get_run_spec(self.conn, self.tenant, w.run)?;
+                        self.condition_only.entry(w.run).or_insert_with(|| {
+                            spec.pipeline
+                                .jobs
+                                .iter()
+                                .map(|job| job.spec.condition.is_some() && job.needs.is_empty())
+                                .collect()
+                        })
+                    }
+                };
+                return Ok(
+                    if conditions
+                        .get(index)
+                        .copied()
+                        .ok_or(Error::Corrupt("spec_index"))?
+                    {
+                        WaitReason::Policy("condition")
+                    } else {
+                        WaitReason::Dependency
+                    },
+                );
+            }
             JobState::Queued => {}
             _ => return Err(Error::InvalidInput("job is not waiting")),
         }

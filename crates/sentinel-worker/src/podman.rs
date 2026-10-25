@@ -577,6 +577,34 @@ impl Container {
         store: &Store,
         network: Network,
     ) -> Result<Container> {
+        Self::start_canceled(
+            worker,
+            attempt,
+            image,
+            limits,
+            workspace,
+            mounts,
+            store,
+            network,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_canceled(
+        worker: WorkerId,
+        attempt: AttemptId,
+        image: &str,
+        limits: Limits,
+        workspace: &Path,
+        mounts: &[Mount],
+        store: &Store,
+        network: Network,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Container> {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Preparation("container create canceled".into()));
+        }
         let name = format!("sentinel-{attempt}");
         let mut cmd = podman_in(store);
         cmd.args(["create", "--name", &name])
@@ -641,7 +669,20 @@ impl Container {
             .arg(image)
             .args(["-c", KEEPALIVE, "sentinel-keepalive"])
             .arg(limits.keepalive_secs().to_string());
-        let created = process::run(cmd, deadline(CONTAINER_START_TIMEOUT), "podman create")?;
+        let created = match process::run_canceled(
+            cmd,
+            deadline(CONTAINER_START_TIMEOUT),
+            "podman create",
+            None,
+            Some(cancel),
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                // The service may have created the container before a canceled or timed-out client exited.
+                let _ = remove_named(&name, store);
+                return Err(error);
+            }
+        };
         if !created.success() {
             return Err(Error::Preparation(format!(
                 "container create: {}",
@@ -655,9 +696,19 @@ impl Container {
             init_pid: None,
             store: store.clone(),
         };
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = container.remove();
+            return Err(Error::Preparation("container create canceled".into()));
+        }
         let mut start = podman_in(store);
         start.args(["start", "--", &container.name]);
-        let started = match process::run(start, deadline(CONTAINER_START_TIMEOUT), "podman start") {
+        let started = match process::run_canceled(
+            start,
+            deadline(CONTAINER_START_TIMEOUT),
+            "podman start",
+            None,
+            Some(cancel),
+        ) {
             Ok(started) => started,
             Err(error) => {
                 let _ = container.remove();
@@ -668,6 +719,10 @@ impl Container {
             let why = started.stderr_excerpt();
             let _ = container.remove();
             return Err(Error::Preparation(format!("container start: {why}")));
+        }
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = container.remove();
+            return Err(Error::Preparation("container start canceled".into()));
         }
         if let Ok((init, cgroup)) = inspect_named(&container.name, store) {
             container.init_pid = init;

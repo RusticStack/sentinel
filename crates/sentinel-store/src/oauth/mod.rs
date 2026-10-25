@@ -10,7 +10,7 @@ use sentinel_auth::{
     secret::{Digest, Secret},
 };
 use sentinel_core::{
-    GrantId, RepoId, TenantId, UnixMillis, UserId,
+    GrantId, RepoId, SessionId, TenantId, UnixMillis, UserId,
     auth::{Audience, Permissions, Principal, Scopes},
 };
 
@@ -639,6 +639,7 @@ pub struct NewGrant<'a> {
     pub name: Option<&'a str>,
     pub lifetime_ms: i64,
     pub created_by: Option<UserId>,
+    pub created_session: Option<SessionId>,
 }
 
 pub(crate) fn insert_grant(
@@ -652,6 +653,9 @@ pub(crate) fn insert_grant(
     if g.repo.is_some() && g.tenant.is_none() {
         return Err(Error::InvalidInput("repository scope without its tenant"));
     }
+    if g.kind != GrantKind::Service && g.created_session.is_some() {
+        return Err(Error::InvalidInput("grant session provenance"));
+    }
     if !(1..=GRANT_MAX_MS).contains(&g.lifetime_ms) {
         return Err(Error::InvalidInput("grant lifetime"));
     }
@@ -663,8 +667,8 @@ pub(crate) fn insert_grant(
     let id = GrantId::new();
     tx.prepare_cached(
         "INSERT INTO oauth_grants(id, user_id, client_id, kind, scopes, tenant_id, repo_id,
-            audience, name, created_by, created_ms, expires_ms, resource)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12)",
+            audience, name, created_by, created_session, created_ms, expires_ms, resource)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13)",
     )?
     .execute(params![
         id.as_bytes(),
@@ -676,6 +680,7 @@ pub(crate) fn insert_grant(
         g.repo.as_ref().map(RepoId::as_bytes),
         g.name,
         g.created_by.as_ref().map(UserId::as_bytes),
+        g.created_session.as_ref().map(SessionId::as_bytes),
         now.0,
         now.0.saturating_add(g.lifetime_ms),
         g.audience.code()
@@ -1294,19 +1299,67 @@ pub fn own_grant(conn: &Connection, user: UserId, grant: GrantId) -> Result<Gran
     grant_record(row)
 }
 
-pub(crate) fn revoke_minted_since(
+pub(crate) fn revoke_minted_for_session(
+    tx: &Transaction<'_>,
+    minter: UserId,
+    session: SessionId,
+    legacy_since: UnixMillis,
+    now: UnixMillis,
+) -> Result<usize> {
+    let mut revoked = tx
+        .prepare_cached(
+            "UPDATE oauth_grants SET revoked_ms = ?3, revoked_reason = ?4
+             WHERE revoked_ms IS NULL AND kind = 3
+             AND created_by = ?1 AND created_session = ?2",
+        )?
+        .execute(params![
+            minter.as_bytes(),
+            session.as_bytes(),
+            now.0,
+            reason::ACCOUNT
+        ])?;
+    revoked += revoke_legacy_minted_since(tx, minter, legacy_since, now)?;
+    audit_minted_revocation(tx, minter, revoked)?;
+    Ok(revoked)
+}
+
+pub(crate) fn revoke_all_minted(
+    tx: &Transaction<'_>,
+    minter: UserId,
+    legacy_since: Option<UnixMillis>,
+    now: UnixMillis,
+) -> Result<usize> {
+    let mut revoked = tx
+        .prepare_cached(
+            "UPDATE oauth_grants SET revoked_ms = ?2, revoked_reason = ?3
+             WHERE revoked_ms IS NULL AND kind = 3
+             AND created_by = ?1 AND created_session IS NOT NULL",
+        )?
+        .execute(params![minter.as_bytes(), now.0, reason::ACCOUNT])?;
+    if let Some(since) = legacy_since {
+        revoked += revoke_legacy_minted_since(tx, minter, since, now)?;
+    }
+    audit_minted_revocation(tx, minter, revoked)?;
+    Ok(revoked)
+}
+
+fn revoke_legacy_minted_since(
     tx: &Transaction<'_>,
     minter: UserId,
     since: UnixMillis,
     now: UnixMillis,
 ) -> Result<usize> {
-    let revoked = tx
+    Ok(tx
         .prepare_cached(
             "UPDATE oauth_grants SET revoked_ms = ?3, revoked_reason = ?4
              WHERE expires_ms > ?3 AND revoked_ms IS NULL AND kind = 3
-             AND created_by = ?1 AND created_ms >= ?2 AND created_ms <= ?3",
+             AND created_by = ?1 AND created_session IS NULL
+             AND created_ms >= ?2 AND created_ms <= ?3",
         )?
-        .execute(params![minter.as_bytes(), since.0, now.0, reason::ACCOUNT])?;
+        .execute(params![minter.as_bytes(), since.0, now.0, reason::ACCOUNT])?)
+}
+
+fn audit_minted_revocation(tx: &Transaction<'_>, minter: UserId, revoked: usize) -> Result<()> {
     if revoked > 0 {
         audit(
             tx,
@@ -1319,7 +1372,7 @@ pub(crate) fn revoke_minted_since(
             )),
         )?;
     }
-    Ok(revoked)
+    Ok(())
 }
 
 pub fn issue_grant_trusted(store: &Store, g: NewGrant<'_>, now: UnixMillis) -> Result<Minted> {
@@ -1478,6 +1531,12 @@ mod tests {
              UNION ALL SELECT id FROM oauth_grants WHERE revoked_ms IS NOT NULL LIMIT ?2",
             "UPDATE oauth_grants SET revoked_ms = ?2, revoked_reason = ?3
              WHERE client_id = ?1 AND revoked_ms IS NULL",
+            "UPDATE oauth_grants SET revoked_ms = ?3, revoked_reason = ?4
+             WHERE revoked_ms IS NULL AND kind = 3
+             AND created_by = ?1 AND created_session = ?2",
+            "UPDATE oauth_grants SET revoked_ms = ?2, revoked_reason = ?3
+             WHERE revoked_ms IS NULL AND kind = 3
+             AND created_by = ?1 AND created_session IS NOT NULL",
         ] {
             let plans = plans(&conn, sql);
             assert!(

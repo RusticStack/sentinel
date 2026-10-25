@@ -2,7 +2,7 @@
 import type { Invitation, NamespaceSettings } from "~~/shared/types/api";
 
 // A GitHub-managed organization, or one with a GitHub App installed, takes no email invitations.
-const props = defineProps<{ slug: string; settings: NamespaceSettings | null }>();
+const props = defineProps<{ slug: string; settings: NamespaceSettings | null; settingsFailure?: { code: string; words: string } | null; retrySettings?: () => unknown }>();
 const api = useApi();
 const act = useAct();
 const showOnce = useShowOnce();
@@ -83,7 +83,9 @@ const columns = [{ id: "who", header: "Invited" }, { id: "role", header: "Role" 
   <section aria-labelledby="invite-h" class="space-y-3">
     <h2 id="invite-h" class="text-base font-semibold">Invite people</h2>
 
-    <UAlert v-if="settings?.kind === 'personal'" color="neutral" variant="subtle" icon="i-lucide-user" title="A personal namespace has no other members."
+    <UAlert v-if="settingsFailure" color="error" variant="subtle" icon="i-lucide-circle-alert" role="alert" title="Could not load namespace settings."
+      :description="settingsFailure.words" :actions="[{ label: 'Try again', onClick: () => retrySettings?.() }]" />
+    <UAlert v-else-if="settings?.kind === 'personal'" color="neutral" variant="subtle" icon="i-lucide-user" title="A personal namespace has no other members."
       description="Create an organization to work with others." :actions="[{ label: 'Organizations', to: '/organizations' }]" />
     <UAlert v-else-if="settings && !applies" color="neutral" variant="subtle" icon="i-lucide-github" title="Membership of this organization is managed by GitHub."
       :description="settings.membership === 'github'

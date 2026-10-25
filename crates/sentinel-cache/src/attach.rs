@@ -4,6 +4,8 @@ use sentinel_core::TenantId;
 use sentinel_pipeline::schema::Cache;
 use sentinel_protocol::cache::Class;
 
+pub use crate::CACHE_DIR as ROOT_DIR;
+
 use crate::{
     lease::Lease,
     manifest::{Compat, key_stem},
@@ -19,8 +21,6 @@ pub const UNKNOWN_TENANT: TenantId = match TenantId::from_bytes([
     Ok(tenant) => tenant,
     Err(_) => panic!("constant is a valid v4 uuid"),
 };
-
-pub const ROOT_DIR: &str = "cache";
 
 pub const MAX_KEY_BYTES: usize = 1024;
 

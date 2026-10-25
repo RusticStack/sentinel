@@ -51,7 +51,7 @@ async function setAccess(m: Member) {
 }
 
 async function loadGrants(m: Member) {
-  const list = await act(`Credentials of ${m.display_name}`, () => api<{ grants: Grant[] }>(`/api/v1/tenants/${props.slug}/service-accounts/${m.user}/grants`));
+  const list = await act(`Credentials of ${m.display_name}`, () => api<{ grants: Grant[] }>(`/api/v1/tenants/${props.slug}/service-accounts/${m.user}/grants`), false);
   if (list) grants[m.user] = list.grants;
 }
 async function toggleGrants(m: Member) {

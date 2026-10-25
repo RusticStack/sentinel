@@ -1338,6 +1338,7 @@ fn untrusted_redirects_wrong_verifiers_and_foreign_audiences_are_refused() {
             name: None,
             lifetime_ms: oauth::LOGIN_GRANT_MS,
             created_by: None,
+            created_session: None,
         },
         UnixMillis::now(),
     )
@@ -1452,6 +1453,7 @@ fn trusted_grant(d: &Deployment) -> oauth::Minted {
             name: None,
             lifetime_ms: oauth::LOGIN_GRANT_MS,
             created_by: None,
+            created_session: None,
         },
         UnixMillis::now(),
     )

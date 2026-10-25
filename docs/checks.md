@@ -90,14 +90,14 @@ bounded thread that:
 3. writes the outcome back in a short transaction, guarded by the sequence it
    read.
 
-The lane does not poll. When nothing is due it sleeps on the store's commit
-notifier and a deadline at the earliest pending row's retry time
-(`checks::next_due_ms`, one read of the head of `check_publications_due`): a
-new publication is read when its transaction commits — at once after a quiet
-spell, at most once per 50 ms under unrelated write load — and a backed-off row
-exactly when it is due. `Config::idle` (2 s by default) is only the longest
-sleep without a read, the net for a write the notifier cannot see, such as one
-from another process on the same database.
+The lane does not poll for publications. When nothing is due it sleeps on the
+store's commit notifier and the earliest of the next pending row's retry time
+(`checks::next_due_ms`, one read of the head of `check_publications_due`) and
+its monotonic re-arm deadline: a new publication is read when its transaction
+commits — at once after a quiet spell, at most once per 50 ms under unrelated
+write load — and a backed-off row exactly when it is due. `Config::idle` (2 s by
+default) is only the longest sleep without a read, the net for a write the
+notifier cannot see, such as one from another process on the same database.
 
 Retries, refusals and rate limits are explicit:
 
@@ -108,10 +108,11 @@ Retries, refusals and rate limits are explicit:
   on, so it gets a longer budget: forty attempts with the ceiling raised to
   fifteen minutes, which rides out an outage of about seven and a half hours;
 - **exhausted final status**: a completed check refused with `attempts` is put
-  back in the queue with a fresh budget **once per lane start** (only rows
-  settled within the last seven days, at most 1000 per start), so a long
-  outage followed by a restart still delivers the verdict, and a permanently
-  failing row costs one budget per restart rather than retrying forever;
+  back in the queue with a fresh budget at lane start and then once per
+  `Config::rearm_interval` (one hour by default). Each pass is bounded to 1000
+  rows settled within the last seven days and schedules its next monotonic
+  deadline even if the store write fails, so publisher recovery needs no
+  restart and a re-arm failure cannot hot-loop;
 - **rate limit** (403/429 with `Retry-After`, or `X-RateLimit-Remaining: 0`
   with a reset): GitHub limits per installation, so only that installation is
   parked. Its rows are deferred until the reset (at most one hour) **without
@@ -120,10 +121,14 @@ Retries, refusals and rate limits are explicit:
   is not known yet carries the scope `u64::MAX`, which never equals a real
   installation id, so it is never held back by another installation's limit
   (a scope of 0 would throttle unrelated installations);
-- **poison rows**: a row whose outcome cannot be written (the store rejects the
-  update three passes in a row) is parked for an hour instead of retried at the
-  head of the queue, so one bad row never blocks other checks or tenants. A
-  generation that moved under the publisher is simply re-read;
+- **poison rows**: `checks::due` isolates an undecodable row by its raw durable
+  ID, and the lane defers it for an hour without trusting its other columns;
+  healthy rows in the batch still publish. A row whose outcome cannot be written
+  (the store rejects the update three passes in a row) is also parked for an
+  hour instead of retried at the head of the queue, so one bad row never blocks
+  other checks or tenants. Transient store faults back off the lane without
+  counting toward a row's quarantine. A generation that moved under the
+  publisher is simply re-read;
 - **permanent** (403 without rate-limit evidence, update/create 404, 422): the row records the
   bounded reason (never empty; a blank GitHub message is recorded as
   `invalid request`) and is not retried. A later state change starts a fresh
@@ -254,8 +259,11 @@ schedule.
   could not record its outcome at all backs the lane off instead of picking the
   same row again at once.
 
-A rerequest resets each job with a compare-and-set on the terminal state it
-just read, so a job that moved is never overwritten.
+A rerequest resets each job with a compare-and-set on the full terminal state,
+fence and cancellation snapshot it just read; the run cancellation flag is
+cleared with the same snapshot discipline. Any stale snapshot is `Conflict` and
+rolls back the receipt, so a moved job or a newer cancellation is never
+overwritten.
 
 **Receipt retention.** A control-event receipt is kept at least 30 days
 whatever retention an operator asks for, then purged. A signed delivery
@@ -300,11 +308,12 @@ holds at most 1024 repository tokens, evicting the earliest expiry at capacity.
   event's completed check (and the outcomes that publish nothing), revoked
   bindings and tag objects, retry/backoff/exhaustion, stale generations and the
   recorded handle, identity immutability and ownership, the completed-check
-  budget and its once-per-start re-arm, a throttle parking without spending an
-  attempt, idempotent re-records and handle retention until a completed state
-  is delivered, and a blank refusal reason stored as a non-empty one.
+  budget and re-arming, a throttle parking without spending an attempt,
+  idempotent re-records and handle retention until a completed state is
+  delivered, and a blank refusal reason stored as a non-empty one.
 - `crates/sentinel-checks/tests/lane.rs`: a retry or throttle that exhausts the
-  budget reported as refused, a throttle parking rows without spending
+  budget reported as refused, an exhausted final check re-armed and published
+  after publisher recovery on the same live lane, a throttle parking rows without spending
   attempts, one throttled scope not stopping the others, and a row whose store
   writes keep failing quarantined without blocking the lane, a publication
   committed to an idle lane (safety re-read two minutes away) delivered by the
@@ -325,10 +334,12 @@ holds at most 1024 repository tokens, evicting the earliest expiry at capacity.
   settled delivery's completed check, and a prompt lane stop.
 - `crates/sentinel-store/tests/github_events.rs`: receipt replay and
   changed-body conflict, check-run and suite rerequests requeueing only a
-  terminal non-superseded run (legacy `NULL` suite rows included), the
-  candidate cap, unbound/revoked refusals, installation disable and
-  repository-set revocation with credentials destroyed, refresh-row sequence
-  fencing, and a confirmed 404 revoking everything.
+  terminal non-superseded run (legacy `NULL` suite rows included), a canceled
+  previously leased run keeping its attempt history and advancing its fence on
+  the next lease, the candidate cap, unbound/revoked refusals, installation
+  disable and repository-set revocation with credentials destroyed, refresh-row
+  sequence fencing, and a confirmed 404 revoking everything. Store unit tests
+  cover stale job-fence and cancellation snapshots conflicting.
 - `crates/sentinel-checks/tests/reconcile.rs` (loopback stub): the refresh
   lane verifying a healthy installation and repository, revoking on rename,
   removal and a changed clone URL, disabling on a verified 404, keeping a

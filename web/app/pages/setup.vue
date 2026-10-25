@@ -46,8 +46,9 @@ onMounted(() => {
     resumed.value = true;
   }
   step.value = 0;
+  // Register persistence only after hydration so restoring a draft cannot save step 0 over it.
+  watch([draft, step], save, { deep: true });
 });
-watch([draft, step], save, { deep: true });
 
 function focusHeading() {
   nextTick(() => heading.value?.focus());

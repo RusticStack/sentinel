@@ -3,10 +3,10 @@ export function useAct() {
   const session = useSession();
   const withStepUp = useStepUp();
 
-  return async function act<T>(label: string, call: () => Promise<T>): Promise<T | undefined> {
+  return async function act<T>(label: string, call: () => Promise<T>, successToast = true): Promise<T | undefined> {
     try {
       const result = await withStepUp(call);
-      toast.add({ title: `${label}: done`, color: "success", icon: "i-lucide-check" });
+      if (successToast) toast.add({ title: `${label}: done`, color: "success", icon: "i-lucide-check" });
       return result;
     } catch (e) {
       if (e instanceof StepUpDeclined) return undefined;

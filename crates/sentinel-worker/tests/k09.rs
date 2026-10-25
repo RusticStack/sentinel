@@ -156,6 +156,7 @@ fn make_job(worker_dir: &Path, repo_dir: &Path, sha: &str, repo: RepoId, trust: 
         images: Images::for_worker_data_dir(worker_dir).unwrap(),
         secret_bundle: sentinel_protocol::secrets::DeliveryBundle::empty(),
         caches: Vec::new(),
+        cache_budget_bytes: sentinel_cache::gc::DEFAULT_BUDGET_BYTES,
         mirrors: None,
         prepare_hold: Duration::ZERO,
         network: sentinel_worker::podman::Network::None,

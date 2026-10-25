@@ -100,6 +100,43 @@ pub struct JobRow {
     pub timestamps: AttemptTimestamps,
 }
 
+type RawJob = (i64, i64, i64, Option<i64>, AttemptTimestamps);
+
+fn raw_job(r: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<RawJob> {
+    let ms = |i: usize| -> rusqlite::Result<Option<UnixMillis>> {
+        Ok(r.get::<_, Option<i64>>(offset + i)?.map(UnixMillis))
+    };
+    Ok((
+        r.get::<_, i64>(offset)?,
+        r.get::<_, i64>(offset + 1)?,
+        r.get::<_, i64>(offset + 2)?,
+        r.get::<_, Option<i64>>(offset + 3)?,
+        AttemptTimestamps {
+            queued: ms(4)?,
+            leased: ms(5)?,
+            preparing: ms(6)?,
+            running: ms(7)?,
+            finalizing: ms(8)?,
+            terminal: ms(9)?,
+        },
+    ))
+}
+
+fn decode_job((code, fence, cancel, class, timestamps): RawJob) -> Result<JobRow> {
+    Ok(JobRow {
+        state: decode_state(code).ok_or(Error::Corrupt("state_code"))?,
+        fence: Fence(fence as u64),
+        cancel_requested: cancel != 0,
+        failure_class: match class {
+            None => None,
+            Some(c) => {
+                Some(crate::codec::decode_failure(c).ok_or(Error::Corrupt("failure_class"))?)
+            }
+        },
+        timestamps,
+    })
+}
+
 fn read_job(conn: &Connection, tenant: TenantId, job: JobId) -> Result<JobRow> {
     conn.prepare_cached(
         "SELECT state_code, fence, cancel_requested, failure_class,
@@ -107,40 +144,28 @@ fn read_job(conn: &Connection, tenant: TenantId, job: JobId) -> Result<JobRow> {
          FROM jobs WHERE id = ?1 AND tenant_id = ?2",
     )?
     .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| {
-        let ms = |i: usize| -> rusqlite::Result<Option<UnixMillis>> {
-            Ok(r.get::<_, Option<i64>>(i)?.map(UnixMillis))
-        };
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, Option<i64>>(3)?,
-            AttemptTimestamps {
-                queued: ms(4)?,
-                leased: ms(5)?,
-                preparing: ms(6)?,
-                running: ms(7)?,
-                finalizing: ms(8)?,
-                terminal: ms(9)?,
-            },
-        ))
+        raw_job(r, 0)
     })
     .optional()?
     .ok_or(Error::NotFound)
-    .and_then(|(code, fence, cancel, class, timestamps)| {
-        Ok(JobRow {
-            state: decode_state(code).ok_or(Error::Corrupt("state_code"))?,
-            fence: Fence(fence as u64),
-            cancel_requested: cancel != 0,
-            failure_class: match class {
-                None => None,
-                Some(c) => {
-                    Some(crate::codec::decode_failure(c).ok_or(Error::Corrupt("failure_class"))?)
-                }
-            },
-            timestamps,
-        })
+    .and_then(decode_job)
+}
+
+pub fn for_run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<(JobId, JobRow)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, state_code, fence, cancel_requested, failure_class,
+                queued_ms, leased_ms, preparing_ms, running_ms, finalizing_ms, terminal_ms
+         FROM jobs WHERE run_id = ?1 AND tenant_id = ?2 ORDER BY spec_index",
+    )?;
+    let rows = stmt.query_map(params![run.as_bytes(), tenant.as_bytes()], |r| {
+        Ok((r.get::<_, [u8; 16]>(0)?, raw_job(r, 1)?))
+    })?;
+    rows.map(|row| {
+        let (id, raw) = row?;
+        let id = JobId::from_bytes(id).map_err(|_| Error::Corrupt("job id"))?;
+        Ok((id, decode_job(raw)?))
     })
+    .collect()
 }
 
 pub fn get_job(conn: &Connection, tenant: TenantId, job: JobId) -> Result<JobRow> {

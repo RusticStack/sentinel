@@ -61,6 +61,7 @@ pub struct Config {
     pub idle: Duration,
     pub min_backoff: Duration,
     pub max_backoff: Duration,
+    pub rearm_interval: Duration,
 }
 
 impl Default for Config {
@@ -70,6 +71,7 @@ impl Default for Config {
             idle: Duration::from_secs(2),
             min_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
+            rearm_interval: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -135,6 +137,9 @@ fn store_fault(
     seq: i64,
     error: &StoreError,
 ) -> Fault {
+    if error.is_transient() {
+        return Fault::Down;
+    }
     match error {
         StoreError::Conflict => return Fault::Moved,
         StoreError::Sqlite(_)
@@ -179,6 +184,7 @@ fn run(
     notice: &(dyn Fn(&Batch) + Send + Sync),
 ) {
     rearm(store);
+    let mut next_rearm = Instant::now() + config.rearm_interval;
     let mut failures: u32 = 0;
     let mut parked: HashMap<u64, i64> = HashMap::new();
     let mut poison: HashMap<CheckId, u32> = HashMap::new();
@@ -188,6 +194,11 @@ fn run(
             break;
         }
         let polled = Instant::now();
+        if polled >= next_rearm {
+            // Whether the batch succeeds or fails, the next pass is one interval away.
+            rearm(store);
+            next_rearm = Instant::now() + config.rearm_interval;
+        }
         let due = match store.read(|c| checks::due(c, UnixMillis::now(), config.batch)) {
             Ok(due) => due,
             Err(_) => {
@@ -196,9 +207,31 @@ fn run(
                 continue;
             }
         };
+        let checks::Due {
+            publications: due,
+            corrupt,
+        } = due;
+        if !corrupt.is_empty() {
+            let now = UnixMillis::now();
+            let until = now.0.saturating_add(QUARANTINE_MS);
+            if store
+                .writer()
+                .write(move |tx| {
+                    for id in &corrupt {
+                        checks::defer_raw(tx, id, now, until)?;
+                    }
+                    Ok(())
+                })
+                .is_err()
+            {
+                failures = failures.saturating_add(1);
+                wait(settled, backoff(config, failures));
+                continue;
+            }
+        }
         if due.is_empty() {
             failures = 0;
-            let deadline = wake_at(store, config, polled);
+            let deadline = wake_at(store, config, polled, next_rearm);
             store.changes().wait_past(seen, deadline);
             if let Some(rest) = COMMIT_GAP.min(config.idle).checked_sub(polled.elapsed()) {
                 wait(settled, rest);
@@ -328,8 +361,8 @@ fn run(
     }
 }
 
-fn wake_at(store: &Store, config: &Config, from: Instant) -> Instant {
-    let ceiling = from + config.idle;
+fn wake_at(store: &Store, config: &Config, from: Instant, next_rearm: Instant) -> Instant {
+    let ceiling = (from + config.idle).min(next_rearm);
     match store.read(checks::next_due_ms) {
         Ok(Some(due_ms)) => {
             let wait_ms = due_ms.saturating_sub(UnixMillis::now().0).max(0) as u64;
@@ -364,4 +397,30 @@ fn wait(settled: &(std::sync::Mutex<bool>, std::sync::Condvar), timeout: Duratio
         .wait_timeout(settled, timeout)
         .unwrap_or_else(|p| p.into_inner());
     *settled = false;
+}
+
+#[cfg(test)]
+mod tests {
+    use sentinel_store::Durability;
+
+    use super::*;
+
+    #[test]
+    fn transient_database_faults_do_not_count_toward_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
+        let error = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        ));
+        let mut poison = HashMap::new();
+        let id = CheckId::new();
+        for _ in 0..=QUARANTINE_AFTER {
+            assert!(matches!(
+                store_fault(&store, &mut poison, id, 1, &error),
+                Fault::Down
+            ));
+        }
+        assert!(poison.is_empty());
+    }
 }
