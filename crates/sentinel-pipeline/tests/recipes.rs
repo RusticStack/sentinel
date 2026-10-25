@@ -182,7 +182,7 @@ fn all_nine_recipes_are_present_and_compile() {
             "python",
             "rust"
         ],
-        "fixtures/recipes must publish exactly the nine K07 recipes"
+        "fixtures/recipes must publish exactly the nine pinned pipeline recipes"
     );
     for (name, text) in &rs {
         compile_str(text).unwrap_or_else(|e| panic!("{name}: {e}"));

@@ -1,5 +1,9 @@
 use std::{
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -237,6 +241,66 @@ fn a_retry_that_spends_the_budget_is_counted_and_reported_as_refused() {
     drop(lane);
 }
 
+struct Recovering {
+    healthy: Arc<AtomicBool>,
+}
+
+impl Publisher for Recovering {
+    fn publish(&mut self, _publication: &checks::Publication) -> Publish {
+        if self.healthy.load(Ordering::Relaxed) {
+            Publish::Published {
+                check_run_id: 11,
+                check_suite_id: None,
+            }
+        } else {
+            Publish::Retry {
+                after_ms: 0,
+                detail: "upstream 502".into(),
+            }
+        }
+    }
+}
+
+#[test]
+fn a_final_check_exhausted_after_startup_rearms_on_the_live_lane() {
+    let f = fixture();
+    let run = event_run(&f);
+    f.store
+        .writer()
+        .write(|tx| {
+            tx.execute(
+                "UPDATE check_publications SET status = 'completed', conclusion = 'failure',
+                    attempts = ?1",
+                [checks::MAX_TERMINAL_ATTEMPTS - 1],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let healthy = Arc::new(AtomicBool::new(false));
+    let lane = Lane::start(
+        Arc::clone(&f.store),
+        Box::new(Recovering {
+            healthy: Arc::clone(&healthy),
+        }),
+        Config {
+            idle: Duration::from_secs(120),
+            rearm_interval: Duration::from_millis(50),
+            ..Config::default()
+        },
+        |_| {},
+    );
+    wait_refused(&f, run);
+
+    healthy.store(true, Ordering::Relaxed);
+    wait_for(
+        &f,
+        run,
+        "the live lane re-arms and publishes",
+        all_published,
+    );
+    drop(lane);
+}
+
 struct Scoped {
     throttle_until_ms: i64,
 }
@@ -414,6 +478,71 @@ fn a_row_whose_store_writes_keep_failing_cannot_block_the_lane() {
     let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
     let aggregate = rows.iter().find(|r| is_aggregate(r)).unwrap();
     assert_eq!(aggregate.state, State::Pending, "the poison row waits");
+}
+
+#[test]
+fn a_malformed_oldest_row_is_parked_and_later_checks_publish() {
+    let f = fixture();
+    let run = event_run(&f);
+    let raw = [0; 16];
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO check_publications(id, tenant_id, repo_id, run_id, scope, name,
+                    head_sha, external_id, status, conclusion, title, summary, seq,
+                    published_seq, state, created_ms, updated_ms)
+                 SELECT ?1, tenant_id, repo_id, run_id, 'poison', name, head_sha,
+                    'sentinel:poison', status, conclusion, title, summary, 1, 0, 0, -1, updated_ms
+                 FROM check_publications WHERE run_id = ?2 ORDER BY id LIMIT 1",
+                rusqlite::params![raw, run.as_bytes()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let healthy = f
+        .store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM check_publications WHERE run_id = ?1 AND id != ?2",
+                rusqlite::params![run.as_bytes(), raw],
+                |r| r.get::<_, i64>(0),
+            )?)
+        })
+        .unwrap();
+    let lane = start_with(&f, Deliver);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let parked = loop {
+        let (published, parked) = f
+            .store
+            .read(move |c| {
+                let published = c.query_row(
+                    "SELECT COUNT(*) FROM check_publications
+                     WHERE run_id = ?1 AND id != ?2 AND state = 1",
+                    rusqlite::params![run.as_bytes(), raw],
+                    |r| r.get::<_, i64>(0),
+                )?;
+                let parked = c.query_row(
+                    "SELECT next_attempt_ms FROM check_publications WHERE id = ?1",
+                    [raw],
+                    |r| r.get::<_, Option<i64>>(0),
+                )?;
+                Ok((published, parked))
+            })
+            .unwrap();
+        if published == healthy
+            && let Some(parked) = parked
+        {
+            break parked;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "healthy rows published {published}/{healthy}; poison parked at {parked:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(lane);
+    assert!(parked > UnixMillis::now().0 + 30 * 60 * 1000, "{parked}");
 }
 
 struct Deliver;

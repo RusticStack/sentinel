@@ -247,28 +247,32 @@ fn issuing_needs_fresh_step_up_and_platform_reach_needs_a_reason() {
 fn session(store: &Store, user: UserId, stepped_ago_ms: Option<i64>) -> (Authority, Secret) {
     let secret = Secret::generate();
     let digest = secret.digest();
+    let id = SessionId::new();
     let now = UnixMillis::now().0;
     store
         .writer()
         .write(move |tx| {
             tx.execute(
                 "INSERT INTO sessions(token_digest, user_id, csrf_digest, created_ms,
-                    idle_deadline_ms, absolute_deadline_ms, stepped_up_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+                    idle_deadline_ms, absolute_deadline_ms, stepped_up_ms, id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)",
                 rusqlite::params![
                     digest.0,
                     user.as_bytes(),
                     [7u8; 32],
                     now - 60_000,
                     now + 3_600_000,
-                    stepped_ago_ms.map(|ago| now - ago)
+                    stepped_ago_ms.map(|ago| now - ago),
+                    id.as_bytes()
                 ],
             )?;
             Ok(())
         })
         .unwrap();
-    let authority =
-        Authority::live_session(person(user, false), digest, local_auth::Policy::default());
+    let session = store
+        .read(|c| local_auth::authenticate(c, &secret, UnixMillis(now)))
+        .unwrap();
+    let authority = Authority::live_session(&session, digest, local_auth::Policy::default());
     (authority, secret)
 }
 
@@ -422,6 +426,88 @@ fn logout_all_reaches_grants_minted_by_a_session_that_has_since_expired() {
         .write(move |tx| local_auth::revoke_all(tx, i.admin, now))
         .unwrap();
     assert!(grant_revoked(&store, i, minted));
+}
+
+#[test]
+fn session_provenance_isolates_concurrent_sessions_and_is_immutable() {
+    let (_dir, store, i) = fixture();
+    let now = UnixMillis::now();
+    let (first, first_cookie) = session(&store, i.admin, Some(1_000));
+    let (second, second_cookie) = session(&store, i.admin, Some(1_000));
+    let first_id = store
+        .read(|c| local_auth::authenticate(c, &first_cookie, now))
+        .unwrap()
+        .id
+        .unwrap();
+    let second_id = store
+        .read(|c| local_auth::authenticate(c, &second_cookie, now))
+        .unwrap()
+        .id
+        .unwrap();
+    let mut first_issue = Issue::with(i, first);
+    first_issue.now = now;
+    let first_grant = issue(&store, first_issue).unwrap().0;
+    let mut second_issue = Issue::with(i, second);
+    second_issue.now = now;
+    let second_grant = issue(&store, second_issue).unwrap().0;
+    let provenance = |grant: GrantId| {
+        store
+            .read(|c| {
+                c.query_row(
+                    "SELECT created_session FROM oauth_grants WHERE id = ?1",
+                    [grant.as_bytes()],
+                    |row| row.get::<_, Option<[u8; 16]>>(0),
+                )
+                .map_err(Error::from)
+            })
+            .unwrap()
+            .map(|bytes| SessionId::from_bytes(bytes).unwrap())
+    };
+    assert_eq!(provenance(first_grant), Some(first_id));
+    assert_eq!(provenance(second_grant), Some(second_id));
+
+    store
+        .writer()
+        .write(move |tx| {
+            local_auth::revoke_session(tx, Authority::HostLocal, i.admin, first_id, now)
+        })
+        .unwrap();
+    assert!(grant_revoked(&store, i, first_grant));
+    assert!(!grant_revoked(&store, i, second_grant));
+    let immutable = store.writer().write(move |tx| {
+        tx.execute(
+            "UPDATE oauth_grants SET created_session = ?2 WHERE id = ?1",
+            rusqlite::params![second_grant.as_bytes(), first_id.as_bytes()],
+        )?;
+        Ok(())
+    });
+    assert!(matches!(immutable, Err(Error::Sqlite(_))));
+    let audit = store
+        .read(|c| local_auth::recent_audit(c, 1))
+        .unwrap()
+        .remove(0);
+    assert_eq!(audit.event, Event::OAuthGrantRevoked);
+    assert_eq!(
+        audit.detail.as_deref(),
+        Some("1 service grants minted in session window")
+    );
+}
+
+#[test]
+fn logout_all_revokes_provenanced_grants_after_expiry_and_session_purge() {
+    let (_dir, store, i) = fixture();
+    let now = UnixMillis::now();
+    let (authority, _) = session(&store, i.admin, Some(1_000));
+    let mut request = Issue::with(i, authority);
+    request.now = now;
+    let grant = issue(&store, request).unwrap().0;
+    let purged_at = UnixMillis(now.0 + SERVICE_DEFAULT_MS + 1);
+    assert_eq!(local_auth::purge_expired(&store, purged_at, 10).unwrap(), 1);
+    store
+        .writer()
+        .write(move |tx| local_auth::revoke_all(tx, i.admin, purged_at))
+        .unwrap();
+    assert!(grant_revoked(&store, i, grant));
 }
 
 #[test]

@@ -294,11 +294,11 @@ pub fn compile(pipeline: Pipeline) -> Result<CompiledPipeline, CompileError> {
 }
 
 /// Not cryptographic: equality of compiled specs only, never trust.
-struct Digest(u128, bool);
+struct Digest(u128);
 
 impl Digest {
     const fn new() -> Self {
-        Self(0x6c62272e07bb014262b821756295c58d, true)
+        Self(0x6c62272e07bb014262b821756295c58d)
     }
     fn bytes(&mut self, b: &[u8]) {
         self.u64(b.len() as u64);
@@ -316,11 +316,10 @@ impl Digest {
     fn str(&mut self, s: &str) {
         self.bytes(s.as_bytes());
     }
-    fn encoded<T: serde::Serialize>(&mut self, v: &T) {
-        match postcard::to_allocvec(v) {
-            Ok(bytes) => self.bytes(&bytes),
-            Err(_) => self.1 = false,
-        }
+    fn encoded<T: serde::Serialize>(&mut self, v: &T) -> Result<(), CompileError> {
+        let bytes = postcard::to_allocvec(v).map_err(|_| CompileError::Encoding)?;
+        self.bytes(&bytes);
+        Ok(())
     }
     fn opt_str(&mut self, s: Option<&str>) {
         match s {
@@ -333,10 +332,10 @@ impl Digest {
     }
 }
 
-fn digest_step(d: &mut Digest, s: &Step) {
+fn digest_step(d: &mut Digest, s: &Step) -> Result<(), CompileError> {
     d.str(&s.id);
     d.str(&s.run);
-    d.encoded(&s.condition);
+    d.encoded(&s.condition)?;
     d.u64(s.shell as u64);
     d.u64(s.env.len() as u64);
     for (k, v) in &s.env {
@@ -354,6 +353,7 @@ fn digest_step(d: &mut Digest, s: &Step) {
     }
     d.opt_str(s.workdir.as_deref());
     d.u64(s.timeout_secs.unwrap_or(0));
+    Ok(())
 }
 
 fn digest_of(
@@ -381,7 +381,7 @@ fn digest_of(
         None => d.u64(0),
         Some(c) => {
             d.u64(1);
-            d.encoded(&c.group);
+            d.encoded(&c.group)?;
             d.u64(c.cancel_in_progress as u64);
         }
     }
@@ -394,7 +394,7 @@ fn digest_of(
         }
         let s = &j.spec;
         d.str(&s.image);
-        d.encoded(&s.condition);
+        d.encoded(&s.condition)?;
         d.u64(s.runs_on.arch.map_or(u64::MAX, |a| a as u64));
         d.u64(s.runs_on.labels.len() as u64);
         for l in &s.runs_on.labels {
@@ -418,13 +418,13 @@ fn digest_of(
         d.opt_str(s.workdir.as_deref());
         d.u64(s.steps.len() as u64);
         for st in &s.steps {
-            digest_step(&mut d, st);
+            digest_step(&mut d, st)?;
         }
         d.u64(s.cache.len() as u64);
         for c in &s.cache {
             d.str(&c.name);
             d.u64(u64::from(c.class.to_u8()));
-            d.encoded(&c.key);
+            d.encoded(&c.key)?;
             d.u64(c.paths.len() as u64);
             for p in &c.paths {
                 d.str(p);
@@ -447,9 +447,32 @@ fn digest_of(
             d.u64(u64::from(a.required));
         }
     }
-    if d.1 {
-        Ok(d.0)
-    } else {
-        Err(CompileError::Encoding)
+    Ok(d.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompileError, Digest};
+    use serde::{Serialize, Serializer, ser::Error as _};
+
+    #[test]
+    fn serialization_failure_is_reported_as_encoding_error() {
+        struct Fails;
+
+        impl Serialize for Fails {
+            fn serialize<S>(&self, _: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                Err(S::Error::custom("forced serialization failure"))
+            }
+        }
+
+        let mut digest = Digest::new();
+        assert_eq!(
+            digest.encoded(&Fails),
+            Err(CompileError::Encoding),
+            "serializer failures must be encoding errors"
+        );
     }
 }

@@ -228,6 +228,7 @@ pub fn grant(d: &Deployment, user: UserId, scopes: Scopes) -> Minted {
             name: None,
             lifetime_ms: oauth::LOGIN_GRANT_MS,
             created_by: None,
+            created_session: None,
         },
         UnixMillis::now(),
     )

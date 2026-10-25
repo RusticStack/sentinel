@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 use sentinel_auth::sealed::Key;
 use sentinel_core::{
-    JobId, RepoId, RunId, TenantId, UnixMillis, UserId,
+    FailureClass, Fence, JobId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Namespace, Permissions, Principal},
     state::{Actor, Event as JobEvent, JobState},
 };
@@ -300,6 +300,125 @@ fn a_check_run_rerequest_requeues_the_terminal_run() {
         },
     );
     assert_eq!(again.0, "unknown_check");
+}
+
+#[test]
+fn a_rerequest_resets_a_canceled_previously_leased_run_without_touching_attempts() {
+    let mut f = fixture();
+    let (run, jobs) = create_run(&mut f, NOW);
+    let tenant = f.tenant;
+    let first = jobs[0];
+    let fence = {
+        let tx = f.conn.transaction().unwrap();
+        runs::resolve_image(
+            &tx,
+            tenant,
+            first,
+            "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
+            "linux/amd64",
+        )
+        .unwrap();
+        let (_, fence) = sentinel_store::jobs::lease(
+            &tx,
+            tenant,
+            first,
+            WorkerId::new(),
+            UnixMillis(NOW.0 + 60_000),
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        fence
+    };
+    assert_eq!(fence, Fence(1));
+    let tx = f.conn.transaction().unwrap();
+    sentinel_store::dispatch::cancel_run(&tx, tenant, run, NOW).unwrap();
+    sentinel_store::jobs::transition(
+        &tx,
+        tenant,
+        first,
+        Actor::Worker(fence),
+        JobEvent::Failed(FailureClass::Canceled),
+        NOW,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let attempt_rows = |conn: &Connection| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, fence, worker_id, lease_until_ms, offered_ms, acked_ms, released_ms
+                 FROM attempts ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    };
+    let before = attempt_rows(&f.conn);
+    assert_eq!(before.len(), 1);
+    let rows = checks::of_run(&f.conn, tenant, run).unwrap();
+    let tx = f.conn.transaction().unwrap();
+    for row in rows {
+        checks::published(&tx, row.id, row.seq, 4242, Some(9001), NOW).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let (outcome, _) = accept(
+        &mut f,
+        "d-canceled-rerequest",
+        9,
+        &Event::Rerequest {
+            installation: INSTALLATION,
+            repository: GITHUB_REPO_ID,
+            head: SHA_B.into(),
+            check: None,
+            suite: 9001,
+        },
+    );
+    assert_eq!(outcome, "rerequested");
+    assert_eq!(
+        states(&f, run, &jobs),
+        vec![JobState::Queued, JobState::Blocked]
+    );
+    assert_eq!(attempt_rows(&f.conn), before);
+    for job in jobs {
+        let row = sentinel_store::jobs::get_job(&f.conn, tenant, job).unwrap();
+        assert!(!row.cancel_requested);
+        assert_eq!(row.fence.0, i64::from(job == first) as u64);
+    }
+    assert!(
+        !f.conn
+            .query_row(
+                "SELECT cancel_requested FROM runs WHERE id=?1",
+                [run.as_bytes()],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    );
+    let tx = f.conn.transaction().unwrap();
+    let (_, next_fence) = sentinel_store::jobs::lease(
+        &tx,
+        tenant,
+        first,
+        WorkerId::new(),
+        UnixMillis(NOW.0 + 120_000),
+        NOW,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(next_fence, Fence(2));
 }
 
 #[test]

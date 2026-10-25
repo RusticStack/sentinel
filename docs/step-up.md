@@ -36,7 +36,7 @@ A service account's refresh token (`runs:write`, `secrets:write` and the rest of
 
 ### Service credentials minted by a session
 
-A grant records who minted it, not through which session. When `local_auth::revoke_all` revokes an account's sessions — logout-all, a password change, host-local recovery or logout-all, suspension or demotion, a second-factor lockout — the same transaction revokes every live service grant that account minted since its **oldest unrevoked session began** (`oauth::revoke_minted_since`, reason `account`), and audits one `oauth-grant-revoked` row with the count. A hijacked session's minted credential therefore does not survive the response to the hijack. Grants minted before the window opened are untouched. The window opens at the oldest session **not individually revoked**, expired-but-unpurged ones included, so a hijacked session that has since gone idle is still covered. Revoking one session by name (`local_auth::revoke_session`) does the same for the grants minted since **that** session began, and records them in the same transaction. The cost is that a logout-all or a session revocation by a tenant administrator also revokes service grants minted by their other sessions in the window (at most the absolute session life, 7 days by default); they are reissued after a step-up. A session that expired and was purged is outside the window.
+A service grant minted by a live browser session records both who minted it and that session's public identifier (`created_session`, migration 55), with no foreign key so the provenance survives session expiry and purge. Revoking one session by name (`local_auth::revoke_session`) revokes exactly its provenanced grants, without touching concurrent sessions; `local_auth::revoke_all` revokes every provenanced grant by that account even when no session rows remain. Both paths use reason `account` and audit one aggregate `oauth-grant-revoked` row with the count. Legacy grants whose `created_session` is NULL retain the former fallback: one-session revocation uses the timestamp window from that session's creation, and logout-all uses the oldest unrevoked session, expired-but-unpurged rows included, with only live grants revoked. Other grant kinds have no session provenance.
 
 ## Platform scope is not data access
 
@@ -54,7 +54,7 @@ A wrong proof returns `false` and an audited `StepUpFailed`, not an error: the c
 
 A TOTP seed is the one credential that must be recoverable to be useful, so it is the one value not stored as a digest. It is sealed with XChaCha20-Poly1305 (RustCrypto) under a 32-byte key that lives **outside the database** — `master.key`, created owner-only by `sentinel admin key create`, which refuses to overwrite. The associated data binds each ciphertext to its account, so a row copied onto another account cannot be opened. A stolen `metadata.sqlite` yields no seed and no ability to mint codes; losing the key loses every sealed value, which is the operator's trade to make and the command says so.
 
-Enrollment is two steps: `begin_enrollment` writes an unconfirmed seed and returns the `otpauth://` URI once; `confirm_enrollment` requires a code from the app, issues the recovery codes once, and stamps the session. Until confirmed, nothing about authentication changes — an abandoned enrollment cannot lock anybody out. A confirmed factor cannot be quietly re-enrolled by a live session; replacing it means `disable` under step-up, which also revokes every session of the account so no stepped-up window outlives the factor.
+Enrollment is two steps: `begin_enrollment` writes an unconfirmed seed, audits `mfa-enrollment-started` (event 75) without seed or URI detail, and returns the `otpauth://` URI once; a conflicting start writes no audit row. `confirm_enrollment` requires a code from the app, issues the recovery codes once, and stamps the session. Until confirmed, nothing about authentication changes — an abandoned enrollment cannot lock anybody out. A confirmed factor cannot be quietly re-enrolled by a live session; replacing it means `disable` under step-up, which also revokes every session of the account so no stepped-up window outlives the factor.
 
 ### Enrolling a second factor
 
@@ -71,7 +71,7 @@ Routes for a **browser session with its CSRF header** ([API](api.md)); a bearer 
 
 ### From the host
 
-The same enrollment exists host-locally for an operator sitting with the person and their device (a GitHub-only super admin on a headless deployment, say). `sentinel admin mfa enroll` prints the `otpauth://` URI alone on stdout, once; `confirm --code` proves the app holds it and prints the ten recovery codes on stdout, once; `codes` replaces the set. Authorization is access to the database file and `master.key`, like removal, and the audit rows are marked host-local; no session is stamped. Removal (`mfa disable`) is the recovery path for a lost device with spent codes.
+The same enrollment exists host-locally for an operator sitting with the person and their device (a GitHub-only super admin on a headless deployment, say). `sentinel admin mfa enroll` prints the `otpauth://` URI alone on stdout, once; `confirm` reads the six-digit code from standard input, never argv, and prints the ten recovery codes on stdout, once; `codes` replaces the set. Authorization is access to the database file and `master.key`, like removal, and the audit rows are marked host-local; no session is stamped. Removal (`mfa disable`) is the recovery path for a lost device with spent codes.
 
 ## Session administration
 
@@ -81,7 +81,7 @@ Sessions carry a public `ses_` identifier (migration 9). `local_auth::sessions` 
 sentinel admin key create   --data-dir <PATH>
 sentinel admin mfa status   --data-dir <PATH> --user root
 sentinel admin mfa enroll   --data-dir <PATH> --user root            # otpauth:// URI on stdout, once
-sentinel admin mfa confirm  --data-dir <PATH> --user root --code 123456   # recovery codes on stdout, once
+sentinel admin mfa confirm  --data-dir <PATH> --user root < code-file # recovery codes on stdout, once
 sentinel admin mfa codes    --data-dir <PATH> --user root            # replace the recovery codes
 sentinel admin mfa disable  --data-dir <PATH> --user root
 sentinel admin session list       --data-dir <PATH> --user root

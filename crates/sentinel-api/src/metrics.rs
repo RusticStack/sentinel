@@ -236,9 +236,15 @@ pub(crate) fn render(state: &State) -> String {
             count(
                 "SELECT COUNT(*) FROM workers WHERE revoked_ms IS NULL AND drain_ms IS NOT NULL",
             )?,
+            c.query_row(
+                "SELECT COUNT(*) FROM workers
+                 WHERE revoked_ms IS NULL AND protocol >= ?1 AND disk_bytes = 0",
+                [i64::from(sentinel_protocol::PROFILE_MIN.0)],
+                |r| r.get::<_, i64>(0),
+            )?,
         ))
     });
-    if let Ok((queued, blocked, held, oldest, enrolled, draining)) = queue {
+    if let Ok((queued, blocked, held, oldest, enrolled, draining, no_disk)) = queue {
         out.family(
             "sentinel_jobs_waiting",
             "gauge",
@@ -265,7 +271,7 @@ pub(crate) fn render(state: &State) -> String {
         out.family(
             "sentinel_workers",
             "gauge",
-            "Enrolled workers: connected now, draining, and all.",
+            "Enrolled workers: connected now, draining, without scratch disk, and all.",
         );
         out.value("sentinel_workers", "state=\"enrolled\"", enrolled);
         out.value(
@@ -274,6 +280,7 @@ pub(crate) fn render(state: &State) -> String {
             state.controller.connected().len(),
         );
         out.value("sentinel_workers", "state=\"draining\"", draining);
+        out.value("sentinel_workers", "state=\"no_disk\"", no_disk);
     }
 
     let s = state.controller.stats();

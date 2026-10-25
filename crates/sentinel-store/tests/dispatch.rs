@@ -1163,6 +1163,46 @@ jobs:
 }
 
 #[test]
+fn condition_wait_is_policy_while_unfinished_needs_remain_a_dependency() {
+    let f = fixture();
+    let (_, ids) = run(
+        &f,
+        "schema: 1
+on: [push]
+jobs:
+  base:
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }]
+  condition:
+    if: ${{ true }}
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }]
+  dependent:
+    needs: [base]
+    if: ${{ true }}
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }]
+",
+        at(2_000),
+    );
+    let (_, condition, dependent) = (ids[0], ids[1], ids[2]);
+    assert_eq!(state(&f, condition), JobState::Blocked);
+    assert_eq!(state(&f, dependent), JobState::Blocked);
+    assert_eq!(
+        f.store
+            .read(|c| dispatch::wait_reason(c, f.tenant, condition, &[]))
+            .unwrap(),
+        WaitReason::Policy("condition")
+    );
+    assert_eq!(
+        f.store
+            .read(|c| dispatch::wait_reason(c, f.tenant, dependent, &[]))
+            .unwrap(),
+        WaitReason::Dependency
+    );
+}
+
+#[test]
 fn finishing_releases_capacity_and_decides_dependents_in_the_same_transaction() {
     let f = fixture();
     let w = worker(

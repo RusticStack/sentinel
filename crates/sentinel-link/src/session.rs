@@ -898,16 +898,20 @@ thread_local! {
 
 impl Sender {
     pub(crate) fn send<M: Serialize>(&self, message: &M) -> Result<()> {
-        self.send_inner(message, false, None)
+        self.send_inner(message, false, None, false)
     }
 
     pub(crate) fn send_bounded<M: Serialize>(&self, message: &M, within: Duration) -> Result<()> {
-        self.send_inner(message, false, Some(within))
+        self.send_inner(message, false, Some(within), false)
+    }
+
+    fn send_waiting<M: Serialize>(&self, message: &M, within: Duration) -> Result<()> {
+        self.send_inner(message, false, Some(within), true)
     }
 
     #[cfg(feature = "controller")]
     pub(crate) fn send_sensitive<M: Serialize>(&self, message: &M) -> Result<()> {
-        self.send_inner(message, true, None)
+        self.send_inner(message, true, None, false)
     }
 
     fn send_inner<M: Serialize>(
@@ -915,6 +919,7 @@ impl Sender {
         message: &M,
         sensitive: bool,
         bound: Option<Duration>,
+        wait: bool,
     ) -> Result<()> {
         ENCODE.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
@@ -932,7 +937,7 @@ impl Sender {
                             Err(Error::Protocol("frame too large"))
                         } else {
                             buffer[..4].copy_from_slice(&(len as u32).to_be_bytes());
-                            self.write_frame(&buffer, bound)
+                            self.write_frame(&buffer, bound, wait)
                         }
                     }
                 }
@@ -947,7 +952,7 @@ impl Sender {
                     Err(Error::Protocol("frame too large"))
                 } else {
                     buffer[..4].copy_from_slice(&(len as u32).to_be_bytes());
-                    self.write_frame(&buffer, bound)
+                    self.write_frame(&buffer, bound, wait)
                 }
             };
             if sensitive {
@@ -958,14 +963,14 @@ impl Sender {
         })
     }
 
-    fn write_frame(&self, frame: &[u8], bound: Option<Duration>) -> Result<()> {
+    fn write_frame(&self, frame: &[u8], bound: Option<Duration>, wait: bool) -> Result<()> {
         if self.0.closing.load(Ordering::Acquire) {
             // A failed write here would reset the socket before the peer reads the close alert, so the frame is dropped.
             return Ok(());
         }
-        let mut conn = match bound {
-            None => self.0.conn.lock().unwrap_or_else(|p| p.into_inner()),
-            Some(_) => match self.0.conn.try_lock() {
+        let mut conn = match (bound, wait) {
+            (None, _) | (Some(_), true) => self.0.conn.lock().unwrap_or_else(|p| p.into_inner()),
+            (Some(_), false) => match self.0.conn.try_lock() {
                 Ok(conn) => conn,
                 Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Internal(BUSY)),
@@ -2532,6 +2537,11 @@ pub fn offer(sender: &Sender, offer: &Offer) -> Result<()> {
             Err(error) if is_busy(&error) && Instant::now() < give_up => {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            Err(error) if is_busy(&error) => {
+                // The reader holds this lock only for in-memory TLS processing. Waiting cannot
+                // strand a leased offer behind reader contention; socket backpressure stays bounded.
+                return sender.send_waiting(&message, DISPATCH_WRITE_BOUND);
+            }
             outcome => return outcome,
         }
     }
@@ -3764,6 +3774,57 @@ mod tests {
             DISPATCH_WRITE_BOUND,
         )
         .expect("busy must not have closed the connection");
+    }
+
+    #[test]
+    fn an_offer_waits_out_reader_contention_instead_of_returning_busy() {
+        let (tx, mut rx) = tls_pair();
+        let expected = Offer {
+            attempt: AttemptId::new(),
+            tenant: TenantId::new(),
+            run: RunId::new(),
+            job: JobId::new(),
+            fence: Fence(7),
+            lease_until: UnixMillis(123_456),
+            cpu_millis: 2_000,
+            memory_bytes: 4 << 30,
+            image_digest: "sha256:test".into(),
+            image_platform: "linux/amd64".into(),
+            job_index: 3,
+        };
+        let message = ServerMessage::Offer(expected.to_wire());
+        let held = tx.0.conn.lock().unwrap();
+        let busy = tx.send_bounded(&message, DISPATCH_WRITE_BOUND).unwrap_err();
+        assert!(is_busy(&busy), "{busy}");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let sending = {
+            let tx = tx.clone();
+            let outgoing = expected.clone();
+            thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                sent_tx.send(offer(&tx, &outgoing)).unwrap();
+            })
+        };
+        started_rx.recv().unwrap();
+        assert!(
+            matches!(
+                sent_rx.recv_timeout(OFFER_BUSY_WAIT * 2),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the offer must wait for the reader rather than expire as BUSY"
+        );
+        drop(held);
+        sent_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        sending.join().unwrap();
+        let ServerMessage::Offer(wire) = rx.recv(Duration::from_secs(1)).unwrap() else {
+            panic!("the delivered frame must be the offer");
+        };
+        assert_eq!(Offer::from_wire(wire).unwrap(), expected);
     }
 
     fn context(tenant: Option<TenantId>, trust: Trust) -> JobContext {

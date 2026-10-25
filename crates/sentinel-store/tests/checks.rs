@@ -574,7 +574,7 @@ fn publications_are_retried_and_never_overwrite_a_newer_generation() {
         create_run(&mut f, repo, true)
     };
     let build = publication(&f, run, &jobs[0].to_string());
-    let due = checks::due(&f.conn, NOW, 10).unwrap();
+    let due = checks::due(&f.conn, NOW, 10).unwrap().publications;
     assert_eq!(due.len(), 3);
     assert!(due.iter().any(|p| p.id == build.id));
 
@@ -591,12 +591,14 @@ fn publications_are_retried_and_never_overwrite_a_newer_generation() {
     assert!(
         checks::due(&f.conn, NOW, 10)
             .unwrap()
+            .publications
             .iter()
             .all(|p| p.id != build.id)
     );
     assert_eq!(
         checks::due(&f.conn, UnixMillis(NOW.0 + 10_000), 10)
             .unwrap()
+            .publications
             .len(),
         3
     );
@@ -634,6 +636,7 @@ fn publications_are_retried_and_never_overwrite_a_newer_generation() {
     assert!(
         checks::due(&f.conn, UnixMillis(NOW.0 + 100_000), 10)
             .unwrap()
+            .publications
             .iter()
             .any(|p| p.id == newer.id),
         "the newer generation is still publishable"
@@ -651,6 +654,7 @@ fn publications_are_retried_and_never_overwrite_a_newer_generation() {
     assert!(
         checks::due(&f.conn, UnixMillis(NOW.0 + 100_000), 10)
             .unwrap()
+            .publications
             .iter()
             .all(|p| p.id != newer.id),
         "a refused generation is not due"
@@ -673,6 +677,7 @@ fn publications_are_retried_and_never_overwrite_a_newer_generation() {
     assert!(
         checks::due(&f.conn, UnixMillis(NOW.0 + 100_000), 10)
             .unwrap()
+            .publications
             .iter()
             .any(|p| p.id == fresh.id),
         "a new generation is publishable again"
@@ -706,6 +711,7 @@ fn attempts_exhaust_into_a_refusal_and_identity_belongs_to_the_target() {
     assert!(
         checks::due(&f.conn, UnixMillis(NOW.0 + 3_600_000), 10)
             .unwrap()
+            .publications
             .iter()
             .all(|p| p.id != build.id)
     );
@@ -788,6 +794,7 @@ fn repeating_the_stored_content_keeps_the_generation_and_the_retry_schedule() {
     assert!(
         checks::due(&f.conn, NOW, 10)
             .unwrap()
+            .publications
             .iter()
             .all(|p| p.id != build.id),
         "the back-off survives a re-record"
@@ -942,6 +949,7 @@ fn an_exhausted_final_status_is_rearmed_only_within_the_window() {
     assert!(
         checks::due(&f.conn, NOW, 10)
             .unwrap()
+            .publications
             .iter()
             .any(|p| p.id == build.id)
     );

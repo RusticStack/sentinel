@@ -44,7 +44,7 @@ const columns = [
           <div v-if="!row.original.connected" class="text-xs text-muted mt-1">seen <RelTime :ms="row.original.last_seen_ms" /></div>
         </template>
         <template #capacity-cell="{ row }">
-          <span v-if="row.original.capacity">{{ cpu(row.original.capacity.cpu_millis) }}, {{ fmtBytes(row.original.capacity.memory_bytes) }}<template v-if="row.original.capacity.disk_bytes">, {{ fmtBytes(row.original.capacity.disk_bytes) }} disk</template></span>
+          <span v-if="row.original.capacity">{{ cpu(row.original.capacity.cpu_millis) }}, {{ fmtBytes(row.original.capacity.memory_bytes) }}<template v-if="row.original.capacity.disk_bytes !== undefined">, {{ row.original.capacity.disk_bytes === 0 ? "no scratch disk; cannot accept jobs" : `${fmtBytes(row.original.capacity.disk_bytes)} disk` }}</template></span>
           <span v-else class="text-muted">not reported</span>
         </template>
         <template #held-cell="{ row }">
@@ -56,7 +56,7 @@ const columns = [
           </div>
         </template>
         <template #free-cell="{ row }">
-          {{ cpu(row.original.free.cpu_millis) }}, {{ fmtBytes(row.original.free.memory_bytes) }}<template v-if="row.original.free.disk_bytes !== undefined">, {{ fmtBytes(row.original.free.disk_bytes) }} disk</template>
+          {{ cpu(row.original.free.cpu_millis) }}, {{ fmtBytes(row.original.free.memory_bytes) }}<template v-if="row.original.free.disk_bytes !== undefined">, {{ row.original.free.disk_bytes === 0 ? "no scratch disk; cannot accept jobs" : `${fmtBytes(row.original.free.disk_bytes)} disk` }}</template>
           <div v-if="(row.original.host_workers ?? 0) > 1" class="text-xs text-muted">host shared by {{ row.original.host_workers }} workers</div>
         </template>
         <template #labels-cell="{ row }">

@@ -783,6 +783,7 @@ fn an_attempt_summary_needs_cache_read_and_reports_cache_records() {
                 name: None,
                 lifetime_ms: oauth::LOGIN_GRANT_MS,
                 created_by: None,
+                created_session: None,
             },
             UnixMillis::now(),
         )

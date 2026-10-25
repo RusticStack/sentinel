@@ -1229,13 +1229,7 @@ fn prepare(
         .get(job_index as usize)
         .filter(|compiled| compiled.name == job_name)
         .ok_or(Error::Corrupt("job spec index"))?;
-    if compiled.spec.registry_auth.is_none()
-        && !compiled
-            .spec
-            .steps
-            .iter()
-            .any(|step| !step.secrets.is_empty() || !step.secret_files.is_empty())
-    {
+    if !compiled.spec.requires_secret_delivery() {
         return Ok(PreparedDelivery {
             fence: Fence(fence as u64),
             encoded: encode_bundle(&DeliveryBundle::empty())?,

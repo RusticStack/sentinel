@@ -5,7 +5,16 @@
 #[path = "support/shim_dir.rs"]
 mod shim_dir;
 
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::OnceLock};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use sentinel_core::{AttemptId, Fence, WorkerId};
 use sentinel_worker::{
@@ -30,7 +39,16 @@ case "$1" in
     name="$5"
     if [ -e "$dir/fail-stop-$name" ]; then echo "Error: stop timed out" >&2; exit 125; fi
     exit 0 ;;
-  create|start) exit 0 ;;
+  create)
+    echo "$3" >> "$dir/created"
+    exit 0 ;;
+  start)
+    name="$3"
+    if [ -e "$dir/hold-start-$name" ]; then
+      echo "$name" >> "$dir/started"
+      while [ -e "$dir/hold-start-$name" ]; do sleep 0.05; done
+    fi
+    exit 0 ;;
   *) exit 1 ;;
 esac
 "#;
@@ -62,6 +80,80 @@ fn removed() -> Vec<String> {
         .lines()
         .map(str::to_owned)
         .collect()
+}
+
+#[test]
+fn a_canceled_attempt_never_invokes_container_create() {
+    let dir = shim();
+    let attempt = AttemptId::new();
+    let name = format!("sentinel-{attempt}");
+    let workspace = tempfile::tempdir().unwrap();
+    let outcome = Container::start_canceled(
+        WorkerId::new(),
+        attempt,
+        "example.org/image@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        Limits {
+            cpu_millis: 1_000,
+            memory_bytes: 1 << 30,
+            pids: 64,
+            disk_bytes: 0,
+            lifetime_secs: 0,
+        },
+        workspace.path(),
+        &[],
+        &podman::Store::Shared,
+        sentinel_worker::podman::Network::None,
+        &AtomicBool::new(true),
+    );
+    assert!(outcome.is_err());
+    let created = fs::read_to_string(dir.join("created")).unwrap_or_default();
+    assert!(
+        !created.lines().any(|created| created == name),
+        "canceled attempt invoked podman create: {created}"
+    );
+}
+
+#[test]
+fn canceling_container_start_removes_the_created_container() {
+    let dir = shim();
+    let attempt = AttemptId::new();
+    let name = format!("sentinel-{attempt}");
+    fs::write(dir.join(format!("hold-start-{name}")), "").unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let canceled = Arc::clone(&cancel);
+    let starting = std::thread::spawn(move || {
+        Container::start_canceled(
+            WorkerId::new(),
+            attempt,
+            "example.org/image@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            Limits {
+                cpu_millis: 1_000,
+                memory_bytes: 1 << 30,
+                pids: 64,
+                disk_bytes: 0,
+                lifetime_secs: 0,
+            },
+            workspace.path(),
+            &[],
+            &podman::Store::Shared,
+            sentinel_worker::podman::Network::None,
+            &canceled,
+        )
+        .is_err()
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let started = fs::read_to_string(dir.join("started")).unwrap_or_default();
+        if started.lines().any(|started| started == name) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "podman start was not invoked");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cancel.store(true, Ordering::Release);
+    assert!(starting.join().unwrap(), "start cancellation succeeded");
+    assert!(removed().contains(&name), "{:?}", removed());
 }
 
 #[test]

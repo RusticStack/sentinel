@@ -147,6 +147,10 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (52, include_str!("migrations/052_setup.sql")),
     (53, include_str!("migrations/053_auto_join.sql")),
     (54, include_str!("migrations/054_job_runtime.sql")),
+    (
+        55,
+        include_str!("migrations/055_session_grant_provenance.sql"),
+    ),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;

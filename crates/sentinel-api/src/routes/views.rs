@@ -3,6 +3,7 @@ use sentinel_core::{
     auth::{Permissions, Scopes},
 };
 use sentinel_protocol::{
+    PROFILE_MIN,
     error::ErrorCode,
     limits::{MAX_PAGE_ITEMS, page_size},
     summary::{AttemptSummary, StepOutcome},
@@ -249,12 +250,15 @@ pub(super) fn workers_view(state: &State, request: &crate::http::Request, query:
                     "draining": load.draining_since.is_some(),
                     "labels": load.labels,
                     "held_attempts": load.held_attempts,
-                    "held": capacity_json(&load.held),
-                    "free": capacity_json(&load.free),
+                    "held": capacity_json(&load.held, false),
+                    "free": capacity_json(&load.free, w.negotiated.protocol >= PROFILE_MIN),
                 });
                 // A capacity the worker never reported is absent, not zero.
                 if load.capacity.cpu_millis > 0 || load.capacity.memory_bytes > 0 {
-                    worker["capacity"] = capacity_json(&load.capacity);
+                    worker["capacity"] = capacity_json(
+                        &load.capacity,
+                        w.negotiated.protocol >= PROFILE_MIN,
+                    );
                 }
                 if let Some(since) = load.draining_since {
                     worker["draining_since_ms"] = json!(since);
@@ -271,10 +275,10 @@ pub(super) fn workers_view(state: &State, request: &crate::http::Request, query:
     }))
 }
 
-fn capacity_json(c: &dispatch::Capacity) -> Value {
+fn capacity_json(c: &dispatch::Capacity, report_zero_disk: bool) -> Value {
     let mut out = json!({ "cpu_millis": c.cpu_millis, "memory_bytes": c.memory_bytes });
-    // Disk 0 is "not reported" on a worker row, and no subtraction applies.
-    if c.disk_bytes != 0 {
+    // Held zero stays absent; profile capacity and free explicitly report zero disk.
+    if c.disk_bytes != 0 || report_zero_disk {
         out["disk_bytes"] = json!(c.disk_bytes);
     }
     out

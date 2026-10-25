@@ -413,13 +413,15 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
     eventually("held canceled", || api.run(&held_id)["state"] == "canceled");
     let held_job = api.job(&held_id, "held");
     assert_eq!(held_job["failure_class"], "canceled");
+    let held_attempt = held_job["attempt"].as_str().unwrap();
+    let recorded = notices.lock().unwrap();
     assert!(
-        !notices
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|n| n.contains("Started") && false)
+        recorded.iter().any(|n| {
+            n.starts_with(&format!("Finished({held_attempt},")) && n.contains("Failed(Canceled")
+        }),
+        "cancel during preparation did not finish as canceled: {recorded:?}"
     );
+    drop(recorded);
 
     let long = api.dispatch(
         &pipeline("long", "echo start; sleep 4; echo end"),

@@ -45,6 +45,7 @@ pub struct Job {
     pub secret_bundle: sentinel_protocol::secrets::DeliveryBundle,
     pub images: Images,
     pub caches: Vec<sentinel_cache::attach::Attached>,
+    pub cache_budget_bytes: u64,
     pub mirrors: Option<checkout::Mirrors>,
     pub prepare_hold: std::time::Duration,
     pub network: podman::Network,
@@ -720,7 +721,7 @@ fn prepare(
                 .saturating_add(podman::KEEPALIVE_SLACK_SECS),
         };
         let sandbox = match job.runtime.for_job(stated_isolation) {
-            Isolation::Container => Sandbox::Container(Container::start(
+            Isolation::Container => Sandbox::Container(Container::start_canceled(
                 job.worker,
                 job.attempt,
                 &image,
@@ -729,6 +730,7 @@ fn prepare(
                 &mounts,
                 &store,
                 job.network,
+                cancel,
             )?),
             Isolation::Microvm => {
                 let setup = job.runtime.microvm.as_deref().ok_or_else(|| {
@@ -1187,8 +1189,9 @@ fn publish_caches(
     let canceled = || cancel.load(Ordering::Acquire);
     for (index, attached) in job.caches.iter_mut().enumerate() {
         let started = Instant::now();
-        let committed = sentinel_cache::publish::commit(
+        let committed = sentinel_cache::publish::commit_with_budget(
             &cache_root,
+            job.cache_budget_bytes,
             attached,
             job.context.trust,
             sentinel_core::UnixMillis::now(),
@@ -1531,6 +1534,7 @@ mod tests {
             },
             images: Images::with_download(|_, _, _, _, _| Ok(false)),
             caches: Vec::new(),
+            cache_budget_bytes: sentinel_cache::gc::DEFAULT_BUDGET_BYTES,
             mirrors: None,
             prepare_hold: Duration::ZERO,
             network: podman::Network::None,
@@ -1678,6 +1682,39 @@ mod tests {
             notes.cache_notes.lock().unwrap().as_slice(),
             [CacheNote {
                 outcome: CacheOutcome::Sealed { .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn publish_uses_the_attempt_cache_budget() {
+        const BUDGET: u64 = 1 << 30;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (root, ws) = (temp.path().join("worker"), temp.path().join("ws"));
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("f.lock"), b"locked").unwrap();
+        let mut job = job(spec());
+        job.cache_budget_bytes = BUDGET;
+        let declared = job.spec.pipeline.jobs[0].spec.cache.clone();
+        let image = format!("example.test/i@{}", job.digest);
+        restore_caches(&root, &mut job, &declared, &ws, &image, None);
+        let huge = fs::File::create(ws.join("vendor/lib")).unwrap();
+        huge.set_len(BUDGET / 4 + 1).unwrap();
+        let notes = Notes::default();
+        let flag: Cancel = Arc::new(AtomicBool::new(false));
+        let sealed = publish_caches(&root, &mut job, &notes, &flag);
+
+        assert!(sealed.is_empty());
+        assert!(matches!(
+            job.caches[0].stats.committed,
+            Some(sentinel_cache::Committed::Failed)
+        ));
+        assert!(matches!(
+            notes.cache_notes.lock().unwrap().as_slice(),
+            [CacheNote {
+                outcome: CacheOutcome::Failed(_),
                 ..
             }]
         ));

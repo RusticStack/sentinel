@@ -2,7 +2,7 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::secret::Digest;
 use sentinel_core::{
-    RepoId, TenantId, UnixMillis, UserId,
+    RepoId, SessionId, TenantId, UnixMillis, UserId,
     auth::{Namespace, Permissions, Principal, Role},
 };
 
@@ -220,6 +220,7 @@ pub enum Authority {
     Session {
         principal: Principal,
         token: Digest,
+        id: Option<SessionId>,
         step_up_ms: i64,
     },
     HostLocal,
@@ -244,14 +245,15 @@ impl Authority {
         }
     }
 
-    pub const fn live_session(
-        principal: Principal,
+    pub fn live_session(
+        session: &crate::local_auth::Session,
         token: Digest,
         policy: crate::local_auth::Policy,
     ) -> Self {
         Self::Session {
-            principal,
+            principal: session.principal(),
             token,
+            id: session.id,
             step_up_ms: policy.step_up_ms,
         }
     }
@@ -349,6 +351,13 @@ impl Authority {
 
     pub const fn host_local(&self) -> bool {
         matches!(self, Authority::HostLocal)
+    }
+
+    pub const fn created_session(&self) -> Option<SessionId> {
+        match self {
+            Authority::Session { id, .. } => *id,
+            _ => None,
+        }
     }
 }
 

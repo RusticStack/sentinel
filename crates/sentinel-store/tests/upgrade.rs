@@ -1,6 +1,8 @@
 use rusqlite::{Connection, params};
-use sentinel_core::{RepoId, RunId, TenantId, UnixMillis};
-use sentinel_store::{Durability, Error, Store, jobs, schema, upgrade, workers};
+use sentinel_core::{GrantId, RepoId, RunId, TenantId, UnixMillis, UserId};
+use sentinel_store::{
+    Durability, Error, Store, auth::provisioning, jobs, schema, upgrade, workers,
+};
 
 const NOW: UnixMillis = UnixMillis(1_000_000_000);
 
@@ -90,6 +92,38 @@ fn an_upgrade_keeps_a_copy_of_the_database_from_before_it() {
         .map(|(v, _)| v)
         .collect();
     assert_eq!(kept, vec![2, from]);
+}
+
+#[test]
+fn session_grant_provenance_migration_preserves_legacy_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.sqlite");
+    let mut conn = database_at(&path, 54);
+    let user = UserId::new();
+    let grant = GrantId::new();
+    let tx = conn.transaction().unwrap();
+    provisioning::insert_human(&tx, user, "Root", true, NOW).unwrap();
+    tx.execute(
+        "INSERT INTO oauth_grants(id, user_id, client_id, kind, scopes, audience, created_ms, expires_ms)
+         VALUES (?1, ?2, 'sentinel-cli', 1, 1, 1, ?3, ?4)",
+        params![grant.as_bytes(), user.as_bytes(), NOW.0, NOW.0 + 1_000],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    drop(conn);
+
+    let (store, _) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
+    let provenance = store
+        .read(|c| {
+            c.query_row(
+                "SELECT created_session FROM oauth_grants WHERE id = ?1",
+                [grant.as_bytes()],
+                |row| row.get::<_, Option<[u8; 16]>>(0),
+            )
+            .map_err(Error::from)
+        })
+        .unwrap();
+    assert_eq!(provenance, None);
 }
 
 #[test]

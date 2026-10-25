@@ -35,11 +35,17 @@ impl Fixture {
     }
 
     fn code_for(&self, seed: &Seed, now: UnixMillis) -> String {
+        self.code_for_after(seed, now, 0)
+    }
+
+    fn code_for_after(&self, seed: &Seed, now: UnixMillis, last_step: u64) -> String {
         let seconds = now.0 as u64 / 1000;
         (0..1_000_000u32)
             .map(|n| format!("{n:06}"))
-            .find(|code| sentinel_auth::mfa::check(seed, code, seconds).is_some())
-            .expect("some six-digit code matches")
+            .find(|code| {
+                sentinel_auth::mfa::check(seed, code, seconds).is_some_and(|step| step > last_step)
+            })
+            .expect("some six-digit code matches in a fresh step")
     }
 
     fn enroll(&self, now: UnixMillis) -> (Seed, Vec<String>) {
@@ -188,6 +194,16 @@ fn enrollment_is_confirmed_by_a_code_and_the_seed_is_stored_only_sealed() {
     let enrollment =
         mfa::begin_enrollment(&f.store, &f.key, &f.session(now), "Sentinel", "root", now).unwrap();
     assert!(enrollment.provisioning_uri.starts_with("otpauth://totp/"));
+    let started = f
+        .store
+        .read(|c| local_auth::recent_audit(c, 1))
+        .unwrap()
+        .remove(0);
+    assert_eq!(started.event, Event::MfaEnrollmentStarted);
+    assert_eq!(started.actor, Some(f.root));
+    assert_eq!(started.subject, Some(f.root));
+    assert!(!started.host_local);
+    assert_eq!(started.detail, None);
     let seed = seed_from_uri(&enrollment.provisioning_uri);
 
     assert!(!f.store.read(|c| mfa::enrolled(c, f.root)).unwrap());
@@ -241,6 +257,16 @@ fn enrollment_is_confirmed_by_a_code_and_the_seed_is_stored_only_sealed() {
         mfa::begin_enrollment(&f.store, &f.key, &f.session(now), "Sentinel", "root", now),
         Err(Error::Conflict)
     ));
+    assert_eq!(
+        f.store
+            .read(|c| local_auth::recent_audit(c, 100))
+            .unwrap()
+            .iter()
+            .filter(|row| row.event == Event::MfaEnrollmentStarted)
+            .count(),
+        1,
+        "a conflicting start is not audited"
+    );
 }
 
 #[test]
@@ -952,6 +978,7 @@ fn a_password_change_with_a_factor_needs_step_up_and_a_wrong_password_never_coun
         Err(Error::StepUpRequired)
     ));
     let code = f.code_for(&seed, later);
+    let used_step = sentinel_auth::mfa::check(&seed, &code, later.0 as u64 / 1000).unwrap();
     assert!(
         mfa::step_up(
             &f.store,
@@ -992,7 +1019,7 @@ fn a_password_change_with_a_factor_needs_step_up_and_a_wrong_password_never_coun
 
     let t2 = at(later.0 + 60_000);
     let (cookie, session) = sign_in(&f, t2);
-    let code = f.code_for(&seed, t2);
+    let code = f.code_for_after(&seed, t2, used_step);
     assert!(mfa::step_up(&f.store, &f.key, &cookie, &session, Proof::Totp(&code), t2).unwrap());
     let stepped = f
         .store
@@ -1090,9 +1117,15 @@ fn host_local_enrollment_needs_the_code_marks_the_audit_and_leaves_sessions_alon
         .unwrap()
     );
     let audit = f.store.read(|c| local_auth::recent_audit(c, 100)).unwrap();
-    for event in [Event::MfaEnrolled, Event::RecoveryCodesIssued] {
+    for event in [
+        Event::MfaEnrollmentStarted,
+        Event::MfaEnrolled,
+        Event::RecoveryCodesIssued,
+    ] {
         let row = audit.iter().find(|r| r.event == event).expect("audited");
         assert!(row.host_local && row.actor.is_none(), "{event:?}");
+        assert_eq!(row.subject, Some(f.root));
+        assert_eq!(row.detail, None);
     }
 }
 

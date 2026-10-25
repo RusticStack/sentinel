@@ -15,6 +15,22 @@ fn sentinel(data: &std::path::Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn sentinel_with_stdin(data: &std::path::Path, args: &[&str], input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+        .args(args)
+        .arg("--data-dir")
+        .arg(data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    std::io::Write::write_all(&mut stdin, input.as_bytes()).unwrap();
+    drop(stdin);
+    child.wait_with_output().unwrap()
+}
+
 fn lines(out: &Output) -> Vec<String> {
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -77,19 +93,28 @@ fn enrolling_from_the_host_needs_the_key_and_a_valid_code_and_prints_secrets_onc
     let status = sentinel(&data, &["admin", "mfa", "status", "--user", "root"]);
     assert!(lines(&status).contains(&"enrolled: false".to_owned()));
 
-    let wrong = sentinel(
+    let argv = sentinel(
         &data,
         &[
-            "admin", "mfa", "confirm", "--user", "root", "--code", "abcdef",
+            "admin", "mfa", "confirm", "--user", "root", "--code", "123456",
         ],
+    );
+    assert!(!argv.status.success());
+    assert!(!String::from_utf8_lossy(&argv.stderr).contains("123456"));
+
+    let wrong = sentinel_with_stdin(
+        &data,
+        &["admin", "mfa", "confirm", "--user", "root"],
+        "abcdef\n",
     );
     assert!(!wrong.status.success());
     assert!(wrong.stdout.is_empty());
 
     let code = current_code(&out[0]);
-    let confirmed = sentinel(
+    let confirmed = sentinel_with_stdin(
         &data,
-        &["admin", "mfa", "confirm", "--user", "root", "--code", &code],
+        &["admin", "mfa", "confirm", "--user", "root"],
+        &format!("{code}\n"),
     );
     assert!(
         confirmed.status.success(),

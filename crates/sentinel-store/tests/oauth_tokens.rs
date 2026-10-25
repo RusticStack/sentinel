@@ -107,6 +107,7 @@ fn login_grant(user: UserId, scopes: Scopes) -> NewGrant<'static> {
         name: None,
         lifetime_ms: oauth::LOGIN_GRANT_MS,
         created_by: None,
+        created_session: None,
     }
 }
 
@@ -265,6 +266,7 @@ fn service_principals_are_confined_to_their_home_tenant() {
             name: Some("deploy bot"),
             lifetime_ms: oauth::SERVICE_DEFAULT_MS,
             created_by: Some(i.dev),
+            created_session: None,
             ..login_grant(i.bot, Scopes::RUNS_READ.union(Scopes::RUNS_WRITE))
         },
     );

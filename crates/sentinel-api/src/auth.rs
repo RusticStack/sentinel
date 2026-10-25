@@ -123,7 +123,7 @@ pub fn identify(
         grant: None,
         expires: None,
         stepped_up: session.stepped_up_within(sessions, now),
-        authority: Authority::live_session(principal, secret.digest(), sessions),
+        authority: Authority::live_session(&session, secret.digest(), sessions),
     })
 }
 

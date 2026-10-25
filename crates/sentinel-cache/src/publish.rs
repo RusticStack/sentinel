@@ -24,13 +24,17 @@ use crate::{
 };
 
 pub const CACHE_PUBLISH_TIMEOUT: Duration = Duration::from_secs(3 * 60);
-pub const MAX_GENERATION_BYTES: u64 = crate::gc::DEFAULT_BUDGET_BYTES / 4;
+pub const MAX_GENERATION_BYTES: u64 = max_generation_bytes(crate::gc::DEFAULT_BUDGET_BYTES);
 pub const FREE_SPACE_RESERVE: u64 = 1 << 30;
 const CHECK_EVERY: u32 = 256;
 pub(crate) const MAX_WALK_DEPTH: usize = 64;
 const COPY_BYTES: usize = 1 << 20;
 const SYNC_FDS: usize = 64;
 pub(crate) const CURRENT_TMP: &str = "current.tmp";
+
+const fn max_generation_bytes(budget_bytes: u64) -> u64 {
+    budget_bytes / 4
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Published {
@@ -136,8 +140,30 @@ pub fn commit(
     deadline: Instant,
     cancel: &dyn Fn() -> bool,
 ) -> Result<Published, PublishError> {
-    commit_profiled(
+    commit_with_budget(
         cache_root,
+        crate::gc::DEFAULT_BUDGET_BYTES,
+        attached,
+        trust,
+        now,
+        deadline,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn commit_with_budget(
+    cache_root: &Path,
+    budget_bytes: u64,
+    attached: &Attached,
+    trust: Trust,
+    now: UnixMillis,
+    deadline: Instant,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Published, PublishError> {
+    commit_profiled_with_budget(
+        cache_root,
+        budget_bytes,
         attached,
         trust,
         now,
@@ -149,6 +175,29 @@ pub fn commit(
 
 pub fn commit_profiled(
     cache_root: &Path,
+    attached: &Attached,
+    trust: Trust,
+    now: UnixMillis,
+    deadline: Instant,
+    cancel: &dyn Fn() -> bool,
+    phases: &mut Phases,
+) -> Result<Published, PublishError> {
+    commit_profiled_with_budget(
+        cache_root,
+        crate::gc::DEFAULT_BUDGET_BYTES,
+        attached,
+        trust,
+        now,
+        deadline,
+        cancel,
+        phases,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn commit_profiled_with_budget(
+    cache_root: &Path,
+    budget_bytes: u64,
     attached: &Attached,
     trust: Trust,
     now: UnixMillis,
@@ -202,6 +251,7 @@ pub fn commit_profiled(
         deadline,
         cancel,
         phases,
+        budget_bytes,
     ) {
         Ok(done) => Ok(done),
         Err(Stop::Canceled) => Ok(Published::Skipped(SkipReason::Canceled)),
@@ -228,6 +278,7 @@ struct Plan<'a> {
     planned: Vec<Planned>,
     bases: Vec<Base>,
     bytes: u64,
+    max_bytes: u64,
     skipped: u64,
     since_check: u32,
     unchanged: bool,
@@ -285,6 +336,7 @@ fn stage(
     deadline: Instant,
     cancel: &dyn Fn() -> bool,
     phases: &mut Phases,
+    budget_bytes: u64,
 ) -> Result<Published, Stop> {
     let planning = Instant::now();
     let source = attached
@@ -306,6 +358,7 @@ fn stage(
         planned: Vec::new(),
         bases: Vec::with_capacity(attached.targets.len()),
         bytes: 0,
+        max_bytes: max_generation_bytes(budget_bytes),
         skipped: 0,
         since_check: 0,
         unchanged: true,
@@ -523,7 +576,7 @@ impl Plan<'_> {
         }
         let size = meta.size;
         self.bytes = self.bytes.saturating_add(size);
-        if self.bytes > MAX_GENERATION_BYTES {
+        if self.bytes > self.max_bytes {
             return Err(PublishError::TooLarge.into());
         }
         let mode = meta.mode;

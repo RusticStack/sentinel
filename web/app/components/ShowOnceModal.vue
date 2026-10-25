@@ -5,6 +5,7 @@ const emit = defineEmits<{ close: [] }>();
 const values = ref<string[]>([...props.secrets]);
 const saved = ref(false);
 const status = ref("");
+const blobUrl = ref<string | null>(null);
 const text = () => values.value.join("\n") + "\n";
 
 async function copy() {
@@ -17,12 +18,12 @@ async function copy() {
 }
 
 function download() {
-  const url = URL.createObjectURL(new Blob([text()], { type: "text/plain" }));
+  const url = blobUrl.value ??= URL.createObjectURL(new Blob([text()], { type: "text/plain" }));
   const a = document.createElement("a");
   a.href = url;
   a.download = props.filename;
   a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 0);
+  // Keep the object URL alive until the dialog is gone so the download can finish.
   status.value = `Downloaded ${props.filename}.`;
 }
 
@@ -31,7 +32,10 @@ function done() {
   values.value = [];
   emit("close");
 }
-onBeforeUnmount(() => { values.value = []; });
+onBeforeUnmount(() => {
+  values.value = [];
+  if (blobUrl.value) URL.revokeObjectURL(blobUrl.value);
+});
 </script>
 
 <template>

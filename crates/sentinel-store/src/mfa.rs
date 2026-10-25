@@ -38,7 +38,7 @@ pub fn begin_enrollment(
     account: &str,
     now: UnixMillis,
 ) -> Result<Enrollment> {
-    begin(store, key, session.user, issuer, account, now)
+    begin(store, key, session.user, false, issuer, account, now)
 }
 
 pub fn begin_enrollment_host_local(
@@ -49,13 +49,14 @@ pub fn begin_enrollment_host_local(
     account: &str,
     now: UnixMillis,
 ) -> Result<Enrollment> {
-    begin(store, key, user, issuer, account, now)
+    begin(store, key, user, true, issuer, account, now)
 }
 
 fn begin(
     store: &Store,
     key: &Key,
     user: UserId,
+    host_local: bool,
     issuer: &str,
     account: &str,
     now: UnixMillis,
@@ -89,7 +90,14 @@ fn begin(
             }
             other => Error::from(other),
         })?;
-        Ok(())
+        audit(
+            tx,
+            Event::MfaEnrollmentStarted,
+            (!host_local).then_some(user),
+            Some(user),
+            host_local,
+            None,
+        )
     })?;
     Ok(Enrollment { provisioning_uri })
 }

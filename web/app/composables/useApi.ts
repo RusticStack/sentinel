@@ -42,7 +42,7 @@ export function useEndSession() {
   const me = useState<Me | null>("me", () => null);
   const tenants = useState<TenantChoice[]>("tenants", () => []);
   return async function end(reason: EndReason) {
-    if (!me.value) return;
+    if (reason === "expired" && !me.value) return;
     me.value = null;
     tenants.value = [];
     // After an expiry another tab may already hold a fresh CSRF token; keep it.
