@@ -162,6 +162,7 @@ const PAGES = {
   organizations: ["/organizations", "!!document.querySelector('#ns-h') && !!document.querySelector('#new-org-h')"],
   settings: ["/t/acme/settings", "!!document.querySelector('#about-h') && !!document.querySelector('#members-h')"],
   invitations: ["/t/acme/admin/invitations", "!!document.querySelector('#invite-h')"],
+  github: ["/setup/github", "document.querySelector('main h1') && document.querySelector('main h1').textContent === 'GitHub App' && document.querySelectorAll('main [role=status], main section').length >= 1"],
 };
 
 const PUBLIC_PAGES = {
@@ -257,6 +258,16 @@ await scenario("pages", async () => {
   await page.eval(clickText("nav a", "Queue"));
   await page.waitFor("location.pathname === '/t/acme/queue' && document.activeElement && document.activeElement.tagName === 'H1'", 10000, "focus on heading");
   check("navigation moves focus to the view's heading", true);
+});
+
+await scenario("GitHub App setup page", async () => {
+  await go(page, ...PAGES.github);
+  const policy = await page.eval("fetch('/setup/github', { headers: { accept: 'text/html' } }).then((r) => r.headers.get('content-security-policy') || '')");
+  check("the GitHub App page may post its manifest form to GitHub only", /form-action 'self' https:\/\/github\.com(;|$)/.test(policy), policy.slice(0, 300));
+  const other = await page.eval("fetch('/t/acme', { headers: { accept: 'text/html' } }).then((r) => r.headers.get('content-security-policy') || '')");
+  check("other pages keep form-action to this origin", /form-action 'self'(;|$)/.test(other));
+  const text = await page.eval("document.querySelector('main').textContent");
+  check("a controller GitHub cannot reach over HTTPS is said on the page", text.includes("GitHub cannot deliver events"), text.slice(0, 300));
 });
 
 await scenario("hopping between live pages", async () => {
