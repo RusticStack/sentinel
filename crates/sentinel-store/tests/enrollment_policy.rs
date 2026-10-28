@@ -428,6 +428,7 @@ jobs:
         .unwrap()
         .expect("the job fits before the reduction");
 
+    let disk_before = capacity(&f, worker).disk_bytes;
     // Halving the CPU ceiling below the held 2 cores' share: the accepted attempt stays, and the
     // free room goes negative instead of killing it.
     f.store
@@ -449,7 +450,10 @@ jobs:
     let free = capacity(&f, worker);
     assert_eq!(free.cpu_millis, 1_000 - 2_000);
     assert_eq!(free.memory_bytes, (1 << 30) - (2 << 30));
-    assert_eq!(free.disk_bytes, 100 << 30);
+    assert_eq!(
+        free.disk_bytes, disk_before,
+        "a policy without a disk ceiling leaves the disk room alone"
+    );
     let held = f
         .store
         .read(|c| dispatch::is_held(c, worker, offer.attempt))
