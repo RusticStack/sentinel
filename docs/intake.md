@@ -335,6 +335,12 @@ worker's expression context is filled from it, so `event.name`, `event.ref`,
 `event.key`, `event.base_ref` and `event.pr_number` are real values rather
 than unresolved fields (see the [pipeline schema](pipeline-schema.md)).
 
+The controller is the only writer: `intake::dispatch` inserts the run and its
+`run_provenance` row in one transaction (`provenance::insert`), so a rolled-back
+dispatch leaves neither, and a run without a row reads as a `manual` event. The
+worker only reads the facts (`provenance::event_facts`, carried in the worker
+protocol) when it builds its expression context; it never records them.
+
 Settled rows are terminal — the store's trigger refuses reopening one — and
 each settlement is logged as `intake_settled` with its delivery and outcome,
 and a failed batch as `intake_failed`. A settled delivery on a
