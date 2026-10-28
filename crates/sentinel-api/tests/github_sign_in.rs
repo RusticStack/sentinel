@@ -36,6 +36,10 @@ struct Deployment {
     store: Arc<Store>,
     _controller: Controller,
     server: Option<sentinel_api::Server>,
+    logs: Arc<LogStore>,
+    objects: Arc<Objects>,
+    key: Arc<sentinel_auth::sealed::Key>,
+    configured: bool,
     github: FakeGithub,
     base: String,
     root: UserId,
@@ -46,6 +50,54 @@ impl Drop for Deployment {
         if let Some(server) = self.server.take() {
             server.shutdown();
         }
+    }
+}
+
+fn serve(
+    store: &Arc<Store>,
+    logs: &Arc<LogStore>,
+    objects: &Arc<Objects>,
+    key: &Arc<sentinel_auth::sealed::Key>,
+    controller: &Controller,
+    github: &FakeGithub,
+    configured: bool,
+) -> sentinel_api::Server {
+    sentinel_api::Server::start(sentinel_api::Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        store: Arc::clone(store),
+        logs: Arc::clone(logs),
+        objects: Arc::clone(objects),
+        controller: controller.handle(),
+        secret_key: Some(Arc::clone(key)),
+        sessions: local_auth::Policy::default(),
+        github_webhook_secret: None,
+        intake: None,
+        public_url: None,
+        github_sign_in: configured.then(|| sentinel_api::GithubSignIn {
+            client_id: "Iv1.fake0123456789".into(),
+            client_secret: SECRET.into(),
+            endpoints: github.endpoints(),
+        }),
+        trusted_proxies: sentinel_api::TrustedProxy::loopback(),
+    })
+    .unwrap()
+}
+
+impl Deployment {
+    /// Stops the API server and starts a new one over the same store: everything the old one held in memory is gone.
+    fn restart_api(&mut self) {
+        self.server.take().unwrap().shutdown();
+        let server = serve(
+            &self.store,
+            &self.logs,
+            &self.objects,
+            &self.key,
+            &self._controller,
+            &self.github,
+            self.configured,
+        );
+        self.base = format!("http://{}", server.local_addr());
+        self.server = Some(server);
     }
 }
 
@@ -125,25 +177,15 @@ fn deployment(configured: bool) -> (Deployment, UserId) {
     )
     .unwrap();
     let github = FakeGithub::start(SECRET);
-    let server = sentinel_api::Server::start(sentinel_api::Config {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        store: Arc::clone(&store),
-        logs,
-        objects,
-        controller: controller.handle(),
-        secret_key: Some(key),
-        sessions: local_auth::Policy::default(),
-        github_webhook_secret: None,
-        intake: None,
-        public_url: None,
-        github_sign_in: configured.then(|| sentinel_api::GithubSignIn {
-            client_id: "Iv1.fake0123456789".into(),
-            client_secret: SECRET.into(),
-            endpoints: github.endpoints(),
-        }),
-        trusted_proxies: sentinel_api::TrustedProxy::loopback(),
-    })
-    .unwrap();
+    let server = serve(
+        &store,
+        &logs,
+        &objects,
+        &key,
+        &controller,
+        &github,
+        configured,
+    );
     let base = format!("http://{}", server.local_addr());
     (
         Deployment {
@@ -151,6 +193,10 @@ fn deployment(configured: bool) -> (Deployment, UserId) {
             store,
             _controller: controller,
             server: Some(server),
+            logs,
+            objects,
+            key,
+            configured,
             github,
             base,
             root,
@@ -1332,4 +1378,62 @@ fn without_github_configured_no_page_offers_it_and_the_routes_do_not_exist() {
             "{path}"
         );
     }
+}
+
+/// Hand-offs live in controller memory (docs/github-sign-in.md, "A restart between the callback and the finish").
+/// The loss is accepted: the state was spent at the callback, so the browser must start over, and nothing is issued.
+#[test]
+fn a_restart_between_the_callback_and_the_finish_issues_nothing_and_a_new_sign_in_works() {
+    let (mut d, octo) = deployment(true);
+    d.github.sign_in_as(Some(octo_github()));
+    let mut browser = Browser::new(&d);
+
+    let start = browser.get(&format!("{}/auth/github/start?return_to=%2F", d.base));
+    assert_eq!(start.status, 303, "{}", start.text);
+    let to_github = start.header("location").unwrap().to_owned();
+    let back = browser
+        .get(&to_github)
+        .header("location")
+        .unwrap()
+        .to_owned();
+    let page = browser.cross_site_get(&back);
+    assert_eq!(page.status, 200, "{}", page.text);
+    assert_eq!(continue_target(&page), "/auth/github/finish");
+    assert_eq!(sessions_of(&d, octo), 0);
+
+    d.restart_api();
+    let finish = format!("{}/auth/github/finish", d.base);
+    let lost = browser.get(&finish);
+    assert_eq!(lost.status, 400, "{}", lost.text);
+    assert!(lost.text.contains("Start again"), "{}", lost.text);
+    assert_eq!(sessions_of(&d, octo), 0);
+    assert!(browser.cookie("__Host-sentinel_signin").is_none());
+    assert!(
+        lost.set_cookies()
+            .iter()
+            .all(|c| !c.contains("sentinel_session")),
+        "{:?}",
+        lost.set_cookies()
+    );
+
+    // The old callback URL cannot be replayed either: its state was spent before the restart.
+    let replay = browser.cross_site_get(
+        &back.replace(back.split("/auth/github/callback").next().unwrap(), &d.base),
+    );
+    assert_eq!(replay.status, 400, "{}", replay.text);
+    assert_eq!(sessions_of(&d, octo), 0);
+
+    // Starting again on the restarted server completes normally.
+    let start = browser.get(&format!("{}/auth/github/start?return_to=%2F", d.base));
+    assert_eq!(start.status, 303, "{}", start.text);
+    let to_github = start.header("location").unwrap().to_owned();
+    let back = browser
+        .get(&to_github)
+        .header("location")
+        .unwrap()
+        .to_owned();
+    let done = browser.callback(&back);
+    assert_eq!(done.status, 200, "{}", done.text);
+    assert_eq!(continue_target(&done), "/");
+    assert_eq!(sessions_of(&d, octo), 1);
 }
