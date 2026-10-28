@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn os_store_is_refused_off_windows_and_names_the_file_store() {
-        assert!(!OS_AVAILABLE);
+        const { assert!(!OS_AVAILABLE) };
         let dir = std::env::temp_dir();
         let message = read(Backend::Os, &dir, "sentinel:i:p", "p")
             .expect_err("no OS store off Windows")
