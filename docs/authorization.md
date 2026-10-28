@@ -76,6 +76,7 @@ Earlier parent foreign keys did not enforce equal tenant IDs (Parts 01–02 audi
 - Repository access uses cached static statements and primary-key joins. `require_repo` returns a 16-byte tenant ID without allocating repository metadata. Spec reads use one statement/snapshot.
 - Listing uses the `(tenant_id, id)` repository index and keyset range. A query-plan test verifies point and page lookups use index searches and avoid table scans and temporary sort trees. Returned strings/vectors are allocated only for actual results.
 - Administrative changes use short existing single-writer transactions; there is no separate authorization service/cache, lock hierarchy or new crate/dependency.
+- Present and absent repositories take the same path: `require_repo` runs one cached statement keyed on the repository ID and returns `NotFound` for a missing row and a foreign tenant's row alike. `repo_authorization_runs_the_same_keyed_probe_for_present_and_absent_objects` asserts this structurally by counting SQLite VM instructions: absent, foreign and guessed IDs cost exactly the same, and a hit differs only by the result row.
 - No authorization latency claim is made from unit tests.
 
 ## Verification

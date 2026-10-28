@@ -843,3 +843,59 @@ fn the_last_tenant_administrator_keeps_the_role() {
         Err(Error::Conflict)
     ));
 }
+
+/// Counts the SQLite virtual-machine instructions one authorization call executes.
+fn vm_steps<T>(c: &Connection, f: impl FnOnce() -> T) -> (u64, T) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    let steps = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&steps);
+    c.progress_handler(
+        1,
+        Some(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            false
+        }),
+    )
+    .unwrap();
+    let out = f();
+    c.progress_handler(1, None::<fn() -> bool>).unwrap();
+    (steps.load(Ordering::Relaxed), out)
+}
+
+#[test]
+fn repo_authorization_runs_the_same_keyed_probe_for_present_and_absent_objects() {
+    let (_dir, store, i) = fixture();
+    store
+        .read(|c| {
+            let who = principal(i.alice);
+            // Warm the statement cache so the first call's compile cost is not counted.
+            let _ = auth::require_repo(c, who, i.ar, P::READ);
+            let (present, found) = vm_steps(c, || auth::require_repo(c, who, i.ar, P::READ));
+            assert_eq!(found.unwrap(), i.a);
+            // A repository of another tenant, one that never existed and a random id are
+            // refused by the identical keyed probe, so they cost exactly the same as each other.
+            let (foreign, r1) =
+                vm_steps(c, || auth::require_repo(c, who, i.personal_repo, P::READ));
+            let (never, r2) = vm_steps(c, || auth::require_repo(c, who, RepoId::new(), P::READ));
+            let (guess, r3) = vm_steps(c, || auth::require_repo(c, who, RepoId::new(), P::READ));
+            missing(r1);
+            missing(r2);
+            missing(r3);
+            assert_eq!(never, guess, "two absent ids differ in work");
+            // A repository that exists but is not visible to the caller does the same one
+            // index probe; the only difference to a hit is the single result row.
+            assert_eq!(
+                foreign, never,
+                "a foreign repository differs from an absent one"
+            );
+            assert!(
+                present.abs_diff(never) <= 16,
+                "present {present} vs absent {never}: the probe is not the same shape"
+            );
+            Ok(())
+        })
+        .unwrap();
+}

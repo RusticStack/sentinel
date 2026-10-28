@@ -1009,3 +1009,137 @@ fn a_racing_swapper_never_makes_the_extract_write_outside() {
     });
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
 }
+
+struct FailingReader {
+    sent: usize,
+}
+
+impl std::io::Read for FailingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.sent >= 4096 {
+            return Err(std::io::Error::other("source died mid-stream"));
+        }
+        let n = buf.len().min(1024);
+        buf[..n].fill(9);
+        self.sent += n;
+        Ok(n)
+    }
+}
+
+fn object_path(fx: &Fixture, digest: Digest) -> std::path::PathBuf {
+    let hex = digest.to_string();
+    fx.dir
+        .path()
+        .join("objects")
+        .join(fx.tenant.to_string())
+        .join(&hex[..2])
+        .join(&hex)
+}
+
+#[test]
+fn a_source_that_fails_mid_stream_publishes_nothing_and_leaves_no_staging() {
+    let fx = fixture();
+    let result = fx.objects.stage(
+        fx.tenant,
+        FailingReader { sent: 0 },
+        u64::MAX,
+        Expect::default(),
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read_dir(fx.dir.path().join("tmp"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let count: i64 = fx
+        .conn
+        .query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    let report = fx.objects.recover(&fx.conn).unwrap();
+    assert!(report.orphans.is_empty() && report.corrupt.is_empty() && report.missing.is_empty());
+}
+
+#[test]
+fn truncated_extended_and_vanished_files_are_refused_on_read_and_named_by_recovery() {
+    let body = b"a committed body that is long enough to truncate".to_vec();
+    for (label, damage) in [
+        ("truncated", 0u8),
+        ("extended", 1),
+        ("vanished", 2),
+        ("emptied", 3),
+    ] {
+        let mut fx = fixture();
+        let digest = fx.put(
+            fx.tenant,
+            format!("{label}: ")
+                .as_bytes()
+                .iter()
+                .chain(&body)
+                .copied()
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
+        let path = object_path(&fx, digest);
+        let bytes = std::fs::read(&path).unwrap();
+        match damage {
+            0 => std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap(),
+            1 => std::fs::write(&path, [&bytes[..], b"tail"].concat()).unwrap(),
+            2 => std::fs::remove_file(&path).unwrap(),
+            _ => std::fs::write(&path, b"").unwrap(),
+        }
+        let mut out = Vec::new();
+        let err = fx
+            .objects
+            .read(&fx.conn, fx.tenant, digest, &mut out)
+            .unwrap_err();
+        let expected = if damage == 2 {
+            "object missing"
+        } else {
+            "object length"
+        };
+        assert!(
+            matches!(err, Error::Corrupt(what) if what == expected),
+            "{label}: {err:?}"
+        );
+        let report = fx.objects.recover(&fx.conn).unwrap();
+        if damage == 2 {
+            assert_eq!(report.missing.len(), 1, "{label}");
+            assert!(report.corrupt.is_empty(), "{label}");
+        } else {
+            assert_eq!(report.corrupt, vec![path.clone()], "{label}");
+            assert!(report.missing.is_empty(), "{label}");
+        }
+    }
+}
+
+#[test]
+fn a_renamed_file_without_a_reference_is_an_orphan_not_a_published_object() {
+    let fx = fixture();
+    // The crash window between the directory flush and the reference commit.
+    let staged = fx
+        .objects
+        .stage(
+            fx.tenant,
+            &b"crash before commit"[..],
+            u64::MAX,
+            Expect::default(),
+        )
+        .unwrap();
+    let digest = staged.digest();
+    drop(staged);
+    let path = object_path(&fx, digest);
+    assert!(path.is_file());
+    let mut out = Vec::new();
+    assert!(matches!(
+        fx.objects.read(&fx.conn, fx.tenant, digest, &mut out),
+        Err(Error::NotFound)
+    ));
+    // A half-written copy of it (as after a torn rename on a filesystem that lacks one)
+    // is also only reported, never read or published.
+    std::fs::write(&path, b"crash").unwrap();
+    let report = fx.objects.recover(&fx.conn).unwrap();
+    assert_eq!(report.orphans, vec![path]);
+    assert!(report.corrupt.is_empty());
+}
