@@ -310,6 +310,7 @@ pub fn admit(
             tx,
             repo,
             &intake::NewDelivery {
+                authentication: intake::Authentication::Observed,
                 provider: PROVIDER,
                 external_id: &external,
                 event: "ref_update",
@@ -347,6 +348,7 @@ pub fn admit(
             tx,
             repo,
             &intake::NewDelivery {
+                authentication: intake::Authentication::Observed,
                 provider: PROVIDER,
                 external_id: &external,
                 event: "ref_update",

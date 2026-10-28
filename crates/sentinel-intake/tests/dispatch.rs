@@ -375,6 +375,7 @@ impl Fixture {
                     tx,
                     repo,
                     &NewDelivery {
+                        authentication: sentinel_store::intake::Authentication::HookToken,
                         provider: "generic",
                         external_id: &id,
                         event: "ref_update",
@@ -413,6 +414,7 @@ impl Fixture {
                     tx,
                     repo,
                     &NewDelivery {
+                        authentication: sentinel_store::intake::Authentication::SignedWebhook,
                         provider: "github",
                         external_id: &id,
                         event: "pull_request",
@@ -1048,6 +1050,7 @@ fn a_generic_binding_without_an_app_association_cannot_claim_a_pull_request() {
                 tx,
                 repo,
                 &NewDelivery {
+                    authentication: sentinel_store::intake::Authentication::SignedWebhook,
                     provider: "github",
                     external_id: "pr-generic",
                     event: "pull_request",

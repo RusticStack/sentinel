@@ -34,7 +34,7 @@ Repository permission bits are `READ` (1), `RUN` (2), `WRITE_SECRETS` (4). Admin
 
 Secret-write delegation is independent: an operator's run grant never grants it implicitly. An explicit secret-write grant may be given to a reader or operator; no role has a plaintext secret read-back operation.
 
-A `run` grant (or an MCP `runs:write` token) can submit a pipeline of its own, so it never reaches secrets: a manually dispatched run is refused every secret and the API refuses a manual pipeline that declares one ([secrets](secrets.md#who-may-cause-a-delivery)). Only runs built from the repository's own pipeline at a bound revision receive them.
+A `run` grant (or an MCP `runs:write` token) can submit a pipeline of its own, so it never reaches secrets: a manually dispatched run is refused every secret and the API refuses a manual pipeline that declares one ([secrets](secrets.md#who-may-cause-a-delivery)). Only runs built from the repository's own pipeline at a bound revision, from a delivery authenticated at intake (a verified webhook signature or the hook secret; never a polled event), receive them.
 
 ## Queries and mutations
 

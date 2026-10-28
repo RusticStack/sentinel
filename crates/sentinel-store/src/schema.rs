@@ -155,13 +155,24 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         56,
         include_str!("migrations/056_minted_grants_unattributed.sql"),
     ),
+    (
+        57,
+        include_str!("migrations/057_delivery_authentication.sql"),
+    ),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 
 // List a migration only when an older binary can neither break it nor be broken by it.
-pub const READABLE_BY: &[(u32, u32)] =
-    &[(45, 44), (48, 47), (49, 48), (52, 51), (53, 51), (56, 55)];
+pub const READABLE_BY: &[(u32, u32)] = &[
+    (45, 44),
+    (48, 47),
+    (49, 48),
+    (52, 51),
+    (53, 51),
+    (56, 55),
+    (57, 56),
+];
 
 pub fn readable_by(version: u32) -> u32 {
     READABLE_BY

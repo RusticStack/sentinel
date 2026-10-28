@@ -116,6 +116,7 @@ fn accept_with(
         &tx,
         f.repo,
         &NewDelivery {
+            authentication: sentinel_store::intake::Authentication::HookToken,
             provider: "generic",
             external_id,
             event: "ref_update",
@@ -692,6 +693,7 @@ fn accept_pr(f: &mut Fixture, id: &str, terms: &intake::PrTerms<'_>) -> Result<A
         &tx,
         f.repo,
         &NewDelivery {
+            authentication: sentinel_store::intake::Authentication::SignedWebhook,
             provider: "github",
             external_id: id,
             event: "pull_request",

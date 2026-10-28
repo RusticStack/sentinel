@@ -31,6 +31,13 @@ writer transaction commits. A redelivery with identical terms is
 `{"duplicate": true}` with the original record ID; the same identity with
 different terms is `conflict`.
 
+Each row also records how it was authenticated (`webhook_deliveries.authentication`,
+migration 57): `2` when the GitHub signature verified, `1` when the hook secret
+was presented, `0` for a transition the controller observed itself by polling.
+The adapter that checked the credential names the level; nothing later can change
+it. It decides one thing downstream: only a run from a delivery at level 1 or 2
+may receive secrets ([secrets](secrets.md#who-may-cause-a-delivery)).
+
 `POST /api/v1/intake/{repo}` body:
 
 ```json
@@ -195,6 +202,10 @@ admission time for a ref with no cursor): replaying an advertisement against
 the same cursor is a no-op, while a legitimate repeat of a transition —
 `A→B`, force-reverted `B→A`, re-pushed `A→B` — is a new delivery and is
 built again. Nothing is acknowledged from memory.
+
+A polled delivery is recorded as observed, not authenticated, so a run it
+creates never receives secrets; deliver the event through the forge webhook or
+the repository's hook when the pipeline needs them.
 
 **Budgets.** Each `ls-remote` runs under the same discipline as every Git
 call — no prompts, no host configuration, a process group with a deadline

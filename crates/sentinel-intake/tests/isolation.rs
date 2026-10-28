@@ -269,6 +269,7 @@ impl Fixture {
                     tx,
                     repo,
                     &NewDelivery {
+                        authentication: sentinel_store::intake::Authentication::HookToken,
                         provider: "generic",
                         external_id: &id,
                         event: "ref_update",
