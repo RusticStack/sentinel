@@ -451,35 +451,26 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
     assert_eq!(remaining[0]["run"], run);
 }
 
-/// A test-only RSA key; it authenticates nothing.
-const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
-MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDf6rEvjDV4LPW4
-lLht6MWXLarjIFjXnB53o9UxkubIhOGY4RuGq7L2hz8Be5pLy+dA79JbgdoyCzrW
-wR8IGVVdWFeSLC3U4RK+AvYhejVxForWyHIjb60GltbZN2pIADLCx2jS7KZK+3sP
-fQQa7YxkRCAoZmqqEMV/JqNuFebmICrwN+Zm2NCRIsqxcjbbefIdhlHShveZ6ulS
-QLxBN/ZFnCEWSZvZ5D5HDbJx3KHSFGpPZJ4Hyoghv20dYOmv8J2O2U246x9hq46Z
-zeutnBkTY11jrYKTJnSt4Oc8Alsf75G9V+Q/nSbmbS2nje8y0qtpKIosSoqEd6Rb
-e2+UrQSRAgMBAAECggEAAbj+T9iFGwmEAq10uYY9WmlT16tamZ6KKrcWQ1tPJpbk
-niqprbydi+lclAonlMqS2vBZYsI2C7VjyI4L60HYIvekdVO9DsakQHVY/8cPGRGQ
-hABe5exElVDU4m8LZJZJTa+vbBN9YEVs5ACtBtjB4C3YvjzS+F/YiB7TyiuVlxq/
-r265ZXQdqjy/Hl5G8gwIEVWPF8diR1fQi5nfqKjybSe5DL5kdo3CDHvm6UbY1arI
-0j7n/CDCERP/j4XnkS97vbKML3j2l2PFzQ42bgU6GuEtAlJLKHZKja1NiDfmCX2+
-0zH6ueVcqVO9iZnxthWznJeUnVWp1V3NeUa8eN1HIQKBgQD8YzEzbpHmXFLd5CCG
-i19bgpGIN0bPUpPF6Ipb73j8NW1dXdENRYgPKizWRdBQZygUmwvfuzsUnN+MZMgw
-ic09xbw/slO75bDhLtnBDZ34hFloCjJHSXlxeKqlQCkifKmhcS2vkKgVoO3TMp1Z
-iyZh2jvCVNOm9U+JfEE4y0+C8QKBgQDjHy0vNtnIvN65DHWsuJWoqrIORDcluExv
-50tMySPQ6l/5t6zYW3GNdnUUkXdtjworvIunp7yCnM0FTL/mpFHOkruwr2fJXMIg
-GOn0nzcGxKdyy9tFDx7FmJzwUiMow18qXptIdCQJZo0JO+w0iJYBX1pZYtvQSAjd
-TJqXdiBboQKBgAQUCkB9gegKB+DEBe6GpATTiEx+MCu7dt3U0x+HMBpLNrgyguVH
-AVrVYKIZwLL7577lfnygBuVfX5FiM4XtRB7CajdRR18a6A/LdQNUl//jC5rNx2A1
-hLvbqk4/SirfftI4BPf4S28GCbHG+Jnw0K72Gs8aFc1121IqatdjGabRAoGAekkQ
-9PjdbZ1zdcLloOeJfNTbJZ9I6gA+94lbG664oAVxQ2zHnX4ut3HuO/LOkKiRW1cb
-AlvnvZNbN91I/Y+/lC+g6tKmWN6ejtWbMeB/qh874S0tlBM+CDnRVfuDfrEijhd+
-GBagSId0rGIdHXPlADws0y/NFmmSjERwf9hUN8ECgYAlWpgQzrKS7xkaYaCngYgr
-sDhna8Obj+EC26+CgQs5BEXE+xkfrGXrPnsjcKpYHXATzMc9wnlWbuTzqWbqkvM7
-ya49XtXpSauI28m06lYEfdjXXItrna7u1Kxn02j/ZdJPmLT4KOy2QeDGJopezxB2
-N1m0wYzl/x50+EWUWQ1veg==
------END PRIVATE KEY-----";
+/// A test-only RSA key generated fresh for this test process with the `openssl`
+/// CLI; it authenticates nothing and no private key is committed (see
+/// `no_committed_keys` in the `sentinel` crate tests).
+fn test_key() -> &'static str {
+    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        let out = std::process::Command::new("openssl")
+            .args([
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+            ])
+            .output()
+            .expect("the openssl CLI must be installed to generate the test-only App key");
+        assert!(out.status.success(), "openssl genpkey failed");
+        String::from_utf8(out.stdout).expect("PEM is ASCII")
+    })
+}
 
 struct GithubApi {
     addr: std::net::SocketAddr,
@@ -691,7 +682,7 @@ fn a_refused_fork_pull_request_publishes_a_completed_check() {
 
     let api = GithubApi::start();
     let app_key = temp.path().join("app.pem");
-    fs::write(&app_key, TEST_KEY).unwrap();
+    fs::write(&app_key, test_key()).unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&app_key, fs::Permissions::from_mode(0o600)).unwrap();
