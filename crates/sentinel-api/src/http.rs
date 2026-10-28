@@ -1923,6 +1923,7 @@ mod tests {
                 public_bodies: 2,
                 proxy_bodies: 1,
                 public_body_time: Duration::from_secs(3),
+                body_time: Duration::from_secs(5),
                 proxy_body_time: proxy_time,
                 ..tune()
             },
