@@ -3,3 +3,4 @@ node_modules/
 .tanstack/
 .nitro/
 dist/
+src/routeTree.gen.ts
