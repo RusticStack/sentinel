@@ -473,12 +473,22 @@ fn back_off_resets_after_a_healthy_helper_and_never_delays_a_new_list() {
         "  serve) printf 'listening on tcabcdefghijklmnopqrstuvwxyz0123\\n'; sleep 0.2; exit 7 ;;\n",
     );
     let server = tailcat::start_server(&flapping.config(7443), flapping.path(), &[]).unwrap();
-    let started = Instant::now();
-    wait_until("four healthy runs", || flapping.calls("serve").len() >= 4);
+    // Each run is healthy (it listens, then exits), so the wait before the next start stays at the minimum
+    // (1 s). Had it doubled, the gaps would be about 1, 2, 4 and 8 s. Judge the gap before the fifth start
+    // against that, as one observation: a stall has to eat several seconds of one gap to fake growth, instead
+    // of the total of five runs having to fit a budget.
+    let mut seen = Vec::new();
+    wait_until("five healthy runs", || {
+        let count = flapping.calls("serve").len();
+        while seen.len() < count {
+            seen.push(Instant::now());
+        }
+        count >= 5
+    });
+    let last_gap = seen[4].duration_since(seen[3]);
     assert!(
-        started.elapsed() < Duration::from_millis(5_500),
-        "back-off grew across healthy runs: {:?}",
-        started.elapsed()
+        last_gap < Duration::from_secs(4),
+        "back-off grew across healthy runs: the fifth start came {last_gap:?} after the fourth"
     );
     server.shutdown();
 
@@ -487,13 +497,21 @@ fn back_off_resets_after_a_healthy_helper_and_never_delays_a_new_list() {
     wait_until("three failed runs", || failing.calls("serve").len() >= 3);
     let before = failing.calls("serve").len();
     std::thread::sleep(Duration::from_millis(100));
+    // Three failures leave a 4 s wait pending; a new list must not sit it out. The start has to carry the new
+    // list, so a natural restart of the old one cannot satisfy the wait, and the bound is a margin under the
+    // back-off rather than a latency figure.
     let asked = Instant::now();
     server.set_allow(&[key(KEY)]);
+    let wanted = format!("argv serve --allow={} 7443", key(KEY).expose());
     wait_until("the new list to be served", || {
-        failing.calls("serve").len() > before
+        failing
+            .calls("serve")
+            .iter()
+            .skip(before)
+            .any(|c| *c == wanted)
     });
     assert!(
-        asked.elapsed() < Duration::from_millis(900),
+        asked.elapsed() < Duration::from_secs(3),
         "a new allow list waited out the back-off: {:?}",
         asked.elapsed()
     );
