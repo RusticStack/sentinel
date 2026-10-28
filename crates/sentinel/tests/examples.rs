@@ -162,8 +162,14 @@ fn unit_and_container_command_lines_use_flags_that_exist() {
                 .split(',')
                 .map(|word| word.trim().trim_matches('"').to_owned())
                 .collect();
-            assert_flags_exist(name, &words);
-            seen += 1;
+            // Health checks and other lists are not the service's command line.
+            if words
+                .iter()
+                .any(|word| word == "server" || word == "worker")
+            {
+                assert_flags_exist(name, &words);
+                seen += 1;
+            }
         }
     }
     assert_eq!(

@@ -11,6 +11,9 @@ log_level = "info"
 # enrollment_file = "/etc/sentinel/enrollment"
 # git_mirrors = true               # per-repository object mirrors under <data_dir>/mirrors (default on)
 
+# With Tailcat (the [tailcat] section below), the controller's Tailcat address; keep it above every section.
+# tailcat_address = "tc<address>"  # the controller's Tailcat address
+
 # Optional Firecracker executor on a KVM host. Omit this section to disable microVMs.
 # [microvm]
 # firecracker = "/usr/local/bin/firecracker"
@@ -19,7 +22,6 @@ log_level = "info"
 
 # Optional NAT-traversing transport; without it (or with enabled = false) the link uses direct TLS. With it, `controller` is 127.0.0.1:<listen_port>.
 # Admit this worker's node key (<data_dir>/tailcat/client-default.nodekey) in the controller's tailcat-allow.
-# tailcat_address = "tc<address>"  # the controller's Tailcat address
 # [tailcat]
 # enabled = true
 # binary = "/usr/local/bin/tailcat"
