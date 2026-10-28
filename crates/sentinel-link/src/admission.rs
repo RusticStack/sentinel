@@ -321,7 +321,7 @@ pub fn session_cap(wanted: usize) -> crate::Result<usize> {
     let cap = sessions_within(soft, wanted);
     if cap < MIN_SESSIONS.min(wanted) {
         return Err(crate::Error::Descriptors(format!(
-            "the soft open-files limit is {soft}, which holds {cap} worker sessions; at least {} are required              ({} for {wanted}). Raise it (systemd: LimitNOFILE=, shell: ulimit -n) and restart",
+            "the soft open-files limit is {soft}, which holds {cap} worker sessions; at least {} are required, and {wanted} sessions need {} descriptors. Raise it (systemd: LimitNOFILE=, shell: ulimit -n) and restart",
             MIN_SESSIONS.min(wanted),
             descriptors_for(wanted),
         )));
