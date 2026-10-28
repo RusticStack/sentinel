@@ -51,7 +51,7 @@ function AppShell() {
   ] : [];
   const platform = [
     { label: "Organizations", icon: "building", to: "/organizations" },
-    ...(me?.super_admin ? [{ label: "Platform", icon: "shield", to: "/platform" }] : []),
+    ...(me?.super_admin ? [{ label: "Platform", icon: "shield", to: "/platform" }, { label: "GitHub App", icon: "github", to: "/setup/github" }] : []),
   ];
 
   function switchTheme() {
