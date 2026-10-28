@@ -231,11 +231,39 @@ B02's phase record ([`b02-sentinel.jsonl`](../bench/b02-sentinel.jsonl)) is the 
 | Image pull | 1.03 s | 0.05–0.07 s |
 | Checkout | 1.77 s | 1.79–1.87 s |
 | Finalize | 2.95 s | 2.77–3.55 s |
-| Everything but the test step (intake to finish, less the step's own time) | 10.9 s (median of 10 warm B02 runs, 10.5–11.4 s) | 7.2 s (median of 4, 7.1–8.0 s) |
+| Everything but the test step (intake to finish, less the step's own time) | 10.9 s (median of 10 warm B02 runs, 10.5–11.4 s) | 7.3 s (median of 4, 7.1–8.0 s) |
 
 The "after" column is four samples, so no tail is claimed. The runs carry no build commit or host block (records carry them since; see [benchmarking](benchmarking.md#record-format-sentinel-bench1)): the commit that added each file is the only attribution.
 
-Sentinel's overhead on this lane is about 7 s against a healthy self-hosted runner's 11 s, plus its queue (B02). What remains, in order: cache publication in finalize (about 3 s), checkout (about 1.8 s), then dispatch and reporting (about 1.5 s together). **CPU throttling and disk wait were not profiled** (neither the cgroup's throttled time nor I/O pressure was recorded for any phase, in the test step or around it). The argument that the step's time is the same in every executor says the step is not an engine difference; it does not show that throttling or disk wait cost nothing in Sentinel's own phases (checkout, cache publication). That part of B04 is split out as B04a in `TODO.md` and is open.
+Sentinel's overhead on this lane is about 7.3 s against a healthy self-hosted runner's 11 s, plus its queue (B02). What remains, in order: cache publication in finalize (about 3 s), checkout (about 1.8 s), then dispatch and reporting (about 1.5 s together). **CPU throttling and disk wait were not profiled in this record** (neither the cgroup's throttled time nor I/O pressure was recorded for any phase). The argument that the step's time is the same in every executor says the step is not an engine difference; it does not show that throttling or disk wait cost nothing in Sentinel's own phases (checkout, cache publication). That part of B04 is split out as B04a in `TODO.md`; the assessment below covers what has been recorded since.
+
+**Closure check (B04, 2026-10-28).** The record was rechecked against the repository. The code exists: `sentinel-git` reads the pipeline through a promisor `origin` with `blob:none` and falls back to the depth-one fetch (`crates/sentinel-git/src/unix.rs`), and `a_filtering_server_sends_only_the_pipeline_blob` and its merge-ref twin exist in `crates/sentinel-git/tests/file_at.rs`. Both artifacts exist: [`bench/b02-sentinel.jsonl`](../bench/b02-sentinel.jsonl) (10 non-warm-up warm runs) and [`bench/b04-pipeline-fetch.jsonl`](../bench/b04-pipeline-fetch.jsonl) (4 plus a warm-up). Recomputed from them: intake to dispatch 4.23 s to 0.48 s (medians), overhead around the test step 10.91 s (10.49–11.41) to **7.33 s** (7.14–8.00). An earlier text quoted 7.2 s for the "after" overhead; the median of four runs is 7.33 s, the figure above. Residuals that keep the ledger entry open: the isolated fetch figures (3.6 s and 75 MB to 0.3 s and 0.2 MB) have no committed raw output and are not evidence; the two records carry no build commit or host block; the "after" column is 4 samples; and disk wait and throttling are B04a.
+
+### B04a: disk wait and CPU throttling, assessed
+
+Records: [`bench/p14-b04a-cli.jsonl`](../bench/p14-b04a-cli.jsonl) and [`bench/p14-b04a-ripgrep.jsonl`](../bench/p14-b04a-ripgrep.jsonl) (contract `pilots-ci` revision 4, `warm`, one warm-up and five samples each, all jobs passed, build `3572006d` clean, reference host, CPU pressure avg60 0.46–1.75 % at the start). Produced by [`bench/b04a_profile.py`](../bench/b04a_profile.py) under `B04A_PROFILE`; reducer and summary tests are in [`bench/test_b04a_profile.py`](../bench/test_b04a_profile.py). Summary: `b04a_profile.py summarize FILE`; medians over the five samples below. Host pressure is machine-wide: the GitHub baseline runs on the other CCD and a concurrent run is not excluded by the record, so a stall is an upper bound for Sentinel's own share.
+
+| Phase (median) | cli time | cli I/O stall (`full`) | ripgrep time | ripgrep I/O stall (`full`) |
+|---|---|---|---|---|
+| prepare (checkout, image, restore) | 3.01 s | 0.13 s | 1.23 s | 0.08 s |
+| checkout | 0.46 s | 0.01 s | 0.10 s | 0.001 s |
+| container start | 0.26 s | 0.11 s (41 %) | 0.26 s | 0.06 s (22 %) |
+| steps | 56.08 s | 0.47 s (0.8 %) | 17.81 s | 0.80 s (4.5 %) |
+| finalize (cache publication) | 4.35 s | 0.29 s (6.8 %) | 2.22 s | 0.19 s (8.4 %) |
+
+What this shows. Steal is 0 and memory stall is about zero in every phase. CPU `some` stall is 1.1 % of the cli step and 3.0 % of the ripgrep step, and negligible elsewhere. Disk wait is small for the lane (at most 8 % of finalize) except container start, where a quarter to two fifths of the 0.26 s is I/O stall; that phase is 0.26 s in total. Cache publication writes 214 MB (cli) and 967 MB (ripgrep) in finalize with the device busy 450 ms and 758 ms of 4.35 s and 2.22 s. On these two lanes neither stall explains the 3–4 s finalize; it is copy and hash work.
+
+What it does not show. **CPU throttling is not measured.** No record has `throttled_us` or `throttled_periods` for any phase: the worker scope has no `cpu.max` (`worker_cpu_quota_cpus` null), and the container scope was never attached to the step window. All 12 records saw four containers in the run, a window with more than one container is deliberately not guessed between, and only one record (ripgrep sample 5) reports a container quota (10 CPUs, the job's cap). The 10-CPU job cap therefore went unobserved at the cgroup where throttling would show.
+
+Remaining phases and lanes, all required before B04a closes:
+
+1. **Throttling in the step window**: attribute the container scope to the step window (one container per step, or tag the step's container) so `cpu.stat` throttled time and periods are present for the cli and ripgrep steps.
+2. **gson**: no B04a record exists for `build-jdk17`, `-21` and `-25`.
+3. **Conditions**: only `warm` was profiled; `cold` (where checkout and cache restore are largest) and `small-edit` have no profile.
+4. **Cache publication under load**: finalize was profiled only while the host was quiet. Whether the container-start stall grows with a concurrent baseline job is open.
+5. **Sample size**: five samples give no tail (every `p95` is the maximum, flagged `p95_is_max`).
+
+B04a stays open for these reasons.
 
 ### Reproducing
 
