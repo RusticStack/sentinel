@@ -1394,8 +1394,15 @@ impl Inner {
     ) {
         let (tenant, run, job) = (f.tenant, f.run, f.job);
         let name = f.name.clone();
-        let entries = f.done.len() as u64;
-        let bytes = f.done.iter().map(|(_, _, s)| s.len()).sum::<u64>();
+        // Only a captured artifact keeps what it staged; a failed one discards it, so it holds
+        // no bytes against the repository's quota.
+        let captured = state == artifacts::State::Captured;
+        let entries = if captured { f.done.len() as u64 } else { 0 };
+        let bytes = if captured {
+            f.done.iter().map(|(_, _, s)| s.len()).sum::<u64>()
+        } else {
+            0
+        };
         let retain_until = UnixMillis(
             UnixMillis::now()
                 .0
