@@ -1,5 +1,11 @@
 #![cfg(target_os = "linux")]
 
+//! The worker end to end under the isolation of the run: rootless containers, or Firecracker microVMs with
+//! `SENTINEL_MICROVM_TESTS=1` (see `support/isolation.rs`; TODO M04's gate).
+
+#[path = "support/isolation.rs"]
+mod isolation;
+
 use std::{
     fs,
     path::Path,
@@ -39,43 +45,13 @@ use sentinel_worker::{
     workspace::Workspace,
 };
 
+use isolation::sandboxes;
+
 const IMAGE: &str = "docker.io/library/busybox";
 const DIGEST: &str = "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
 
 fn enabled() -> bool {
-    if std::env::var_os("SENTINEL_PODMAN_TESTS").is_some() {
-        return true;
-    }
-    eprintln!("skipped: set SENTINEL_PODMAN_TESTS=1 as a rootless Podman account to run");
-    false
-}
-
-/// SENTINEL_E2E_MICROVM=1 runs this suite with microVMs as the worker's default executor (TODO M04's gate),
-/// with the setup in SENTINEL_FIRECRACKER, SENTINEL_GUEST_KERNEL and SENTINEL_GUEST_AGENT.
-fn microvm_runtime() -> Option<sentinel_worker::attempt::Runtime> {
-    std::env::var_os("SENTINEL_E2E_MICROVM")?;
-    let path = |name: &str| {
-        std::path::PathBuf::from(
-            std::env::var_os(name).unwrap_or_else(|| panic!("{name} is required")),
-        )
-    };
-    let setup = sentinel_worker::microvm::Setup {
-        firecracker: path("SENTINEL_FIRECRACKER"),
-        kernel: path("SENTINEL_GUEST_KERNEL"),
-        agent: path("SENTINEL_GUEST_AGENT"),
-        snapshots: true,
-        guard: Default::default(),
-    };
-    setup.check().unwrap();
-    Some(sentinel_worker::attempt::Runtime {
-        default: Some(sentinel_worker::host::Isolation::Microvm),
-        microvm: Some(Arc::new(setup)),
-    })
-}
-
-/// The worker's live sandboxes: its containers and its microVMs.
-fn sandboxes(worker: WorkerId, worker_dir: &Path) -> usize {
-    podman::owned(worker).unwrap().len() + sentinel_worker::microvm::owned(worker_dir).len()
+    isolation::enabled()
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -280,9 +256,7 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
     .unwrap();
     let _ = registrar.set(executor.clone());
     executor.set_cancel_grace(Duration::from_secs(2));
-    if let Some(runtime) = microvm_runtime() {
-        executor.set_runtime(runtime);
-    }
+    isolation::apply(&executor);
     let handle = Arc::new(Handle::new());
     let (worker_cert, worker_key) = (temp.path().join("w.crt"), temp.path().join("w.key"));
     let link_thread = {
@@ -409,7 +383,19 @@ jobs:
     steps:
       - id: wait
         run: 'trap \"\" TERM; echo stubborn-started; while :; do sleep 1; done'
-"
+  sealed:
+    image: {IMAGE}@{DIGEST}
+    resources: {{ cpu: 1, memory: 128MiB }}
+    steps:
+      - id: no-kvm
+        run: '{sealed}'
+",
+        sealed = if isolation::microvm() {
+            // The guest is given neither the device nor the CPU's virtualization extensions to nest on.
+            "test ! -e /dev/kvm && ! grep -qwE \"vmx|svm\" /proc/cpuinfo"
+        } else {
+            "test ! -e /dev/kvm"
+        },
     );
     let spec = RunSpec::new(
         PinnedSource::new(repo.to_str().unwrap(), &sha, Some("main")).unwrap(),
@@ -457,6 +443,7 @@ jobs:
     };
     let compiled = spec_names(&yaml);
     let by_name = |name: &str| ids[compiled.iter().position(|n| n == name).unwrap()];
+    let sealed = by_name("sealed");
     let (broken, inspect, secret_use, gated, unknown, oom, slow, polite, stubborn) = (
         by_name("broken"),
         by_name("inspect"),
@@ -577,6 +564,17 @@ jobs:
     assert!(inspect_summary.steps_ns.is_some());
     assert!(inspect_summary.finalize_ns.is_some());
     assert!(inspect_summary.detail.is_empty());
+    // The digest the job ran is the one it was pinned to, whichever executor ran it.
+    match isolation::microvm() {
+        true => assert_eq!(
+            inspect_summary
+                .guest_image
+                .as_ref()
+                .map(|g| g.digest.as_str()),
+            Some(DIGEST)
+        ),
+        false => assert!(inspect_summary.guest_image.is_none()),
+    }
     assert!(
         inspect_summary
             .steps
@@ -629,6 +627,9 @@ jobs:
     );
     assert!(summary_of(unknown).detail.contains("step 1 `if`"));
 
+    eventually("sealed passed", || {
+        state(sealed).state == JobState::Terminal(Outcome::Passed)
+    });
     eventually("oom failed", || {
         state(oom).state == JobState::Terminal(Outcome::Failed)
     });
@@ -712,7 +713,7 @@ jobs:
         .stats()
         .reports
         .load(std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(reports, 9 * 4, "every report was applied");
+    assert_eq!(reports, 10 * 4, "every report was applied");
     assert_eq!(
         controller
             .stats()
@@ -792,36 +793,15 @@ jobs:
         disk_bytes: 0,
         lifetime_secs: 0,
     };
-    match microvm_runtime().and_then(|r| r.microvm) {
-        Some(setup) => std::mem::forget(
-            sentinel_worker::microvm::Vm::start(
-                &worker_dir,
-                &setup,
-                worker_id,
-                attempt,
-                &format!("{IMAGE}@{DIGEST}"),
-                limits,
-                ws.path(),
-                &[],
-                &podman::Store::Shared,
-                sentinel_worker::podman::Network::None,
-            )
-            .unwrap(),
-        ),
-        None => std::mem::forget(
-            sentinel_worker::podman::Container::start(
-                worker_id,
-                attempt,
-                &format!("{IMAGE}@{DIGEST}"),
-                limits,
-                ws.path(),
-                &[],
-                &podman::Store::Shared,
-                sentinel_worker::podman::Network::None,
-            )
-            .unwrap(),
-        ),
-    }
+    std::mem::forget(isolation::start_sandbox(
+        &worker_dir,
+        worker_id,
+        attempt,
+        &format!("{IMAGE}@{DIGEST}"),
+        limits,
+        ws.path(),
+        &podman::Store::Shared,
+    ));
     {
         let mut spool = sentinel_worker::spool::Spool::open(&worker_dir, attempt).unwrap();
         spool
@@ -847,9 +827,7 @@ jobs:
         true,
     )
     .unwrap();
-    if let Some(runtime) = microvm_runtime() {
-        executor2.set_runtime(runtime);
-    }
+    isolation::apply(&executor2);
     let recovered = executor2.recovered();
     assert_eq!(recovered.leftovers, vec![(attempt, fence)]);
     assert_eq!(recovered.containers_removed, 1);

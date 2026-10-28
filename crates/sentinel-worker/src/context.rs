@@ -6,10 +6,16 @@ use sentinel_pipeline::{
     expr::{Context, DependencySummary, HashFilesError, Lookup, Phase, Value},
 };
 
+/// Brings the files `hash_files` is about to read up to date with what the steps did.
+pub type Refresh<'a> = &'a dyn Fn(&[&str]);
+
 pub struct WorkerContext<'a> {
     pub job: &'a JobContext,
     pub spec: &'a RunSpec,
     pub workspace: PathBuf,
+    /// Set when the steps run somewhere that does not share the host workspace (a microVM): called with the
+    /// patterns before each `hash_files`, so a condition sees the files earlier steps wrote.
+    refresh: Option<Refresh<'a>>,
 }
 
 impl<'a> WorkerContext<'a> {
@@ -18,7 +24,13 @@ impl<'a> WorkerContext<'a> {
             job,
             spec,
             workspace: workspace.to_path_buf(),
+            refresh: None,
         }
+    }
+
+    pub fn with_refresh(mut self, refresh: Refresh<'a>) -> Self {
+        self.refresh = Some(refresh);
+        self
     }
 }
 
@@ -71,6 +83,9 @@ impl Context for WorkerContext<'_> {
     }
 
     fn hash_files(&self, patterns: &[&str]) -> Result<String, HashFilesError> {
+        if let Some(refresh) = self.refresh {
+            refresh(patterns);
+        }
         sentinel_pipeline::hash_files(&self.workspace, patterns)
     }
 }

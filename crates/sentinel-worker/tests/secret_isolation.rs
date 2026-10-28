@@ -1,7 +1,11 @@
 //! One test function: the registry configuration is a process environment variable, set once before any runtime starts.
+//! It runs under the isolation of the run: rootless containers, or Firecracker microVMs with
+//! `SENTINEL_MICROVM_TESTS=1` (see `support/isolation.rs`; TODO M04's gate).
 
 #![cfg(target_os = "linux")]
 
+#[path = "support/isolation.rs"]
+mod isolation;
 #[path = "support/live.rs"]
 mod live;
 
@@ -16,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use live::{DIGEST, IMAGE, Live, eventually, podman_enabled};
+use live::{DIGEST, IMAGE, Live, eventually};
 use sentinel_auth::sealed::Key;
 use sentinel_core::{
     AttemptId, JobState, Outcome, UnixMillis, WorkerId,
@@ -29,7 +33,7 @@ use sentinel_store::{
 };
 use sentinel_worker::{
     executor::Executor,
-    podman::{self, Container, Limits, Store},
+    podman::{self, Limits, Store},
 };
 
 const HTPASSWD: &str = "sentinel:$2b$05$FLtrX1HxgXf8j22jKC6xTuhjawXxqgbQWPCCfhsil94PyJI/CFU1G\n";
@@ -220,7 +224,7 @@ fn settled(live: &Live, job: sentinel_core::JobId) -> sentinel_store::jobs::JobR
 
 #[test]
 fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
-    if !podman_enabled() {
+    if !isolation::enabled() {
         return;
     }
     let scratch = tempfile::tempdir().unwrap();
@@ -354,7 +358,9 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
         &never,
     )
     .unwrap();
-    let container = Container::start(
+    let stray_dir = tempfile::tempdir().unwrap();
+    let container = isolation::start_sandbox(
+        stray_dir.path(),
         WorkerId::new(),
         AttemptId::new(),
         &format!("{IMAGE}@{DIGEST}"),
@@ -366,11 +372,8 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
             lifetime_secs: 0,
         },
         ws.path(),
-        &[],
         &Store::Shared,
-        sentinel_worker::podman::Network::None,
-    )
-    .unwrap();
+    );
     let step = |script: &str| sentinel_pipeline::run::StepCommand {
         argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
         env: Vec::new(),
@@ -405,7 +408,11 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
     Key::create(&key_path).unwrap();
     let key = Arc::new(Key::load(&key_path).unwrap());
     let (live, _executor) = Live::start_with(
-        |dir, worker| Executor::start(dir.to_path_buf(), worker, |_| {}, false).unwrap(),
+        |dir, worker| {
+            let executor = Executor::start(dir.to_path_buf(), worker, |_| {}, false).unwrap();
+            isolation::apply(&executor);
+            executor
+        },
         10,
         Capabilities(Capabilities::REQUIRED.0 | Capabilities::SECRET_DELIVERY.0),
         Some(Arc::clone(&key)),
@@ -532,7 +539,9 @@ jobs:
     assert!(exists_in(&tenant_store, &private));
     drop_store(&tenant_store);
     let runtime = sentinel_worker::runtime_dir(&live.worker_dir);
+    let (worker, worker_dir) = (live.worker, live.worker_dir.clone());
     live.stop();
+    assert_eq!(isolation::sandboxes(worker, &worker_dir), 0);
     let _ = fs::remove_dir_all(runtime);
     drop(registry);
 }

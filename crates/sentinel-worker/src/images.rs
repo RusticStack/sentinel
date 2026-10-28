@@ -489,8 +489,9 @@ impl Images {
     }
 
     /// Cached microVM root file systems to remove to bring the guest images back under their share of the
-    /// image budget (`over` bytes, see [`guest_overage`]): least recently used first, never one used within
-    /// `IMAGE_KEEP` (an attempt may be about to boot from it) and never one whose digest is being pulled.
+    /// image budget (`over` bytes, see [`guest_overage`]): least recently used first, never one a live attempt
+    /// holds (`in_use`), one used within `IMAGE_KEEP` (an attempt may be about to boot from it) or one whose
+    /// digest is being pulled.
     pub fn reclaimable_guests(&self, guests: &[GuestEntry], over: u64) -> Vec<String> {
         let state = self.state();
         let pulling: HashSet<&str> = state
@@ -526,7 +527,7 @@ fn plan_guest_reclaim(
     }
     let mut candidates: Vec<&GuestEntry> = guests
         .iter()
-        .filter(|g| !pulling.contains(g.digest.as_str()))
+        .filter(|g| !g.in_use && !pulling.contains(g.digest.as_str()))
         .filter(|g| {
             now.duration_since(g.used)
                 .is_ok_and(|age| age >= IMAGE_KEEP)
@@ -939,6 +940,7 @@ mod tests {
             digest: digest.into(),
             bytes,
             used: SystemTime::now() - idle,
+            in_use: false,
         }
     }
 
@@ -980,6 +982,20 @@ mod tests {
             Arc::new(Pull::default()),
         );
         assert_eq!(images.reclaimable_guests(&guests, 200), ["old", "middle"]);
+    }
+
+    #[test]
+    fn guest_reclamation_never_takes_an_image_a_live_attempt_holds() {
+        let images = Images::new(PathBuf::new());
+        let hour = Duration::from_secs(3_600);
+        let busy = GuestEntry {
+            in_use: true,
+            ..guest("busy", "sha256:busy", 500, hour * 48)
+        };
+        let guests = [busy, guest("idle", "sha256:idle", 100, hour * 2)];
+        // The busy image is the least recently used by far, and still not offered.
+        assert_eq!(images.reclaimable_guests(&guests, u64::MAX), ["idle"]);
+        assert!(images.reclaimable_guests(&guests[..1], u64::MAX).is_empty());
     }
 
     #[test]

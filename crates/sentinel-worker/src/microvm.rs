@@ -208,6 +208,49 @@ pub struct GuestImage {
     pub env: Vec<(String, String)>,
     /// What the attempt's summary records: the pinned digest this root file system carries.
     pub record: GuestImageRecord,
+    /// Keeps GC off the image for as long as a VM boots from it (see [`ImageLease`]).
+    lease: Arc<ImageLease>,
+}
+
+/// A live attempt's claim on a cached image. GC ([`remove_guest_image`]) never removes a leased image, so
+/// an attempt's root file system cannot go while the attempt is booting from it or running on it, however
+/// old its last-use stamp is. A lease is taken before the cache is consulted and held by the VM until it
+/// is destroyed, so a removal either completes first (the next lookup misses and rebuilds) or sees the lease.
+#[derive(Debug)]
+pub struct ImageLease {
+    rootfs: PathBuf,
+}
+
+type Leases = Mutex<Vec<(PathBuf, usize)>>;
+
+fn leases() -> MutexGuard<'static, Vec<(PathBuf, usize)>> {
+    static LEASES: Leases = Mutex::new(Vec::new());
+    LEASES.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+impl ImageLease {
+    fn take(rootfs: &Path) -> Arc<ImageLease> {
+        let mut held = leases();
+        match held.iter_mut().find(|(path, _)| path == rootfs) {
+            Some((_, count)) => *count += 1,
+            None => held.push((rootfs.to_path_buf(), 1)),
+        }
+        Arc::new(ImageLease {
+            rootfs: rootfs.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for ImageLease {
+    fn drop(&mut self) {
+        let mut held = leases();
+        if let Some(at) = held.iter().position(|(path, _)| *path == self.rootfs) {
+            held[at].1 -= 1;
+            if held[at].1 == 0 {
+                held.swap_remove(at);
+            }
+        }
+    }
 }
 
 /// What `<key>.json` holds. It is written after the root file system is in place, so its presence marks a
@@ -296,24 +339,43 @@ pub fn guest_image_canceled(
     store: &Store,
     cancel: &AtomicBool,
 ) -> Result<GuestImage> {
+    ensure_image(root, image, store, cancel, &build_image)
+}
+
+/// Builds the image's files: the temporary names it may use are derived from the final ones.
+type Builder<'a> = &'a dyn Fn(&str, &str, &Store, &Path, &Path, &AtomicBool) -> Result<ImageMeta>;
+
+fn ensure_image(
+    root: &Path,
+    image: &str,
+    store: &Store,
+    cancel: &AtomicBool,
+    build: Builder,
+) -> Result<GuestImage> {
     let digest = pinned_digest(image)?;
     let dir = images_dir(root);
     fs::create_dir_all(&dir)?;
     let key = image_key(store, image);
     let rootfs = dir.join(format!("{key}.ext4"));
     let meta_path = dir.join(format!("{key}.json"));
-    if let Some(hit) = cached_image(&rootfs, &meta_path, digest) {
+    // Taken before the cache is consulted: GC either removed the image already (a miss, so a rebuild) or
+    // finds the lease and leaves it.
+    let lease = ImageLease::take(&rootfs);
+    if let Some(hit) = cached_image(&rootfs, &meta_path, digest, &lease) {
         return Ok(hit);
     }
     // One build per image at a time: a burst of attempts on a new image waits for the first one's result.
     let lock = build_lock(&key);
     let built = (|| -> Result<GuestImage> {
         let _held = acquire_build(&lock, cancel)?;
-        if let Some(hit) = cached_image(&rootfs, &meta_path, digest) {
+        if let Some(hit) = cached_image(&rootfs, &meta_path, digest, &lease) {
             return Ok(hit);
         }
+        // What is here is not a usable image (a marker that does not parse or names another digest, a root
+        // file system of another size): drop the marker so nothing counts or serves it while it is rebuilt.
+        let _ = fs::remove_file(&meta_path);
         let started = Instant::now();
-        let meta = build_image(image, digest, store, &rootfs, &meta_path, cancel)?;
+        let meta = build(image, digest, store, &rootfs, &meta_path, cancel)?;
         // A rebuilt root file system is a new file: snapshots taken from the old one no longer describe its disk.
         snapshot::remove_for_image(root, &key);
         Ok(GuestImage {
@@ -325,6 +387,7 @@ pub fn guest_image_canceled(
                 build_ns: Some(started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX)),
             },
             env: meta.env,
+            lease: Arc::clone(&lease),
         })
     })();
     drop(lock);
@@ -354,7 +417,12 @@ fn acquire_build<'a>(lock: &'a Mutex<()>, cancel: &AtomicBool) -> Result<MutexGu
 
 /// A complete cached image for `digest`: its marker parses, names that digest and the root file system has
 /// the recorded size. A hit stamps the marker when its stamp is old, which is what keeps GC off it.
-fn cached_image(rootfs: &Path, meta_path: &Path, digest: &str) -> Option<GuestImage> {
+fn cached_image(
+    rootfs: &Path,
+    meta_path: &Path,
+    digest: &str,
+    lease: &Arc<ImageLease>,
+) -> Option<GuestImage> {
     let mut marker = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -380,6 +448,7 @@ fn cached_image(rootfs: &Path, meta_path: &Path, digest: &str) -> Option<GuestIm
             build_ns: None,
         },
         env: meta.env,
+        lease: Arc::clone(lease),
     })
 }
 
@@ -469,7 +538,6 @@ fn build_image(
     let deadline = Instant::now() + IMAGE_BUILD_TIMEOUT;
     let tag = format!("{}.{}", std::process::id(), thread_tag());
     let tmp = rootfs.with_extension(format!("ext4.{tag}"));
-    let tmp_meta = meta_path.with_extension(format!("json.{tag}"));
     let mut inspect = crate::podman::podman_in(store);
     inspect.args(["image", "inspect", "--format", INSPECT_FORMAT, "--", image]);
     let inspected = process::run_canceled(
@@ -521,12 +589,35 @@ fn build_image(
             return Err(e);
         }
     }
+    publish_image(
+        &tmp,
+        rootfs,
+        meta_path,
+        digest,
+        &inspected.id,
+        &inspected.env,
+    )
+}
+
+/// Puts a built root file system (`tmp`) in place and writes its marker. The marker goes last: an image
+/// counts only once both files are in place, and a failure leaves neither behind.
+fn publish_image(
+    tmp: &Path,
+    rootfs: &Path,
+    meta_path: &Path,
+    digest: &str,
+    image_id: &str,
+    env: &[(String, String)],
+) -> Result<ImageMeta> {
+    let mut tmp_meta = tmp.as_os_str().to_owned();
+    tmp_meta.push(".json");
+    let tmp_meta = PathBuf::from(tmp_meta);
     let finish = || -> Result<ImageMeta> {
         let meta = ImageMeta {
             digest: digest.to_owned(),
-            image_id: inspected.id.clone(),
-            rootfs_bytes: fs::metadata(&tmp)?.len(),
-            env: inspected.env.clone(),
+            image_id: image_id.to_owned(),
+            rootfs_bytes: fs::metadata(tmp)?.len(),
+            env: env.to_vec(),
         };
         fs::OpenOptions::new()
             .create_new(true)
@@ -534,13 +625,12 @@ fn build_image(
             .mode(0o600)
             .open(&tmp_meta)?
             .write_all(&meta.to_json())?;
-        // The marker goes last: an image counts only once both files are in place.
-        fs::rename(&tmp, rootfs)?;
+        fs::rename(tmp, rootfs)?;
         fs::rename(&tmp_meta, meta_path)?;
         Ok(meta)
     };
     finish().inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(tmp);
         let _ = fs::remove_file(&tmp_meta);
     })
 }
@@ -573,6 +663,8 @@ pub struct GuestEntry {
     pub bytes: u64,
     /// The last use: the marker's modification time.
     pub used: SystemTime,
+    /// A live attempt is booting from or running on this image: GC must leave it, whatever its stamp says.
+    pub in_use: bool,
 }
 
 /// The complete cached images under `root`.
@@ -581,6 +673,8 @@ pub fn guest_images(root: &Path) -> Vec<GuestEntry> {
         return Vec::new();
     };
     let snapshots = snapshot::bytes_by_image(root);
+    let dir = images_dir(root);
+    let leased: Vec<PathBuf> = leases().iter().map(|(path, _)| path.clone()).collect();
     entries
         .flatten()
         .filter_map(|entry| {
@@ -598,22 +692,32 @@ pub fn guest_images(root: &Path) -> Vec<GuestEntry> {
                     .rootfs_bytes
                     .saturating_add(snapshots.get(key).copied().unwrap_or(0)),
                 used,
+                in_use: leased.contains(&dir.join(format!("{key}.ext4"))),
             })
         })
         .collect()
 }
 
-/// Removes one cached image, marker first so no attempt can pick it up half gone. A VM already running
-/// from it keeps its open file; the space frees when that VM ends.
+/// Removes one cached image, marker first so no attempt can pick it up half gone; false when there is no
+/// such image and when a live attempt holds it (an [`ImageLease`]: GC never takes an image out from under a
+/// VM, and a lease taken after the check waits on the lease registry this function holds while it removes).
 pub fn remove_guest_image(root: &Path, key: &str) -> bool {
     if !is_image_key(key) {
         return false;
     }
     let dir = images_dir(root);
+    let held = leases();
+    if held
+        .iter()
+        .any(|(path, _)| *path == dir.join(format!("{key}.ext4")))
+    {
+        return false;
+    }
     let removed = fs::remove_file(dir.join(format!("{key}.json"))).is_ok();
     let _ = fs::remove_file(dir.join(format!("{key}.ext4")));
     // The snapshots were taken from this root file system and are useless without it.
     snapshot::remove_for_image(root, key);
+    drop(held);
     removed
 }
 
@@ -965,6 +1069,8 @@ pub struct Vm {
     next_id: AtomicU32,
     /// Writable mounts: their guest path and the host directory they come back to.
     writable: Vec<(String, PathBuf)>,
+    /// Keeps image GC off this VM's root file system until the VM is gone.
+    _image: Arc<ImageLease>,
 }
 
 impl std::fmt::Debug for Vm {
@@ -1513,6 +1619,7 @@ impl Vm {
             env: guest.env,
             next_id: AtomicU32::new(1),
             writable: Vec::new(),
+            _image: guest.lease,
         };
         let prepared = (|| -> Result<()> {
             vm.client.put_dir(
@@ -1668,18 +1775,25 @@ impl Vm {
     /// Brings back what the host reads after the steps: `workspace_paths` (relative to the workspace, the
     /// artifacts) and every writable mount, whose host directory is replaced by the guest's view.
     pub fn sync_out(&self, workspace: &Path, workspace_paths: &[String]) -> Result<()> {
-        if !workspace_paths.is_empty() {
-            self.client.get_into(
-                &guest_path(WORKSPACE_MOUNT),
-                workspace_paths.to_vec(),
-                workspace,
-            )?;
-        }
+        let patterns: Vec<&str> = workspace_paths.iter().map(String::as_str).collect();
+        self.pull_workspace(workspace, &patterns)?;
         for (guest, host) in &self.writable {
             clear_dir(host)?;
             self.client.get_into(guest, vec![".".into()], host)?;
         }
         Ok(())
+    }
+
+    /// Brings the guest workspace's files matching `patterns` (globs, as artifacts and `hash_files` state
+    /// them) back over the host copy. The agent returns literal paths, so each pattern is fetched as the
+    /// directory it starts from and the host applies the glob to what arrived.
+    pub fn pull_workspace(&self, workspace: &Path, patterns: &[&str]) -> Result<()> {
+        let roots = fetch_roots(patterns);
+        if roots.is_empty() {
+            return Ok(());
+        }
+        self.client
+            .get_into(&guest_path(WORKSPACE_MOUNT), roots, workspace)
     }
 
     pub fn destroy(self) -> Result<()> {
@@ -1744,6 +1858,38 @@ fn vm_config(
         config["network-interfaces"] = net::interface();
     }
     config
+}
+
+/// The literal paths to fetch for glob `patterns`: each pattern's leading components that hold no glob
+/// character (the whole pattern when it has none), `.` when it starts with a glob. Paths under another
+/// fetched path are dropped, so nothing travels twice.
+fn fetch_roots(patterns: &[&str]) -> Vec<String> {
+    let mut roots: Vec<String> = Vec::new();
+    for pattern in patterns {
+        let literal: Vec<&str> = pattern
+            .trim_start_matches('/')
+            .split('/')
+            .take_while(|part| !part.contains(['*', '?', '[', '{']))
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+        let root = if literal.is_empty() {
+            ".".to_owned()
+        } else {
+            literal.join("/")
+        };
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    if roots.iter().any(|r| r == ".") {
+        return vec![".".to_owned()];
+    }
+    let all = roots.clone();
+    roots.retain(|r| {
+        !all.iter()
+            .any(|other| other != r && r.starts_with(&format!("{other}/")))
+    });
+    roots
 }
 
 fn guest_path(container: &str) -> String {
@@ -2057,6 +2203,10 @@ mod tests {
         (rootfs, marker)
     }
 
+    fn lease(rootfs: &Path) -> Arc<ImageLease> {
+        ImageLease::take(rootfs)
+    }
+
     fn age(path: &Path, by: Duration) {
         fs::OpenOptions::new()
             .write(true)
@@ -2154,25 +2304,33 @@ mod tests {
         // The marker names another digest than the reference: never served.
         let (_, marker) = plant_image(root.path(), &image, OTHER, 4096);
         let dir = images_dir(root.path());
-        assert!(cached_image(&dir.join("x.ext4"), &marker, DIGEST).is_none());
+        assert!(
+            cached_image(
+                &dir.join("x.ext4"),
+                &marker,
+                DIGEST,
+                &lease(&dir.join("x.ext4"))
+            )
+            .is_none()
+        );
         let key = image_key(&Store::Shared, &image);
         let rootfs = dir.join(format!("{key}.ext4"));
-        assert!(cached_image(&rootfs, &marker, DIGEST).is_none());
+        assert!(cached_image(&rootfs, &marker, DIGEST, &lease(&rootfs)).is_none());
         // A root file system of another size than the marker records (truncated or replaced).
         let (rootfs, marker) = plant_image(root.path(), &image, DIGEST, 4096);
-        assert!(cached_image(&rootfs, &marker, DIGEST).is_some());
+        assert!(cached_image(&rootfs, &marker, DIGEST, &lease(&rootfs)).is_some());
         fs::OpenOptions::new()
             .write(true)
             .open(&rootfs)
             .unwrap()
             .set_len(100)
             .unwrap();
-        assert!(cached_image(&rootfs, &marker, DIGEST).is_none());
+        assert!(cached_image(&rootfs, &marker, DIGEST, &lease(&rootfs)).is_none());
         // A marker that does not parse, or of another format.
         fs::write(&marker, b"{").unwrap();
-        assert!(cached_image(&rootfs, &marker, DIGEST).is_none());
+        assert!(cached_image(&rootfs, &marker, DIGEST, &lease(&rootfs)).is_none());
         fs::write(&marker, br#"{"format":9}"#).unwrap();
-        assert!(cached_image(&rootfs, &marker, DIGEST).is_none());
+        assert!(cached_image(&rootfs, &marker, DIGEST, &lease(&rootfs)).is_none());
         // And a tag is refused before anything runs.
         let tagged = guest_image(root.path(), "example.test/i:latest", &Store::Shared);
         assert!(matches!(tagged, Err(Error::Preparation(_))));
@@ -2229,6 +2387,250 @@ mod tests {
             !remove_guest_image(root.path(), &listed[1].key),
             "already gone"
         );
+    }
+
+    /// A builder that makes a root file system of `bytes` without Podman and counts its calls.
+    fn fake_build(
+        calls: &std::sync::atomic::AtomicUsize,
+        bytes: u64,
+        delay: Duration,
+        image: &str,
+        digest: &str,
+        rootfs: &Path,
+        meta_path: &Path,
+    ) -> Result<ImageMeta> {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(delay);
+        let tmp = rootfs.with_extension(format!("ext4.test.{n}"));
+        fs::File::create(&tmp)?.set_len(bytes)?;
+        let _ = image;
+        publish_image(
+            &tmp,
+            rootfs,
+            meta_path,
+            digest,
+            &"cd".repeat(32),
+            &[("PATH".into(), "/bin".into())],
+        )
+    }
+
+    fn ensure(root: &Path, image: &str, build: Builder) -> Result<GuestImage> {
+        ensure_image(root, image, &Store::Shared, &AtomicBool::new(false), build)
+    }
+
+    #[test]
+    fn a_damaged_or_partial_image_is_rebuilt_and_never_served() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let build =
+            |image: &str, digest: &str, _: &Store, rootfs: &Path, meta: &Path, _: &AtomicBool| {
+                fake_build(&calls, 8192, Duration::ZERO, image, digest, rootfs, meta)
+            };
+        type Damage = fn(&Path, &Path);
+        let damages: [(&str, Damage); 4] = [
+            ("truncated root file system", |rootfs, _| {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(rootfs)
+                    .unwrap()
+                    .set_len(100)
+                    .unwrap();
+            }),
+            ("marker that does not parse", |_, marker| {
+                fs::write(marker, b"{\"format\":1,").unwrap();
+            }),
+            ("marker without a root file system", |rootfs, _| {
+                fs::remove_file(rootfs).unwrap();
+            }),
+            ("root file system without a marker", |_, marker| {
+                fs::remove_file(marker).unwrap();
+            }),
+        ];
+        for (what, damage) in damages {
+            let root = tempfile::tempdir().unwrap();
+            let image = image_ref(DIGEST);
+            let (rootfs, marker) = plant_image(root.path(), &image, DIGEST, 4096);
+            damage(&rootfs, &marker);
+            let before = calls.load(Ordering::SeqCst);
+            let rebuilt = ensure(root.path(), &image, &build).unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), before + 1, "{what}");
+            assert!(rebuilt.record.built, "{what}");
+            assert_eq!(rebuilt.record.rootfs_bytes, 8192, "{what}");
+            assert_eq!(fs::metadata(&rootfs).unwrap().len(), 8192, "{what}");
+            drop(rebuilt);
+            // The rebuilt image is a complete one: the next attempt is served from the cache.
+            let again = ensure(root.path(), &image, &build).unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), before + 1, "{what}");
+            assert!(!again.record.built, "{what}");
+        }
+    }
+
+    #[test]
+    fn a_failed_rebuild_leaves_no_marker_to_count() {
+        let root = tempfile::tempdir().unwrap();
+        let image = image_ref(DIGEST);
+        let (rootfs, marker) = plant_image(root.path(), &image, DIGEST, 4096);
+        fs::write(&marker, b"garbage").unwrap();
+        let refused = ensure(
+            root.path(),
+            &image,
+            &|_: &str, _: &str, _: &Store, _: &Path, _: &Path, _: &AtomicBool| {
+                Err(Error::Preparation("guest image build: no space".into()))
+            },
+        );
+        assert!(matches!(refused, Err(Error::Preparation(_))));
+        assert!(!marker.exists(), "a damaged marker is not left to count");
+        assert!(guest_images(root.path()).is_empty());
+        // The root file system without a marker is not an image; the orphan sweep takes it once it is old.
+        assert!(rootfs.exists());
+    }
+
+    #[test]
+    fn concurrent_attempts_on_a_new_image_build_it_once() {
+        let root = tempfile::tempdir().unwrap();
+        let image = image_ref(OTHER);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let build =
+            |image: &str, digest: &str, _: &Store, rootfs: &Path, meta: &Path, _: &AtomicBool| {
+                fake_build(
+                    &calls,
+                    4096,
+                    Duration::from_millis(150),
+                    image,
+                    digest,
+                    rootfs,
+                    meta,
+                )
+            };
+        let waiting = std::sync::Barrier::new(8);
+        let results: Vec<GuestImage> = thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        waiting.wait();
+                        ensure(root.path(), &image, &build).unwrap()
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a stampede builds once");
+        assert_eq!(results.iter().filter(|r| r.record.built).count(), 1);
+        assert!(results.iter().all(|r| r.rootfs == results[0].rootfs));
+        assert!(
+            results
+                .iter()
+                .all(|r| r.record.digest == OTHER && r.record.rootfs_bytes == 4096)
+        );
+        let key = image_key(&Store::Shared, &image);
+        assert!(
+            build_locks().lock().unwrap().iter().all(|(k, _)| *k != key),
+            "the build lock is forgotten once nobody waits"
+        );
+        // Every attempt holds the image, so GC leaves it.
+        assert!(guest_images(root.path())[0].in_use);
+        assert!(!remove_guest_image(root.path(), &key));
+        drop(results);
+        assert!(!guest_images(root.path())[0].in_use);
+    }
+
+    #[test]
+    fn an_image_a_live_attempt_holds_is_never_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let image = image_ref(DIGEST);
+        let (rootfs, marker) = plant_image(root.path(), &image, DIGEST, 4096);
+        let key = image_key(&Store::Shared, &image);
+        let held = guest_image(root.path(), &image, &Store::Shared).unwrap();
+        // The attempt has been running for a day: the stamp is far past any keep window.
+        age(&marker, Duration::from_secs(86_400));
+        assert!(guest_images(root.path())[0].in_use);
+        assert!(!remove_guest_image(root.path(), &key));
+        assert!(rootfs.exists() && marker.exists());
+        // A second attempt on the same image shares the claim: one releasing leaves it held.
+        let second = guest_image(root.path(), &image, &Store::Shared).unwrap();
+        drop(held);
+        assert!(!remove_guest_image(root.path(), &key));
+        drop(second);
+        assert!(!guest_images(root.path())[0].in_use);
+        assert!(remove_guest_image(root.path(), &key));
+        assert!(!rootfs.exists() && !marker.exists());
+        // After a removal the next attempt rebuilds, and GC cannot take the image while it is built.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let root_path = root.path().to_path_buf();
+        let rebuilt = ensure(
+            root.path(),
+            &image,
+            &|image: &str, digest: &str, _: &Store, rootfs: &Path, meta: &Path, _: &AtomicBool| {
+                assert!(
+                    !remove_guest_image(&root_path, &key),
+                    "GC cannot take an image out from under the attempt that builds it"
+                );
+                fake_build(&calls, 2048, Duration::ZERO, image, digest, rootfs, meta)
+            },
+        )
+        .unwrap();
+        assert!(rebuilt.record.built);
+    }
+
+    #[test]
+    fn budget_eviction_takes_the_least_recently_used_and_spares_held_images() {
+        let root = tempfile::tempdir().unwrap();
+        let hour = Duration::from_secs(3_600);
+        let digests: Vec<String> = (1..=4).map(|n| format!("sha256:{n:064x}")).collect();
+        let shapes = [
+            (1000u64, hour * 3),
+            (2000, hour * 9),
+            (4000, hour * 30),
+            (8000, hour),
+        ];
+        let mut keys = Vec::new();
+        for (digest, (bytes, idle)) in digests.iter().zip(shapes) {
+            let image = image_ref(digest);
+            let (_, marker) = plant_image(root.path(), &image, digest, bytes);
+            age(&marker, idle);
+            keys.push(image_key(&Store::Shared, &image));
+        }
+        // The least recently used image (idle 30 h) belongs to a running attempt.
+        let held = guest_image(root.path(), &image_ref(&digests[2]), &Store::Shared).unwrap();
+        age(
+            &images_dir(root.path()).join(format!("{}.json", keys[2])),
+            hour * 30,
+        );
+        let images = crate::images::Images::new(PathBuf::new());
+        let guests = guest_images(root.path());
+        let total: u64 = guests.iter().map(|g| g.bytes).sum();
+        assert_eq!(total, 15_000);
+        // A 12 000 byte budget with nothing else in the store: 3 000 bytes must go.
+        let over = crate::images::guest_overage(total, 0, 12_000);
+        assert_eq!(over, 3_000);
+        let victims = images.reclaimable_guests(&guests, over);
+        // The held image is skipped; of the rest the 9 h one (2 000 bytes) goes first, then the 3 h one
+        // (1 000 bytes), which is enough. The 1 h image is untouched.
+        assert_eq!(victims, [keys[1].clone(), keys[0].clone()]);
+        for key in &victims {
+            assert!(remove_guest_image(root.path(), key));
+        }
+        let left = guest_images(root.path());
+        assert_eq!(left.iter().map(|g| g.bytes).sum::<u64>(), 12_000);
+        assert!(left.iter().any(|g| g.key == keys[2] && g.in_use));
+        drop(held);
+    }
+
+    #[test]
+    fn a_glob_is_fetched_as_the_directory_it_starts_from() {
+        // The agent returns literal paths: a pattern must name where to look, the host applies the glob.
+        assert_eq!(fetch_roots(&["out/**"]), ["out"]);
+        assert_eq!(fetch_roots(&["target/release/*.so"]), ["target/release"]);
+        assert_eq!(fetch_roots(&["out/app", "missing"]), ["out/app", "missing"]);
+        assert_eq!(fetch_roots(&["./reports/{a,b}.xml"]), ["reports"]);
+        // A leading glob needs the whole workspace, which swallows the other roots.
+        assert_eq!(fetch_roots(&["out/**", "**/*.xml", "x"]), ["."]);
+        assert_eq!(fetch_roots(&["*"]), ["."]);
+        // A path under another fetched path travels once; a longer name that merely shares a prefix stays.
+        assert_eq!(
+            fetch_roots(&["out/**", "out/deep/*.txt", "output/**"]),
+            ["out", "output"]
+        );
+        assert!(fetch_roots(&[]).is_empty());
     }
 
     #[test]

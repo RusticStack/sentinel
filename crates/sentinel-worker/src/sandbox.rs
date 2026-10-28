@@ -57,6 +57,15 @@ impl Sandbox {
         }
     }
 
+    /// Brings the workspace files matching `patterns` current on the host (a VM's workspace is a copy; a
+    /// container shares the host's directory already): what a step `if:` reads after earlier steps ran.
+    pub fn pull_workspace(&self, workspace: &Path, patterns: &[&str]) -> Result<()> {
+        match self {
+            Sandbox::Container(_) => Ok(()),
+            Sandbox::Vm(vm) => vm.pull_workspace(workspace, patterns),
+        }
+    }
+
     pub fn destroy(self) -> Result<()> {
         match self {
             Sandbox::Container(c) => c.destroy(),

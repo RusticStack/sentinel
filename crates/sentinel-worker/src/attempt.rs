@@ -902,7 +902,15 @@ fn execute(
     ];
     let compiled = &job.spec.pipeline.jobs[job.job_index].spec;
     let job_deadline = Instant::now() + Duration::from_secs(compiled.timeout_secs.max(1));
-    let context = WorkerContext::new(&job.context, &job.spec, workspace);
+    // A VM works on its own copy of the workspace: before `hash_files` reads one, bring back what the steps
+    // that already ran changed there. Nothing ran before the first step, and a container shares the directory.
+    let ran = AtomicBool::new(false);
+    let refresh = |patterns: &[&str]| {
+        if ran.load(Ordering::Acquire) {
+            let _ = container.pull_workspace(workspace, patterns);
+        }
+    };
+    let context = WorkerContext::new(&job.context, &job.spec, workspace).with_refresh(&refresh);
     let mut oom_seen = container.oom_kills().unwrap_or(0);
     let mut failure: Option<(FailureClass, String)> = None;
     for (index, step) in compiled.steps.iter().enumerate() {
@@ -1005,6 +1013,7 @@ fn execute(
             Arc::new(move |stream, bytes: &[u8]| output.write(step_index, stream, bytes))
         };
         let exec = container.exec_streaming(&command, &extra, Some(sink));
+        ran.store(true, Ordering::Release);
         let cleared = if secret_step
             && exec.as_ref().is_ok_and(|exit| !exit.timed_out)
             && !cancel.load(Ordering::Acquire)
