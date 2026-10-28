@@ -389,7 +389,7 @@ jobs:
     resources: {{ cpu: 1, memory: 512MiB, disk: 1GiB }}
     steps:
       - id: fill
-        run: 'i=0; while [ $i -lt 128 ]; do dd if=/dev/zero of=part$i bs=1M count=32 conv=fdatasync 2>/dev/null; i=$((i+1)); done'
+        run: 'i=0; while [ $i -lt 128 ]; do dd if=/dev/zero of=part$i bs=1M count=32 conv=fsync 2>/dev/null; i=$((i+1)); done'
       - id: never
         run: 'true'
   slow:
