@@ -22,6 +22,7 @@ cargo deny --locked check bans licenses sources
 fresh=$(mktemp)
 trap 'rm -f "$fresh"' EXIT
 cargo about generate --locked --all-features -c about.toml about.hbs -o "$fresh"
+sed -i 's/$//' "$fresh"   # the file is committed with LF endings on every OS
 if [ $write = 1 ]; then
   cp "$fresh" THIRD-PARTY-LICENSES.md
   echo "wrote THIRD-PARTY-LICENSES.md"
