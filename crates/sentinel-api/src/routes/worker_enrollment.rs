@@ -2,8 +2,12 @@
 //! host ceilings and priority the controller approves, read its state, withdraw it, and download the
 //! worker-only bootstrap script. The secret leaves the controller once, in the issuing response; the
 //! script carries none.
+//!
+//! The same module holds the controller's authority over an enrolled host (Q12): read and replace the
+//! ceilings and priority approved for one worker, and request its uninstall. A worker's own report can
+//! never raise either.
 
-use sentinel_core::{PoolId, TokenId, UnixMillis};
+use sentinel_core::{PoolId, TokenId, UnixMillis, WorkerId};
 use sentinel_protocol::error::{ApiError, ErrorCode};
 use sentinel_store::workers::{
     self, DEFAULT_ENROLLMENT_MS, EnrollmentState, EnrollmentStatus, EnrollmentTerms, HostPolicy,
@@ -45,6 +49,15 @@ pub(super) fn route(
                 "bootstrap.sh",
             ],
         ) => script(state, request, enrollment),
+        ("GET", ["api", "v1", "admin", "workers", worker, "policy"]) => {
+            host_policy(state, request, worker)
+        }
+        ("PUT", ["api", "v1", "admin", "workers", worker, "policy"]) => {
+            set_host_policy(state, request, worker)
+        }
+        ("POST", ["api", "v1", "admin", "workers", worker, "uninstall"]) => {
+            uninstall(state, request, worker)
+        }
         _ => return None,
     })
 }
@@ -268,4 +281,93 @@ fn script(state: &State, request: &Request, enrollment: &str) -> Route {
             e => store_error(e),
         })?;
     Ok(Reply::Script(200, rendered))
+}
+
+fn view_json(view: &workers::HostView) -> Value {
+    json!({
+        "approved": policy_json(&view.policy),
+        "reported": {
+            "cpu_millis": view.reported_cpu_millis,
+            "memory_bytes": view.reported_memory_bytes,
+            "disk_bytes": view.reported_disk_bytes,
+        },
+        "effective": {
+            "cpu_millis": view.effective_cpu_millis,
+            "memory_bytes": view.effective_memory_bytes,
+            "disk_bytes": view.effective_disk_bytes,
+        },
+    })
+}
+
+fn host_policy(state: &State, request: &Request, worker: &str) -> Route {
+    let who = super::admin::platform(state, request, false)?;
+    let worker: WorkerId = id(worker, "worker")?;
+    let authority = who.authority();
+    let view = state
+        .store
+        .read(move |c| workers::host_view(c, authority, worker))
+        .map_err(store_error)?;
+    ok(view_json(&view))
+}
+
+/// The whole approved policy: an absent or `null` ceiling removes it, an absent priority is neutral.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyBody {
+    #[serde(default)]
+    cpu_millis: Option<i64>,
+    #[serde(default)]
+    memory_bytes: Option<i64>,
+    #[serde(default)]
+    disk_bytes: Option<i64>,
+    #[serde(default)]
+    priority: Option<i32>,
+}
+
+fn set_host_policy(state: &State, request: &mut Request, worker: &str) -> Route {
+    let who = super::admin::platform(state, request, true)?;
+    let worker: WorkerId = id(worker, "worker")?;
+    let body: PolicyBody = parse(&body(request)?)?;
+    let policy = HostPolicy {
+        cpu_millis: body.cpu_millis,
+        memory_bytes: body.memory_bytes,
+        disk_bytes: body.disk_bytes,
+        priority: body.priority.unwrap_or(0),
+    };
+    limited(state, &who, Budget::HostPolicy)?;
+    let authority = who.authority();
+    let view = state
+        .store
+        .writer()
+        .write(move |tx| {
+            // A ceiling decides how much of the machine tenants can use: it needs a fresh step-up.
+            authority.require_privileged(tx)?;
+            workers::set_policy(tx, authority, worker, policy)?;
+            workers::host_view(tx, authority, worker)
+        })
+        .map_err(store_error)?;
+    // Placement reads the recorded size on its next pass; wake it so a raise is used at once.
+    state.controller.wake();
+    ok(view_json(&view))
+}
+
+fn uninstall(state: &State, request: &Request, worker: &str) -> Route {
+    let who = super::admin::platform(state, request, true)?;
+    let worker: WorkerId = id(worker, "worker")?;
+    limited(state, &who, Budget::HostPolicy)?;
+    let authority = who.authority();
+    state
+        .store
+        .writer()
+        .write(move |tx| {
+            authority.require_privileged(tx)?;
+            workers::request_uninstall(tx, authority, worker, UnixMillis::now())
+        })
+        .map_err(store_error)?;
+    state.controller.wake();
+    Ok(Reply::Json(
+        202,
+        json!({ "worker": worker.to_string(), "uninstall": "requested" }),
+        Vec::new(),
+    ))
 }

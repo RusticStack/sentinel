@@ -190,7 +190,12 @@ fn send(
             request.send_empty()
         }
         _ => {
-            let mut request = agent.post(&url).header("content-type", "application/json");
+            let mut request = if method == "PUT" {
+                agent.put(&url)
+            } else {
+                agent.post(&url)
+            }
+            .header("content-type", "application/json");
             for (k, v) in headers {
                 request = request.header(*k, *v);
             }
@@ -653,4 +658,157 @@ fn issuing_and_downloading_are_rate_limited_per_administrator() {
     }
     assert_eq!(&codes[..10], &[200; 10], "{codes:?}");
     assert!(codes[10..].iter().all(|c| *c == 429), "{codes:?}");
+}
+
+fn enroll_worker(d: &Deployment, secret: &str) -> sentinel_core::WorkerId {
+    let secret = sentinel_auth::token::parse(secret).expect("a well-formed secret");
+    let worker = sentinel_core::WorkerId::new();
+    d.store
+        .writer()
+        .write(move |tx| {
+            workers::redeem_bound(
+                tx,
+                &secret,
+                Presentation {
+                    worker,
+                    fingerprint: sentinel_auth::secret::Secret::generate().digest(),
+                    name: "builder-1",
+                    negotiated: negotiated(),
+                },
+                None,
+                UnixMillis::now(),
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+    d.store
+        .writer()
+        .write(move |tx| {
+            sentinel_store::dispatch::report_capacity(
+                tx,
+                worker,
+                sentinel_store::dispatch::Capacity {
+                    cpu_millis: 16_000,
+                    memory_bytes: 64 << 30,
+                    disk_bytes: 0,
+                },
+            )
+        })
+        .unwrap();
+    worker
+}
+
+#[test]
+fn an_administrator_reads_and_replaces_a_workers_host_policy_and_requests_its_uninstall() {
+    let d = deployment(Some(false));
+    let session = administrator(&d);
+    let issued = issue(
+        &d,
+        &session,
+        json!({ "pool": d.pool.to_string(), "transport": "direct", "cpu_millis": 4000, "priority": 5 }),
+    );
+    assert_eq!(issued.status, 201, "{}", issued.text);
+    let worker = enroll_worker(&d, issued.json()["secret"].as_str().unwrap());
+    let path = format!("/api/v1/admin/workers/{worker}/policy");
+
+    // Approved, reported and effective are three different facts: the host claims 16 cores, the
+    // controller approved 4, and 4 is what it offers.
+    let shown = send(&d, "GET", &path, None, &session.headers());
+    assert_eq!(shown.status, 200, "{}", shown.text);
+    let body = shown.json();
+    assert_eq!(body["approved"]["cpu_millis"], 4000);
+    assert_eq!(body["approved"]["priority"], 5);
+    assert_eq!(body["reported"]["cpu_millis"], 16_000);
+    assert_eq!(body["effective"]["cpu_millis"], 4000);
+    assert_eq!(body["effective"]["memory_bytes"], 64u64 << 30);
+
+    // Replacing the policy needs a fresh step-up and platform administration.
+    let unsure = sign_in(&d);
+    let refused = send(
+        &d,
+        "PUT",
+        &path,
+        Some(&json!({ "cpu_millis": 8000 })),
+        &unsure.headers(),
+    );
+    assert_eq!(refused.status, 403, "{}", refused.text);
+    assert_eq!(refused.json()["details"]["step_up"], true);
+    assert_eq!(
+        send(&d, "PUT", &path, Some(&json!({ "cpu_millis": 8000 })), &[]).status,
+        401
+    );
+    assert_eq!(
+        send(&d, "GET", &path, None, &unsure.headers()).json()["approved"]["cpu_millis"],
+        4000,
+        "a refused change changes nothing"
+    );
+
+    let replaced = send(
+        &d,
+        "PUT",
+        &path,
+        Some(&json!({ "cpu_millis": 8000, "memory_bytes": 1u64 << 30, "priority": -20 })),
+        &session.headers(),
+    );
+    assert_eq!(replaced.status, 200, "{}", replaced.text);
+    let body = replaced.json();
+    assert_eq!(body["approved"]["cpu_millis"], 8000);
+    assert_eq!(body["approved"]["disk_bytes"], Value::Null);
+    assert_eq!(body["approved"]["priority"], -20);
+    assert_eq!(
+        body["effective"]["cpu_millis"], 8000,
+        "a raise applies at once"
+    );
+    assert_eq!(
+        body["effective"]["memory_bytes"],
+        1u64 << 30,
+        "a reduction too"
+    );
+    assert!(audit_events(&d, &session).contains(&"worker-policy-changed".to_owned()));
+
+    for bad in [
+        json!({ "priority": 101 }),
+        json!({ "cpu_millis": 0 }),
+        json!({ "cpu_millis": 1, "tenant_priority": 3 }),
+    ] {
+        let rejected = send(&d, "PUT", &path, Some(&bad), &session.headers());
+        assert_eq!(rejected.status, 400, "{bad}: {}", rejected.text);
+    }
+    let unknown = format!(
+        "/api/v1/admin/workers/{}/policy",
+        sentinel_core::WorkerId::new()
+    );
+    assert_eq!(
+        send(&d, "GET", &unknown, None, &session.headers()).status,
+        404
+    );
+    assert_eq!(
+        send(&d, "PUT", &unknown, Some(&json!({})), &session.headers()).status,
+        404
+    );
+
+    // An uninstall request is accepted and audited; the controller settles it once the work has drained.
+    let uninstall = format!("/api/v1/admin/workers/{worker}/uninstall");
+    assert_eq!(
+        send(&d, "POST", &uninstall, None, &unsure.headers()).status,
+        403
+    );
+    let accepted = send(&d, "POST", &uninstall, None, &session.headers());
+    assert_eq!(accepted.status, 202, "{}", accepted.text);
+    assert_eq!(accepted.json()["uninstall"], "requested");
+    assert!(audit_events(&d, &session).contains(&"worker-uninstall-requested".to_owned()));
+    assert_eq!(
+        send(
+            &d,
+            "POST",
+            &format!(
+                "/api/v1/admin/workers/{}/uninstall",
+                sentinel_core::WorkerId::new()
+            ),
+            None,
+            &session.headers()
+        )
+        .status,
+        404
+    );
 }

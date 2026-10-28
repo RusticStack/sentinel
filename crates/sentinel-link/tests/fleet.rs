@@ -232,6 +232,22 @@ impl Deployment {
             .secret
     }
 
+    fn enrollment_with(&self, policy: workers::HostPolicy) -> Secret {
+        let terms = workers::EnrollmentTerms {
+            pool: self.pool,
+            lifetime_ms: 60_000,
+            policy,
+            tailcat: false,
+        };
+        self.store
+            .writer()
+            .write(move |tx| {
+                workers::issue_enrollment_with(tx, Authority::HostLocal, terms, UnixMillis::now())
+            })
+            .unwrap()
+            .secret
+    }
+
     fn runs(&self, specs: Vec<(TenantId, RepoId, String)>) -> Vec<Vec<JobId>> {
         let prepared: Vec<(TenantId, RepoId, RunSpec)> = specs
             .into_iter()
@@ -1228,6 +1244,80 @@ fn an_uninstalled_worker_finishes_its_attempt_then_is_revoked() {
         d.controller().connected().is_empty()
     });
     let _ = process.stop();
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
+}
+
+/// The ceiling is the controller's: a worker whose hello claims 5 cores is offered work for the 1 core it
+/// was approved for, and a raised ceiling is used at once, up to the host's own claim and no further.
+#[test]
+fn a_worker_that_claims_more_than_its_approved_ceiling_is_offered_no_more() {
+    let mut d = deployment();
+    let id = WorkerId::new();
+    let recorder = Recorder::new();
+    let process = WorkerProcess::start(
+        &d,
+        Identity::generate("capped").unwrap(),
+        id,
+        d.enrollment_with(workers::HostPolicy {
+            cpu_millis: Some(1_000),
+            priority: 40,
+            ..workers::HostPolicy::default()
+        }),
+        STANDARD,
+        profile(80, 128 << 30),
+        Arc::clone(&recorder),
+    );
+    process.wait_for("Connected", 1);
+    eventually("fleet", || d.controller().connected() == vec![id]);
+
+    // Eight quarter-core jobs: 5 cores would take them all; the approved core takes four.
+    let jobs = d.runs(vec![(d.tenant_a, d.repo_a, noise())])[0].clone();
+    assert_eq!(jobs.len(), 8);
+    d.controller().wake();
+    eventually("four offers", || recorder.offers.lock().unwrap().len() == 4);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        recorder.offers.lock().unwrap().len(),
+        4,
+        "the worker was offered more than its approved CPU"
+    );
+    let known = d
+        .store
+        .read(|c| workers::host_view(c, Authority::HostLocal, id))
+        .unwrap();
+    assert_eq!(known.policy.cpu_millis, Some(1_000));
+    assert_eq!(known.policy.priority, 40);
+    assert_eq!(known.reported_cpu_millis, 5_000);
+    assert_eq!(known.effective_cpu_millis, 1_000);
+
+    // Doubling the ceiling needs no new hello: the remaining four jobs go out.
+    d.store
+        .writer()
+        .write(move |tx| {
+            workers::set_policy(
+                tx,
+                Authority::HostLocal,
+                id,
+                workers::HostPolicy {
+                    cpu_millis: Some(2_000),
+                    priority: 40,
+                    ..workers::HostPolicy::default()
+                },
+            )
+        })
+        .unwrap();
+    d.controller().wake();
+    eventually("eight offers", || {
+        recorder.offers.lock().unwrap().len() == 8
+    });
+
+    assert_eq!(d.held(id).len(), 8);
+    process.stop().unwrap();
     assert!(
         d.controller
             .take()

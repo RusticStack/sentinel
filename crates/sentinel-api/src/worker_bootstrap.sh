@@ -611,7 +611,7 @@ cmd_install() {
         say "worker id: $(head -n 1 "$DATA_DIR/worker.id")"
     fi
     if [ "$TRANSPORT" = tailcat ]; then
-        say "until the controller admits Tailcat nodes by itself, list this worker there with: sh $0 identity | sentinel admin tailcat allow --data-dir <controller data dir>"
+        say "the controller admits this worker's Tailcat key once you authorize it for the enrollment it was issued from: sh $0 identity | sentinel admin tailcat authorize --enrollment <tok_ id> --data-dir <controller data dir>"
     fi
 }
 

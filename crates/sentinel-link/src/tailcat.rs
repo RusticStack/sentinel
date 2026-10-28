@@ -424,6 +424,35 @@ pub fn retire(data_dir: &Path, keep: &Admission) -> Result<usize> {
     Ok(removed)
 }
 
+/// Remove every listed line `drop_line` answers true for, and report how many went. The file is
+/// replaced atomically and stays owner-only; comments, blank lines and the other lines are kept
+/// byte for byte, and nothing is written when no line matches.
+pub fn prune(data_dir: &Path, mut drop_line: impl FnMut(&Admission) -> bool) -> Result<usize> {
+    // Refuse a file `allow_list` would refuse (not a regular owner-only file, malformed, too big).
+    allow_list(data_dir)?;
+    let text = read_allow_text(data_dir)?;
+    let mut kept = String::with_capacity(text.len());
+    let mut removed = 0;
+    for line in text.lines() {
+        if parse_admission(line.trim()).is_some_and(|listed| drop_line(&listed)) {
+            removed += 1;
+        } else {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    if removed > 0 {
+        write_private(data_dir, ALLOW_LIST_FILE, kept.as_bytes())?;
+    }
+    Ok(removed)
+}
+
+/// Take every key of one worker off the allow list (its uninstall or revocation), the overlap-window
+/// key of a rotation included. Reports how many lines went.
+pub fn revoke(data_dir: &Path, worker: WorkerId) -> Result<usize> {
+    prune(data_dir, |listed| listed.worker == worker)
+}
+
 fn parse_admission(line: &str) -> Option<Admission> {
     let mut fields = line.split_whitespace();
     let (Some(key), Some(worker), None) = (fields.next(), fields.next(), fields.next()) else {

@@ -1817,7 +1817,7 @@ impl Admission for Inner {
         self.store
             .writer()
             .write(move |tx| {
-                let Some(enrolled) = workers::redeem(
+                let Some(enrolled) = workers::redeem_authorized(
                     tx,
                     &secret,
                     workers::Presentation {

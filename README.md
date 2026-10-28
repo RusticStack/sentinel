@@ -114,7 +114,7 @@ Then follow [operator first run](docs/development.md#operator-first-run) to crea
 | Multi-tenancy, authentication, OAuth and secrets | Implemented; authorization/admission rework open |
 | Logs, artifacts, caches, recovery and retention | Implemented; durability and cache rework open |
 | Web interface, CLI, MCP and GitHub Checks | Implemented; current verification open |
-| UI worker enrollment, host caps and host priority | Enrollment API and install script built ([worker bootstrap](docs/worker-bootstrap.md)); web page and Q12–Q13 open |
+| UI worker enrollment, host caps and host priority | Enrollment API, install script, authorized Tailcat node keys and authoritative ceilings/priority (API and CLI) built ([worker bootstrap](docs/worker-bootstrap.md)); web page, priority-aware placement and Q13 open |
 | Same-hardware optimization and pilot measurements | Revision-4 records exist; B08 unmet |
 | 2× Blacksmith comparison | B11 blocked by benchmark access |
 | Firecracker microVMs for Linux jobs | Implemented; networking, snapshots and verification open |

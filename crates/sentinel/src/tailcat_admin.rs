@@ -39,7 +39,72 @@ pub fn run(args: &TailcatArgs) -> Result<(), String> {
             );
             Ok(())
         }
+        TailcatCommand::Authorize { data, enrollment } => {
+            let admission = read_admission()?;
+            authorize(&data.data_dir, enrollment, &admission)?;
+            eprintln!(
+                "authorized a key for {} on that enrollment; the running controller admits it within 10 s and stops once the enrollment is spent, withdrawn or expired",
+                admission.worker
+            );
+            Ok(())
+        }
+        TailcatCommand::Revoke { data, id } => {
+            let worker: WorkerId = id
+                .parse()
+                .map_err(|_| "expected a wrk_ worker identifier".to_owned())?;
+            let removed = tailcat::revoke(&data.data_dir, worker).map_err(|e| e.to_string())?;
+            eprintln!(
+                "removed {removed} key(s) of {worker} from the allow list; the running controller drops them within 10 s"
+            );
+            Ok(())
+        }
     }
+}
+
+#[cfg(feature = "server")]
+fn authorize(data_dir: &Path, enrollment: &str, admission: &Admission) -> Result<(), String> {
+    use sentinel_core::{TokenId, UnixMillis};
+    use sentinel_store::{auth::Authority, workers};
+
+    let enrollment: TokenId = enrollment
+        .parse()
+        .map_err(|_| "expected a tok_ enrollment identifier".to_owned())?;
+    let key = workers::parse_node_key(admission.key.expose())
+        .ok_or_else(|| "the node key is not nodekey:<64 hex>".to_owned())?;
+    let worker = admission.worker;
+    let store = crate::admin::open(&crate::cli::DataDir::at(data_dir), true)
+        .map_err(|error| error.message)?;
+    store
+        .writer()
+        .write(move |tx| {
+            workers::authorize_node_key(
+                tx,
+                Authority::HostLocal,
+                enrollment,
+                worker,
+                key,
+                UnixMillis::now(),
+            )
+        })
+        .map_err(|error| match error {
+            sentinel_store::Error::NotFound => "no enrollment with that identifier".to_owned(),
+            sentinel_store::Error::Conflict => {
+                "the enrollment is no longer pending, already has another key, or that key or worker identifier already belongs to a worker"
+                    .to_owned()
+            }
+            sentinel_store::Error::InvalidInput(_) => {
+                "that enrollment is for direct TLS and takes no node key".to_owned()
+            }
+            other => format!("cannot authorize the key: {other}"),
+        })
+}
+
+#[cfg(not(feature = "server"))]
+fn authorize(_data_dir: &Path, _enrollment: &str, _admission: &Admission) -> Result<(), String> {
+    Err(
+        "authorizing a key for an enrollment needs the controller's own build (--features server)"
+            .to_owned(),
+    )
 }
 
 struct Target {

@@ -113,6 +113,8 @@ pub enum Event {
     WorkerUninstalled = 91,
     WorkerBootstrapDownloaded = 92,
     WorkerEnrollmentRevoked = 93,
+    WorkerPolicyChanged = 94,
+    WorkerNodeKeyAuthorized = 95,
 }
 
 impl Event {
@@ -189,6 +191,8 @@ impl Event {
             Event::WorkerUninstalled => "worker-uninstalled",
             Event::WorkerBootstrapDownloaded => "worker-bootstrap-downloaded",
             Event::WorkerEnrollmentRevoked => "worker-enrollment-revoked",
+            Event::WorkerPolicyChanged => "worker-policy-changed",
+            Event::WorkerNodeKeyAuthorized => "worker-node-key-authorized",
         }
     }
 
@@ -265,6 +269,8 @@ impl Event {
             91 => Event::WorkerUninstalled,
             92 => Event::WorkerBootstrapDownloaded,
             93 => Event::WorkerEnrollmentRevoked,
+            94 => Event::WorkerPolicyChanged,
+            95 => Event::WorkerNodeKeyAuthorized,
             _ => return None,
         })
     }

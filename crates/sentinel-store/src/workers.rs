@@ -450,7 +450,126 @@ pub fn redeem_bound(
     }))
 }
 
+/// State a pending Tailcat enrollment needs before its worker can reach the controller: which
+/// worker identifier and which node key it is for. The pair is set once by platform
+/// administration, and redemption binds exactly that key to exactly that identifier. Until the
+/// enrollment is spent, withdrawn or expired the controller admits the key to its Tailcat helper
+/// (`pending_node_keys`), so the worker can present the enrollment secret at all; afterwards the
+/// worker's own `node_key` takes over (`admitted_node_keys`).
+///
+/// Idempotent for the same pair. A direct-TLS enrollment takes no key (`InvalidInput`); a spent,
+/// withdrawn or expired one, a second pair, and a key or identifier that already belongs to a
+/// worker are `Conflict`.
+pub fn authorize_node_key(
+    tx: &Transaction<'_>,
+    authority: Authority,
+    enrollment: TokenId,
+    worker: WorkerId,
+    key: NodeKey,
+    now: UnixMillis,
+) -> Result<()> {
+    authority.require_platform(tx)?;
+    let status = enrollment_status_of(tx, enrollment, now)?;
+    if status.state != EnrollmentState::Pending {
+        return Err(Error::Conflict);
+    }
+    if !status.tailcat {
+        return Err(Error::InvalidInput("node key for a direct enrollment"));
+    }
+    let current: AuthorizedPair = tx
+        .prepare_cached(
+            "SELECT authorized_worker, authorized_node_key FROM worker_enrollments WHERE id = ?1",
+        )?
+        .query_row([enrollment.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    if let (Some(w), Some(k)) = &current {
+        return if w.as_slice() == worker.as_bytes() && k.as_slice() == key {
+            Ok(())
+        } else {
+            Err(Error::Conflict)
+        };
+    }
+    let taken: bool = tx
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM workers WHERE id = ?1 OR node_key = ?2)")?
+        .query_row(params![worker.as_bytes(), key.as_slice()], |r| r.get(0))?;
+    if taken {
+        return Err(Error::Conflict);
+    }
+    let set = tx.execute(
+        "UPDATE worker_enrollments SET authorized_worker = ?2, authorized_node_key = ?3
+         WHERE id = ?1 AND redeemed_ms IS NULL AND revoked_ms IS NULL",
+        params![enrollment.as_bytes(), worker.as_bytes(), key.as_slice()],
+    );
+    // Another pending enrollment already holds this key.
+    if let Err(rusqlite::Error::SqliteFailure(code, _)) = &set
+        && code.code == rusqlite::ErrorCode::ConstraintViolation
+    {
+        return Err(Error::Conflict);
+    }
+    set?;
+    audit(
+        tx,
+        Event::WorkerNodeKeyAuthorized,
+        authority.actor(),
+        None,
+        authority.host_local(),
+        Some(&enrollment.to_string()),
+    )
+}
+
+/// The node keys of enrollments that can still be redeemed, for the Tailcat allow list: without
+/// them a new worker could never reach the controller to present its secret. A key leaves this
+/// list the moment its enrollment is spent (then `admitted_node_keys` carries it), withdrawn or
+/// expired, or its pool is deactivated.
+pub fn pending_node_keys(conn: &Connection, now: UnixMillis) -> Result<Vec<(WorkerId, NodeKey)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT e.authorized_worker, e.authorized_node_key
+         FROM worker_enrollments e JOIN pools p ON p.id = e.pool_id
+         WHERE e.authorized_node_key IS NOT NULL AND e.redeemed_ms IS NULL
+           AND e.revoked_ms IS NULL AND e.expires_ms > ?1 AND p.active = 1
+         ORDER BY e.created_ms, e.id",
+    )?;
+    let rows = stmt.query_map([now.0], |r| {
+        Ok((r.get::<_, [u8; 16]>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+    rows.map(|row| {
+        let (id, key) = row?;
+        Ok((
+            WorkerId::from_bytes(id).map_err(|_| Error::Corrupt("worker id"))?,
+            NodeKey::try_from(key).map_err(|_| Error::Corrupt("enrollment node key"))?,
+        ))
+    })
+    .collect()
+}
+
+/// Redeem an enrollment the way the controller's link does: a Tailcat enrollment binds the node
+/// key an administrator authorized for it, and only for the worker identifier it was authorized
+/// for; a direct-TLS enrollment binds none. A Tailcat enrollment with no authorized key, or one
+/// presented by a different identifier, is refused as a value and stays unspent.
+pub fn redeem_authorized(
+    tx: &Transaction<'_>,
+    presented: &Secret,
+    presentation: Presentation<'_>,
+    now: UnixMillis,
+) -> Result<Option<Worker>> {
+    let authorized: Option<AuthorizedPair> = tx
+        .prepare_cached(
+            "SELECT authorized_worker, authorized_node_key FROM worker_enrollments
+             WHERE token_digest = ?1",
+        )?
+        .query_row([presented.digest().0], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let node_key = match authorized {
+        Some((Some(worker), Some(key))) if worker.as_slice() == presentation.worker.as_bytes() => {
+            NodeKey::try_from(key).ok()
+        }
+        _ => None,
+    };
+    redeem_bound(tx, presented, presentation, node_key, now)
+}
+
 type PoolBytes = [u8; 16];
+/// The worker identifier and node key an administrator authorized for an enrollment, as stored.
+type AuthorizedPair = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 // Negotiation runs on every hello; dropping below the profile protocol clears the placement facts (labels, images, disk) that an old worker cannot report, so stale ones never match.
 pub fn renegotiate(tx: &Transaction<'_>, worker: WorkerId, negotiated: Negotiated) -> Result<()> {
@@ -625,10 +744,12 @@ pub fn admitted_node_keys(conn: &Connection) -> Result<Vec<(WorkerId, NodeKey)>>
     .collect()
 }
 
-/// Replace a live worker's approved ceilings and priority (platform administration only). A
-/// reduction clamps the recorded capacity at once, so no new work is placed over it; attempts the
-/// worker already holds are untouched. A raise or removal takes effect at the worker's next
-/// capacity report, which is the only place the host's own size is learned.
+/// Replace a live worker's approved ceilings and priority (platform administration only). The
+/// effective size the controller offers is recomputed from what the worker last reported, under the
+/// new ceilings, in both directions: a reduction stops new oversubscription at once, and a raise or
+/// removal takes effect at once as well, up to the host's own report and never beyond it. Attempts
+/// the worker already holds are untouched; a reduction only drives the free room negative. A size
+/// the worker has not reported yet (0) is only ever reduced, never raised. Audited.
 pub fn set_policy(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -640,12 +761,18 @@ pub fn set_policy(
     let changed = tx.execute(
         "UPDATE workers SET cpu_ceiling_millis = ?2, memory_ceiling_bytes = ?3,
                 disk_ceiling_bytes = ?4, priority = ?5,
-                cpu_millis = CASE WHEN ?2 IS NOT NULL AND cpu_millis > ?2 THEN ?2 ELSE cpu_millis END,
-                memory_bytes = CASE WHEN ?3 IS NOT NULL AND memory_bytes > ?3 THEN ?3
-                                    ELSE memory_bytes END,
-                disk_bytes = CASE WHEN ?4 IS NULL THEN disk_bytes
-                                  WHEN disk_bytes = 0 OR disk_bytes > ?4 THEN ?4
-                                  ELSE disk_bytes END
+                cpu_millis = CASE
+                    WHEN reported_cpu_millis > 0 THEN MIN(reported_cpu_millis, COALESCE(?2, reported_cpu_millis))
+                    WHEN ?2 IS NOT NULL AND cpu_millis > ?2 THEN ?2
+                    ELSE cpu_millis END,
+                memory_bytes = CASE
+                    WHEN reported_memory_bytes > 0 THEN MIN(reported_memory_bytes, COALESCE(?3, reported_memory_bytes))
+                    WHEN ?3 IS NOT NULL AND memory_bytes > ?3 THEN ?3
+                    ELSE memory_bytes END,
+                disk_bytes = CASE
+                    WHEN reported_disk_bytes > 0 THEN MIN(reported_disk_bytes, COALESCE(?4, reported_disk_bytes))
+                    WHEN ?4 IS NOT NULL THEN ?4
+                    ELSE 0 END
          WHERE id = ?1 AND revoked_ms IS NULL",
         params![
             worker.as_bytes(),
@@ -658,7 +785,68 @@ pub fn set_policy(
     if changed == 0 {
         return Err(Error::NotFound);
     }
-    Ok(())
+    let detail = format!(
+        "{worker} cpu={} memory={} disk={} priority={}",
+        ceiling(policy.cpu_millis),
+        ceiling(policy.memory_bytes),
+        ceiling(policy.disk_bytes),
+        policy.priority
+    );
+    audit(
+        tx,
+        Event::WorkerPolicyChanged,
+        authority.actor(),
+        None,
+        authority.host_local(),
+        Some(&detail),
+    )
+}
+
+fn ceiling(value: Option<i64>) -> String {
+    value.map_or_else(|| "none".to_owned(), |v| v.to_string())
+}
+
+/// A live worker as the controller sees its host: what the controller approved, what the worker
+/// reported about itself and what the controller therefore offers. `reported_*` is 0 until the
+/// worker states that size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostView {
+    pub policy: HostPolicy,
+    pub reported_cpu_millis: i64,
+    pub reported_memory_bytes: i64,
+    pub reported_disk_bytes: i64,
+    pub effective_cpu_millis: i64,
+    pub effective_memory_bytes: i64,
+    pub effective_disk_bytes: i64,
+}
+
+/// The policy, report and effective size of one live worker (platform administration only).
+pub fn host_view(conn: &Connection, authority: Authority, worker: WorkerId) -> Result<HostView> {
+    authority.require_platform(conn)?;
+    conn.prepare_cached(
+        "SELECT cpu_ceiling_millis, memory_ceiling_bytes, disk_ceiling_bytes, priority,
+                reported_cpu_millis, reported_memory_bytes, reported_disk_bytes,
+                cpu_millis, memory_bytes, disk_bytes
+         FROM workers WHERE id = ?1 AND revoked_ms IS NULL",
+    )?
+    .query_row([worker.as_bytes()], |r| {
+        Ok(HostView {
+            policy: HostPolicy {
+                cpu_millis: r.get(0)?,
+                memory_bytes: r.get(1)?,
+                disk_bytes: r.get(2)?,
+                priority: r.get(3)?,
+            },
+            reported_cpu_millis: r.get(4)?,
+            reported_memory_bytes: r.get(5)?,
+            reported_disk_bytes: r.get(6)?,
+            effective_cpu_millis: r.get(7)?,
+            effective_memory_bytes: r.get(8)?,
+            effective_disk_bytes: r.get(9)?,
+        })
+    })
+    .optional()?
+    .ok_or(Error::NotFound)
 }
 
 /// Ask for a worker to be uninstalled: no new work is placed on it from now on (it drains), and

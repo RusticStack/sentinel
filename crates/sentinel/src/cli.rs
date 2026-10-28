@@ -174,6 +174,15 @@ pub struct DataDir {
     pub data_dir: PathBuf,
 }
 
+impl DataDir {
+    #[cfg(all(target_os = "linux", feature = "server"))]
+    pub fn at(path: &std::path::Path) -> Self {
+        Self {
+            data_dir: path.to_path_buf(),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum AdminCommand {
     /// Bind source repositories, rotate deploy credentials and manage App installations
@@ -489,6 +498,13 @@ pub struct WorkerArgs {
     pub command: WorkerCommand,
 }
 
+/// The transport a worker enrollment is issued for.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EnrollTransport {
+    Direct,
+    Tailcat,
+}
+
 #[derive(Subcommand)]
 pub enum WorkerCommand {
     /// Issue a one-time enrollment for a pool; the secret alone goes to stdout
@@ -500,6 +516,27 @@ pub enum WorkerCommand {
         /// Lifetime such as 1h or 30m; bounded by one day
         #[arg(long, value_name = "DURATION", default_value = "1h")]
         expires_in: String,
+        /// How the machine reaches the controller: direct TLS (the default here) or the pinned
+        /// Tailcat helper, whose node key is then authorized with `admin tailcat authorize`
+        #[arg(long, value_enum, default_value = "direct")]
+        transport: EnrollTransport,
+        /// CPU ceiling approved for the machine, in milli-cores
+        #[arg(long, value_name = "MILLIS")]
+        cpu_millis: Option<i64>,
+        /// Memory ceiling approved for the machine, in bytes
+        #[arg(long, value_name = "BYTES")]
+        memory_bytes: Option<i64>,
+        /// Storage ceiling approved for the machine, in bytes
+        #[arg(long, value_name = "BYTES")]
+        disk_bytes: Option<i64>,
+        /// Operator priority, -100 to 100; higher is preferred, 0 is neutral
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = 0,
+            allow_hyphen_values = true
+        )]
+        priority: i32,
     },
     /// Live workers of a pool
     List {
@@ -526,6 +563,36 @@ pub enum WorkerCommand {
     },
     /// Revoke a worker; its session is refused at its next authentication
     Revoke {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `wrk_` identifier the worker generated
+        #[arg(long)]
+        id: String,
+    },
+    /// Show or change the CPU, memory and storage ceilings and the priority approved for a worker.
+    /// Only the flags given change; the worker's own report can never raise any of them
+    Policy {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `wrk_` identifier the worker generated
+        #[arg(long)]
+        id: String,
+        /// CPU ceiling in milli-cores (1000 = one core), or `none` to remove it
+        #[arg(long, value_name = "MILLIS|none")]
+        cpu_millis: Option<String>,
+        /// Memory ceiling in bytes, or `none` to remove it
+        #[arg(long, value_name = "BYTES|none")]
+        memory_bytes: Option<String>,
+        /// Storage ceiling in bytes, or `none` to remove it
+        #[arg(long, value_name = "BYTES|none")]
+        disk_bytes: Option<String>,
+        /// Operator priority, -100 to 100; higher is preferred, 0 is neutral
+        #[arg(long, value_name = "N", allow_hyphen_values = true)]
+        priority: Option<i32>,
+    },
+    /// Drain a worker and revoke it, with its fingerprint and Tailcat node key, once the work it
+    /// already accepted has settled
+    Uninstall {
         #[command(flatten)]
         data: DataDir,
         /// The `wrk_` identifier the worker generated
@@ -581,6 +648,24 @@ pub enum TailcatCommand {
     Retire {
         #[command(flatten)]
         data: DataDir,
+    },
+    /// Authorize the `nodekey:<hex> wrk_<id>` line on standard input for one pending Tailcat
+    /// enrollment: the controller admits that key to its helper until the enrollment is spent,
+    /// withdrawn or expired, and redemption binds exactly that key to exactly that worker
+    Authorize {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `tok_` identifier of a pending Tailcat enrollment
+        #[arg(long)]
+        enrollment: String,
+    },
+    /// Take every key of one worker off the controller's allow list
+    Revoke {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `wrk_` identifier of the worker
+        #[arg(long)]
+        id: String,
     },
 }
 

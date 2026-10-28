@@ -155,6 +155,10 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         56,
         include_str!("migrations/056_worker_enrollment_policy.sql"),
     ),
+    (57, include_str!("migrations/057_reserved_for_merge.sql")),
+    (58, include_str!("migrations/058_reserved_for_merge.sql")),
+    (59, include_str!("migrations/059_reserved_for_merge.sql")),
+    (60, include_str!("migrations/060_host_policy.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;

@@ -67,7 +67,7 @@ The account `sentinel-worker` is a system account with its home at the data dire
 - **`rollback`** swaps `current` and `previous` and restarts, undoing itself if the other release does not stay up either.
 - **`uninstall`** stops and removes the service, `/opt/sentinel-worker`, `/etc/sentinel-worker`, lingering, the account if the script created it, and the data directory (`--keep-data` keeps it). It does not tell the controller. To avoid cutting accepted work, request the worker's uninstall on the controller first: it drains the worker and revokes it, with its fingerprint and node key, once its attempts have settled ([worker link](worker-link.md#approved-policy-the-bound-node-key-and-uninstall-q11-store-layer)).
 - A failed fresh `install` removes whatever it had created; a failed upgrade restores the previous release.
-- `identity` prints the worker id and, for Tailcat, the line `nodekey:<64 hex> wrk_<id>` that the controller's `tailcat-allow` list takes.
+- `identity` prints the worker id and, for Tailcat, the line `nodekey:<64 hex> wrk_<id>` that `sentinel admin tailcat authorize` (or, for a hand-listed worker, `allow`) takes on the controller.
 
 ## Controller configuration
 
@@ -90,7 +90,7 @@ aarch64_sha256 = "…64 hex…"                           # this build pins no a
 
 ## Not built yet
 
-- **Controller-side Tailcat admission.** The worker's node key must reach the controller's allow list before its first connection, and the enrollment must bind it at redemption ([worker link](worker-link.md#approved-policy-the-bound-node-key-and-uninstall-q11-store-layer)). Until the controller feeds `workers::admitted_node_keys` to the allow list and presents the node key at redemption, the administrator lists the key by hand with `sh sentinel-worker-bootstrap.sh identity | sentinel admin tailcat allow --data-dir <controller data dir>`. Direct TLS enrollments need no such step.
+- **Delivering the node key without the administrator.** The controller side is built: the key is authorized through the enrollment with `sh sentinel-worker-bootstrap.sh identity | sentinel admin tailcat authorize --enrollment tok_… --data-dir <controller data dir>`, admitted to the Tailcat helper while the enrollment can still be redeemed, bound at redemption, and withdrawn with the enrollment or the worker ([worker link](worker-link.md#the-node-key-authorized-through-the-enrollment-q11)). What is missing is the automatic hand-over: before its tunnel exists the worker has no channel to the controller but the API, so a one-click flow needs the script (or the web page) to post the `identity` line to an authenticated route that calls the same `workers::authorize_node_key`. Until that route exists the administrator runs the command above (`identity` waits for the worker's first start). Direct TLS enrollments need no such step.
 - **The web page** that calls the routes and shows the secret once (Part 20).
 - **The worker unit** of the V02 deployment examples; the unit this script writes is the minimal one and should converge with it.
 - **A published V01 manifest beyond `SHA256SUMS`**, such as signatures or a Tailcat entry in the release set; the controller pins what its operator configures.

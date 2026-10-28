@@ -182,6 +182,14 @@ sentinel api --token-file ~/.sentinel/token undrain wrk_…
 
 Draining needs a platform-admin credential on the API; on the controller's own host the same change is `sentinel admin worker drain --id wrk_… --data-dir …` (and `undrain`), which acts on the store directly like the rest of `sentinel admin`.
 
+Host policy (Q12) is the controller's alone: the ceilings and priority a worker is approved for come from the enrollment and from these routes, never from the worker's hello.
+
+| Route | Who | Scope | Result |
+|---|---|---|---|
+| `GET /admin/workers/{wrk}/policy` | platform admin | `platform:admin` | `{approved:{cpu_millis, memory_bytes, disk_bytes, priority}, reported:{cpu_millis, memory_bytes, disk_bytes}, effective:{…}}`: what the controller approved (`null` = no ceiling), what the worker last stated (`0` = not stated) and what it is offered (the report under the ceilings). `404` for an unknown or revoked worker |
+| `PUT /admin/workers/{wrk}/policy` `{cpu_millis?, memory_bytes?, disk_bytes?, priority?}` | browser session, fresh step-up, rate limited | `platform:admin` | replace the whole approved policy (an absent or `null` ceiling removes it, an absent priority is 0; ceilings are positive, priority −100…100, unknown fields `400`) and answer the new view. A reduction stops new oversubscription at once and a raise is used by the next placement pass, never above the worker's report; running attempts are untouched. Audited as `worker-policy-changed` |
+| `POST /admin/workers/{wrk}/uninstall` | browser session, fresh step-up, rate limited | `platform:admin` | drain the worker now and revoke it, with its fingerprint and Tailcat node key, once its accepted attempts have settled → `202 {worker, uninstall:"requested"}`; idempotent. Audited as `worker-uninstall-requested` (and `worker-uninstalled` when it settles) |
+
 ## The web interface
 
 The controller serves no page of its own besides the OAuth consent and device pages: `GET /` is `not_found`. The web interface is `sentinel-web` ([web interface](web-ui.md)), a client of these routes.

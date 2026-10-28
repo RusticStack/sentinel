@@ -1248,3 +1248,86 @@ fn a_hand_off_closes_a_carried_connection_still_in_its_handshake() {
     server.shutdown();
     assert!(controller.shutdown(Duration::from_secs(5)));
 }
+
+#[test]
+fn revoking_a_worker_takes_every_key_of_it_off_the_list_and_the_helper_stops_serving_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stays, leaves) = (WorkerId::new(), WorkerId::new());
+    let admit = |k: &str, worker| {
+        tailcat::admit(
+            dir.path(),
+            &Admission {
+                key: key(k),
+                worker,
+            },
+        )
+        .unwrap()
+    };
+    assert!(admit(KEY, stays));
+    assert!(admit(OTHER, leaves));
+    // The overlap window of a rotation: a second key for the leaving worker.
+    assert!(admit(THIRD, leaves));
+    let path = dir.path().join(tailcat::ALLOW_LIST_FILE);
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.insert_str(0, "# builders\n");
+    fs::write(&path, &text).unwrap();
+
+    let fake = Fake::write(SERVE_FOREVER);
+    let config = fake.config(7443);
+    let listed: Vec<NodeKey> = tailcat::allow_list(dir.path())
+        .unwrap()
+        .into_iter()
+        .map(|line| line.key)
+        .collect();
+    assert_eq!(listed.len(), 3);
+    let server = tailcat::start_server(&config, fake.path(), &listed).unwrap();
+    server.wait_ready(Duration::from_secs(10)).unwrap();
+    let served = &fake.calls("serve")[0];
+    for k in [KEY, OTHER, THIRD] {
+        assert!(served.contains(k), "{served}");
+    }
+
+    // Revocation drops both of the leaving worker's lines and nothing else, comments included.
+    assert_eq!(tailcat::revoke(dir.path(), leaves).unwrap(), 2);
+    assert_eq!(tailcat::revoke(dir.path(), leaves).unwrap(), 0);
+    let kept = fs::read_to_string(&path).unwrap();
+    assert_eq!(kept, format!("# builders\nnodekey:{KEY} {stays}\n"));
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        tailcat::allow_list(dir.path()).unwrap(),
+        vec![Admission {
+            key: key(KEY),
+            worker: stays
+        }]
+    );
+    // A predicate decides the rest: nothing matching writes nothing.
+    assert_eq!(tailcat::prune(dir.path(), |_| false).unwrap(), 0);
+    assert_eq!(fs::read_to_string(&path).unwrap(), kept);
+
+    // The helper is restarted with only the remaining key.
+    let remaining: Vec<NodeKey> = tailcat::allow_list(dir.path())
+        .unwrap()
+        .into_iter()
+        .map(|line| line.key)
+        .collect();
+    server.set_allow(&remaining);
+    wait_until("serve without the revoked keys", || {
+        fake.calls("serve").len() == 2
+    });
+    assert_eq!(
+        fake.calls("serve")[1],
+        format!(
+            "argv serve --allow={KEY_ARG} 7443",
+            KEY_ARG = remaining[0].expose()
+        )
+    );
+    server.shutdown();
+
+    // A file `allow_list` refuses is not rewritten.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(tailcat::revoke(dir.path(), stays).is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), kept);
+}
