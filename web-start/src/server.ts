@@ -13,7 +13,10 @@ import { clientIp } from "./server/upstream.ts";
 const start = createStartHandler(defaultRenderHandler);
 
 function rawPath(request: Request): string {
-  // The path exactly as the client sent it: `new URL` would resolve dot segments the allowlist must see.
+  // The path exactly as the client sent it: the request's URL has been through the URL parser, which decodes `%2e` and
+  // resolves dot segments the allowlist must see, so Node's own request target is read when there is one.
+  const target = (request as Request & { runtime?: { node?: { req?: { url?: string } } } }).runtime?.node?.req?.url;
+  if (typeof target === "string" && target.startsWith("/")) return target;
   const url = request.url;
   const at = url.indexOf("/", url.indexOf("//") + 2);
   return at < 0 ? "/" : url.slice(at);
