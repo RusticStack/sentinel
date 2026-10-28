@@ -7,6 +7,7 @@ pub mod checks;
 pub mod codec;
 pub mod dispatch;
 pub mod email;
+pub mod github_app;
 pub mod github_events;
 pub mod github_members;
 pub mod idempotency;

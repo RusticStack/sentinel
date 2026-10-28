@@ -26,6 +26,13 @@ struct Inner {
     codes: HashMap<String, (Account, String)>,
     tokens: HashMap<String, Account>,
     received: Vec<String>,
+    /// App manifest codes and the conversion each returns once.
+    manifests: HashMap<String, String>,
+    /// `GET /app/installations/{id}` bodies, answered to any App JWT.
+    installations: HashMap<u64, String>,
+    users: HashMap<u64, String>,
+    memberships: HashMap<(String, String), String>,
+    app: Option<String>,
 }
 
 pub struct FakeGithub {
@@ -98,6 +105,33 @@ impl FakeGithub {
         self.lock().tokens.keys().cloned().collect()
     }
 
+    /// The App manifest flow: `code` converts once into `conversion` (a JSON object).
+    pub fn add_manifest(&self, code: &str, conversion: &str) {
+        self.lock()
+            .manifests
+            .insert(code.to_owned(), conversion.to_owned());
+    }
+
+    pub fn add_installation(&self, id: u64, body: &str) {
+        self.lock().installations.insert(id, body.to_owned());
+    }
+
+    pub fn add_user(&self, id: u64, login: &str) {
+        self.lock()
+            .users
+            .insert(id, format!(r#"{{"id":{id},"login":"{login}"}}"#));
+    }
+
+    pub fn add_membership(&self, org: &str, login: &str, body: &str) {
+        self.lock()
+            .memberships
+            .insert((org.to_owned(), login.to_owned()), body.to_owned());
+    }
+
+    pub fn set_app(&self, body: &str) {
+        self.lock().app = Some(body.to_owned());
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -140,6 +174,94 @@ fn encode(value: &str) -> String {
         }
     }
     out
+}
+
+type Answer = (u16, Option<String>, String);
+
+fn not_found() -> Answer {
+    (404, None, r#"{"message":"Not Found"}"#.to_owned())
+}
+
+/// The App side: manifest conversion (unauthenticated), installation lookups and tokens (App
+/// JWT), and the reads an installation token makes for membership.
+fn app_route(
+    state: &mut Inner,
+    request_line: &str,
+    path: &str,
+    authorization: Option<String>,
+    body: &str,
+) -> Option<Answer> {
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let post = request_line.starts_with("POST ");
+    let get = request_line.starts_with("GET ");
+    let jwt = authorization
+        .as_deref()
+        .is_some_and(|t| t.starts_with("ey"));
+    Some(match parts.as_slice() {
+        ["app-manifests", code, "conversions"] if post => {
+            if authorization.is_some() {
+                return Some((400, None, r#"{"message":"unexpected credential"}"#.into()));
+            }
+            match state.manifests.remove(*code) {
+                Some(conversion) => (201, None, conversion),
+                None => not_found(),
+            }
+        }
+        ["app"] if get && jwt => match &state.app {
+            Some(app) => (200, None, app.clone()),
+            None => not_found(),
+        },
+        ["app", "installations", id] if get && jwt => {
+            match id
+                .parse()
+                .ok()
+                .and_then(|id: u64| state.installations.get(&id))
+            {
+                Some(found) => (200, None, found.clone()),
+                None => not_found(),
+            }
+        }
+        ["app", "installations", id, "access_tokens"] if post && jwt => {
+            let known = id
+                .parse()
+                .ok()
+                .is_some_and(|id: u64| state.installations.contains_key(&id));
+            if !known {
+                return Some(not_found());
+            }
+            let asked: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+            let expires = (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("format expiry");
+            let token = format!("ghs_{:016x}{:016x}", rand_u64(), rand_u64());
+            (
+                201,
+                None,
+                serde_json::json!({
+                    "token": token,
+                    "expires_at": expires,
+                    "permissions": asked["permissions"],
+                })
+                .to_string(),
+            )
+        }
+        ["user", id] if get && authorization.is_some() => {
+            match id.parse().ok().and_then(|id: u64| state.users.get(&id)) {
+                Some(found) => (200, None, found.clone()),
+                None => not_found(),
+            }
+        }
+        ["orgs", org, "memberships", login] if get && authorization.is_some() => {
+            match state
+                .memberships
+                .get(&((*org).to_owned(), (*login).to_owned()))
+            {
+                Some(found) => (200, None, found.clone()),
+                None => not_found(),
+            }
+        }
+        _ => return None,
+    })
 }
 
 fn serve(
@@ -185,55 +307,58 @@ fn serve(
     state.received.push(format!("{head}{body}"));
     let target = request_line.split(' ').nth(1).unwrap_or_default();
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let (status, location, json) =
-        if request_line.starts_with("GET ") && path == "/login/oauth/authorize" {
-            let q = params(query);
-            let redirect = q.get("redirect_uri").cloned().unwrap_or_default();
-            let st = q.get("state").cloned().unwrap_or_default();
-            let location = match state.browser.clone() {
-                Some(account) => {
-                    let code = format!(
-                        "ghcode{:08x}{:016x}",
-                        serial.fetch_add(1, Ordering::SeqCst),
-                        rand_u64()
-                    );
-                    state
-                        .codes
-                        .insert(code.clone(), (account, redirect.clone()));
-                    format!("{redirect}?code={}&state={}", encode(&code), encode(&st))
-                }
-                None => format!("{redirect}?error=access_denied&state={}", encode(&st)),
-            };
-            (302, Some(location), String::new())
-        } else if request_line.starts_with("POST ") && path == "/login/oauth/access_token" {
-            let form = params(&body);
-            let code = form.get("code").cloned().unwrap_or_default();
-            let redirect = form.get("redirect_uri").cloned().unwrap_or_default();
-            let secret_ok = form.get("client_secret").map(String::as_str) == Some(secret);
-            let json = match state.codes.remove(&code) {
-                Some((account, bound)) if secret_ok && bound == redirect => {
-                    let token = format!("gho_{:016x}{:016x}", rand_u64(), rand_u64());
-                    state.tokens.insert(token.clone(), account);
-                    format!(r#"{{"access_token":"{token}","token_type":"bearer","scope":""}}"#)
-                }
-                _ => r#"{"error":"bad_verification_code"}"#.to_owned(),
-            };
-            (200, None, json)
-        } else if request_line.starts_with("GET ") && path == "/user" {
-            match authorization.and_then(|t| state.tokens.get(&t).cloned()) {
-                Some(a) => (
-                    200,
-                    None,
-                    format!(
-                        r#"{{"id":{},"login":"{}","name":"{}","email":"{}"}}"#,
-                        a.id, a.login, a.login, a.email
-                    ),
-                ),
-                None => (401, None, r#"{"message":"Bad credentials"}"#.to_owned()),
+    let (status, location, json) = if request_line.starts_with("GET ")
+        && path == "/login/oauth/authorize"
+    {
+        let q = params(query);
+        let redirect = q.get("redirect_uri").cloned().unwrap_or_default();
+        let st = q.get("state").cloned().unwrap_or_default();
+        let location = match state.browser.clone() {
+            Some(account) => {
+                let code = format!(
+                    "ghcode{:08x}{:016x}",
+                    serial.fetch_add(1, Ordering::SeqCst),
+                    rand_u64()
+                );
+                state
+                    .codes
+                    .insert(code.clone(), (account, redirect.clone()));
+                format!("{redirect}?code={}&state={}", encode(&code), encode(&st))
             }
-        } else {
-            (404, None, "{}".to_owned())
+            None => format!("{redirect}?error=access_denied&state={}", encode(&st)),
         };
+        (302, Some(location), String::new())
+    } else if request_line.starts_with("POST ") && path == "/login/oauth/access_token" {
+        let form = params(&body);
+        let code = form.get("code").cloned().unwrap_or_default();
+        let redirect = form.get("redirect_uri").cloned().unwrap_or_default();
+        let secret_ok = form.get("client_secret").map(String::as_str) == Some(secret);
+        let json = match state.codes.remove(&code) {
+            Some((account, bound)) if secret_ok && bound == redirect => {
+                let token = format!("gho_{:016x}{:016x}", rand_u64(), rand_u64());
+                state.tokens.insert(token.clone(), account);
+                format!(r#"{{"access_token":"{token}","token_type":"bearer","scope":""}}"#)
+            }
+            _ => r#"{"error":"bad_verification_code"}"#.to_owned(),
+        };
+        (200, None, json)
+    } else if request_line.starts_with("GET ") && path == "/user" {
+        match authorization.and_then(|t| state.tokens.get(&t).cloned()) {
+            Some(a) => (
+                200,
+                None,
+                format!(
+                    r#"{{"id":{},"login":"{}","name":"{}","email":"{}"}}"#,
+                    a.id, a.login, a.login, a.email
+                ),
+            ),
+            None => (401, None, r#"{"message":"Bad credentials"}"#.to_owned()),
+        }
+    } else if let Some(answer) = app_route(&mut state, &request_line, path, authorization, &body) {
+        answer
+    } else {
+        (404, None, "{}".to_owned())
+    };
     drop(state);
     let mut response = format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n");
     if let Some(location) = location {

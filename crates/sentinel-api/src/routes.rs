@@ -376,6 +376,9 @@ pub(crate) fn route(
     if let Some(reply) = crate::github::route(state, request, method, &parts, query) {
         return reply;
     }
+    if let Some(reply) = crate::github_app::route(state, request, method, &parts) {
+        return reply;
+    }
     if let Some(reply) = account::route(state, request, method, &parts) {
         return reply;
     }
@@ -426,7 +429,7 @@ pub(crate) fn route(
             }))
         }
         ("GET", ["api", "v1", "health"]) => {
-            ok(json!({ "ok": true, "github_sign_in": state.github.is_some() }))
+            ok(json!({ "ok": true, "github_sign_in": state.github.get().is_some() }))
         }
         ("GET", ["api", "v1", "ready"]) => ready(state),
         ("POST", ["mcp"]) => crate::mcp::post(state, request),
@@ -791,7 +794,7 @@ fn wake_intake(state: &State, duplicate: bool) {
 }
 
 fn github_hook(state: &State, request: &mut Request) -> Route {
-    let Some(secret) = state.github_webhook_secret.as_deref() else {
+    let Some(secret) = state.github_webhook_secret.get().map(|s| &**s) else {
         return Err(err(ErrorCode::NotFound, "no such route"));
     };
     let event =

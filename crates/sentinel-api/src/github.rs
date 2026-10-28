@@ -155,7 +155,7 @@ pub(crate) fn route(
     parts: &[&str],
     query: &str,
 ) -> Option<Route> {
-    let github = state.github.as_ref()?;
+    let github = state.github.get()?;
     Some(match (method, parts) {
         ("GET", ["auth", "github", "start"]) => Ok(start(state, github, request, query)),
         ("GET", ["auth", "github", "callback"]) => Ok(callback(state, github, request, query)),

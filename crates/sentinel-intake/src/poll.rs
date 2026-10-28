@@ -14,7 +14,7 @@ use std::{
 
 use sentinel_auth::sealed::Key;
 use sentinel_core::{RepoId, UnixMillis};
-use sentinel_github::app::App;
+use sentinel_github::app::Current;
 use sentinel_protocol::source::{Access, ref_matches};
 use sentinel_store::{Error as StoreError, Store, poll};
 
@@ -92,7 +92,7 @@ pub struct Poll {
 struct Inner {
     store: Arc<Store>,
     key: Option<Arc<Key>>,
-    app: Option<Arc<App>>,
+    app: Current,
     destinations: Arc<[String]>,
     lister: Arc<dyn Lister>,
     work_root: PathBuf,
@@ -105,7 +105,7 @@ impl Poll {
     pub fn start(
         store: Arc<Store>,
         key: Option<Arc<Key>>,
-        app: Option<Arc<App>>,
+        app: impl Into<Current>,
         destinations: Arc<[String]>,
         lister: Arc<dyn Lister>,
         work_root: PathBuf,
@@ -121,7 +121,7 @@ impl Poll {
         let inner = Arc::new(Inner {
             store,
             key,
-            app,
+            app: app.into(),
             destinations,
             lister,
             work_root,
@@ -222,7 +222,7 @@ impl Inner {
         let access = match source::issue(
             &self.store,
             self.key.as_deref(),
-            self.app.as_ref(),
+            self.app.get(),
             &binding,
             now,
         ) {

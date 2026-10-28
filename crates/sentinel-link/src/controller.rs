@@ -2873,6 +2873,11 @@ impl Handle {
         self.0.wake();
     }
 
+    /// Puts a GitHub App in force for source resolution without a restart.
+    pub fn set_source_app(&self, app: Arc<sentinel_github::app::App>) {
+        *self.0.source_app.lock().unwrap_or_else(|p| p.into_inner()) = Some(app);
+    }
+
     pub fn cancel_hint(&self) {
         self.0.cancel_hint.store(true, Ordering::Release);
         self.0.wake();

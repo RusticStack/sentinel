@@ -13,7 +13,7 @@ pub const BATCH: u32 = 256;
 pub fn sealed_rows_exist(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM secret_versions) OR EXISTS(SELECT 1 FROM mfa_totp)
-             OR EXISTS(SELECT 1 FROM source_bindings)",
+             OR EXISTS(SELECT 1 FROM source_bindings) OR EXISTS(SELECT 1 FROM github_app)",
         [],
         |r| r.get(0),
     )?)
@@ -25,6 +25,9 @@ pub fn key_ids(conn: &Connection) -> Result<std::collections::BTreeSet<u32>> {
         "SELECT sealed FROM secret_versions",
         "SELECT sealed_seed FROM mfa_totp",
         "SELECT credential FROM source_bindings",
+        "SELECT sealed_key FROM github_app",
+        "SELECT sealed_client_secret FROM github_app",
+        "SELECT sealed_webhook_secret FROM github_app",
     ] {
         let mut stmt = conn.prepare(sql)?;
         let mut rows = stmt.query([])?;
@@ -77,7 +80,88 @@ pub fn verify_key(conn: &Connection, key: &Key) -> Result<()> {
         let context = source_context(row.0, row.1, row.2)?;
         opens(key, &context, &row.3, "source_bindings")?;
     }
+    if let Some(row) = github_app_row(conn)? {
+        for (column, sealed) in row.columns() {
+            opens(
+                key,
+                &crate::github_app::context(column, row.app_id),
+                sealed,
+                "github_app",
+            )?;
+        }
+    }
     Ok(())
+}
+
+struct GithubAppRow {
+    app_id: u64,
+    key: Vec<u8>,
+    client_secret: Vec<u8>,
+    webhook_secret: Option<Vec<u8>>,
+}
+
+impl GithubAppRow {
+    fn columns(&self) -> impl Iterator<Item = (&'static str, &[u8])> {
+        use crate::github_app::{CLIENT_SECRET_COLUMN, KEY_COLUMN, WEBHOOK_SECRET_COLUMN};
+        [
+            (KEY_COLUMN, Some(self.key.as_slice())),
+            (CLIENT_SECRET_COLUMN, Some(self.client_secret.as_slice())),
+            (WEBHOOK_SECRET_COLUMN, self.webhook_secret.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(column, sealed)| sealed.map(|s| (column, s)))
+    }
+}
+
+fn github_app_row(conn: &Connection) -> Result<Option<GithubAppRow>> {
+    Ok(conn
+        .query_row(
+            "SELECT app_id, sealed_key, sealed_client_secret, sealed_webhook_secret
+             FROM github_app WHERE id = 1",
+            [],
+            |r| {
+                Ok(GithubAppRow {
+                    app_id: r.get::<_, i64>(0)? as u64,
+                    key: r.get(1)?,
+                    client_secret: r.get(2)?,
+                    webhook_secret: r.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// The App's three sealed values move to the active key in one statement; the row is unique.
+fn reseal_github_app(tx: &rusqlite::Transaction<'_>, key: &Key) -> Result<Progress> {
+    let mut step = Progress::default();
+    let Some(row) = github_app_row(tx)? else {
+        return Ok(step);
+    };
+    let mut fresh: [Option<Vec<u8>>; 3] = [None, None, None];
+    for (slot, (column, sealed)) in fresh.iter_mut().zip(row.columns()) {
+        step.examined += 1;
+        if current(key, sealed) {
+            continue;
+        }
+        *slot = key
+            .reseal(&crate::github_app::context(column, row.app_id), sealed)
+            .map_err(|_| Error::Corrupt("github_app"))?;
+    }
+    let [new_key, new_client, new_hook] = fresh;
+    step.resealed = [&new_key, &new_client, &new_hook]
+        .iter()
+        .filter(|v| v.is_some())
+        .count() as u64;
+    if step.resealed > 0 {
+        tx.execute(
+            "UPDATE github_app SET sealed_key = COALESCE(?1, sealed_key),
+                 sealed_client_secret = COALESCE(?2, sealed_client_secret),
+                 sealed_webhook_secret = COALESCE(?3, sealed_webhook_secret)
+             WHERE id = 1",
+            params![new_key, new_client, new_hook],
+        )?;
+    }
+    Ok(step)
 }
 
 fn opens(key: &Key, context: &[u8], sealed: &[u8], what: &'static str) -> Result<()> {
@@ -103,6 +187,13 @@ pub fn stale(conn: &Connection, key: &Key) -> Result<u64> {
     )? + count(
         "SELECT count(*) FROM source_bindings
          WHERE substr(credential,1,1)!=x'02' OR substr(credential,2,4)!=?1",
+    )? + count(
+        "SELECT COALESCE((SELECT
+                (substr(sealed_key,1,1)!=x'02' OR substr(sealed_key,2,4)!=?1)
+              + (substr(sealed_client_secret,1,1)!=x'02' OR substr(sealed_client_secret,2,4)!=?1)
+              + COALESCE(substr(sealed_webhook_secret,1,1)!=x'02'
+                         OR substr(sealed_webhook_secret,2,4)!=?1, 0)
+             FROM github_app WHERE id = 1), 0)",
     )?)
 }
 
@@ -155,6 +246,11 @@ pub fn reseal_all(store: &Store, key: Arc<Key>) -> Result<Progress> {
             None => break,
         }
     }
+    let step = store
+        .writer()
+        .write(move |tx| reseal_github_app(tx, &key))?;
+    progress.examined += step.examined;
+    progress.resealed += step.resealed;
     Ok(progress)
 }
 
