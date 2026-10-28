@@ -65,7 +65,7 @@ receipted in `github_events` by delivery ID and content digest (a replay
 replays the recorded outcome; a changed body is a `conflict`), and answer
 `200 {"controlled": <outcome>}`. What they do — rerequest handling, revocation
 and the durable refresh lane — is the reconcile contract in
-[checks](checks.md#rerequests-and-lifecycle-reconciliation-g05).
+[checks](checks.md#rerequests-and-lifecycle-reconciliation).
 
 ### Pull requests
 

@@ -65,7 +65,7 @@ At the API a `WriteAmbiguous` answer is `503 outcome_unknown`, not retryable as 
 
 `jobs::transition` reads the row, lets `JobControl::apply` decide (actor permission, fence, edge), then executes one static `UPDATE … WHERE id=? AND tenant_id=? AND state_code=? AND fence=?`. Zero rows changed means the row moved between read and write: `Conflict`, and the transaction rolls back. `jobs::lease` bumps the fence, transitions to `Leased` and inserts the attempt row in the same transaction. `jobs::insert_job`'s `created_seq` orders jobs of equal priority, so callers must pass a monotonic per-run or global sequence. `jobs::pick_ready` is a single indexed `ORDER BY priority, created_seq LIMIT 1`; the test asserts the query plan uses `jobs_ready`. `jobs::run_state` recomputes the run outcome from job rows through the core aggregation. `runs::create_run` writes the run, its spec and its job rows in one transaction (dependency-free jobs start `Queued`); terminal-job resets clear the job's attempt timestamps while preserving its attempt rows and fence, with state, fence and cancellation snapshots compare-and-set so a stale reset is `Conflict`.
 
-## Fleet placement (Q01–Q04)
+## Fleet placement
 
 Migration 28 adds what a job needs beyond CPU and memory (`disk_bytes`, `arch`, `labels`, `concurrency_group`) and what a worker reports beyond its capacity (`disk_bytes`, `labels`, `host_id`, `drain_ms`, `avail_images`, `cache_bytes`, `load_ns`). `runs::create_run` copies the compiled job's disk, architecture, labels and rendered concurrency group onto the job row in the same transaction, and `jobs::lease` copies the disk reservation onto the attempt beside CPU and memory. Migration 35 adds `jobs.repo_id` (copied from the run at insert), `jobs.pull_request` (set by a trigger when the run's `pull_request` provenance is recorded) and `attempts.repo_id`, and replaces the placement indexes (below); it also drops `wait_code`, `wait_detail` and `jobs_fair`, which nothing wrote or read. `load_ns` and `cache_bytes` feed the dispatcher's ranking. Migration 36 adds `jobs.image_name`, the repository part of the job's image reference, which `runs::create_run` writes beside the digest (only names in the OCI reference charset, 1–255 bytes) so the prefetch pass can hint `name@digest` without decoding a spec. `dispatch::prefetch_hints` reads the longest-waiting ready jobs through `jobs_queued_since` — a scan of that partial index bounded by `PREFETCH_SCAN` (256), sorted in memory by priority and age, pinned by both plan tests below — plus one grouped held-CPU read, one point read per worker and one pool-access probe per (tenant, pool) it meets; see [executor](executor.md#the-image-pull) for what it hints to whom.
 
@@ -97,7 +97,7 @@ Two tests pin the plans. `dispatch::tests::placement_statements_plan_their_index
 
 **Load evidence.** `tests/fleet_load.rs` is store-level: 100 worker identities (50 hosts, two identities each, reporting whole-host capacity), 10,000 queued quarter-core jobs from four tenants (one with 70 % of the runs) over twelve repositories, a tenth of the runs pull requests and an eighth needing a label half the fleet has. It places in the controller's round structure (one placement per hungry worker per writer transaction) and **holds** what it places — capacity fills as a real fleet's does — until no worker can take more; then the wave completes and the next places. It asserts every job is placed exactly once, no host goes negative, and each quiet tenant gets at least its share of the first wave, and records per-placement latency, queue wait, throughput and (Linux) CPU, peak RSS and I/O in `bench/q09-fleet-load.jsonl`. It runs no TLS session and no executor: the 100 concurrent real TLS sessions are `sentinel-link/tests/fleet_sessions.rs` (100 sessions × 200 jobs), a separate test, and the three-worker link fleet (`sentinel-link/tests/fleet.rs`) covers partitions, stale fences, drain, spreading a burst over identical workers, revocation of a live session and a counted placement failure. Controller restart is covered by `sentinel-link/tests/link.rs` for a single worker, not in the fleet suites.
 
-## Objects and manifests (D01)
+## Objects and manifests
 
 `sentinel-store::objects` is the controller's content-addressed body store, under the same data directory as the database:
 
@@ -117,7 +117,7 @@ Reads are verified: `read` streams the object while rehashing and compares diges
 
 **Recovery.** The server opens the store and runs `recover` at startup (logged as `objects_recovered`); `sentinel admin objects recover` runs the same reconciliation host-locally while the controller is stopped. It removes anything in `tmp/` (incomplete staged writes), then walks both trees against the committed rows: files with no row are **orphans** (reported, never deleted — a staged-but-uncommitted file and a leaked file are indistinguishable), files whose row disagrees on length or whose streamed BLAKE3 disagrees on content are **corrupt**, and rows with no file are **missing**. Recovery reuses one bounded buffer and hashes each present committed object during that walk, so startup integrity work is O(stored bytes), not a second whole-store pass. `verify` — `sentinel admin objects verify` — applies the same length-and-content check as an explicit drill.
 
-## Resumable uploads, reads and materialization (D02)
+## Resumable uploads, reads and materialization
 
 `<data>/incoming/<upl_…>` is durable staging for resumable upload sessions, backed by the `uploads` table (migration 24): each row records the owning tenant, declared length, an optional declared digest, a compact blob of received byte ranges, an expiry and a state (`open` → `committed`/`aborted`).
 
@@ -130,7 +130,7 @@ Downloads go through `open_read`, which pins `(tenant, digest)` with a live `Rea
 
 The API exposes this as `POST /tenants/{slug}/uploads`, `GET|PUT|DELETE /uploads/{upl}` (`PUT` takes `?offset=` and a raw body of at most 8 MiB), `POST /uploads/{upl}/commit` and `GET /tenants/{slug}/objects/{digest}` with `Range: bytes=…` support. Upload sessions require operator-level tenant membership. Downloads authorize through repository evidence (`auth::require_object_read`): the caller must be able to `READ` a repository with an artifact whose manifest references the digest, or be an operator-or-above member holding `RUN` in a tenant where the digest was committed through an upload; platform scope confers nothing, and a refusal is the same `not_found` as an unknown digest. An upload id resolves its owner before authorization so a foreign id is indistinguishable from a missing one. At most three transfer bodies are in flight at once (`TRANSFERS`), counted until a download's body has been written, and seals hold a slot while they hash; the next request is `rate_limited` rather than queued work. A whole-object download is rehashed while it streams and ends short of its declared length if the bytes no longer match their digest; range reads are not verified.
 
-## Artifact records (D03)
+## Artifact records
 
 The `artifacts` table (migration 25) is the durable outcome of each declared artifact on an attempt: one row per `(attempt_id, name)` with the job and run for scoping, a terminal `state_code` (`captured`, `absent`, `failed`), entry and byte counts, the `manifests` version when captured, the retention deadline and the creation timestamp. `UNIQUE(attempt_id, name)` makes a redelivery a conflict rather than a duplicate; the state/identity columns sit behind the usual immutability triggers.
 
@@ -138,11 +138,11 @@ A captured row and its manifest commit in **one writer transaction**: the contro
 
 The API lists a run's artifacts (`GET /runs/{run}/artifacts`) and shows one row's detail (`GET /runs/{run}/artifacts/{arf}`), the latter inlining the manifest's entry paths, digests, lengths and modes; entry bytes download through the existing `GET /tenants/{slug}/objects/{digest}` route.
 
-## Segmented logs (D04)
+## Segmented logs
 
 Each attempt owns `logs/<run>/<job>/<attempt>/`: `seg-NNNNNN` record segments sealed at 4 MiB and compressed to `seg-NNNNNN.z` (zlib, `SNLZ` format 1) by a background thread, a sparse `index` (`SNLI` format 1; 41-byte checkpoints on segment starts, step changes, every 64 frames, and a seal record per closed segment), and the atomic `end` marker (`SNLE` format 1) that is the single completeness boundary. Sequence jumps record holes instead of refusing; fills narrow them; the marker's gap list merges observed holes, worker-declared gaps and the never-stored tail (≤ 1,024 ranges, coalesced). Reopen truncates torn segment and index tails, rebuilds a missing index, repairs an end record that reached a segment without its marker, and re-queues un-compressed sealed segments. Reads seek by sequence through the index and can filter to one step; flat `logs/<attempt>.log` files from before segmentation still read through `read_tail`. The full contract is in [logs](logs.md#on-the-controller-segments-index-and-the-end-marker).
 
-## Terminal publication (D05)
+## Terminal publication
 
 A job's terminal transition carries its data status in the same transaction — `finish` is also the finalization boundary:
 
@@ -152,7 +152,7 @@ A job's terminal transition carries its data status in the same transaction — 
 
 Because log frames and `LogEnd` are accepted for an attempt the worker owns even after release (`attempt_log_scope`), a post-terminal retransmission can still land its marker and upgrade `incomplete → complete`; artifact publication stays held-only, since it is part of the verdict.
 
-## Disk admission, quotas and reclamation (D06)
+## Disk admission, quotas and reclamation
 
 One `Admission` gate (`sentinel_store::space`) watches the filesystem holding the data directory — `statvfs` on Unix, `GetDiskFreeSpaceExW` on Windows — with the probe result cached for one second. The model is a single axis of free bytes: `reserve` is held back for the metadata database and log evidence, `low`/`high` are the close/reopen hysteresis for discretionary admission, and `floor` (inside the reserve) is where even log frames refuse. Between probes the in-flight charge is what keeps concurrent writers honest: `admit` charges promised-but-uncommitted bytes per tenant and per filesystem, released when the bytes land (the next probe sees them) or the write is abandoned. A refused frame is reported `StorageFull`, never silently dropped and never recorded as a log hole.
 
@@ -162,15 +162,15 @@ Reclamation is reader- and lease-safe (migration 27): `manifest_refs` records th
 
 The controller runs the whole pass — expired uploads and leases, artifact retirement, the reference backfill, object reclaim, orphan files, idle log writers, and log retention (stamp, expire, sweep; [retention](retention.md)) — on its own maintenance thread (`sentinel-storage`), at most every `sweep_interval` ([configuration](configuration.md)); placement never waits on it. The row stages take at most 256 rows through indexes; the orphan and log sweeps each examine at most 4,096 directory entries and resume where they stopped. Below the low watermark the dispatcher also stops placing new work and artifact grants answer `TooLarge` — a job that cannot store its output does not consume capacity finding out. `admin objects reclaim` runs the same pass by hand against a stopped server and `admin objects status` reports free space and per-tenant usage.
 
-## External copy (R02, R03)
+## External copy
 
 With `[s3]` configured, committed objects and finished logs are also copied to an S3 bucket, verified, and replicated objects may be evicted locally and fetched back verified on read; a backlog past its budget closes admission until it drains. The local write path and every rule above are unchanged. See [s3](s3.md).
 
-## Backup and restore (R04)
+## Backup and restore
 
 Online backups (`VACUUM INTO` on their own connection, with the maintenance lock held so nothing the snapshot names is deleted before it is copied), verification by rehashing, and restore onto an empty data directory with the master key checked, are in [backup](backup.md).
 
-## Fault boundaries (D07)
+## Fault boundaries
 
 Every write path settles one of two ways: bytes durable *and* row committed, or the residue found and swept. `tests/faults.rs` drives the boundaries — a `commit` or `commit_manifest` rolled back after the rename leaves an orphan that `recover` reports and `sweep_orphans` collects past the grace; an upload chunk whose transaction rolled back leaves bytes the resend converges into a verifiable seal; closed admission refuses object bytes while log frames still flow above `floor`; binary frames round-trip byte-identical, oversized frames refuse and the refused sequence becomes a declared gap; the per-attempt log cap refuses with `log size` and the refusal is declared, not silent; a torn segment tail never reaches a tail reader and is cut on reopen; and a lost `end` marker is rebuilt from the sealed segment's end record instead of silently reopening the log. `read_tail` streams flat logs in bounded chunks.
 

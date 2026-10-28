@@ -4,7 +4,7 @@ Implemented in `sentinel-store::dispatch` (`cancel`, `cancel_run`, `cancel_reque
 
 ## Cancellation is desired state
 
-`dispatch::cancel` records `cancel_requested` on the job first — durable, and never cleared by an operator or API cancel: a cancelled job cannot be rerun. The one exception is a GitHub check-run rerequest, which deliberately starts a cancelled job over and resets the flag with it ([checks](checks.md#rerequests-and-lifecycle-reconciliation-g05)). It then does one of three things:
+`dispatch::cancel` records `cancel_requested` on the job first — durable, and never cleared by an operator or API cancel: a cancelled job cannot be rerun. The one exception is a GitHub check-run rerequest, which deliberately starts a cancelled job over and resets the flag with it ([checks](checks.md#rerequests-and-lifecycle-reconciliation)). It then does one of three things:
 
 - **Unstarted** (`blocked` or `queued`): `CancelBeforeStart` moves it to `canceled` and its dependents are decided (skipped) in the same transaction — like every other terminal edge, so a run never waits on a dependent nothing will release. Placement already skips any job with cancellation desired, so nothing starts after the decision.
 - **Offered, not yet started** (`leased`): the offer goes back one way or another — declined, never acknowledged, lost with the session, or handed back because its spec never arrived — and at that moment the job ends `canceled` with its dependents decided, instead of returning to the queue for a placement it can no longer get. An acknowledged attempt that asks for its spec with the cancel already recorded is settled the same way before anything runs.

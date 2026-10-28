@@ -420,7 +420,7 @@ Measure delivery, intake/config, dependency wait, capacity wait, dispatch, check
 
 Benchmark matrix:
 
-- No-op; the pilots' lanes as their live fork pipelines, online — cli `go.yml` `build` (ubuntu row: race tests, builds), ripgrep's stable `test` row, gson `build` on JDK 17/21/25 — cold (including downloads), warm and small-edit; Node install/tests; many tiny files, large artifacts, noisy 100 MiB logs, 10 GiB caches with published file distributions. Follow the [pilot benchmark and cutover gates](docs/pilot-repositories.md#performance-and-cutover-gates).
+- No-op; the pilots' lanes as their live fork pipelines, online — cli `go.yml` `build` (ubuntu row: race tests, builds), ripgrep's stable `test` row, gson `build` on JDK 17/21/25 — cold (including downloads), warm and small-edit; Node install/tests; many tiny files, large artifacts, noisy 100 MiB logs, 10 GiB caches with published file distributions. Follow the [pilot benchmark and cutover gates](docs/pilot-repositories.md#performance-and-parity-gates).
 - Fully cold, image/source/dependency/compiler warm, exact hit/miss/invalidation/corruption; report bytes and latency.
 - Same-host direct runtime, healthy GitHub self-hosted runner, Woodpecker, Sentinel. Equal resources, commands, image/source, isolation, warm state. Runner mode against GitHub-hosted runners and the Blacksmith probe's queue → job reference ([16.10](#1610-github-actions-runner-mode)); microVMs against rootless Podman on the same KVM host.
 - Actual Blacksmith executions for B11 once access exists; disclose hosted hardware/network differences and never call them same-hardware evidence. Vendor multipliers and the one-run startup probe are not Sentinel evidence.
@@ -556,7 +556,7 @@ Default proposal: the native job-object executor with per-slot accounts is the f
 
 ### 16.2 Artifact storage
 
-**What exists.** Declared artifacts are captured at finalization (D03) into tenant-scoped, BLAKE3-addressed objects deduplicated within the tenant, listed by versioned manifests (D01), uploadable in resumable 8 MiB chunks (D02), retained by the pipeline's `retain` shortened to the effective retention (R01), counted against run, repository and tenant quotas, optionally copied to S3 (R02/R03), listed and downloaded per entry through API, CLI and UI ([storage](docs/storage.md#artifact-records-d03), [retention](docs/retention.md), [s3](docs/s3.md)).
+**What exists.** Declared artifacts are captured at finalization (D03) into tenant-scoped, BLAKE3-addressed objects deduplicated within the tenant, listed by versioned manifests (D01), uploadable in resumable 8 MiB chunks (D02), retained by the pipeline's `retain` shortened to the effective retention (R01), counted against run, repository and tenant quotas, optionally copied to S3 (R02/R03), listed and downloaded per entry through API, CLI and UI ([storage](docs/storage.md#artifact-records), [retention](docs/retention.md), [s3](docs/s3.md)).
 
 **What is added.**
 
