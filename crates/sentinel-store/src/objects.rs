@@ -2163,7 +2163,11 @@ impl Objects {
         Ok(removed)
     }
 
-    /// Path checks are not descriptor-relative: dest must not be writable by untrusted users.
+    /// Writes a manifest's entries below `dest`. On Unix the walk is descriptor-relative: `dest` is resolved once,
+    /// and every component below it is created and opened relative to the directory descriptor before it without
+    /// following a symlink, so a destination changed while the extract runs cannot redirect a write outside the
+    /// directories this call opened. Elsewhere the checks are path-based and `dest` must not be writable by
+    /// untrusted users.
     pub fn materialize(
         &self,
         conn: &Connection,
@@ -2173,10 +2177,128 @@ impl Objects {
         version: Option<u64>,
         dest: &Path,
     ) -> Result<u64> {
+        self.materialize_with(conn, tenant, kind, name, version, dest, |_| {})
+    }
+
+    /// [`Objects::materialize`] with a call before each entry's file is created, after its directory is open;
+    /// tests change the destination there to prove the write cannot follow.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn materialize_with(
+        &self,
+        conn: &Connection,
+        tenant: TenantId,
+        kind: Kind,
+        name: &str,
+        version: Option<u64>,
+        dest: &Path,
+        mut before_create: impl FnMut(usize),
+    ) -> Result<u64> {
         let manifest = self.manifest(conn, tenant, kind, name, version)?;
         fs::create_dir_all(dest)?;
+        self.extract(conn, tenant, &manifest.entries, dest, &mut before_create)
+    }
+
+    #[cfg(unix)]
+    fn extract(
+        &self,
+        conn: &Connection,
+        tenant: TenantId,
+        entries: &[Entry],
+        dest: &Path,
+        before_create: &mut impl FnMut(usize),
+    ) -> Result<u64> {
+        use std::os::{
+            fd::{AsFd, OwnedFd},
+            unix::fs::PermissionsExt,
+        };
+
+        use rustix::{
+            fs::{Mode, OFlags, mkdirat, openat},
+            io::Errno,
+        };
+
+        let io = |e: Errno| Error::Io(e.into());
+        let root: OwnedFd = rustix::fs::open(
+            dest,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io)?;
+        // The directories of the previous entry, reused while the next entry shares their names: a descriptor names
+        // one inode, so reuse cannot be redirected either.
+        let mut open: Vec<(&str, OwnedFd)> = Vec::new();
         let mut written = 0u64;
-        for entry in &manifest.entries {
+        for (index, entry) in entries.iter().enumerate() {
+            let (dirs, file_name) = entry
+                .path
+                .rsplit_once('/')
+                .map_or(("", entry.path.as_str()), |(dirs, name)| (dirs, name));
+            let mut depth = 0;
+            if !dirs.is_empty() {
+                for part in dirs.split('/') {
+                    if open.get(depth).is_some_and(|(held, _)| *held == part) {
+                        depth += 1;
+                        continue;
+                    }
+                    open.truncate(depth);
+                    let parent = open.last().map_or(root.as_fd(), |(_, fd)| fd.as_fd());
+                    match mkdirat(parent, part, Mode::RWXU | Mode::RWXG | Mode::RWXO) {
+                        Ok(()) | Err(Errno::EXIST) => {}
+                        Err(e) => return Err(io(e)),
+                    }
+                    // `O_NOFOLLOW` fails on a symlink (`ELOOP`, or `ENOTDIR` beside `O_DIRECTORY`) and
+                    // `O_DIRECTORY` on a file: neither is a directory this extract may descend into.
+                    let child = openat(
+                        parent,
+                        part,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .map_err(|e| match e {
+                        Errno::LOOP | Errno::NOTDIR => Error::InvalidInput("materialize path"),
+                        e => io(e),
+                    })?;
+                    open.push((part, child));
+                    depth += 1;
+                }
+            }
+            open.truncate(depth);
+            let dir = open.last().map_or(root.as_fd(), |(_, fd)| fd.as_fd());
+            before_create(index);
+            let fd = openat(
+                dir,
+                file_name,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+            )
+            .map_err(|e| match e {
+                Errno::EXIST => Error::InvalidInput("materialize target"),
+                e => io(e),
+            })?;
+            let mut file = File::from(fd);
+            self.read(conn, tenant, entry.digest, &mut file)?;
+            file.sync_data()?;
+            if entry.mode & 0o777 != 0 {
+                file.set_permissions(fs::Permissions::from_mode(entry.mode & 0o777))?;
+            }
+            written += entry.len;
+        }
+        File::from(root).sync_all()?;
+        Ok(written)
+    }
+
+    #[cfg(not(unix))]
+    fn extract(
+        &self,
+        conn: &Connection,
+        tenant: TenantId,
+        entries: &[Entry],
+        dest: &Path,
+        before_create: &mut impl FnMut(usize),
+    ) -> Result<u64> {
+        let mut written = 0u64;
+        for (index, entry) in entries.iter().enumerate() {
             let mut path = dest.to_path_buf();
             for part in entry.path.split('/') {
                 path.push(part);
@@ -2193,6 +2315,7 @@ impl Objects {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
+            before_create(index);
             let mut file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -2203,11 +2326,6 @@ impl Objects {
                 })?;
             self.read(conn, tenant, entry.digest, &mut file)?;
             file.sync_data()?;
-            #[cfg(unix)]
-            if entry.mode & 0o777 != 0 {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(fs::Permissions::from_mode(entry.mode & 0o777))?;
-            }
             written += entry.len;
         }
         sync_dir(dest)?;

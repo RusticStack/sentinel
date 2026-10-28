@@ -859,3 +859,153 @@ fn materialize_refuses_symlinked_ancestors() {
     ));
     assert!(!outside.join("x").exists());
 }
+
+#[cfg(unix)]
+fn commit_entries(fx: &mut Fixture, name: &str, paths: &[&str]) {
+    let a = fx.put(fx.tenant, b"payload");
+    let entries: Vec<Entry> = paths.iter().map(|p| entry(p, a, 7)).collect();
+    let tx = fx.conn.transaction().unwrap();
+    fx.objects
+        .commit_manifest(&tx, fx.tenant, Kind::Artifact, name, &entries)
+        .unwrap();
+    tx.commit().unwrap();
+}
+
+/// A directory swapped for a symlink after the walk opened it cannot redirect the write: the file is created
+/// through the open descriptor, which names the original directory wherever the path now leads.
+#[cfg(unix)]
+#[test]
+fn a_directory_swapped_for_a_symlink_during_extraction_cannot_redirect_a_write() {
+    let mut fx = fixture();
+    commit_entries(&mut fx, "m", &["sub/x", "sub/y", "other/z"]);
+    let dest = fx.dir.path().join("dest");
+    let outside = fx.dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let written = fx
+        .objects
+        .materialize_with(
+            &fx.conn,
+            fx.tenant,
+            Kind::Artifact,
+            "m",
+            None,
+            &dest,
+            |index| {
+                if index == 0 {
+                    std::fs::rename(dest.join("sub"), dest.join("sub.moved")).unwrap();
+                    std::os::unix::fs::symlink(&outside, dest.join("sub")).unwrap();
+                }
+            },
+        )
+        .unwrap();
+    assert_eq!(written, 21);
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    // The walk keeps the directory it opened for the entries that follow it.
+    assert_eq!(std::fs::read(dest.join("sub.moved/x")).unwrap(), b"payload");
+    assert_eq!(std::fs::read(dest.join("sub.moved/y")).unwrap(), b"payload");
+    assert_eq!(std::fs::read(dest.join("other/z")).unwrap(), b"payload");
+}
+
+/// The destination itself is resolved once: replacing it by a symlink mid-extract leaves every write in the
+/// directory that was opened.
+#[cfg(unix)]
+#[test]
+fn a_destination_swapped_for_a_symlink_during_extraction_cannot_redirect_a_write() {
+    let mut fx = fixture();
+    commit_entries(&mut fx, "m", &["a", "deep/b"]);
+    let dest = fx.dir.path().join("dest");
+    let moved = fx.dir.path().join("dest.moved");
+    let outside = fx.dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    fx.objects
+        .materialize_with(
+            &fx.conn,
+            fx.tenant,
+            Kind::Artifact,
+            "m",
+            None,
+            &dest,
+            |index| {
+                if index == 0 {
+                    std::fs::rename(&dest, &moved).unwrap();
+                    std::os::unix::fs::symlink(&outside, &dest).unwrap();
+                }
+            },
+        )
+        .unwrap();
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    assert_eq!(std::fs::read(moved.join("a")).unwrap(), b"payload");
+    assert_eq!(std::fs::read(moved.join("deep/b")).unwrap(), b"payload");
+}
+
+/// A symlink planted at the file's own name is not followed (`O_EXCL` fails on it) and a directory component
+/// that is a regular file is refused like a symlink.
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_target_or_a_file_in_the_way_is_refused() {
+    let mut fx = fixture();
+    commit_entries(&mut fx, "m", &["sub/x"]);
+    let dest = fx.dir.path().join("dest");
+    let outside = fx.dir.path().join("outside");
+    std::fs::create_dir_all(dest.join("sub")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(outside.join("x"), dest.join("sub/x")).unwrap();
+    assert!(matches!(
+        fx.objects
+            .materialize(&fx.conn, fx.tenant, Kind::Artifact, "m", None, &dest),
+        Err(Error::InvalidInput("materialize target"))
+    ));
+    assert!(!outside.join("x").exists());
+
+    let blocked = fx.dir.path().join("blocked");
+    std::fs::create_dir_all(&blocked).unwrap();
+    std::fs::write(blocked.join("sub"), b"in the way").unwrap();
+    assert!(matches!(
+        fx.objects
+            .materialize(&fx.conn, fx.tenant, Kind::Artifact, "m", None, &blocked),
+        Err(Error::InvalidInput("materialize path"))
+    ));
+}
+
+/// Directories planted while the extract runs never lead out: whatever the interleaving, nothing lands outside.
+#[cfg(unix)]
+#[test]
+fn a_racing_swapper_never_makes_the_extract_write_outside() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const DIRS: usize = 64;
+    let mut fx = fixture();
+    let paths: Vec<String> = (0..DIRS).map(|i| format!("d{i}/f")).collect();
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    commit_entries(&mut fx, "m", &refs);
+    let attempt = fx.dir.path().join("race");
+    let outside = fx.dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                for i in 0..DIRS {
+                    let at = attempt.join(format!("d{i}"));
+                    if std::fs::remove_dir(&at).is_ok() {
+                        let _ = std::os::unix::fs::symlink(&outside, &at);
+                    }
+                }
+            }
+        });
+        for _ in 0..20 {
+            let _ = std::fs::remove_dir_all(&attempt);
+            std::fs::create_dir_all(&attempt).unwrap();
+            let result =
+                fx.objects
+                    .materialize(&fx.conn, fx.tenant, Kind::Artifact, "m", None, &attempt);
+            // Any refusal is fine; a write through a swapped directory is not.
+            assert!(matches!(
+                result,
+                Ok(_) | Err(Error::InvalidInput(_) | Error::Io(_))
+            ));
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}
