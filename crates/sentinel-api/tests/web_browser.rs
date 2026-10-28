@@ -37,40 +37,78 @@ fn free_port() -> u16 {
         .port()
 }
 
-struct Web(Child);
+/// The web interface: one process, or during the strangler migration (plan 16.4) the
+/// TanStack Start front (`SENTINEL_WEB_FRONT`, its server entry) with the Nuxt process
+/// behind it on loopback. `SENTINEL_WEB_SERVER` replaces the default entry.
+struct Web(Vec<Child>);
+
+fn spawn_web(server: &std::path::Path, port: u16, envs: &[(&str, String)]) -> Child {
+    assert!(
+        server.exists(),
+        "build the web interface first: {} is missing",
+        server.display()
+    );
+    let mut command = Command::new(node());
+    command
+        .arg(server)
+        .env("PORT", port.to_string())
+        .env("HOST", "127.0.0.1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    for (k, v) in envs {
+        command.env(k, v);
+    }
+    let child = command.spawn().expect("start the web interface");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the web interface did not listen"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child
+}
 
 impl Web {
     fn start(port: u16, api: &str) -> Web {
-        let server = repo_root().join("web/.output/server/index.mjs");
-        assert!(
-            server.exists(),
-            "build the web interface first: pnpm -C web install && pnpm -C web build"
-        );
-        let child = Command::new(node())
-            .arg(&server)
-            .env("PORT", port.to_string())
-            .env("HOST", "127.0.0.1")
-            .env("NUXT_SENTINEL_API", api)
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("start the web interface");
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "the web interface did not listen"
-            );
-            std::thread::sleep(Duration::from_millis(50));
+        let entry = |var: &str, default: &str| {
+            std::env::var_os(var)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| repo_root().join(default))
+        };
+        let server = entry("SENTINEL_WEB_SERVER", "web/.output/server/index.mjs");
+        let api_env = [
+            ("NUXT_SENTINEL_API", api.to_owned()),
+            ("SENTINEL_API", api.to_owned()),
+        ];
+        match std::env::var_os("SENTINEL_WEB_FRONT") {
+            None => Web(vec![spawn_web(&server, port, &api_env)]),
+            Some(front) => {
+                let legacy_port = free_port();
+                let legacy = spawn_web(&server, legacy_port, &api_env);
+                let mut envs = api_env.to_vec();
+                envs.push((
+                    "SENTINEL_LEGACY_ORIGIN",
+                    format!("http://127.0.0.1:{legacy_port}"),
+                ));
+                let front = spawn_web(std::path::Path::new(&front), port, &envs);
+                Web(vec![front, legacy])
+            }
         }
-        Web(child)
+    }
+
+    fn pids(&self) -> Vec<u32> {
+        self.0.iter().map(Child::id).collect()
     }
 }
 
 impl Drop for Web {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -162,6 +200,36 @@ fn the_web_interface_in_a_real_browser() {
     assert!(status.success(), "ui.mjs failed: {status}");
 }
 
+/// The TanStack Start shell (U09): its own views under the hash-only policy, and the
+/// strangler front serving the unmoved views, the API and the streams. Needs
+/// `SENTINEL_WEB_FRONT` (the Start server entry) and the built Nuxt interface.
+#[test]
+#[ignore = "needs Node, both built web interfaces and a Chromium-family browser"]
+fn the_start_shell_in_a_real_browser() {
+    assert!(
+        std::env::var_os("SENTINEL_WEB_FRONT").is_some(),
+        "set SENTINEL_WEB_FRONT to web-start/.output/server/index.mjs"
+    );
+    let (f, web, web_addr, origin) = deployment(4, false);
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = keep_writing(&f, &stop);
+    let config_path = f.dir.path().join("shell.json");
+    std::fs::write(
+        &config_path,
+        config(&f, &origin, &web_addr, f.dir.path()).to_string(),
+    )
+    .unwrap();
+    let status = Command::new(node())
+        .arg(repo_root().join("web-start/test/shell.mjs"))
+        .arg(&config_path)
+        .status()
+        .expect("run node");
+    stop.store(true, Ordering::Release);
+    writer.join().unwrap();
+    drop(web);
+    assert!(status.success(), "shell.mjs failed: {status}");
+}
+
 /// The U08/U14 measurement: `web/bench/web-bench.mjs` against this fixture, on the
 /// reference host. `SENTINEL_BENCH_RECORD` appends the record to a file under the
 /// repository; `SENTINEL_BENCH_HOST_LABEL` names the host in it.
@@ -176,7 +244,7 @@ fn measure_the_web_interface() {
     let stop = Arc::new(AtomicBool::new(false));
     let writer = keep_writing(&f, &stop);
     let mut cfg = config(&f, &origin, &web_addr, f.dir.path());
-    cfg["web_pid"] = json!(web.0.id());
+    cfg["web_pids"] = json!(web.pids());
     cfg["interface"] = json!(std::env::var("SENTINEL_WEB_INTERFACE").unwrap_or_default());
     let config_path = f.dir.path().join("bench.json");
     std::fs::write(&config_path, cfg.to_string()).unwrap();

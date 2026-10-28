@@ -1,0 +1,145 @@
+@import "tailwindcss";
+
+/* Semantic colours as CSS variables, so a theme switch is one class on <html> and the server renders it (no inline script).
+   Light text colours use 700/800 shades for WCAG AA on white; dark ones 400. */
+@theme {
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --color-canvas: var(--s-bg);
+  --color-subtle: var(--s-bg-muted);
+  --color-elevated: var(--s-bg-elevated);
+  --color-accented: var(--s-bg-accented);
+  --color-fg: var(--s-text);
+  --color-strong: var(--s-text-strong);
+  --color-muted: var(--s-text-muted);
+  --color-dimmed: var(--s-text-dimmed);
+  --color-line: var(--s-border);
+  --color-line-strong: var(--s-border-strong);
+  --color-primary: var(--s-primary);
+  --color-on-primary: var(--s-on-primary);
+  --color-success: var(--s-success);
+  --color-info: var(--s-info);
+  --color-warning: var(--s-warning);
+  --color-error: var(--s-error);
+  --color-neutral: var(--s-text-muted);
+}
+
+:root {
+  color-scheme: light;
+  --s-bg: #ffffff;
+  --s-bg-muted: #fafafa;
+  --s-bg-elevated: #f4f4f5;
+  --s-bg-accented: #e4e4e7;
+  --s-text: #3f3f46;
+  --s-text-strong: #18181b;
+  --s-text-muted: #52525b;
+  --s-text-dimmed: #71717a;
+  --s-border: #e4e4e7;
+  --s-border-strong: #d4d4d8;
+  --s-primary: #0369a1;
+  --s-on-primary: #ffffff;
+  --s-success: #166534;
+  --s-info: #1d4ed8;
+  --s-warning: #854d0e;
+  --s-error: #b91c1c;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    color-scheme: dark;
+    --s-bg: #18181b;
+    --s-bg-muted: #202024;
+    --s-bg-elevated: #27272a;
+    --s-bg-accented: #3f3f46;
+    --s-text: #e4e4e7;
+    --s-text-strong: #ffffff;
+    --s-text-muted: #a1a1aa;
+    --s-text-dimmed: #a1a1aa;
+    --s-border: #27272a;
+    --s-border-strong: #3f3f46;
+    --s-primary: #38bdf8;
+    --s-on-primary: #18181b;
+    --s-success: #4ade80;
+    --s-info: #60a5fa;
+    --s-warning: #facc15;
+    --s-error: #f87171;
+  }
+}
+:root.dark {
+  color-scheme: dark;
+  --s-bg: #18181b;
+  --s-bg-muted: #202024;
+  --s-bg-elevated: #27272a;
+  --s-bg-accented: #3f3f46;
+  --s-text: #e4e4e7;
+  --s-text-strong: #ffffff;
+  --s-text-muted: #a1a1aa;
+  --s-text-dimmed: #a1a1aa;
+  --s-border: #27272a;
+  --s-border-strong: #3f3f46;
+  --s-primary: #38bdf8;
+  --s-on-primary: #18181b;
+  --s-success: #4ade80;
+  --s-info: #60a5fa;
+  --s-warning: #facc15;
+  --s-error: #f87171;
+}
+
+html, body { background: var(--s-bg); color: var(--s-text); }
+body { font-family: var(--font-sans); font-size: 14px; line-height: 1.5; }
+
+/* Every focusable control shows a ring when reached by keyboard. */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible,
+[data-focus-visible] {
+  outline: 2px solid var(--s-primary);
+  outline-offset: 2px;
+}
+
+/* `hidden` must beat the display the pooled log rows set. */
+[hidden] { display: none !important; }
+
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+.skip-link { position: absolute; left: 8px; top: -48px; z-index: 100; }
+.skip-link:focus { top: 8px; }
+h1[tabindex="-1"]:focus { outline: none; }
+
+.log-view {
+  position: relative;
+  height: 70vh;
+  min-height: 240px;
+  overflow: auto;
+  border: 1px solid var(--s-border);
+  border-radius: 0.375rem;
+  background: var(--s-bg-muted);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  contain: strict;
+}
+.log-spacer { width: 1px; }
+.log-row {
+  position: absolute; left: 0; right: 0; top: 0;
+  height: 18px; line-height: 18px;
+  white-space: pre; display: flex;
+}
+.log-row .gut {
+  flex: 0 0 64px; text-align: right; padding-right: 8px;
+  color: var(--s-text-muted); text-decoration: none; user-select: none;
+}
+.log-row .txt { flex: 1 0 auto; padding-right: 12px; color: var(--s-text); }
+.log-row.err .txt { color: var(--s-error); }
+.log-row.meta .txt { color: var(--s-warning); font-style: italic; }
+.log-row.hl { background: var(--s-bg-accented); box-shadow: inset 3px 0 0 var(--s-primary); }
+.log-row.head { background: var(--s-bg-elevated); font-family: var(--font-sans); font-weight: 600; }
+.log-row.head button {
+  border: 0; background: transparent; padding: 0 8px; width: 100%; text-align: left;
+  line-height: 18px; height: 18px; display: flex; gap: 8px; cursor: pointer; color: var(--s-text);
+}
+.log-row .muted { color: var(--s-text-muted); }
+.log-row mark { background: var(--s-warning); color: var(--s-bg); border-radius: 2px; }
+.log-row button.link { background: none; border: 0; padding: 0; color: var(--s-primary); text-decoration: underline; cursor: pointer; font: inherit; }
+
+.dag .edge { fill: none; stroke: var(--s-border-strong); stroke-width: 1.5; }
+.dag .node rect { fill: var(--s-bg); stroke: currentColor; stroke-width: 1.5; }
+.dag .node text { fill: var(--s-text); font-size: 12px; }
+.dag .node text.state { fill: currentColor; font-weight: 600; font-size: 11px; }
+.dag a:focus-visible rect { stroke-width: 3; }

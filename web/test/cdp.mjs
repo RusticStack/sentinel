@@ -111,8 +111,9 @@ export class Page {
   async goto(url) {
     await this.send("Page.navigate", { url });
     await this.waitFor("document.readyState === 'complete'", 15000);
-    // A form submitted before Vue takes over is submitted natively, so wait for hydration.
-    await this.waitFor("(() => { try { return typeof window.useNuxtApp !== 'function' || !window.useNuxtApp().isHydrating; } catch (e) { return true; } })()", 15000, "hydration");
+    // A form submitted before the framework takes over is submitted natively, so wait for hydration
+    // (Nuxt's flag, or the attribute the TanStack Start root sets once React has hydrated).
+    await this.waitFor("(() => { try { if (document.documentElement.dataset.app === 'start') return document.documentElement.dataset.hydrated === '1'; return typeof window.useNuxtApp !== 'function' || !window.useNuxtApp().isHydrating; } catch (e) { return true; } })()", 15000, "hydration");
   }
   async eval(expression) {
     const r = await this.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
