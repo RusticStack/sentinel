@@ -20,6 +20,8 @@ The routes are in the [API](api.md), the store rules behind them in [worker link
    Run from a terminal with `--secret-stdin` and no pipe, the script prompts for each line with the input hidden.
 4. The worker starts, presents the secret once with its first hello, and the controller binds the machine to the enrollment's pool and policy. The worker deletes its enrollment file when it has enrolled.
 
+Outstanding and spent enrollments are read back, without any secret, with `GET /api/v1/admin/worker-enrollments?pool=` (and one by `{id}`); the machines they produced, with their approved, reported and effective ceilings, are `GET /api/v1/admin/workers?pool=`. An unspent enrollment is withdrawn with `DELETE /api/v1/admin/worker-enrollments/{id}` and an enrolled machine is removed with `POST /api/v1/admin/workers/{id}/uninstall`.
+
 An enrollment that is spent, withdrawn (`DELETE`) or expired gets no further script (`409`).
 
 ## What the script holds, and what it never does
