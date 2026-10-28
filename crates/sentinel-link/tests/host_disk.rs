@@ -91,11 +91,12 @@ impl Deployment {
             .secret
     }
 
-    fn offered_disk(&self, worker: WorkerId) -> i64 {
+    /// The disk the controller offers `worker`, once the worker is enrolled.
+    fn offered_disk(&self, worker: WorkerId) -> Option<i64> {
         self.store
             .read(move |c| dispatch::free_capacity(c, worker))
-            .unwrap()
-            .disk_bytes
+            .ok()
+            .map(|free| free.disk_bytes)
     }
 }
 
@@ -213,21 +214,21 @@ fn a_measured_disk_follows_the_host_as_its_caches_grow_and_shrink() {
     let executor = Measured::new(100 * GIB, false);
     let (_process, id) = start(&d, Arc::clone(&executor), 100 * GIB);
     eventually("the connect-time disk", Duration::from_secs(20), || {
-        d.offered_disk(id) == (100 * GIB) as i64
+        d.offered_disk(id) == Some((100 * GIB) as i64)
     });
     // Caches, mirrors and images fill the file system: the next heartbeat carries the smaller room.
     executor.room.store(60 * GIB, Ordering::SeqCst);
     eventually("the shrunken disk", Duration::from_secs(30), || {
-        d.offered_disk(id) == (60 * GIB) as i64
+        d.offered_disk(id) == Some((60 * GIB) as i64)
     });
     // A small wobble is not worth a profile message; the controller keeps the last figure it was sent.
     executor.room.store(60 * GIB + (10 << 20), Ordering::SeqCst);
     thread::sleep(Duration::from_secs(7));
-    assert_eq!(d.offered_disk(id), (60 * GIB) as i64);
+    assert_eq!(d.offered_disk(id), Some((60 * GIB) as i64));
     // Space returning is offered again.
     executor.room.store(90 * GIB, Ordering::SeqCst);
     eventually("the recovered disk", Duration::from_secs(30), || {
-        d.offered_disk(id) == (90 * GIB) as i64
+        d.offered_disk(id) == Some((90 * GIB) as i64)
     });
 }
 
@@ -237,9 +238,9 @@ fn a_stated_disk_is_never_replaced_by_a_measurement() {
     let executor = Measured::new(10 * GIB, true);
     let (_process, id) = start(&d, Arc::clone(&executor), 40 * GIB);
     eventually("the stated disk", Duration::from_secs(20), || {
-        d.offered_disk(id) == (40 * GIB) as i64
+        d.offered_disk(id) == Some((40 * GIB) as i64)
     });
     executor.room.store(5 * GIB, Ordering::SeqCst);
     thread::sleep(Duration::from_secs(7));
-    assert_eq!(d.offered_disk(id), (40 * GIB) as i64);
+    assert_eq!(d.offered_disk(id), Some((40 * GIB) as i64));
 }
