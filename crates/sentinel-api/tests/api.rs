@@ -3157,6 +3157,126 @@ fn a_foreign_tenant_slug_lists_as_not_found() {
 }
 
 #[test]
+fn listing_repositories_as_a_stale_github_member_takes_no_writer_and_files_one_refresh() {
+    let d = deployment();
+    let (member, auth) = person(
+        &d,
+        "stale",
+        Some(sentinel_core::auth::Role::Reader),
+        P::REPOSITORY,
+    );
+    let tenant = d.tenant;
+    // The first use of a credential is recorded through the writer (throttled afterwards); spend it here,
+    // while the tenant is not yet GitHub-backed and the member is not stale.
+    assert_eq!(
+        call(
+            &d,
+            "GET",
+            "/api/v1/tenants/acme/repos",
+            None,
+            Some(&auth),
+            &[]
+        )
+        .0,
+        200
+    );
+    d.store
+        .writer()
+        .write(move |tx| {
+            provisioning::link_verified_identity(tx, member, "github", "3030", UnixMillis(1))?;
+            tx.execute(
+                "UPDATE tenants SET membership_source = 1 WHERE id = ?1",
+                [tenant.as_bytes()],
+            )?;
+            tx.execute(
+                "UPDATE memberships SET synced_ms = 1 WHERE tenant_id = ?1 AND user_id = ?2",
+                [tenant.as_bytes().as_slice(), member.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let queued = |d: &Deployment| -> Option<i64> {
+        d.store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT seq FROM github_member_checks WHERE tenant_id = ?1 AND user_id = ?2",
+                    [tenant.as_bytes().as_slice(), member.as_bytes().as_slice()],
+                    |r| r.get(0),
+                )
+                .ok())
+            })
+            .unwrap()
+    };
+    assert_eq!(queued(&d), None);
+
+    // Wedge the writer: a request that waited for it would sit out the whole write wait.
+    let (started_tx, started) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let store = Arc::clone(&d.store);
+    let wedge = std::thread::spawn(move || {
+        let _ = store.writer().raw(move |_| {
+            started_tx.send(()).unwrap();
+            let _ = released.recv();
+            Ok(())
+        });
+    });
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    let began = std::time::Instant::now();
+    for _ in 0..3 {
+        let (status, _) = call(
+            &d,
+            "GET",
+            "/api/v1/tenants/acme/repos",
+            None,
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(status, 200);
+    }
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "the list waited for the writer: {:?}",
+        began.elapsed()
+    );
+    assert_eq!(
+        queued(&d),
+        None,
+        "nothing was written while the writer was held"
+    );
+    release.send(()).unwrap();
+    wedge.join().unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let seq = loop {
+        if let Some(seq) = queued(&d) {
+            break seq;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the refresh was never filed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // The same member opening the tenant again inside the gap files nothing more.
+    for _ in 0..3 {
+        assert_eq!(
+            call(
+                &d,
+                "GET",
+                "/api/v1/tenants/acme/repos",
+                None,
+                Some(&auth),
+                &[]
+            )
+            .0,
+            200
+        );
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(queued(&d), Some(seq));
+}
+
+#[test]
 fn an_active_session_outlives_its_first_idle_deadline() {
     let policy = local_auth::Policy {
         idle_ms: 6_000,

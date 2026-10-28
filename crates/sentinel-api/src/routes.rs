@@ -493,11 +493,10 @@ pub(crate) fn route(
                 })
                 .map_err(store_error)?;
             if stale {
-                let user = who.principal.user;
-                let _ = state
-                    .store
-                    .writer()
-                    .write(move |tx| sentinel_store::github_members::enqueue_user(tx, user, now));
+                // Off the request path: the refresh is filed, never written here.
+                state
+                    .refresh
+                    .request(who.principal.user, std::time::Instant::now());
             }
             ok(json!({
                 "repos": repos.iter().map(|r| json!({ "id": r.id.to_string(), "name": r.name })).collect::<Vec<_>>()

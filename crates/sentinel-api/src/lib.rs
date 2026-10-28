@@ -7,6 +7,7 @@ mod login_guard;
 mod mcp;
 mod metrics;
 mod oauth;
+mod refresh;
 mod routes;
 mod secret_routes;
 
@@ -148,6 +149,7 @@ pub(crate) struct State {
     pub logins: login_guard::LoginGuard,
     pub exchanges: Outbound,
     pub requests: metrics::Requests,
+    pub refresh: refresh::Refresh,
 }
 
 #[derive(Default)]
@@ -245,6 +247,7 @@ impl Server {
             })?;
         let stop = Arc::new(AtomicBool::new(false));
         let proxies = config.trusted_proxies.clone();
+        let refresh = refresh::Refresh::start(Arc::downgrade(&config.store))?;
         let state = Arc::new(State {
             auto_join: options.auto_join,
             mail: options.mail,
@@ -270,6 +273,7 @@ impl Server {
             logins: login_guard::LoginGuard::default(),
             exchanges: Outbound::default(),
             requests: metrics::Requests::default(),
+            refresh,
         });
         let conns = http::listen(
             listener,
