@@ -63,6 +63,9 @@ struct PendingLink {
 }
 
 const MAX_LINKS: usize = 256;
+/// Attempts one account may have pending at once. A fifth start drops that account's own oldest, so
+/// a stepped-up user retrying or scripting the route can only ever displace itself.
+const MAX_LINKS_PER_USER: usize = 4;
 
 enum Purpose {
     SignIn,
@@ -103,10 +106,7 @@ impl Github {
 
     fn park_link(&self, link: PendingLink, now: Instant) {
         let mut queue = self.links.lock().unwrap_or_else(|p| p.into_inner());
-        while queue.front().is_some_and(|l| l.deadline <= now) || queue.len() >= MAX_LINKS {
-            queue.pop_front();
-        }
-        queue.push_back(link);
+        admit_link(&mut queue, link, now);
     }
 
     fn take_link(
@@ -146,6 +146,33 @@ impl Github {
             .unwrap_or_else(|p| p.into_inner())
             .admit(client, Instant::now())
     }
+}
+
+/// Parks `link`, keeping the queue in deadline order and bounded without letting one account push
+/// out another's attempt: expired entries go first; an account over its own allowance loses its own
+/// oldest; and only when the whole queue is full is the oldest attempt of the account holding the
+/// most dropped (ties go to the oldest), so the heaviest holder pays and a lone newcomer is admitted.
+fn admit_link(queue: &mut VecDeque<PendingLink>, link: PendingLink, now: Instant) {
+    while queue.front().is_some_and(|l| l.deadline <= now) {
+        queue.pop_front();
+    }
+    while queue.iter().filter(|l| l.user == link.user).count() >= MAX_LINKS_PER_USER {
+        if let Some(at) = queue.iter().position(|l| l.user == link.user) {
+            queue.remove(at);
+        }
+    }
+    while queue.len() >= MAX_LINKS {
+        let mut counts: std::collections::HashMap<UserId, usize> = std::collections::HashMap::new();
+        for l in queue.iter() {
+            *counts.entry(l.user).or_default() += 1;
+        }
+        let heaviest = counts.values().copied().max().unwrap_or(0);
+        let Some(at) = queue.iter().position(|l| counts[&l.user] == heaviest) else {
+            break;
+        };
+        queue.remove(at);
+    }
+    queue.push_back(link);
 }
 
 pub(crate) fn route(
@@ -557,6 +584,88 @@ mod tests {
             "/device?{}",
             "a".repeat(MAX_REDIRECT_BYTES)
         )));
+    }
+
+    fn pending(user: UserId, at: Instant) -> PendingLink {
+        PendingLink {
+            state: Secret::generate().digest(),
+            user,
+            session: Secret::generate().digest(),
+            deadline: at + Duration::from_secs(600),
+        }
+    }
+
+    fn held(queue: &VecDeque<PendingLink>, user: UserId) -> usize {
+        queue.iter().filter(|l| l.user == user).count()
+    }
+
+    #[test]
+    fn one_account_only_displaces_its_own_pending_links() {
+        let now = Instant::now();
+        let (victim, abuser) = (UserId::new(), UserId::new());
+        let mut queue = VecDeque::new();
+        let first = pending(victim, now);
+        let first_state = first.state;
+        admit_link(&mut queue, first, now);
+        let mut abuser_states = Vec::new();
+        for _ in 0..MAX_LINKS * 2 {
+            let link = pending(abuser, now);
+            abuser_states.push(link.state);
+            admit_link(&mut queue, link, now);
+        }
+        assert_eq!(held(&queue, abuser), MAX_LINKS_PER_USER);
+        assert_eq!(held(&queue, victim), 1);
+        assert!(queue.iter().any(|l| digest_eq(&l.state, &first_state)));
+        // The abuser kept its newest attempts, not its oldest.
+        let kept: Vec<_> = queue.iter().filter(|l| l.user == abuser).collect();
+        for (l, s) in kept
+            .iter()
+            .zip(&abuser_states[abuser_states.len() - MAX_LINKS_PER_USER..])
+        {
+            assert!(digest_eq(&l.state, s));
+        }
+    }
+
+    #[test]
+    fn a_full_queue_drops_from_the_heaviest_holder_not_the_newcomer() {
+        let now = Instant::now();
+        let mut queue = VecDeque::new();
+        let lone = UserId::new();
+        admit_link(&mut queue, pending(lone, now), now);
+        // Fill the rest with accounts holding the per-account maximum.
+        let mut crowd = Vec::new();
+        while queue.len() < MAX_LINKS {
+            let user = UserId::new();
+            crowd.push(user);
+            for _ in 0..MAX_LINKS_PER_USER.min(MAX_LINKS - queue.len()) {
+                admit_link(&mut queue, pending(user, now), now);
+            }
+        }
+        assert_eq!(queue.len(), MAX_LINKS);
+        let newcomer = UserId::new();
+        admit_link(&mut queue, pending(newcomer, now), now);
+        assert_eq!(queue.len(), MAX_LINKS);
+        assert_eq!(held(&queue, newcomer), 1);
+        assert_eq!(
+            held(&queue, lone),
+            1,
+            "the account with one attempt is not the one dropped"
+        );
+        // The oldest heavy holder paid with one attempt.
+        assert_eq!(held(&queue, crowd[0]), MAX_LINKS_PER_USER - 1);
+    }
+
+    #[test]
+    fn expired_attempts_leave_before_any_live_one_is_dropped() {
+        let start = Instant::now();
+        let mut queue = VecDeque::new();
+        let user = UserId::new();
+        for _ in 0..MAX_LINKS_PER_USER {
+            admit_link(&mut queue, pending(user, start), start);
+        }
+        let later = start + Duration::from_secs(601);
+        admit_link(&mut queue, pending(user, later), later);
+        assert_eq!(queue.len(), 1);
     }
 
     #[test]
