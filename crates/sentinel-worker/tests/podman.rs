@@ -530,7 +530,7 @@ fn started_sandbox(
         IMAGE,
         Limits {
             cpu_millis: 500,
-            memory_bytes: 64 << 20,
+            memory_bytes: 512 << 20,
             pids: 32,
             disk_bytes,
             lifetime_secs: 0,

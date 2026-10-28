@@ -742,7 +742,7 @@ jobs:
         .stats()
         .reports
         .load(std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(reports, 9 * 4, "every report was applied");
+    assert_eq!(reports, 10 * 4, "every report was applied");
     assert_eq!(
         controller
             .stats()
