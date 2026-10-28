@@ -386,10 +386,10 @@ jobs:
         run: 'dd if=/dev/zero of=/tmp/x bs=1M count=300'
   fat:
     image: {IMAGE}@{DIGEST}
-    resources: {{ cpu: 1, memory: 128MiB, disk: 1GiB }}
+    resources: {{ cpu: 1, memory: 512MiB, disk: 1GiB }}
     steps:
       - id: fill
-        run: 'i=0; while [ $i -lt 40 ]; do dd if=/dev/zero of=part$i bs=1M count=100 2>/dev/null; i=$((i+1)); done'
+        run: 'i=0; while [ $i -lt 128 ]; do dd if=/dev/zero of=part$i bs=1M count=32 2>/dev/null; i=$((i+1)); done'
       - id: never
         run: 'true'
   slow:
@@ -644,7 +644,7 @@ jobs:
         Some(sentinel_core::FailureClass::OutOfMemory)
     );
     assert_eq!(summary_of(oom).steps[0].outcome, StepOutcome::OutOfMemory);
-    // 4 GiB are written 100 MiB at a time against a declared 1 GiB: no single file passes `fsize`, so only the
+    // 4 GiB are written 32 MiB at a time against a declared 1 GiB: no single file passes `fsize`, so only the
     // storage guard can end it. The verdict names the limit; the class stays the job's own `command_failed`.
     eventually("fat failed", || {
         state(fat).state == JobState::Terminal(Outcome::Failed)
