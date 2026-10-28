@@ -677,3 +677,137 @@ fn asking_for_an_address_answers_alike_past_the_link_allowance() {
     replies.push(status);
     assert!(replies.iter().all(|s| *s == 202), "{replies:?}");
 }
+
+/// An organization nobody belongs to, so the platform administrator has no ambient access to it.
+fn empty_organization(f: &Fixture, slug: &'static str) -> sentinel_core::TenantId {
+    let (root, tenant) = (f.root, sentinel_core::TenantId::new());
+    f.store
+        .writer()
+        .write(move |tx| {
+            sentinel_store::auth::create_namespace(
+                tx,
+                sentinel_core::auth::Principal::new(
+                    root,
+                    sentinel_core::auth::Permissions::ALL,
+                    None,
+                    None,
+                ),
+                tenant,
+                sentinel_core::auth::Namespace::parse(slug).unwrap(),
+                sentinel_store::auth::NamespaceKind::Organization,
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+    tenant
+}
+
+fn is_member(f: &Fixture, tenant: sentinel_core::TenantId, user: UserId) -> bool {
+    f.store
+        .read(move |c| {
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memberships WHERE tenant_id = ?1 AND user_id = ?2)",
+                [tenant.as_bytes().as_slice(), user.as_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .map_err(sentinel_store::Error::from)
+        })
+        .unwrap()
+}
+
+// `admin invite create --tenant ... --role admin` is host-local and carries no step-up or reason, so it
+// must not let a platform administrator join: the invitation stays unspent for the person it is for.
+#[test]
+fn a_host_local_invitation_does_not_make_the_platform_administrator_a_member() {
+    let f = Fixture::new(1);
+    let tenant = empty_organization(&f, "bench");
+    let invitation = f
+        .store
+        .writer()
+        .write(move |tx| {
+            registration::invite(
+                tx,
+                Authority::HostLocal,
+                Terms {
+                    tenant: Some(tenant),
+                    role: Some(sentinel_core::auth::Role::TenantAdmin),
+                    ..Terms::default()
+                },
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+    let secret = token::format(&invitation.secret);
+    let root = session(&f, "root");
+    let (status, body) = send(
+        &f,
+        "POST",
+        "/api/v1/invitations/accept",
+        Some(json!({ "token": secret })),
+        &root,
+    );
+    assert_eq!(status, 404, "{body}");
+    assert!(!is_member(&f, tenant, f.root));
+
+    let rui = session(&f, "rui");
+    let (status, body) = send(
+        &f,
+        "POST",
+        "/api/v1/invitations/accept",
+        Some(json!({ "token": secret })),
+        &rui,
+    );
+    assert_eq!(
+        (status, body["status"].as_str(), body["tenant"].as_str()),
+        (200, Some("joined"), Some("bench")),
+        "{body}"
+    );
+    assert!(is_member(&f, tenant, f.rui));
+}
+
+// The supported way for a platform administrator to reach a tenant's data, which a benchmark seed uses
+// instead of writing the membership row: a session, a step-up, a stated reason, an audit row.
+#[test]
+fn a_platform_administrator_joins_a_tenant_only_through_the_audited_override() {
+    let f = Fixture::new(1);
+    let tenant = empty_organization(&f, "bench");
+    let path = format!("/api/v1/tenants/bench/members/{}", f.root);
+    let body = json!({ "role": "admin", "reason": "benchmark seed" });
+
+    // A bearer credential never steps up, however broad its scope.
+    let (status, reply) = as_root(&f, "PUT", &path, Some(body.clone()));
+    assert_eq!(status, 403, "{reply}");
+    assert_eq!(reply["details"]["step_up"], true);
+
+    let root = session(&f, "root");
+    let (status, reply) = send(&f, "PUT", &path, Some(body.clone()), &root);
+    assert_eq!(status, 403, "{reply}");
+    assert_eq!(reply["details"]["step_up"], true);
+    assert!(!is_member(&f, tenant, f.root));
+
+    let (status, reply) = send(
+        &f,
+        "POST",
+        "/api/v1/step-up",
+        Some(json!({ "method": "password", "code": PASSWORD })),
+        &root,
+    );
+    assert_eq!(status, 200, "{reply}");
+    let (status, reply) = send(&f, "PUT", &path, Some(json!({ "role": "admin" })), &root);
+    assert_eq!(status, 400, "a reason is required: {reply}");
+    assert!(!is_member(&f, tenant, f.root));
+
+    let (status, reply) = send(&f, "PUT", &path, Some(body), &root);
+    assert_eq!(status, 200, "{reply}");
+    assert!(is_member(&f, tenant, f.root));
+    let audit = f
+        .store
+        .read(|c| sentinel_store::local_auth::recent_audit(c, 4))
+        .unwrap();
+    let override_row = audit
+        .iter()
+        .find(|row| row.event == sentinel_store::local_auth::Event::PlatformOverride)
+        .expect("the override is audited");
+    assert_eq!(override_row.actor, Some(f.root));
+    assert_eq!(override_row.detail.as_deref(), Some("benchmark seed"));
+}

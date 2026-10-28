@@ -871,3 +871,49 @@ fn an_unverified_account_is_looked_at_again_until_it_can_join() {
     f.session_statements(user, 80);
     assert_eq!(marked(&f), f.generation());
 }
+
+#[test]
+fn a_platform_administrator_is_never_joined_by_domain_and_is_checked_again_once_demoted() {
+    let f = fixture();
+    assert!(f.rules("example.com").is_empty());
+    let user = f.claim("ana@example.com");
+    let set_flag = |flag: i64| {
+        f.store
+            .writer()
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE users SET super_admin = ?2 WHERE id = ?1",
+                    params![user.as_bytes(), flag],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    };
+    set_flag(1);
+    let secret = f.link(user);
+    assert!(matches!(
+        email::confirm(&f.store, &secret, at(20)).unwrap(),
+        Confirmation::Verified { .. }
+    ));
+    f.sign_in("ana@example.com");
+    assert_eq!(
+        f.memberships_of(user),
+        0,
+        "joining takes step-up and a reason"
+    );
+    assert_eq!(
+        f.tenants_named(SLUG),
+        0,
+        "and creates no organization either"
+    );
+    assert_eq!(f.count(Event::DomainAutoJoined), 0);
+
+    set_flag(0);
+    f.sign_in("ana@example.com");
+    assert_eq!(
+        f.role_in(SLUG, user),
+        3,
+        "the skipped check was not recorded"
+    );
+    assert_eq!(f.count(Event::DomainAutoJoined), 1);
+}

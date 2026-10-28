@@ -9,6 +9,7 @@
 # Contract pilots-ci revision 4: each lane is the fork's own live pipeline (examples/pilots/, copied into
 # KIT/pilots/), run on a worker with operator-granted egress (job_network = "egress"), so jobs download their
 # dependencies as the GitHub jobs do and a cold sample includes those downloads. Pushes go to the fork's default branch.
+# KIT also holds seed-membership.py (bench/seed-membership.py), which gives the platform admin its tenant membership through the API.
 # The fixture commits use the account's own git identity (user.name and user.email in its git config).
 set -euo pipefail
 MODE=$1 KIT=$2 ROOT=$3
@@ -89,15 +90,6 @@ setup)
     admin worker enroll --pool builders --expires-in 1d > enrollment
     admin token issue --user root --name p14 --scope read,run,tenant-admin,platform-admin --expires-in 7d > token
     printf 'listen = "127.0.0.1:0"\napi_listen = "127.0.0.1:0"\n' > server.toml
-    # The host-local CLI has no membership command and a platform admin cannot add itself over the API.
-    python3 - "$C/metadata.sqlite" <<'PY'
-import sqlite3, sys
-c = sqlite3.connect(sys.argv[1], timeout=20)
-tenant = c.execute("SELECT id FROM tenants WHERE slug = 'acme'").fetchone()[0]
-user = c.execute("SELECT id FROM users WHERE super_admin = 1").fetchone()[0]
-c.execute("INSERT OR REPLACE INTO memberships(tenant_id, user_id, role) VALUES (?, ?, 3)", (tenant, user))
-c.commit()
-PY
   fi
   ;;
 start)
@@ -123,6 +115,10 @@ PY
   echo $! > server.pgid
   link=$(event server.log link_listening); api=$(event server.log api_listening)
   field "$api" addr > api.addr
+  # A platform admin has no ambient tenant access and no host-local command adds it to one; the audited override
+  # (session, step-up, reason) is the supported path, so the membership is made over the running API.
+  printf 'correct horse battery staple' | python3 "$KIT/seed-membership.py" --api "http://$(cat api.addr)/api/v1" \
+    --username root --tenant acme --reason "benchmark seed"
   printf 'controller = "%s"\ncontroller_fingerprint = "%s"\nworker_name = "p14"\nenrollment_file = "%s/enrollment"\njob_network = "egress"\n' \
     "$(field "$link" addr)" "$(field "$link" fingerprint)" "$ROOT" > worker.toml
   start_worker

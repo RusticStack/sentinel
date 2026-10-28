@@ -3050,6 +3050,46 @@ fn the_login_lockout_follows_the_client_a_proxy_names() {
     );
 }
 
+// The request-level budget stands apart from the failure lockout (raised out of reach here): a client
+// past its burst is answered 429 with a retry hint before its password is judged, so even the right
+// password teaches it nothing, while another client is untouched.
+#[test]
+fn a_client_past_its_login_budget_is_refused_before_its_password_is_judged() {
+    let policy = local_auth::Policy {
+        max_failures: 1000,
+        ..local_auth::Policy::default()
+    };
+    let d = deployment_with(policy);
+    let noisy = "198.51.100.7";
+    let mut headers = LOGIN_JSON.to_vec();
+    headers.push(("x-forwarded-for", noisy));
+    let mut first_refusal = None;
+    for attempt in 0..30 {
+        let (status, cookie, body) = raw_login(&d, WRONG_PASSWORD, &headers);
+        assert!(cookie.is_none());
+        match status {
+            401 => {}
+            429 => {
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(body["code"], "rate_limited");
+                assert!(body["details"]["retry_after_ms"].as_u64().unwrap() > 0);
+                first_refusal = Some(attempt);
+                break;
+            }
+            other => panic!("unexpected {other}: {body}"),
+        }
+    }
+    let first_refusal = first_refusal.expect("the budget refused a client that kept going");
+    assert!(
+        first_refusal >= 10,
+        "a burst of 10 is admitted: {first_refusal}"
+    );
+    let (status, cookie, _) = raw_login(&d, RIGHT_PASSWORD, &headers);
+    assert_eq!(status, 429);
+    assert!(cookie.is_none(), "no session for a refused attempt");
+    assert_eq!(login_as(&d, RIGHT_PASSWORD, Some("198.51.100.8")), 200);
+}
+
 #[test]
 fn a_foreign_tenant_slug_lists_as_not_found() {
     let d = deployment();

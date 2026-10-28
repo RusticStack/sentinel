@@ -264,7 +264,7 @@ pub(crate) fn apply_if_due(
     let due = tx
         .prepare_cached(
             "UPDATE users SET auto_join_gen = (SELECT generation FROM auto_join_state)
-             WHERE id = ?1 AND kind = 0 AND active = 1 AND status = 1
+             WHERE id = ?1 AND kind = 0 AND active = 1 AND status = 1 AND super_admin = 0
                AND email_verified_ms IS NOT NULL
                AND auto_join_gen != (SELECT generation FROM auto_join_state)",
         )?
@@ -275,6 +275,7 @@ pub(crate) fn apply_if_due(
     apply(tx, user, now)
 }
 
+/// A platform administrator is never auto-joined: joining a tenant takes step-up and an audited reason.
 pub(crate) fn apply(
     tx: &Transaction<'_>,
     user: UserId,
@@ -284,7 +285,7 @@ pub(crate) fn apply(
         .prepare_cached(
             "SELECT j.slug FROM users u
              JOIN auto_join_domains j ON j.domain = substr(u.email, instr(u.email, '@') + 1)
-             WHERE u.id = ?1 AND u.kind = 0 AND u.active = 1 AND u.status = 1
+             WHERE u.id = ?1 AND u.kind = 0 AND u.active = 1 AND u.status = 1 AND u.super_admin = 0
                AND u.email_verified_ms IS NOT NULL",
         )?
         .query_row([user.as_bytes()], |r| r.get(0))

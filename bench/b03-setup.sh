@@ -118,16 +118,10 @@ PY
   setsid "$BIN" worker --config worker.toml --data-dir "$W" --log-format json > worker.log 2>&1 < /dev/null &
   echo $! > worker.pgid
   event worker.log link_connected >/dev/null
-  # The host-local CLI has no membership command and a platform admin cannot add itself over the API.
-  python3 - "$C/metadata.sqlite" "$(cat user)" <<'PY'
-import sqlite3, sys, uuid
-db, user = sys.argv[1:]
-c = sqlite3.connect(db, timeout=20)
-tenant = c.execute("SELECT id FROM tenants WHERE slug = 'acme'").fetchone()[0]
-c.execute("INSERT OR REPLACE INTO memberships(tenant_id, user_id, role) VALUES (?, ?, 3)",
-          (tenant, uuid.UUID(user.removeprefix("usr_")).bytes))
-c.commit()
-PY
+  # A platform admin has no ambient tenant access and no host-local command adds it to one; the audited override
+  # (session, step-up, reason) is the supported path, so the membership is made over the running API.
+  printf 'correct horse battery staple' | python3 "$KIT/seed-membership.py" --api "http://$(cat api.addr)/api/v1" \
+    --username root --tenant acme --reason "benchmark seed"
   echo "started: git on $port, api on $(cat api.addr)"
   ;;
 stop)
