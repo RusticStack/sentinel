@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Needs rootless Podman, or the worker's executor never starts (see executor_ready in the output).
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/stamp.sh"
+stamp_init
 BIN=${BIN:-$HOME/r06/sentinel}
 WINDOW=${WINDOW:-600}
 SETTLE=${SETTLE:-60}
@@ -74,10 +76,10 @@ worker_up=$(curl -fsS "http://$MET/metrics" | grep -c '^sentinel_worker_connecte
 scraped=$(curl -fsS -H "authorization: Bearer $TOKEN" "http://$API/metrics" | grep -c '^sentinel_workers{state="connected"} 1$' || true)
 
 python3 - "$s0" "$s1" "$w0" "$w1" "$t0" "$t1" "$ticks" "$smax" "$slast" "$wmax" "$wlast" \
-  "$ready" "$worker_up" "$scraped" "$EXEC" "$("$BIN" --version)" <<'PY'
+  "$ready" "$worker_up" "$scraped" "$EXEC" "$("$BIN" --version)" "{$STAMP_BODY}" <<'PY'
 import json, os, platform, sys, time
 s0, s1, w0, w1, t0, t1, ticks, smax, slast, wmax, wlast = (int(x) for x in sys.argv[1:12])
-ready, worker_up, scraped, executor, version = sys.argv[12:17]
+ready, worker_up, scraped, executor, version, stamp = sys.argv[12:18]
 wall = (t1 - t0) / 1e9
 def pct(a, b):
     return round((b - a) / ticks / wall * 100, 4)
@@ -86,7 +88,7 @@ cpu_model = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l
 print(json.dumps({
     "schema": "sentinel-bench/1", "workload": "r06-idle", "version": version,
     "started_at_unix_ms": int(time.time() * 1000) - int(wall * 1000),
-    "host": {"kernel": platform.release(), "cpu_model": cpu_model, "cpus_online": os.cpu_count()},
+    **json.loads(stamp),
     "window_s": round(wall, 1),
     "controller": {"rss_max_mib": mib(smax), "rss_last_mib": mib(slast), "cpu_pct_of_core": pct(s0, s1)},
     "worker": {"rss_max_mib": mib(wmax), "rss_last_mib": mib(wlast), "cpu_pct_of_core": pct(w0, w1),
