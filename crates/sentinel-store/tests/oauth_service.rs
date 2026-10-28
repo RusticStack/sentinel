@@ -769,3 +769,41 @@ fn creating_a_service_account_is_audited_and_needs_an_administrator() {
         "a refusal writes nothing"
     );
 }
+
+fn plan(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap_or_else(|e| panic!("SQLite refused {sql}: {e}"));
+    let values = vec![rusqlite::types::Value::Null; stmt.parameter_count()];
+    stmt.query_map(rusqlite::params_from_iter(values), |r| r.get(3))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+#[test]
+fn revoking_minted_grants_seeks_the_minter_by_key_and_never_walks_other_users_grants() {
+    let (_dir, store, _) = fixture();
+    // Each statement is one index search on `created_by`; none may fall back to the expiry
+    // or user indexes, which would read every unexpired grant of every account.
+    for (sql, search) in [
+        (
+            oauth::REVOKE_MINTED_BY_SESSION,
+            "SEARCH oauth_grants USING INDEX oauth_grants_by_created_session \
+             (created_by=? AND created_session=?)",
+        ),
+        (
+            oauth::REVOKE_MINTED_BY_USER,
+            "SEARCH oauth_grants USING INDEX oauth_grants_by_created_session \
+             (created_by=? AND created_session>?)",
+        ),
+        (
+            oauth::REVOKE_MINTED_LEGACY,
+            "SEARCH oauth_grants USING INDEX oauth_grants_by_unattributed_minter \
+             (created_by=? AND created_ms>? AND created_ms<?)",
+        ),
+    ] {
+        let plan = store.read(|c| Ok(plan(c, sql))).unwrap();
+        assert_eq!(plan, [search], "{sql}");
+    }
+}
