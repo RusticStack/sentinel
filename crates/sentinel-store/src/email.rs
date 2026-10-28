@@ -21,10 +21,15 @@ const DAY_MS: i64 = 24 * HOUR_MS;
 pub const VERIFICATION_TTL_MS: i64 = DAY_MS;
 pub const RESENDS_PER_WINDOW: i64 = 5;
 pub const RESEND_WINDOW_MS: i64 = HOUR_MS;
+/// Messages one mailbox may be sent per `RESEND_WINDOW_MS`, whoever asked for them.
 pub const RECIPIENT_PER_WINDOW: i64 = 5;
+/// Least gap between two messages of one kind to one mailbox, whoever asked for them.
+pub const RECIPIENT_COOLDOWN_MS: i64 = 60 * 1000;
 pub const MAX_PENDING: i64 = 2_000;
 pub const MAX_ATTEMPTS: u32 = 8;
 pub const RETAIN_MS: i64 = 7 * DAY_MS;
+/// An email-registered account whose address was never verified is retired this long after it registered.
+pub const UNVERIFIED_TTL_MS: i64 = 7 * DAY_MS;
 pub const MAX_EMAIL_BYTES: usize = 254;
 const MAX_LOCAL_BYTES: usize = 64;
 
@@ -201,6 +206,33 @@ pub(crate) struct Outgoing<'a> {
     pub ttl_ms: i64,
 }
 
+/// The mailbox's allowance, shared by every requester: the outbox bound, the per-hour cap, and a
+/// cooldown between two messages of one kind (an invitation does not delay a verification).
+pub(crate) fn recipient_allows(
+    conn: &Connection,
+    recipient: &str,
+    kind: Kind,
+    now: UnixMillis,
+) -> Result<bool> {
+    let pending: i64 = conn
+        .prepare_cached("SELECT COUNT(*) FROM mail_outbox WHERE state = 0")?
+        .query_row([], |r| r.get(0))?;
+    if pending >= MAX_PENDING {
+        return Ok(false);
+    }
+    let (recent, last_of_kind): (i64, Option<i64>) = conn
+        .prepare_cached(
+            "SELECT COUNT(*), MAX(CASE WHEN kind = ?3 THEN created_ms END) FROM mail_outbox
+             WHERE recipient = ?1 AND created_ms > ?2",
+        )?
+        .query_row(
+            params![recipient, now.0 - RESEND_WINDOW_MS, kind as u8],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+    Ok(recent < RECIPIENT_PER_WINDOW
+        && last_of_kind.is_none_or(|last| last <= now.0.saturating_sub(RECIPIENT_COOLDOWN_MS)))
+}
+
 pub(crate) fn enqueue(
     tx: &Transaction<'_>,
     key: &Key,
@@ -214,15 +246,7 @@ pub(crate) fn enqueue(
         body,
         ttl_ms,
     } = *message;
-    let pending: i64 = tx
-        .prepare_cached("SELECT COUNT(*) FROM mail_outbox WHERE state = 0")?
-        .query_row([], |r| r.get(0))?;
-    let recent: i64 = tx
-        .prepare_cached(
-            "SELECT COUNT(*) FROM mail_outbox WHERE recipient = ?1 AND created_ms > ?2",
-        )?
-        .query_row(params![recipient, now.0 - RESEND_WINDOW_MS], |r| r.get(0))?;
-    if pending >= MAX_PENDING || recent >= RECIPIENT_PER_WINDOW {
+    if !recipient_allows(tx, recipient, kind, now)? {
         return Ok(false);
     }
     let id = MailId::new();
@@ -392,8 +416,16 @@ fn request_canonical(
     if minted >= RESENDS_PER_WINDOW {
         return Ok(Requested::Throttled);
     }
+    let delivery = match (key, delivery_url(tx)?) {
+        (Some(key), Some(url)) => Some((key, url)),
+        _ => None,
+    };
+    // Judged before the token is minted: a refused request must not void the link already mailed.
+    if delivery.is_some() && !recipient_allows(tx, email, Kind::Verification, now)? {
+        return Ok(Requested::Throttled);
+    }
     let secret = mint(tx, user, email, invitation, now, false)?;
-    let (Some(key), Some(url)) = (key, delivery_url(tx)?) else {
+    let Some((key, url)) = delivery else {
         return Ok(Requested::Undelivered);
     };
     let (subject, body) = verification_message(&url, &secret);
@@ -844,6 +876,55 @@ pub fn purge(store: &Store, now: UnixMillis, limit: u32) -> Result<usize> {
             params![horizon, limit],
         )?;
         Ok(touched)
+    })
+}
+
+/// Retires email-registered accounts whose address was never verified within `UNVERIFIED_TTL_MS` of
+/// registering, at most `limit` per call. Only an account that holds nothing qualifies: no
+/// membership, session, API token, OAuth grant, external identity or second factor, and not a
+/// platform administrator. Its generated sign-in name, password hash, pending links and address are
+/// removed and the row stays as a rejected tombstone with a placeholder name, because the
+/// append-only audit record references it.
+pub fn purge_unverified(store: &Store, now: UnixMillis, limit: u32) -> Result<usize> {
+    let horizon = now.0.saturating_sub(UNVERIFIED_TTL_MS);
+    store.writer().write(move |tx| {
+        let ids: Vec<[u8; 16]> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT u.id FROM users u
+                 WHERE u.kind = 0 AND u.status IN (0, 1) AND u.super_admin = 0
+                   AND u.email IS NOT NULL AND u.email_verified_ms IS NULL AND u.created_ms <= ?1
+                   AND EXISTS(SELECT 1 FROM local_credentials c WHERE c.user_id = u.id
+                              AND c.username = 'user-' || lower(hex(substr(u.id, 1, 6))))
+                   AND NOT EXISTS(SELECT 1 FROM memberships WHERE user_id = u.id)
+                   AND NOT EXISTS(SELECT 1 FROM sessions WHERE user_id = u.id)
+                   AND NOT EXISTS(SELECT 1 FROM api_tokens WHERE user_id = u.id)
+                   AND NOT EXISTS(SELECT 1 FROM oauth_grants WHERE user_id = u.id)
+                   AND NOT EXISTS(SELECT 1 FROM external_identities WHERE user_id = u.id)
+                   AND NOT EXISTS(SELECT 1 FROM mfa_totp WHERE user_id = u.id)
+                 ORDER BY u.created_ms LIMIT ?2",
+            )?;
+            stmt.query_map(params![horizon, limit], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for id in &ids {
+            let user = UserId::from_bytes(*id).map_err(|_| Error::Corrupt("user_id"))?;
+            tx.execute("DELETE FROM local_credentials WHERE user_id = ?1", [id])?;
+            tx.execute("DELETE FROM email_verifications WHERE user_id = ?1", [id])?;
+            tx.execute(
+                "UPDATE users SET active = 0, status = 2, email = NULL,
+                    display_name = 'expired registration' WHERE id = ?1",
+                [id],
+            )?;
+            audit(
+                tx,
+                Event::UnverifiedAccountPurged,
+                None,
+                Some(user),
+                false,
+                Some("address never verified"),
+            )?;
+        }
+        Ok(ids.len())
     })
 }
 

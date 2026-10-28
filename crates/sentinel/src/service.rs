@@ -1480,13 +1480,18 @@ fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
     let wall = sentinel_core::UnixMillis::now();
     // Idempotency keys are stamped by the deadline clock, so their TTL is judged on it.
     let steady = sentinel_core::UnixMillis::steady();
-    let purges: [(&str, Purge, sentinel_core::UnixMillis); 8] = [
+    let purges: [(&str, Purge, sentinel_core::UnixMillis); 9] = [
         ("setup", sentinel_store::setup::purge, wall),
         ("oauth", sentinel_store::oauth::purge_expired, wall),
         ("api_tokens", sentinel_store::tokens::purge_expired, wall),
         ("sessions", sentinel_store::local_auth::purge_expired, wall),
         ("sign_in", sentinel_store::sign_in::purge_expired, wall),
         ("email", sentinel_store::email::purge, wall),
+        (
+            "unverified_accounts",
+            sentinel_store::email::purge_unverified,
+            wall,
+        ),
         (
             "idempotency",
             sentinel_store::idempotency::purge_expired,
