@@ -489,6 +489,9 @@ pub struct EventContext {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobContext {
     pub source: Option<sentinel_protocol::source::Access>,
+    /// Worker-local, never on the wire: the monotonic instant at which `source` stops being usable, stamped
+    /// when the access arrives. The wall-clock `expires_ms` inside the access can be stepped by the host clock.
+    pub source_valid_until: Option<std::time::Instant>,
     pub run: RunId,
     pub repo: RepoId,
     pub repo_name: String,
@@ -503,6 +506,8 @@ pub struct JobContext {
 }
 
 pub const SOURCE_ACCESS_WINDOW_MS: i64 = 12 * 60 * 1000;
+const SOURCE_ACCESS_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(SOURCE_ACCESS_WINDOW_MS as u64);
 
 const fn outcome_code(outcome: Outcome) -> u8 {
     match outcome {
@@ -581,6 +586,7 @@ impl JobContext {
             AttemptId::from_bytes(wire.attempt).map_err(|_| Error::Protocol("id"))?,
             JobContext {
                 source: None,
+                source_valid_until: None,
                 run: RunId::from_bytes(wire.run).map_err(|_| Error::Protocol("id"))?,
                 repo: RepoId::from_bytes(wire.repo).map_err(|_| Error::Protocol("id"))?,
                 repo_name: wire.repo_name,
@@ -614,6 +620,7 @@ impl JobContext {
             AttemptId::from_bytes(wire.attempt).map_err(|_| Error::Protocol("id"))?,
             JobContext {
                 source: None,
+                source_valid_until: None,
                 run: RunId::from_bytes(wire.run).map_err(|_| Error::Protocol("id"))?,
                 repo: RepoId::from_bytes(wire.repo).map_err(|_| Error::Protocol("id"))?,
                 repo_name: wire.repo_name,
@@ -3330,6 +3337,9 @@ fn handle_bulk_message(
                 return Err(Error::Protocol("source access"));
             }
             let access = access.rebased(UnixMillis::now().0, SOURCE_ACCESS_WINDOW_MS);
+            // An unrepresentable instant fails closed: the access is already expired.
+            let now = std::time::Instant::now();
+            let valid_until = now.checked_add(SOURCE_ACCESS_WINDOW).unwrap_or(now);
             let context = state
                 .contexts
                 .get_mut(&attempt)
@@ -3337,6 +3347,7 @@ fn handle_bulk_message(
             if context.source.replace(access).is_some() {
                 return Err(Error::Protocol("duplicate source"));
             }
+            context.source_valid_until = Some(valid_until);
         }
         ServerMessage::LogAck { attempt, through } => {
             let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
@@ -3830,6 +3841,7 @@ mod tests {
     fn context(tenant: Option<TenantId>, trust: Trust) -> JobContext {
         JobContext {
             source: None,
+            source_valid_until: None,
             run: RunId::new(),
             repo: RepoId::new(),
             repo_name: "org/repo".to_string(),

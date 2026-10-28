@@ -392,6 +392,9 @@ impl Limits {
 const KEEPALIVE: &str =
     "trap 'exit 0' TERM INT; n=$1; while [ \"$n\" -gt 0 ]; do sleep 1; n=$((n-1)); done";
 
+/// Where a job sees its scratch directory; a [`Mount`] at this path replaces the default tmpfs.
+pub const TMP_MOUNT: &str = "/tmp";
+
 #[derive(Clone, Debug)]
 pub struct Mount {
     pub host: std::path::PathBuf,
@@ -627,8 +630,6 @@ impl Container {
             .args(["--network", network.argument()])
             .args([
                 "--read-only",
-                "--tmpfs",
-                "/tmp:rw,nosuid,nodev,size=1g",
                 "--cap-drop",
                 "ALL",
                 "--security-opt",
@@ -644,6 +645,15 @@ impl Container {
             ])
             .arg("--volume")
             .arg(format!("{}:{WORKSPACE_MOUNT}", workspace.display()));
+        // A job's `/tmp` is a directory on the workspace disk when the caller supplies one (the executor always
+        // does), so it draws on the job's disk budget like the workspace. Without one it is a tmpfs, which the
+        // container's memory limit already bounds, so it is sized to that limit and no smaller.
+        if !mounts.iter().any(|mount| mount.container == TMP_MOUNT) {
+            cmd.arg("--tmpfs").arg(format!(
+                "{TMP_MOUNT}:rw,nosuid,nodev,size={}",
+                limits.memory_bytes
+            ));
+        }
         // Caches declared at absolute paths keep their bytes in the workspace's private directory; an empty
         // read-only tmpfs over it keeps tools that walk the tree (gofmt, linters, globs) from finding them twice.
         // `notmpcopyup`: Podman otherwise copies the directory's contents into a new tmpfs.
@@ -658,11 +668,15 @@ impl Container {
                 .arg(format!("fsize={0}:{0}", limits.disk_bytes));
         }
         for mount in mounts {
+            let options = match (mount.read_only, mount.container == TMP_MOUNT) {
+                (true, _) => "ro",
+                (false, true) => "rw,nosuid,nodev",
+                (false, false) => "rw",
+            };
             cmd.arg("--volume").arg(format!(
-                "{}:{}:{}",
+                "{}:{}:{options}",
                 mount.host.display(),
-                mount.container,
-                if mount.read_only { "ro" } else { "rw" }
+                mount.container
             ));
         }
         cmd.arg("--")

@@ -508,3 +508,104 @@ fn a_mounted_cache_is_seen_where_declared_and_never_under_the_workspace() {
     );
     assert_eq!(fs::read_to_string(cache.join("new.go")).unwrap(), "built\n");
 }
+
+fn start_with_tmp(
+    root: &std::path::Path,
+    ws: &Workspace,
+    memory_bytes: u64,
+    disk_bytes: u64,
+) -> (Container, WorkerId) {
+    let authfile = authfile(root);
+    podman::pull(
+        IMAGE,
+        &authfile,
+        &podman::Store::Shared,
+        Duration::from_secs(600),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    let worker = WorkerId::new();
+    let tmp = podman::Mount {
+        host: ws.create_tmp().unwrap(),
+        container: podman::TMP_MOUNT.into(),
+        read_only: false,
+    };
+    let container = Container::start(
+        worker,
+        ws.attempt(),
+        IMAGE,
+        Limits {
+            cpu_millis: 500,
+            memory_bytes,
+            pids: 32,
+            disk_bytes,
+            lifetime_secs: 0,
+        },
+        ws.path(),
+        &[tmp],
+        &podman::Store::Shared,
+        podman::Network::None,
+    )
+    .unwrap();
+    (container, worker)
+}
+
+#[test]
+fn a_job_tmp_outgrows_the_old_one_gib_tmpfs_on_the_workspace_disk() {
+    if !enabled() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    // 512 MiB of memory and a 3 GiB disk budget: a 1.1 GiB file in /tmp can only succeed if /tmp is disk, not a
+    // memory-charged tmpfs. (Dirty page cache is charged to the cgroup like any workspace write, so the limit
+    // must leave room for write-back to keep up.)
+    let (container, worker) = start_with_tmp(temp.path(), &ws, 512 << 20, 3 << 30);
+    let big = 1100u64 << 20;
+    let exit = container
+        .exec(
+            &sh(
+                "dd if=/dev/zero of=/tmp/big bs=1M count=1100 2>/dev/null; \
+                 ls -l /tmp/big; ls -ld /tmp; mount | grep ' on /tmp ' || true",
+                300,
+            ),
+            &[],
+        )
+        .unwrap();
+    let text = String::from_utf8_lossy(&exit.stdout).to_string();
+    assert_eq!(exit.code, Some(0), "{text} {}", exit.stderr_excerpt());
+    assert!(text.contains(&big.to_string()), "{text}");
+    assert!(
+        text.contains("drwxrwxrwt"),
+        "sticky and world-writable: {text}"
+    );
+    assert_eq!(container.oom_kills().unwrap(), 0);
+    // The bytes are on the host in the directory the workspace owns, not in memory.
+    assert_eq!(fs::metadata(ws.tmp_path().join("big")).unwrap().len(), big);
+    container.destroy().unwrap();
+    assert!(podman::owned(worker).unwrap().is_empty());
+    let tmp = ws.tmp_path();
+    ws.destroy().unwrap();
+    assert!(!tmp.exists(), "the job /tmp goes with its workspace");
+}
+
+#[test]
+fn a_file_in_tmp_is_bound_by_the_jobs_disk_budget() {
+    if !enabled() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    let (container, worker) = start_with_tmp(temp.path(), &ws, 256 << 20, 64 << 20);
+    let exit = container
+        .exec(&sh("dd if=/dev/zero of=/tmp/big bs=1M count=100", 60), &[])
+        .unwrap();
+    assert_ne!(exit.code, Some(0), "a 100 MiB file passed a 64 MiB cap");
+    assert!(
+        fs::metadata(ws.tmp_path().join("big")).map_or(0, |m| m.len()) <= 64 << 20,
+        "the per-file cap stopped the write"
+    );
+    container.destroy().unwrap();
+    assert!(podman::owned(worker).unwrap().is_empty());
+    ws.destroy().unwrap();
+}

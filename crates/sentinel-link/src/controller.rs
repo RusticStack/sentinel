@@ -2403,6 +2403,7 @@ fn resolve_spec(
         let bytes = dispatch::spec_bytes(&tx, worker, attempt)?;
         let context = JobContext {
             source: None,
+            source_valid_until: None,
             run: c.run,
             repo: c.repo,
             repo_name: c.repo_name,

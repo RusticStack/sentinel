@@ -117,6 +117,17 @@ after a mirror lock wait or timeout still holds a valid access. The access
 exists only in the attempt's in-memory context, bounded by the attempt's fence
 and lease, and is never persisted or re-sent.
 
+The restated wall-clock expiry can still be moved by a host clock step, so
+receipt also stamps a **monotonic** `Instant` (`JobContext::source_valid_until`,
+`now + 12 min`, worker-local and never on the wire). The checkout functions
+(`checkout_mirrored`, `through_mirror`, `checkout_authorized`) take it: an access
+whose instant has passed is refused with `source access expired` before the
+workspace is initialised, the credential is opened, or any connection is made,
+and every checkout deadline is capped by the validity that remains. This covers
+the mirror attempt and the direct fallback after it, each of which re-checks
+and re-caps. An unrepresentable instant is treated as already expired. The
+controller's own wall-clock validation of the 60 s access is unchanged.
+
 `checkout::checkout_authorized` validates the access object (expiry, exact
 remote, allowed ref) before starting Git, then:
 
@@ -284,6 +295,11 @@ the event context; a worker below protocol 3 is served `NoSpec`. Intake uses
   no credential file left behind; a real `sshd` deployment-key checkout with
   pinned host trust and a refused wrong host, both proving the private
   directory is removed and the key never reaches `.git/config`.
+- `crates/sentinel-worker/tests/checkout.rs` and `tests/mirror.rs`: a
+  monotonically expired access is refused on the direct, mirrored and mirror
+  fallback routes before any file, credential or connection (a loopback
+  listener sees no connection), and a remaining validity of seconds caps a
+  60 s checkout or fallback deadline against a remote that never answers.
 - `crates/sentinel-link/tests/source_delivery.rs`: a bound source reaches a
   protocol-2 worker with its credential only after acknowledgement, its
   validity restated on the worker's clock to cover a whole checkout, and a
