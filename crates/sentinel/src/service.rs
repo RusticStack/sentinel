@@ -2234,6 +2234,7 @@ mod worker_role {
                     sentinel_worker::executor::Notice::ShutDown { ended, left, handed_back } => {
                         tracing::info!(event = "attempts_shut_down", ended, left, handed_back);
                     }
+                    sentinel_worker::executor::Notice::CacheFigures(_) => {}
                     sentinel_worker::executor::Notice::Availability(snapshot) => {
                         tracing::info!(event = "availability", images_held = snapshot.images_held.len(), images_in_flight = snapshot.images_in_flight, cache_entries = snapshot.cache_entries, cache_generations = snapshot.cache_generations, cache_bytes = snapshot.cache_bytes, truncated = snapshot.truncated);
                     }

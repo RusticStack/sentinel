@@ -16,7 +16,7 @@ pub mod scope;
 
 pub use attach::{Attached, Committed, Costly, Stats, Target};
 pub use clone::Backend;
-pub use cost::CostBook;
+pub use cost::{ClassFigures, CostBook, Estimate};
 pub use manifest::{Boundary, Compat, FileEntry, FilesBlob, Manifest, Request};
 pub use outcome::{Hit, Miss, Outcome};
 pub use scope::{Os, Platform, Scope};

@@ -373,6 +373,8 @@ pub trait Report: Send + Sync {
         _stats: &sentinel_cache::Stats,
     ) {
     }
+    /// The attempt's cache figures, once per attempt that declared a cache entry.
+    fn cache_records(&self, _attempt: AttemptId, _records: &[CacheRecord]) {}
     fn remote(&self) -> Option<Arc<dyn sentinel_cache::remote::Remote>> {
         None
     }
@@ -550,6 +552,14 @@ pub fn run(
         .take(MAX_CACHE_RECORDS)
         .map(|(attached, costly)| cache_record(attached, costly.is_some()))
         .collect();
+    if let Some(book) = report.cost_book()
+        && matches!(verdict, Verdict::Passed)
+    {
+        book.observe_run(&job.caches, summary.steps_ns.unwrap_or(0));
+    }
+    if !summary.caches.is_empty() {
+        report.cache_records(job.attempt, &summary.caches);
+    }
     match summary.encode() {
         Ok(bytes) => report.finish(job.attempt, job.fence, event, bytes),
         Err(_) => report.event(job.attempt, job.fence, event),
