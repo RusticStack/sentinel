@@ -1,5 +1,0 @@
-# Supply chain: refuse any package version published less than seven days
-# ago (minutes), so a freshly hijacked release is not installed.
-minimumReleaseAge: 10080
-allowBuilds:
-  esbuild: true

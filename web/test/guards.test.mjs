@@ -1,8 +1,8 @@
 // Run with node --test on Node 22.18+, which strips the TypeScript types.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyProxyPath, clientAddress } from "../server/utils/guard.ts";
-import { pendingReturn, RETURN_SECONDS, returnCookie, sameOriginPath } from "../app/utils/redirect.ts";
+import { classifyProxyPath, clientAddress } from "../src/server/guard.ts";
+import { pendingReturn, RETURN_SECONDS, returnCookie, sameOriginPath } from "../src/lib/redirect.ts";
 
 test("controller paths proxy and others pass", () => {
   assert.equal(classifyProxyPath("/api/v1/runs?x=1", "GET").kind, "proxy");

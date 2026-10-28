@@ -26,7 +26,7 @@ Build a fully open-source, self-hosted CI engine optimized for fast feedback on 
 | Original assumption | Decision |
 |---|---|
 | One queue, slots on one VPS | Durable event-driven fleet scheduler with resource reservations and fairness |
-| Reuse/fork the Fresh UI | New UI (Nuxt 4 today, moving to TanStack Start, [16.4](#164-web-interface-on-tanstack-start)); the old implementation is reference material |
+| Reuse/fork the Fresh UI | New UI (TanStack Start since Part 20, [16.4](#164-web-interface-on-tanstack-start); Nuxt 4 before it); the old implementation is reference material |
 | Go or Rust; four mandatory processes | Rust workspace; server embeds storage; workers remain separate execution boundaries; the optional web interface is its own Node process |
 | Dropping Actions guarantees speed | Measure dispatch, preparation, execution, transfer, and total feedback independently |
 | Migrating means rewriting CI | Runner mode: change `runs-on:`, keep the workflows; native pipelines are the optional full-speed path ([16.10](#1610-github-actions-runner-mode)) |
@@ -76,14 +76,14 @@ One Rust workspace, initially one `sentinel` binary with subcommands:
 
 Keep roles in separate processes/OS identities. The web server never executes repository code. A smaller worker executable can follow if distribution measurements warrant it.
 
-Crates are split by boundary and created when useful, not as empty scaffolding; the current set is in the [AGENTS.md](AGENTS.md#layout) layout table. `web/` holds the web interface (Nuxt 4 today, being replaced by TanStack Start, [16.4](#164-web-interface-on-tanstack-start)); `fixtures/` and `bench/` hold reproducible workloads and records.
+Crates are split by boundary and created when useful, not as empty scaffolding; the current set is in the [AGENTS.md](AGENTS.md#layout) layout table. `web/` holds the web interface (TanStack Start, [16.4](#164-web-interface-on-tanstack-start)); `fixtures/` and `bench/` hold reproducible workloads and records.
 
 ### Dependency policy
 
 - Use maintained Rust libraries for async networking, TLS, serialization, hashing, compression, and embedded SQLite. Pin and justify dependencies.
 - Required worker tooling: Git and a rootless OCI runtime. **Podman first**; Docker only after runtime conformance tests. On a KVM host, after v0.1, a VMM: Firecracker for Linux guests and Cloud Hypervisor for Windows guests ([16.8](#168-microvm-execution-on-kvm-hosts)). Do not implement containers, cryptography, TLS, or Git transport ourselves.
 - Project tools (Go, Rust, Python, Java, Node, Bun, pnpm, Gradle, Bazel, compilers, browsers, builders) belong in project-selected versioned images/scripts. Cookbook profiles expose cache paths and diagnostics, not privileged plugins. Optional runtime capabilities must be justified across workloads; one repository's Docker or emulation harness does not mandate VM lifecycle support in Sentinel.
-- No required Redis, Postgres, MinIO, Elasticsearch, Kubernetes, Deno, or message broker. The web interface is an optional Node process (`sentinel-web`; Nuxt 4 now, TanStack Start next): the owner chose a full-stack interface over build-time-only assets for its components, server rendering and maintainability; the controller, CLI and MCP never need it. It holds no credential and no state. `sentinel-ai` is the same kind of optional Node process.
+- No required Redis, Postgres, MinIO, Elasticsearch, Kubernetes, Deno, or message broker. The web interface is an optional Node process (`sentinel-web`; TanStack Start since Part 20, Nuxt 4 before): the owner chose a full-stack interface over build-time-only assets for its components, server rendering and maintainability; the controller, CLI and MCP never need it. It holds no credential and no state. `sentinel-ai` is the same kind of optional Node process.
 - Build the application-specific storage layer ourselves; embed SQLite instead of inventing a database engine. Reconsider a custom engine only after profiling demonstrates a real bottleneck and a separate durability/recovery design exists.
 - Optional Tailcat helper/self-hosted DERP and optional S3 are explicit dependencies, not hidden cloud requirements.
 
@@ -320,7 +320,7 @@ Stdio uses the CLI's locally provisioned credential source; it does not run an H
 
 ### Human UI
 
-`sentinel-web` runs beside the controller, renders pages as the signed-in person, streams live run and log updates as server-sent events (the controller's long polls, held on the browser's behalf) and proxies the controller's routes as one origin. The current code is Nuxt 4 (Vue, TypeScript, Nuxt UI), chosen after measuring the accessible live-log view four ways: windowing is what matters ([web interface](docs/web-ui.md#stack-choice)). It is being replaced, view by view, by a TanStack Start application with the same process role and budgets against a measured baseline ([16.4](#164-web-interface-on-tanstack-start)).
+`sentinel-web` runs beside the controller, renders pages as the signed-in person, streams live run and log updates as server-sent events (the controller's long polls, held on the browser's behalf) and proxies the controller's routes as one origin. The first code was Nuxt 4 (Vue, TypeScript, Nuxt UI), chosen after measuring the accessible live-log view four ways: windowing is what matters ([web interface](docs/web-ui.md#stack-choice)). Part 20 replaced it, view by view through a strangler front, with a TanStack Start application (React, Tailwind CSS v4), lighter and faster against a measured baseline ([16.4](#164-web-interface-on-tanstack-start)).
 
 - Runs by installation/repo/branch/PR/SHA, queue/execute timings, cache effectiveness.
 - Failure summary first, file/test evidence links, job DAG, step timelines.
@@ -491,7 +491,7 @@ Gate: each part's own measured gates in section 16; no regression of the B03 bud
 
 ## 14. Decisions and open questions
 
-Adopted: purpose-built performance-first Rust CI engine; strict native pipelines plus a GitHub Actions runner mode for migration by `runs-on:` (one GitHub App, permissions per enabled feature); preserved legacy/new UI (Nuxt now, TanStack Start next); multi-org auth/super-admin registrations; OAuth CLI/MCP and scoped secret management; one active controller with UI-generated worker-only Tailcat enrollment, controller-owned host ceilings/priority and fastest-eligible placement; Linux-first fleet with the sandbox chosen by host (rootless Podman; Firecracker/Cloud Hypervisor microVMs with KVM; no QEMU) and operator-granted egress; durable push scheduling with pushed cancellation; first-class local/compiler/image caches and artifacts on Sentinel's own disks for both modes; SQLite/owned file storage; optional S3; pinned Tailcat/direct TLS; shared API; bounded diagnostics (an 8 KiB default failure view); advisory AI on Effect 4 and OpenRouter, off by default; B11's 2× Blacksmith objective plus B08's same-hardware sub-minute ambition measured on the pilots; Part 24 starting before further optimization and closing before release; MIT/no usage gate. Supporting many project tools does not mean a generic automation framework. Repository adaptation must not dictate fundamental runtime changes.
+Adopted: purpose-built performance-first Rust CI engine; strict native pipelines plus a GitHub Actions runner mode for migration by `runs-on:` (one GitHub App, permissions per enabled feature); preserved legacy/new UI (TanStack Start since Part 20); multi-org auth/super-admin registrations; OAuth CLI/MCP and scoped secret management; one active controller with UI-generated worker-only Tailcat enrollment, controller-owned host ceilings/priority and fastest-eligible placement; Linux-first fleet with the sandbox chosen by host (rootless Podman; Firecracker/Cloud Hypervisor microVMs with KVM; no QEMU) and operator-granted egress; durable push scheduling with pushed cancellation; first-class local/compiler/image caches and artifacts on Sentinel's own disks for both modes; SQLite/owned file storage; optional S3; pinned Tailcat/direct TLS; shared API; bounded diagnostics (an 8 KiB default failure view); advisory AI on Effect 4 and OpenRouter, off by default; B11's 2× Blacksmith objective plus B08's same-hardware sub-minute ambition measured on the pilots; Part 24 starting before further optimization and closing before release; MIT/no usage gate. Supporting many project tools does not mean a generic automation framework. Repository adaptation must not dictate fundamental runtime changes.
 
 Open questions, to resolve through hardware and workflow evidence:
 

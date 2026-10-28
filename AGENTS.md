@@ -68,7 +68,7 @@ All aliases pass `--locked`; a dependency change must update and commit `Cargo.l
 | `crates/sentinel` | CLI (`pipeline`, `api` client, host-local `admin`) plus Linux `server`/`worker` roles behind features |
 | `crates/sentinel-bench` | Benchmark runner and contract checks; see [docs/benchmarking.md](docs/benchmarking.md), [benchmark contracts](docs/benchmark-contracts.md) |
 | `crates/sentinel-probes` | SQLite/clone probes; see [docs/feasibility-probes.md](docs/feasibility-probes.md) |
-| `web/` | The web interface, `sentinel-web` (Nuxt 4, Vue, TypeScript, Nuxt UI; pnpm): pages, live event streams, the proxy to the API, its tests and benchmark; see [web interface](docs/web-ui.md) |
+| `web/` | The web interface, `sentinel-web` (TanStack Start, React, TypeScript, Tailwind CSS v4; pnpm), its own Node process with server rendering: pages, live event streams, the proxy to the API, its tests and benchmark; see [web interface](docs/web-ui.md) |
 | `bench/` | Committed machine-readable benchmark records, frozen contracts (`bench/contracts/`), harness scripts and host setup (`bench/hosts/`) |
 | `fixtures/` | Valid and invalid pipeline fixtures exercised by tests |
 | `docs/` | Contracts and guides: [development](docs/development.md), [configuration](docs/configuration.md), [runtime foundations](docs/runtime-foundation.md) |

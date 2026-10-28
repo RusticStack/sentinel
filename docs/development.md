@@ -72,7 +72,7 @@ pnpm -C web build
 cargo test -p sentinel-api --test web_browser -- --ignored --nocapture the_web_interface
 ```
 
-The browser test starts a seeded controller and the built interface; `serve_the_fixture` (same test binary) serves them for a person to look at (`SENTINEL_SERVE_SECS`, default 600). For live editing, run `pnpm -C web dev` with `NUXT_SENTINEL_API` pointing at a controller (or at a running `sentinel-web`, which proxies the API); sign in on the origin the controller names as `public_url`, whose session cookie the dev server shares (cookies ignore the port).
+The browser test starts a seeded controller and the built interface; `serve_the_fixture` (same test binary) serves them for a person to look at (`SENTINEL_SERVE_SECS`, default 600). For live editing, run `pnpm -C web dev` with `SENTINEL_API` pointing at a controller (or at a running `sentinel-web`, which proxies the API); sign in on the origin the controller names as `public_url`, whose session cookie the dev server shares (cookies ignore the port).
 
 Each command returns Cargo's exit status. Stop and fix failures before proceeding. There is no aggregate alias hiding intermediate failures. Extra test arguments can be appended, for example `cargo test-linux -- --nocapture`.
 

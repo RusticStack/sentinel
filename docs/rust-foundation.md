@@ -92,7 +92,7 @@ Also check `server` and `worker` individually on Linux, and verify each is rejec
 | Storage, TLS, HTTP | `rusqlite` (bundled SQLite), `rustls` with `ring`, `ureq` with rustls | Used by the store, link, S3 and API crates; no async runtime |
 | Development tooling | Pinned Cargo, rustfmt, Clippy | Toolchain components, not production services |
 | OS/runtime prerequisites | Native linker/SDK for linking | Git and rootless Podman are Linux worker runtime tools, not server/CLI dependencies |
-| UI | Nuxt server in `web/` ([web UI](web-ui.md)) | A separate `sentinel-web` process; not part of the Rust build |
+| UI | TanStack Start server in `web/` ([web UI](web-ui.md)) | A separate `sentinel-web` process; not part of the Rust build |
 | S3 / Tailcat | `sentinel-s3` client; Tailcat helper | Optional; no mandatory external service |
 
 There is no `[workspace.dependencies]` catalog. Exact versions, including proc-macro and platform transitive dependencies, are committed in `Cargo.lock`. Only `crates/sentinel-bench` has a build script; maintained dependencies may use build scripts and proc macros. Inspect `cargo tree --locked --edges normal,build` with the selected target/features to distinguish the production tree from dev-only and inactive lockfile packages. Work lanes and bounded queue plumbing use the standard library.

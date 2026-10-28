@@ -1,4 +1,4 @@
-//! Needs Node 22+, a built web interface and Edge, Chrome or Chromium: run with --ignored.
+//! Needs Node 22+, the built web interface (`pnpm -C web build`) and Edge, Chrome or Chromium: run with --ignored.
 
 #[path = "support/web_fixture.rs"]
 mod fixture;
@@ -37,9 +37,8 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// The web interface: one process, or during the strangler migration (plan 16.4) the
-/// TanStack Start front (`SENTINEL_WEB_FRONT`, its server entry) with the Nuxt process
-/// behind it on loopback. `SENTINEL_WEB_SERVER` replaces the default entry.
+/// The web interface, `web/.output/server/index.mjs` unless `SENTINEL_WEB_SERVER`
+/// names another build of it.
 struct Web(Vec<Child>);
 
 fn spawn_web(server: &std::path::Path, port: u16, envs: &[(&str, String)]) -> Child {
@@ -72,30 +71,17 @@ fn spawn_web(server: &std::path::Path, port: u16, envs: &[(&str, String)]) -> Ch
 
 impl Web {
     fn start(port: u16, api: &str) -> Web {
-        let entry = |var: &str, default: &str| {
-            std::env::var_os(var)
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| repo_root().join(default))
+        let server = std::env::var_os("SENTINEL_WEB_SERVER")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| repo_root().join("web/.output/server/index.mjs"));
+        // `SENTINEL_WEB_API_ENV=NUXT_SENTINEL_API` checks the name an upgraded Nuxt deployment still sets.
+        let name = std::env::var("SENTINEL_WEB_API_ENV").unwrap_or_else(|_| "SENTINEL_API".into());
+        let name: &str = if name == "NUXT_SENTINEL_API" {
+            "NUXT_SENTINEL_API"
+        } else {
+            "SENTINEL_API"
         };
-        let server = entry("SENTINEL_WEB_SERVER", "web/.output/server/index.mjs");
-        let api_env = [
-            ("NUXT_SENTINEL_API", api.to_owned()),
-            ("SENTINEL_API", api.to_owned()),
-        ];
-        match std::env::var_os("SENTINEL_WEB_FRONT") {
-            None => Web(vec![spawn_web(&server, port, &api_env)]),
-            Some(front) => {
-                let legacy_port = free_port();
-                let legacy = spawn_web(&server, legacy_port, &api_env);
-                let mut envs = api_env.to_vec();
-                envs.push((
-                    "SENTINEL_LEGACY_ORIGIN",
-                    format!("http://127.0.0.1:{legacy_port}"),
-                ));
-                let front = spawn_web(std::path::Path::new(&front), port, &envs);
-                Web(vec![front, legacy])
-            }
-        }
+        Web(vec![spawn_web(&server, port, &[(name, api.to_owned())])])
     }
 
     fn pids(&self) -> Vec<u32> {
@@ -198,36 +184,6 @@ fn the_web_interface_in_a_real_browser() {
     writer.join().unwrap();
     drop(web);
     assert!(status.success(), "ui.mjs failed: {status}");
-}
-
-/// The TanStack Start shell (U09): its own views under the hash-only policy, and the
-/// strangler front serving the unmoved views, the API and the streams. Needs
-/// `SENTINEL_WEB_FRONT` (the Start server entry) and the built Nuxt interface.
-#[test]
-#[ignore = "needs Node, both built web interfaces and a Chromium-family browser"]
-fn the_start_shell_in_a_real_browser() {
-    assert!(
-        std::env::var_os("SENTINEL_WEB_FRONT").is_some(),
-        "set SENTINEL_WEB_FRONT to web-start/.output/server/index.mjs"
-    );
-    let (f, web, web_addr, origin) = deployment(4, false);
-    let stop = Arc::new(AtomicBool::new(false));
-    let writer = keep_writing(&f, &stop);
-    let config_path = f.dir.path().join("shell.json");
-    std::fs::write(
-        &config_path,
-        config(&f, &origin, &web_addr, f.dir.path()).to_string(),
-    )
-    .unwrap();
-    let status = Command::new(node())
-        .arg(repo_root().join("web-start/test/shell.mjs"))
-        .arg(&config_path)
-        .status()
-        .expect("run node");
-    stop.store(true, Ordering::Release);
-    writer.join().unwrap();
-    drop(web);
-    assert!(status.success(), "shell.mjs failed: {status}");
 }
 
 /// The first-run setup wizard (U10's seed): a controller with no administrator yet, its setup

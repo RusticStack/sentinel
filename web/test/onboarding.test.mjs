@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   baseUrlProblem, emptyDraft, fragmentToken, githubStanding, INVITATION_STASH_MS, isSetupToken, parseDraft,
   passwordAdvice, serializeDraft, slugProblem, stashInvitation, unstashInvitation,
-} from "../app/utils/onboarding.ts";
+} from "../src/lib/onboarding.ts";
 
 const HEX = "0123456789abcdef".repeat(4);
 
