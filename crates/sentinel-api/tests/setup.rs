@@ -471,6 +471,26 @@ fn an_approved_user_creates_an_organization_when_policy_allows() {
         &dana,
     );
     assert_eq!(status, 409);
+    // The name of a GitHub account the App is installed on is held: the same 409 as a taken name.
+    f.store
+        .writer()
+        .write(|tx| {
+            registration::record_installation(tx, "github", "9001", "Initech", UnixMillis::now())
+                .map(|_| ())
+        })
+        .unwrap();
+    let (status, answer) = send(
+        &f,
+        "POST",
+        "/api/v1/orgs",
+        Some(json!({ "slug": "initech" })),
+        &dana,
+    );
+    assert_eq!(
+        (status, &answer["code"]),
+        (409, &json!("conflict")),
+        "{answer}"
+    );
     let (status, _) = send(
         &f,
         "POST",
