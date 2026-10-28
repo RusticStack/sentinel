@@ -12,6 +12,9 @@ import glob
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -164,6 +167,72 @@ class RecordStamps(unittest.TestCase):
         for name, marker in STAMPED_WRITERS.items():
             with open(os.path.join(HERE, name), encoding="utf-8") as f:
                 self.assertIn(marker, f.read(), name)
+
+
+def run_bash(script, *args, **env):
+    """Runs `script` with SENTINEL_SRC and SHUF_SEED removed from the environment unless given."""
+    base = {k: v for k, v in os.environ.items() if k not in ("SENTINEL_SRC", "SENTINEL_BIN", "SHUF_SEED")}
+    return subprocess.run(["bash", "-c", script, "bash", *args], capture_output=True, text=True, env={**base, **env})
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("shuf") and shutil.which("git"), "needs bash, shuf and git")
+class StampHelpers(unittest.TestCase):
+    STAMP = os.path.join(HERE, "stamp.sh")
+
+    def order(self, seed):
+        r = run_bash('. "$1"; seq 1 40 | shuffle_lines "$2" | tr "\\n" " "', self.STAMP, seed)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_a_seed_replays_the_same_order_and_another_seed_differs(self):
+        self.assertEqual(self.order("s/ext4/1"), self.order("s/ext4/1"))
+        self.assertEqual(sorted(self.order("s/ext4/1").split(), key=int), [str(i) for i in range(1, 41)])
+        self.assertNotEqual(self.order("s/ext4/1"), self.order("s/ext4/2"))
+
+    def test_shuffle_init_keeps_a_given_seed_and_makes_one_otherwise(self):
+        script = '. "$1"; shuffle_init; echo "$SHUF_SEED"'
+        self.assertEqual(run_bash(script, self.STAMP, SHUF_SEED="fixed-7").stdout.strip(), "fixed-7")
+        self.assertTrue(run_bash(script, self.STAMP).stdout.strip())
+
+    def test_stamp_needs_the_source_and_ignores_untracked_files(self):
+        self.assertNotEqual(run_bash('. "$1"; stamp_init', self.STAMP).returncode, 0,
+                            "no SENTINEL_SRC must not produce a stamp")
+        with tempfile.TemporaryDirectory() as d:
+            def git(*a):
+                return subprocess.run(["git", "-C", d, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                                       "-c", "commit.gpgsign=false", *a], capture_output=True, text=True)
+
+            def write(name, text):
+                with open(os.path.join(d, name), "w") as f:
+                    f.write(text)
+
+            def dirty():
+                r = run_bash('"$1"', self.STAMP, SENTINEL_SRC=d)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                return json.loads(r.stdout)["build"]["dirty"]
+
+            git("init", "-q")
+            write("a", "1")
+            git("add", "a")
+            self.assertEqual(git("commit", "-q", "-m", "i").returncode, 0)
+            self.assertIs(dirty(), False)
+            write("scratch", "x")
+            self.assertIs(dirty(), False, "an untracked file is not dirty")
+            write("a", "2")
+            self.assertIs(dirty(), True, "a tracked edit is dirty")
+
+    def test_stamp_sed_survives_slashes_and_ampersands(self):
+        script = ('. "$1"; STAMP_BODY=\'"a":"x/y&z"\'; echo "{}" | sed "s/^{/{$(stamp_sed),/"')
+        r = run_bash(script, self.STAMP)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), '{"a":"x/y&z",}')
+
+    def test_shuffling_writers_record_the_seed(self):
+        for name in ("k02-cache-clone.sh", "f07-storage.sh"):
+            with open(os.path.join(HERE, name), encoding="utf-8") as f:
+                text = f.read()
+            self.assertNotRegex(text, r"\|\s*shuf\b", f"{name} shuffles without the recorded seed")
+            self.assertIn("shuffle_seed", text, name)
 
 
 if __name__ == "__main__":
