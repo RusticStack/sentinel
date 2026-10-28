@@ -42,8 +42,9 @@ function Created() {
         : outcome.kind === "refused" ? <Alert color="error" role="alert" title={outcome.text}><ButtonLink to="/setup/github" size="sm" variant="outline" color="neutral" label="Back to the GitHub App" /></Alert>
         : (
           <div className="space-y-4">
-            <Alert color="success" role="status" title={`${outcome.app.name} is ready`} description="The controller stored its credentials. Install it on the GitHub organization or account whose repositories Sentinel should build." />
-            {outcome.install.startsWith("https://") ? <a className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-on-primary" href={outcome.install}>Install the App on GitHub</a> : null}
+            <Alert color="success" role="status" title={`${outcome.app.name} is ready`} description="The controller stored its credentials. Install it on the GitHub organization or account whose repositories Sentinel should build, from the namespace that should own them." />
+            {/* The installation is started per namespace, so the controller can bind it to that namespace when GitHub returns. */}
+            <ButtonLink to="/setup/github" icon="github" label="Install it on a namespace" />
           </div>
         )}
     </Page>

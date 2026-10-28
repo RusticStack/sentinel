@@ -13,8 +13,29 @@ export interface GithubAppStatus {
   webhook_reachable: boolean;
   reason: Unreachable | null;
   can_create: boolean;
+  /** Platform administrators only: why creating is refused now. */
+  create_refusal?: CreateRefusal | null;
   install_url: string | null;
 }
+
+export type CreateRefusal = "files" | "configured" | "no_public_url" | "public_url_has_path" | "no_master_key" | "forbidden";
+
+export const CREATE_REFUSAL: Record<CreateRefusal, string> = {
+  files: "This controller is configured by GitHub App files on its host, which take precedence; remove them to use one-click setup.",
+  configured: "This deployment already has its GitHub App.",
+  no_public_url: "The controller has no public address (public_url), so there is no webhook or return address to give GitHub. Set it and restart the controller.",
+  public_url_has_path: "The controller's public address has a path; GitHub's return addresses need the bare origin. Set public_url to the origin and restart the controller.",
+  no_master_key: "The controller has no master key to seal the App's private key and secrets with. Create master.key on the controller host (docs/sealed-storage.md), then restart it.",
+  forbidden: "Only a platform administrator can create the deployment's GitHub App.",
+};
+
+export const INSTALL_REFUSAL: Record<string, string> = {
+  foreign_installation: "GitHub says that installation does not belong to this deployment's App.",
+  cross_account: "The App was installed on a GitHub account that is not this namespace's.",
+  not_org_owner: "Only an owner of the GitHub organization can connect it to a namespace.",
+  link_github: "Link your GitHub account on the Account security page first, so Sentinel can see it is yours.",
+  tenant_mismatch: "The installation belongs to a different namespace than the one it was started from.",
+};
 
 export interface ManifestStart { action_url: string; manifest: string; state: string; expires_ms: number }
 

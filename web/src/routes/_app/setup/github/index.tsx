@@ -5,9 +5,9 @@ import { createFileRoute } from "@tanstack/react-router";
 import { api, ApiError } from "../../../../lib/api.ts";
 import { act } from "../../../../lib/act.tsx";
 import { useSession } from "../../../../lib/session.ts";
-import { REACHABILITY, type GithubAppStatus, type ManifestStart } from "../../../../lib/githubApp.ts";
+import { CREATE_REFUSAL, REACHABILITY, type GithubAppStatus, type ManifestStart } from "../../../../lib/githubApp.ts";
 import { Page } from "../../../../components/Page.tsx";
-import { Alert, Badge, Button, Card, Field, Input } from "../../../../components/ui.tsx";
+import { Alert, Badge, Button, Card, Checkbox, Field, Input } from "../../../../components/ui.tsx";
 
 export const Route = createFileRoute("/_app/setup/github/")({
   loader: async () => {
@@ -31,6 +31,7 @@ function GithubAppView() {
   const [login, setLogin] = useState("");
   const [problem, setProblem] = useState("");
   const [busy, setBusy] = useState(false);
+  const [shared, setShared] = useState(false);
   const [manifest, setManifest] = useState<ManifestStart | null>(null);
   const form = useRef<HTMLFormElement>(null);
   const admin = tenants.filter((t) => t.role === "admin");
@@ -44,7 +45,7 @@ function GithubAppView() {
     setProblem("");
     setBusy(true);
     const owner = kind === "user" ? { kind } : { kind, login: login.trim() };
-    const started = await act(me, "Create the GitHub App", () => api<ManifestStart>("/api/v1/github/app/manifest", { method: "POST", body: { owner } }), false);
+    const started = await act(me, "Create the GitHub App", () => api<ManifestStart>("/api/v1/github/app/manifest", { method: "POST", body: { owner, public: shared } }), false);
     setBusy(false);
     if (!started) return;
     // The manifest is posted to GitHub by a form, as GitHub's manifest flow requires; the page policy allows only github.com as a form target here.
@@ -80,7 +81,7 @@ function GithubAppView() {
           <Alert color="warning" role="status" title="GitHub cannot deliver events to this controller"
             description={<>
               <p>{status.reason ? REACHABILITY[status.reason] : "The controller's public address cannot receive GitHub webhooks."}</p>
-              <p className="mt-1">Check runs can still be published, because publishing is a request from the controller to GitHub, but pushes and pull requests will not start runs until GitHub can reach <code>{status.webhook_url ?? "the webhook address"}</code> over HTTPS. Put the controller behind a public HTTPS address (the reverse proxy in front of sentinel-web), or start runs with the CLI or polling intake.</p>
+              <p className="mt-1">The App can still be created, with its webhook registered inactive. Check runs can still be published, because publishing is a request from the controller to GitHub, but pushes and pull requests will not start runs until GitHub can reach <code>{status.webhook_url ?? "the webhook address"}</code> over HTTPS. Put the controller behind a public HTTPS address (the reverse proxy in front of sentinel-web), or start runs with the CLI or polling intake.</p>
             </>} />
         ) : null}
 
@@ -104,6 +105,8 @@ function GithubAppView() {
                     <Input id="gh-org" value={login} onChange={(e) => setLogin(e.target.value)} autoCapitalize="off" spellCheck={false} placeholder="my-org" className="max-w-xs" />
                   </Field>
                 ) : null}
+                <Checkbox id="gh-public" checked={shared} onChange={setShared} label="Let other GitHub accounts install it"
+                  description="Needed when more than one GitHub organization or account will connect to this deployment. Otherwise only the account that owns the App can install it." />
                 <Button type="submit" icon="github" label="Create on GitHub" loading={busy} />
               </form>
               {manifest ? (
@@ -113,7 +116,8 @@ function GithubAppView() {
               ) : null}
             </Card>
           ) : (
-            <Alert color="info" role="status" title="This deployment has no GitHub App yet" description="A platform administrator creates it here." />
+            <Alert color={status.create_refusal && status.create_refusal !== "forbidden" ? "warning" : "info"} role="status" title="This deployment has no GitHub App yet"
+              description={status.create_refusal ? CREATE_REFUSAL[status.create_refusal] : "A platform administrator creates it here."} />
           )
         ) : null}
 

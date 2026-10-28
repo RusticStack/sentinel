@@ -5,7 +5,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { api, ApiError } from "../../../../lib/api.ts";
 import { refusal } from "../../../../lib/act.tsx";
 import { refreshTenants } from "../../../../lib/session.ts";
-import { INSTALLATION, SETUP_ACTION, STATE } from "../../../../lib/githubApp.ts";
+import { INSTALL_REFUSAL, INSTALLATION, SETUP_ACTION, STATE } from "../../../../lib/githubApp.ts";
 import { Page } from "../../../../components/Page.tsx";
 import { Alert, ButtonLink } from "../../../../components/ui.tsx";
 
@@ -35,9 +35,10 @@ function Installed() {
       (r) => { setOutcome({ kind: "done", tenant: r.tenant, account: r.account }); void refreshTenants(); },
       (e) => {
         const err = e as ApiError;
-        setOutcome({ kind: "refused", text: err.code === "conflict"
-          ? "That installation is already connected to another namespace."
-          : err.code === "not_found" || err.code === "forbidden"
+        const why = INSTALL_REFUSAL[String(err.details?.reason ?? "")];
+        setOutcome({ kind: "refused", text: why ? `The installation could not be connected. ${why}` : err.code === "conflict"
+          ? (err.details?.reason === "not_configured" ? "This deployment has no GitHub App configured." : "That installation is already connected to another namespace.")
+          : err.code === "not_found"
             ? "The installation could not be connected: it was started by another session or namespace, it expired, or it was already used."
             : `The installation could not be connected: ${refusal(err)}.` });
       },
