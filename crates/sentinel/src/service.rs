@@ -906,8 +906,7 @@ impl Config {
             .as_ref()
             .or(file.manual_destinations.as_ref())
         {
-            sentinel_protocol::source::validate_manual_destinations(list)
-                .map_err(Error::config)?;
+            sentinel_protocol::source::validate_manual_destinations(list).map_err(Error::config)?;
         }
         Ok(Self {
             data_dir,
