@@ -7,6 +7,12 @@ import { sameOriginPath, RETURN_COOKIE, rememberReturn } from "../lib/redirect.t
 import { INVITATION_STASH, unstashInvitation } from "../lib/onboarding.ts";
 import { setupOpen } from "../lib/setup.ts";
 import { OverlayHost, Toaster } from "../lib/overlay.tsx";
+import { Announcer } from "../lib/announce.tsx";
+import { setStrangling, strangled } from "../lib/owned.ts";
+import { createIsomorphicFn } from "@tanstack/react-start";
+
+// Whether the Nuxt process still serves the views this application has not taken over (server env, never a URL).
+const legacyBehind = createIsomorphicFn().server(() => !!process.env.SENTINEL_LEGACY_ORIGIN).client(() => false);
 import { ButtonLink, Empty } from "../components/ui.tsx";
 
 const PUBLIC = new Set(["/login", "/register", "/verify-email", "/forgot-password", "/setup", "/invitations/accept"]);
@@ -17,6 +23,11 @@ export type Theme = "light" | "dark" | null;
 // The first render runs on the server with the browser's cookie, so a signed-out visitor is redirected before any page draws.
 export const Route = createRootRoute({
   beforeLoad: async ({ location }) => {
+    // A view still served by the legacy process is left with a full page load.
+    if (typeof window !== "undefined" && document.documentElement.dataset.hydrated === "1" && strangled(location.pathname)) {
+      window.location.assign(location.href);
+      await new Promise(() => {});
+    }
     const session = await loadSession();
     const me = session.me;
     const path = location.pathname;
@@ -34,9 +45,9 @@ export const Route = createRootRoute({
       throw redirect({ href: `/login?next=${encodeURIComponent(full)}` });
     }
     const theme = (await readCookie("sentinel-theme")) as Theme;
-    return { session, theme: theme === "dark" || theme === "light" ? theme : null };
+    return { session, theme: theme === "dark" || theme === "light" ? theme : null, legacy: legacyBehind() };
   },
-  loader: ({ context }) => ({ session: context.session as SessionState, theme: context.theme as Theme }),
+  loader: ({ context }) => ({ session: context.session as SessionState, theme: context.theme as Theme, legacy: context.legacy as boolean }),
   head: () => ({
     meta: [
       { charSet: "utf-8" },
@@ -52,8 +63,9 @@ export const Route = createRootRoute({
 });
 
 function Root() {
-  const { session, theme } = Route.useLoaderData();
+  const { session, theme, legacy } = Route.useLoaderData();
   seedSession(session);
+  if (typeof window !== "undefined" && legacy) setStrangling(true);
   const router = useRouter();
   useEffect(() => {
     setNavigator((to, replace) => router.navigate({ href: to, replace }));
@@ -86,6 +98,7 @@ function Root() {
       <Outlet />
       <OverlayHost />
       <Toaster />
+      <Announcer />
     </Document>
   );
 }
