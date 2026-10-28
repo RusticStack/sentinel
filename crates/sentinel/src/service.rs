@@ -1743,7 +1743,7 @@ fn start_server(
             tracing::info!(
                 event = "checks_enabled",
                 endpoint = %app.app.endpoint(),
-                details_url = app.public_url.is_some()
+                details_url = app.public_url.is_some() || public_url.is_some()
             );
             let reconcile_dispatch = tracing::dispatcher::get_default(Clone::clone);
             reconcile = Some(Box::new(sentinel_checks::Reconcile::start(
@@ -1774,7 +1774,7 @@ fn start_server(
             let publisher = sentinel_checks::github::GithubChecks::new(
                 Arc::clone(&store),
                 Arc::clone(&app.app),
-                app.public_url.clone(),
+                app.public_url.clone().or_else(|| public_url.clone()),
             );
             let dispatch = tracing::dispatcher::get_default(Clone::clone);
             Some(Box::new(sentinel_checks::Lane::start(

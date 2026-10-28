@@ -699,6 +699,10 @@ fn a_run_publishes_a_stable_aggregate_and_per_job_checks() {
             .starts_with(&format!("sentinel:{run}:{build}:")),
         "{job:?}"
     );
+    assert_eq!(
+        job.body["details_url"],
+        format!("https://ci.example/runs/{run}?job={build}")
+    );
     assert_eq!(posts(&records, "/access_tokens").len(), 1);
 
     step(&mut f, build, Actor::Controller, Event::Leased(Fence(1)));

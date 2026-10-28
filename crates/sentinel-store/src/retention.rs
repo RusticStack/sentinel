@@ -770,4 +770,25 @@ mod tests {
             }
         }
     }
+
+    /// Each maintenance read names a partial index with `INDEXED BY`; SQLite refuses to
+    /// prepare the statement when that index cannot answer the query, so running them
+    /// against the migrated schema proves the index still serves its predicate.
+    #[test]
+    fn maintenance_reads_are_served_by_their_partial_indexes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::migrate(&mut conn).unwrap();
+        crate::register_functions(&conn).unwrap();
+        assert!(unstamped(&conn, 256).unwrap().is_empty());
+        assert!(
+            expiring(&conn, UnixMillis(i64::MAX), 256)
+                .unwrap()
+                .is_empty()
+        );
+        let tx = conn.transaction().unwrap();
+        assert_eq!(
+            purge_aborted_uploads(&tx, UnixMillis(i64::MAX), 256).unwrap(),
+            0
+        );
+    }
 }

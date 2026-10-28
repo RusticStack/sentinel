@@ -4,7 +4,7 @@ The human web interface is its own process, `sentinel-web`: a Nuxt 4 server (Vue
 
 The web interface is optional: the controller, CLI and MCP work without it.
 
-Planned: a TanStack Start application replaces this Nuxt one view by view, keeping the process role, the Views table below as its parity checklist and the browser test, with budgets against a measured baseline of this interface ([plan 16.4](../plan.md#164-web-interface-on-tanstack-start), `TODO.md` Part 20). This page describes the Nuxt interface in service today.
+Planned: a TanStack Start application replaces this Nuxt one view by view, keeping the process role, the Views table below as its parity checklist and the browser test, with budgets against a measured baseline of this interface ([plan 16.4](../plan.md#164-web-interface-on-tanstack-start), `TODO.md` Part 20). This page describes the Nuxt interface in service today. Whatever builds the interface must keep serving `GET /runs/<run id>`: GitHub check runs link to it for good ([details link contract](checks.md#details-link-contract)).
 
 ## Architecture
 

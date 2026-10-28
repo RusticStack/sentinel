@@ -2237,8 +2237,34 @@ impl SessionHandler for Inner {
         let objects = Arc::clone(&self.objects);
         let bytes = entries.iter().map(|e| e.len).sum::<u64>();
         let count = entries.len() as u64;
+        let deployment = self.objects.deployment();
         // One transaction: a crash mid-commit leaves only adoptable orphans; the stages stay pinned until it ends.
         self.write(move |tx| {
+            // The repository quota binds at commit, not only when the artifact begins: the
+            // begin check cannot know the size, and the single writer makes this one exact.
+            if matches!(
+                retention::check_run_repo(tx, &deployment, tenant, run, bytes),
+                Err(sentinel_store::Error::QuotaExceeded)
+            ) {
+                for s in staged {
+                    objects.discard(tx, s)?;
+                }
+                artifacts::record(
+                    tx,
+                    tenant,
+                    run,
+                    job,
+                    attempt,
+                    &artifact_name,
+                    artifacts::State::Failed,
+                    None,
+                    0,
+                    0,
+                    retain_until,
+                    UnixMillis::now(),
+                )?;
+                return Ok(ArtifactCode::TooLarge);
+            }
             for s in &staged {
                 objects.commit(tx, s)?;
             }
@@ -2263,11 +2289,12 @@ impl SessionHandler for Inner {
                 retain_until,
                 UnixMillis::now(),
             )?;
-            Ok(())
+            Ok(ArtifactCode::Stored)
         })
-        .map(|()| {
-            self.stats.artifacts.fetch_add(1, Ordering::Relaxed);
-            ArtifactCode::Stored
+        .inspect(|&code| {
+            if code == ArtifactCode::Stored {
+                self.stats.artifacts.fetch_add(1, Ordering::Relaxed);
+            }
         })
         .unwrap_or(ArtifactCode::Store)
     }

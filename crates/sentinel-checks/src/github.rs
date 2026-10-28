@@ -9,6 +9,7 @@ use sentinel_github::{
 };
 use sentinel_store::{Error as StoreError, Store, checks, sources, sources_forge};
 
+use crate::details::Details;
 use crate::lane::Publish;
 
 const TOKEN_MARGIN_MS: i64 = 120_000;
@@ -30,7 +31,7 @@ pub struct GithubChecks {
     store: Arc<Store>,
     app: Arc<App>,
     client: Client,
-    public_url: Option<String>,
+    details: Details,
     tokens: HashMap<RepoId, CachedToken>,
     // GitHub rate-limits per installation, which is the lane's throttle scope.
     installations: HashMap<RepoId, u64>,
@@ -42,7 +43,7 @@ impl GithubChecks {
             store,
             app,
             client: Client::new(),
-            public_url: public_url.map(|url| url.trim_end_matches('/').to_owned()),
+            details: Details::new(public_url),
             tokens: HashMap::new(),
             installations: HashMap::new(),
         }
@@ -103,12 +104,6 @@ impl GithubChecks {
         Ok(std::mem::take(&mut token.secret))
     }
 
-    fn details_url(&self, run: Option<sentinel_core::RunId>) -> Option<String> {
-        let base = self.public_url.as_deref()?;
-        let run = run?;
-        Some(format!("{base}/runs/{run}"))
-    }
-
     fn check(&self, publication: &checks::Publication, now: UnixMillis) -> Result<Check, Publish> {
         let status =
             api::Status::parse(publication.status.as_str()).ok_or_else(|| Publish::Refused {
@@ -132,7 +127,7 @@ impl GithubChecks {
             title: publication.title.clone(),
             summary: publication.summary.clone(),
             external_id: publication.created_identity(),
-            details_url: self.details_url(publication.run),
+            details_url: self.details.of(publication),
             completed_at: (status == api::Status::Completed).then(|| api::timestamp(now.0)),
         })
     }

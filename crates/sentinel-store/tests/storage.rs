@@ -307,6 +307,70 @@ fn admission_holds_the_reserve_and_the_log_floor() {
 }
 
 #[test]
+fn the_reserve_follows_the_metadata_database_in_both_directions() {
+    let free = Arc::new(AtomicU64::new(10_000));
+    let admission = probed(
+        &free,
+        Watermarks {
+            reserve: 1_000,
+            low: 2_000,
+            high: 4_000,
+            floor: 500,
+        },
+    );
+    let tenant = TenantId::new();
+    assert_eq!(admission.reserve(), 1_000);
+    assert!(admission.admit(tenant, 1).is_ok());
+    admission.release(tenant, 1);
+
+    // Twice a 5,000-byte database needs 10,000: nothing discretionary is left.
+    admission.set_metadata_bytes(5_000);
+    assert_eq!(admission.reserve(), 10_000);
+    assert!(matches!(
+        admission.admit(tenant, 1),
+        Err(Error::StorageFull)
+    ));
+    assert!(!admission.is_open());
+
+    // A database under half the configured reserve changes nothing...
+    admission.set_metadata_bytes(100);
+    assert_eq!(admission.reserve(), 1_000);
+    // ...and once the need falls, the 6,000 left are above the high watermark.
+    assert!(admission.admit(tenant, 1).is_ok());
+    admission.release(tenant, 1);
+
+    // The log floor is the disk's own and does not move with the database.
+    admission.set_metadata_bytes(5_000);
+    assert!(admission.headroom());
+}
+
+#[test]
+fn metadata_bytes_include_the_write_ahead_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.sqlite");
+    let store = Store::open(&path, Durability::Normal).unwrap();
+    store
+        .writer()
+        .write(|tx| {
+            tx.execute("CREATE TABLE scratch(x BLOB)", [])?;
+            for _ in 0..200 {
+                tx.execute("INSERT INTO scratch VALUES (zeroblob(4096))", [])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let main = fs::metadata(&path).unwrap().len();
+    let mut wal = path.clone().into_os_string();
+    wal.push("-wal");
+    let wal = fs::metadata(&wal).map_or(0, |m| m.len());
+    assert!(
+        wal > 0,
+        "the committed rows are in the write-ahead log until a checkpoint"
+    );
+    assert!(store.metadata_bytes() >= main + wal);
+}
+
+#[test]
 fn inflight_charges_serialize_writers_and_release_exactly() {
     let free = Arc::new(AtomicU64::new(10_000));
     let admission = probed(
