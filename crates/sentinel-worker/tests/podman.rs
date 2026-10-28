@@ -560,7 +560,7 @@ fn a_workspace_that_passes_its_declared_disk_stops_the_container() {
     let started = std::time::Instant::now();
     let exit = sandbox.exec(
         &sh(
-            "i=0; while [ $i -lt 64 ]; do dd if=/dev/zero of=/workspace/part$i bs=1M count=32 2>/dev/null; \
+            "i=0; while [ $i -lt 64 ]; do dd if=/dev/zero of=/workspace/part$i bs=1M count=32 conv=fdatasync 2>/dev/null; \
              i=$((i+1)); done; echo WROTE_ALL",
             120,
         ),
