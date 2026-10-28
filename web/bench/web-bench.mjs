@@ -94,6 +94,7 @@ const record = {
   interface: cfg.interface || "unknown",
   code: null,
   harness: `web/bench/web-bench.mjs: ${RENDERS} server renders per view after 5 warm-ups (time to the whole body, signed in as root, one at a time); shipped JavaScript = same-origin scripts a cache-disabled first load of each view fetched until it was ready and the network idle 500 ms, each gzip -9 in the harness; RSS from /proc of the web process(es); stream CPU = utime+stime of the web process(es) over ${STREAM_SECS} s with ten /_stream/log streams (4 root, 3 dana, 3 rui) on the live attempt (a line every 150 ms); log jumps: ${JUMPS} random scroll jumps over the read bulk log, work = script + layout + style time from Performance.getMetrics, ${JUMP_REPEATS} fresh pages`,
+  niceness: Number(process.env.SENTINEL_BENCH_NICE || 0),
   load_start: load(),
 };
 try { record.code = execSync("git rev-parse --short HEAD", { cwd: repo }).toString().trim() + (execSync("git status --porcelain -- web crates", { cwd: repo }).toString().trim() ? "+dirty" : ""); } catch {}
