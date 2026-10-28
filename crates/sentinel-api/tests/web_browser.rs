@@ -230,6 +230,78 @@ fn the_start_shell_in_a_real_browser() {
     assert!(status.success(), "shell.mjs failed: {status}");
 }
 
+/// The first-run setup wizard (U10's seed): a controller with no administrator yet, its setup
+/// token issued, the web interface in front, and `web/test/setup.mjs` driving every step.
+#[test]
+#[ignore = "needs Node, the built web interface and a Chromium-family browser"]
+fn the_setup_wizard_in_a_real_browser() {
+    use sentinel_link::{controller::Controller, identity::Identity};
+    use sentinel_store::{Durability, Store, logs::LogStore, objects::Objects};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
+    let logs = Arc::new(LogStore::open(dir.path().join("logs")).unwrap());
+    let objects = Arc::new(Objects::open(dir.path()).unwrap());
+    let key_path = dir.path().join("master.key");
+    sentinel_auth::sealed::Key::create(&key_path).unwrap();
+    let key = Arc::new(sentinel_auth::sealed::Key::load(&key_path).unwrap());
+    let controller = Controller::start(
+        Arc::clone(&store),
+        Arc::clone(&logs),
+        Arc::clone(&objects),
+        Identity::generate("controller").unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
+    let port = free_port();
+    let origin = format!("http://127.0.0.1:{port}");
+    let server = sentinel_api::Server::start_with(
+        sentinel_api::Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            store: Arc::clone(&store),
+            logs,
+            objects,
+            controller: controller.handle(),
+            secret_key: Some(key),
+            sessions: sentinel_store::local_auth::Policy::default(),
+            github_webhook_secret: None,
+            intake: None,
+            public_url: Some(origin.clone()),
+            github_sign_in: None,
+            trusted_proxies: sentinel_api::TrustedProxy::loopback(),
+        },
+        sentinel_api::Options::default(),
+    )
+    .unwrap();
+    let token = sentinel_store::setup::issue(&store, sentinel_core::UnixMillis::now())
+        .unwrap()
+        .unwrap();
+    let mut token_text = String::new();
+    token.expose(&mut token_text);
+    let web = Web::start(port, &format!("http://{}", server.local_addr()));
+    let out = match std::env::var_os("SENTINEL_UI_OUT") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => dir.path().join("ui"),
+    };
+    std::fs::create_dir_all(&out).unwrap();
+    let config_path = dir.path().join("setup.json");
+    std::fs::write(
+        &config_path,
+        json!({ "base": origin, "token": token_text, "out": out }).to_string(),
+    )
+    .unwrap();
+    let status = Command::new(node())
+        .arg(repo_root().join("web/test/setup.mjs"))
+        .arg(&config_path)
+        .status()
+        .expect("run node");
+    drop(web);
+    server.shutdown();
+    drop(controller);
+    assert!(status.success(), "setup.mjs failed: {status}");
+}
+
 /// The U08/U14 measurement: `web/bench/web-bench.mjs` against this fixture, on the
 /// reference host. `SENTINEL_BENCH_RECORD` appends the record to a file under the
 /// repository; `SENTINEL_BENCH_HOST_LABEL` names the host in it.
