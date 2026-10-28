@@ -830,10 +830,16 @@ mod tests {
     }
 
     #[test]
-    fn a_ratio_on_the_limit_does_not_clear_the_upper_bound() {
-        let r = run_series(series(100, 0.50));
-        assert!((r.geometric_mean_ratio - 0.5).abs() < 0.03);
-        assert_eq!(r.verdict, Verdict::Fail, "{:?}", r.reasons);
+    fn an_estimate_under_the_limit_fails_when_the_bound_does_not_clear_it() {
+        // Half the pairs at 0.25 and half at 0.9: the geometric mean is 0.47,
+        // under the limit, but the confidence bound is not.
+        let pairs = (0..100)
+            .map(|i| pair(i, if i % 2 == 0 { 250 } else { 900 }, 1_000))
+            .collect();
+        let r = run_series(pairs);
+        assert!(r.geometric_mean_ratio < 0.5, "{}", r.geometric_mean_ratio);
+        assert!(r.ratio_upper >= 0.5, "{}", r.ratio_upper);
+        assert_eq!(r.verdict, Verdict::Fail);
         assert!(r.reasons.iter().any(|m| m.contains("upper bound")));
     }
 
