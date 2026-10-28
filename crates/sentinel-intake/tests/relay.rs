@@ -191,9 +191,7 @@ impl Repo {
             "/../../examples/hooks/post-receive"
         ))
         .unwrap()
-        .replace("
-", "
-");
+        .replace("\r\n", "\n");
         fs::write(&hook, script).unwrap();
         #[cfg(unix)]
         {
