@@ -109,7 +109,7 @@ fn open_dir(parent: libc::c_int, name: &std::ffi::CStr) -> Option<OwnedFd> {
 fn charge(walk: &mut Walk, stat: &libc::stat) {
     let is_dir = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
     if !is_dir && stat.st_nlink > 1 && walk.links.len() < MAX_LINKS_TRACKED {
-        let key = (stat.st_dev as u64, stat.st_ino as u64);
+        let key = (stat.st_dev, stat.st_ino);
         if !walk.links.insert(key) {
             return;
         }
@@ -141,7 +141,7 @@ fn descend(dir: &OwnedFd, depth: usize, walk: &mut Walk) {
             continue;
         };
         if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            if stat.st_dev as u64 != walk.root_dev {
+            if stat.st_dev != walk.root_dev {
                 continue;
             }
             charge(walk, &stat);
@@ -187,7 +187,7 @@ pub fn measure(
         abort,
         limit,
         deadline: Instant::now() + budget,
-        root_dev: stat.st_dev as u64,
+        root_dev: stat.st_dev,
         bytes: 0,
         entries: 0,
         complete: true,

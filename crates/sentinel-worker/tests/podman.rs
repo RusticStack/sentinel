@@ -581,7 +581,8 @@ fn a_workspace_that_passes_its_declared_disk_stops_the_container() {
     let written = fs::read_dir(ws.path()).unwrap().count() as u64;
     assert!(written < 64, "{written} parts were written");
     drop(guard);
-    sandbox.destroy().unwrap();
+    // The guard already removed the container, so there is nothing left for the teardown to stop.
+    let _ = sandbox.destroy();
 }
 
 #[test]

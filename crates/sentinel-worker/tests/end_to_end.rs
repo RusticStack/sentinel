@@ -654,11 +654,14 @@ jobs:
         Some(sentinel_core::FailureClass::CommandFailed)
     );
     let fat_summary = summary_of(fat);
-    assert!(
-        fat_summary.detail.contains("disk limit"),
-        "{}",
-        fat_summary.detail
-    );
+    // A microVM job meets its size-bound scratch disk instead (`ENOSPC` in the guest), which has no guard text.
+    if microvm_runtime().is_none() {
+        assert!(
+            fat_summary.detail.contains("disk limit"),
+            "{}",
+            fat_summary.detail
+        );
+    }
     assert!(matches!(
         fat_summary.steps[0].outcome,
         StepOutcome::Failed { .. }
