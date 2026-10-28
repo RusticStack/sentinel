@@ -235,6 +235,7 @@ SENTINEL_AUTO_JOIN_DOMAINS="example.com=engineering, example.org, bücher.exampl
 - The controller reads the setting at start. A malformed entry (bad shape, invalid domain or name, a domain listed twice, a collision, or past 1,024 entries) is **dropped alone** and logged as `auto_join_entry_ignored` with its 1-based position and a fixed reason, never its text; the controller still starts. A rule whose organization already exists but is GitHub-backed, is a personal namespace or is suspended is dropped the same way as `auto_join_entry_refused`. `auto_join_domains` reports how many rules stand.
 - The rules in force are recorded in the database at each start, replacing the previous run's. Removing a domain stops **new** joins and removes nobody; restarting changes nobody's access. A person is checked against the rules at their first sign-in and again at the next one after the list actually changed (a restart with the same list changes nothing), so a new entry reaches people who already signed in at their next sign-in.
 - A member an administrator removed stays removed: the removal is recorded and domain auto-join skips that person for that organization from then on ([admission](admission.md#domain-auto-join)). Add them back explicitly to restore access.
+- A value that is not valid Unicode (possible on Linux) stops the controller at start with an error that names the variable and never echoes the value; unset means no rules.
 - Only the controller reads it; a worker ignores it.
 
 ### Remote cache
