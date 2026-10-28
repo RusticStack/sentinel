@@ -241,6 +241,8 @@ def sample_side(r):
     if not SHA.match(r["sha"]):
         raise SystemExit(f"malformed SHA in a {r['side']} record")
     side = {"sha": r["sha"], "trigger_to_required_ns": r["trigger_to_required_ns"], "outcome": r["outcome"]}
+    if r.get("censored"):
+        side["censored"] = True
     if r.get("job_ns"):
         side["job_ns"] = r["job_ns"]
     if r.get("phases"):

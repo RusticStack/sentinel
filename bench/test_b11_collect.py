@@ -250,6 +250,12 @@ class Pairing(unittest.TestCase):
         self.assertEqual(lines[0]["sentinel"]["outcome"], "incorrect")
         self.assertNotEqual(lines[0]["sentinel"]["sha"], lines[0]["blacksmith"]["sha"])
 
+    def test_a_censored_execution_stays_marked_so_the_report_can_count_it(self):
+        recs = [record("cli", "warm", 0, "sentinel", outcome="fail", censored=True), record("cli", "warm", 0, "blacksmith")]
+        _, lines = b11.pair_records(recs, CONTRACT)
+        self.assertEqual(lines[0]["sentinel"]["censored"], True)
+        self.assertNotIn("censored", lines[0]["blacksmith"])
+
 
 class Replay(unittest.TestCase):
     def test_the_committed_baselines_replay_into_a_pairable_dry_run(self):

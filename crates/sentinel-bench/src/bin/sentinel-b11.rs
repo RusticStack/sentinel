@@ -145,6 +145,10 @@ struct Side {
     #[serde(default)]
     phases: BTreeMap<String, u64>,
     outcome: Outcome,
+    /// A required check never completed: `outcome` is `fail` and the duration is
+    /// the observation window, a lower bound. Counted apart, never dropped.
+    #[serde(default)]
+    censored: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -167,6 +171,9 @@ impl Side {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
         if !sha_ok {
             return Err("sha must be 40 or 64 lowercase hex digits".into());
+        }
+        if self.censored && self.outcome != Outcome::Fail {
+            return Err("a censored execution never completed, so its outcome is fail".into());
         }
         if self.trigger_to_required_ns == 0 || self.job_ns == Some(0) {
             return Err("durations must be at least 1 ns".into());
@@ -387,6 +394,9 @@ struct NonPass {
     sentinel_incorrect: usize,
     blacksmith_fail: usize,
     blacksmith_incorrect: usize,
+    /// Of the failures above, the executions that never completed
+    sentinel_censored: usize,
+    blacksmith_censored: usize,
 }
 
 #[derive(Serialize)]
@@ -449,6 +459,8 @@ fn evaluate(lane: &str, condition: &str, mut pairs: Vec<PairLine>, gate: &Gate) 
             Outcome::Fail => non_pass.blacksmith_fail += 1,
             Outcome::Incorrect => non_pass.blacksmith_incorrect += 1,
         }
+        non_pass.sentinel_censored += usize::from(p.sentinel.censored);
+        non_pass.blacksmith_censored += usize::from(p.blacksmith.censored);
         sha_mismatches += usize::from(p.sentinel.sha != p.blacksmith.sha);
         let expected = if p.pair.is_multiple_of(2) {
             Order::SentinelFirst
@@ -737,6 +749,7 @@ mod tests {
             job_ns: None,
             phases: BTreeMap::new(),
             outcome: Outcome::Pass,
+            censored: false,
         }
     }
 
@@ -885,6 +898,29 @@ mod tests {
                 + r.non_pass.blacksmith_incorrect;
             assert_eq!(total, 1);
         }
+    }
+
+    #[test]
+    fn a_censored_execution_is_a_failure_and_is_counted_as_censored() {
+        let mut pairs = series(100, 0.30);
+        pairs[5].sentinel.outcome = Outcome::Fail;
+        pairs[5].sentinel.censored = true;
+        pairs[6].blacksmith.outcome = Outcome::Fail;
+        let r = run_series(pairs);
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(r.non_pass.sentinel_fail, 1);
+        assert_eq!(r.non_pass.sentinel_censored, 1);
+        assert_eq!(r.non_pass.blacksmith_fail, 1);
+        assert_eq!(r.non_pass.blacksmith_censored, 0);
+    }
+
+    #[test]
+    fn a_censored_execution_that_passed_is_an_input_error() {
+        let mut s = side(5);
+        s.censored = true;
+        assert!(s.check().is_err());
+        s.outcome = Outcome::Fail;
+        assert!(s.check().is_ok());
     }
 
     #[test]

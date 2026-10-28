@@ -179,6 +179,7 @@ fn run() -> Result<(), String> {
                     "count": syncs.len(),
                     "median": median(&syncs),
                     "p95": percentile(&syncs, 0.95),
+                    "p95_is_max": syncs.len() < 20,
                     "max": syncs[syncs.len() - 1],
                 },
             })
@@ -192,7 +193,6 @@ fn run() -> Result<(), String> {
         "frame_bytes": args.frame_bytes,
         "rounds": args.rounds,
         "order": order_log,
-        "p95_is_max": args.rounds < 20,
         "results": results,
     });
     println!("{record}");
