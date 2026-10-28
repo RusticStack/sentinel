@@ -331,6 +331,10 @@ pub fn session_cap(wanted: usize) -> crate::Result<usize> {
 
 /// The soft `RLIMIT_NOFILE`, `None` where it cannot be read or does not apply.
 #[cfg(unix)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "`rlim_t` is 32 bits on 32-bit targets"
+)]
 pub fn soft_limit() -> Option<u64> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,

@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
     io::{self, BufRead, BufReader, Cursor, Read, Write},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -1045,6 +1045,7 @@ impl Conns {
     /// Elsewhere there is no wake for a blocked `accept` but a connection, so make one and look again, bounded.
     #[cfg(not(target_os = "linux"))]
     fn wake_acceptor(&self, acceptor: &JoinHandle<()>) {
+        use std::net::{Ipv4Addr, Ipv6Addr};
         let target = match self.wake.ip() {
             IpAddr::V4(ip) if ip.is_unspecified() => {
                 SocketAddr::from((Ipv4Addr::LOCALHOST, self.wake.port()))
@@ -1711,7 +1712,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        conns.wake = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 9));
+        conns.wake = SocketAddr::from((std::net::Ipv4Addr::new(192, 0, 2, 1), 9));
         thread::sleep(Duration::from_millis(50));
         let started = Instant::now();
         assert!(conns.shutdown());
