@@ -33,6 +33,8 @@ fn setup() -> Option<Setup> {
         firecracker: path("SENTINEL_FIRECRACKER"),
         kernel: path("SENTINEL_GUEST_KERNEL"),
         agent: path("SENTINEL_GUEST_AGENT"),
+        snapshots: true,
+        guard: Default::default(),
     };
     setup.check().unwrap();
     Some(setup)
@@ -343,7 +345,16 @@ fn reconciliation_removes_a_vm_a_crashed_worker_left_running() {
     assert!(!microvm::exists(root.path(), attempt));
     assert!(microvm::owned(root.path()).is_empty());
     assert_scope_gone(root.path(), attempt);
-    assert_eq!(microvm::reconcile(root.path()).unwrap(), 0);
+    // systemd unloads a killed scope a moment after it stops; a pass that sees it still listed removes nothing.
+    let mut left = usize::MAX;
+    for _ in 0..50 {
+        left = microvm::reconcile(root.path()).unwrap();
+        if left == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(left, 0, "a second pass finds nothing left");
 }
 
 #[test]
@@ -412,4 +423,419 @@ fn a_cancel_during_the_start_leaves_no_vm() {
     assert!(starting.join().unwrap().is_err());
     assert!(!microvm::exists(root.path(), attempt));
     assert_scope_gone(root.path(), attempt);
+}
+
+// ---------------------------------------------------------------- M06: snapshot warm start
+
+fn start_net(
+    root: &std::path::Path,
+    setup: &Setup,
+    workspace: &std::path::Path,
+    network: Network,
+) -> (AttemptId, Vm) {
+    let attempt = AttemptId::new();
+    let vm = Vm::start(
+        root,
+        setup,
+        WorkerId::new(),
+        attempt,
+        IMAGE,
+        limits(),
+        workspace,
+        &[],
+        &Store::Shared,
+        network,
+    )
+    .unwrap();
+    eprintln!("start report: {:?}", vm.start_report());
+    (attempt, vm)
+}
+
+fn snapshots(root: &std::path::Path) -> Vec<PathBuf> {
+    let dir = root.join(microvm::DIR).join("snapshots");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut all: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    all.sort();
+    all
+}
+
+fn nothing_left(root: &std::path::Path, attempts: &[AttemptId]) {
+    assert!(microvm::owned(root).is_empty(), "no VM directory remains");
+    for attempt in attempts {
+        assert_scope_gone(root, *attempt);
+    }
+    let run = root.join(microvm::DIR).join("run");
+    assert!(
+        run.read_dir()
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(true),
+        "the fixed run path is an empty directory on the host"
+    );
+    assert!(
+        snapshots(root)
+            .iter()
+            .all(|p| !p.file_name().unwrap().to_string_lossy().starts_with('.')),
+        "no snapshot build is left half done"
+    );
+}
+
+#[test]
+fn the_first_vm_of_a_shape_builds_a_snapshot_and_the_next_ones_restore_it_with_their_own_state() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (a_id, a) = start_net(root.path(), &setup, workspace.path(), Network::None);
+    let first = a.start_report().clone();
+    assert_eq!(first.mode, microvm::Start::Restored, "{first:?}");
+    assert!(
+        first.snapshot_built && first.fallback.is_none(),
+        "{first:?}"
+    );
+    assert_eq!(snapshots(root.path()).len(), 1);
+
+    // State this attempt writes: into the image overlay (the scratch disk), its memory and its random stream.
+    let wrote = a
+        .exec(
+            &sh("echo mine > /etc/attempt-a; echo mem > /tmp/a; head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'", 60),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(wrote.code, Some(0), "{}", text(&wrote.stderr));
+    let rand_a = text(&wrote.stdout);
+
+    let started = Instant::now();
+    let (b_id, b) = start_net(root.path(), &setup, workspace.path(), Network::None);
+    eprintln!("second start (restore): {:?}", started.elapsed());
+    let second = b.start_report().clone();
+    assert_eq!(second.mode, microvm::Start::Restored, "{second:?}");
+    assert!(
+        !second.snapshot_built && second.fallback.is_none(),
+        "{second:?}"
+    );
+    assert_eq!(snapshots(root.path()).len(), 1, "the snapshot is shared");
+    let seen = b
+        .exec(
+            &sh("test ! -e /etc/attempt-a && test ! -e /tmp/a && head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'; echo; date +%s", 60),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        seen.code,
+        Some(0),
+        "A's state leaked into B: {}",
+        text(&seen.stderr)
+    );
+    let out = text(&seen.stdout);
+    let mut lines = out.lines();
+    let rand_b = lines.next().unwrap();
+    let clock: i64 = lines.next().unwrap().parse().unwrap();
+    assert_ne!(
+        rand_a, rand_b,
+        "two restores must not share a random stream"
+    );
+    let host = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(
+        (host - clock).abs() <= 5,
+        "guest clock {clock} vs host {host}"
+    );
+
+    // A's own state is intact while B runs.
+    let still = a.exec(&sh("cat /etc/attempt-a /tmp/a", 60), &[]).unwrap();
+    assert_eq!(text(&still.stdout), "mine\nmem");
+
+    a.destroy().unwrap();
+    b.destroy().unwrap();
+    nothing_left(root.path(), &[a_id, b_id]);
+    // The snapshot itself holds no attempt's data.
+    let snap = &snapshots(root.path())[0];
+    assert!(
+        !fs::read(snap.join("scratch.ext4"))
+            .unwrap()
+            .windows(9)
+            .any(|w| w == b"attempt-a")
+    );
+}
+
+#[test]
+fn with_snapshots_off_every_vm_boots_cold_and_makes_none() {
+    let Some(mut setup) = setup() else { return };
+    setup.snapshots = false;
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (id, vm) = start_net(root.path(), &setup, workspace.path(), Network::None);
+    let report = vm.start_report().clone();
+    assert_eq!(report.mode, microvm::Start::Cold);
+    assert!(report.fallback.is_none() && !report.snapshot_built);
+    assert!(snapshots(root.path()).is_empty());
+    vm.destroy().unwrap();
+    nothing_left(root.path(), &[id]);
+}
+
+#[test]
+fn a_snapshot_that_cannot_be_restored_falls_back_to_a_cold_boot_and_is_rebuilt() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (id, first) = start_net(root.path(), &setup, workspace.path(), Network::None);
+    first.destroy().unwrap();
+    let snap = snapshots(root.path()).remove(0);
+    // Damage the saved VM state in a way the marker and the sizes do not show.
+    let state = snap.join("state");
+    let len = fs::metadata(&state).unwrap().len() as usize;
+    fs::write(&state, vec![0xA5u8; len]).unwrap();
+
+    let (b_id, b) = start_net(root.path(), &setup, workspace.path(), Network::None);
+    let report = b.start_report().clone();
+    assert_eq!(report.mode, microvm::Start::Cold, "{report:?}");
+    assert!(
+        report
+            .fallback
+            .as_deref()
+            .is_some_and(|f| f.contains("restoring the snapshot failed")),
+        "{report:?}"
+    );
+    let ran = b.exec(&sh("echo cold-and-working", 60), &[]).unwrap();
+    assert_eq!(text(&ran.stdout), "cold-and-working");
+    b.destroy().unwrap();
+    assert!(
+        snapshots(root.path()).is_empty(),
+        "the unusable snapshot is gone"
+    );
+
+    let (c_id, c) = start_net(root.path(), &setup, workspace.path(), Network::None);
+    assert_eq!(c.start_report().mode, microvm::Start::Restored);
+    assert!(c.start_report().snapshot_built);
+    c.destroy().unwrap();
+    nothing_left(root.path(), &[id, b_id, c_id]);
+}
+
+#[test]
+fn simultaneous_first_starts_of_a_shape_publish_one_snapshot_and_both_run() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    // The image is built once up front so the race is about the snapshot.
+    let (id, warm) = start_net(root.path(), &setup, workspace.path(), Network::None);
+    warm.destroy().unwrap();
+    for entry in snapshots(root.path()) {
+        fs::remove_dir_all(entry).unwrap();
+    }
+    let starts: Vec<_> = (0..2)
+        .map(|_| {
+            let (root, workspace, setup) = (
+                root.path().to_path_buf(),
+                workspace.path().to_path_buf(),
+                setup.clone(),
+            );
+            std::thread::spawn(move || start_net(&root, &setup, &workspace, Network::None))
+        })
+        .collect();
+    let mut ids = vec![id];
+    for start in starts {
+        let (attempt, vm) = start.join().unwrap();
+        let ran = vm.exec(&sh("echo ok", 60), &[]).unwrap();
+        assert_eq!(text(&ran.stdout), "ok");
+        vm.destroy().unwrap();
+        ids.push(attempt);
+    }
+    assert_eq!(snapshots(root.path()).len(), 1);
+    nothing_left(root.path(), &ids);
+}
+
+#[test]
+fn removing_a_guest_image_removes_its_snapshots() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (_, vm) = start_net(root.path(), &setup, workspace.path(), Network::None);
+    vm.destroy().unwrap();
+    let image = microvm::guest_images(root.path()).remove(0);
+    assert!(
+        image.bytes > vm_image_bytes(root.path()),
+        "the budget counts the snapshot beside the root file system"
+    );
+    assert_eq!(snapshots(root.path()).len(), 1);
+    assert!(microvm::remove_guest_image(root.path(), &image.key));
+    assert!(snapshots(root.path()).is_empty());
+}
+
+/// The root file system's own size, as the image directory holds it.
+fn vm_image_bytes(root: &std::path::Path) -> u64 {
+    fs::read_dir(root.join(microvm::DIR).join("images"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "ext4"))
+        .map(|e| e.metadata().unwrap().len())
+        .sum()
+}
+
+// ---------------------------------------------------------------- M05: network
+
+/// A listener the guest must never reach; it records whether anything connected.
+fn listener(addr: &str) -> (std::net::TcpListener, std::net::SocketAddr) {
+    let listener = std::net::TcpListener::bind(format!("{addr}:0")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let bound = listener.local_addr().unwrap();
+    (listener, bound)
+}
+
+fn connects(vm: &Vm, host: &str, port: u16) -> bool {
+    let exit = vm
+        .exec(&sh(&format!("nc -w 2 {host} {port} < /dev/null"), 30), &[])
+        .unwrap();
+    exit.code == Some(0)
+}
+
+fn egress_target() -> (String, u16) {
+    let target =
+        std::env::var("SENTINEL_MICROVM_EGRESS_TARGET").unwrap_or_else(|_| "1.1.1.1:443".into());
+    let (host, port) = target.rsplit_once(':').unwrap();
+    (host.to_owned(), port.parse().unwrap())
+}
+
+#[test]
+fn the_rules_are_accepted_by_nft() {
+    if std::env::var_os("SENTINEL_MICROVM_TESTS").is_none() {
+        eprintln!(
+            "skipped: set SENTINEL_MICROVM_TESTS=1 as an account with rootless Podman and nft"
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let host = microvm::net::host_addresses().unwrap();
+    let guard = microvm::net::Guard {
+        link: vec![
+            "198.51.100.9:7443".parse().unwrap(),
+            "127.0.0.1:9000".parse().unwrap(),
+        ],
+    };
+    let rules = microvm::net::Policy::new(&host, &guard).rules();
+    let file = dir.path().join("egress.nft");
+    fs::write(&file, &rules).unwrap();
+    let out = std::process::Command::new("podman")
+        .args(["unshare", "unshare", "--net", "nft", "-c", "-f"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "nft refused the rules: {}\n{rules}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_guest_without_egress_has_no_network_interface() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (id, vm) = start_net(root.path(), &setup, workspace.path(), Network::None);
+    let exit = vm.exec(&sh("ls /sys/class/net", 30), &[]).unwrap();
+    assert_eq!(text(&exit.stdout), "lo", "{}", text(&exit.stderr));
+    assert!(!connects(&vm, "1.1.1.1", 443));
+    vm.destroy().unwrap();
+    nothing_left(root.path(), &[id]);
+}
+
+#[test]
+fn a_granted_guest_reaches_out_but_not_the_host_the_link_or_metadata() {
+    let Some(mut setup) = setup() else { return };
+    pull();
+    // What the guest must not reach: a service on loopback, one on each non-loopback address of the host, and
+    // the worker's own link endpoint (here a listener standing for the controller).
+    let (loopback, loopback_addr) = listener("127.0.0.1");
+    let (link, link_addr) = listener("127.0.0.1");
+    setup.guard.link = vec![link_addr];
+    let mut watched = vec![loopback, link];
+    let mut targets = vec![
+        ("127.0.0.1".to_owned(), loopback_addr.port()),
+        ("127.0.0.1".to_owned(), link_addr.port()),
+    ];
+    for address in microvm::net::host_addresses().unwrap() {
+        if address.is_loopback() {
+            continue;
+        }
+        let (l, bound) = listener(&address.to_string());
+        watched.push(l);
+        targets.push((address.to_string(), bound.port()));
+    }
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (id, vm) = start_net(root.path(), &setup, workspace.path(), Network::Egress);
+    let net = vm
+        .exec(&sh("ip -4 -o addr show eth0; ip route", 30), &[])
+        .unwrap();
+    eprintln!("guest network:\n{}", text(&net.stdout));
+    for (host, port) in &targets {
+        assert!(
+            !connects(&vm, host, *port),
+            "the guest reached {host}:{port}"
+        );
+    }
+    // The namespace's own side of the tap and the link-local range with the metadata endpoints.
+    for (host, port) in [
+        ("10.211.0.1", 22u16),
+        ("169.254.169.254", 80),
+        ("169.254.170.2", 80),
+    ] {
+        assert!(
+            !connects(&vm, host, port),
+            "the guest reached {host}:{port}"
+        );
+    }
+    for listener in &watched {
+        assert!(
+            listener.accept().is_err(),
+            "something connected to a service the guest must not reach"
+        );
+    }
+    // Egress works where granted: a name resolves and a public address answers.
+    let (host, port) = egress_target();
+    assert!(connects(&vm, &host, port), "no egress to {host}:{port}");
+    let dns = vm.exec(&sh("nslookup example.com", 30), &[]).unwrap();
+    assert_eq!(
+        dns.code,
+        Some(0),
+        "{}{}",
+        text(&dns.stdout),
+        text(&dns.stderr)
+    );
+    vm.destroy().unwrap();
+    nothing_left(root.path(), &[id]);
+}
+
+#[test]
+fn a_restored_guest_keeps_its_network_and_its_policy() {
+    let Some(mut setup) = setup() else { return };
+    pull();
+    let (link, link_addr) = listener("127.0.0.1");
+    setup.guard.link = vec![link_addr];
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (a_id, a) = start_net(root.path(), &setup, workspace.path(), Network::Egress);
+    a.destroy().unwrap();
+    let (b_id, b) = start_net(root.path(), &setup, workspace.path(), Network::Egress);
+    assert_eq!(
+        b.start_report().mode,
+        microvm::Start::Restored,
+        "{:?}",
+        b.start_report()
+    );
+    let (host, port) = egress_target();
+    assert!(connects(&b, &host, port), "no egress after a restore");
+    assert!(!connects(&b, "127.0.0.1", link_addr.port()));
+    assert!(link.accept().is_err());
+    b.destroy().unwrap();
+    nothing_left(root.path(), &[a_id, b_id]);
 }

@@ -56,7 +56,7 @@ cpu_millis = 8000                  # override measured capacity (default: every 
 memory_bytes = 34359738368         # override measured capacity (default: total less a host reserve); the whole host's
 git_mirrors = true                 # keep per-repository object mirrors under <data_dir>/mirrors (default on; [mirrors](mirrors.md))
 labels = ["linux", "gpu"]          # scheduling labels this worker selects work by; at most 16, each 1-128 bytes (default none)
-job_network = "none"               # "egress" gives job containers outbound network (rootless pasta, no route to this host's loopback) and adds the label "egress"; operator-granted, trusted code only (default "none"; [executor](executor.md#job-network))
+job_network = "none"               # "egress" gives job containers and microVM guests outbound network (rootless pasta; containers have no route to this host's loopback, guests none to the host's addresses, loopback, link-local and metadata addresses or the controller link) and adds the label "egress"; operator-granted, trusted code only (default "none"; [executor](executor.md#job-network), [microVM network](executor.md#network-m05))
 isolation = "auto"                 # default executor for jobs that state none: "auto" (a microVM where /dev/kvm is usable and the microVM executor is set up, else rootless Podman), "container" or "microvm" (refused at start where microVMs cannot run); the worker logs runtime_selected with what it detected ([plan 16.8](../plan.md#168-microvm-execution-on-kvm-hosts))
 disk_bytes = 1073741824            # scratch disk offered to jobs; default: the data directory's free space less an eighth (clamped to 512 MiB-2 GiB); a platform that cannot measure it offers none, and no job is placed there
 spool_reserve_bytes = 1073741824   # free space the log spools never write the data directory below (default 1 GiB; 0 = none)
@@ -72,6 +72,7 @@ tailcat_address = "tc…"            # required with `[tailcat] enabled = true`:
 firecracker = "/usr/local/bin/firecracker"  # Firecracker executable
 kernel = "/var/lib/sentinel-microvm/vmlinux" # pinned Linux guest kernel
 agent = "/usr/local/bin/sentinel-agent"      # static Linux guest agent executable
+snapshots = true                             # start VMs from snapshots of a booted guest of their shape (default true); false boots every VM cold ([executor](executor.md#snapshot-warm-start-m06))
 
 # either role: the optional pinned Tailcat transport; absent or `enabled = false` = direct TLS
 [tailcat]

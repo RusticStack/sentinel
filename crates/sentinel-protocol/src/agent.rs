@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any change to these types; the agent states its own in [`Reply::Ready`].
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// The vsock port the agent listens on.
 pub const PORT: u32 = 1024;
@@ -56,6 +56,14 @@ pub enum Request {
     OomKills,
     /// Syncs file systems and powers the guest off; the stream ends.
     Shutdown,
+    /// First request to a guest restored from a snapshot (M06): the restored guest knows neither the time that
+    /// passed nor that it is not the only copy of the snapshot. The agent credits `entropy` to the kernel's
+    /// random pool (bytes the worker drew fresh for this attempt, so no two restores share a random stream),
+    /// sets the wall clock to `realtime_ns` nanoseconds since the Unix epoch and answers `Done`.
+    Resume {
+        entropy: Vec<u8>,
+        realtime_ns: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +197,16 @@ mod tests {
         ));
         let chunk = encode(&Reply::Data(vec![0; CHUNK])).unwrap();
         assert!(chunk.len() <= MAX_FRAME + 4);
+    }
+
+    #[test]
+    fn a_resume_request_carries_its_entropy_and_clock() {
+        let resume = Request::Resume {
+            entropy: vec![7; 64],
+            realtime_ns: 1_790_000_000_123_456_789,
+        };
+        let frame = encode(&resume).unwrap();
+        assert_eq!(decode::<Request>(&frame[4..]).unwrap(), resume);
     }
 
     #[test]

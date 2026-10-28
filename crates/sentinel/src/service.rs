@@ -108,6 +108,8 @@ struct MicrovmFile {
     firecracker: PathBuf,
     kernel: PathBuf,
     agent: PathBuf,
+    /// Start VMs from snapshots of a booted guest (default true, M06).
+    snapshots: Option<bool>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -388,6 +390,7 @@ struct MicrovmSetup {
     firecracker: PathBuf,
     kernel: PathBuf,
     agent: PathBuf,
+    snapshots: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -819,6 +822,7 @@ impl Config {
                             firecracker: m.firecracker,
                             kernel: m.kernel,
                             agent: m.agent,
+                            snapshots: m.snapshots.unwrap_or(true),
                         }),
                         disk_bytes: file.disk_bytes,
                         spool_reserve_bytes: file.spool_reserve_bytes,
@@ -2271,12 +2275,24 @@ mod worker_role {
                 );
                 executor.set_storage_budgets(budgets);
                 executor.set_job_network(network);
+                let microvm_egress = network == sentinel_worker::podman::Network::Egress
+                    && runtime.microvm.is_some();
                 executor.set_runtime(runtime);
                 if network == sentinel_worker::podman::Network::Egress {
                     tracing::warn!(
                         event = "job_egress_enabled",
                         "job containers on this worker have outbound network (job_network = \"egress\")"
                     );
+                }
+                if microvm_egress {
+                    let missing = sentinel_worker::microvm::net::missing_prerequisites();
+                    if !missing.is_empty() {
+                        tracing::warn!(
+                            event = "microvm_egress_unavailable",
+                            missing = %missing.join(", "),
+                            "microVM jobs on this worker cannot get network until these are installed"
+                        );
+                    }
                 }
                 let runtime = executor.runtime();
                 let recovered = executor.recovered();
@@ -2547,6 +2563,16 @@ mod worker_role {
                 firecracker: m.firecracker.clone(),
                 kernel: m.kernel.clone(),
                 agent: m.agent.clone(),
+                snapshots: m.snapshots,
+                // A guest granted egress never reaches the controller's link: the address the worker dials
+                // (the Tailcat helper's local forward, when there is one) and the configured one.
+                guard: sentinel_worker::microvm::net::Guard {
+                    link: if controller == link.controller {
+                        vec![controller]
+                    } else {
+                        vec![controller, link.controller]
+                    },
+                },
             });
         let preference = match link.isolation {
             IsolationSetting::Auto => sentinel_worker::host::Preference::Auto,

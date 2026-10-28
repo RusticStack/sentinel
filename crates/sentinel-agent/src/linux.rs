@@ -138,6 +138,9 @@ fn boot() -> io::Result<()> {
     mount("tmpfs", "/job/tmp", "tmpfs", nodev, "mode=1777,size=1g")?;
     std::fs::create_dir_all("/job/workspace")?;
     loopback_up()?;
+    if let Some(net) = parse_net(&std::fs::read_to_string("/proc/cmdline").unwrap_or_default()) {
+        configure_net(&net)?;
+    }
     if let Some(dns) = cmdline_value("sentinel.dns") {
         std::fs::create_dir_all("/job/etc")?;
         std::fs::write("/job/etc/resolv.conf", format!("nameserver {dns}\n"))?;
@@ -150,6 +153,173 @@ fn cmdline_value(key: &str) -> Option<String> {
     line.split_whitespace()
         .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
         .map(str::to_owned)
+}
+
+/// The guest's one network interface, as the worker states it on the kernel command line
+/// (`sentinel.ip=<address>/<prefix> sentinel.gw=<gateway>`); absent for a job without network, whose VM has no
+/// interface at all.
+#[derive(Debug, PartialEq, Eq)]
+struct NetConfig {
+    addr: [u8; 4],
+    prefix: u8,
+    gateway: [u8; 4],
+}
+
+fn parse_net(cmdline: &str) -> Option<NetConfig> {
+    let value = |key: &str| {
+        cmdline
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+    };
+    let (addr, prefix) = value("sentinel.ip")?.split_once('/')?;
+    let prefix: u8 = prefix.parse().ok().filter(|p| (1..=30).contains(p))?;
+    let addr: std::net::Ipv4Addr = addr.parse().ok()?;
+    let gateway: std::net::Ipv4Addr = value("sentinel.gw")?.parse().ok()?;
+    Some(NetConfig {
+        addr: addr.octets(),
+        prefix,
+        gateway: gateway.octets(),
+    })
+}
+
+fn netmask(prefix: u8) -> [u8; 4] {
+    (u32::MAX << (32 - u32::from(prefix))).to_be_bytes()
+}
+
+fn sockaddr_in(ip: [u8; 4]) -> libc::sockaddr_in {
+    libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        // The octets in memory order are the address in network byte order.
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(ip),
+        },
+        sin_zero: [0; 8],
+    }
+}
+
+/// The kernel's `struct rtentry` (`SIOCADDRT`), declared here because not every libc target has it.
+#[repr(C)]
+struct RtEntry {
+    pad1: libc::c_ulong,
+    dst: libc::sockaddr_in,
+    gateway: libc::sockaddr_in,
+    genmask: libc::sockaddr_in,
+    flags: libc::c_ushort,
+    pad2: libc::c_short,
+    pad3: libc::c_ulong,
+    pad4: *mut libc::c_void,
+    metric: libc::c_short,
+    dev: *mut libc::c_char,
+    mtu: libc::c_ulong,
+    window: libc::c_ulong,
+    irtt: libc::c_ushort,
+}
+
+const RTF_UP: u16 = 0x1;
+const RTF_GATEWAY: u16 = 0x2;
+const SIOCADDRT: libc::c_ulong = 0x890B;
+const SIOCSIFADDR: libc::c_ulong = 0x8916;
+const SIOCSIFNETMASK: libc::c_ulong = 0x891C;
+const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
+/// `RNDADDENTROPY`: `_IOW('R', 0x03, int[2])`.
+const RNDADDENTROPY: libc::c_ulong = 0x4008_5203;
+
+fn ifreq(name: &str) -> libc::ifreq {
+    // SAFETY: ifreq is plain data; zeroed is a valid value.
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (i, b) in name.bytes().take(libc::IFNAMSIZ - 1).enumerate() {
+        req.ifr_name[i] = b as libc::c_char;
+    }
+    req
+}
+
+fn inet_socket() -> io::Result<OwnedFd> {
+    // SAFETY: a plain socket call; the descriptor is owned below.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a fresh descriptor this function owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Gives `eth0` its address, brings it up and routes everything through the gateway. The interface is the
+/// one virtio-net device the VMM was given; its driver is built in, so it exists when `/init` starts.
+fn configure_net(net: &NetConfig) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let sock = inet_socket()?;
+    let fd = sock.as_raw_fd();
+    let set_addr = |request: libc::c_ulong, ip: [u8; 4]| -> io::Result<()> {
+        let mut req = ifreq("eth0");
+        // SAFETY: sockaddr and sockaddr_in are both 16 bytes; ifru_addr is the union member these requests read.
+        unsafe {
+            std::ptr::write(
+                std::ptr::addr_of_mut!(req.ifr_ifru.ifru_addr).cast::<libc::sockaddr_in>(),
+                sockaddr_in(ip),
+            );
+        }
+        // SAFETY: req is a valid ifreq for the request and lives across the call.
+        if unsafe { libc::ioctl(fd, request as _, &req) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    set_addr(SIOCSIFADDR, net.addr)?;
+    set_addr(SIOCSIFNETMASK, netmask(net.prefix))?;
+    let mut req = ifreq("eth0");
+    req.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+    // SAFETY: req is a valid ifreq for SIOCSIFFLAGS and lives across the call.
+    if unsafe { libc::ioctl(fd, SIOCSIFFLAGS as _, &req) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let route = RtEntry {
+        pad1: 0,
+        dst: sockaddr_in([0; 4]),
+        gateway: sockaddr_in(net.gateway),
+        genmask: sockaddr_in([0; 4]),
+        flags: (RTF_UP | RTF_GATEWAY) as libc::c_ushort,
+        pad2: 0,
+        pad3: 0,
+        pad4: std::ptr::null_mut(),
+        metric: 0,
+        dev: std::ptr::null_mut(),
+        mtu: 0,
+        window: 0,
+        irtt: 0,
+    };
+    // SAFETY: route is a valid rtentry for SIOCADDRT and lives across the call.
+    if unsafe { libc::ioctl(fd, SIOCADDRT as _, &route) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// What a restored guest needs before it runs a step (`Request::Resume`): fresh randomness credited to the
+/// kernel's pool and the current wall clock.
+fn resume(entropy: &[u8], realtime_ns: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if !entropy.is_empty() {
+        let n = entropy.len().min(512);
+        let mut info = Vec::with_capacity(8 + n);
+        info.extend_from_slice(&((n * 8) as i32).to_ne_bytes());
+        info.extend_from_slice(&(n as i32).to_ne_bytes());
+        info.extend_from_slice(&entropy[..n]);
+        let pool = File::options().write(true).open("/dev/urandom")?;
+        // SAFETY: info is a rand_pool_info header followed by n bytes, as RNDADDENTROPY reads.
+        if unsafe { libc::ioctl(pool.as_raw_fd(), RNDADDENTROPY as _, info.as_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let at = libc::timespec {
+        tv_sec: (realtime_ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (realtime_ns % 1_000_000_000) as libc::c_long,
+    };
+    // SAFETY: at is a valid timespec for the call.
+    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &at) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Brings `lo` up, as a container's network namespace has it.
@@ -311,6 +481,18 @@ fn serve(conn: File, children: &Arc<Mutex<Children>>) -> io::Result<()> {
                 send(&writer, &Reply::Done)?;
             }
             Request::OomKills => send(&writer, &Reply::OomKills(oom_kills()))?,
+            Request::Resume {
+                entropy,
+                realtime_ns,
+            } => {
+                let reply = match resume(&entropy, realtime_ns) {
+                    Ok(()) => Reply::Done,
+                    Err(e) => Reply::Failed {
+                        message: format!("resume: {e}"),
+                    },
+                };
+                send(&writer, &reply)?;
+            }
             Request::Shutdown => power_off(),
             Request::Hello { .. } | Request::Data(_) | Request::End => {
                 return Err(io::Error::other("unexpected frame"));
@@ -593,5 +775,56 @@ fn reap(children: &Arc<Mutex<Children>>) {
             };
             let _ = running.done.send(ended);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_network_comes_from_the_command_line_or_is_absent() {
+        let line = "console=ttyS0 quiet sentinel.ip=10.211.0.2/30 sentinel.gw=10.211.0.1 sentinel.dns=192.0.2.53";
+        assert_eq!(
+            parse_net(line),
+            Some(NetConfig {
+                addr: [10, 211, 0, 2],
+                prefix: 30,
+                gateway: [10, 211, 0, 1],
+            })
+        );
+        // No interface was given, or the line is not a usable one: nothing is configured.
+        assert_eq!(parse_net("console=ttyS0 quiet"), None);
+        assert_eq!(parse_net("sentinel.ip=10.211.0.2/30"), None);
+        assert_eq!(
+            parse_net("sentinel.ip=10.211.0.2 sentinel.gw=10.211.0.1"),
+            None
+        );
+        assert_eq!(
+            parse_net("sentinel.ip=10.211.0.2/0 sentinel.gw=10.211.0.1"),
+            None
+        );
+        assert_eq!(
+            parse_net("sentinel.ip=10.211.0.2/31 sentinel.gw=10.211.0.1"),
+            None
+        );
+        assert_eq!(
+            parse_net("sentinel.ip=nope/30 sentinel.gw=10.211.0.1"),
+            None
+        );
+    }
+
+    #[test]
+    fn prefixes_become_masks() {
+        assert_eq!(netmask(30), [255, 255, 255, 252]);
+        assert_eq!(netmask(24), [255, 255, 255, 0]);
+        assert_eq!(netmask(1), [128, 0, 0, 0]);
+    }
+
+    #[test]
+    fn addresses_are_stored_in_network_order() {
+        let sin = sockaddr_in([10, 211, 0, 2]);
+        assert_eq!(sin.sin_addr.s_addr.to_ne_bytes(), [10, 211, 0, 2]);
+        assert_eq!(i32::from(sin.sin_family), libc::AF_INET);
     }
 }

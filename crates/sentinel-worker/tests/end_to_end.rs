@@ -63,6 +63,8 @@ fn microvm_runtime() -> Option<sentinel_worker::attempt::Runtime> {
         firecracker: path("SENTINEL_FIRECRACKER"),
         kernel: path("SENTINEL_GUEST_KERNEL"),
         agent: path("SENTINEL_GUEST_AGENT"),
+        snapshots: true,
+        guard: Default::default(),
     };
     setup.check().unwrap();
     Some(sentinel_worker::attempt::Runtime {

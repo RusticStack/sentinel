@@ -1,18 +1,27 @@
-//! MicroVM jobs (plan 16.8, TODO M03–M05): one Firecracker VM per attempt, steps run by the guest agent.
+//! MicroVM jobs (plan 16.8, TODO M03–M06): one Firecracker VM per attempt, steps run by the guest agent.
 //!
 //! Rootless, like the container executor. Firecracker's jailer needs root, so its sandbox is built from
 //! what the worker account has: a user namespace from `podman unshare` (Podman's setuid id-map helpers),
-//! a fresh network namespace (empty unless the worker grants egress), a user systemd scope that caps CPU
-//! and memory and names the VM for cleanup, and Firecracker's own seccomp filters. The guest boots the
+//! fresh mount and network namespaces (the network empty unless the worker grants egress, see [`net`]), a user systemd scope that
+//! caps CPU and memory and names the VM for cleanup, and Firecracker's own seccomp filters. The guest boots the
 //! pinned kernel with an initramfs whose `/init` is the agent; `/dev/vda` is the job image as a read-only
 //! ext4 file built once per image (cached under `microvm/images`) and `/dev/vdb` the attempt's scratch
 //! disk, sized to the job's disk reservation. Firecracker has no shared file system, so the workspace and
 //! mounts go in as tar streams over vsock and the paths the host reads afterwards (artifacts, writable
 //! caches) come back the same way.
+//!
+//! A VM starts warm when it can: the first VM of a shape (image, vCPUs, memory, scratch size, network) builds
+//! a snapshot of its booted, idle guest ([`snapshot`]) and every VM of that shape, that one included, is
+//! restored from it with a copy-on-write memory mapping and a clone of the snapshot's scratch disk. Anything
+//! that goes wrong with a warm start falls back to a cold boot of the same attempt.
+
+mod fcapi;
+pub mod net;
+mod snapshot;
 
 use std::{
     collections::HashSet,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
@@ -65,6 +74,10 @@ const STAMP_AFTER: Duration = Duration::from_secs(60);
 /// writes at least every few minutes and ends within `IMAGE_BUILD_TIMEOUT`.
 const ORPHAN_AGE: Duration = Duration::from_secs(3600);
 const SYSTEMCTL: &str = "systemctl";
+/// Firecracker's `PUT /snapshot/create` writes the guest's whole memory.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the restored VMM has to bring up its API socket and load a snapshot.
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The operator's `[microvm]` setup: Firecracker, the pinned guest kernel and the static agent binary.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +85,10 @@ pub struct Setup {
     pub firecracker: PathBuf,
     pub kernel: PathBuf,
     pub agent: PathBuf,
+    /// Whether VMs start from snapshots of a booted guest (M06). Off, every VM boots cold.
+    pub snapshots: bool,
+    /// Endpoints of the worker itself that a guest granted egress must not reach (M05).
+    pub guard: net::Guard,
 }
 
 impl Setup {
@@ -297,6 +314,8 @@ pub fn guest_image_canceled(
         }
         let started = Instant::now();
         let meta = build_image(image, digest, store, &rootfs, &meta_path, cancel)?;
+        // A rebuilt root file system is a new file: snapshots taken from the old one no longer describe its disk.
+        snapshot::remove_for_image(root, &key);
         Ok(GuestImage {
             rootfs: rootfs.clone(),
             record: GuestImageRecord {
@@ -398,7 +417,8 @@ struct Inspected {
 
 const ENV_SEPARATOR: &str = "--env--";
 /// One value per line: the image ID, its manifest digest, each repo digest, a separator, then the environment.
-const INSPECT_FORMAT: &str = "{{println .Id}}{{println .Digest}}{{range .RepoDigests}}{{println .}}{{end}}{{println \"--env--\"}}{{range .Config.Env}}{{println .}}{{end}}";
+/// Plain actions with newlines in the template: Podman 4.9 refuses a field passed to `println`.
+const INSPECT_FORMAT: &str = "{{.Id}}\n{{.Digest}}\n{{range .RepoDigests}}{{.}}\n{{end}}--env--\n{{range .Config.Env}}{{.}}\n{{end}}";
 
 fn parse_inspect(text: &str) -> Option<Inspected> {
     let mut lines = text.lines();
@@ -548,7 +568,8 @@ fn thread_tag() -> u64 {
 pub struct GuestEntry {
     pub key: String,
     pub digest: String,
-    /// Apparent size of the root file system, the figure the image budget counts.
+    /// The figure the image budget counts: the apparent size of the root file system plus the bytes held by
+    /// the image's snapshots (they are reclaimed with it).
     pub bytes: u64,
     /// The last use: the marker's modification time.
     pub used: SystemTime,
@@ -559,6 +580,7 @@ pub fn guest_images(root: &Path) -> Vec<GuestEntry> {
     let Ok(entries) = fs::read_dir(images_dir(root)) else {
         return Vec::new();
     };
+    let snapshots = snapshot::bytes_by_image(root);
     entries
         .flatten()
         .filter_map(|entry| {
@@ -572,7 +594,9 @@ pub fn guest_images(root: &Path) -> Vec<GuestEntry> {
             Some(GuestEntry {
                 key: key.to_owned(),
                 digest: meta.digest,
-                bytes: meta.rootfs_bytes,
+                bytes: meta
+                    .rootfs_bytes
+                    .saturating_add(snapshots.get(key).copied().unwrap_or(0)),
                 used,
             })
         })
@@ -588,6 +612,8 @@ pub fn remove_guest_image(root: &Path, key: &str) -> bool {
     let dir = images_dir(root);
     let removed = fs::remove_file(dir.join(format!("{key}.json"))).is_ok();
     let _ = fs::remove_file(dir.join(format!("{key}.ext4")));
+    // The snapshots were taken from this root file system and are useless without it.
+    snapshot::remove_for_image(root, key);
     removed
 }
 
@@ -617,8 +643,13 @@ fn orphans(files: &[(String, Duration)]) -> Vec<&str> {
 /// Removes the image directory's orphans; the count removed.
 pub fn sweep_guest_orphans(root: &Path) -> usize {
     let dir = images_dir(root);
+    let snapshots = snapshot::sweep(
+        root,
+        |key| is_image_key(key) && dir.join(format!("{key}.json")).is_file(),
+        ORPHAN_AGE,
+    );
     let Ok(entries) = fs::read_dir(&dir) else {
-        return 0;
+        return snapshots;
     };
     let now = SystemTime::now();
     let files: Vec<(String, Duration)> = entries
@@ -634,10 +665,11 @@ pub fn sweep_guest_orphans(root: &Path) -> usize {
             Some((entry.file_name().into_string().ok()?, age))
         })
         .collect();
-    orphans(&files)
-        .into_iter()
-        .filter(|name| fs::remove_file(dir.join(name)).is_ok())
-        .count()
+    snapshots
+        + orphans(&files)
+            .into_iter()
+            .filter(|name| fs::remove_file(dir.join(name)).is_ok())
+            .count()
 }
 
 // ---------------------------------------------------------------- agent client
@@ -734,6 +766,13 @@ impl Client {
                     ));
                 }
             }
+        }
+    }
+
+    /// Ends the connection from the host side, so the guest agent's end of it ends too.
+    fn close(&self) {
+        if let Ok(writer) = self.writer.lock() {
+            let _ = writer.shutdown(std::net::Shutdown::Both);
         }
     }
 
@@ -889,6 +928,28 @@ impl DataIn<'_> {
 
 // ---------------------------------------------------------------- the VM
 
+/// How a VM's guest came up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Start {
+    /// Booted from the kernel.
+    Cold,
+    /// Restored from a snapshot of a booted guest of the same shape.
+    Restored,
+}
+
+/// What the start of a VM decided and measured, for diagnostics and for the warm-start evidence (M06, M08).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartReport {
+    pub mode: Start,
+    /// Monotonic time from the start of the VMM until the guest agent was ready for the workspace (for a restore:
+    /// clone, load, connect and resume; for the VM that builds the snapshot: the build is in it).
+    pub ready_ns: u64,
+    /// This start built the snapshot it was restored from.
+    pub snapshot_built: bool,
+    /// Why a warm start was not used when one was wanted: a snapshot that failed to build or to restore.
+    pub fallback: Option<String>,
+}
+
 /// A running job VM; the counterpart of [`crate::podman::Container`].
 pub struct Vm {
     attempt: AttemptId,
@@ -897,6 +958,7 @@ pub struct Vm {
     unit: String,
     /// The guest image this VM booted, for the attempt's summary.
     guest: GuestImageRecord,
+    start: StartReport,
     child: Mutex<Child>,
     client: Client,
     env: Vec<(String, String)>,
@@ -911,6 +973,404 @@ impl std::fmt::Debug for Vm {
             .field("attempt", &self.attempt)
             .finish_non_exhaustive()
     }
+}
+
+/// The kernel command line of a guest.
+fn boot_args(net: bool) -> String {
+    let mut args = String::from(
+        "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd quiet",
+    );
+    if net {
+        args.push_str(&net::boot_args());
+    }
+    args
+}
+
+/// A VM start in progress: everything the cold boot, the snapshot build and the restore share.
+struct Plan<'a> {
+    root: &'a Path,
+    setup: &'a Setup,
+    guest: &'a GuestImage,
+    initrd: &'a Path,
+    limits: Limits,
+    shape: snapshot::Shape,
+    /// The attempt's VM directory and the scope its VMM runs in.
+    dir: &'a Path,
+    unit: &'a str,
+    cancel: &'a AtomicBool,
+}
+
+impl Plan<'_> {
+    /// The nftables rules of a VM granted egress (none for a VM without a network).
+    fn rules(&self) -> Result<Option<String>> {
+        if !self.shape.net {
+            return Ok(None);
+        }
+        let host = net::host_addresses()
+            .map_err(|e| Error::Preparation(format!("the host's addresses: {e}")))?;
+        Ok(Some(net::Policy::new(&host, &self.setup.guard).rules()))
+    }
+
+    /// Starts the VMM in its scope. `bind` is the fixed run path the VM directory is bound to inside the VMM's
+    /// mount namespace (snapshot builds and restores); `tap` is the rules of a VM with a tap and whether it
+    /// also gets an uplink.
+    fn spawn(
+        &self,
+        dir: &Path,
+        unit: &str,
+        limits: Limits,
+        bind: Option<&Path>,
+        tap: Option<(&str, bool)>,
+        args: &[OsString],
+    ) -> Result<Child> {
+        net::install(
+            dir,
+            tap.map(|(rules, _)| rules),
+            tap.is_some_and(|(_, uplink)| uplink),
+        )?;
+        let console = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(dir.join("console.log"))?;
+        let mut command = Command::new("systemd-run");
+        command
+            .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
+            .arg(unit)
+            .arg(format!("-pCPUQuota={}%", (limits.cpu_millis / 10).max(1)))
+            .arg(format!(
+                "-pMemoryMax={}",
+                limits.memory_bytes.saturating_add(VMM_OVERHEAD)
+            ))
+            .args(["--", "/bin/sh"])
+            .arg(net::launch_script(dir))
+            .arg(dir)
+            .arg(bind.map_or(OsStr::new("-"), Path::as_os_str))
+            .arg(&self.setup.firecracker)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(console.try_clone()?)
+            .stderr(console);
+        command
+            .spawn()
+            .map_err(|e| Error::Preparation(format!("firecracker: {e}")))
+    }
+
+    /// Connects to the guest agent of a VMM just started in `dir`; a VMM that ends or a cancel stops the wait
+    /// and the VM with it.
+    fn await_agent(&self, child: &mut Child, dir: &Path, unit: &str) -> Result<Client> {
+        let deadline = Instant::now() + BOOT_TIMEOUT;
+        let client = connect(&dir.join("vsock.sock"), deadline, &mut || {
+            matches!(child.try_wait(), Ok(None)) && !self.cancel.load(Ordering::Acquire)
+        });
+        client.map_err(|e| {
+            let tail = console_tail(dir);
+            kill_vmm(child, unit);
+            if self.cancel.load(Ordering::Acquire) {
+                return canceled_start();
+            }
+            Error::Preparation(format!("{e}; console: {tail}"))
+        })
+    }
+
+    /// The cold boot: the pinned kernel, the initramfs, the image and a fresh scratch disk.
+    fn cold(&self) -> Result<(Child, Client)> {
+        let scratch = self.dir.join("scratch.ext4");
+        scratch_disk(&scratch, self.shape.scratch_bytes)?;
+        let config = vm_config(
+            self.setup,
+            self.initrd,
+            &self.guest.rootfs,
+            &scratch,
+            &self.dir.join("vsock.sock"),
+            &self.shape,
+        );
+        fs::write(
+            self.dir.join("vm.json"),
+            serde_json::to_vec_pretty(&config).map_err(io::Error::other)?,
+        )?;
+        let rules = self.rules()?;
+        let mut child = self.spawn(
+            self.dir,
+            self.unit,
+            self.limits,
+            None,
+            rules.as_deref().map(|r| (r, true)),
+            &[
+                "--api-sock".into(),
+                self.dir.join("api.sock").into(),
+                "--config-file".into(),
+                self.dir.join("vm.json").into(),
+            ],
+        )?;
+        let client = self.await_agent(&mut child, self.dir, self.unit)?;
+        Ok((child, client))
+    }
+
+    /// The warm start. `Ok(None)` when no snapshot is usable right now and the VM should boot cold without
+    /// it being a failure (another attempt is building the snapshot, or a build failed lately).
+    fn warm(&self, report: &mut StartReport) -> Result<Option<(Child, Client)>> {
+        let rootfs_id = snapshot::file_identity(&self.guest.rootfs)?;
+        let image_key = self
+            .guest
+            .rootfs
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let name = snapshot::name(
+            image_key,
+            &rootfs_id,
+            self.initrd,
+            &self.setup.kernel,
+            &self.setup.firecracker,
+            &self.shape,
+            &boot_args(self.shape.net),
+        )?;
+        let snap = match snapshot::open(self.root, &name) {
+            Some(snap) => snap,
+            None => match self.ensure_snapshot(&name, report)? {
+                Some(snap) => snap,
+                None => return Ok(None),
+            },
+        };
+        match self.restore(&snap) {
+            Ok(started) => Ok(Some(started)),
+            Err(e) => {
+                // A snapshot that cannot be restored is not tried again: the next attempt builds a new one.
+                if !self.cancel.load(Ordering::Acquire) {
+                    snapshot::remove(self.root, &name);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The snapshot `name`, built now when it does not exist, nobody else is building it and a build of it
+    /// has not failed lately.
+    fn ensure_snapshot(
+        &self,
+        name: &str,
+        report: &mut StartReport,
+    ) -> Result<Option<snapshot::Snapshot>> {
+        if snapshot::recently_failed(name) {
+            report.fallback = Some("building a snapshot of this shape failed lately".into());
+            return Ok(None);
+        }
+        let lock = snapshot::build_lock(name);
+        let outcome = match lock.try_lock() {
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Ok(_held) => self.build_if_missing(name, report),
+            Err(TryLockError::Poisoned(held)) => {
+                let _held = held.into_inner();
+                self.build_if_missing(name, report)
+            }
+        };
+        drop(lock);
+        snapshot::release_build_lock(name);
+        outcome
+    }
+
+    fn build_if_missing(
+        &self,
+        name: &str,
+        report: &mut StartReport,
+    ) -> Result<Option<snapshot::Snapshot>> {
+        if let Some(snap) = snapshot::open(self.root, name) {
+            return Ok(Some(snap));
+        }
+        match self.build_snapshot(name) {
+            Ok(()) => {
+                report.snapshot_built = true;
+                Ok(snapshot::open(self.root, name))
+            }
+            Err(_) if self.cancel.load(Ordering::Acquire) => Err(canceled_start()),
+            Err(e) => {
+                snapshot::note_failure(name);
+                report.fallback = Some(format!("building the snapshot failed: {e}"));
+                Ok(None)
+            }
+        }
+    }
+
+    /// Boots a template VM of the shape in a VM directory of its own (so a crash leaves it to startup
+    /// reconciliation like any VM), waits for its agent, pauses it and saves its state, memory and scratch disk.
+    fn build_snapshot(&self, name: &str) -> Result<()> {
+        let builder = AttemptId::new();
+        let dir = vm_dir(self.root, builder);
+        fs::create_dir_all(&dir)?;
+        let unit = unit_name(self.root, builder);
+        let built = self.build_in(&dir, &unit, name, builder);
+        // The template VM never outlives the build; its directory stays while its scope could still be running.
+        if stop_unit(OsStr::new(SYSTEMCTL), &unit).is_ok() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        built
+    }
+
+    fn build_in(&self, dir: &Path, unit: &str, name: &str, builder: AttemptId) -> Result<()> {
+        let run = snapshot::run_path(self.root);
+        fs::create_dir_all(&run)?;
+        std::os::unix::fs::symlink(&self.guest.rootfs, dir.join("image.ext4"))?;
+        scratch_disk(&dir.join("scratch.ext4"), self.shape.scratch_bytes)?;
+        let config = vm_config(
+            self.setup,
+            self.initrd,
+            &run.join("image.ext4"),
+            &run.join("scratch.ext4"),
+            &run.join("vsock.sock"),
+            &self.shape,
+        );
+        fs::write(
+            dir.join("vm.json"),
+            serde_json::to_vec_pretty(&config).map_err(io::Error::other)?,
+        )?;
+        // The template has the tap and the rules a VM of its shape has, but no uplink: it never runs a job.
+        let rules = self
+            .shape
+            .net
+            .then(|| net::Policy::new(&[], &net::Guard::default()).rules());
+        let limits = Limits {
+            cpu_millis: u32::try_from(self.shape.vcpus * 1000).unwrap_or(u32::MAX),
+            memory_bytes: self.shape.mib << 20,
+            ..self.limits
+        };
+        let mut child = self.spawn(
+            dir,
+            unit,
+            limits,
+            Some(&run),
+            rules.as_deref().map(|r| (r, false)),
+            &[
+                "--api-sock".into(),
+                run.join("api.sock").into(),
+                "--config-file".into(),
+                run.join("vm.json").into(),
+            ],
+        )?;
+        let saved = (|| -> Result<()> {
+            let client = self.await_agent(&mut child, dir, unit)?;
+            // The snapshot holds no connection: the host side closes its own and the guest sees the end.
+            client.close();
+            thread::sleep(Duration::from_millis(20));
+            let api = dir.join("api.sock");
+            fcapi::call(
+                &api,
+                "PATCH",
+                "/vm",
+                Some(&serde_json::json!({ "state": "Paused" })),
+                CONTROL_TIMEOUT,
+            )?;
+            fcapi::call(
+                &api,
+                "PUT",
+                "/snapshot/create",
+                Some(&serde_json::json!({
+                    "snapshot_type": "Full",
+                    "snapshot_path": run.join("state"),
+                    "mem_file_path": run.join("mem"),
+                })),
+                SNAPSHOT_TIMEOUT,
+            )?;
+            Ok(())
+        })();
+        kill_vmm(&mut child, unit);
+        saved?;
+        stop_unit(OsStr::new(SYSTEMCTL), unit)?;
+        let staged = snapshot::staging(self.root, name, &builder.to_string())?;
+        let moved = (|| -> Result<()> {
+            for file in ["state", "mem", "scratch.ext4"] {
+                fs::rename(dir.join(file), staged.join(file))?;
+            }
+            snapshot::publish(self.root, name, &staged)?;
+            Ok(())
+        })();
+        if moved.is_err() {
+            let _ = fs::remove_dir_all(&staged);
+        }
+        moved
+    }
+
+    /// Restores a VM from `snap`: the snapshot's scratch disk cloned for this attempt, the image linked, a VMM
+    /// with no configuration that loads the snapshot, then the agent told the time and given fresh entropy.
+    fn restore(&self, snap: &snapshot::Snapshot) -> Result<(Child, Client)> {
+        snapshot::clone_file(&snap.scratch, &self.dir.join("scratch.ext4"))?;
+        std::os::unix::fs::symlink(&self.guest.rootfs, self.dir.join("image.ext4"))?;
+        let run = snapshot::run_path(self.root);
+        fs::create_dir_all(&run)?;
+        let rules = self.rules()?;
+        let mut child = self.spawn(
+            self.dir,
+            self.unit,
+            self.limits,
+            Some(&run),
+            rules.as_deref().map(|r| (r, true)),
+            &["--api-sock".into(), run.join("api.sock").into()],
+        )?;
+        let resumed = (|| -> Result<Client> {
+            self.await_api(&mut child)?;
+            fcapi::call(
+                &self.dir.join("api.sock"),
+                "PUT",
+                "/snapshot/load",
+                Some(&serde_json::json!({
+                    "snapshot_path": snap.state,
+                    "mem_backend": { "backend_path": snap.mem, "backend_type": "File" },
+                    "resume_vm": true,
+                })),
+                RESTORE_TIMEOUT,
+            )?;
+            let client = self.await_agent(&mut child, self.dir, self.unit)?;
+            let mut entropy = vec![0u8; 64];
+            fs::File::open("/dev/urandom")?.read_exact(&mut entropy)?;
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|_| Error::Runtime("the clock is before the epoch".into()))?;
+            client.send(&Request::Resume {
+                entropy,
+                realtime_ns: u64::try_from(now.as_nanos()).unwrap_or(u64::MAX),
+            })?;
+            client.expect_done("resume")?;
+            Ok(client)
+        })();
+        match resumed {
+            Ok(client) => Ok((child, client)),
+            Err(e) => {
+                kill_vmm(&mut child, self.unit);
+                Err(e)
+            }
+        }
+    }
+
+    /// Waits for the restored VMM's API socket to accept a connection.
+    fn await_api(&self, child: &mut Child) -> Result<()> {
+        let api = self.dir.join("api.sock");
+        let deadline = Instant::now() + RESTORE_TIMEOUT;
+        loop {
+            if UnixStream::connect(&api).is_ok() {
+                return Ok(());
+            }
+            if self.cancel.load(Ordering::Acquire) {
+                return Err(canceled_start());
+            }
+            if !matches!(child.try_wait(), Ok(None)) {
+                return Err(Error::Preparation(format!(
+                    "the VMM ended before its API was up; console: {}",
+                    console_tail(self.dir)
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout("firecracker API"));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// Ends a VMM that failed or finished its work: the process, then its scope.
+fn kill_vmm(child: &mut Child, unit: &str) {
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = stop_unit(OsStr::new(SYSTEMCTL), unit);
 }
 
 impl Vm {
@@ -958,11 +1418,6 @@ impl Vm {
         network: Network,
         cancel: &AtomicBool,
     ) -> Result<Vm> {
-        if network != Network::None {
-            return Err(Error::Preparation(
-                "microVM jobs with egress are not supported yet (TODO M05)".into(),
-            ));
-        }
         if cancel.load(Ordering::Acquire) {
             return Err(canceled_start());
         }
@@ -972,7 +1427,7 @@ impl Vm {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir)?;
         let started = Vm::boot(
-            root, setup, attempt, image, limits, workspace, mounts, store, cancel, &dir,
+            root, setup, attempt, image, limits, workspace, mounts, store, network, cancel, &dir,
         );
         if started.is_err() {
             let _ = fs::remove_dir_all(&dir);
@@ -990,6 +1445,7 @@ impl Vm {
         workspace: &Path,
         mounts: &[Mount],
         store: &Store,
+        network: Network,
         cancel: &AtomicBool,
         dir: &Path,
     ) -> Result<Vm> {
@@ -998,75 +1454,60 @@ impl Vm {
         if cancel.load(Ordering::Acquire) {
             return Err(canceled_start());
         }
-        let scratch = dir.join("scratch.ext4");
-        scratch_disk(&scratch, limits.disk_bytes.max(1 << 30))?;
-        let vcpus = limits.cpu_millis.div_ceil(1000).max(1);
-        let mib = (limits.memory_bytes >> 20).max(128);
-        let socket = dir.join("vsock.sock");
-        let config = vm_config(
-            setup,
-            &initrd,
-            &guest.rootfs,
-            &scratch,
-            &socket,
-            u64::from(vcpus),
-            mib,
-        );
-        fs::write(
-            dir.join("vm.json"),
-            serde_json::to_vec_pretty(&config).map_err(io::Error::other)?,
-        )?;
-        let console = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(dir.join("console.log"))?;
         let unit = unit_name(root, attempt);
-        let mut command = Command::new("systemd-run");
-        command
-            .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
-            .arg(&unit)
-            .arg(format!("-pCPUQuota={}%", (limits.cpu_millis / 10).max(1)))
-            .arg(format!(
-                "-pMemoryMax={}",
-                limits.memory_bytes.saturating_add(VMM_OVERHEAD)
-            ))
-            .args([
-                "--", "podman", "unshare", "unshare", "--net", "--fork", "--",
-            ])
-            .arg(&setup.firecracker)
-            .arg("--api-sock")
-            .arg(dir.join("api.sock"))
-            .arg("--config-file")
-            .arg(dir.join("vm.json"))
-            .stdin(Stdio::null())
-            .stdout(console.try_clone()?)
-            .stderr(console);
-        let mut child = command
-            .spawn()
-            .map_err(|e| Error::Preparation(format!("firecracker: {e}")))?;
-        let deadline = Instant::now() + BOOT_TIMEOUT;
-        let client = connect(&socket, deadline, &mut || {
-            matches!(child.try_wait(), Ok(None)) && !cancel.load(Ordering::Acquire)
-        });
-        let client = match client {
-            Ok(client) => client,
-            Err(e) => {
-                let tail = console_tail(dir);
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stop_unit(OsStr::new(SYSTEMCTL), &unit);
-                if cancel.load(Ordering::Acquire) {
-                    return Err(canceled_start());
-                }
-                return Err(Error::Preparation(format!("{e}; console: {tail}")));
-            }
+        let plan = Plan {
+            root,
+            setup,
+            guest: &guest,
+            initrd: &initrd,
+            limits,
+            shape: snapshot::Shape {
+                vcpus: u64::from(limits.cpu_millis.div_ceil(1000).max(1)),
+                mib: (limits.memory_bytes >> 20).max(128),
+                scratch_bytes: limits.disk_bytes.max(1 << 30),
+                net: network == Network::Egress,
+            },
+            dir,
+            unit: &unit,
+            cancel,
         };
+        let began = Instant::now();
+        let mut report = StartReport {
+            mode: Start::Cold,
+            ready_ns: 0,
+            snapshot_built: false,
+            fallback: None,
+        };
+        let mut launched = None;
+        if setup.snapshots && plan.shape.mib <= snapshot::MAX_MEMORY_MIB {
+            match plan.warm(&mut report) {
+                Ok(Some(started)) => {
+                    report.mode = Start::Restored;
+                    launched = Some(started);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(canceled_start());
+                    }
+                    // The same attempt boots cold in the same directory.
+                    report.fallback = Some(format!("restoring the snapshot failed: {e}"));
+                    stop_unit(OsStr::new(SYSTEMCTL), &unit)?;
+                    clear_dir(dir)?;
+                }
+            }
+        }
+        let (child, client) = match launched {
+            Some(started) => started,
+            None => plan.cold()?,
+        };
+        report.ready_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let mut vm = Vm {
             attempt,
             dir: dir.to_path_buf(),
             unit,
             guest: guest.record,
+            start: report,
             child: Mutex::new(child),
             client,
             env: guest.env,
@@ -1097,6 +1538,11 @@ impl Vm {
             return Err(e);
         }
         Ok(vm)
+    }
+
+    /// How this VM's guest came up and how long it took to be ready.
+    pub fn start_report(&self) -> &StartReport {
+        &self.start
     }
 
     /// The guest image this VM booted: the pinned digest, for the attempt's provenance.
@@ -1271,29 +1717,33 @@ fn canceled_start() -> Error {
 
 /// The Firecracker configuration of one VM. The guest gets the image (read-only), its scratch disk and the
 /// vsock the agent speaks on; no CPU template or custom CPU configuration, so the guest sees no hardware
-/// virtualization (`/dev/kvm` and nested KVM stay off), and nothing else is attached.
+/// virtualization (`/dev/kvm` and nested KVM stay off). A network interface is attached only to a guest the
+/// worker granted egress; nothing else is.
 fn vm_config(
     setup: &Setup,
     initrd: &Path,
     rootfs: &Path,
     scratch: &Path,
     socket: &Path,
-    vcpus: u64,
-    mib: u64,
+    shape: &snapshot::Shape,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut config = serde_json::json!({
         "boot-source": {
             "kernel_image_path": setup.kernel,
             "initrd_path": initrd,
-            "boot_args": "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd quiet",
+            "boot_args": boot_args(shape.net),
         },
         "drives": [
             { "drive_id": "image", "path_on_host": rootfs, "is_root_device": false, "is_read_only": true },
             { "drive_id": "scratch", "path_on_host": scratch, "is_root_device": false, "is_read_only": false },
         ],
-        "machine-config": { "vcpu_count": vcpus, "mem_size_mib": mib, "smt": false },
+        "machine-config": { "vcpu_count": shape.vcpus, "mem_size_mib": shape.mib, "smt": false },
         "vsock": { "guest_cid": GUEST_CID, "uds_path": socket },
-    })
+    });
+    if shape.net {
+        config["network-interfaces"] = net::interface();
+    }
+    config
 }
 
 fn guest_path(container: &str) -> String {
@@ -1341,10 +1791,25 @@ fn scratch_disk(path: &Path, bytes: u64) -> Result<()> {
     Ok(())
 }
 
+/// The last lines the VMM and the launch scripts wrote to the VM's console log: one line is rarely enough to
+/// say why a VM did not come up (`mount` and `nft` print their reason before their last line).
 fn console_tail(dir: &Path) -> String {
     let text = fs::read(dir.join("console.log")).unwrap_or_default();
     let start = text.len().saturating_sub(2048);
-    crate::redact::excerpt(&text[start..])
+    let text = String::from_utf8_lossy(&text[start..]);
+    let mut lines: Vec<String> = text
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(4)
+        .map(|l| l.chars().filter(|c| !c.is_control()).take(200).collect())
+        .collect();
+    lines.reverse();
+    if lines.is_empty() {
+        "no diagnostic output".to_owned()
+    } else {
+        lines.join(" | ")
+    }
 }
 
 /// Whether `systemctl is-active` said the unit is up (or coming up or going down).
@@ -1548,6 +2013,8 @@ mod tests {
             firecracker: "/nonexistent/firecracker".into(),
             kernel: "/nonexistent/vmlinux".into(),
             agent: "/nonexistent/agent".into(),
+            snapshots: true,
+            guard: net::Guard::default(),
         };
         assert!(setup.check().unwrap_err().contains("firecracker"));
     }
@@ -1819,6 +2286,125 @@ mod tests {
         assert_eq!(sweep_guest_orphans(&root.path().join("nowhere")), 0);
     }
 
+    // ------------------------------------------------------------ snapshots beside the image GC and reconciliation
+
+    /// A complete snapshot of the image `key`, as a finished build publishes it.
+    fn plant_snapshot(root: &Path, key: &str, suffix: &str, bytes: usize) -> String {
+        let name = format!("{key}-{suffix}");
+        let staged = snapshot::staging(root, &name, "t").unwrap();
+        for file in ["state", "mem", "scratch.ext4"] {
+            fs::write(staged.join(file), vec![9u8; bytes]).unwrap();
+        }
+        snapshot::publish(root, &name, &staged).unwrap();
+        name
+    }
+
+    #[test]
+    fn an_images_snapshots_count_against_its_budget_and_go_with_it() {
+        let root = tempfile::tempdir().unwrap();
+        let image = image_ref(DIGEST);
+        plant_image(root.path(), &image, DIGEST, 1000);
+        let key = image_key(&Store::Shared, &image);
+        assert_eq!(guest_images(root.path())[0].bytes, 1000);
+        let a = plant_snapshot(root.path(), &key, "aaaaaaaaaaaaaaaa", 8192);
+        plant_snapshot(root.path(), &key, "bbbbbbbbbbbbbbbb", 8192);
+        // Another image's snapshot is neither counted nor removed.
+        let other_key = "f".repeat(32);
+        let other = plant_snapshot(root.path(), &other_key, "cccccccccccccccc", 8192);
+        let counted = guest_images(root.path())[0].bytes;
+        assert!(counted >= 1000 + 2 * 3 * 8192, "{counted}");
+        assert!(snapshot::open(root.path(), &a).is_some());
+        assert!(remove_guest_image(root.path(), &key));
+        assert!(
+            snapshot::open(root.path(), &a).is_none(),
+            "a snapshot is useless without its root file system"
+        );
+        assert!(snapshot::open(root.path(), &other).is_some());
+    }
+
+    #[test]
+    fn the_orphan_sweep_takes_old_snapshots_of_missing_images_and_abandoned_builds() {
+        let root = tempfile::tempdir().unwrap();
+        let image = image_ref(DIGEST);
+        plant_image(root.path(), &image, DIGEST, 1000);
+        let key = image_key(&Store::Shared, &image);
+        let kept = plant_snapshot(root.path(), &key, "aaaaaaaaaaaaaaaa", 16);
+        let lost_key = "e".repeat(32);
+        let lost = plant_snapshot(root.path(), &lost_key, "bbbbbbbbbbbbbbbb", 16);
+        let abandoned = snapshot::staging(root.path(), &kept, "dead").unwrap();
+        for path in [
+            snapshot::dir(root.path()).join(&lost),
+            snapshot::dir(root.path()).join(&kept),
+            abandoned.clone(),
+        ] {
+            fs::File::open(&path)
+                .unwrap()
+                .set_modified(SystemTime::now() - ORPHAN_AGE - Duration::from_secs(60))
+                .unwrap();
+        }
+        assert_eq!(sweep_guest_orphans(root.path()), 2);
+        assert!(snapshot::open(root.path(), &kept).is_some());
+        assert!(snapshot::open(root.path(), &lost).is_none());
+        assert!(!abandoned.exists());
+        // A young orphan is a build that may still be running.
+        let young = plant_snapshot(root.path(), &lost_key, "dddddddddddddddd", 16);
+        assert_eq!(sweep_guest_orphans(root.path()), 0);
+        assert!(snapshot::open(root.path(), &young).is_some());
+    }
+
+    #[test]
+    fn removing_a_vm_never_follows_its_image_link_into_the_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        let image = image_ref(DIGEST);
+        let (rootfs, _) = {
+            fs::create_dir_all(&root).unwrap();
+            plant_image(&root, &image, DIGEST, 1000)
+        };
+        let attempt = AttemptId::new();
+        let dir = vm_files(&root, attempt);
+        // The files a snapshot start leaves: the link to the cached image, sockets, the saved state.
+        std::os::unix::fs::symlink(&rootfs, dir.join("image.ext4")).unwrap();
+        for file in ["state", "mem", "netns.pid", "uplink"] {
+            fs::write(dir.join(file), b"x").unwrap();
+        }
+        let systemctl = FakeSystemctl::new(temp.path(), "inactive", "", 0);
+        remove_named_with(systemctl.program.as_os_str(), &root, attempt).unwrap();
+        assert!(!dir.exists());
+        assert!(rootfs.is_file(), "the cached root file system survives");
+        // A failed warm start empties the directory the same way, keeping the directory itself.
+        let again = vm_files(&root, attempt);
+        std::os::unix::fs::symlink(&rootfs, again.join("image.ext4")).unwrap();
+        clear_dir(&again).unwrap();
+        assert!(again.is_dir() && fs::read_dir(&again).unwrap().next().is_none());
+        assert!(rootfs.is_file());
+    }
+
+    #[test]
+    fn a_template_vm_a_crashed_worker_left_is_reconciled_like_any_vm() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        let builder = AttemptId::new();
+        let dir = vm_files(&root, builder);
+        for file in ["state", "mem", "api.sock"] {
+            fs::write(dir.join(file), b"x").unwrap();
+        }
+        let systemctl = FakeSystemctl::new(
+            temp.path(),
+            "inactive",
+            &format!(
+                "{}.scope loaded active running x\n",
+                unit_name(&root, builder)
+            ),
+            0,
+        );
+        assert_eq!(
+            reconcile_with(systemctl.program.as_os_str(), &root).unwrap(),
+            1
+        );
+        assert!(!dir.exists() && owned(&root).is_empty());
+    }
+
     // ------------------------------------------------------------ the VM configuration
 
     #[test]
@@ -1827,6 +2413,14 @@ mod tests {
             firecracker: "/fc".into(),
             kernel: "/vmlinux".into(),
             agent: "/agent".into(),
+            snapshots: true,
+            guard: net::Guard::default(),
+        };
+        let mut shape = snapshot::Shape {
+            vcpus: 2,
+            mib: 512,
+            scratch_bytes: 1 << 30,
+            net: false,
         };
         let config = vm_config(
             &setup,
@@ -1834,8 +2428,7 @@ mod tests {
             Path::new("/image.ext4"),
             Path::new("/scratch.ext4"),
             Path::new("/vsock.sock"),
-            2,
-            512,
+            &shape,
         );
         // A new top-level section (a CPU configuration could unmask VMX; a device could carry /dev/kvm) must
         // be reviewed against the isolation contract before this test is changed.
@@ -1863,6 +2456,49 @@ mod tests {
         assert_eq!(drives[1]["path_on_host"], "/scratch.ext4");
         assert_eq!(config["machine-config"]["vcpu_count"], 2);
         assert_eq!(config["machine-config"]["mem_size_mib"], 512);
+        assert!(
+            !config["boot-source"]["boot_args"]
+                .as_str()
+                .unwrap()
+                .contains("sentinel.ip")
+        );
+
+        // A guest granted egress gets exactly one more section: its one network interface, backed by the tap.
+        shape.net = true;
+        let granted = vm_config(
+            &setup,
+            Path::new("/initrd"),
+            Path::new("/image.ext4"),
+            Path::new("/scratch.ext4"),
+            Path::new("/vsock.sock"),
+            &shape,
+        );
+        let mut sections: Vec<&str> = granted
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        sections.sort_unstable();
+        assert_eq!(
+            sections,
+            [
+                "boot-source",
+                "drives",
+                "machine-config",
+                "network-interfaces",
+                "vsock"
+            ]
+        );
+        assert_eq!(granted["network-interfaces"].as_array().unwrap().len(), 1);
+        assert_eq!(granted["network-interfaces"][0]["host_dev_name"], net::TAP);
+        assert!(
+            granted["boot-source"]["boot_args"]
+                .as_str()
+                .unwrap()
+                .contains("sentinel.ip=10.211.0.2/30")
+        );
+        assert!(!granted.to_string().to_ascii_lowercase().contains("kvm"));
     }
 
     // ------------------------------------------------------------ reconciliation, without a KVM host
@@ -2162,6 +2798,8 @@ mod tests {
             firecracker: "/nonexistent/firecracker".into(),
             kernel: "/nonexistent/vmlinux".into(),
             agent: "/nonexistent/agent".into(),
+            snapshots: true,
+            guard: net::Guard::default(),
         };
         let limits = Limits {
             cpu_millis: 1000,
