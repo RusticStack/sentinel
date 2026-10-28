@@ -894,8 +894,23 @@ const fn role_label(role: Role) -> &'static str {
     }
 }
 
-pub fn finish(tx: &Transaction<'_>, check: &Check) -> Result<()> {
-    remove_row(tx, check)
+/// The pair has no target: the tenant has no organization installation to ask about. A tenant that is not
+/// GitHub-backed owes nothing, so the row goes. A GitHub-backed one still holds derived members that nobody
+/// can confirm any more (an installation that lost its account, a release that never reached the tenant), so
+/// the pass counts as an unanswered one: the grace clock starts if it never did, derived access lapses when it
+/// is over, and a first-time candidate is dropped after its tries. Deleting the row instead would leave that
+/// access with no expiry.
+pub fn no_target(
+    tx: &Transaction<'_>,
+    check: &Check,
+    timing: Timing,
+    now: UnixMillis,
+) -> Result<&'static str> {
+    if !is_github_backed(tx, check.tenant)? {
+        remove_row(tx, check)?;
+        return Ok("target gone");
+    }
+    unreachable(tx, check, timing, now, None)
 }
 
 /// Deletes the row: the pair is not checkable at all (no target, not GitHub-backed), so no gap is owed.

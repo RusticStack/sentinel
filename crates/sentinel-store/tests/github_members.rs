@@ -650,6 +650,111 @@ fn an_unknown_answer_keeps_access_within_grace_grants_nothing_and_expires() {
 }
 
 #[test]
+fn a_backed_tenant_without_a_target_still_expires_derived_access() {
+    let f = fixture();
+    f.back();
+    let gina = f.person("gina", Some("7007"));
+    let hugo = f.person("hugo", Some("8008"));
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| {
+            github_members::hint(tx, tenant, Some(7007), at(20))?;
+            github_members::hint(tx, tenant, Some(8008), at(20))
+        })
+        .unwrap();
+    f.apply(
+        gina,
+        observed(7007, Membership::Active(OrgRole::Member), vec![]),
+        false,
+        100,
+    )
+    .unwrap();
+    assert!(f.can_see_tenant(gina));
+    // The installation loses its organization account while the tenant stays GitHub-backed.
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE installations SET account_id = NULL WHERE tenant_id = ?1",
+                [tenant.as_bytes()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let check = f.check(gina).unwrap();
+    f.store
+        .read(move |c| {
+            assert!(github_members::target(c, &check)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    let no_target = |user: UserId, now: i64| {
+        let check = f.check(user).unwrap();
+        f.store
+            .writer()
+            .write(move |tx| github_members::no_target(tx, &check, TIMING, at(now)))
+            .unwrap()
+    };
+    assert_eq!(no_target(gina, 100 + HOUR), "kept: unreachable");
+    assert!(f.can_see_tenant(gina), "inside grace the access stays");
+    assert!(
+        f.check(gina).is_some(),
+        "the row stays so the grace can end"
+    );
+    assert_eq!(
+        f.membership(gina).unwrap().1,
+        Some(100),
+        "the clock is the last confirmation"
+    );
+    assert_eq!(no_target(gina, 100 + 24 * HOUR), "removed: grace expired");
+    assert!(!f.can_see_tenant(gina));
+
+    // A derived member whose clock never started gets one now and expires a grace period later.
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO memberships(tenant_id, user_id, role, synced_ms) VALUES (?1, ?2, 1, NULL)",
+                params![tenant.as_bytes(), hugo.as_bytes()],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO github_member_checks(tenant_id, user_id, next_ms) VALUES (?1, ?2, 0)",
+                params![tenant.as_bytes(), hugo.as_bytes()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(no_target(hugo, 1_000), "kept: unreachable");
+    assert_eq!(f.membership(hugo).unwrap().1, Some(1_000));
+    assert_eq!(no_target(hugo, 1_000 + 24 * HOUR), "removed: grace expired");
+    assert!(f.membership(hugo).is_none());
+
+    // A tenant that is no longer GitHub-backed owes nothing: the row goes.
+    let ines = f.person("ines", Some("9009"));
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(9009), at(2_000)))
+        .unwrap();
+    f.store
+        .writer()
+        .write(move |tx| github_members::set_backing_trusted(tx, tenant, false, at(2_100)))
+        .unwrap();
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO github_member_checks(tenant_id, user_id, next_ms) VALUES (?1, ?2, 0)",
+                params![tenant.as_bytes(), ines.as_bytes()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(no_target(ines, 3_000), "target gone");
+    assert!(f.check(ines).is_none());
+}
+
+#[test]
 fn an_answer_about_a_different_github_account_is_discarded() {
     let f = fixture();
     f.back();

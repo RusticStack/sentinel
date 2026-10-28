@@ -177,13 +177,13 @@ impl Worker {
         let target = match self.store.read(|c| github_members::target(c, check)) {
             Ok(Some(target)) => target,
             Ok(None) => {
-                let check = *check;
+                let (check, now) = (*check, UnixMillis::now());
                 return match self
                     .store
                     .writer()
-                    .write(move |tx| github_members::finish(tx, &check))
+                    .write(move |tx| github_members::no_target(tx, &check, timing, now))
                 {
-                    Ok(()) => "target gone".into(),
+                    Ok(outcome) => outcome.into(),
                     Err(_) => STORE.into(),
                 };
             }
