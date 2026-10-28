@@ -66,7 +66,8 @@ const ALICE_ID: u64 = 1001;
 
 struct World {
     org_login: String,
-    snapshot_login: String,
+    /// The login the installation snapshot reports when it differs from `org_login`.
+    snapshot_login: Option<String>,
     logins: HashMap<u64, String>,
     members: HashMap<String, (u64, &'static str, &'static str)>,
     perms: HashMap<(String, String), (u64, &'static str, &'static str)>,
@@ -90,7 +91,7 @@ impl Stub {
         let addr = listener.local_addr().unwrap();
         let world = Arc::new(Mutex::new(World {
             org_login: "acme".into(),
-            snapshot_login: "acme".into(),
+            snapshot_login: None,
             logins: HashMap::new(),
             members: HashMap::new(),
             perms: HashMap::new(),
@@ -223,7 +224,7 @@ fn route(world: &World, method: &str, path: &str) -> (u16, Option<i64>, serde_js
             serde_json::json!({
                 "id": INSTALLATION,
                 "app_id": 1234,
-                "account": {"id": ORG, "login": world.snapshot_login, "type": "Organization"},
+                "account": {"id": ORG, "login": world.snapshot_login.as_ref().unwrap_or(&world.org_login), "type": "Organization"},
                 "suspended_at": null,
                 "permissions": {"contents": "read", "checks": "write", "members": "read"},
             }),
@@ -789,7 +790,7 @@ fn a_renamed_organization_answering_404_for_every_repository_withdraws_nothing()
     // The membership read still works (a cached session), but every repository path is stale and the
     // fresh installation snapshot names another login: the 404s are not believed.
     f.stub.with(|w| {
-        w.snapshot_login = "acme-renamed".into();
+        w.snapshot_login = Some("acme-renamed".into());
         w.fail_repos.insert("acme/app".into(), 404);
         w.fail_repos.insert("acme/lib".into(), 404);
     });
