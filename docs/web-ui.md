@@ -116,6 +116,7 @@ SENTINEL_API=http://127.0.0.1:7080 HOST=127.0.0.1 PORT=3000 node web/.output/ser
 |---|---|
 | `SENTINEL_API` | the controller's `api_listen`, reached from this process (default `http://127.0.0.1:7080`); the Nuxt release's `NUXT_SENTINEL_API` is still read when it is unset, for one release |
 | `SENTINEL_CLIENT_IP_HEADER` | (or, for one release, `NUXT_CLIENT_IP_HEADER`) the header the reverse proxy sets to the real client address (`x-forwarded-for`, `x-real-ip`); empty by default, which trusts no header (see below) |
+| `SENTINEL_GITHUB_WEB_URL` | GitHub Enterprise Server only: its web address, which the GitHub App setup page may post the manifest to (default `https://github.com`) |
 | `HOST`, `PORT` | where `sentinel-web` listens (default `0.0.0.0:3000`; bind loopback behind a proxy) |
 
 ### Client addresses
@@ -189,7 +190,7 @@ TanStack Start with React 19 and Tailwind CSS v4 (CSS-first configuration in `sr
 - **Routes.** File routes under `src/routes/` mirror the paths in the Views table; `_auth` is the centred signed-out layout and `_app` the signed-in shell with the namespace switcher. Search parameters are validated by hand-written Standard Schema validators (`src/lib/search.ts`; a malformed field is dropped) and kept as plain `key=value` pairs, so deep links such as `?pr=42` or `?step=1&seq=40` read as before. The log viewer route is `ssr: 'data-only'`.
 - **Widgets.** Native elements styled with Tailwind, plus three small ARIA widgets in `src/components/ui.tsx`: a listbox select, a menu button and a modal on the native `<dialog>`. React Aria Components was measured first and not taken: about 71 KB of gzipped JavaScript for those three patterns ([`bench/u09-web-spikes.jsonl`](../bench/u09-web-spikes.jsonl)).
 - **Public landing page.** `/` shows a signed-out visitor what Sentinel is, with Sign in and Sign up; a signed-in person goes on, as before, to a pending return, the last tenant used or the first one. The runs view opens with the tenant's waiting jobs, connected workers and held attempts as the controller reports them.
-- **GitHub App setup.** `/setup/github` (platform administrators) creates the deployment's GitHub App from the controller's manifest and lets tenant administrators install it; `/setup/github/created` and `/setup/github/installed` are where GitHub sends the browser back. They only relay the code and state to the controller ([GitHub App](github-app.md)). The page policy of `/setup/github` alone adds `https://github.com` to `form-action` for the manifest form.
+- **GitHub App setup.** `/setup/github` (platform administrators) creates the deployment's GitHub App from the controller's manifest and lets tenant administrators install it; `/setup/github/created` and `/setup/github/installed` are where GitHub sends the browser back. They only relay the code and state to the controller ([GitHub App](github-app.md)). The page policy of `/setup/github` alone adds GitHub's origin to `form-action` for the manifest form: `https://github.com`, or the origin of `SENTINEL_GITHUB_WEB_URL` for GitHub Enterprise Server.
 
 For a live-editing session, `SENTINEL_API=http://127.0.0.1:7080 pnpm -C web dev` serves the interface with hot reload (no page policy); sign in on the origin the controller names as `public_url`.
 

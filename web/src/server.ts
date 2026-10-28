@@ -25,9 +25,13 @@ function secure(response: Response): Response {
   return response;
 }
 
-const FORM_ACTIONS: Record<string, string[]> = {
-  // The GitHub App manifest form is posted to GitHub (docs/github-app.md).
-  "/setup/github": ["https://github.com"],
+// The GitHub App manifest form is posted to GitHub (docs/github-app.md): github.com, or the GitHub Enterprise Server
+// (or test double) origin named by SENTINEL_GITHUB_WEB_URL, the same web URL the controller's GitHub configuration uses.
+function githubOrigin(): string {
+  try { return new URL(process.env.SENTINEL_GITHUB_WEB_URL || "https://github.com").origin; } catch { return "https://github.com"; }
+}
+const FORM_ACTIONS: Record<string, () => string[]> = {
+  "/setup/github": () => [githubOrigin()],
 };
 
 export default createServerEntry({
@@ -46,7 +50,7 @@ export default createServerEntry({
     const html = await response.text();
     const headers = new Headers(response.headers);
     headers.delete("content-length");
-    headers.set("content-security-policy", await policyFor(html, { formAction: FORM_ACTIONS[bare] }));
+    headers.set("content-security-policy", await policyFor(html, { formAction: FORM_ACTIONS[bare]?.() }));
     return secure(new Response(html, { status: response.status, statusText: response.statusText, headers }));
   },
 });
