@@ -1432,6 +1432,7 @@ dependencies = [
  "md-5",
  "quick-xml",
  "ring",
+ "serde_json",
  "ureq",
  "zeroize",
 ]

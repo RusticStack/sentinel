@@ -53,13 +53,17 @@ LEGACY_UNSTAMPED = {
 STAMPED_WRITERS = {
     "b02-sentinel.sh": '"build"',
     "b03-latency.py": "def stamp(",
+    "backup-rehash.sh": "stamp.sh",
     "c02-engines.sh": "stamp.sh",
+    "checks-lane.sh": "stamp.sh",
     "f07-storage.sh": "stamp.sh",
     "k02-cache-clone.sh": "stamp.sh",
     "k07-recipes.sh": "stamp.sh",
     "k09-before-after.sh": "stamp.sh",
+    "log-ack.sh": "stamp.sh",
     "p14-pilot.sh": '"build"',
     "r06-idle.sh": "stamp.sh",
+    "s3-hash.sh": "stamp.sh",
 }
 
 HOST_LABEL = re.compile(r"^[a-z][a-z0-9-]*$")

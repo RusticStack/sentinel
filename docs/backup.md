@@ -55,7 +55,7 @@ Offline, beside a stopped controller: `sentinel admin backup create --data-dir D
 
 ## Verifying
 
-`sentinel admin backup verify --dir DIR [--id ID]` rehashes the snapshot against its recorded BLAKE3, runs SQLite's `PRAGMA integrity_check` on it, and rehashes every object and manifest it names; it exits 2 with the missing and corrupt paths when anything is wrong. It is a drill, not a request-path cost: schedule it (weekly, and after any storage incident) and alert on a non-zero exit.
+`sentinel admin backup verify --dir DIR [--id ID]` rehashes the snapshot against its recorded BLAKE3, runs SQLite's `PRAGMA integrity_check` on it, and rehashes every object and manifest it names; it exits 2 with the missing and corrupt paths when anything is wrong. It is a drill, not a request-path cost: schedule it (weekly, and after any storage incident) and alert on a non-zero exit. The rehash cost at chosen object counts is measured by `crates/sentinel-store/examples/backup-rehash-bench.rs` ([benchmarking](benchmarking.md#backup-rehash-cost)); no record is committed yet, and the 1.4 s drill figure below is a single run of one dataset.
 
 ## Restoring
 
