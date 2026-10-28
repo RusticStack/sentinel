@@ -15,7 +15,7 @@ use sentinel_store::workers::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Reply, Route, body, err, id, ok, parse, store_error};
+use super::{Reply, Route, body, err, id, ok, parse, query_param, store_error};
 use crate::{
     State,
     auth::Identity,
@@ -29,9 +29,14 @@ pub(super) fn route(
     request: &mut Request,
     method: &str,
     parts: &[&str],
+    query: &str,
 ) -> Option<Route> {
     Some(match (method, parts) {
         ("POST", ["api", "v1", "admin", "worker-enrollments"]) => issue(state, request),
+        ("GET", ["api", "v1", "admin", "worker-enrollments"]) => {
+            list_enrollments(state, request, query)
+        }
+        ("GET", ["api", "v1", "admin", "workers"]) => list_hosts(state, request, query),
         ("GET", ["api", "v1", "admin", "worker-enrollments", enrollment]) => {
             show(state, request, enrollment)
         }
@@ -406,4 +411,65 @@ fn uninstall(state: &State, request: &Request, worker: &str) -> Route {
         json!({ "worker": worker.to_string(), "uninstall": "requested" }),
         Vec::new(),
     ))
+}
+
+/// The pool a listing is narrowed to, if the query names one.
+fn pool_filter(query: &str) -> Result<Option<PoolId>, ApiError> {
+    query_param(query, "pool")
+        .filter(|v| !v.is_empty())
+        .map(|v| id(v, "pool"))
+        .transpose()
+}
+
+/// Enrollments newest first, optionally for one pool: terms and state, never a secret.
+fn list_enrollments(state: &State, request: &Request, query: &str) -> Route {
+    let who = super::admin::platform(state, request, false)?;
+    let pool = pool_filter(query)?;
+    let before = super::admin::before(query)?.map(UnixMillis);
+    let limit = super::admin::limit(query);
+    let authority = who.authority();
+    let found = state
+        .store
+        .read(move |c| {
+            workers::list_enrollments(c, authority, pool, before, limit, UnixMillis::now())
+        })
+        .map_err(store_error)?;
+    let next = (found.len() == usize::from(limit))
+        .then(|| found.last().map(|e| e.created.0))
+        .flatten();
+    ok(json!({
+        "enrollments": found.iter().map(status_json).collect::<Vec<_>>(),
+        "next_before": next,
+    }))
+}
+
+/// Every live worker with the host policy the controller approved, what it reported and what it is
+/// offered, optionally for one pool. No fingerprint, node key or enrollment secret is part of it.
+fn list_hosts(state: &State, request: &Request, query: &str) -> Route {
+    let who = super::admin::platform(state, request, false)?;
+    let pool = pool_filter(query)?;
+    let authority = who.authority();
+    let hosts = state
+        .store
+        .read(move |c| workers::hosts(c, authority, pool))
+        .map_err(store_error)?;
+    let connected = state.controller.connected();
+    ok(json!({
+        "workers": hosts.iter().map(|(w, view)| {
+            let mut host = json!({
+                "id": w.id.to_string(),
+                "pool": w.pool.to_string(),
+                "name": w.name,
+                "arch": format!("{:?}", w.negotiated.arch).to_lowercase(),
+                "enrolled_ms": w.enrolled.0,
+                "last_seen_ms": w.last_seen.map(|t| t.0),
+                "connected": connected.contains(&w.id),
+                "software": w.software,
+                "transport": if w.node_key.is_some() { "tailcat" } else { "direct" },
+                "uninstall_requested_ms": w.uninstall_requested.map(|t| t.0),
+            });
+            host["host"] = view_json(view);
+            host
+        }).collect::<Vec<_>>(),
+    }))
 }

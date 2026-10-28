@@ -298,6 +298,45 @@ pub fn enrollment_status(
     enrollment_status_of(conn, id, now)
 }
 
+/// The most enrollments one listing returns.
+pub const ENROLLMENT_PAGE_MAX: u16 = 200;
+
+/// Worker enrollments newest first, optionally for one pool, with the terms and state but never the
+/// secret (only its digest is stored). `before` is the `created` time of the last row of the
+/// previous page (platform administration only).
+pub fn list_enrollments(
+    conn: &Connection,
+    authority: Authority,
+    pool: Option<PoolId>,
+    before: Option<UnixMillis>,
+    limit: u16,
+    now: UnixMillis,
+) -> Result<Vec<EnrollmentStatus>> {
+    authority.require_platform(conn)?;
+    let limit = i64::from(limit.clamp(1, ENROLLMENT_PAGE_MAX));
+    let mut stmt = conn.prepare_cached(
+        "SELECT id FROM worker_enrollments
+         WHERE (?1 IS NULL OR pool_id = ?1) AND (?2 IS NULL OR created_ms < ?2)
+         ORDER BY created_ms DESC, id DESC LIMIT ?3",
+    )?;
+    let ids = stmt
+        .query_map(
+            params![
+                pool.map(|p| p.as_bytes().to_vec()),
+                before.map(|t| t.0),
+                limit
+            ],
+            |r| r.get::<_, PoolBytes>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ids.into_iter()
+        .map(|bytes| {
+            let id = TokenId::from_bytes(bytes).map_err(|_| Error::Corrupt("enrollment id"))?;
+            enrollment_status_of(conn, id, now)
+        })
+        .collect()
+}
+
 /// Record that the bootstrap script of a *pending* enrollment was handed out, and return the terms
 /// it was rendered for, in one transaction: a spent, revoked or expired enrollment is `Conflict`
 /// and leaves no row, so a script is never issued for an enrollment that can no longer be redeemed.
@@ -1054,6 +1093,35 @@ pub fn in_pool(conn: &Connection, authority: Authority, pool: PoolId) -> Result<
     ))?;
     let rows = stmt.query_map([pool.as_bytes()], RawWorker::read)?;
     rows.map(|row| row?.into_worker()).collect()
+}
+
+/// Every live worker with its host policy view, oldest first, optionally for one pool (platform
+/// administration only). A worker whose uninstall was requested stays listed, marked, until it settles.
+pub fn hosts(
+    conn: &Connection,
+    authority: Authority,
+    pool: Option<PoolId>,
+) -> Result<Vec<(Worker, HostView)>> {
+    authority.require_platform(conn)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {WORKER_COLUMNS} FROM workers w
+         WHERE w.revoked_ms IS NULL AND (?1 IS NULL OR w.pool_id = ?1)
+         ORDER BY w.enrolled_ms, w.id"
+    ))?;
+    let rows = stmt.query_map(
+        params![pool.map(|p| p.as_bytes().to_vec())],
+        RawWorker::read,
+    )?;
+    let workers = rows
+        .map(|row| row?.into_worker())
+        .collect::<Result<Vec<_>>>()?;
+    workers
+        .into_iter()
+        .map(|worker| {
+            let view = host_view(conn, authority, worker.id)?;
+            Ok((worker, view))
+        })
+        .collect()
 }
 
 const fn arch_name(arch: Arch) -> &'static str {

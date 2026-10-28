@@ -3,12 +3,15 @@
 use std::sync::Arc;
 
 use sentinel_api::{Pin, TailcatRelease, WorkerBootstrap, WorkerBootstrapSettings};
-use sentinel_core::{PoolId, UnixMillis, UserId};
+use sentinel_core::{
+    PoolId, TenantId, UnixMillis, UserId,
+    auth::{Namespace, Permissions, Principal},
+};
 use sentinel_link::{controller::Controller, identity::Identity};
 use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
 use sentinel_store::{
     Durability, Store,
-    auth::Authority,
+    auth::{self, Authority, NamespaceKind, provisioning},
     local_auth,
     logs::LogStore,
     objects::Objects,
@@ -831,4 +834,253 @@ fn an_administrator_reads_and_replaces_a_workers_host_policy_and_requests_its_un
         .status,
         404
     );
+}
+
+/// A tenant administrator who holds every permission scope: the live platform check, not the scope,
+/// is what has to refuse it.
+fn tenant_administrator(d: &Deployment) -> String {
+    let (root, tenant, user) = (d.root, TenantId::new(), UserId::new());
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            let admin = Principal::new(root, Permissions::ALL, None, None);
+            auth::create_namespace(
+                tx,
+                admin,
+                tenant,
+                Namespace::parse("acme").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )?;
+            provisioning::insert_human(tx, user, "tenant-admin", false, now)?;
+            auth::set_membership(
+                tx,
+                admin,
+                tenant,
+                user,
+                sentinel_core::auth::Role::TenantAdmin,
+            )
+        })
+        .unwrap();
+    let granted =
+        tokens::provision(&d.store, Grant::new(user, "tenant", Permissions::ALL), now).unwrap();
+    format!("Bearer {}", sentinel_auth::token::format(&granted.secret))
+}
+
+#[test]
+fn only_a_platform_administrator_reaches_any_enrollment_or_host_route() {
+    let d = deployment(Some(true));
+    let admin = administrator(&d);
+    let issued = issue(&d, &admin, json!({ "pool": d.pool.to_string() }));
+    assert_eq!(issued.status, 201, "{}", issued.text);
+    let issued = issued.json();
+    let id = issued["id"].as_str().unwrap().to_owned();
+    let worker = {
+        let direct = issue(
+            &d,
+            &admin,
+            json!({ "pool": d.pool.to_string(), "transport": "direct" }),
+        );
+        enroll_worker(&d, direct.json()["secret"].as_str().unwrap())
+    };
+    let tenant = tenant_administrator(&d);
+    let bearer = [("authorization", tenant.as_str())];
+
+    let routes = [
+        ("POST", "/api/v1/admin/worker-enrollments".to_owned()),
+        ("GET", "/api/v1/admin/worker-enrollments".to_owned()),
+        ("GET", format!("/api/v1/admin/worker-enrollments/{id}")),
+        ("DELETE", format!("/api/v1/admin/worker-enrollments/{id}")),
+        (
+            "GET",
+            format!("/api/v1/admin/worker-enrollments/{id}/bootstrap.sh"),
+        ),
+        ("GET", "/api/v1/admin/workers".to_owned()),
+        ("GET", format!("/api/v1/admin/workers/{worker}/policy")),
+        ("PUT", format!("/api/v1/admin/workers/{worker}/policy")),
+        ("POST", format!("/api/v1/admin/workers/{worker}/uninstall")),
+        ("GET", "/api/v1/admin/placement".to_owned()),
+    ];
+    let body = json!({ "pool": d.pool.to_string() });
+    for (method, path) in &routes {
+        let anonymous = send(&d, method, path, Some(&body), &[]);
+        assert_eq!(anonymous.status, 401, "{method} {path}: {}", anonymous.text);
+        let refused = send(&d, method, path, Some(&body), &bearer);
+        assert!(
+            matches!(refused.status, 403 | 404),
+            "{method} {path} reached a tenant administrator: {} {}",
+            refused.status,
+            refused.text
+        );
+        assert!(!refused.text.contains(&id));
+    }
+
+    // Nothing the refused calls attempted took effect.
+    let after = send(
+        &d,
+        "GET",
+        &format!("/api/v1/admin/worker-enrollments/{id}"),
+        None,
+        &admin.headers(),
+    );
+    assert_eq!(after.json()["state"], "pending");
+    let events = audit_events(&d, &admin);
+    for forbidden in [
+        "worker-enrollment-revoked",
+        "worker-uninstall-requested",
+        "worker-policy-changed",
+        "worker-bootstrap-downloaded",
+    ] {
+        assert!(!events.contains(&forbidden.to_owned()), "{forbidden}");
+    }
+}
+
+#[test]
+fn listings_show_terms_and_host_policy_and_never_a_secret() {
+    let d = deployment(Some(true));
+    let admin = administrator(&d);
+    let first = issue(
+        &d,
+        &admin,
+        json!({ "pool": d.pool.to_string(), "transport": "direct", "cpu_millis": 2000, "priority": 3 }),
+    )
+    .json();
+    let second = issue(
+        &d,
+        &admin,
+        json!({ "pool": d.pool.to_string(), "memory_bytes": 4_294_967_296u64 }),
+    )
+    .json();
+    let (secret_a, secret_b) = (
+        first["secret"].as_str().unwrap().to_owned(),
+        second["secret"].as_str().unwrap().to_owned(),
+    );
+    let other = PoolId::new();
+    d.store
+        .writer()
+        .write(move |tx| {
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                other,
+                "elsewhere",
+                PoolKind::Shared,
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+    let third = issue(
+        &d,
+        &admin,
+        json!({ "pool": other.to_string(), "transport": "direct" }),
+    );
+    assert_eq!(third.status, 201, "{}", third.text);
+
+    let all = send(
+        &d,
+        "GET",
+        "/api/v1/admin/worker-enrollments",
+        None,
+        &admin.headers(),
+    );
+    assert_eq!(all.status, 200, "{}", all.text);
+    assert_eq!(all.json()["enrollments"].as_array().unwrap().len(), 3);
+    let narrowed = send(
+        &d,
+        "GET",
+        &format!("/api/v1/admin/worker-enrollments?pool={}", d.pool),
+        None,
+        &admin.headers(),
+    );
+    let listed = narrowed.json();
+    let rows = listed["enrollments"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r["pool"] == d.pool.to_string()));
+    assert!(rows.iter().all(|r| r["state"] == "pending"));
+    let direct = rows.iter().find(|r| r["transport"] == "direct").unwrap();
+    assert_eq!(direct["host"]["cpu_millis"], 2000);
+    assert_eq!(direct["host"]["priority"], 3);
+    for served in [&all.text, &narrowed.text] {
+        assert!(!served.contains(&secret_a[5..]) && !served.contains(&secret_b[5..]));
+        assert!(!served.contains(TAILCAT_ADDRESS));
+    }
+
+    // Paging: one at a time, newest first, with a cursor.
+    let page = send(
+        &d,
+        "GET",
+        "/api/v1/admin/worker-enrollments?limit=1",
+        None,
+        &admin.headers(),
+    )
+    .json();
+    assert_eq!(page["enrollments"].as_array().unwrap().len(), 1);
+    assert!(page["next_before"].is_i64() || page["next_before"].is_u64());
+    for bad in ["pool=not-an-id", "before=-1", "before=x"] {
+        let rejected = send(
+            &d,
+            "GET",
+            &format!("/api/v1/admin/worker-enrollments?{bad}"),
+            None,
+            &admin.headers(),
+        );
+        assert_eq!(rejected.status, 400, "{bad}: {}", rejected.text);
+    }
+
+    // A redeemed enrollment is listed as such, and its worker is listed with its host policy.
+    let worker = enroll_worker(&d, &secret_a);
+    let states: Vec<String> = send(
+        &d,
+        "GET",
+        "/api/v1/admin/worker-enrollments",
+        None,
+        &admin.headers(),
+    )
+    .json()["enrollments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["state"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(states.iter().filter(|s| *s == "redeemed").count(), 1);
+
+    let hosts = send(&d, "GET", "/api/v1/admin/workers", None, &admin.headers());
+    assert_eq!(hosts.status, 200, "{}", hosts.text);
+    let hosts = hosts.json();
+    let listed = hosts["workers"].as_array().unwrap();
+    assert_eq!(listed.len(), 1);
+    let host = &listed[0];
+    assert_eq!(host["id"], worker.to_string());
+    assert_eq!(host["pool"], d.pool.to_string());
+    assert_eq!(host["transport"], "direct");
+    assert_eq!(host["connected"], false);
+    assert_eq!(host["uninstall_requested_ms"], Value::Null);
+    assert_eq!(host["host"]["approved"]["cpu_millis"], 2000);
+    assert_eq!(host["host"]["approved"]["priority"], 3);
+    assert_eq!(host["host"]["reported"]["cpu_millis"], 16_000);
+    assert_eq!(host["host"]["effective"]["cpu_millis"], 2000);
+    let text = hosts.to_string();
+    assert!(!text.contains(&secret_a[5..]));
+    assert!(!text.contains("fingerprint") && !text.contains("node_key"));
+    let elsewhere = send(
+        &d,
+        "GET",
+        &format!("/api/v1/admin/workers?pool={other}"),
+        None,
+        &admin.headers(),
+    );
+    assert_eq!(elsewhere.json()["workers"], json!([]));
+
+    // An uninstall request is visible on the listing.
+    let uninstall = send(
+        &d,
+        "POST",
+        &format!("/api/v1/admin/workers/{worker}/uninstall"),
+        None,
+        &admin.headers(),
+    );
+    assert_eq!(uninstall.status, 202, "{}", uninstall.text);
+    let marked = send(&d, "GET", "/api/v1/admin/workers", None, &admin.headers()).json();
+    assert!(marked["workers"][0]["uninstall_requested_ms"].is_number());
 }
