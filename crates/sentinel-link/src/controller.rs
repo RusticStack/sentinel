@@ -3770,8 +3770,13 @@ mod tests {
         );
     }
 
+    /// A valid identifier whose order is `n`'s.
     fn wrk(n: u8) -> WorkerId {
-        WorkerId::from_bytes([n; 16]).unwrap()
+        let mut bytes = [0u8; 16];
+        bytes[0] = n;
+        bytes[6] = 0x40;
+        bytes[8] = 0x80;
+        WorkerId::from_bytes(bytes).unwrap()
     }
 
     fn order_of(order: PlacementOrder, entries: &[(WorkerId, i32, Standing)]) -> Vec<WorkerId> {
