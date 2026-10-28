@@ -69,6 +69,29 @@
       "sample counts per series and the raw samples"
     ]
   },
+  "freshness": {
+    "rule": "Every required test runs on every execution on both sides; build and dependency caches may be kept, test results never. An execution counts only when every required check passes.",
+    "cold": "worker or runner caches removed, images present; Blacksmith's side starts from its equivalent empty cache state",
+    "warm": "unchanged tree, caches kept after one unrecorded warm-up per series and side",
+    "small-edit": "one line appended to a compiled source of the lane's main package, caches kept"
+  },
+  "required_outputs": {
+    "rule": "The required checks and artifacts of the lane as in its pilots-ci lane definition are identical on both sides; a missing or different required output makes the execution incorrect.",
+    "per_lane": "named by the contract revision that selects the lanes; not yet selected"
+  },
+  "resource_envelope": {
+    "status": "unfilled until Blacksmith runner sizes are known; nothing is frozen here and no value may be guessed",
+    "sentinel": { "vcpu": null, "memory_mib": null, "disk_gib": null },
+    "blacksmith": { "runner_label": null, "vcpu": null, "memory_mib": null, "disk_gib": null },
+    "equal_request_required": true
+  },
+  "hosted_hardware_disclosure_fields": {
+    "status": "unfilled; completed in the report of each release run, never inferred",
+    "fields": ["blacksmith_cpu_model", "blacksmith_region", "blacksmith_network_path", "sentinel_cpu_model", "sentinel_host_label", "sentinel_network_path", "cache_state_per_condition", "resource_envelope_difference", "sample_counts_per_series"]
+  },
+  "failure_counts": {
+    "rule": "Reports state per series and side the number of pass, fail, incorrect and censored (never completed) executions. A censored execution is a failure whose duration is the observation window and stays in the distributions."
+  },
   "not_evidence": [
     "vendor-stated multipliers",
     "GitHub self-hosted runner records",

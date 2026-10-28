@@ -277,3 +277,35 @@ fn the_collectors_dry_run_output_is_read_by_the_harness_and_cannot_pass() {
         assert!(s["job"]["sentinel"]["count"].as_u64().unwrap() > 0);
     }
 }
+
+#[test]
+fn the_contract_leaves_the_resource_envelope_and_hardware_fields_unfilled() {
+    let c = contract();
+    for side in ["sentinel", "blacksmith"] {
+        for (k, v) in c["resource_envelope"][side].as_object().unwrap() {
+            assert!(
+                v.is_null(),
+                "{side}.{k} must stay unfilled until sizes are known"
+            );
+        }
+    }
+    assert!(
+        c["hosted_hardware_disclosure_fields"]["fields"]
+            .as_array()
+            .unwrap()
+            .len()
+            >= 6
+    );
+    assert!(
+        c["freshness"]["rule"]
+            .as_str()
+            .unwrap()
+            .contains("test results never")
+    );
+    assert!(
+        c["failure_counts"]["rule"]
+            .as_str()
+            .unwrap()
+            .contains("censored")
+    );
+}
