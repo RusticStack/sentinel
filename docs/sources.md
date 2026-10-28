@@ -41,9 +41,10 @@ resolver that hangs, floods, exits non-zero or prints a line that is not an
 address is killed and refused; no resolver thread or process outlives the
 call. A deployment that really
 needs an internal manual destination lists its exact authorities,
-comma-separated, in `SENTINEL_MANUAL_DESTINATIONS` (for example
-`https://git.corp.internal:8443`) in **both** the controller's and the
-worker's environment; a listed authority skips the check and the pin. Every
+comma-separated, in `SENTINEL_MANUAL_DESTINATIONS` or as `manual_destinations`
+(configuration key and `--manual-destinations` flag, which take precedence;
+for example `https://git.corp.internal:8443`) for **both** the controller and
+the worker; a listed authority skips the check and the pin. Every
 refusal or failure of an unbound remote surfaces as one message ("the manual
 remote was refused or could not be fetched") — never Git's own stderr — so
 neither the policy nor the worker's network is an oracle. A bound

@@ -200,3 +200,17 @@ fn a_digest_pinned_spec_prefills_the_digest_but_still_needs_a_platform() {
         "platform is written once too"
     );
 }
+
+#[test]
+fn pinned_images_is_the_only_digest_source_and_never_resolves_a_tag() {
+    // No registry is contacted anywhere in the controller or worker to turn a tag into a digest:
+    // a tag-only spec yields `Unresolved` (it stays unexecutable), a digest-pinned one yields its digest.
+    assert!(matches!(
+        runs::pinned_images(&spec("ghcr.io/o/i:v1")),
+        Err(Error::Unresolved)
+    ));
+    assert_eq!(
+        runs::pinned_images(&spec(&format!("ghcr.io/o/i@{DIGEST}"))).unwrap(),
+        [(DIGEST.to_owned(), "linux/amd64".to_owned())]
+    );
+}

@@ -1,10 +1,14 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/shim_dir.rs"]
+mod shim_dir;
+
 use std::{
     fs,
-    path::Path,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -201,4 +205,146 @@ fn an_unpinned_reference_is_still_refused() {
     }
     assert_eq!(images.in_flight(), 0);
     assert!(images.held().is_empty());
+}
+
+// Only shell builtins: the pull command runs with an empty PATH.
+const PODMAN: &str = r#"#!/bin/sh
+dir="${0%/*}"
+last=
+for a in "$@"; do last="$a"; done
+key="${last##*@}"
+case "$1" in
+  image)
+    echo "exists $key" >> "$dir/calls"
+    if [ -e "$dir/corrupt-$key" ] && [ ! -e "$dir/repaired-$key" ]; then
+      echo "Error: layer not known" >&2
+      exit 125
+    fi
+    if [ -e "$dir/present-$key" ]; then exit 0; fi
+    exit 1 ;;
+  pull)
+    echo "pull $key" >> "$dir/calls"
+    : > "$dir/present-$key"
+    : > "$dir/repaired-$key"
+    exit 0 ;;
+  *) exit 1 ;;
+esac
+"#;
+
+fn podman_shim() -> &'static PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = shim_dir::create("images");
+        let path = dir.join("podman");
+        fs::write(&path, PODMAN).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let joined = format!(
+            "{}:{}",
+            dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        // SAFETY: set once, before any test in this binary spawns podman
+        // (every test that does calls `podman_shim()` first, and `OnceLock` serializes it).
+        unsafe {
+            std::env::set_var("PATH", joined);
+        }
+        dir
+    })
+}
+
+fn pulls_of(dir: &Path, digest: &str) -> usize {
+    fs::read_to_string(dir.join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| *l == format!("pull {digest}"))
+        .count()
+}
+
+fn digest_of(n: u8) -> String {
+    format!("sha256:{n:02x}{}", "ab".repeat(31))
+}
+
+fn reference(digest: &str) -> String {
+    format!("example.test/image@{digest}")
+}
+
+#[test]
+fn a_resident_digest_skips_the_pull_and_a_missing_one_pulls() {
+    let dir = podman_shim();
+    let (present, missing) = (digest_of(1), digest_of(2));
+    fs::write(dir.join(format!("present-{present}")), "").unwrap();
+    let images = Images::new(PathBuf::from("unused-auth.json"));
+
+    // Anonymous pull into the shared store: a resident digest never asks the registry.
+    assert!(
+        images
+            .pull(&reference(&present), Duration::from_secs(10), &uncanceled())
+            .unwrap(),
+        "a resident digest reports present"
+    );
+    assert_eq!(pulls_of(dir, &present), 0, "the resident digest was pulled");
+    assert!(images.holds(&present));
+
+    assert!(
+        !images
+            .pull(&reference(&missing), Duration::from_secs(10), &uncanceled())
+            .unwrap(),
+        "a missing digest reports not present"
+    );
+    assert_eq!(pulls_of(dir, &missing), 1);
+    // The pull landed it; a second pull now takes the fast path.
+    assert!(
+        images
+            .pull(&reference(&missing), Duration::from_secs(10), &uncanceled())
+            .unwrap()
+    );
+    assert_eq!(
+        pulls_of(dir, &missing),
+        1,
+        "the second pull skipped the registry"
+    );
+}
+
+#[test]
+fn an_image_podman_cannot_confirm_is_pulled_again() {
+    let dir = podman_shim();
+    let corrupt = digest_of(3);
+    fs::write(dir.join(format!("present-{corrupt}")), "").unwrap();
+    fs::write(dir.join(format!("corrupt-{corrupt}")), "").unwrap();
+    let images = Images::new(PathBuf::from("unused-auth.json"));
+    // `podman image exists` fails for a damaged image, so it is not trusted as resident.
+    assert!(
+        !images
+            .pull(&reference(&corrupt), Duration::from_secs(10), &uncanceled())
+            .unwrap()
+    );
+    assert_eq!(pulls_of(dir, &corrupt), 1);
+}
+
+#[test]
+fn a_credentialed_pull_contacts_the_registry_even_for_a_resident_digest() {
+    let dir = podman_shim();
+    let resident = digest_of(4);
+    fs::write(dir.join(format!("present-{resident}")), "").unwrap();
+    let images = Images::new(PathBuf::from("unused-auth.json"));
+    let present = images
+        .pull_for_tenant(
+            &reference(&resident),
+            [7; 16],
+            [9; 32],
+            Path::new("tenant-auth.json"),
+            &sentinel_worker::podman::Store::Shared,
+            Duration::from_secs(10),
+            &uncanceled(),
+        )
+        .unwrap();
+    assert!(
+        present,
+        "the image was resident before the authorizing pull"
+    );
+    assert_eq!(
+        pulls_of(dir, &resident),
+        1,
+        "authorization needs the registry"
+    );
 }

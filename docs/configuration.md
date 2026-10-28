@@ -45,6 +45,8 @@ api_listen = "127.0.0.1:7080"
 public_url = "https://ci.example.com"
 # server only: the reverse proxy's networks, whose X-Forwarded-For is believed. Absent = loopback only
 trusted_proxies = ["127.0.0.1"]
+# both roles: internal https authorities an unbound repository's manual remote may name (default none; see "Manual remote destinations")
+# manual_destinations = ["https://git.corp.internal:8443"]
 # worker only: the controller to reach and the fingerprint it logged at `link_listening`
 controller = "10.0.0.5:7443"
 controller_fingerprint = "<64 lower-case hex characters>"
@@ -147,7 +149,7 @@ Optional on-disk controller state configures sources ([sources](sources.md)), ev
 - `<data_dir>/github-webhook.json` — `{"secret": "…"}` for GitHub webhook signature verification; the secret is 16–256 printable ASCII bytes and the file must be owner-only. Without it the GitHub intake route does not exist.
 - **Secret files** — the webhook file, the GitHub App key and the sign-in client secret file are opened once, never through a symbolic link, and judged on the open handle like `master.key`: a regular file owned by the controller's user with no group or other access; anything else is refused at startup without echoing a path or a value. Wiping of a secret's memory uses volatile writes (`zeroize`), and installation tokens are wiped when released.
 
-`SENTINEL_MANUAL_DESTINATIONS` (environment of the controller and of every worker, read once per process) — comma-separated exact `https://host[:port]` authorities that an unbound repository's manual remote may name although they are not public DNS names or resolve to private addresses. Unset (the default), only public names resolving to globally routable addresses are fetched ([sources](sources.md)).
+**Manual remote destinations.** `manual_destinations` (server and worker files; flag `--manual-destinations a,b`) lists the exact `https://host[:port]` authorities that an unbound repository's manual remote may name although they are not public DNS names or resolve to private addresses. Each entry has a lower-case host, an optional port and nothing else; at most 128, no duplicates; anything else (a path, user, `http://`, `ssh://`) stops the start with exit 2. Precedence is flag, then file, then the environment variable `SENTINEL_MANUAL_DESTINATIONS` (comma-separated, read once per process, unusable entries skipped); a configured list, even an empty one, replaces the variable. The controller and every worker that fetches manual remotes need the same list. Unset everywhere (the default), only public names resolving to globally routable addresses are fetched ([sources](sources.md)).
 
 Source credentials themselves are sealed with `<data_dir>/master.key` (`admin key create`), the same key-outside-database file second factors use. Repository hook secrets are digests and need no key. Resolution also uses `<data_dir>/intake-work/` as per-delivery scratch space for the repository fetches it makes; it is emptied at startup and never reused.
 

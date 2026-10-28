@@ -6,6 +6,8 @@ log_level = "info"
 listen = "127.0.0.1:7443"
 # API address, proxied by sentinel-web; put TLS in front before exposing it.
 api_listen = "127.0.0.1:7080"
+# Internal https authorities that a manual remote may name (default: none, public hosts only).
+# manual_destinations = ["https://git.corp.internal:8443"]
 
 # Optional NAT-traversing transport; without it (or with enabled = false) the link uses direct TLS.
 # The tc… address in <data_dir>/tailcat/address is a credential (owner-only).

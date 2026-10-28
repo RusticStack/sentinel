@@ -73,6 +73,7 @@ struct FileConfig {
     api_listen: Option<String>,
     public_url: Option<String>,
     trusted_proxies: Option<Vec<String>>,
+    manual_destinations: Option<Vec<String>>,
     controller: Option<String>,
     controller_fingerprint: Option<String>,
     controller_fingerprint_also: Option<Vec<String>>,
@@ -457,6 +458,7 @@ enum Role {
 
 struct Config {
     data_dir: PathBuf,
+    manual_destinations: Option<Vec<String>>,
     log_format: LogFormat,
     log_level: LogLevel,
     #[cfg(feature = "server")]
@@ -899,8 +901,20 @@ impl Config {
                 .unwrap_or_default(),
             Role::Worker(_) => sentinel_store::auto_join::Parsed::default(),
         };
+        if let Some(list) = args
+            .manual_destinations
+            .as_ref()
+            .or(file.manual_destinations.as_ref())
+        {
+            sentinel_protocol::source::validate_manual_destinations(list)
+                .map_err(Error::config)?;
+        }
         Ok(Self {
             data_dir,
+            manual_destinations: args
+                .manual_destinations
+                .clone()
+                .or(file.manual_destinations),
             log_format: args.log_format.or(file.log_format).unwrap_or_default(),
             log_level: args.log_level.or(file.log_level).unwrap_or_default(),
             #[cfg(feature = "server")]
@@ -1009,6 +1023,9 @@ pub fn run(role: &str, args: ServiceArgs) -> Result<(), Error> {
         return Ok(());
     }
 
+    if let Some(list) = &config.manual_destinations {
+        sentinel_protocol::source::set_manual_destinations(list.clone());
+    }
     let mut diagnostics = Diagnostics::stderr(config.log_format, config.log_level)
         .map_err(|error| Error::runtime(format!("cannot initialize diagnostics: {error}")))?;
     let dispatch = diagnostics.dispatch().clone();
@@ -1120,6 +1137,7 @@ pub(crate) fn tailcat_setup(
         check: true,
         log_format: None,
         log_level: None,
+        manual_destinations: None,
     };
     let mut io = Executor::new(WorkClass::BlockingIo, 1)
         .map_err(|error| Error::runtime(format!("cannot start I/O lane: {error}")))?;
