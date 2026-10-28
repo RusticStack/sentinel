@@ -1,4 +1,5 @@
-//! Guard: no PEM private key is committed. Tests that need an App key generate
+//! Guard: no PEM private key is committed (tracked by git; a source archive without git
+//! is walked instead). Tests that need an App key generate
 //! a throwaway one at run time.
 
 use std::{fs, path::Path};
@@ -50,11 +51,41 @@ fn walk(dir: &Path, hits: &mut Vec<String>) {
     }
 }
 
+/// The files git tracks, so an ignored local credential folder cannot trip the guard.
+/// `None` when this is not a git checkout (a source archive): the caller walks the tree.
+fn tracked(root: &Path) -> Option<Vec<std::path::PathBuf>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    Some(
+        out.stdout
+            .split(|b| *b == 0)
+            .filter(|name| !name.is_empty())
+            .map(|name| root.join(String::from_utf8_lossy(name).as_ref()))
+            .collect(),
+    )
+}
+
 #[test]
 fn no_pem_private_key_is_committed() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut hits = Vec::new();
-    walk(&root, &mut hits);
+    match tracked(&root) {
+        Some(files) => {
+            for path in files {
+                if let Ok(text) = fs::read_to_string(&path)
+                    && has_pem_body(&text)
+                {
+                    hits.push(path.display().to_string());
+                }
+            }
+        }
+        None => walk(&root, &mut hits),
+    }
     assert!(hits.is_empty(), "committed PEM private key in: {hits:?}");
 }
 
