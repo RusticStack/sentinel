@@ -184,14 +184,17 @@ impl Repo {
         git(&work, &["init", "-q", "--initial-branch=main"]);
         git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
         let hook = bare.join("hooks").join("post-receive");
-        fs::copy(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../examples/hooks/post-receive"
-            ),
-            &hook,
-        )
-        .unwrap();
+        // Write the hook with LF endings whatever the checkout's `core.autocrlf`
+        // produced: a CRLF shebang fails to execute.
+        let script = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/hooks/post-receive"
+        ))
+        .unwrap()
+        .replace("
+", "
+");
+        fs::write(&hook, script).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
