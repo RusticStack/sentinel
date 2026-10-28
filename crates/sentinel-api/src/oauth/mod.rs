@@ -326,7 +326,19 @@ pub(crate) fn admitted(state: &State, request: &Request, budget: Budget) -> bool
     }
 }
 
+/// The key for per-client budgets and the sign-in lockout: the client a trusted proxy names, else the
+/// connection ([`limit::connection_key`]).
 pub(crate) fn client_of(state: &State, request: &Request) -> u128 {
+    limit::connection_key(
+        request.peer_addr(),
+        routes::header_value(request, "x-forwarded-for"),
+        &state.trusted_proxies,
+    )
+}
+
+/// The key for a quota that reconnecting must not mint (client registrations): the proxy's address when
+/// it names no client, so everything behind it shares the quota.
+pub(crate) fn client_of_address(state: &State, request: &Request) -> u128 {
     limit::client_key(
         request.peer(),
         routes::header_value(request, "x-forwarded-for"),

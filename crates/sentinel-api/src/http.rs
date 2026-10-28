@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::oauth::limit::{TrustedProxy, client_key, is_proxy};
+use crate::oauth::limit::{TrustedProxy, client_key, connection_key, is_proxy};
 
 #[derive(Clone, Copy)]
 pub(crate) struct Tune {
@@ -790,7 +790,11 @@ impl Request<'_> {
     }
 
     pub(crate) fn peer(&self) -> Option<std::net::IpAddr> {
-        self.writer.peer_addr().ok().map(|addr| addr.ip())
+        self.peer_addr().map(|addr| addr.ip())
+    }
+
+    pub(crate) fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.writer.peer_addr().ok()
     }
 
     pub(crate) fn peer_gone(&self) -> bool {
@@ -824,7 +828,7 @@ impl Request<'_> {
                 .iter()
                 .find(|h| h.field.equiv("x-forwarded-for"))
                 .map(|h| h.value.as_str());
-            let key = client_key(self.peer(), forwarded, &gate.trusted);
+            let key = connection_key(self.peer_addr(), forwarded, &gate.trusted);
             let Some(reader) = ReaderKey::take(&gate.readers, key) else {
                 self.restore_handler(gate)?;
                 return Err(BodyErr::Busy);
@@ -1807,6 +1811,58 @@ mod tests {
         other.write_all(b"k").unwrap();
         let other = status(other);
         assert!(other.starts_with(b"HTTP/1.1 200"), "got {other:?}");
+        conns.close();
+    }
+
+    // A trusted proxy that names no client must not serialize everyone behind it onto one body slot.
+    #[test]
+    fn connections_of_an_unforwarding_proxy_hold_separate_body_slots() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conns = listen(
+            listener,
+            Arc::new(|request: &mut Request| {
+                let outcome = request.public_body(1024).map(|b| b.len());
+                let status = if outcome.is_ok() { 200 } else { 400 };
+                let _ = request.respond(
+                    Response::from_string(String::new()).with_status_code(StatusCode(status)),
+                );
+            }),
+            Arc::new(AtomicBool::new(false)),
+            Tune {
+                connections: 6,
+                handlers: 4,
+                public_bodies: 2,
+                public_body_time: Duration::from_secs(3),
+                ..tune()
+            },
+            TrustedProxy::loopback(),
+        )
+        .unwrap();
+        let post = |body: &str, declared: usize| {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "POST /p HTTP/1.1\r\nhost: h\r\ncontent-length: {declared}\r\n\r\n{body}"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stream
+        };
+        let _slow = post("x", 100);
+        thread::sleep(Duration::from_millis(150));
+        // A second connection from the same proxy address is another client, not a refused duplicate.
+        let mut other = post("o", 2);
+        thread::sleep(Duration::from_millis(100));
+        other.write_all(b"k").unwrap();
+        other
+            .set_read_timeout(Some(Duration::from_millis(1500)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let n = other.read(&mut buf).expect("answered in time");
+        assert!(buf[..n].starts_with(b"HTTP/1.1 200"), "got {:?}", &buf[..n]);
         conns.close();
     }
 

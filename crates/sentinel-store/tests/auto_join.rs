@@ -1,4 +1,9 @@
-use rusqlite::params;
+use std::sync::Mutex;
+
+use rusqlite::{
+    params,
+    trace::{TraceEvent, TraceEventCodes},
+};
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
     TenantId, UnixMillis, UserId,
@@ -12,6 +17,14 @@ use sentinel_store::{
     local_auth::{self, Event, Login, Policy},
     registration::{self, Admission, Applicant, Authority, DeploymentPolicy, Registration, Terms},
 };
+
+static SQL: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn record(event: TraceEvent<'_>) {
+    if let TraceEvent::Stmt(_, sql) = event {
+        SQL.lock().unwrap().push(sql.to_owned());
+    }
+}
 
 const PASSWORD: &[u8] = b"an acceptable member password";
 const SLUG: &str = "example-com";
@@ -96,6 +109,30 @@ impl Fixture {
         let outcome =
             local_auth::login(&self.store, address, PASSWORD, Policy::default(), at(50)).unwrap();
         assert!(matches!(outcome, Login::Accepted(_)), "sign-in refused");
+    }
+
+    fn generation(&self) -> i64 {
+        self.store
+            .read(|c| {
+                c.query_row("SELECT generation FROM auto_join_state", [], |r| r.get(0))
+                    .map_err(Error::from)
+            })
+            .unwrap()
+    }
+
+    /// Every statement one `issue_session` runs, in order.
+    fn session_statements(&self, user: UserId, ms: i64) -> Vec<String> {
+        SQL.lock().unwrap().clear();
+        self.store
+            .writer()
+            .write(move |tx| {
+                tx.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(record));
+                let issued = local_auth::issue_session(tx, user, Policy::default(), at(ms));
+                tx.trace_v2(TraceEventCodes::empty(), None);
+                issued.map(|_| ())
+            })
+            .unwrap();
+        std::mem::take(&mut *SQL.lock().unwrap())
     }
 
     fn tenants_named(&self, slug: &str) -> i64 {
@@ -659,8 +696,10 @@ fn a_member_removed_by_an_administrator_is_not_re_added_by_the_domain() {
     f.remove(SLUG, bruno, 100);
     assert_eq!(f.role_in(SLUG, bruno), 0);
 
-    // Sign-in runs `auto_join::apply`; two sign-ins prove the veto is not consumed.
+    // The first sign-in runs `auto_join::apply`; a changed rule set runs it again at the next one. Neither
+    // consumes the veto.
     f.sign_in("bruno@example.com");
+    assert!(f.rules("example.com, other.example").is_empty());
     f.sign_in("bruno@example.com");
     assert_eq!(f.role_in(SLUG, bruno), 0, "the removal stands");
     assert_eq!(
@@ -698,4 +737,137 @@ fn an_administrator_can_add_a_removed_member_back_and_a_second_removal_still_hol
         })
         .unwrap();
     assert_eq!(rows, 1, "one tombstone per person and organization");
+}
+
+// A sign-in is one writer transaction; once a person was checked under the rules in force, the join logic
+// costs it one conditional UPDATE and reads neither the rules nor the organization.
+#[test]
+fn a_session_checks_auto_join_once_per_rule_set_with_one_statement() {
+    let f = fixture();
+    assert!(f.rules("example.com").is_empty());
+    let user = f.verified("ana@example.com");
+
+    let first = f.session_statements(user, 60);
+    assert!(
+        first.iter().any(|sql| sql.contains("auto_join_domains")),
+        "the first sign-in applies the rules: {first:?}"
+    );
+    let second = f.session_statements(user, 61);
+    let joining = |sql: &&String| {
+        [
+            "auto_join_domains",
+            "INTO memberships",
+            "membership_removals",
+            "t.slug = ?1",
+        ]
+        .iter()
+        .any(|word| sql.contains(word))
+    };
+    assert_eq!(
+        second.iter().filter(joining).count(),
+        0,
+        "a checked person pays no join read: {second:?}"
+    );
+    assert_eq!(
+        second
+            .iter()
+            .filter(|sql| sql.contains("UPDATE users SET auto_join_gen"))
+            .count(),
+        1,
+        "{second:?}"
+    );
+    assert!(
+        second.len() < first.len(),
+        "{} vs {}",
+        second.len(),
+        first.len()
+    );
+
+    // A changed rule set checks the person once more, then stops again.
+    assert!(f.rules("example.com, other.example").is_empty());
+    let third = f.session_statements(user, 62);
+    assert!(third.iter().any(|sql| sql.contains("auto_join_domains")));
+    let fourth = f.session_statements(user, 63);
+    assert_eq!(fourth.len(), second.len(), "{fourth:?}");
+    assert_eq!(f.role_in(SLUG, user), 3);
+}
+
+#[test]
+fn a_domain_listed_after_the_person_signed_in_still_joins_at_the_next_sign_in() {
+    let f = fixture();
+    assert!(f.rules("").is_empty());
+    let user = f.verified("ana@example.com");
+    f.sign_in("ana@example.com");
+    assert_eq!(f.memberships_of(user), 0);
+    f.sign_in("ana@example.com");
+    assert_eq!(f.memberships_of(user), 0);
+
+    assert!(f.rules("example.com").is_empty());
+    f.sign_in("ana@example.com");
+    assert_eq!(f.role_in(SLUG, user), 3);
+    assert_eq!(f.count(Event::DomainAutoJoined), 1);
+}
+
+// The controller rewrites the rules at every start; only a different effective set may send everyone back
+// through the join logic.
+#[test]
+fn the_generation_moves_only_when_the_effective_rules_change() {
+    let f = fixture();
+    let start = f.generation();
+    assert!(f.rules("").is_empty());
+    assert_eq!(f.generation(), start, "empty over empty");
+
+    assert!(f.rules("example.com").is_empty());
+    let listed = f.generation();
+    assert!(listed > start);
+    assert!(f.rules("EXAMPLE.com").is_empty());
+    assert!(f.rules("example.com").is_empty());
+    assert_eq!(f.generation(), listed, "a restart with the same rules");
+
+    assert!(f.rules("example.com=acme").is_empty());
+    let renamed = f.generation();
+    assert!(renamed > listed, "the same domain for another organization");
+    assert!(f.rules("").is_empty());
+    assert!(f.generation() > renamed, "removing the last domain");
+
+    // A rule the joining transaction would refuse is not part of the effective set.
+    let tenant = f.organization("example-com");
+    f.bind_github(tenant);
+    let before = f.generation();
+    assert_eq!(f.rules("example.com").len(), 1);
+    assert_eq!(f.generation(), before, "a refused rule changes nothing");
+}
+
+// An account that cannot join yet is not marked checked, so the sign-in after it can join looks again.
+#[test]
+fn an_unverified_account_is_looked_at_again_until_it_can_join() {
+    let f = fixture();
+    assert!(f.rules("example.com").is_empty());
+    let user = f.claim("ana@example.com");
+    let marked = |f: &Fixture| -> i64 {
+        f.store
+            .read(|c| {
+                c.query_row(
+                    "SELECT auto_join_gen FROM users WHERE id = ?1",
+                    [user.as_bytes()],
+                    |r| r.get(0),
+                )
+                .map_err(Error::from)
+            })
+            .unwrap()
+    };
+    let statements = f.session_statements(user, 60);
+    assert!(
+        statements.iter().any(|sql| sql.contains("auto_join_gen")),
+        "{statements:?}"
+    );
+    assert_eq!(marked(&f), 0, "not eligible, so not checked");
+    let secret = f.link(user);
+    assert!(matches!(
+        email::confirm(&f.store, &secret, at(70)).unwrap(),
+        Confirmation::Verified { .. }
+    ));
+    assert_eq!(f.role_in(SLUG, user), 3);
+    f.session_statements(user, 80);
+    assert_eq!(marked(&f), f.generation());
 }

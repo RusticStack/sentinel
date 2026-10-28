@@ -686,7 +686,7 @@ pub fn issue_session(
         ],
     )?;
     crate::github_members::enqueue_user(tx, user, now)?;
-    crate::auto_join::apply(tx, user, now)?;
+    crate::auto_join::apply_if_due(tx, user, now)?;
     Ok(Issued {
         user,
         session,

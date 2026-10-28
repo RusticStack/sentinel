@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
 
@@ -168,26 +168,85 @@ impl TrustedProxy {
 
 // A client reaching the server directly is keyed by its own address, whatever headers it sends.
 // IPv6 is keyed per /64, so one host cannot mint buckets from its own prefix.
+// A trusted proxy's request that names no valid client address is keyed by the proxy's own address, so
+// every client of that hop shares one key: the key for a quota that reconnecting must not mint.
 pub(crate) fn client_key(
     peer: Option<IpAddr>,
     forwarded_for: Option<&str>,
     trusted: &[TrustedProxy],
 ) -> u128 {
-    let peer = peer.map(canonical);
-    let via_proxy = peer.is_some_and(|ip| is_proxy(ip, trusted));
-    let client = match (via_proxy, forwarded_for) {
-        (true, Some(header)) => header
-            .rsplit(',')
-            .next()
-            .and_then(|last| last.trim().parse::<IpAddr>().ok())
-            .map(canonical)
-            .or(peer),
-        _ => peer,
+    match forwarded_client(peer.map(canonical), forwarded_for, trusted) {
+        Hop::Client(ip) | Hop::Proxy(ip) => address_key(Some(ip)),
+        Hop::Unknown => 0,
+    }
+}
+
+/// Where a request came from, as far as the controller can tell.
+enum Hop {
+    /// The peer itself, or the client a trusted proxy named in its last `X-Forwarded-For` entry.
+    Client(IpAddr),
+    /// A trusted proxy that named no valid client.
+    Proxy(IpAddr),
+    Unknown,
+}
+
+fn forwarded_client(
+    peer: Option<IpAddr>,
+    forwarded_for: Option<&str>,
+    trusted: &[TrustedProxy],
+) -> Hop {
+    let Some(peer) = peer else {
+        return Hop::Unknown;
     };
+    if !is_proxy(peer, trusted) {
+        return Hop::Client(peer);
+    }
+    forwarded_for
+        .and_then(|header| header.rsplit(',').next())
+        .and_then(|last| last.trim().parse::<IpAddr>().ok())
+        .map_or(Hop::Proxy(peer), |ip| Hop::Client(canonical(ip)))
+}
+
+fn address_key(client: Option<IpAddr>) -> u128 {
     match client {
         None => 0,
         Some(IpAddr::V4(v4)) => u128::from(u32::from(v4)),
         Some(IpAddr::V6(v6)) => (u128::from(v6) & !0xffff_ffff_ffff_ffff) | 1,
+    }
+}
+
+// Marks a connection key. An IPv4 key has 96 zero high bits and an IPv6 key has a low half of exactly 1;
+// a connection key has its top bit set and this marker above the port in the low half, so it equals neither.
+const CONNECTION_TAG: u64 = 0xC0DE_0000_0000_0000;
+
+/// The key for rate limits, lockouts and body slots.
+///
+/// It is `client_key` except for a trusted proxy that sent no valid client address: those requests are
+/// keyed by the proxy's connection (its address and source port), so the clients of one proxy no longer
+/// share a single bucket, lockout pair and body slot. A connection is the finest identity the controller
+/// has without the header. A client that opens a new connection for each request gets a fresh key there;
+/// the global ceilings, the handler and body pools and the store's account-wide lock still bound it.
+/// Setting `X-Forwarded-For` at the proxy gives real per-client keys.
+pub(crate) fn connection_key(
+    peer: Option<SocketAddr>,
+    forwarded_for: Option<&str>,
+    trusted: &[TrustedProxy],
+) -> u128 {
+    let ip = peer.map(|addr| canonical(addr.ip()));
+    match forwarded_client(ip, forwarded_for, trusted) {
+        Hop::Client(client) => address_key(Some(client)),
+        Hop::Unknown => 0,
+        Hop::Proxy(proxy) => {
+            let host = match proxy {
+                IpAddr::V4(v4) => u64::from(u32::from(v4)),
+                IpAddr::V6(v6) => {
+                    let bits = u128::from(v6);
+                    (bits >> 64) as u64 ^ bits as u64
+                }
+            };
+            let port = peer.map_or(0, |addr| u64::from(addr.port()));
+            (u128::from(host | 1 << 63) << 64) | u128::from(CONNECTION_TAG | port)
+        }
     }
 }
 
@@ -274,6 +333,49 @@ mod tests {
         assert_eq!(key(a, None), key(b, None));
         let mapped: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
         assert_eq!(key(mapped, None), key(public, None));
+    }
+
+    #[test]
+    fn a_proxy_naming_no_client_is_keyed_per_connection() {
+        let trusted = TrustedProxy::loopback();
+        let conn = |port: u16, via| {
+            connection_key(
+                Some(SocketAddr::new("127.0.0.1".parse().unwrap(), port)),
+                via,
+                &trusted,
+            )
+        };
+        // Two connections of one proxy are two clients; one connection stays one client.
+        assert_ne!(conn(40_001, None), conn(40_002, None));
+        assert_eq!(conn(40_001, None), conn(40_001, Some("junk")));
+        // The proxy's address key, the one that quotas share, does not move with the port.
+        let local: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(
+            client_key(Some(local), None, &trusted),
+            client_key(Some(local), Some("junk"), &trusted)
+        );
+        // A named client wins over the connection, whatever port carried it.
+        let named = Some("198.51.100.7");
+        assert_eq!(conn(40_001, named), conn(40_002, named));
+        assert_eq!(
+            conn(40_001, named),
+            client_key(Some("198.51.100.7".parse().unwrap()), None, &trusted)
+        );
+        // A direct client keeps its address key on every connection and cannot spoof the header.
+        let direct = |port: u16, via| {
+            connection_key(
+                Some(SocketAddr::new("203.0.113.9".parse().unwrap(), port)),
+                via,
+                &trusted,
+            )
+        };
+        assert_eq!(direct(1, Some("198.51.100.7")), direct(2, None));
+        // A connection key never equals an address key.
+        let tagged = conn(40_001, None);
+        assert_ne!(tagged, client_key(Some(local), None, &trusted));
+        assert_ne!(tagged & 0xffff_ffff_ffff_ffff, 1);
+        assert_ne!(tagged >> 96, 0);
+        assert_eq!(connection_key(None, None, &trusted), 0);
     }
 
     #[test]

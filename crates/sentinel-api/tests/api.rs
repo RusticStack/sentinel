@@ -3001,6 +3001,55 @@ fn login_refuses_a_foreign_origin() {
     assert_eq!(status, 200);
 }
 
+const LOGIN_JSON: &[(&str, &str)] = &[("content-type", "application/json")];
+const WRONG_PASSWORD: &str = r#"{"username":"root","password":"not the password at all"}"#;
+const RIGHT_PASSWORD: &str = r#"{"username":"root","password":"correct horse battery staple"}"#;
+
+fn login_as(d: &Deployment, body: &str, client: Option<&str>) -> u16 {
+    let mut headers = LOGIN_JSON.to_vec();
+    if let Some(client) = client {
+        headers.push(("x-forwarded-for", client));
+    }
+    raw_login(d, body, &headers).0
+}
+
+// The loopback proxy here sends no client address, as an unconfigured reverse proxy does. Every attempt
+// is its own connection, so the guesser's failures must not lock the owner out of the account.
+#[test]
+fn guessing_through_an_unforwarding_proxy_does_not_lock_the_owner_out() {
+    let policy = local_auth::Policy {
+        max_failures: 3,
+        ..local_auth::Policy::default()
+    };
+    let d = deployment_with(policy);
+    for _ in 0..4 {
+        assert_eq!(login_as(&d, WRONG_PASSWORD, None), 401);
+    }
+    assert_eq!(login_as(&d, RIGHT_PASSWORD, None), 200);
+}
+
+// A proxy that names the client gets the per-client lockout: the guesser's address is refused, even with
+// the right password, and the owner's address still signs in.
+#[test]
+fn the_login_lockout_follows_the_client_a_proxy_names() {
+    let policy = local_auth::Policy {
+        max_failures: 3,
+        ..local_auth::Policy::default()
+    };
+    let d = deployment_with(policy);
+    let guesser = Some("198.51.100.7");
+    for _ in 0..3 {
+        assert_eq!(login_as(&d, WRONG_PASSWORD, guesser), 401);
+    }
+    assert_eq!(login_as(&d, RIGHT_PASSWORD, guesser), 401, "locked out");
+    assert_eq!(login_as(&d, RIGHT_PASSWORD, Some("198.51.100.8")), 200);
+    // The same address on another connection is the same client; a spoofed first entry changes nothing.
+    assert_eq!(
+        login_as(&d, RIGHT_PASSWORD, Some("203.0.113.1, 198.51.100.7")),
+        401
+    );
+}
+
 #[test]
 fn a_foreign_tenant_slug_lists_as_not_found() {
     let d = deployment();
