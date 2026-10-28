@@ -901,6 +901,17 @@ fn execute(
     let context = WorkerContext::new(&job.context, &job.spec, workspace);
     let mut oom_seen = container.oom_kills().unwrap_or(0);
     let mut failure: Option<(FailureClass, String)> = None;
+    // A container's workspace has no kernel quota: the guard measures it and stops the container once it passes
+    // the declared disk (docs/executor.md#disk). A microVM's scratch disk is the bound there.
+    let guard = container.guard_storage(workspace, compiled.resources.disk_bytes);
+    let over_disk = |index: usize| {
+        guard.as_ref().and_then(|g| g.exceeded()).map(|used| {
+            (
+                FailureClass::CommandFailed,
+                disk_exceeded(index, used, compiled.resources.disk_bytes),
+            )
+        })
+    };
     for (index, step) in compiled.steps.iter().enumerate() {
         let mut record = StepRecord {
             index: index as u32,
@@ -922,6 +933,11 @@ fn execute(
                 FailureClass::Canceled,
                 format!("canceled before step {index}"),
             ));
+            continue;
+        }
+        if let Some(over) = over_disk(index) {
+            summary.steps.push(record);
+            failure = Some(over);
             continue;
         }
         if let Some(condition) = &step.condition {
@@ -1014,8 +1030,17 @@ fn execute(
         let exit = match exec.and_then(|exit| cleared.map(|()| exit)) {
             Ok(exit) => exit,
             Err(e) => {
-                record.outcome = StepOutcome::Runtime;
                 record.duration_ns = ns(started);
+                // The guard removed the container under the running step: that is the disk limit, not a fault.
+                if !cancel.load(Ordering::Acquire)
+                    && let Some(over) = over_disk(index)
+                {
+                    record.outcome = StepOutcome::Failed { code: -1 };
+                    summary.steps.push(record);
+                    failure = Some(over);
+                    continue;
+                }
+                record.outcome = StepOutcome::Runtime;
                 summary.steps.push(record);
                 failure = Some((FailureClass::Runtime, format!("step {index}: {e}")));
                 continue;
@@ -1028,6 +1053,13 @@ fn execute(
                     signal: exit.signal.unwrap_or(0),
                 },
                 Some((FailureClass::Canceled, format!("step {index} canceled"))),
+            )
+        } else if let Some(over) = over_disk(index) {
+            (
+                StepOutcome::Failed {
+                    code: exit.code.unwrap_or(-1),
+                },
+                Some(over),
             )
         } else if exit.timed_out {
             (
@@ -1108,6 +1140,14 @@ pub fn capture_artifacts(
         }
     }
     failed
+}
+
+/// The verdict text for a step stopped because the workspace passed the job's declared disk. The failure class
+/// stays `command_failed` (the job's own writes did it); this text is what names the limit.
+fn disk_exceeded(step: usize, used: u64, limit: u64) -> String {
+    format!(
+        "step {step} exceeded the job's disk limit: the workspace held {used} bytes of the {limit} declared as resources.disk"
+    )
 }
 
 fn describe(error: &EvalError) -> String {

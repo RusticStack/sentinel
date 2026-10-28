@@ -384,6 +384,14 @@ jobs:
     steps:
       - id: fill
         run: 'dd if=/dev/zero of=/tmp/x bs=1M count=300'
+  fat:
+    image: {IMAGE}@{DIGEST}
+    resources: {{ cpu: 1, memory: 128MiB, disk: 1GiB }}
+    steps:
+      - id: fill
+        run: 'i=0; while [ $i -lt 40 ]; do dd if=/dev/zero of=part$i bs=1M count=100 2>/dev/null; i=$((i+1)); done'
+      - id: never
+        run: 'true'
   slow:
     image: {IMAGE}@{DIGEST}
     resources: {{ cpu: 1, memory: 128MiB }}
@@ -466,6 +474,7 @@ jobs:
         by_name("polite"),
         by_name("stubborn"),
     );
+    let fat = by_name("fat");
     let inspect_deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let current = state(inspect);
@@ -635,6 +644,26 @@ jobs:
         Some(sentinel_core::FailureClass::OutOfMemory)
     );
     assert_eq!(summary_of(oom).steps[0].outcome, StepOutcome::OutOfMemory);
+    // 4 GiB are written 100 MiB at a time against a declared 1 GiB: no single file passes `fsize`, so only the
+    // storage guard can end it. The verdict names the limit; the class stays the job's own `command_failed`.
+    eventually("fat failed", || {
+        state(fat).state == JobState::Terminal(Outcome::Failed)
+    });
+    assert_eq!(
+        state(fat).failure_class,
+        Some(sentinel_core::FailureClass::CommandFailed)
+    );
+    let fat_summary = summary_of(fat);
+    assert!(
+        fat_summary.detail.contains("disk limit"),
+        "{}",
+        fat_summary.detail
+    );
+    assert!(matches!(
+        fat_summary.steps[0].outcome,
+        StepOutcome::Failed { .. }
+    ));
+    assert_eq!(fat_summary.steps[1].outcome, StepOutcome::NotRun);
     eventually("slow timed out", || {
         state(slow).state == JobState::Terminal(Outcome::TimedOut)
     });

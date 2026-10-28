@@ -21,6 +21,8 @@ pub mod podman;
 pub mod prefetch;
 #[cfg(target_os = "linux")]
 mod process;
+#[cfg(target_os = "linux")]
+pub mod quota;
 /// A step's output callback: the log path and tests take it.
 #[cfg(target_os = "linux")]
 pub use process::Sink as OutputSink;
