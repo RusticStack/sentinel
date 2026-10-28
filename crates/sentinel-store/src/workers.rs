@@ -116,12 +116,49 @@ pub fn enroll(
     redeem(tx, presented, presentation, now)?.ok_or(Error::NotFound)
 }
 
+/// Who a refused enrollment is charged to: a hash of the source key, or `UNATTRIBUTED`.
+pub type Peer = [u8; 16];
+pub const UNATTRIBUTED: Peer = [0; 16];
+
+/// Refusals are counted per hour; past these caps an attempt is counted but writes no audit row.
+pub const REFUSAL_WINDOW_MS: i64 = 60 * 60 * 1000;
+pub const REFUSAL_ROWS_PER_PEER: i64 = 5;
+pub const REFUSAL_ROWS_PER_WINDOW: i64 = 50;
+pub const REFUSAL_PEERS_PER_WINDOW: i64 = 64;
+const REFUSAL_KEEP_MS: i64 = 7 * DAY_MS;
+
+const REDEEMABLE: &str =
+    "SELECT e.pool_id FROM worker_enrollments e JOIN pools p ON p.id = e.pool_id
+             WHERE e.token_digest = ?1 AND e.redeemed_ms IS NULL AND e.revoked_ms IS NULL
+             AND e.expires_ms > ?2 AND p.active = 1";
+
+/// Whether `presented` would redeem right now. A read: it records nothing, so the controller can let a
+/// secret that is still good through without charging it to the refusal budget.
+pub fn redeemable(conn: &Connection, presented: &Secret, now: UnixMillis) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(REDEEMABLE)?
+        .query_row(params![presented.digest().0, now.0], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
 // Refusal is Ok(None), not Err: an Err would roll back the audit row a committing caller must keep.
 pub fn redeem(
     tx: &Transaction<'_>,
     presented: &Secret,
     presentation: Presentation<'_>,
     now: UnixMillis,
+) -> Result<Option<Worker>> {
+    redeem_from(tx, presented, presentation, now, UNATTRIBUTED)
+}
+
+/// `redeem` with the refusal charged to `peer`, so one peer's guesses cannot use up the audit budget.
+pub fn redeem_from(
+    tx: &Transaction<'_>,
+    presented: &Secret,
+    presentation: Presentation<'_>,
+    now: UnixMillis,
+    peer: Peer,
 ) -> Result<Option<Worker>> {
     if presentation.name.is_empty()
         || presentation.name.len() > 128
@@ -131,15 +168,11 @@ pub fn redeem(
     }
     let digest = presented.digest();
     let pool: Option<[u8; 16]> = tx
-        .prepare_cached(
-            "SELECT e.pool_id FROM worker_enrollments e JOIN pools p ON p.id = e.pool_id
-             WHERE e.token_digest = ?1 AND e.redeemed_ms IS NULL AND e.revoked_ms IS NULL
-             AND e.expires_ms > ?2 AND p.active = 1",
-        )?
+        .prepare_cached(REDEEMABLE)?
         .query_row(params![digest.0, now.0], |r| r.get(0))
         .optional()?;
     let Some(pool) = pool else {
-        audit(tx, Event::WorkerEnrollmentRefused, None, None, false, None)?;
+        record_refusal(tx, peer, now)?;
         return Ok(None);
     };
     let pool = PoolId::from_bytes(pool).map_err(|_| Error::Corrupt("pool id"))?;
@@ -186,6 +219,92 @@ pub fn redeem(
         last_seen: None,
         software: None,
     }))
+}
+
+// Every refusal is counted; only the first few per peer and per window also write an audit row, and the
+// first refusal of a later window writes one row summarising the counted-only ones before it.
+fn record_refusal(tx: &Transaction<'_>, peer: Peer, now: UnixMillis) -> Result<()> {
+    let window = now.0.div_euclid(REFUSAL_WINDOW_MS) * REFUSAL_WINDOW_MS;
+    let (unsummarized, windows): (i64, i64) = tx
+        .prepare_cached(
+            "SELECT COALESCE(SUM(suppressed), 0), COUNT(DISTINCT window_ms)
+             FROM worker_enrollment_refusals WHERE window_ms < ?1 AND suppressed > 0 AND summarized = 0",
+        )?
+        .query_row([window], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    if unsummarized > 0 {
+        let detail = format!("{unsummarized} more refused over {windows} earlier hour(s)");
+        audit(
+            tx,
+            Event::WorkerEnrollmentRefused,
+            None,
+            None,
+            false,
+            Some(&detail),
+        )?;
+        tx.prepare_cached(
+            "UPDATE worker_enrollment_refusals SET summarized = 1
+             WHERE window_ms < ?1 AND suppressed > 0 AND summarized = 0",
+        )?
+        .execute([window])?;
+    }
+    tx.prepare_cached("DELETE FROM worker_enrollment_refusals WHERE window_ms < ?1")?
+        .execute([window - REFUSAL_KEEP_MS])?;
+
+    let own: Option<i64> = tx
+        .prepare_cached(
+            "SELECT recorded FROM worker_enrollment_refusals WHERE window_ms = ?1 AND peer = ?2",
+        )?
+        .query_row(params![window, peer], |r| r.get(0))
+        .optional()?;
+    let (peer, own) = match own {
+        Some(own) => (peer, own),
+        None => {
+            let tracked: i64 = tx
+                .prepare_cached(
+                    "SELECT COUNT(*) FROM worker_enrollment_refusals WHERE window_ms = ?1",
+                )?
+                .query_row([window], |r| r.get(0))?;
+            if tracked < REFUSAL_PEERS_PER_WINDOW {
+                (peer, 0)
+            } else {
+                let shared: Option<i64> = tx
+                    .prepare_cached(
+                        "SELECT recorded FROM worker_enrollment_refusals
+                         WHERE window_ms = ?1 AND peer = ?2",
+                    )?
+                    .query_row(params![window, UNATTRIBUTED], |r| r.get(0))
+                    .optional()?;
+                (UNATTRIBUTED, shared.unwrap_or(0))
+            }
+        }
+    };
+    let total: i64 = tx
+        .prepare_cached(
+            "SELECT COALESCE(SUM(recorded), 0) FROM worker_enrollment_refusals WHERE window_ms = ?1",
+        )?
+        .query_row([window], |r| r.get(0))?;
+    let written = own < REFUSAL_ROWS_PER_PEER && total < REFUSAL_ROWS_PER_WINDOW;
+    tx.prepare_cached(
+        "INSERT INTO worker_enrollment_refusals(window_ms, peer, recorded, suppressed)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(window_ms, peer) DO UPDATE SET
+             recorded = recorded + excluded.recorded, suppressed = suppressed + excluded.suppressed",
+    )?
+    .execute(params![window, peer, i64::from(written), i64::from(!written)])?;
+    if written {
+        audit(tx, Event::WorkerEnrollmentRefused, None, None, false, None)?;
+    }
+    Ok(())
+}
+
+/// Refusals over the kept windows: `(with an audit row, counted only)`.
+pub fn refusal_counts(conn: &Connection) -> Result<(i64, i64)> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(SUM(recorded), 0), COALESCE(SUM(suppressed), 0)
+         FROM worker_enrollment_refusals",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
 }
 
 // Negotiation runs on every hello; dropping below the profile protocol clears the placement facts (labels, images, disk) that an old worker cannot report, so stale ones never match.

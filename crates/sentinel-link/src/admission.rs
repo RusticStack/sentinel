@@ -7,8 +7,37 @@ use std::{
 
 pub const PENDING_PER_SOURCE: usize = 8;
 pub const PENDING_PER_KNOWN_SOURCE: usize = 64;
-const KNOWN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const KNOWN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const KNOWN_MAX: usize = 4096;
+/// A known source is written to the store when first seen and then at most this often.
+const KNOWN_PERSIST_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// Whether an address says nothing about who is behind it: a local process or, under Tailcat, any tunnelled peer.
+pub fn is_loopback(ip: IpAddr) -> bool {
+    ip.is_loopback()
+        || matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()))
+}
+
+/// The key the store keeps a known source under.
+pub fn source_bytes(ip: IpAddr) -> [u8; 16] {
+    match source_key(ip) {
+        IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+        IpAddr::V6(v6) => v6.octets(),
+    }
+}
+
+/// Who a refused enrollment is charged to in the store: a hash of the source key, so the audit log holds no address.
+/// Behind a Tailcat helper every peer shares one source, so there this is a per-tunnel cap, not a per-node one.
+pub fn peer_key(ip: IpAddr) -> [u8; 16] {
+    let hash = blake3::hash(&source_bytes(ip));
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hash.as_bytes()[..16]);
+    key
+}
+
+fn source_from_bytes(bytes: [u8; 16]) -> IpAddr {
+    source_key(IpAddr::V6(Ipv6Addr::from(bytes)))
+}
 
 /// IPv6 is counted per /64: the unit an attacker controls, so rotating low bits buys nothing.
 pub fn source_key(ip: IpAddr) -> IpAddr {
@@ -25,6 +54,10 @@ pub fn source_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+fn stranger_ceiling(max_pending: usize) -> usize {
+    max_pending - max_pending / 4
+}
+
 #[derive(Default)]
 pub struct Pending {
     book: Mutex<Book>,
@@ -34,22 +67,31 @@ pub struct Pending {
 struct Book {
     total: usize,
     by_source: HashMap<IpAddr, usize>,
-    known: HashMap<IpAddr, Instant>,
+    known: HashMap<IpAddr, Known>,
+}
+
+#[derive(Clone, Copy)]
+struct Known {
+    seen: Instant,
+    persisted: Option<Instant>,
 }
 
 impl Pending {
+    /// A loopback source gets the whole pool: the address cannot tell tunnelled peers apart, so the
+    /// reserve is closed to strangers later, at the hello, by `stranger_room`.
     pub fn enter(&self, ip: IpAddr, max_pending: usize, now: Instant) -> bool {
-        let loopback = ip.is_loopback();
+        let loopback = is_loopback(ip);
         let key = source_key(ip);
         let mut book = self.book.lock().unwrap_or_else(|p| p.into_inner());
-        let known = book
-            .known
-            .get(&key)
-            .is_some_and(|at| now.saturating_duration_since(*at) < KNOWN_TTL);
+        let known = loopback
+            || book
+                .known
+                .get(&key)
+                .is_some_and(|k| now.saturating_duration_since(k.seen) < KNOWN_TTL);
         let ceiling = if known {
             max_pending
         } else {
-            max_pending - max_pending / 4
+            stranger_ceiling(max_pending)
         };
         if book.total >= ceiling {
             return false;
@@ -81,17 +123,78 @@ impl Pending {
         }
     }
 
-    pub fn vouch(&self, ip: IpAddr, now: Instant) {
+    /// Whether a connection that has completed its handshake as an unknown identity may go on: the
+    /// reserve is for authenticated workers, so a stranger needs room in the unreserved part. The
+    /// connection being asked about holds one slot itself.
+    pub fn stranger_room(&self, max_pending: usize) -> bool {
+        self.book.lock().unwrap_or_else(|p| p.into_inner()).total <= stranger_ceiling(max_pending)
+    }
+
+    /// Record that `ip` authenticated a worker. Returns the key to persist when the store should hear
+    /// of it (first sight, or not written for an hour). Loopback is never recorded.
+    pub fn vouch(&self, ip: IpAddr, now: Instant) -> Option<[u8; 16]> {
+        if is_loopback(ip) {
+            return None;
+        }
         let key = source_key(ip);
         let mut book = self.book.lock().unwrap_or_else(|p| p.into_inner());
         if book.known.len() >= KNOWN_MAX && !book.known.contains_key(&key) {
             book.known
-                .retain(|_, at| now.saturating_duration_since(*at) < KNOWN_TTL);
+                .retain(|_, k| now.saturating_duration_since(k.seen) < KNOWN_TTL);
             if book.known.len() >= KNOWN_MAX {
-                return;
+                return None;
             }
         }
-        book.known.insert(key, now);
+        let stale = book.known.get(&key).is_none_or(|k| {
+            k.persisted
+                .is_none_or(|at| now.saturating_duration_since(at) >= KNOWN_PERSIST_EVERY)
+        });
+        let persisted = if stale {
+            Some(now)
+        } else {
+            book.known.get(&key).and_then(|k| k.persisted)
+        };
+        book.known.insert(
+            key,
+            Known {
+                seen: now,
+                persisted,
+            },
+        );
+        stale.then(|| source_bytes(key))
+    }
+
+    /// Load sources stored by an earlier run: each `(key, age)` is how long ago it was last seen.
+    pub fn restore(&self, sources: impl IntoIterator<Item = ([u8; 16], Duration)>, now: Instant) {
+        let mut book = self.book.lock().unwrap_or_else(|p| p.into_inner());
+        for (bytes, age) in sources {
+            if book.known.len() >= KNOWN_MAX {
+                break;
+            }
+            let ip = source_from_bytes(bytes);
+            if age >= KNOWN_TTL || is_loopback(ip) {
+                continue;
+            }
+            let Some(seen) = now.checked_sub(age) else {
+                continue;
+            };
+            book.known.insert(
+                ip,
+                Known {
+                    seen,
+                    persisted: Some(seen),
+                },
+            );
+        }
+    }
+
+    /// Sources currently vouched for (expired ones included until the next prune).
+    pub fn known(&self) -> usize {
+        self.book
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .known
+            .len()
     }
 
     #[cfg(test)]
@@ -272,6 +375,134 @@ mod tests {
         assert!(!pending.enter(ip(100), 256, now), "a stranger is shed");
         assert!(pending.enter(ip(200), 256, now), "a known worker enters");
         assert_eq!(pending.len(), 193);
+    }
+
+    /// Fill the unreserved part of the pool with strangers, one share each; returns how many slots are held.
+    fn fill_unreserved(pending: &Pending, now: Instant) -> usize {
+        let mut taken = 0;
+        'fill: for host in 1..=60u8 {
+            for _ in 0..PENDING_PER_SOURCE {
+                if !pending.enter(ip(host), 256, now) {
+                    break 'fill;
+                }
+                taken += 1;
+            }
+        }
+        taken
+    }
+
+    #[test]
+    fn a_restart_restores_known_sources_so_the_reserve_still_admits_them() {
+        use sentinel_store::{Durability, Store, known_sources};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
+        let ttl = KNOWN_TTL.as_millis() as i64;
+        let start = Instant::now();
+
+        let before = Pending::default();
+        let key = before.vouch(ip(200), start).expect("first sight is stored");
+        assert!(
+            before
+                .vouch(ip(200), start + Duration::from_secs(600))
+                .is_none(),
+            "a source seen again within the hour is not rewritten"
+        );
+        assert!(
+            before
+                .vouch(
+                    ip(200),
+                    start + KNOWN_PERSIST_EVERY + Duration::from_secs(1)
+                )
+                .is_some(),
+            "and is refreshed once the hour is past"
+        );
+        let seen_ms = 5_000_000;
+        store
+            .writer()
+            .write(move |tx| known_sources::record(tx, key, seen_ms, ttl))
+            .unwrap();
+
+        // The controller restarts three hours later and reads the set back.
+        let wall = seen_ms + 3 * 60 * 60 * 1000;
+        let stored = store.read(|c| known_sources::load(c, wall, ttl)).unwrap();
+        let after = Pending::default();
+        let now = Instant::now();
+        after.restore(
+            stored
+                .into_iter()
+                .map(|(source, at)| (source, Duration::from_millis((wall - at) as u64))),
+            now,
+        );
+        assert_eq!(after.known(), 1);
+        assert_eq!(fill_unreserved(&after, now), 192);
+        assert!(!after.enter(ip(100), 256, now), "a stranger is still shed");
+        assert!(
+            after.enter(ip(200), 256, now),
+            "the restored worker enters the reserve"
+        );
+
+        let forgetful = Pending::default();
+        assert_eq!(fill_unreserved(&forgetful, now), 192);
+        assert!(
+            !forgetful.enter(ip(200), 256, now),
+            "without the stored set the same worker is shed"
+        );
+    }
+
+    #[test]
+    fn restoring_skips_what_is_past_the_day_and_never_stores_loopback() {
+        let pending = Pending::default();
+        let now = Instant::now() + KNOWN_TTL * 2;
+        let fresh = source_bytes(ip(7));
+        let old = source_bytes(ip(8));
+        let local = source_bytes(IpAddr::from([127, 0, 0, 1]));
+        pending.restore(
+            [
+                (fresh, Duration::from_secs(3600)),
+                (old, KNOWN_TTL + Duration::from_secs(1)),
+                (local, Duration::from_secs(1)),
+            ],
+            now,
+        );
+        assert_eq!(pending.known(), 1);
+        assert!(pending.vouch(IpAddr::from([127, 0, 0, 1]), now).is_none());
+        assert!(pending.vouch("::1".parse().unwrap(), now).is_none());
+        assert!(
+            pending
+                .vouch("::ffff:127.0.0.1".parse().unwrap(), now)
+                .is_none()
+        );
+        assert_eq!(pending.known(), 1);
+    }
+
+    #[test]
+    fn peers_behind_a_loopback_tunnel_are_told_apart_by_identity_not_address() {
+        let pending = Pending::default();
+        let now = Instant::now();
+        let tunnel = IpAddr::from([127, 0, 0, 1]);
+        // A worker through the tunnel does not make the tunnel "known": nothing is stored for it, and
+        // loopback needs no vouch to use the whole pool.
+        assert!(pending.vouch(tunnel, now).is_none());
+        for _ in 0..PENDING_PER_SOURCE * 32 {
+            assert!(pending.enter(tunnel, 256, now));
+        }
+        // The pool is full of tunnelled handshakes; an identity that turns out to be unknown is shed at
+        // the hello, while one the store knows is never asked.
+        assert_eq!(pending.len(), 256);
+        assert!(!pending.stranger_room(256));
+        for _ in 0..64 {
+            pending.leave(tunnel);
+        }
+        assert!(
+            pending.stranger_room(256),
+            "at the stranger ceiling it still has room"
+        );
+        pending.leave(tunnel);
+        assert!(pending.stranger_room(256));
+        // The same pool seen from a direct address keeps the reserve closed to strangers.
+        let direct = Pending::default();
+        assert_eq!(fill_unreserved(&direct, now), 192);
+        assert!(!direct.enter(ip(100), 256, now));
     }
 
     #[test]

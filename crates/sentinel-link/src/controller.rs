@@ -547,6 +547,21 @@ impl Inner {
             .map_err(|_| Error::Internal("store write"))
     }
 
+    /// A worker authenticated from `ip`: remember the source, and tell the store when it has not heard of it lately.
+    fn vouch(&self, ip: IpAddr) {
+        let Some(source) = self.pending.vouch(ip, Instant::now()) else {
+            return;
+        };
+        let _ = self.write_store(move |tx| {
+            sentinel_store::known_sources::record(
+                tx,
+                source,
+                UnixMillis::now().0,
+                admission::KNOWN_TTL.as_millis() as i64,
+            )
+        });
+    }
+
     fn register(&self, worker: WorkerId, peer: Arc<Peer>) {
         let old = self
             .fleet
@@ -605,11 +620,11 @@ impl Inner {
         self.pending.leave(addr.ip());
         let mut session = match outcome {
             Ok(Accepted::Control(session)) => {
-                self.pending.vouch(addr.ip(), Instant::now());
+                self.vouch(addr.ip());
                 session
             }
             Ok(Accepted::Bulk(bulk)) => {
-                self.pending.vouch(addr.ip(), Instant::now());
+                self.vouch(addr.ip());
                 self.leave(arrival.as_ref());
                 self.serve_bulk(bulk);
                 return;
@@ -1695,17 +1710,19 @@ impl Admission for Inner {
             Err(sentinel_store::Error::NotFound) => {}
             Err(_) => return Err(Rejection::Unavailable),
         }
+        // Behind a Tailcat helper every peer is loopback, so the address cannot say who is asking; the
+        // identity can, and an unknown one does not get the reserved part of the pool.
+        if source.is_some_and(admission::is_loopback)
+            && !self
+                .pending
+                .stranger_room(self.max_pending.load(Ordering::Relaxed))
+        {
+            self.stats.shed.fetch_add(1, Ordering::Relaxed);
+            return Err(Rejection::Unavailable);
+        }
         let Some(secret) = enrollment else {
             return Err(Rejection::NotEnrolled);
         };
-        if let Some(source) = source
-            && !self.enrollments.allow(source, Instant::now())
-        {
-            self.stats
-                .enrollment_limited
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(Rejection::Unavailable);
-        }
         let (secret, fingerprint, name) = (
             Secret::parse(&{
                 let mut t = String::new();
@@ -1716,12 +1733,28 @@ impl Admission for Inner {
             *fingerprint,
             name.to_owned(),
         );
+        // A secret that would redeem is never charged to the guessing budget, so a peer that burns the
+        // budget (or the audit allowance) cannot keep the real machine from enrolling.
+        let redeemable = self
+            .store
+            .read(|c| workers::redeemable(c, &secret, UnixMillis::now()))
+            .map_err(|_| Rejection::Unavailable)?;
+        if !redeemable
+            && let Some(source) = source
+            && !self.enrollments.allow(source, Instant::now())
+        {
+            self.stats
+                .enrollment_limited
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(Rejection::Unavailable);
+        }
+        let peer = source.map_or(workers::UNATTRIBUTED, admission::peer_key);
         let immediate_capacity = (!deferred).then_some(capacity);
         let enrolled_software = workers::software_label(&hello.software);
         self.store
             .writer()
             .write(move |tx| {
-                let Some(enrolled) = workers::redeem(
+                let Some(enrolled) = workers::redeem_from(
                     tx,
                     &secret,
                     workers::Presentation {
@@ -1731,6 +1764,7 @@ impl Admission for Inner {
                         negotiated,
                     },
                     UnixMillis::now(),
+                    peer,
                 )?
                 else {
                     return Ok(None);
@@ -2672,6 +2706,24 @@ impl Controller {
             .map_err(|_| Error::Internal("startup reconciliation"))?;
         let listener = TcpListener::bind(listen)?;
         let addr = listener.local_addr()?;
+        let pending = admission::Pending::default();
+        let wall = UnixMillis::now().0;
+        // A failed read leaves every source a stranger until it connects, as before a restart was survivable.
+        if let Ok(known) = store.read(|c| {
+            sentinel_store::known_sources::load(c, wall, admission::KNOWN_TTL.as_millis() as i64)
+        }) {
+            pending.restore(
+                known.into_iter().map(|(source, seen_ms)| {
+                    (
+                        source,
+                        Duration::from_millis(
+                            u64::try_from(wall.saturating_sub(seen_ms)).unwrap_or(0),
+                        ),
+                    )
+                }),
+                Instant::now(),
+            );
+        }
         let inner = Arc::new(Inner {
             me: std::sync::OnceLock::new(),
             source_destinations: Mutex::new(Arc::new(Vec::new())),
@@ -2694,7 +2746,7 @@ impl Controller {
             stop: AtomicBool::new(false),
             sessions: AtomicUsize::new(0),
             session_cap: admission::session_cap(MAX_SESSIONS),
-            pending: admission::Pending::default(),
+            pending,
             enrollments: admission::Enrollments::new(Instant::now()),
             arrivals: Mutex::new(Vec::new()),
             arrived: AtomicU64::new(0),
@@ -2748,6 +2800,11 @@ impl Controller {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Network sources remembered as having authenticated a worker (restored from the store at start).
+    pub fn known_sources(&self) -> usize {
+        self.inner.pending.known()
     }
 
     pub fn fingerprint(&self) -> Digest {
