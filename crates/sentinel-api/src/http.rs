@@ -984,16 +984,27 @@ pub(crate) struct Conns {
     sockets: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
     permits: Arc<Pool>,
     poll: Duration,
+    /// A second handle on the listening socket, kept to wake the acceptor: it outlives the acceptor's own, so the
+    /// descriptor cannot be reused by anything else while shutdown signals it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    waker: Option<TcpListener>,
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     wake: SocketAddr,
     acceptor: Option<JoinHandle<()>>,
 }
+
+/// How long a platform without a listener-shutdown wake may spend reaching the acceptor with a loopback connect.
+#[cfg(not(target_os = "linux"))]
+const WAKE_BY_CONNECT: Duration = Duration::from_secs(2);
 
 impl Conns {
     pub(crate) fn close(mut self) {
         self.shutdown();
     }
 
-    fn shutdown(&mut self) {
+    /// Stop accepting, cut every open connection, join the acceptor and wait for the handlers to finish. Returns
+    /// whether the acceptor was joined.
+    fn shutdown(&mut self) -> bool {
         self.stop.store(true, Ordering::Release);
         for socket in self
             .sockets
@@ -1003,33 +1014,54 @@ impl Conns {
         {
             let _ = socket.shutdown(Shutdown::Both);
         }
+        let mut joined = true;
         if let Some(acceptor) = self.acceptor.take() {
-            let target = match self.wake.ip() {
-                IpAddr::V4(ip) if ip.is_unspecified() => {
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, self.wake.port()))
-                }
-                IpAddr::V6(ip) if ip.is_unspecified() => {
-                    SocketAddr::from((Ipv6Addr::LOCALHOST, self.wake.port()))
-                }
-                _ => self.wake,
-            };
-            for _ in 0..50 {
-                if acceptor.is_finished() {
-                    break;
-                }
-                let _ = TcpStream::connect_timeout(&target, Duration::from_millis(100));
-                for _ in 0..20 {
-                    if acceptor.is_finished() {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
-            if acceptor.is_finished() {
+            self.wake_acceptor(&acceptor);
+            joined = acceptor.is_finished();
+            if joined {
                 let _ = acceptor.join();
             }
         }
         self.permits.wait_full(self.poll);
+        joined
+    }
+
+    /// Linux: `shutdown(2)` on a listening socket fails a blocked `accept` at once and every later one, so the acceptor
+    /// always reaches its stop check; every other wait it has is bounded by `poll`, and the join below cannot hang.
+    #[cfg(target_os = "linux")]
+    fn wake_acceptor(&self, acceptor: &JoinHandle<()>) {
+        use std::os::fd::AsRawFd;
+        if let Some(listener) = &self.waker {
+            // SAFETY: the descriptor is owned by `listener`, open for this whole call.
+            unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) };
+        }
+        // A failed signal (the acceptor was already past it) still ends within `poll`; wait for that, not for a retry.
+        let deadline = Instant::now() + self.poll * 4 + Duration::from_millis(250);
+        while !acceptor.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Elsewhere there is no wake for a blocked `accept` but a connection, so make one and look again, bounded.
+    #[cfg(not(target_os = "linux"))]
+    fn wake_acceptor(&self, acceptor: &JoinHandle<()>) {
+        let target = match self.wake.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => {
+                SocketAddr::from((Ipv4Addr::LOCALHOST, self.wake.port()))
+            }
+            IpAddr::V6(ip) if ip.is_unspecified() => {
+                SocketAddr::from((Ipv6Addr::LOCALHOST, self.wake.port()))
+            }
+            _ => self.wake,
+        };
+        let deadline = Instant::now() + WAKE_BY_CONNECT;
+        while !acceptor.is_finished() && Instant::now() < deadline {
+            let _ = TcpStream::connect_timeout(&target, Duration::from_millis(100));
+            let settle = Instant::now() + Duration::from_millis(20);
+            while !acceptor.is_finished() && Instant::now() < settle {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
 
@@ -1048,6 +1080,7 @@ pub(crate) fn listen(
 ) -> io::Result<Conns> {
     listener.set_nonblocking(false)?;
     let wake = listener.local_addr()?;
+    let waker = listener.try_clone().ok();
     let (sockets, permits) = (
         Arc::new(Mutex::new(BTreeMap::new())),
         Pool::new(tune.connections),
@@ -1079,6 +1112,7 @@ pub(crate) fn listen(
         sockets,
         permits,
         poll: tune.poll,
+        waker,
         wake,
         acceptor: Some(acceptor),
     })
@@ -1188,6 +1222,7 @@ fn accept_loop(
                         .remove(&id);
                 }
             }
+            Err(_) if stop.load(Ordering::Acquire) => break,
             Err(_) => thread::sleep(tune.poll),
         }
     }
@@ -1617,6 +1652,71 @@ mod tests {
         conns.close();
         assert!(
             started.elapsed() < Duration::from_secs(5),
+            "shutdown took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn shutdown_joins_the_acceptor_well_under_a_second_with_the_default_poll() {
+        for busy in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut conns = listen(
+                listener,
+                Arc::new(|request: &mut Request| {
+                    let _ = request.respond(Response::from_string("ok"));
+                }),
+                Arc::new(AtomicBool::new(false)),
+                Tune {
+                    poll: Duration::from_millis(100),
+                    ..tune()
+                },
+                Vec::new(),
+            )
+            .unwrap();
+            // Busy: fill the pool so the acceptor waits for a permit instead of sitting in accept.
+            let held: Vec<TcpStream> = if busy {
+                (0..2).map(|_| TcpStream::connect(addr).unwrap()).collect()
+            } else {
+                Vec::new()
+            };
+            thread::sleep(Duration::from_millis(150));
+            let started = Instant::now();
+            assert!(conns.shutdown(), "the acceptor must be joined");
+            assert!(
+                started.elapsed() < Duration::from_millis(800),
+                "shutdown took {:?}",
+                started.elapsed()
+            );
+            drop(held);
+            assert!(conns.acceptor.is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_does_not_need_the_wake_address_to_be_reachable() {
+        // A listener on an address a self-connect cannot reach used to cost the whole retry budget (about 6 s) and leave
+        // the acceptor detached; the listener-level wake does not use the address at all.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut conns = listen(
+            listener,
+            Arc::new(|_: &mut Request| {}),
+            Arc::new(AtomicBool::new(false)),
+            Tune {
+                poll: Duration::from_millis(100),
+                ..tune()
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        conns.wake = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 9));
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        assert!(conns.shutdown());
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
             "shutdown took {:?}",
             started.elapsed()
         );

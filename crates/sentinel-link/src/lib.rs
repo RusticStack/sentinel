@@ -22,6 +22,8 @@ pub enum Error {
     Closed,
     Rejected(session::Rejection),
     Internal(&'static str),
+    /// The process's open-files limit cannot hold the minimum number of worker sessions.
+    Descriptors(String),
     Io(std::io::Error),
 }
 
@@ -35,6 +37,7 @@ impl fmt::Display for Error {
             Self::Closed => f.write_str("peer closed the session"),
             Self::Rejected(why) => write!(f, "rejected: {why:?}"),
             Self::Internal(what) => write!(f, "controller: {what}"),
+            Self::Descriptors(what) => write!(f, "descriptor limit: {what}"),
             Self::Io(e) => write!(f, "io: {e}"),
         }
     }

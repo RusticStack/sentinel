@@ -46,6 +46,15 @@ const _: () = assert!(
 );
 pub const MAX_SESSIONS: usize = 1024;
 pub const MAX_PENDING: usize = 256;
+const _: () = assert!(
+    MAX_SESSIONS <= sentinel_store::logs::MAX_OPEN_WRITERS,
+    "admission::LOG_FDS_PER_SESSION assumes one open log writer per session at most"
+);
+
+/// The open descriptors the controller needs to hold `sessions` worker sessions; the service raises its soft limit to this.
+pub const fn descriptors_needed(sessions: usize) -> usize {
+    admission::descriptors_for(sessions)
+}
 const SPEC_RESOLVERS: usize = 8;
 const MAX_SPEC_QUEUE: usize = 4096;
 const SPEC_ACK_WAIT: Duration = Duration::from_millis(dispatch::OFFER_ACK_MS as u64);
@@ -2695,6 +2704,16 @@ impl Controller {
         identity: Identity,
         listen: SocketAddr,
     ) -> Result<Controller> {
+        let session_cap = admission::session_cap(MAX_SESSIONS)?;
+        if session_cap < MAX_SESSIONS {
+            tracing::warn!(
+                event = "session_cap_lowered",
+                cap = session_cap,
+                wanted = MAX_SESSIONS,
+                needed = descriptors_needed(MAX_SESSIONS),
+                "the open-files limit holds fewer worker sessions than the controller allows"
+            );
+        }
         let fingerprint = identity.fingerprint();
         let config = tls::server_config(identity)?;
         let reconcile_logs = Arc::clone(&logs);
@@ -2745,7 +2764,7 @@ impl Controller {
             wake: (Mutex::new(false), Condvar::new()),
             stop: AtomicBool::new(false),
             sessions: AtomicUsize::new(0),
-            session_cap: admission::session_cap(MAX_SESSIONS),
+            session_cap,
             pending,
             enrollments: admission::Enrollments::new(Instant::now()),
             arrivals: Mutex::new(Vec::new()),
@@ -2792,6 +2811,11 @@ impl Controller {
 
     pub fn reconciled(&self) -> dispatch::Reconciled {
         self.reconciled
+    }
+
+    /// The most worker sessions admitted at once, as the open-files limit allows.
+    pub fn session_cap(&self) -> usize {
+        self.inner.session_cap
     }
 
     pub fn handle(&self) -> Handle {

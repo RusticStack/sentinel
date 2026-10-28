@@ -1514,6 +1514,47 @@ fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
     backlog
 }
 
+/// Raise the soft open-files limit once, at startup, to what the controller's session limit needs and never past the
+/// hard limit, which stays as it was. The link library only reads the limit and sizes its session cap from it, so the
+/// process-wide change is made here, by the one owner of the process, and a limit that stays too low is reported by
+/// `Controller::start` with the numbers instead of being papered over.
+#[cfg(all(feature = "server", target_os = "linux"))]
+fn raise_descriptor_soft_limit() {
+    let need =
+        sentinel_link::controller::descriptors_needed(sentinel_link::controller::MAX_SESSIONS)
+            as libc::rlim_t;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable `rlimit` for the whole call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 || limit.rlim_cur >= need {
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: need.min(limit.rlim_max),
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: `raised` is a valid `rlimit` that only moves the soft limit up to the hard one; failure leaves the
+    // limit as it was.
+    let raised_ok = raised.rlim_cur > limit.rlim_cur
+        && unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0;
+    tracing::info!(
+        event = "descriptor_limit",
+        soft = if raised_ok {
+            raised.rlim_cur
+        } else {
+            limit.rlim_cur
+        },
+        hard = limit.rlim_max,
+        needed = need,
+        raised = raised_ok,
+    );
+}
+
+#[cfg(all(feature = "server", not(target_os = "linux")))]
+fn raise_descriptor_soft_limit() {}
+
 #[cfg(feature = "server")]
 fn start_server(
     config: &Config,
@@ -1620,6 +1661,7 @@ fn start_server(
     if swept > 0 {
         tracing::info!(event = "uploads_swept", expired = swept);
     }
+    raise_descriptor_soft_limit();
     let controller = sentinel_link::controller::Controller::start(
         Arc::clone(&store),
         Arc::clone(&logs),

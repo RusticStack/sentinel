@@ -284,44 +284,72 @@ impl Enrollments {
     }
 }
 
-#[cfg(unix)]
-const FDS_PER_SESSION: usize = 2;
-#[cfg(unix)]
-const FD_HEADROOM: usize = 256;
+/// Descriptors one session holds on the link: its socket and the clone its writer half uses.
+pub const FDS_PER_SESSION: usize = 2;
+/// Descriptors a session's attempt adds: an open log writer is two files. The store keeps at most
+/// `MAX_OPEN_WRITERS` writers open and `MAX_SESSIONS` does not exceed it, so one pair per session bounds them all.
+pub const LOG_FDS_PER_SESSION: usize = 2;
+/// Descriptors outside any session: standard streams, the link and API listeners, the API's connection pool
+/// (`CONNECTIONS` is 64), the database files, the object and log directories, the Tailcat helper's pipes and a margin
+/// for outbound sockets (GitHub, mail, S3, checks).
+pub const FD_BASE: usize = 192;
+/// Fewer sessions than this is not a controller worth starting: refuse with a message instead.
+pub const MIN_SESSIONS: usize = 16;
 
-/// Raise the soft descriptor limit first: a common 1024 soft limit would stop the controller at about 380 sessions with EMFILE.
+/// The descriptors the controller needs to hold `sessions` sessions at once: the fixed base plus a share per session,
+/// so the headroom follows the configured session limit instead of a constant.
+pub const fn descriptors_for(sessions: usize) -> usize {
+    FD_BASE + sessions * (FDS_PER_SESSION + LOG_FDS_PER_SESSION)
+}
+
+/// How many sessions a soft descriptor limit holds, at most `wanted`; the pure half of [`session_cap`].
+pub fn sessions_within(soft: u64, wanted: usize) -> usize {
+    let usable = usize::try_from(soft)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(FD_BASE)
+        / (FDS_PER_SESSION + LOG_FDS_PER_SESSION);
+    usable.min(wanted)
+}
+
+/// The session cap for the process's current soft descriptor limit. This only reads the limit: raising it is the
+/// service's one startup decision (it owns the process), never a side effect of constructing a controller. A limit that
+/// cannot hold [`MIN_SESSIONS`] fails with the numbers an operator needs instead of shedding every worker at runtime.
+pub fn session_cap(wanted: usize) -> crate::Result<usize> {
+    let Some(soft) = soft_limit() else {
+        return Ok(wanted);
+    };
+    let cap = sessions_within(soft, wanted);
+    if cap < MIN_SESSIONS.min(wanted) {
+        return Err(crate::Error::Descriptors(format!(
+            "the soft open-files limit is {soft}, which holds {cap} worker sessions; at least {} are required              ({} for {wanted}). Raise it (systemd: LimitNOFILE=, shell: ulimit -n) and restart",
+            MIN_SESSIONS.min(wanted),
+            descriptors_for(wanted),
+        )));
+    }
+    Ok(cap)
+}
+
+/// The soft `RLIMIT_NOFILE`, `None` where it cannot be read or does not apply.
 #[cfg(unix)]
-pub fn session_cap(wanted: usize) -> usize {
+pub fn soft_limit() -> Option<u64> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
     // SAFETY: `limit` is a valid, writable `rlimit` for the whole call.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-        return wanted;
+        return None;
     }
-    let needed = (wanted * FDS_PER_SESSION + FD_HEADROOM) as libc::rlim_t;
-    if limit.rlim_cur < needed && limit.rlim_cur < limit.rlim_max {
-        let raised = libc::rlimit {
-            rlim_cur: needed.min(limit.rlim_max),
-            rlim_max: limit.rlim_max,
-        };
-        // SAFETY: `raised` is a valid `rlimit`; failure leaves the limit as
-        // it was, which the re-read below accounts for.
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
-            limit.rlim_cur = raised.rlim_cur;
-        }
-    }
-    let usable = usize::try_from(limit.rlim_cur)
-        .unwrap_or(usize::MAX)
-        .saturating_sub(FD_HEADROOM)
-        / FDS_PER_SESSION;
-    usable.clamp(1, wanted)
+    Some(if limit.rlim_cur == libc::RLIM_INFINITY {
+        u64::MAX
+    } else {
+        limit.rlim_cur as u64
+    })
 }
 
 #[cfg(not(unix))]
-pub fn session_cap(wanted: usize) -> usize {
-    wanted
+pub fn soft_limit() -> Option<u64> {
+    None
 }
 
 pub fn accept_backoff(failures: u32) -> Duration {
@@ -342,6 +370,24 @@ mod tests {
 
     fn ip(last: u8) -> IpAddr {
         IpAddr::from([203, 0, 113, last])
+    }
+
+    #[test]
+    fn the_descriptor_headroom_follows_the_session_limit() {
+        assert_eq!(descriptors_for(0), FD_BASE);
+        assert_eq!(descriptors_for(1024), FD_BASE + 1024 * 4);
+        for wanted in [16, 100, 1024] {
+            assert_eq!(
+                sessions_within(descriptors_for(wanted) as u64, 4096),
+                wanted
+            );
+            assert_eq!(
+                sessions_within(descriptors_for(wanted) as u64 - 1, 4096),
+                wanted - 1
+            );
+        }
+        assert_eq!(sessions_within(u64::MAX, 1024), 1024);
+        assert_eq!(sessions_within(100, 1024), 0, "below the base nothing fits");
     }
 
     #[test]
