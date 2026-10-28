@@ -163,11 +163,6 @@ fn host_policy_is_shown_changed_and_validated_through_the_admin_commands() {
     let c = controller(&controller_dir);
 
     // A worker exists once an enrollment is redeemed; do that through the store.
-    let store = sentinel_store::Store::open(
-        controller_dir.join("metadata.sqlite"),
-        sentinel_store::Durability::Normal,
-    )
-    .unwrap();
     let secret = c
         .ok(
             &[
@@ -188,6 +183,11 @@ fn host_policy_is_shown_changed_and_validated_through_the_admin_commands() {
     let secret = sentinel_auth::token::parse(text(&secret).trim())
         .expect("an enrollment secret on standard output");
     let worker = sentinel_core::WorkerId::new();
+    let store = sentinel_store::Store::open(
+        controller_dir.join("metadata.sqlite"),
+        sentinel_store::Durability::Normal,
+    )
+    .unwrap();
     store
         .writer()
         .write(move |tx| {
