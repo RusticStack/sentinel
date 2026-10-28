@@ -16,7 +16,7 @@ stamp_init() {
   STAMP_BODY="${obj#\{}"; STAMP_BODY="${STAMP_BODY%\}}"
 }
 
-stamp_sed() { local s="$STAMP_BODY"; s="${s//\/\\}"; s="${s//&/\&}"; s="${s//\//\/}"; printf '%s' "$s"; }
+stamp_sed() { printf '%s' "$STAMP_BODY" | sed -e 's/[\\/&]/\\&/g'; }
 
 shuffle_init() { SHUF_SEED="${SHUF_SEED:-$(date +%s%N)-$$}"; }
 

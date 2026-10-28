@@ -207,7 +207,7 @@ class StampHelpers(unittest.TestCase):
                     f.write(text)
 
             def dirty():
-                r = run_bash('"$1"', self.STAMP, SENTINEL_SRC=d)
+                r = run_bash('bash "$1"', self.STAMP, SENTINEL_SRC=d)
                 self.assertEqual(r.returncode, 0, r.stderr)
                 return json.loads(r.stdout)["build"]["dirty"]
 
