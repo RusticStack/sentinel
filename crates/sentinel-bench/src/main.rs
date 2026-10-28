@@ -1013,12 +1013,26 @@ fn source_revision() -> Result<Source, String> {
              needs `git config --global --add safe.directory {dir}`)"
         )
     })?;
-    let git_dirty =
-        command_line(&["git", "-C", dir, "status", "--porcelain"]).map(|s| !s.is_empty());
+    let git_dirty = git_dirty(dir);
     Ok(Source {
         git_commit: Some(git_commit),
         git_dirty,
     })
+}
+
+/// Whether tracked files differ from `HEAD`. Untracked files are ignored on purpose: a scratch
+/// file next to the sources does not change what the runner was built from. `None` when git
+/// cannot say.
+fn git_dirty(dir: &str) -> Option<bool> {
+    command_line(&[
+        "git",
+        "-C",
+        dir,
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+    ])
+    .map(|s| !s.is_empty())
 }
 
 pub(crate) fn command_line(argv: &[&str]) -> Option<String> {
@@ -1101,6 +1115,41 @@ fn mount_fs(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dirty_means_tracked_changes_not_untracked_files() {
+        let dir = std::env::temp_dir().join(format!("sentinel-bench-dirty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        let git = |args: &[&str]| {
+            let mut argv = vec![
+                "git",
+                "-C",
+                d,
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ];
+            argv.extend_from_slice(args);
+            command_line(&argv).is_some()
+        };
+        if !git(&["init", "-q"]) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // no git on this host; nothing to assert
+        }
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        assert!(git(&["add", "a.txt"]) && git(&["commit", "-q", "-m", "init"]));
+        assert_eq!(git_dirty(d), Some(false));
+        std::fs::write(dir.join("scratch.txt"), "untracked").unwrap();
+        assert_eq!(git_dirty(d), Some(false), "an untracked file is not dirty");
+        std::fs::write(dir.join("a.txt"), "two").unwrap();
+        assert_eq!(git_dirty(d), Some(true), "a tracked edit is dirty");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_stall_delta_needs_both_ends_and_a_forward_counter() {

@@ -41,6 +41,12 @@ In an interleaved group (below) the runtimes alternate, so one window around the
 
 **Script records.** Records written by the benchmark scripts rather than the runner (`b02-sentinel.sh`, `b03-latency.py`) carry a `build {commit, dirty, binary_sha256}` and a `host` block too, taken from the checkout named by `SENTINEL_SRC` / `--source`; a script refuses to write without it. Older B02, B03 and B04 records carry neither and are not back-filled.
 
+**Naming the build.** A caller passes the build once: `bench/run-stamped.sh CHECKOUT BINARY b03 ROOT OUT` exports `SENTINEL_SRC` (the checkout the binary was built from) and `SENTINEL_BIN` (hashed into the record) and starts the harness; `bench/stamp.sh` run directly prints the stamp object. `sentinel-bench` stamps itself from the checkout it was built in. `b02-sentinel.sh`, `b03-latency.py`, `p14-pilot.sh`, `b09-harness.py`, `k02-cache-clone.sh` and `f07-storage.sh` refuse to write without it; the other scripts do not stamp a build yet (tracked in RW10).
+
+**Dirty means tracked changes.** `git_dirty` / `dirty` is true only when a tracked file differs from `HEAD` (`git status --porcelain --untracked-files=no`); untracked files are ignored, because a scratch file does not change what was built. A new source file that is not yet added therefore does not make a build dirty: `git add` it, or commit, before measuring.
+
+**Shuffle seed.** `k02-cache-clone.sh` and `f07-storage.sh` shuffle the clone-mode order per round from a recorded seed: every record carries `shuffle_seed`, and a round's order is `shuf` seeded with `<shuffle_seed>/<fs>/<round>` (`bench/stamp.sh` `shuffle_lines`), so the order can be reproduced. `SHUF_SEED=…` replays a run; otherwise a fresh seed is made and printed. `position` still records the realised order. Records taken before this carry no seed.
+
 ## F05 baseline: direct rootless runtime
 
 Record: [`bench/f05-noop-baseline.jsonl`](../bench/f05-noop-baseline.jsonl), captured 2026-09-13 21:34 UTC+1.

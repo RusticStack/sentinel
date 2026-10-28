@@ -229,7 +229,7 @@ def stamp(source, binary):
     commit = git("rev-parse", "HEAD")
     if commit is None:
         raise SystemExit(f"cannot read the source commit of {source}; no record is written without it")
-    status = git("status", "--porcelain")
+    status = git("status", "--porcelain", "--untracked-files=no")
     with open(binary, "rb") as f:
         digest = hashlib.sha256(f.read()).hexdigest()
     mem = field("/proc/meminfo", "MemTotal")
