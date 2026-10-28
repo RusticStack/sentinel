@@ -1,6 +1,7 @@
 // Search parameters are validated with a Standard Schema (https://standardschema.dev) on every route that has them:
 // a field that does not match its pattern and bound is dropped, so a malformed parameter falls back to the default
-// and never reaches the API. The validator is chosen by the U09 bundle measurement (docs/web-ui.md, "Stack choice").
+// and never reaches the API. Written by hand: U09 measured the libraries at 1.5 KB (valibot) to 79 KB (Effect Schema) of
+// gzipped browser JavaScript for this, against 0.3 KB here (bench/u09-web-spikes.jsonl).
 export type FieldRule = readonly [pattern: RegExp, maxLength: number];
 
 export interface SearchSchema<T> {
