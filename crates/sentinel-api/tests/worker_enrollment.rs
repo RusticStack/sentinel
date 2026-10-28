@@ -836,8 +836,7 @@ fn an_administrator_reads_and_replaces_a_workers_host_policy_and_requests_its_un
     );
 }
 
-/// A tenant administrator who holds every permission scope: the live platform check, not the scope,
-/// is what has to refuse it.
+/// A tenant administrator with the strongest token the store allows it.
 fn tenant_administrator(d: &Deployment) -> String {
     let (root, tenant, user) = (d.root, TenantId::new(), UserId::new());
     let now = UnixMillis::now();
@@ -863,8 +862,10 @@ fn tenant_administrator(d: &Deployment) -> String {
             )
         })
         .unwrap();
-    let granted =
-        tokens::provision(&d.store, Grant::new(user, "tenant", Permissions::ALL), now).unwrap();
+    // The store refuses a platform-scoped token for anyone but a super administrator, so the
+    // strongest credential a tenant administrator can hold is every other permission.
+    let strongest = Permissions::REPOSITORY.union(Permissions::TENANT_ADMIN);
+    let granted = tokens::provision(&d.store, Grant::new(user, "tenant", strongest), now).unwrap();
     format!("Bearer {}", sentinel_auth::token::format(&granted.secret))
 }
 
