@@ -1,10 +1,10 @@
 use std::time::{Duration, Instant};
 
-use sentinel_core::{AttemptId, JobId, RunId};
+use sentinel_core::{AttemptId, JobId, RunId, UnixMillis};
 use sentinel_protocol::logs::{Frame, Record, Stream};
 use sentinel_store::{
     Error,
-    logs::{Appended, LogStore, read_dir},
+    logs::{Appended, LineSeek, LogStore, TimeSeek, read_dir, seek_line, seek_time},
 };
 
 fn run() -> RunId {
@@ -668,5 +668,331 @@ fn a_resent_deferred_frame_is_a_duplicate_and_a_reopen_keeps_what_was_written() 
         )
         .unwrap(),
         Appended::Stored { through: 3 }
+    );
+}
+
+/// The index entry layout: a 6-byte header, then 41-byte entries (`kind`, `seq`, `seg`, `step`, `line`, `bytes`, `ms`).
+fn index_entries(dir: &std::path::Path) -> Vec<Vec<u8>> {
+    std::fs::read(dir.join("index")).unwrap()[6..]
+        .chunks_exact(41)
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+fn write_index(dir: &std::path::Path, entries: &[Vec<u8>]) {
+    let mut bytes = std::fs::read(dir.join("index")).unwrap()[..6].to_vec();
+    entries.iter().for_each(|e| bytes.extend_from_slice(e));
+    std::fs::write(dir.join("index"), bytes).unwrap();
+}
+
+fn found(after: u64) -> impl Fn(LineSeek) -> bool {
+    move |seek| seek.found && seek.after == after
+}
+
+#[test]
+fn a_line_is_found_in_the_frame_holding_its_first_byte() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let attempt = AttemptId::new();
+    // "abc\ndef\ng\nh": a line split across frames, newlines ending a frame, a last line without one.
+    for (seq, text) in [(1, "ab"), (2, "c\nde"), (3, "f\n"), (4, "g\n"), (5, "h")] {
+        logs.append(run(), job(), attempt, &frame(seq, text))
+            .unwrap();
+    }
+    let at = |line| logs.seek_line(run(), job(), attempt, line).unwrap();
+    assert!(found(0)(at(1)));
+    assert!(found(1)(at(2)));
+    // Line 3 ("g") starts after the newline that closes frame 3, so in frame 4.
+    assert!(found(3)(at(3)));
+    assert!(found(4)(at(4)));
+    let beyond = at(5);
+    assert!(!beyond.found);
+    assert_eq!(beyond.after, 5);
+    assert!(beyond.exact);
+    assert!(!beyond.complete);
+    assert!(matches!(
+        logs.seek_line(run(), job(), attempt, 0),
+        Err(Error::InvalidInput(_))
+    ));
+    logs.finish(run(), job(), attempt, 5, &[]).unwrap();
+    let ended = at(5);
+    assert!(!ended.found && ended.complete);
+    // The cursor is the ordinary sequence cursor: reading after it starts at the line.
+    let dir = logs.attempt_dir(run(), job(), attempt);
+    let tail = read_dir(&dir, at(3).after, 10, None).unwrap();
+    assert_eq!(tail.frames.first().map(|f| f.seq), Some(4));
+    assert!(matches!(
+        seek_line(&temp.path().join("absent"), 1),
+        Err(Error::NotFound)
+    ));
+}
+
+/// Every line of a log whose frames cut lines anywhere resolves to the frame a byte-by-byte model names, across
+/// the index's checkpoints (a line checkpoint every 64 frames and at each step change).
+#[test]
+fn every_line_resolves_like_a_byte_model_across_checkpoints() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let attempt = AttemptId::new();
+    let mut frames = Vec::new();
+    for seq in 1..=300u64 {
+        let text = format!(
+            "{}{}",
+            "p".repeat(1 + (seq % 7) as usize),
+            "\n".repeat((seq % 4) as usize)
+        );
+        logs.append(
+            run(),
+            job(),
+            attempt,
+            &at_step(seq, (seq / 100) as u32, &text),
+        )
+        .unwrap();
+        frames.push((seq, text));
+    }
+    let stream: String = frames.iter().map(|(_, t)| t.as_str()).collect();
+    let newlines = stream.matches('\n').count() as u64;
+    let dir = logs.attempt_dir(run(), job(), attempt);
+    for line in 1..=newlines + 2 {
+        let start = if line == 1 {
+            Some(0)
+        } else {
+            stream
+                .match_indices('\n')
+                .nth((line - 2) as usize)
+                .map(|(i, _)| i + 1)
+                .filter(|pos| *pos < stream.len())
+        };
+        let expected = start.map(|pos| {
+            let mut end = 0;
+            frames
+                .iter()
+                .find(|(_, t)| {
+                    end += t.len();
+                    pos < end
+                })
+                .map(|(seq, _)| *seq)
+                .unwrap()
+        });
+        let seek = seek_line(&dir, line).unwrap();
+        match expected {
+            Some(seq) => {
+                assert!(seek.found, "line {line}");
+                let after = if line == 1 { 0 } else { seq - 1 };
+                assert_eq!(seek.after, after, "line {line}");
+            }
+            None => {
+                assert!(!seek.found, "line {line}");
+                assert_eq!(seek.after, 300, "line {line}");
+            }
+        }
+        assert!(seek.exact);
+    }
+}
+
+/// A lookup decodes from the nearest line checkpoint: a corrupted early segment is never opened for a line past it.
+#[test]
+fn a_line_lookup_seeks_by_checkpoint_and_skips_sealed_segments_before_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let attempt = AttemptId::new();
+    let text = format!("{}\n", "x".repeat(32 * 1024 - 19));
+    for seq in 1..=140u64 {
+        logs.append(run(), job(), attempt, &frame(seq, &text))
+            .unwrap();
+    }
+    let dir = logs.attempt_dir(run(), job(), attempt);
+    wait_compressed(&dir, 0);
+    std::fs::write(dir.join("seg-000000.z"), b"not a segment").unwrap();
+    let seek = logs.seek_line(run(), job(), attempt, 135).unwrap();
+    assert!(found(134)(seek) && seek.exact);
+    assert!(
+        logs.seek_line(run(), job(), attempt, 100).is_err(),
+        "a line inside the damaged segment needs it"
+    );
+}
+
+#[test]
+fn a_missing_stale_or_reordered_index_falls_back_to_the_segments() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let attempt = AttemptId::new();
+    for seq in 1..=200u64 {
+        logs.append(run(), job(), attempt, &frame(seq, "x\n"))
+            .unwrap();
+    }
+    let dir = logs.attempt_dir(run(), job(), attempt);
+    let honest = index_entries(&dir);
+    assert!(honest.len() >= 3);
+    let check = || {
+        for line in [1, 2, 64, 65, 66, 150, 200] {
+            let seek = seek_line(&dir, line).unwrap();
+            assert!(found(line - 1)(seek) && seek.exact, "line {line}");
+        }
+        let seek = seek_line(&dir, 201).unwrap();
+        assert!(!seek.found && seek.after == 200);
+    };
+    check();
+    // Checkpoints that name frames the segment does not hold.
+    let stale: Vec<Vec<u8>> = honest
+        .iter()
+        .map(|e| {
+            let mut e = e.clone();
+            e[1..9].copy_from_slice(&777_777u64.to_le_bytes());
+            e
+        })
+        .collect();
+    write_index(&dir, &stale);
+    check();
+    // Line counts that decrease cannot be searched.
+    let reordered: Vec<Vec<u8>> = honest.iter().rev().cloned().collect();
+    write_index(&dir, &reordered);
+    check();
+    std::fs::remove_file(dir.join("index")).unwrap();
+    check();
+}
+
+#[test]
+fn gaps_and_late_fills_make_a_line_inexact_but_not_the_lines_before_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let attempt = AttemptId::new();
+    // Stored order 1, 2, 5, then the fill 3: seq 4 stays a hole.
+    for (seq, text) in [(1, "a\n"), (2, "b\n"), (5, "e\n"), (3, "c\n")] {
+        logs.append(run(), job(), attempt, &frame(seq, text))
+            .unwrap();
+    }
+    let at = |line| logs.seek_line(run(), job(), attempt, line).unwrap();
+    assert!(found(0)(at(1)) && at(1).exact);
+    assert!(found(1)(at(2)) && at(2).exact);
+    // Line 3 is "e" (seq 5) behind the hole; line 4 is the late fill, found by stored order.
+    assert!(found(4)(at(3)) && !at(3).exact);
+    assert!(found(2)(at(4)) && !at(4).exact);
+    logs.finish(run(), job(), attempt, 6, &[]).unwrap();
+    // The finished log keeps the same answer, now complete, and a line past the end is not found.
+    assert!(found(1)(at(2)) && at(2).exact && at(2).complete);
+    assert!(!at(3).exact);
+    let beyond = at(9);
+    assert!(!beyond.found && beyond.complete);
+    assert!(
+        !beyond.exact,
+        "the hole at 4 lies behind the last stored frame"
+    );
+}
+
+#[test]
+fn torn_and_zeroed_tails_end_the_lookup_at_the_last_whole_frame() {
+    use std::io::Write;
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let tails: [&[u8]; 2] = [&[1, 2, 0, 0], &[0; 4096]];
+    let mut dirs = Vec::new();
+    for _ in tails {
+        let attempt = AttemptId::new();
+        for (seq, text) in [
+            (
+                1, "a
+",
+            ),
+            (
+                2, "b
+",
+            ),
+            (
+                3, "c
+",
+            ),
+        ] {
+            logs.append(run(), job(), attempt, &frame(seq, text))
+                .unwrap();
+        }
+        dirs.push(logs.attempt_dir(run(), job(), attempt));
+    }
+    drop(logs);
+    for (dir, tail) in dirs.iter().zip(tails) {
+        let mut segment = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("seg-000000"))
+            .unwrap();
+        segment.write_all(tail).unwrap();
+        let mut index = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("index"))
+            .unwrap();
+        index.write_all(&[9, 9, 9]).unwrap();
+        assert!(found(2)(seek_line(dir, 3).unwrap()));
+        let beyond = seek_line(dir, 5).unwrap();
+        assert!(!beyond.found && beyond.after == 3);
+        let time = seek_time(dir, UnixMillis(i64::MAX)).unwrap();
+        assert!(time.until.is_none() && time.after == 1);
+    }
+}
+
+#[test]
+fn a_wall_time_lookup_brackets_the_frames_between_two_checkpoints() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let attempt = AttemptId::new();
+    let nap = || std::thread::sleep(Duration::from_millis(40));
+    // Every frame opens a checkpoint: the first of a segment, then each step change.
+    logs.append(run(), job(), attempt, &at_step(1, 0, "a\n"))
+        .unwrap();
+    nap();
+    let early = UnixMillis::now();
+    nap();
+    logs.append(run(), job(), attempt, &at_step(2, 1, "b\n"))
+        .unwrap();
+    nap();
+    let middle = UnixMillis::now();
+    nap();
+    logs.append(run(), job(), attempt, &at_step(3, 2, "c\n"))
+        .unwrap();
+    nap();
+    let late = UnixMillis::now();
+    let at = |ms| logs.seek_time(run(), job(), attempt, ms).unwrap();
+    let seek = |after, until| TimeSeek {
+        after,
+        until,
+        complete: false,
+    };
+    assert_eq!(at(UnixMillis(0)), seek(0, Some(1)));
+    assert_eq!(at(early), seek(1, Some(2)));
+    assert_eq!(at(middle), seek(2, Some(3)));
+    assert_eq!(at(late), seek(3, None));
+    logs.finish(run(), job(), attempt, 3, &[]).unwrap();
+    assert!(at(late).complete);
+    assert!(matches!(
+        seek_time(&temp.path().join("absent"), early),
+        Err(Error::NotFound)
+    ));
+}
+
+/// A seal record is a wall-time checkpoint too, and a segment before the instant need not be read to place it.
+#[test]
+fn a_wall_time_lookup_uses_seal_records_across_segments() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let attempt = AttemptId::new();
+    let text = "x".repeat(32 * 1024 - 18);
+    for seq in 1..=100u64 {
+        logs.append(run(), job(), attempt, &frame(seq, &text))
+            .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(60));
+    let mark = UnixMillis::now();
+    std::thread::sleep(Duration::from_millis(60));
+    for seq in 101..=140u64 {
+        logs.append(run(), job(), attempt, &frame(seq, &text))
+            .unwrap();
+    }
+    let dir = logs.attempt_dir(run(), job(), attempt);
+    wait_compressed(&dir, 0);
+    std::fs::write(dir.join("seg-000000.z"), b"not a segment").unwrap();
+    let seek = logs.seek_time(run(), job(), attempt, mark).unwrap();
+    assert!(seek.after <= 100, "{seek:?}");
+    assert!(
+        seek.until
+            .is_some_and(|until| until > 100 && until >= seek.after),
+        "{seek:?}"
     );
 }
