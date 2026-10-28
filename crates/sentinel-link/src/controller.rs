@@ -260,6 +260,8 @@ struct Peer {
     disk_bytes: AtomicI64,
     load_ns: AtomicI64,
     cache_bytes: AtomicI64,
+    /// The machine identity from the worker's profile; identities sharing one are one physical host.
+    host: Mutex<Option<[u8; 16]>>,
     seen_recorded_ms: AtomicI64,
     fingerprint: Digest,
     protocol: u16,
@@ -426,33 +428,74 @@ struct Inner {
 
 const WARN_INTERVAL_MS: i64 = 60_000;
 
-fn rank(size: Ranked, held_millis: i64) -> (i64, i64, i64, i64, i64) {
-    let cpu = size.cpu_millis.max(1);
-    (
-        held_millis.saturating_mul(1_000) / cpu,
-        size.load_ns / cpu,
-        size.cache_bytes.saturating_neg(),
-        size.cpu_millis,
-        size.memory_bytes,
-    )
-}
+/// The busy CPU time `Availability::load_ns` counts is measured over this window (the worker samples
+/// `/proc/stat` for 100 ms), so `load_ns / LOAD_WINDOW_NS` is the number of busy cores.
+const LOAD_WINDOW_NS: i64 = 100_000_000;
+/// Placement ranks workers by when a reference job would finish on them: [`REFERENCE_JOB_MILLIS`] of CPU
+/// and [`REFERENCE_WORK_NS`] of service with no contention. Only the ratios matter; neither is a claim
+/// about real jobs.
+const REFERENCE_JOB_MILLIS: i64 = 1_000;
+const REFERENCE_WORK_NS: i128 = 10_000_000_000;
+/// A host already fully used runs the reference job `1 / INTERFERENCE_DIVISOR` slower even before the
+/// job oversubscribes it (memory bandwidth, disk and cache are shared).
+const INTERFERENCE_DIVISOR: i64 = 16;
+/// A warm cache of `CACHE_CREDIT_FULL_BYTES` or more is worth at most a tenth of the reference service
+/// time. The credit is bounded on purpose: locality can offset a mild slowdown but never an
+/// oversubscribed host, so cache affinity cannot strand work behind a saturated machine.
+const CACHE_CREDIT_FULL_BYTES: i64 = 4 << 30;
+const CACHE_CREDIT_MAX_NS: i128 = REFERENCE_WORK_NS / 10;
 
+/// What the controller knows of one worker when it ranks it. `committed_millis` is the **host's**
+/// commitment, not the identity's: the larger of what every connected identity on the host has been
+/// offered and what the host measured busy (the two overlap, running attempts are inside the
+/// measurement, so they are not added).
 #[derive(Clone, Copy, Debug)]
-struct Ranked {
+struct Standing {
     cpu_millis: i64,
     memory_bytes: i64,
-    load_ns: i64,
+    committed_millis: i64,
     cache_bytes: i64,
 }
 
+fn busy_millis(load_ns: i64) -> i64 {
+    load_ns.max(0) / (LOAD_WINDOW_NS / 1_000)
+}
+
+/// Nanoseconds until the reference job would finish if it started on this worker now, less the bounded
+/// credit for a warm cache. Processor sharing: once the host's commitment plus the job exceeds its
+/// cores, every core's share falls with it. Lower is better.
+fn expected_finish_ns(standing: Standing) -> i64 {
+    let cpu = i128::from(standing.cpu_millis.max(1));
+    let committed = i128::from(standing.committed_millis.max(0));
+    let after = committed + i128::from(REFERENCE_JOB_MILLIS);
+    let slowdown_ppm = (after * 1_000_000 / cpu).max(1_000_000);
+    let busy_ppm = committed.min(cpu) * 1_000_000 / cpu;
+    let factor_ppm = slowdown_ppm + busy_ppm / i128::from(INTERFERENCE_DIVISOR);
+    let service = REFERENCE_WORK_NS * factor_ppm / 1_000_000;
+    let warm = i128::from(standing.cache_bytes.clamp(0, CACHE_CREDIT_FULL_BYTES));
+    let credit = CACHE_CREDIT_MAX_NS * warm / i128::from(CACHE_CREDIT_FULL_BYTES);
+    i64::try_from(service - credit).unwrap_or(i64::MAX)
+}
+
+/// Earliest expected finish first; among equals the smaller worker (best fit keeps the larger one free
+/// for work only it can hold), then the smaller memory.
+fn rank(standing: Standing) -> (i64, i64, i64) {
+    (
+        expected_finish_ns(standing),
+        standing.cpu_millis,
+        standing.memory_bytes,
+    )
+}
+
+/// The machine key placement groups identities by: the reported host, or the worker itself when it
+/// reported none (each such identity is accounted alone, as the store does).
+fn host_key(worker: WorkerId, host: Option<[u8; 16]>) -> [u8; 16] {
+    host.unwrap_or(*worker.as_bytes())
+}
+
 impl Peer {
-    fn ranked(&self) -> Ranked {
-        Ranked {
-            cpu_millis: self.cpu_millis,
-            memory_bytes: self.memory_bytes,
-            load_ns: self.load_ns.load(Ordering::Relaxed),
-            cache_bytes: self.cache_bytes.load(Ordering::Relaxed),
-        }
+    fn host(&self) -> Option<[u8; 16]> {
+        *self.host.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -643,6 +686,7 @@ impl Inner {
             disk_bytes: AtomicI64::new(0),
             load_ns: AtomicI64::new(0),
             cache_bytes: AtomicI64::new(0),
+            host: Mutex::new(None),
             seen_recorded_ms: AtomicI64::new(0),
             fingerprint: session.fingerprint,
             protocol: session.admitted.negotiated.protocol.0,
@@ -788,6 +832,7 @@ impl Inner {
             }
             Err(e) => self.failed(false, "lapse", &e),
         }
+        self.uninstall_pass();
         self.revocation_pass(now);
         self.placement_pass();
         self.prefetch_pass();
@@ -876,6 +921,22 @@ impl Inner {
         }
     }
 
+    /// An uninstall is a drain plus a revoke once the accepted work has settled; the revocation pass
+    /// that follows closes the session and fences whatever is left.
+    fn uninstall_pass(&self) {
+        match self.store.read(workers::uninstalling) {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(e) =
+                    self.write_store(|tx| workers::settle_uninstalls(tx, UnixMillis::now()))
+                {
+                    self.failed(false, "uninstall", &e);
+                }
+            }
+            Err(e) => self.failed(false, "uninstall", &e),
+        }
+    }
+
     fn revocation_pass(&self, now: UnixMillis) {
         let stamp = match self.store.read(dispatch::revocations) {
             Ok(stamp) => stamp,
@@ -926,14 +987,18 @@ impl Inner {
         if !self.objects.admission().is_none_or(|a| a.is_open()) {
             return;
         }
-        let mut peers: Vec<(WorkerId, Arc<Peer>)> = self
+        let fleet: Vec<(WorkerId, Arc<Peer>)> = self
             .fleet
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
             .map(|(w, p)| (*w, Arc::clone(p)))
             .collect();
-        peers.retain(|(_, p)| session::is_free(&p.sender));
+        let mut peers: Vec<(WorkerId, Arc<Peer>)> = fleet
+            .iter()
+            .filter(|(_, p)| session::is_free(&p.sender))
+            .map(|(w, p)| (*w, Arc::clone(p)))
+            .collect();
         if peers.is_empty() {
             return;
         }
@@ -948,21 +1013,52 @@ impl Inner {
         };
         peers.sort_unstable_by_key(|(worker, p)| (p.cpu_millis, p.memory_bytes, *worker));
         let reach = Reach::of(peers.iter().map(|(_, p)| (p.pool, p.size())));
+        // Identities are grouped by machine over the whole fleet, busy sessions included: their
+        // attempts and their measurements are still the host's.
+        let hosts: HashMap<WorkerId, [u8; 16]> = fleet
+            .iter()
+            .map(|(w, p)| (*w, host_key(*w, p.host())))
+            .collect();
+        let host_of: Vec<[u8; 16]> = peers.iter().map(|(w, _)| hosts[w]).collect();
         let mut active: Vec<usize> = (0..peers.len()).collect();
         for _ in 0..dispatch::MAX_HELD_ATTEMPTS {
             if active.is_empty() {
                 return;
             }
+            let mut host_held: HashMap<[u8; 16], i64> = HashMap::new();
+            let mut host_busy: HashMap<[u8; 16], i64> = HashMap::new();
+            for (worker, peer) in &fleet {
+                let host = hosts[worker];
+                *host_held.entry(host).or_default() += held.get(worker).copied().unwrap_or(0);
+                let busy = host_busy.entry(host).or_default();
+                *busy = (*busy).max(busy_millis(peer.load_ns.load(Ordering::Relaxed)));
+            }
             active.sort_by_cached_key(|&i| {
                 let (worker, peer) = &peers[i];
+                let host = host_of[i];
                 (
-                    rank(peer.ranked(), held.get(worker).copied().unwrap_or(0)),
+                    rank(Standing {
+                        cpu_millis: peer.cpu_millis,
+                        memory_bytes: peer.memory_bytes,
+                        committed_millis: host_held
+                            .get(&host)
+                            .copied()
+                            .unwrap_or(0)
+                            .max(host_busy.get(&host).copied().unwrap_or(0)),
+                        cache_bytes: peer.cache_bytes.load(Ordering::Relaxed),
+                    }),
                     *worker,
                 )
             });
+            // One identity per machine per round: the next placement on a host is ranked again
+            // against what this round just committed, so several identities on one host cannot
+            // each take a job from the same stale view and oversubscribe it.
+            let mut taken: HashSet<[u8; 16]> = HashSet::new();
             let round: Vec<(usize, WorkerId, PoolId, Option<dispatch::Capacity>)> = active
                 .iter()
-                .map(|&i| {
+                .copied()
+                .filter(|&i| taken.insert(host_of[i]))
+                .map(|i| {
                     (
                         i,
                         peers[i].0,
@@ -1900,6 +1996,7 @@ impl SessionHandler for Inner {
             peer.load_ns.store(load_ns.unwrap_or(0), Ordering::Relaxed);
             peer.cache_bytes
                 .store(cache_bytes.unwrap_or(0), Ordering::Relaxed);
+            *peer.host.lock().unwrap_or_else(|p| p.into_inner()) = host_id;
         }
         self.write(move |tx| {
             dispatch::report_capacity(tx, worker, capacity)?;
@@ -3379,24 +3476,63 @@ mod tests {
         assert_eq!(ids(&q).len(), MAX_DEFERRED);
     }
 
-    fn ranked(cpu_millis: i64, load_ns: i64, cache_bytes: i64) -> Ranked {
-        Ranked {
+    fn standing(cpu_millis: i64, committed_millis: i64, cache_bytes: i64) -> Standing {
+        Standing {
             cpu_millis,
             memory_bytes: 8 << 30,
-            load_ns,
+            committed_millis,
             cache_bytes,
         }
     }
 
     #[test]
-    fn the_sweep_ranks_workers_by_commitment_then_load_then_cache_then_size() {
-        let idle = ranked(8_000, 0, 0);
-        assert!(rank(idle, 0) < rank(ranked(8_000, 0, 1 << 40), 2_000));
-        assert!(rank(ranked(16_000, 0, 0), 2_000) < rank(ranked(8_000, 0, 0), 2_000));
-        assert!(rank(ranked(8_000, 10_000_000, 0), 0) < rank(ranked(8_000, 400_000_000, 0), 0));
-        assert!(rank(ranked(16_000, 200_000_000, 0), 0) < rank(ranked(8_000, 200_000_000, 0), 0));
-        assert!(rank(ranked(8_000, 0, 1 << 30), 0) < rank(idle, 0));
-        assert!(rank(ranked(2_500, 0, 0), 0) < rank(idle, 0));
+    fn measured_load_is_busy_cores_over_the_sampling_window() {
+        assert_eq!(busy_millis(0), 0);
+        assert_eq!(busy_millis(100_000_000), 1_000);
+        assert_eq!(busy_millis(800_000_000), 8_000);
+        assert_eq!(busy_millis(-5), 0);
+    }
+
+    #[test]
+    fn the_sweep_ranks_workers_by_expected_finish() {
+        let idle = standing(8_000, 0, 0);
+        // A host with spare cores is slowed only by sharing; the idle one finishes first.
+        assert!(rank(idle) < rank(standing(8_000, 4_000, 0)));
+        // The same absolute commitment hurts the smaller host more.
+        assert!(rank(standing(16_000, 8_000, 0)) < rank(standing(8_000, 8_000, 0)));
+        // At equal finish the smaller worker goes first, keeping the larger one free.
+        assert!(rank(standing(2_500, 0, 0)) < rank(idle));
+        let mut bigger_memory = idle;
+        bigger_memory.memory_bytes += 1;
+        assert!(rank(idle) < rank(bigger_memory));
+    }
+
+    #[test]
+    fn a_warm_cache_offsets_sharing_but_never_an_oversubscribed_host() {
+        let idle = standing(8_000, 0, 0);
+        // Warm and half busy still finishes before cold and idle...
+        assert!(rank(standing(8_000, 4_000, 4 << 30)) < rank(idle));
+        // ...and so does warm and full to the last core, since the job still gets a core of its own...
+        assert!(rank(standing(8_000, 7_000, 4 << 30)) < rank(idle));
+        // ...but once the job would oversubscribe the host, no amount of cache wins.
+        assert!(rank(idle) < rank(standing(8_000, 8_000, 1 << 50)));
+        assert!(rank(idle) < rank(standing(8_000, 20_000, 1 << 50)));
+        // The credit is bounded by the warm size and saturates.
+        assert!(rank(standing(8_000, 0, 1 << 30)) < rank(idle));
+        assert!(rank(standing(8_000, 0, 4 << 30)) < rank(standing(8_000, 0, 1 << 30)));
+        assert_eq!(
+            expected_finish_ns(standing(8_000, 0, 4 << 30)),
+            expected_finish_ns(standing(8_000, 0, i64::MAX))
+        );
+    }
+
+    #[test]
+    fn extreme_inputs_rank_without_overflow() {
+        let huge = standing(i64::MAX, i64::MAX, i64::MAX);
+        let tiny = standing(0, i64::MAX, i64::MIN);
+        assert!(expected_finish_ns(huge) > 0);
+        assert_eq!(expected_finish_ns(tiny), i64::MAX);
+        assert!(rank(huge) < rank(tiny));
     }
 
     #[test]

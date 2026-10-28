@@ -109,6 +109,8 @@ pub enum Event {
     TenantBackingChanged = 73,
     DomainAutoJoined = 74,
     MfaEnrollmentStarted = 75,
+    WorkerUninstallRequested = 90,
+    WorkerUninstalled = 91,
 }
 
 impl Event {
@@ -181,6 +183,8 @@ impl Event {
             Event::TenantBackingChanged => "tenant-backing-changed",
             Event::DomainAutoJoined => "domain-auto-joined",
             Event::MfaEnrollmentStarted => "mfa-enrollment-started",
+            Event::WorkerUninstallRequested => "worker-uninstall-requested",
+            Event::WorkerUninstalled => "worker-uninstalled",
         }
     }
 
@@ -253,6 +257,8 @@ impl Event {
             73 => Event::TenantBackingChanged,
             74 => Event::DomainAutoJoined,
             75 => Event::MfaEnrollmentStarted,
+            90 => Event::WorkerUninstallRequested,
+            91 => Event::WorkerUninstalled,
             _ => return None,
         })
     }

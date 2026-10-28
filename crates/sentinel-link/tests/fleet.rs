@@ -1019,3 +1019,219 @@ fn each_session_reports_the_helpers_latest_transport_measurement() {
             .shutdown(Duration::from_secs(5))
     );
 }
+
+/// A profile that also reports the measured load and warm cache the ranking reads.
+fn measured(host: u8, load_ns: u64, cache_bytes: u64) -> Profile {
+    let mut p = profile(host, 128 << 30);
+    p.availability.load_ns = load_ns;
+    p.availability.cache_bytes = cache_bytes;
+    p
+}
+
+fn start_fleet(
+    d: &Deployment,
+    profiles: Vec<Profile>,
+) -> (Vec<WorkerId>, Vec<Arc<Recorder>>, Vec<WorkerProcess>) {
+    let n = profiles.len();
+    let ids: Vec<WorkerId> = (0..n).map(|_| WorkerId::new()).collect();
+    let recorders: Vec<Arc<Recorder>> = (0..n).map(|_| Recorder::new()).collect();
+    let processes: Vec<WorkerProcess> = profiles
+        .into_iter()
+        .enumerate()
+        .map(|(i, profile)| {
+            WorkerProcess::start(
+                d,
+                Identity::generate(&format!("ranked-{i}")).unwrap(),
+                ids[i],
+                d.enrollment(),
+                STANDARD,
+                profile,
+                Arc::clone(&recorders[i]),
+            )
+        })
+        .collect();
+    for process in &processes {
+        process.wait_for("Connected", 1);
+    }
+    eventually("the fleet", || d.controller().connected().len() == n);
+    for worker in ids.iter().copied() {
+        eventually("the reported disk", || {
+            d.store
+                .read(move |c| dispatch::free_capacity(c, worker))
+                .unwrap()
+                .disk_bytes
+                >= 64 << 30
+        });
+    }
+    (ids, recorders, processes)
+}
+
+fn offered(recorders: &[Arc<Recorder>]) -> Vec<usize> {
+    recorders
+        .iter()
+        .map(|r| r.offers.lock().unwrap().len())
+        .collect()
+}
+
+fn finish(mut d: Deployment, processes: Vec<WorkerProcess>) {
+    for process in processes {
+        process.stop().unwrap();
+    }
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
+}
+
+/// Two worker identities on one machine each report the whole machine. A burst smaller than the
+/// number of identities must not give that one machine two jobs while another machine idles.
+#[test]
+fn identities_sharing_a_host_do_not_take_a_burst_together() {
+    let d = deployment();
+    let (_, recorders, processes) = start_fleet(
+        &d,
+        vec![
+            profile(40, 128 << 30),
+            profile(40, 128 << 30),
+            profile(41, 128 << 30),
+        ],
+    );
+    let burst = d.runs(vec![(d.tenant_a, d.repo_a, noise_of(2))]);
+    d.controller().wake();
+    eventually("the burst leased", || {
+        burst[0]
+            .iter()
+            .all(|job| d.state(d.tenant_a, *job) == JobState::Leased)
+    });
+    eventually("every offer delivered", || {
+        offered(&recorders).iter().sum::<usize>() >= 2
+    });
+    let per_identity = offered(&recorders);
+    assert_eq!(
+        per_identity[0] + per_identity[1],
+        1,
+        "the shared host holds one job: {per_identity:?}"
+    );
+    assert_eq!(per_identity[2], 1, "the other host takes the other");
+    finish(d, processes);
+}
+
+const FIVE_CORES_NS: u64 = 5 * 100_000_000;
+
+/// A warm cache outweighs a half-busy host (the job still has cores to itself) but not a host the
+/// job would oversubscribe: locality is bounded and cannot strand work behind a saturated machine.
+#[test]
+fn locality_offsets_moderate_load_but_not_a_saturated_host() {
+    for (warm_load_ns, warm_wins) in [(FIVE_CORES_NS / 2, true), (FIVE_CORES_NS, false)] {
+        let d = deployment();
+        let (_, recorders, processes) = start_fleet(
+            &d,
+            vec![measured(50, warm_load_ns, 4 << 30), measured(51, 0, 0)],
+        );
+        let burst = d.runs(vec![(d.tenant_a, d.repo_a, noise_of(1))]);
+        d.controller().wake();
+        eventually("the job leased", || {
+            d.state(d.tenant_a, burst[0][0]) == JobState::Leased
+        });
+        eventually("the offer delivered", || {
+            offered(&recorders).iter().sum::<usize>() >= 1
+        });
+        let got = offered(&recorders);
+        let expected = if warm_wins { vec![1, 0] } else { vec![0, 1] };
+        assert_eq!(got, expected, "warm host load {warm_load_ns} ns");
+        finish(d, processes);
+    }
+}
+
+/// Measured load that no attempt of ours explains still counts: a busy machine yields to an idle one.
+#[test]
+fn measured_throughput_steers_a_job_to_the_idle_worker() {
+    let d = deployment();
+    let (_, recorders, processes) = start_fleet(
+        &d,
+        vec![
+            measured(60, FIVE_CORES_NS, 0),
+            measured(61, 0, 0),
+            measured(62, FIVE_CORES_NS, 0),
+        ],
+    );
+    let burst = d.runs(vec![(d.tenant_a, d.repo_a, noise_of(1))]);
+    d.controller().wake();
+    eventually("the job leased", || {
+        d.state(d.tenant_a, burst[0][0]) == JobState::Leased
+    });
+    eventually("the offer delivered", || {
+        offered(&recorders).iter().sum::<usize>() >= 1
+    });
+    assert_eq!(offered(&recorders), vec![0, 1, 0]);
+    finish(d, processes);
+}
+
+/// An uninstall is not an eviction: the worker finishes what it accepted, takes nothing new, and is
+/// then revoked by the controller's own pass, which ends its session.
+#[test]
+fn an_uninstalled_worker_finishes_its_attempt_then_is_revoked() {
+    let mut d = deployment();
+    let id = WorkerId::new();
+    let recorder = Recorder::new();
+    let process = WorkerProcess::start(
+        &d,
+        Identity::generate("uninstall").unwrap(),
+        id,
+        d.enrollment(),
+        STANDARD,
+        profile(70, 128 << 30),
+        Arc::clone(&recorder),
+    );
+    process.wait_for("Connected", 1);
+    eventually("fleet", || d.controller().connected() == vec![id]);
+
+    let first = d.runs(vec![(d.tenant_a, d.repo_a, one_job())])[0][0];
+    d.controller().wake();
+    eventually("the first job leased", || {
+        d.state(d.tenant_a, first) == JobState::Leased
+    });
+    eventually("the first job acknowledged", || {
+        d.controller().stats().acknowledged.load(Ordering::SeqCst) == 1
+    });
+
+    d.store
+        .writer()
+        .write(move |tx| {
+            workers::request_uninstall(tx, Authority::HostLocal, id, UnixMillis::now())
+        })
+        .unwrap();
+    let second = d.runs(vec![(d.tenant_a, d.repo_a, one_job())])[0][0];
+    d.controller().wake();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        d.controller().connected(),
+        vec![id],
+        "revoked with work held"
+    );
+    assert_eq!(d.held(id).len(), 1);
+    assert_eq!(
+        recorder.offers.lock().unwrap().len(),
+        1,
+        "an uninstalling worker took a new offer"
+    );
+    assert_eq!(d.state(d.tenant_a, second), JobState::Queued);
+
+    pass(&d, &[(id, &recorder)], d.tenant_a, first);
+    d.controller().wake();
+    eventually("the uninstall settled", || {
+        d.store.read(move |c| workers::revoked(c, id)).unwrap()
+    });
+    eventually("the session ended", || {
+        d.controller().connected().is_empty()
+    });
+    let _ = process.stop();
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
+}

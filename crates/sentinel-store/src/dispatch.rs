@@ -68,6 +68,7 @@ impl LogState {
 }
 
 /// Zero disk means not reported only from workers older than protocol 7; from newer workers it is a real limit.
+/// `report_capacity` stores the reported size under the worker's approved ceilings (`workers::HostPolicy`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capacity {
     pub cpu_millis: i64,
@@ -81,7 +82,12 @@ pub fn report_capacity(tx: &Transaction<'_>, worker: WorkerId, capacity: Capacit
     }
     let changed = tx
         .prepare_cached(
-            "UPDATE workers SET cpu_millis = ?2, memory_bytes = ?3, disk_bytes = ?4
+            "UPDATE workers SET
+                    cpu_millis = MIN(?2, COALESCE(cpu_ceiling_millis, ?2)),
+                    memory_bytes = MIN(?3, COALESCE(memory_ceiling_bytes, ?3)),
+                    disk_bytes = CASE WHEN disk_ceiling_bytes IS NULL THEN ?4
+                                      WHEN ?4 = 0 THEN disk_ceiling_bytes
+                                      ELSE MIN(?4, disk_ceiling_bytes) END
              WHERE id = ?1 AND revoked_ms IS NULL",
         )?
         .execute(params![
