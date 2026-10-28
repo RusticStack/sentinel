@@ -11,6 +11,8 @@
 //! caches) come back the same way.
 
 use std::{
+    collections::HashSet,
+    ffi::OsStr,
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
@@ -20,17 +22,20 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Mutex,
-        atomic::{AtomicU32, Ordering},
+        Arc, Mutex, MutexGuard, TryLockError,
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use sentinel_core::{AttemptId, WorkerId};
 use sentinel_pipeline::run::StepCommand;
-use sentinel_protocol::agent::{self, Reply, Request};
+use sentinel_protocol::{
+    agent::{self, Reply, Request},
+    summary::GuestImageRecord,
+};
 
 use crate::{
     Error, Result,
@@ -49,6 +54,17 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const IMAGE_BUILD_TIMEOUT: Duration = Duration::from_secs(900);
 /// Memory the VMM process needs beyond the guest's RAM, in the scope's cap.
 const VMM_OVERHEAD: u64 = 256 << 20;
+/// How long a cancel waits for the guest agent to confirm a signal before it kills the VM instead.
+const CANCEL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a cancel waits to reach the agent at all.
+const CANCEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// A cached guest image is stamped on use only when its stamp is older than this, so the stamp stays within
+/// it of the last use while a hit costs no write; image GC keeps everything used within `images::IMAGE_KEEP`.
+const STAMP_AFTER: Duration = Duration::from_secs(60);
+/// Files in the image directory that no complete image owns are removed once this old: a build in progress
+/// writes at least every few minutes and ends within `IMAGE_BUILD_TIMEOUT`.
+const ORPHAN_AGE: Duration = Duration::from_secs(3600);
+const SYSTEMCTL: &str = "systemctl";
 
 /// The operator's `[microvm]` setup: Firecracker, the pinned guest kernel and the static agent binary.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,12 +100,24 @@ fn vm_dir(root: &Path, attempt: AttemptId) -> PathBuf {
     root.join(DIR).join("vms").join(attempt.to_string())
 }
 
-fn unit_name(attempt: AttemptId) -> String {
-    format!("sentinel-vm-{attempt}")
+/// Every VM scope of one worker data root shares this prefix, so reconciliation finds its own scopes and
+/// never another worker's on the same account.
+fn unit_prefix(root: &Path) -> String {
+    let tag = blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex();
+    format!("sentinel-vm-{}-", &tag[..8])
 }
 
-fn systemctl_user(args: &[&str]) -> io::Result<std::process::Output> {
-    Command::new("systemctl").arg("--user").args(args).output()
+fn unit_name(root: &Path, attempt: AttemptId) -> String {
+    format!("{}{attempt}", unit_prefix(root))
+}
+
+/// The name of the systemd scope an attempt's VM runs in.
+pub fn scope_name(root: &Path, attempt: AttemptId) -> String {
+    format!("{}.scope", unit_name(root, attempt))
+}
+
+fn systemctl_user(program: &OsStr, args: &[&str]) -> io::Result<std::process::Output> {
+    Command::new(program).arg("--user").args(args).output()
 }
 
 // ---------------------------------------------------------------- initramfs
@@ -161,48 +189,290 @@ fn cpio_entry(out: &mut Vec<u8>, ino: &mut u32, name: &str, mode: u32, data: &[u
 pub struct GuestImage {
     pub rootfs: PathBuf,
     pub env: Vec<(String, String)>,
+    /// What the attempt's summary records: the pinned digest this root file system carries.
+    pub record: GuestImageRecord,
 }
 
-/// The image's root file system as a read-only ext4 file, built once per (store, image) and reused.
-pub fn guest_image(root: &Path, image: &str, store: &Store) -> Result<GuestImage> {
-    let dir = root.join(DIR).join("images");
-    fs::create_dir_all(&dir)?;
-    let key = blake3::hash(format!("{store:?}\0{image}").as_bytes()).to_hex();
-    let rootfs = dir.join(format!("{}.ext4", &key[..32]));
-    let env_file = dir.join(format!("{}.env", &key[..32]));
-    if !(rootfs.exists() && env_file.exists()) {
-        build_image(image, store, &rootfs, &env_file)?;
+/// What `<key>.json` holds. It is written after the root file system is in place, so its presence marks a
+/// complete image, and its modification time is the image's last use for GC.
+#[derive(Debug, PartialEq, Eq)]
+struct ImageMeta {
+    digest: String,
+    image_id: String,
+    rootfs_bytes: u64,
+    env: Vec<(String, String)>,
+}
+
+const META_FORMAT: u64 = 1;
+
+impl ImageMeta {
+    fn to_json(&self) -> Vec<u8> {
+        let env: Vec<String> = self.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        serde_json::to_vec(&serde_json::json!({
+            "format": META_FORMAT,
+            "digest": self.digest,
+            "image_id": self.image_id,
+            "rootfs_bytes": self.rootfs_bytes,
+            "env": env,
+        }))
+        .expect("a JSON value serializes")
     }
-    let env = fs::read_to_string(&env_file)?
-        .lines()
+
+    fn from_json(bytes: &[u8]) -> Option<ImageMeta> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        if value.get("format")?.as_u64()? != META_FORMAT {
+            return None;
+        }
+        Some(ImageMeta {
+            digest: value.get("digest")?.as_str()?.to_owned(),
+            image_id: value.get("image_id")?.as_str()?.to_owned(),
+            rootfs_bytes: value.get("rootfs_bytes")?.as_u64()?,
+            env: value
+                .get("env")?
+                .as_array()?
+                .iter()
+                .filter_map(|line| {
+                    let (k, v) = line.as_str()?.split_once('=')?;
+                    Some((k.to_owned(), v.to_owned()))
+                })
+                .collect(),
+        })
+    }
+}
+
+fn images_dir(root: &Path) -> PathBuf {
+    root.join(DIR).join("images")
+}
+
+/// The name both of an image's files share, one per (store, image): a tenant's private store never shares a
+/// root file system with the shared one.
+fn image_key(store: &Store, image: &str) -> String {
+    blake3::hash(format!("{store:?}\0{image}").as_bytes()).to_hex()[..32].to_owned()
+}
+
+fn is_image_key(text: &str) -> bool {
+    text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The `sha256:` digest of a reference that is pinned by one.
+fn pinned_digest(image: &str) -> Result<&str> {
+    let digest = image.rsplit_once('@').map(|(_, digest)| digest);
+    match digest.and_then(|d| Some((d, d.strip_prefix("sha256:")?))) {
+        Some((digest, hex))
+            if hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+        {
+            Ok(digest)
+        }
+        _ => Err(Error::Preparation("image is not pinned by digest".into())),
+    }
+}
+
+/// The image's root file system as a read-only ext4 file, built once per (store, pinned digest) and reused.
+pub fn guest_image(root: &Path, image: &str, store: &Store) -> Result<GuestImage> {
+    guest_image_canceled(root, image, store, &AtomicBool::new(false))
+}
+
+/// As [`guest_image`]; a build under way ends when `cancel` is set.
+pub fn guest_image_canceled(
+    root: &Path,
+    image: &str,
+    store: &Store,
+    cancel: &AtomicBool,
+) -> Result<GuestImage> {
+    let digest = pinned_digest(image)?;
+    let dir = images_dir(root);
+    fs::create_dir_all(&dir)?;
+    let key = image_key(store, image);
+    let rootfs = dir.join(format!("{key}.ext4"));
+    let meta_path = dir.join(format!("{key}.json"));
+    if let Some(hit) = cached_image(&rootfs, &meta_path, digest) {
+        return Ok(hit);
+    }
+    // One build per image at a time: a burst of attempts on a new image waits for the first one's result.
+    let lock = build_lock(&key);
+    let built = (|| -> Result<GuestImage> {
+        let _held = acquire_build(&lock, cancel)?;
+        if let Some(hit) = cached_image(&rootfs, &meta_path, digest) {
+            return Ok(hit);
+        }
+        let started = Instant::now();
+        let meta = build_image(image, digest, store, &rootfs, &meta_path, cancel)?;
+        Ok(GuestImage {
+            rootfs: rootfs.clone(),
+            record: GuestImageRecord {
+                digest: meta.digest,
+                rootfs_bytes: meta.rootfs_bytes,
+                built: true,
+                build_ns: Some(started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX)),
+            },
+            env: meta.env,
+        })
+    })();
+    drop(lock);
+    release_build_lock(&key);
+    built
+}
+
+/// Waits for the key's build lock, until `cancel` is set or a build's time is up.
+fn acquire_build<'a>(lock: &'a Mutex<()>, cancel: &AtomicBool) -> Result<MutexGuard<'a, ()>> {
+    let deadline = Instant::now() + IMAGE_BUILD_TIMEOUT;
+    loop {
+        match lock.try_lock() {
+            Ok(held) => return Ok(held),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(Error::Preparation("guest image build canceled".into()));
+                }
+                if Instant::now() >= deadline {
+                    return Err(Error::Timeout("guest image build"));
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// A complete cached image for `digest`: its marker parses, names that digest and the root file system has
+/// the recorded size. A hit stamps the marker when its stamp is old, which is what keeps GC off it.
+fn cached_image(rootfs: &Path, meta_path: &Path, digest: &str) -> Option<GuestImage> {
+    let mut marker = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(meta_path)
+        .ok()?;
+    let mut text = Vec::new();
+    marker.read_to_end(&mut text).ok()?;
+    let meta = ImageMeta::from_json(&text)?;
+    if meta.digest != digest || fs::metadata(rootfs).ok()?.len() != meta.rootfs_bytes {
+        return None;
+    }
+    let stamp = marker.metadata().ok()?.modified().ok()?;
+    let now = SystemTime::now();
+    if now.duration_since(stamp).is_ok_and(|age| age > STAMP_AFTER) {
+        let _ = marker.set_modified(now);
+    }
+    Some(GuestImage {
+        rootfs: rootfs.to_path_buf(),
+        record: GuestImageRecord {
+            digest: meta.digest,
+            rootfs_bytes: meta.rootfs_bytes,
+            built: false,
+            build_ns: None,
+        },
+        env: meta.env,
+    })
+}
+
+type BuildLocks = Mutex<Vec<(String, Arc<Mutex<()>>)>>;
+
+fn build_locks() -> &'static BuildLocks {
+    static LOCKS: BuildLocks = Mutex::new(Vec::new());
+    &LOCKS
+}
+
+fn build_lock(key: &str) -> Arc<Mutex<()>> {
+    let mut locks = build_locks().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((_, lock)) = locks.iter().find(|(k, _)| k == key) {
+        return Arc::clone(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.push((key.to_owned(), Arc::clone(&lock)));
+    lock
+}
+
+/// Forgets a key's lock once nobody holds or waits on it, so the list stays as long as the builds in flight.
+fn release_build_lock(key: &str) {
+    let mut locks = build_locks().lock().unwrap_or_else(|p| p.into_inner());
+    locks.retain(|(k, lock)| k != key || Arc::strong_count(lock) > 1);
+}
+
+/// What `podman image inspect` reports for a guest image (see [`INSPECT_FORMAT`]).
+#[derive(Debug, PartialEq, Eq)]
+struct Inspected {
+    id: String,
+    digest: String,
+    repo_digests: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+const ENV_SEPARATOR: &str = "--env--";
+/// One value per line: the image ID, its manifest digest, each repo digest, a separator, then the environment.
+const INSPECT_FORMAT: &str = "{{println .Id}}{{println .Digest}}{{range .RepoDigests}}{{println .}}{{end}}{{println \"--env--\"}}{{range .Config.Env}}{{println .}}{{end}}";
+
+fn parse_inspect(text: &str) -> Option<Inspected> {
+    let mut lines = text.lines();
+    let id = lines.next()?.trim().to_owned();
+    let digest = lines.next()?.trim().to_owned();
+    let mut repo_digests = Vec::new();
+    loop {
+        let line = lines.next()?.trim();
+        if line == ENV_SEPARATOR {
+            break;
+        }
+        if !line.is_empty() {
+            repo_digests.push(line.to_owned());
+        }
+    }
+    let env = lines
         .filter_map(|l| l.split_once('='))
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect();
-    Ok(GuestImage { rootfs, env })
+    (!id.is_empty()).then_some(Inspected {
+        id,
+        digest,
+        repo_digests,
+        env,
+    })
 }
 
-fn build_image(image: &str, store: &Store, rootfs: &Path, env_file: &Path) -> Result<()> {
+impl Inspected {
+    /// Whether the stored image is the one `pinned` names: its manifest digest, or a repo digest it was
+    /// pulled under.
+    fn carries(&self, pinned: &str) -> bool {
+        self.digest == pinned
+            || self
+                .repo_digests
+                .iter()
+                .any(|r| r.rsplit_once('@').is_some_and(|(_, d)| d == pinned))
+    }
+}
+
+fn build_image(
+    image: &str,
+    digest: &str,
+    store: &Store,
+    rootfs: &Path,
+    meta_path: &Path,
+    cancel: &AtomicBool,
+) -> Result<ImageMeta> {
     let deadline = Instant::now() + IMAGE_BUILD_TIMEOUT;
     let tag = format!("{}.{}", std::process::id(), thread_tag());
     let tmp = rootfs.with_extension(format!("ext4.{tag}"));
-    let tmp_env = env_file.with_extension(format!("env.{tag}"));
+    let tmp_meta = meta_path.with_extension(format!("json.{tag}"));
     let mut inspect = crate::podman::podman_in(store);
-    inspect.args([
-        "image",
-        "inspect",
-        "--format",
-        "{{range .Config.Env}}{{println .}}{{end}}",
-        "--",
-        image,
-    ]);
-    let env = process::run(inspect, deadline, "podman image inspect")?;
-    if !env.success() {
+    inspect.args(["image", "inspect", "--format", INSPECT_FORMAT, "--", image]);
+    let inspected = process::run_canceled(
+        inspect,
+        deadline,
+        "podman image inspect",
+        None,
+        Some(cancel),
+    )?;
+    if !inspected.success() {
         return Err(Error::Preparation(format!(
             "image inspect: {}",
-            env.stderr_excerpt()
+            inspected.stderr_excerpt()
         )));
     }
-    fs::write(&tmp_env, &env.stdout)?;
+    let inspected = parse_inspect(&String::from_utf8_lossy(&inspected.stdout))
+        .ok_or_else(|| Error::Preparation("image inspect: unreadable answer".into()))?;
+    // The digest a job ran is the one the controller pinned: never a root file system from another image.
+    if !inspected.carries(digest) {
+        return Err(Error::Preparation(
+            "the stored image does not carry the pinned digest".into(),
+        ));
+    }
     // Inside the user namespace the image's files keep their owners, so the ext4 file records them.
     let store_args = store_args(store);
     let script = format!(
@@ -216,18 +486,43 @@ fn build_image(image: &str, store: &Store, rootfs: &Path, env_file: &Path) -> Re
     build
         .args(["unshare", "sh", "-c", &script, "sh", image])
         .arg(&tmp);
-    let built = process::run(build, deadline, "guest image build")?;
-    if !built.success() {
-        let _ = fs::remove_file(&tmp);
-        let _ = fs::remove_file(&tmp_env);
-        return Err(Error::Preparation(format!(
-            "guest image build: {}",
-            built.stderr_excerpt()
-        )));
+    let built = process::run_canceled(build, deadline, "guest image build", None, Some(cancel));
+    match built {
+        Ok(built) if built.success() => {}
+        Ok(built) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(Error::Preparation(format!(
+                "guest image build: {}",
+                built.stderr_excerpt()
+            )));
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
-    fs::rename(&tmp_env, env_file)?;
-    fs::rename(&tmp, rootfs)?;
-    Ok(())
+    let finish = || -> Result<ImageMeta> {
+        let meta = ImageMeta {
+            digest: digest.to_owned(),
+            image_id: inspected.id.clone(),
+            rootfs_bytes: fs::metadata(&tmp)?.len(),
+            env: inspected.env.clone(),
+        };
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp_meta)?
+            .write_all(&meta.to_json())?;
+        // The marker goes last: an image counts only once both files are in place.
+        fs::rename(&tmp, rootfs)?;
+        fs::rename(&tmp_meta, meta_path)?;
+        Ok(meta)
+    };
+    finish().inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(&tmp_meta);
+    })
 }
 
 fn store_args(store: &Store) -> String {
@@ -244,6 +539,105 @@ fn thread_tag() -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     thread::current().id().hash(&mut h);
     h.finish()
+}
+
+// ---------------------------------------------------------------- guest image GC
+
+/// A cached guest image, for the image budget (see [`crate::images`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestEntry {
+    pub key: String,
+    pub digest: String,
+    /// Apparent size of the root file system, the figure the image budget counts.
+    pub bytes: u64,
+    /// The last use: the marker's modification time.
+    pub used: SystemTime,
+}
+
+/// The complete cached images under `root`.
+pub fn guest_images(root: &Path) -> Vec<GuestEntry> {
+    let Ok(entries) = fs::read_dir(images_dir(root)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let key = name.to_str()?.strip_suffix(".json")?;
+            if !is_image_key(key) {
+                return None;
+            }
+            let used = entry.metadata().ok()?.modified().ok()?;
+            let meta = ImageMeta::from_json(&fs::read(entry.path()).ok()?)?;
+            Some(GuestEntry {
+                key: key.to_owned(),
+                digest: meta.digest,
+                bytes: meta.rootfs_bytes,
+                used,
+            })
+        })
+        .collect()
+}
+
+/// Removes one cached image, marker first so no attempt can pick it up half gone. A VM already running
+/// from it keeps its open file; the space frees when that VM ends.
+pub fn remove_guest_image(root: &Path, key: &str) -> bool {
+    if !is_image_key(key) {
+        return false;
+    }
+    let dir = images_dir(root);
+    let removed = fs::remove_file(dir.join(format!("{key}.json"))).is_ok();
+    let _ = fs::remove_file(dir.join(format!("{key}.ext4")));
+    removed
+}
+
+/// Files in the image directory that no complete image owns and that are old enough not to be a build in
+/// progress: temporary files of failed builds, a root file system whose marker never landed, leftovers of
+/// an earlier layout.
+fn orphans(files: &[(String, Duration)]) -> Vec<&str> {
+    let names: HashSet<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    files
+        .iter()
+        .filter(|(name, age)| {
+            if *age < ORPHAN_AGE {
+                return false;
+            }
+            let Some((key, ext)) = name.split_once('.') else {
+                return true;
+            };
+            let complete = is_image_key(key)
+                && names.contains(format!("{key}.json").as_str())
+                && names.contains(format!("{key}.ext4").as_str());
+            !(complete && (ext == "json" || ext == "ext4"))
+        })
+        .map(|(name, _)| name.as_str())
+        .collect()
+}
+
+/// Removes the image directory's orphans; the count removed.
+pub fn sweep_guest_orphans(root: &Path) -> usize {
+    let dir = images_dir(root);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let files: Vec<(String, Duration)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            let age = now
+                .duration_since(metadata.modified().ok()?)
+                .unwrap_or(Duration::ZERO);
+            Some((entry.file_name().into_string().ok()?, age))
+        })
+        .collect();
+    orphans(&files)
+        .into_iter()
+        .filter(|name| fs::remove_file(dir.join(name)).is_ok())
+        .count()
 }
 
 // ---------------------------------------------------------------- agent client
@@ -344,7 +738,11 @@ impl Client {
     }
 
     fn expect_done(&self, what: &str) -> Result<()> {
-        match self.control(CONTROL_TIMEOUT)? {
+        self.expect_done_within(what, CONTROL_TIMEOUT)
+    }
+
+    fn expect_done_within(&self, what: &str, timeout: Duration) -> Result<()> {
+        match self.control(timeout)? {
             Reply::Done => Ok(()),
             Reply::Failed { message } => Err(Error::Runtime(format!("{what}: {message}"))),
             other => Err(Error::Runtime(format!("{what}: unexpected {other:?}"))),
@@ -495,6 +893,10 @@ impl DataIn<'_> {
 pub struct Vm {
     attempt: AttemptId,
     dir: PathBuf,
+    /// The systemd scope the VM runs in (`unit_name`), stopped on destroy.
+    unit: String,
+    /// The guest image this VM booted, for the attempt's summary.
+    guest: GuestImageRecord,
     child: Mutex<Child>,
     client: Client,
     env: Vec<(String, String)>,
@@ -516,7 +918,7 @@ impl Vm {
     pub fn start(
         root: &Path,
         setup: &Setup,
-        _worker: WorkerId,
+        worker: WorkerId,
         attempt: AttemptId,
         image: &str,
         limits: Limits,
@@ -525,34 +927,91 @@ impl Vm {
         store: &Store,
         network: Network,
     ) -> Result<Vm> {
+        Vm::start_canceled(
+            root,
+            setup,
+            worker,
+            attempt,
+            image,
+            limits,
+            workspace,
+            mounts,
+            store,
+            network,
+            &AtomicBool::new(false),
+        )
+    }
+
+    /// Starts the VM; `cancel` (set by a cancel, a lease loss or a shutdown) ends an image build or a boot in
+    /// progress and removes what the start made, so no VM outlives the attempt that asked for it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_canceled(
+        root: &Path,
+        setup: &Setup,
+        _worker: WorkerId,
+        attempt: AttemptId,
+        image: &str,
+        limits: Limits,
+        workspace: &Path,
+        mounts: &[Mount],
+        store: &Store,
+        network: Network,
+        cancel: &AtomicBool,
+    ) -> Result<Vm> {
         if network != Network::None {
             return Err(Error::Preparation(
                 "microVM jobs with egress are not supported yet (TODO M05)".into(),
             ));
         }
-        let guest = guest_image(root, image, store)?;
-        let initrd = initramfs(root, setup)?;
+        if cancel.load(Ordering::Acquire) {
+            return Err(canceled_start());
+        }
+        // The directory exists from here to destroy, so a cancel or lease loss that arrives during the image
+        // build or the boot finds this VM by name and stops it.
         let dir = vm_dir(root, attempt);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir)?;
+        let started = Vm::boot(
+            root, setup, attempt, image, limits, workspace, mounts, store, cancel, &dir,
+        );
+        if started.is_err() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        started
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn boot(
+        root: &Path,
+        setup: &Setup,
+        attempt: AttemptId,
+        image: &str,
+        limits: Limits,
+        workspace: &Path,
+        mounts: &[Mount],
+        store: &Store,
+        cancel: &AtomicBool,
+        dir: &Path,
+    ) -> Result<Vm> {
+        let guest = guest_image_canceled(root, image, store, cancel)?;
+        let initrd = initramfs(root, setup)?;
+        if cancel.load(Ordering::Acquire) {
+            return Err(canceled_start());
+        }
         let scratch = dir.join("scratch.ext4");
         scratch_disk(&scratch, limits.disk_bytes.max(1 << 30))?;
         let vcpus = limits.cpu_millis.div_ceil(1000).max(1);
         let mib = (limits.memory_bytes >> 20).max(128);
         let socket = dir.join("vsock.sock");
-        let config = serde_json::json!({
-            "boot-source": {
-                "kernel_image_path": setup.kernel,
-                "initrd_path": initrd,
-                "boot_args": "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd quiet",
-            },
-            "drives": [
-                { "drive_id": "image", "path_on_host": guest.rootfs, "is_root_device": false, "is_read_only": true },
-                { "drive_id": "scratch", "path_on_host": scratch, "is_root_device": false, "is_read_only": false },
-            ],
-            "machine-config": { "vcpu_count": vcpus, "mem_size_mib": mib, "smt": false },
-            "vsock": { "guest_cid": GUEST_CID, "uds_path": socket },
-        });
+        let config = vm_config(
+            setup,
+            &initrd,
+            &guest.rootfs,
+            &scratch,
+            &socket,
+            u64::from(vcpus),
+            mib,
+        );
         fs::write(
             dir.join("vm.json"),
             serde_json::to_vec_pretty(&config).map_err(io::Error::other)?,
@@ -562,10 +1021,11 @@ impl Vm {
             .append(true)
             .mode(0o600)
             .open(dir.join("console.log"))?;
+        let unit = unit_name(root, attempt);
         let mut command = Command::new("systemd-run");
         command
             .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
-            .arg(unit_name(attempt))
+            .arg(&unit)
             .arg(format!("-pCPUQuota={}%", (limits.cpu_millis / 10).max(1)))
             .arg(format!(
                 "-pMemoryMax={}",
@@ -587,22 +1047,26 @@ impl Vm {
             .map_err(|e| Error::Preparation(format!("firecracker: {e}")))?;
         let deadline = Instant::now() + BOOT_TIMEOUT;
         let client = connect(&socket, deadline, &mut || {
-            matches!(child.try_wait(), Ok(None))
+            matches!(child.try_wait(), Ok(None)) && !cancel.load(Ordering::Acquire)
         });
         let client = match client {
             Ok(client) => client,
             Err(e) => {
-                let tail = console_tail(&dir);
+                let tail = console_tail(dir);
                 let _ = child.kill();
                 let _ = child.wait();
-                stop_unit(attempt);
-                let _ = fs::remove_dir_all(&dir);
+                let _ = stop_unit(OsStr::new(SYSTEMCTL), &unit);
+                if cancel.load(Ordering::Acquire) {
+                    return Err(canceled_start());
+                }
                 return Err(Error::Preparation(format!("{e}; console: {tail}")));
             }
         };
         let mut vm = Vm {
             attempt,
-            dir,
+            dir: dir.to_path_buf(),
+            unit,
+            guest: guest.record,
             child: Mutex::new(child),
             client,
             env: guest.env,
@@ -623,6 +1087,9 @@ impl Vm {
                         .push((guest_path(&mount.container), mount.host.clone()));
                 }
             }
+            if cancel.load(Ordering::Acquire) {
+                return Err(canceled_start());
+            }
             Ok(())
         })();
         if let Err(e) = prepared {
@@ -630,6 +1097,11 @@ impl Vm {
             return Err(e);
         }
         Ok(vm)
+    }
+
+    /// The guest image this VM booted: the pinned digest, for the attempt's provenance.
+    pub fn guest_image(&self) -> &GuestImageRecord {
+        &self.guest
     }
 
     pub fn attempt(&self) -> AttemptId {
@@ -780,7 +1252,8 @@ impl Vm {
         }
         let _ = child.kill();
         let _ = child.wait();
-        stop_unit(self.attempt);
+        // A scope that is still running keeps its directory: startup reconciliation finds the VM by it.
+        stop_unit(OsStr::new(SYSTEMCTL), &self.unit)?;
         fs::remove_dir_all(&self.dir).or_else(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 Ok(())
@@ -790,6 +1263,37 @@ impl Vm {
         })?;
         Ok(())
     }
+}
+
+fn canceled_start() -> Error {
+    Error::Preparation("microVM start canceled".into())
+}
+
+/// The Firecracker configuration of one VM. The guest gets the image (read-only), its scratch disk and the
+/// vsock the agent speaks on; no CPU template or custom CPU configuration, so the guest sees no hardware
+/// virtualization (`/dev/kvm` and nested KVM stay off), and nothing else is attached.
+fn vm_config(
+    setup: &Setup,
+    initrd: &Path,
+    rootfs: &Path,
+    scratch: &Path,
+    socket: &Path,
+    vcpus: u64,
+    mib: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "boot-source": {
+            "kernel_image_path": setup.kernel,
+            "initrd_path": initrd,
+            "boot_args": "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd quiet",
+        },
+        "drives": [
+            { "drive_id": "image", "path_on_host": rootfs, "is_root_device": false, "is_read_only": true },
+            { "drive_id": "scratch", "path_on_host": scratch, "is_root_device": false, "is_read_only": false },
+        ],
+        "machine-config": { "vcpu_count": vcpus, "mem_size_mib": mib, "smt": false },
+        "vsock": { "guest_cid": GUEST_CID, "uds_path": socket },
+    })
 }
 
 fn guest_path(container: &str) -> String {
@@ -843,54 +1347,97 @@ fn console_tail(dir: &Path) -> String {
     crate::redact::excerpt(&text[start..])
 }
 
-fn stop_unit(attempt: AttemptId) {
-    let unit = format!("{}.scope", unit_name(attempt));
-    let _ = systemctl_user(&["kill", "--signal=SIGKILL", &unit]);
-    let _ = systemctl_user(&["stop", &unit]);
+/// Whether `systemctl is-active` said the unit is up (or coming up or going down).
+fn unit_running(output: &std::process::Output) -> bool {
+    matches!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "active" | "activating" | "deactivating" | "reloading"
+    )
+}
+
+/// Kills and stops the VM's scope, then checks it is gone: a VM that may still be running must not have its
+/// files removed or its attempt abandoned. A `systemctl` that cannot run at all means no scope can exist.
+fn stop_unit(systemctl: &OsStr, unit: &str) -> Result<()> {
+    let scope = format!("{unit}.scope");
+    let _ = systemctl_user(systemctl, &["kill", "--signal=SIGKILL", &scope]);
+    let _ = systemctl_user(systemctl, &["stop", &scope]);
+    match systemctl_user(systemctl, &["is-active", &scope]) {
+        Ok(status) if unit_running(&status) => {
+            Err(Error::Runtime("the VM's scope is still running".into()))
+        }
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------- by name, from other threads
 
-/// A cancel: SIGTERM to every guest process, SIGKILL after `grace`, through a connection of its own.
+/// A cancel: SIGTERM to every guest process, SIGKILL after `grace`, through a connection of its own. A guest
+/// that does not confirm in time loses its VM instead.
 pub fn terminate_named(root: &Path, attempt: AttemptId, grace: Duration) -> Result<Terminated> {
+    terminate_named_with(
+        OsStr::new(SYSTEMCTL),
+        root,
+        attempt,
+        grace,
+        CANCEL_CONNECT_TIMEOUT,
+        CANCEL_REPLY_TIMEOUT,
+    )
+}
+
+fn terminate_named_with(
+    systemctl: &OsStr,
+    root: &Path,
+    attempt: AttemptId,
+    grace: Duration,
+    connect_wait: Duration,
+    reply_wait: Duration,
+) -> Result<Terminated> {
     let dir = vm_dir(root, attempt);
     let socket = dir.join("vsock.sock");
     if !socket.exists() {
         return Ok(Terminated::Gone);
     }
-    let client = match connect(
-        &socket,
-        Instant::now() + Duration::from_secs(2),
-        &mut || true,
-    ) {
+    let client = match connect(&socket, Instant::now() + connect_wait, &mut || true) {
         Ok(client) => client,
         Err(_) => {
-            remove_named(root, attempt)?;
+            remove_named_with(systemctl, root, attempt)?;
             return Ok(Terminated::Forced);
         }
     };
-    client.send(&Request::SignalAll {
-        signal: libc::SIGTERM,
-    })?;
-    client.expect_done("terminate")?;
-    thread::sleep(grace);
-    client.send(&Request::SignalAll {
-        signal: libc::SIGKILL,
-    })?;
-    client.expect_done("terminate")?;
+    let signaled = (|| -> Result<()> {
+        client.send(&Request::SignalAll {
+            signal: libc::SIGTERM,
+        })?;
+        client.expect_done_within("terminate", reply_wait)?;
+        thread::sleep(grace);
+        client.send(&Request::SignalAll {
+            signal: libc::SIGKILL,
+        })?;
+        client.expect_done_within("terminate", reply_wait)
+    })();
+    if signaled.is_err() {
+        // The guest could not be told: the VM is all that is left to stop, and the step waiting on it ends
+        // when its connection closes.
+        remove_named_with(systemctl, root, attempt)?;
+    }
     Ok(Terminated::Forced)
 }
 
-/// Stops the VM's scope and removes its directory: shutdown, lease loss and startup recovery.
+/// Stops the VM's scope and removes its directory: shutdown, lease loss and startup recovery. A scope that
+/// does not stop is an error and leaves the directory, so the VM is still found by name.
 pub fn remove_named(root: &Path, attempt: AttemptId) -> Result<()> {
-    stop_unit(attempt);
+    remove_named_with(OsStr::new(SYSTEMCTL), root, attempt)
+}
+
+fn remove_named_with(systemctl: &OsStr, root: &Path, attempt: AttemptId) -> Result<()> {
+    stop_unit(systemctl, &unit_name(root, attempt))?;
     match fs::remove_dir_all(vm_dir(root, attempt)) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(Error::Io(e)),
         _ => Ok(()),
     }
 }
 
-/// Whether the attempt runs in a VM here (its directory exists from start to destroy).
+/// Whether the attempt runs in a VM here (its directory exists from the start of its start to destroy).
 pub fn exists(root: &Path, attempt: AttemptId) -> bool {
     vm_dir(root, attempt).is_dir()
 }
@@ -904,6 +1451,71 @@ pub fn owned(root: &Path) -> Vec<AttemptId> {
         .flatten()
         .filter_map(|e| e.file_name().to_str()?.parse::<AttemptId>().ok())
         .collect()
+}
+
+/// The attempts named by the VM scopes in a `systemctl list-units` listing, for scopes with `prefix`.
+fn parse_units(listing: &str, prefix: &str) -> Vec<AttemptId> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let name = line.split_whitespace().next()?;
+            name.strip_prefix(prefix)?
+                .strip_suffix(".scope")?
+                .parse::<AttemptId>()
+                .ok()
+        })
+        .collect()
+}
+
+/// The attempts whose VM scopes this data root left running or failed, whether or not their directories
+/// remain. A `systemctl` that fails is an error, not an empty listing: a scope would go unstopped.
+fn listed_units(systemctl: &OsStr, root: &Path) -> Result<Vec<AttemptId>> {
+    let prefix = unit_prefix(root);
+    let pattern = format!("{prefix}*.scope");
+    let listing = systemctl_user(
+        systemctl,
+        &[
+            "list-units",
+            "--all",
+            "--no-legend",
+            "--plain",
+            "--no-pager",
+            &pattern,
+        ],
+    )
+    .map_err(|e| Error::Runtime(format!("listing microVM scopes: {e}")))?;
+    if !listing.status.success() {
+        return Err(Error::Runtime(format!(
+            "listing microVM scopes: {}",
+            crate::redact::excerpt(&listing.stderr)
+        )));
+    }
+    Ok(parse_units(
+        &String::from_utf8_lossy(&listing.stdout),
+        &prefix,
+    ))
+}
+
+/// Startup reconciliation: every VM this data root left behind, whether it has a directory, a scope or both,
+/// is stopped and its files (scratch disk, console log, sockets) removed. The count of VMs removed. A host that
+/// never ran a microVM (no `microvm` directory) is not asked about scopes at all.
+pub fn reconcile(root: &Path) -> Result<usize> {
+    reconcile_with(OsStr::new(SYSTEMCTL), root)
+}
+
+fn reconcile_with(systemctl: &OsStr, root: &Path) -> Result<usize> {
+    let mut leftover = owned(root);
+    if root.join(DIR).is_dir() {
+        for attempt in listed_units(systemctl, root)? {
+            if !leftover.contains(&attempt) {
+                leftover.push(attempt);
+            }
+        }
+    }
+    for attempt in &leftover {
+        remove_named_with(systemctl, root, *attempt)?;
+    }
+    Ok(leftover.len())
 }
 
 #[cfg(test)]
@@ -949,5 +1561,643 @@ mod tests {
         fs::create_dir_all(vms.join("not-an-attempt")).unwrap();
         assert_eq!(owned(&dir), vec![attempt]);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ------------------------------------------------------------ guest images
+
+    const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+    const OTHER: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000002";
+
+    fn image_ref(digest: &str) -> String {
+        format!("example.test/i@{digest}")
+    }
+
+    /// A complete cached image, as a finished build leaves it.
+    fn plant_image(root: &Path, image: &str, digest: &str, bytes: u64) -> (PathBuf, PathBuf) {
+        let dir = images_dir(root);
+        fs::create_dir_all(&dir).unwrap();
+        let key = image_key(&Store::Shared, image);
+        let rootfs = dir.join(format!("{key}.ext4"));
+        let marker = dir.join(format!("{key}.json"));
+        fs::File::create(&rootfs).unwrap().set_len(bytes).unwrap();
+        let meta = ImageMeta {
+            digest: digest.into(),
+            image_id: "ab".repeat(32),
+            rootfs_bytes: bytes,
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        };
+        fs::write(&marker, meta.to_json()).unwrap();
+        (rootfs, marker)
+    }
+
+    fn age(path: &Path, by: Duration) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - by)
+            .unwrap();
+    }
+
+    #[test]
+    fn only_a_digest_pinned_reference_names_a_guest_image() {
+        assert_eq!(pinned_digest(&image_ref(DIGEST)).unwrap(), DIGEST);
+        for bad in [
+            "example.test/i:latest",
+            "example.test/i@sha256:abc",
+            "example.test/i@sha512:00",
+            &format!("example.test/i@sha256:{}", "G".repeat(64)),
+            &format!("example.test/i@sha256:{}", "A".repeat(64)),
+        ] {
+            assert!(
+                matches!(pinned_digest(bad), Err(Error::Preparation(ref why)) if why == "image is not pinned by digest"),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inspect_answer_is_checked_against_the_pinned_digest() {
+        let answer = format!(
+            "{id}\n{DIGEST}\nexample.test/i@{DIGEST}\nexample.test/i@{OTHER}\n--env--\nPATH=/bin\nA=b=c\nnoequals\n",
+            id = "ab".repeat(32)
+        );
+        let inspected = parse_inspect(&answer).unwrap();
+        assert_eq!(inspected.id, "ab".repeat(32));
+        assert_eq!(inspected.repo_digests.len(), 2);
+        assert_eq!(
+            inspected.env,
+            vec![
+                ("PATH".to_owned(), "/bin".to_owned()),
+                ("A".to_owned(), "b=c".to_owned())
+            ]
+        );
+        assert!(inspected.carries(DIGEST));
+        assert!(
+            inspected.carries(OTHER),
+            "a repo digest it was pulled under"
+        );
+        assert!(!inspected.carries(&format!("sha256:{}", "f".repeat(64))));
+        // An image with no repo digests still carries its own manifest digest.
+        let local = parse_inspect(&format!("id\n{DIGEST}\n--env--\n")).unwrap();
+        assert!(local.carries(DIGEST) && !local.carries(OTHER));
+        assert!(parse_inspect("id\n").is_none());
+        assert!(parse_inspect(&format!("\n{DIGEST}\n--env--\n")).is_none());
+        assert!(parse_inspect("id\ndigest\nno separator\n").is_none());
+    }
+
+    #[test]
+    fn a_cached_image_is_reused_and_reports_the_digest_it_carries() {
+        let root = tempfile::tempdir().unwrap();
+        let image = image_ref(DIGEST);
+        let (rootfs, marker) = plant_image(root.path(), &image, DIGEST, 4096);
+        let hit = guest_image(root.path(), &image, &Store::Shared).unwrap();
+        assert_eq!(hit.rootfs, rootfs);
+        assert_eq!(hit.env, vec![("PATH".into(), "/usr/bin:/bin".into())]);
+        assert_eq!(
+            hit.record,
+            GuestImageRecord {
+                digest: DIGEST.into(),
+                rootfs_bytes: 4096,
+                built: false,
+                build_ns: None,
+            }
+        );
+        // A stale stamp is refreshed by the use, which is what keeps GC off a busy image.
+        age(&marker, Duration::from_secs(3600));
+        guest_image(root.path(), &image, &Store::Shared).unwrap();
+        let stamp = fs::metadata(&marker).unwrap().modified().unwrap();
+        assert!(stamp.elapsed().unwrap() < Duration::from_secs(60));
+        // A recent stamp is left alone.
+        let recent = SystemTime::now() - Duration::from_secs(10);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(recent)
+            .unwrap();
+        guest_image(root.path(), &image, &Store::Shared).unwrap();
+        assert_eq!(fs::metadata(&marker).unwrap().modified().unwrap(), recent);
+    }
+
+    #[test]
+    fn a_cache_entry_that_is_not_the_pinned_image_is_not_used() {
+        let root = tempfile::tempdir().unwrap();
+        let image = image_ref(DIGEST);
+        // The marker names another digest than the reference: never served.
+        let (_, marker) = plant_image(root.path(), &image, OTHER, 4096);
+        let dir = images_dir(root.path());
+        assert!(cached_image(&dir.join("x.ext4"), &marker, DIGEST).is_none());
+        let key = image_key(&Store::Shared, &image);
+        let rootfs = dir.join(format!("{key}.ext4"));
+        assert!(cached_image(&rootfs, &marker, DIGEST).is_none());
+        // A root file system of another size than the marker records (truncated or replaced).
+        let (rootfs, marker) = plant_image(root.path(), &image, DIGEST, 4096);
+        assert!(cached_image(&rootfs, &marker, DIGEST).is_some());
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&rootfs)
+            .unwrap()
+            .set_len(100)
+            .unwrap();
+        assert!(cached_image(&rootfs, &marker, DIGEST).is_none());
+        // A marker that does not parse, or of another format.
+        fs::write(&marker, b"{").unwrap();
+        assert!(cached_image(&rootfs, &marker, DIGEST).is_none());
+        fs::write(&marker, br#"{"format":9}"#).unwrap();
+        assert!(cached_image(&rootfs, &marker, DIGEST).is_none());
+        // And a tag is refused before anything runs.
+        let tagged = guest_image(root.path(), "example.test/i:latest", &Store::Shared);
+        assert!(matches!(tagged, Err(Error::Preparation(_))));
+    }
+
+    #[test]
+    fn a_canceled_image_build_waits_for_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let image = image_ref(OTHER);
+        let canceled = AtomicBool::new(true);
+        // Another attempt holds the image's build lock; this one gives up when its cancel is set.
+        let key = image_key(&Store::Shared, &image);
+        let lock = build_lock(&key);
+        let held = lock.lock().unwrap();
+        let started = Instant::now();
+        let result = guest_image_canceled(root.path(), &image, &Store::Shared, &canceled);
+        assert!(matches!(result, Err(Error::Preparation(ref why)) if why.contains("canceled")));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(held);
+        drop(lock);
+        release_build_lock(&key);
+        assert!(
+            build_locks().lock().unwrap().iter().all(|(k, _)| *k != key),
+            "an unused lock is forgotten"
+        );
+    }
+
+    #[test]
+    fn cached_images_are_listed_and_removed_by_key() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(guest_images(root.path()).is_empty());
+        let (a, b) = (image_ref(DIGEST), image_ref(OTHER));
+        plant_image(root.path(), &a, DIGEST, 1000);
+        let (rootfs_b, marker_b) = plant_image(root.path(), &b, OTHER, 3000);
+        age(&marker_b, Duration::from_secs(7200));
+        // Half an image (no marker) is not listed.
+        fs::write(
+            images_dir(root.path()).join(format!("{}.ext4", "c".repeat(32))),
+            b"x",
+        )
+        .unwrap();
+        let mut listed = guest_images(root.path());
+        listed.sort_by_key(|g| g.bytes);
+        assert_eq!(listed.len(), 2);
+        assert_eq!((listed[0].digest.as_str(), listed[0].bytes), (DIGEST, 1000));
+        assert_eq!((listed[1].digest.as_str(), listed[1].bytes), (OTHER, 3000));
+        assert!(listed[1].used.elapsed().unwrap() >= Duration::from_secs(7000));
+        assert!(!remove_guest_image(root.path(), "../escape"));
+        assert!(!remove_guest_image(root.path(), "short"));
+        assert!(remove_guest_image(root.path(), &listed[1].key));
+        assert!(!rootfs_b.exists() && !marker_b.exists());
+        assert_eq!(guest_images(root.path()).len(), 1);
+        assert!(
+            !remove_guest_image(root.path(), &listed[1].key),
+            "already gone"
+        );
+    }
+
+    #[test]
+    fn only_old_files_no_complete_image_owns_are_orphans() {
+        let key = "a".repeat(32);
+        let other = "b".repeat(32);
+        let old = ORPHAN_AGE + Duration::from_secs(1);
+        let young = Duration::from_secs(5);
+        let files = vec![
+            (format!("{key}.ext4"), old),
+            (format!("{key}.json"), old),
+            (format!("{key}.ext4.99.7"), old),
+            (format!("{key}.json.99.7"), old),
+            (format!("{key}.env"), old),
+            (format!("{other}.ext4"), old),
+            (format!("{other}.ext4.99.7"), young),
+            ("notes".to_owned(), old),
+        ];
+        let mut found = orphans(&files);
+        found.sort_unstable();
+        let mut want = [
+            format!("{key}.ext4.99.7"),
+            format!("{key}.json.99.7"),
+            format!("{key}.env"),
+            format!("{other}.ext4"),
+            "notes".to_owned(),
+        ];
+        want.sort_unstable();
+        assert_eq!(found, want.iter().map(String::as_str).collect::<Vec<_>>());
+        // A pair that is still young is kept whole, and so is a half that a build is finishing.
+        assert!(orphans(&[(format!("{key}.ext4"), young)]).is_empty());
+    }
+
+    #[test]
+    fn sweeping_removes_the_orphans_and_keeps_complete_images() {
+        let root = tempfile::tempdir().unwrap();
+        let image = image_ref(DIGEST);
+        let (rootfs, marker) = plant_image(root.path(), &image, DIGEST, 2048);
+        age(&rootfs, ORPHAN_AGE * 2);
+        age(&marker, ORPHAN_AGE * 2);
+        let dir = images_dir(root.path());
+        let key = image_key(&Store::Shared, &image);
+        let failed = dir.join(format!("{key}.ext4.1.2"));
+        let leftover = dir.join(format!("{key}.env"));
+        let building = dir.join(format!("{}.ext4.3.4", "d".repeat(32)));
+        for file in [&failed, &leftover, &building] {
+            fs::write(file, b"x").unwrap();
+        }
+        age(&failed, ORPHAN_AGE * 2);
+        age(&leftover, ORPHAN_AGE * 2);
+        assert_eq!(sweep_guest_orphans(root.path()), 2);
+        assert!(rootfs.exists() && marker.exists() && building.exists());
+        assert!(!failed.exists() && !leftover.exists());
+        assert_eq!(sweep_guest_orphans(root.path()), 0);
+        assert_eq!(sweep_guest_orphans(&root.path().join("nowhere")), 0);
+    }
+
+    // ------------------------------------------------------------ the VM configuration
+
+    #[test]
+    fn the_guest_is_given_no_way_to_nest_virtualization() {
+        let setup = Setup {
+            firecracker: "/fc".into(),
+            kernel: "/vmlinux".into(),
+            agent: "/agent".into(),
+        };
+        let config = vm_config(
+            &setup,
+            Path::new("/initrd"),
+            Path::new("/image.ext4"),
+            Path::new("/scratch.ext4"),
+            Path::new("/vsock.sock"),
+            2,
+            512,
+        );
+        // A new top-level section (a CPU configuration could unmask VMX; a device could carry /dev/kvm) must
+        // be reviewed against the isolation contract before this test is changed.
+        let mut sections: Vec<&str> = config
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        sections.sort_unstable();
+        assert_eq!(
+            sections,
+            ["boot-source", "drives", "machine-config", "vsock"]
+        );
+        let machine = config["machine-config"].as_object().unwrap();
+        assert!(!machine.contains_key("cpu_template"));
+        assert!(!config.to_string().to_ascii_lowercase().contains("kvm"));
+        let drives = config["drives"].as_array().unwrap();
+        assert_eq!(drives.len(), 2);
+        assert_eq!(
+            drives[0]["is_read_only"], true,
+            "the job image is read-only"
+        );
+        assert_eq!(drives[0]["path_on_host"], "/image.ext4");
+        assert_eq!(drives[1]["path_on_host"], "/scratch.ext4");
+        assert_eq!(config["machine-config"]["vcpu_count"], 2);
+        assert_eq!(config["machine-config"]["mem_size_mib"], 512);
+    }
+
+    // ------------------------------------------------------------ reconciliation, without a KVM host
+
+    /// A stand-in for `systemctl`: logs every call and answers `is-active` and `list-units` as told.
+    struct FakeSystemctl {
+        program: PathBuf,
+        log: PathBuf,
+    }
+
+    impl FakeSystemctl {
+        fn new(dir: &Path, is_active: &str, listing: &str, list_exit: i32) -> Self {
+            let log = dir.join("systemctl.log");
+            let program = dir.join("systemctl");
+            let script = format!(
+                "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$2\" in\n  is-active) echo '{is_active}';;\n  list-units) cat '{list}'; test {list_exit} -eq 0 || {{ echo 'bus unreachable' >&2; exit {list_exit}; }};;\nesac\nexit 0\n",
+                log = log.display(),
+                list = dir.join("listing.txt").display(),
+            );
+            fs::write(dir.join("listing.txt"), listing).unwrap();
+            fs::write(&program, script).unwrap();
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+            FakeSystemctl { program, log }
+        }
+
+        fn calls(&self) -> String {
+            fs::read_to_string(&self.log).unwrap_or_default()
+        }
+    }
+
+    fn vm_files(root: &Path, attempt: AttemptId) -> PathBuf {
+        let dir = vm_dir(root, attempt);
+        fs::create_dir_all(&dir).unwrap();
+        for file in ["scratch.ext4", "console.log", "vm.json"] {
+            fs::write(dir.join(file), b"x").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn scopes_are_named_per_data_root() {
+        let attempt = AttemptId::new();
+        let (a, b) = (Path::new("/data/worker-a"), Path::new("/data/worker-b"));
+        assert_ne!(unit_prefix(a), unit_prefix(b));
+        assert!(unit_name(a, attempt).starts_with(&unit_prefix(a)));
+        assert_eq!(
+            scope_name(a, attempt),
+            format!("{}.scope", unit_name(a, attempt))
+        );
+        let listing = format!(
+            "{mine}.scope loaded active running Sentinel VM\n{theirs}.scope loaded active running Sentinel VM\nunrelated.service loaded active running x\n{prefix}not-an-attempt.scope loaded failed failed x\n\n",
+            mine = unit_name(a, attempt),
+            theirs = unit_name(b, AttemptId::new()),
+            prefix = unit_prefix(a),
+        );
+        assert_eq!(parse_units(&listing, &unit_prefix(a)), vec![attempt]);
+    }
+
+    #[test]
+    fn startup_reconciliation_removes_every_leftover_vm_and_its_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        let (with_dir, scope_only) = (AttemptId::new(), AttemptId::new());
+        let dir = vm_files(&root, with_dir);
+        let stranger = AttemptId::new();
+        let listing = format!(
+            "{}.scope loaded active running x\n{}.scope loaded failed failed x\n{}.scope loaded active running x\n",
+            unit_name(&root, scope_only),
+            unit_name(&root, with_dir),
+            unit_name(Path::new("/another/worker"), stranger),
+        );
+        let systemctl = FakeSystemctl::new(temp.path(), "inactive", &listing, 0);
+        assert_eq!(
+            reconcile_with(systemctl.program.as_os_str(), &root).unwrap(),
+            2
+        );
+        assert!(
+            !dir.exists(),
+            "the scratch disk and console log go with the VM's directory"
+        );
+        assert!(owned(&root).is_empty());
+        let calls = systemctl.calls();
+        for attempt in [with_dir, scope_only] {
+            let scope = scope_name(&root, attempt);
+            assert!(
+                calls.contains(&format!("kill --signal=SIGKILL {scope}")),
+                "{calls}"
+            );
+            assert!(calls.contains(&format!("stop {scope}")), "{calls}");
+        }
+        assert!(
+            !calls.contains(&stranger.to_string()),
+            "another worker's VM is not ours"
+        );
+        // Nothing left: the second pass finds nothing and removes nothing.
+        let later = temp.path().join("later");
+        fs::create_dir_all(&later).unwrap();
+        let systemctl = FakeSystemctl::new(&later, "inactive", "", 0);
+        assert_eq!(
+            reconcile_with(systemctl.program.as_os_str(), &root).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_host_that_never_ran_a_microvm_is_not_asked_about_scopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let systemctl = FakeSystemctl::new(temp.path(), "inactive", "", 1);
+        let root = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            reconcile_with(systemctl.program.as_os_str(), &root).unwrap(),
+            0
+        );
+        assert_eq!(systemctl.calls(), "");
+    }
+
+    #[test]
+    fn a_scope_listing_that_fails_is_reported_not_taken_for_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        fs::create_dir_all(root.join(DIR)).unwrap();
+        let systemctl = FakeSystemctl::new(temp.path(), "inactive", "", 1);
+        let error = reconcile_with(systemctl.program.as_os_str(), &root).unwrap_err();
+        assert!(
+            error.to_string().contains("listing microVM scopes")
+                && error.to_string().contains("bus unreachable"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_scope_that_will_not_stop_keeps_its_directory_and_fails_the_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        let attempt = AttemptId::new();
+        let dir = vm_files(&root, attempt);
+        let running = FakeSystemctl::new(temp.path(), "active", "", 0);
+        assert!(remove_named_with(running.program.as_os_str(), &root, attempt).is_err());
+        assert!(dir.exists(), "the VM is still found by name");
+        assert!(reconcile_with(running.program.as_os_str(), &root).is_err());
+        let stopped = FakeSystemctl::new(temp.path(), "inactive", "", 0);
+        remove_named_with(stopped.program.as_os_str(), &root, attempt).unwrap();
+        assert!(!dir.exists());
+        // Removing what is not there is not an error.
+        remove_named_with(stopped.program.as_os_str(), &root, attempt).unwrap();
+        // And a host with no systemctl at all has no scopes to be running.
+        let dir = vm_files(&root, attempt);
+        remove_named_with(OsStr::new("/nonexistent/systemctl"), &root, attempt).unwrap();
+        assert!(!dir.exists());
+    }
+
+    // ------------------------------------------------------------ cancel and lease loss, without a KVM host
+
+    /// A guest agent that records the signals it is sent, with the time each arrived; `answer` says whether
+    /// it confirms them. Serves one connection, then returns once it has seen `expect` signals.
+    fn fake_agent(
+        socket: &Path,
+        answer: bool,
+        expect: usize,
+    ) -> thread::JoinHandle<Vec<(i32, Instant)>> {
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while stream.read_exact(&mut byte).is_ok() {
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            assert!(line.starts_with(b"CONNECT "));
+            stream.write_all(b"OK 1\n").unwrap();
+            let hello: Request = agent::read(&mut stream).unwrap().unwrap();
+            assert!(matches!(hello, Request::Hello { .. }));
+            agent::write(
+                &mut stream,
+                &Reply::Ready {
+                    version: agent::VERSION,
+                    kernel: "test".into(),
+                },
+            )
+            .unwrap();
+            let mut seen = Vec::new();
+            while seen.len() < expect {
+                let Ok(Some(Request::SignalAll { signal })) = agent::read::<Request>(&mut stream)
+                else {
+                    break;
+                };
+                seen.push((signal, Instant::now()));
+                if answer {
+                    agent::write(&mut stream, &Reply::Done).unwrap();
+                }
+            }
+            seen
+        })
+    }
+
+    fn terminate(
+        systemctl: &FakeSystemctl,
+        root: &Path,
+        attempt: AttemptId,
+        grace: Duration,
+    ) -> Result<Terminated> {
+        terminate_named_with(
+            systemctl.program.as_os_str(),
+            root,
+            attempt,
+            grace,
+            Duration::from_millis(200),
+            Duration::from_millis(300),
+        )
+    }
+
+    #[test]
+    fn a_cancel_asks_politely_then_forces_through_the_agent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("d");
+        let attempt = AttemptId::new();
+        let dir = vm_files(&root, attempt);
+        let agent = fake_agent(&dir.join("vsock.sock"), true, 2);
+        let systemctl = FakeSystemctl::new(temp.path(), "inactive", "", 0);
+        let grace = Duration::from_millis(150);
+        let outcome = terminate(&systemctl, &root, attempt, grace).unwrap();
+        assert_eq!(outcome, Terminated::Forced);
+        let seen = agent.join().unwrap();
+        assert_eq!(
+            seen.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            [libc::SIGTERM, libc::SIGKILL]
+        );
+        assert!(
+            seen[1].1.duration_since(seen[0].1) >= grace,
+            "the step gets its grace"
+        );
+        assert_eq!(
+            systemctl.calls(),
+            "",
+            "a guest that answers is not killed from outside"
+        );
+        assert!(
+            exists(&root, attempt),
+            "the attempt's own teardown removes the VM"
+        );
+    }
+
+    #[test]
+    fn a_guest_that_does_not_answer_a_cancel_loses_its_vm() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("d");
+        let attempt = AttemptId::new();
+        let dir = vm_files(&root, attempt);
+        let agent = fake_agent(&dir.join("vsock.sock"), false, 1);
+        let systemctl = FakeSystemctl::new(temp.path(), "inactive", "", 0);
+        let started = Instant::now();
+        let outcome = terminate(&systemctl, &root, attempt, Duration::ZERO).unwrap();
+        assert_eq!(outcome, Terminated::Forced);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(agent.join().unwrap().len(), 1);
+        assert!(!exists(&root, attempt), "the VM and its files are gone");
+        assert!(
+            systemctl.calls().contains(&format!(
+                "kill --signal=SIGKILL {}",
+                scope_name(&root, attempt)
+            )),
+            "{}",
+            systemctl.calls()
+        );
+    }
+
+    #[test]
+    fn a_cancel_that_cannot_reach_the_agent_kills_the_vm() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("d");
+        let attempt = AttemptId::new();
+        let systemctl = FakeSystemctl::new(temp.path(), "inactive", "", 0);
+        assert_eq!(
+            terminate(&systemctl, &root, attempt, Duration::ZERO).unwrap(),
+            Terminated::Gone,
+            "no VM by that name"
+        );
+        // A socket file nothing listens on: the guest is gone or never came up.
+        let dir = vm_files(&root, attempt);
+        drop(std::os::unix::net::UnixListener::bind(dir.join("vsock.sock")).unwrap());
+        assert_eq!(
+            terminate(&systemctl, &root, attempt, Duration::ZERO).unwrap(),
+            Terminated::Forced
+        );
+        assert!(!exists(&root, attempt));
+    }
+
+    #[test]
+    fn a_start_that_was_canceled_makes_no_vm() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("d");
+        let setup = Setup {
+            firecracker: "/nonexistent/firecracker".into(),
+            kernel: "/nonexistent/vmlinux".into(),
+            agent: "/nonexistent/agent".into(),
+        };
+        let limits = Limits {
+            cpu_millis: 1000,
+            memory_bytes: 256 << 20,
+            pids: 100,
+            disk_bytes: 1 << 30,
+            lifetime_secs: 60,
+        };
+        let start = |image: &str, cancel: &AtomicBool| {
+            let attempt = AttemptId::new();
+            let result = Vm::start_canceled(
+                &root,
+                &setup,
+                WorkerId::new(),
+                attempt,
+                image,
+                limits,
+                temp.path(),
+                &[],
+                &Store::Shared,
+                Network::None,
+                cancel,
+            );
+            (attempt, result)
+        };
+        let (attempt, result) = start(&image_ref(DIGEST), &AtomicBool::new(true));
+        assert!(
+            matches!(result, Err(Error::Preparation(ref why)) if why == "microVM start canceled")
+        );
+        assert!(!exists(&root, attempt));
+        // A start that fails before the VM boots leaves no directory behind either.
+        let (attempt, result) = start("example.test/i:latest", &AtomicBool::new(false));
+        assert!(
+            matches!(result, Err(Error::Preparation(ref why)) if why == "image is not pinned by digest")
+        );
+        assert!(!exists(&root, attempt));
+        assert!(owned(&root).is_empty());
     }
 }

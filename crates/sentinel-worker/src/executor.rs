@@ -982,14 +982,32 @@ impl Inner {
             *swept = Some(std::time::Instant::now());
         }
         let mut removed = 0usize;
+        // Cached microVM root file systems count against the same budget as Podman's images: Podman's go
+        // first, against what the guest images leave; the guest images then give back whatever still does
+        // not fit, least recently used first.
+        let guests = crate::microvm::guest_images(&self.root);
+        let guest_total: u64 = guests.iter().map(|g| g.bytes).sum();
+        let podman_budget = budget.saturating_sub(guest_total);
+        let mut podman_left = 0u64;
         for store in podman::Store::all(&self.root) {
             let Ok(images) = podman::list_images(&store) else {
                 continue;
             };
-            for id in self.images.reclaimable(&images, budget) {
-                removed += usize::from(podman::remove_image(&store, &id));
+            let mut left: u64 = images.iter().map(|i| i.bytes).sum();
+            for id in self.images.reclaimable(&images, podman_budget) {
+                if podman::remove_image(&store, &id) {
+                    removed += 1;
+                    left = left
+                        .saturating_sub(images.iter().find(|i| i.id == id).map_or(0, |i| i.bytes));
+                }
             }
+            podman_left = podman_left.max(left);
         }
+        let over = crate::images::guest_overage(guest_total, podman_left, budget);
+        for key in self.images.reclaimable_guests(&guests, over) {
+            removed += usize::from(crate::microvm::remove_guest_image(&self.root, &key));
+        }
+        crate::microvm::sweep_guest_orphans(&self.root);
         if removed > 0 {
             (self.notify)(Notice::ImagesReclaimed(removed));
         }

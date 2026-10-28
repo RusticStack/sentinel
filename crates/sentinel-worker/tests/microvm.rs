@@ -271,10 +271,145 @@ fn a_cancel_by_name_ends_the_running_step_and_removal_leaves_nothing() {
     assert!(exit.code == Some(3) || exit.signal.is_some(), "{exit:?}");
     microvm::remove_named(root.path(), attempt).unwrap();
     assert!(!microvm::exists(root.path(), attempt));
-    let unit = format!("sentinel-vm-{attempt}.scope");
+    assert_scope_gone(root.path(), attempt);
+}
+
+fn assert_scope_gone(root: &std::path::Path, attempt: AttemptId) {
     let status = std::process::Command::new("systemctl")
-        .args(["--user", "is-active", &unit])
+        .args(["--user", "is-active", &microvm::scope_name(root, attempt)])
         .output()
         .unwrap();
     assert_ne!(text(&status.stdout), "active", "the VM's scope is gone");
+}
+
+const IMAGE_DIGEST: &str =
+    "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
+
+#[test]
+fn the_digest_a_guest_ran_is_the_pinned_one_and_its_image_is_reused() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (_, first) = start(root.path(), &setup, workspace.path(), &[]);
+    let record = first.guest_image().clone();
+    assert_eq!(record.digest, IMAGE_DIGEST);
+    assert!(record.built && record.build_ns.is_some() && record.rootfs_bytes > 0);
+    first.destroy().unwrap();
+    let (_, second) = start(root.path(), &setup, workspace.path(), &[]);
+    let reused = second.guest_image();
+    assert_eq!(reused.digest, IMAGE_DIGEST);
+    assert!(!reused.built && reused.build_ns.is_none());
+    assert_eq!(reused.rootfs_bytes, record.rootfs_bytes);
+    second.destroy().unwrap();
+    let cached = microvm::guest_images(root.path());
+    assert_eq!(cached.len(), 1);
+    assert_eq!(cached[0].digest, IMAGE_DIGEST);
+    assert!(microvm::remove_guest_image(root.path(), &cached[0].key));
+    assert!(microvm::guest_images(root.path()).is_empty());
+}
+
+#[test]
+fn the_guest_has_no_kvm() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (_, vm) = start(root.path(), &setup, workspace.path(), &[]);
+    let exit = vm
+        .exec(
+            &sh(
+                "test ! -e /dev/kvm && ! grep -Eqw 'vmx|svm' /proc/cpuinfo",
+                60,
+            ),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(exit.code, Some(0), "{}", text(&exit.stderr));
+    vm.destroy().unwrap();
+}
+
+#[test]
+fn reconciliation_removes_a_vm_a_crashed_worker_left_running() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (attempt, vm) = start(root.path(), &setup, workspace.path(), &[]);
+    // The worker dies without tearing the VM down: nothing runs its destroy.
+    std::mem::forget(vm);
+    assert!(microvm::exists(root.path(), attempt));
+    assert_eq!(microvm::reconcile(root.path()).unwrap(), 1);
+    assert!(!microvm::exists(root.path(), attempt));
+    assert!(microvm::owned(root.path()).is_empty());
+    assert_scope_gone(root.path(), attempt);
+    assert_eq!(microvm::reconcile(root.path()).unwrap(), 0);
+}
+
+#[test]
+fn losing_the_lease_kills_the_vm_and_ends_the_running_step() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (attempt, vm) = start(root.path(), &setup, workspace.path(), &[]);
+    let vm = Arc::new(vm);
+    let running = {
+        let vm = Arc::clone(&vm);
+        std::thread::spawn(move || vm.exec(&sh("sleep 600", 600), &[]))
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    let started = Instant::now();
+    microvm::remove_named(root.path(), attempt).unwrap();
+    assert!(
+        running.join().unwrap().is_err(),
+        "the step is cut off with its VM"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(!microvm::exists(root.path(), attempt));
+    assert_scope_gone(root.path(), attempt);
+    let _ = Arc::try_unwrap(vm).map(|vm| vm.destroy());
+}
+
+#[test]
+fn a_cancel_during_the_start_leaves_no_vm() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let attempt = AttemptId::new();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let starting = {
+        let (root, workspace, cancel) = (
+            root.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            Arc::clone(&cancel),
+        );
+        std::thread::spawn(move || {
+            // A fresh data root: the guest image is built first, which takes long enough to cancel.
+            Vm::start_canceled(
+                &root,
+                &setup,
+                WorkerId::new(),
+                attempt,
+                IMAGE,
+                limits(),
+                &workspace,
+                &[],
+                &Store::Shared,
+                Network::None,
+                &cancel,
+            )
+        })
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        microvm::exists(root.path(), attempt),
+        "the VM is found by name from the start of its start"
+    );
+    cancel.store(true, std::sync::atomic::Ordering::Release);
+    microvm::remove_named(root.path(), attempt).unwrap();
+    assert!(starting.join().unwrap().is_err());
+    assert!(!microvm::exists(root.path(), attempt));
+    assert_scope_gone(root.path(), attempt);
 }

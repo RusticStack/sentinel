@@ -736,7 +736,7 @@ fn prepare(
                 let setup = job.runtime.microvm.as_deref().ok_or_else(|| {
                     Error::Preparation("this worker has no microVM executor".into())
                 })?;
-                Sandbox::Vm(microvm::Vm::start(
+                let vm = microvm::Vm::start_canceled(
                     root,
                     setup,
                     job.worker,
@@ -747,7 +747,11 @@ fn prepare(
                     &mounts,
                     &store,
                     job.network,
-                )?)
+                    cancel,
+                )?;
+                // The digest the guest ran is the one it was built and checked against.
+                summary.guest_image = Some(vm.guest_image().clone());
+                Sandbox::Vm(vm)
             }
         };
         summary.container_start_ns = ns(started);

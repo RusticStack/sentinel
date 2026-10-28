@@ -189,6 +189,7 @@ pub(super) fn attempt_steps(state: &State, request: &crate::http::Request, attem
         "present": true,
         "timings_ns": timings,
         "image_present": summary.image_present,
+        "guest_image": summary.guest_image,
         "steps": summary.steps.iter().map(|s| {
             let mut step = json!({
                 "index": s.index,

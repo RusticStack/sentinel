@@ -2,10 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const SUMMARY_FORMAT: u8 = 3;
+pub const SUMMARY_FORMAT: u8 = 4;
 // Old formats stay decodable forever: keep their shadow structs when the format changes.
 const SUMMARY_FORMAT_V1: u8 = 1;
 const SUMMARY_FORMAT_V2: u8 = 2;
+const SUMMARY_FORMAT_V3: u8 = 3;
 pub const MAX_SUMMARY_BYTES: usize = 32 * 1024;
 // Must fit one control frame; receivers drop a summary the store column cannot hold, never fail the job.
 const _: () = assert!(MAX_SUMMARY_BYTES < crate::limits::MAX_CONTROL_MESSAGE_BYTES);
@@ -60,6 +61,19 @@ pub struct CacheRecord {
     pub costly_hit: bool,
 }
 
+/// The guest image a microVM attempt ran: the digest its root file system was built from and checked against.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestImageRecord {
+    /// The pinned `sha256:` digest, the one the controller offered the job.
+    pub digest: String,
+    /// Apparent size of the read-only root file system, in bytes.
+    pub rootfs_bytes: u64,
+    /// Whether this attempt built the root file system; false when a cached one was reused.
+    pub built: bool,
+    /// Monotonic time spent building it; absent when it was reused.
+    pub build_ns: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptSummary {
     pub checkout_ns: Option<u64>,
@@ -73,7 +87,25 @@ pub struct AttemptSummary {
     pub finalize_ns: Option<u64>,
     pub steps: Vec<StepRecord>,
     pub caches: Vec<CacheRecord>,
+    /// Present for microVM attempts only (format 4).
+    pub guest_image: Option<GuestImageRecord>,
     pub detail: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct AttemptSummaryV3 {
+    checkout_ns: Option<u64>,
+    checkout_fetch_ns: Option<u64>,
+    checkout_materialize_ns: Option<u64>,
+    checkout_route: Option<CheckoutRoute>,
+    image_pull_ns: Option<u64>,
+    image_present: Option<bool>,
+    container_start_ns: Option<u64>,
+    steps_ns: Option<u64>,
+    finalize_ns: Option<u64>,
+    steps: Vec<StepRecord>,
+    caches: Vec<CacheRecord>,
+    detail: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -99,6 +131,26 @@ struct AttemptSummaryV2 {
     finalize_ns: Option<u64>,
     steps: Vec<StepRecord>,
     detail: String,
+}
+
+impl From<AttemptSummaryV3> for AttemptSummary {
+    fn from(v3: AttemptSummaryV3) -> Self {
+        Self {
+            checkout_ns: v3.checkout_ns,
+            checkout_fetch_ns: v3.checkout_fetch_ns,
+            checkout_materialize_ns: v3.checkout_materialize_ns,
+            checkout_route: v3.checkout_route,
+            image_pull_ns: v3.image_pull_ns,
+            image_present: v3.image_present,
+            container_start_ns: v3.container_start_ns,
+            steps_ns: v3.steps_ns,
+            finalize_ns: v3.finalize_ns,
+            steps: v3.steps,
+            caches: v3.caches,
+            detail: v3.detail,
+            guest_image: None,
+        }
+    }
 }
 
 impl From<AttemptSummaryV1> for AttemptSummary {
@@ -162,6 +214,9 @@ impl AttemptSummary {
             Some((&SUMMARY_FORMAT, body)) => {
                 postcard::from_bytes(body).map_err(|_| SummaryError::Decode)
             }
+            Some((&SUMMARY_FORMAT_V3, body)) => postcard::from_bytes::<AttemptSummaryV3>(body)
+                .map(AttemptSummary::from)
+                .map_err(|_| SummaryError::Decode),
             Some((&SUMMARY_FORMAT_V2, body)) => postcard::from_bytes::<AttemptSummaryV2>(body)
                 .map(AttemptSummary::from)
                 .map_err(|_| SummaryError::Decode),
@@ -241,6 +296,12 @@ mod tests {
                     ..full_cache_record()
                 },
             ],
+            guest_image: Some(GuestImageRecord {
+                digest: format!("sha256:{}", "ab".repeat(32)),
+                rootfs_bytes: 123_456_789,
+                built: true,
+                build_ns: Some(9_000_000_000),
+            }),
             detail: "step 1 exited with 3".into(),
         };
         let bytes = summary.encode().unwrap();
@@ -281,6 +342,40 @@ mod tests {
             ..AttemptSummary::default()
         };
         assert!(full.encode().unwrap().len() <= MAX_SUMMARY_BYTES);
+    }
+
+    #[test]
+    fn format_three_blobs_decode_with_no_guest_image() {
+        let v3 = AttemptSummaryV3 {
+            checkout_ns: Some(1),
+            checkout_fetch_ns: Some(2),
+            checkout_materialize_ns: Some(3),
+            checkout_route: Some(CheckoutRoute::Direct),
+            image_pull_ns: Some(4),
+            image_present: Some(true),
+            container_start_ns: Some(5),
+            steps_ns: Some(6),
+            finalize_ns: Some(7),
+            steps: vec![StepRecord {
+                index: 0,
+                id: "s".into(),
+                outcome: StepOutcome::Passed,
+                duration_ns: Some(1),
+            }],
+            caches: vec![full_cache_record()],
+            detail: "kept".into(),
+        };
+        let mut bytes = vec![SUMMARY_FORMAT_V3];
+        bytes.extend(postcard::to_allocvec(&v3).unwrap());
+        let decoded = AttemptSummary::decode(&bytes).unwrap();
+        assert_eq!(decoded.guest_image, None);
+        assert_eq!(decoded.image_present, Some(true));
+        assert_eq!(decoded.caches, vec![full_cache_record()]);
+        assert_eq!(decoded.detail, "kept");
+        assert_eq!(
+            AttemptSummary::decode(&bytes[..bytes.len() - 1]),
+            Err(SummaryError::Decode)
+        );
     }
 
     #[test]
