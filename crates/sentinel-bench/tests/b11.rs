@@ -235,3 +235,45 @@ fn malformed_input_is_an_error_not_a_verdict() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Plumbing only: `bench/b11-collect.py replay` turned the committed GitHub self-hosted baselines into
+/// pair lines whose two sides are one recorded run. The ratio is 1.0 by construction and the series are
+/// short, so the harness must read them and decline to pass; nothing here is a Blacksmith result.
+#[test]
+fn the_collectors_dry_run_output_is_read_by_the_harness_and_cannot_pass() {
+    let samples =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/b11-dryrun-samples.jsonl");
+    let out = harness(&samples);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = report(&out);
+    assert_eq!(r["verdict"], "fail");
+    assert_eq!(
+        r["missing"],
+        json!([
+            "cli/cold",
+            "cli/small-edit",
+            "ripgrep/cold",
+            "ripgrep/small-edit",
+            "gson/cold",
+            "gson/small-edit"
+        ])
+    );
+    let series = r["series"].as_array().unwrap();
+    let warm: Vec<_> = series.iter().filter(|s| s["condition"] == "warm").collect();
+    assert_eq!(warm.len(), 3);
+    for s in warm {
+        assert_eq!(s["pairs"], 5);
+        assert_eq!(s["verdict"], "insufficient");
+        assert_eq!(s["p95_ratio"], 1.0);
+        assert_eq!(s["sha_mismatches"], 0);
+        assert_eq!(s["order_violations"], 0);
+        let phases = s["phases"].as_object().unwrap();
+        assert!(phases.contains_key("queue") && phases.contains_key("run"));
+        assert!(s["job"]["sentinel"]["count"].as_u64().unwrap() > 0);
+    }
+}
