@@ -37,7 +37,7 @@ Run from the repository root; aliases live in `.cargo/config.toml`. The test com
 
 | Purpose | Command |
 |---|---|
-| Portable checks (all OSes) | `cargo fmt-check`, `cargo lint`, `cargo test-cli`, `cargo release-cli` |
+| Portable checks (all OSes) | `cargo fmt-check`, `cargo lint`, `cargo test-cli`, `cargo release-cli`, `cargo licenses` (dependency policy, needs cargo-deny) |
 | Linux role checks | `cargo lint-linux`, `cargo test-server`, `cargo test-worker`, `cargo test-linux`, `cargo release-linux` |
 | Benchmark runner | `cargo bench-noop --runtime direct --warm-state warm`; contract runs `sentinel-bench --contract <file> --lane <id> --condition <c>` |
 | Feasibility probes | `cargo probe sqlite --path /tmp/d.sqlite` |

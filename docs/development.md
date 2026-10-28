@@ -76,7 +76,7 @@ The browser test starts a seeded controller and the built interface; `serve_the_
 
 Each command returns Cargo's exit status. Stop and fix failures before proceeding. There is no aggregate alias hiding intermediate failures. Extra test arguments can be appended, for example `cargo test-linux -- --nocapture`.
 
-Release output is `target/release/sentinel` (`sentinel.exe` on Windows). CLI and role builds have the same binary name: the most recent build for that profile/target determines the available roles. `release-linux` produces the combined Linux distribution. Setting `CARGO_TARGET_DIR` changes output locations normally. The distributable packages (server, worker, CLI and the static guest agent, with `SHA256SUMS`) are built and checked by `scripts/release/package.sh`, and the server unit by `scripts/release/check-server-unit.sh` ([deployment](deployment.md)).
+Release output is `target/release/sentinel` (`sentinel.exe` on Windows). CLI and role builds have the same binary name: the most recent build for that profile/target determines the available roles. `release-linux` produces the combined Linux distribution. Setting `CARGO_TARGET_DIR` changes output locations normally. The distributable packages (server, worker, CLI, the static guest agent and the Windows CLI, with `SHA256SUMS` and a digest manifest) are built and verified by `scripts/release/package.sh` and `package.ps1` ([releasing](releasing.md)), the third-party inventory is checked by `cargo licenses` and `scripts/release/check-inventory.sh`, and the server unit by `scripts/release/check-server-unit.sh` ([deployment](deployment.md)).
 
 ## Local two-process workflow
 

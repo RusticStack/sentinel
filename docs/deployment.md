@@ -1,31 +1,10 @@
 # Deployment
 
-How a Sentinel release is built, packaged and verified, and how the controller and a worker run under systemd. The tasks are V01 (release packages) and V02 (the server and worker units); container examples and the TLS/ingress guide stay open under V02 in [TODO](../TODO.md). Configuration is in [configuration](configuration.md), upgrades in [upgrades](upgrades.md), the web process in [web interface](web-ui.md).
+How the controller and a worker run under systemd. The tasks are V01 ([release packages](releasing.md)) and V02 (the server and worker units); container examples and the TLS/ingress guide stay open under V02 in [TODO](../TODO.md). Configuration is in [configuration](configuration.md), upgrades in [upgrades](upgrades.md), the web process in [web interface](web-ui.md).
 
 ## Release packages
 
-`scripts/release/package.sh build` builds and packages the architecture of the host it runs on, from the checkout it is in, with `cargo build --locked --release` (a dependency change must already be in the committed `Cargo.lock`). Run it once on an x86_64 and once on an arm64 Linux host. It refuses a working tree with uncommitted changes to tracked files; `--allow-dirty` marks the package `dirty: true` in its `BUILD-INFO` for development use.
-
-| Package | Contents | Built as |
-|---|---|---|
-| `sentinel-<version>-<arch>-linux-server.tar.gz` | `bin/sentinel`, the server unit, the web unit, `server.toml` | `-p sentinel --features server` |
-| `sentinel-<version>-<arch>-linux-worker.tar.gz` | `bin/sentinel`, the worker unit, `worker.toml` | `-p sentinel --features worker` |
-| `sentinel-<version>-<arch>-linux-cli.tar.gz` | `bin/sentinel` (`pipeline`, `api`, `auth`, `mcp`; no role) | `-p sentinel`, default features |
-| `sentinel-agent-<version>-<arch>-linux-musl.tar.gz` | `bin/sentinel-agent`, the static guest `/init` of microVM jobs | `-p sentinel-agent --target <arch>-unknown-linux-musl` |
-
-`<arch>` is `x86_64` or `aarch64`; every archive has one top directory named like the archive, the `LICENSE` and a `BUILD-INFO` naming the package, version, commit, dirty flag, architecture and `rustc`. The role packages are separate binaries on purpose: a worker host carries no controller code and the reverse. `SHA256SUMS` lists every archive. The agent needs the musl standard library of the target (`rustup target add x86_64-unknown-linux-musl`, or the aarch64 one on arm64); `--skip-agent` leaves it out.
-
-Archives are deterministic for a given binary (sorted entries, the commit's timestamp, numeric root ownership, `gzip -n`). The binaries are not claimed to be bit-for-bit reproducible across hosts or toolchain installs.
-
-Not in the set yet (V01 stays open): the Windows CLI, a dependency and license inventory, and an `aarch64` Linux CLI built by cross-compilation (each architecture is built natively).
-
-### Verifying a release
-
-```sh
-scripts/release/package.sh verify --out <dir>
-```
-
-or, without the repository, `sha256sum --check --strict SHA256SUMS` in the directory holding the archives. `verify` checks the sums, that every archive is listed and holds the files above, that each `bin/sentinel` runs (`--version`), and that the agent has no program interpreter (static). `build` runs it as its last step and fails when it does.
+What a release contains, how to build it on each architecture, how to verify a download, the digest manifest, reproducibility and the dependency and license inventory are in [releasing](releasing.md). This page covers running the packages: the units and the release profile.
 
 ### Release profile
 
