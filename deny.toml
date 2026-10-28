@@ -35,7 +35,7 @@ allow = [
 confidence-threshold = 0.9
 
 [bans]
-multiple-versions = "allow"
+multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
 
