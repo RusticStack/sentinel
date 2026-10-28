@@ -1,6 +1,6 @@
 # Deployment
 
-How a Sentinel release is built, packaged and verified, and how the controller runs under systemd. The tasks are V01 (release packages) and V02 (the server unit); the worker unit, container examples and the TLS/ingress guide stay open under V02 in [TODO](../TODO.md). Configuration is in [configuration](configuration.md), upgrades in [upgrades](upgrades.md), the web process in [web interface](web-ui.md).
+How a Sentinel release is built, packaged and verified, and how the controller and a worker run under systemd. The tasks are V01 (release packages) and V02 (the server and worker units); container examples and the TLS/ingress guide stay open under V02 in [TODO](../TODO.md). Configuration is in [configuration](configuration.md), upgrades in [upgrades](upgrades.md), the web process in [web interface](web-ui.md).
 
 ## Release packages
 
@@ -9,7 +9,7 @@ How a Sentinel release is built, packaged and verified, and how the controller r
 | Package | Contents | Built as |
 |---|---|---|
 | `sentinel-<version>-<arch>-linux-server.tar.gz` | `bin/sentinel`, the server unit, the web unit, `server.toml` | `-p sentinel --features server` |
-| `sentinel-<version>-<arch>-linux-worker.tar.gz` | `bin/sentinel`, `worker.toml` | `-p sentinel --features worker` |
+| `sentinel-<version>-<arch>-linux-worker.tar.gz` | `bin/sentinel`, the worker unit, `worker.toml` | `-p sentinel --features worker` |
 | `sentinel-<version>-<arch>-linux-cli.tar.gz` | `bin/sentinel` (`pipeline`, `api`, `auth`, `mcp`; no role) | `-p sentinel`, default features |
 | `sentinel-agent-<version>-<arch>-linux-musl.tar.gz` | `bin/sentinel-agent`, the static guest `/init` of microVM jobs | `-p sentinel-agent --target <arch>-unknown-linux-musl` |
 
@@ -82,3 +82,74 @@ scripts/release/check-server-unit.sh <path to a --features server binary>
 ```
 
 as an unprivileged user with a user systemd instance (SQLite calls `fchown` when it runs as root, which the unit's system call filter forbids; the `sentinel` account never makes that call), it runs `systemd-analyze verify` on the unit, requires `systemd-analyze security --offline=true` to score the unit no worse than 1.5 overall, starts a copy in the calling user's systemd instance with every sandbox directive kept (only the account, the unit name, the paths, `ProtectHome=read-only` because a user instance keeps its state under the home directory, and the directives that work by dropping capabilities — the capability sets, `PrivateDevices`, `ProtectClock`, `ProtectKernelModules`, `ProtectKernelLogs` — which an unprivileged user instance cannot apply, differ; `systemd-analyze security` covers those on the shipped unit), and requires `GET /api/v1/health` to answer from a temporary data directory and a `SIGTERM` stop to be a clean exit. It writes only below `~/.local/state/sentinel-unit-check` and removes it.
+
+## A worker as a systemd service
+
+[`examples/sentinel-worker.service`](../examples/sentinel-worker.service) runs `sentinel worker` (the rootless-Podman executor, optionally the Firecracker executor and the Tailcat helper) under its own `sentinel-worker` account and `/var/lib/sentinel-worker`. It shares nothing with the controller unit: a worker host has no database and no master key, and a job that escapes its container reaches an account with neither.
+
+The account is unprivileged and the unit **refuses to run as root**: a first `ExecStartPre` exits with status 2 (a configuration error, never retried) when the effective user id is 0, whatever `User=` was edited to. Rootless Podman needs three things from the account, none of which the unit can create by itself:
+
+- **Subordinate ids** that overlap no other account (`/etc/subuid`, `/etc/subgid`), and the setuid `newuidmap`/`newgidmap` helpers (package `uidmap`).
+- **A user manager** (`user@<uid>.service`), started by `loginctl enable-linger`. Job limits are enforced by a systemd user scope per job that the executor creates over the account's user bus (`systemd-run --user --scope`, also the microVM executor's cgroup); without the manager there is no `XDG_RUNTIME_DIR` and no limits, so the unit's second `ExecStartPre` refuses to start (status 1, retried: at boot the manager may still be coming up).
+- **`/dev/kvm`** for microVMs, on a host that has it: add the account to the `kvm` group. Omit `[microvm]` elsewhere.
+
+```sh
+useradd --system --create-home --home-dir /var/lib/sentinel-worker \
+        --shell /usr/sbin/nologin sentinel-worker
+usermod --add-subuids 300000-365535 --add-subgids 300000-365535 sentinel-worker
+loginctl enable-linger sentinel-worker
+tar -xzf sentinel-<version>-<arch>-linux-worker.tar.gz
+install -D -m 0755 sentinel-*/bin/sentinel /opt/sentinel/bin/sentinel
+install -d -o root -g sentinel-worker -m 0750 /etc/sentinel
+install -o root -g sentinel-worker -m 0640 sentinel-*/examples/worker.toml /etc/sentinel/worker.toml
+install -m 0644 sentinel-*/examples/sentinel-worker.service /etc/systemd/system/
+```
+
+The home directory is the data directory on purpose: Podman keeps its images and containers under `~/.local/share/containers`, so one writable tree (`StateDirectory=sentinel-worker`) holds everything and `ProtectHome=read-only` needs no exception. Pick subordinate id ranges that do not collide with existing ones (`/etc/subuid`, `/etc/subgid`).
+
+A system unit cannot name the account's numeric id, so the wiring to its user manager is a drop-in written once at install time:
+
+```sh
+uid=$(id -u sentinel-worker)
+install -d /etc/systemd/system/sentinel-worker.service.d
+cat >/etc/systemd/system/sentinel-worker.service.d/session.conf <<EOF
+[Unit]
+Requires=user@$uid.service
+After=user@$uid.service
+[Service]
+Environment=XDG_RUNTIME_DIR=/run/user/$uid
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus
+ReadWritePaths=/run/user/$uid
+EOF
+systemctl daemon-reload
+```
+
+Edit `/etc/sentinel/worker.toml` (controller address and fingerprint, enrollment, [configuration](configuration.md)), check it as the account (`runuser -u sentinel-worker -- /opt/sentinel/bin/sentinel worker --check --config /etc/sentinel/worker.toml --data-dir /var/lib/sentinel-worker`), then `systemctl enable --now sentinel-worker`. `ReadWritePaths` is there because `ProtectSystem=strict` would otherwise make the runtime directory read-only, and Podman keeps its run state in it.
+
+What the unit sets:
+
+- **Ordering.** After `network-online.target` only. The Tailcat helper is a child process of the worker (`[tailcat]` in `worker.toml`), not a unit, so there is no helper unit to order against; a worker redials with back-off until the controller answers. On the controller's own host add `After=sentinel-server.service` in a drop-in so a boot does not spend its first back-off on a controller that is still starting.
+- **Restart.** As the controller: `Restart=on-failure` after two seconds, status 2 not retried, five starts in five minutes stop the unit. `TimeoutStopSec=60s` covers a drain (attempts handed back, sessions closed in 2 s, store drained in 5 s).
+- **Limits.** `MemoryMax=2G`, `TasksMax=4096`, `LimitNOFILE=65536`, `LimitCORE=0`: starting points for the worker process, its `git` and `podman` clients and the helper. **Jobs are not in this cgroup**: each runs in a user scope under `user@<uid>.service`, limited by its own job resources and by the worker's `cpu_millis` and `memory_bytes`. To cap the account as a whole, set `CPUQuota=`, `MemoryMax=` and `TasksMax=` on `user-<uid>.slice` with `systemctl set-property`.
+- **Sandbox.** Weaker than the controller's, on purpose. Left on: `ProtectSystem=strict` (state directory and `/run/user/<uid>` writable), `ProtectHome=read-only` (`yes` would hide `/run/user`), private `/tmp`, private mounts, `RemoveIPC`, `DevicePolicy=closed` allowing only `/dev/fuse` (fuse-overlayfs), `/dev/net/tun` (pasta, `job_network = "egress"`) and `/dev/kvm`, and a capability bounding set of `CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_SYS_ADMIN`. Left out: `NoNewPrivileges` (it disables the setuid helpers), `PrivateDevices`, the `Protect*` kernel switches and `RestrictNamespaces` (rootless Podman is built on user and mount namespaces), and every seccomp-based directive (`SystemCallFilter`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies`): the filter would be inherited by every job process through conmon. `TMPDIR` is `/var/lib/sentinel-worker/tmp`, so image layers are staged on the data disk. `scripts/release/check-worker-unit.sh` fails if `systemd-analyze security` scores the unit worse than 7.0.
+
+The system-scope unit with its drop-in (account switch, capability bounding set, device policy) has been checked by `systemd-analyze` only; starting it needs root on a host reserved for it, and it has not been started on one.
+
+### A user unit instead
+
+Where a system unit and a drop-in are unwelcome, the same file runs in the account's own manager, which lingering keeps up without a login. Copy the unit to `~sentinel-worker/.config/systemd/user/sentinel-worker.service` and delete what a user instance cannot apply: `User=`, `Group=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`, `DevicePolicy=` and `DeviceAllow=`. The two `ExecStartPre` lines still work (a user instance never runs as root and always has its bus). Set `WantedBy=default.target` and `ReadWritePaths=%t`. The `StateDirectory=` of a user instance is below `~/.local/state`, so pass that `--data-dir` and `TMPDIR`, or keep `/var/lib/sentinel-worker` and name it in `ReadWritePaths=`. Then, as the account with `XDG_RUNTIME_DIR=/run/user/<uid>` set:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now sentinel-worker
+```
+
+`loginctl enable-linger` is what makes it start at boot and survive logouts. `check-worker-unit.sh` builds exactly this copy and starts it.
+
+### Checking the unit
+
+```sh
+scripts/release/check-worker-unit.sh <path to a --features worker binary>
+```
+
+as the unprivileged worker account (or any unprivileged user) with a user systemd instance. The script refuses root. It runs `systemd-analyze verify` on the unit (nothing may be reported about it), requires `systemd-analyze security --offline=true` to score it no worse than 7.0 overall, starts a user-instance copy that keeps every sandbox directive a user instance can apply (only the account, the unit name, the paths, the capability and device directives, and `ReadWritePaths=%t` differ) and requires `sentinel worker --check` to report `worker configuration valid`. When rootless Podman answers for the account it also starts the worker proper against an address nothing listens on, with Podman's storage, runtime and temporary directories pointed into the test's state directory, and requires the `executor_ready` event and a `SIGTERM` stop that is a clean exit. It writes only below `~/.local/state/sentinel-worker-unit-check` and removes it.

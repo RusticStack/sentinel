@@ -56,7 +56,7 @@ version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' 
 expected() {
   case "$1" in
     server) echo "bin/sentinel BUILD-INFO LICENSE examples/server.toml examples/sentinel-server.service examples/sentinel-web.service" ;;
-    worker) echo "bin/sentinel BUILD-INFO LICENSE examples/worker.toml" ;;
+    worker) echo "bin/sentinel BUILD-INFO LICENSE examples/worker.toml examples/sentinel-worker.service" ;;
     cli) echo "bin/sentinel BUILD-INFO LICENSE" ;;
     agent) echo "bin/sentinel-agent BUILD-INFO LICENSE" ;;
   esac
@@ -144,7 +144,7 @@ package() {
 cargo build --locked --release -p sentinel --features server
 package server "$target_dir/release/sentinel" examples/server.toml examples/sentinel-server.service examples/sentinel-web.service
 cargo build --locked --release -p sentinel --features worker
-package worker "$target_dir/release/sentinel" examples/worker.toml
+package worker "$target_dir/release/sentinel" examples/worker.toml examples/sentinel-worker.service
 cargo build --locked --release -p sentinel
 package cli "$target_dir/release/sentinel"
 if [ $skip_agent = 0 ]; then
