@@ -4,7 +4,7 @@ The human web interface is its own process, `sentinel-web`: a Nuxt 4 server (Vue
 
 The web interface is optional: the controller, CLI and MCP work without it.
 
-Planned: a TanStack Start application replaces this Nuxt one view by view, keeping the process role, the Views table below as its parity checklist and the browser test, with budgets against a measured baseline of this interface ([plan 16.4](../plan.md#164-web-interface-on-tanstack-start), `TODO.md` Part 20). This page describes the Nuxt interface in service today.
+In progress: a TanStack Start application ([`web-start/`](../web-start)) replaces this Nuxt one view by view, keeping the process role, the Views table below as its parity checklist and the browser test, with budgets against a measured baseline of this interface ([plan 16.4](../plan.md#164-web-interface-on-tanstack-start), `TODO.md` Part 20, [below](#tanstack-start-interface)). Until the cut-over (U15) the rest of this page describes the Nuxt interface in service.
 
 ## Architecture
 
@@ -177,6 +177,32 @@ Several choices in `web/test/ui.mjs` exist to keep it deterministic on a loaded 
 - The account-security scenario submits one wrong authenticator code on purpose. A session is revoked after five wrong proofs ([step-up](step-up.md)), so any added wrong-code step has to stay inside that limit.
 
 The setup wizard itself (its steps, resuming after a refresh, the mail test's answers, the authenticator after setup) is not exercised in a browser: it needs a second seed with no administrator in `web_browser.rs`.
+
+## TanStack Start interface
+
+`web-start/` is the replacement `sentinel-web`: TanStack Start with React 19 and Tailwind CSS v4 (CSS-first configuration, `src/styles.css`), built by the Vite plugin with the Nitro Node preset into `.output/server/index.mjs` and run as its own Node process with server-side rendering, exactly like the Nuxt one (never a static build). Versions are pinned exactly in `web-start/pnpm-lock.yaml`; the repository's supply-chain rule (`minimumReleaseAge`, seven days) decides the newest version that may be installed, so `@tanstack/react-start` is 1.169.3 while 1.169.4 (published 2026-10-22) is younger than the rule allows.
+
+- **One origin, same rules.** `src/server.ts` is the server entry. It relays the controller's routes under the same allowlist (`src/server/guard.ts`, the Nuxt `classifyProxyPath` and `clientAddress` unchanged), the same body ceilings and the same client-address handling, and serves `/_stream/run/<id>` and `/_stream/log/<attempt>` itself with the same event names, ids and payloads, so the browser's `EventSource` code and `Last-Event-ID` resumption are unchanged. The controller address and the header rules live in server-only modules and never reach the browser bundle.
+- **Reading data.** Route loaders call one isomorphic helper (`src/lib/api.ts`): during the server render it reads the controller directly with the browser's own cookie (`src/lib/api.server.ts`, a server-only module); in the browser it calls the same-origin proxied API. The server render only reads. Mutations are made in the browser with the session's CSRF secret, through the same step-up and refusal handling as before (`src/lib/act.tsx`). No server function is used, so the interface adds no endpoint of its own and the CSRF model is the controller's.
+- **Rendering and the policy.** Pages are rendered whole (`defaultRenderHandler`), not streamed, so every inline script Start writes, including the router's dehydrated state, is known before the headers are sent: the entry hashes each inline script and style element of that response into `script-src`/`style-src` (`src/server/csp.ts`), with no `unsafe-inline` and no nonce; style attributes stay allowed as before. The log viewer route is `ssr: 'data-only'`: its data is read on the server and the windowed DOM is built in the browser by the unchanged `logviewer.ts`. The colour theme is a `sentinel-theme` cookie the server renders as a class on `<html>`, so it needs no inline script.
+- **Strangler.** While `SENTINEL_LEGACY_ORIGIN` names the Nuxt process on loopback, the front serves only the paths listed in `src/lib/owned.ts` and forwards every other page to the Nuxt process (same origin, same cookie); in the browser a link to an unowned path is followed with a full page load. A view is added to that list once its browser checks pass. With no legacy origin the Start application answers every path.
+- **Public landing page.** `/` shows a signed-out visitor what Sentinel is with Sign in and Sign up; a signed-in person is sent on, as before, to a pending return, the last tenant used or the first one.
+- **GitHub App setup.** `/setup/github` (platform administrators) creates the deployment's GitHub App from the controller's manifest and lets tenant administrators install it; `/setup/github/created` and `/setup/github/installed` are where GitHub sends the browser back. They only relay the code and state to the controller ([GitHub App](github-app.md)); the page policy of `/setup/github` alone adds `https://github.com` to `form-action` for the manifest form.
+
+| Setting | Meaning |
+|---|---|
+| `SENTINEL_API` | the controller's `api_listen` (default `http://127.0.0.1:7080`); `NUXT_SENTINEL_API` is accepted for one release |
+| `SENTINEL_CLIENT_IP_HEADER` | as `NUXT_CLIENT_IP_HEADER` above, which is accepted for one release |
+| `SENTINEL_LEGACY_ORIGIN` | during the migration only: the Nuxt process on loopback that serves the views not moved yet |
+| `HOST`, `PORT` | where it listens |
+
+```sh
+pnpm -C web-start install --frozen-lockfile
+pnpm -C web-start build        # writes web-start/.output
+SENTINEL_API=http://127.0.0.1:7080 HOST=127.0.0.1 PORT=3000 node web-start/.output/server/index.mjs
+```
+
+Verification uses the same harness: `SENTINEL_WEB_SERVER=web-start/.output/server/index.mjs` makes `web_browser.rs` start the Start application instead of the Nuxt one (so `web/test/ui.mjs` runs against it), `SENTINEL_WEB_FRONT` starts it as the front with the Nuxt process behind it (`the_start_shell_in_a_real_browser`, `web-start/test/shell.mjs`), and `pnpm -C web-start test:unit` runs the guard, onboarding and QR unit tests. `measure_the_web_interface` (`web/bench/web-bench.mjs`) measures either interface the same way: shipped JavaScript per first view, server render time per view, resident memory, stream CPU and log-view work per scroll jump; [`bench/u08-web-baseline.jsonl`](../bench/u08-web-baseline.jsonl) is the Nuxt baseline it is compared with.
 
 ## Known limits
 
