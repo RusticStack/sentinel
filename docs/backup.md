@@ -89,7 +89,7 @@ The objectives are **RPO at most 1 hour** and **RTO at most 15 minutes for 100 G
 | RPO, logs | the same | the backup interval (finished logs also reach S3 once settled, when configured) |
 | **Recovery time** (RTO) | at most 15 min for 100 GiB | copying the backup back plus opening the store; it scales with bytes, not with rows |
 
-**Recovery time, and how it is measured.** A restore is an I/O-bound sequential copy that rehashes as it goes, so the time is bytes over the backup volume's read rate and the data volume's write rate, plus a store open of tens of milliseconds. The drill (`backup_drill.rs`, below) builds a deployment, takes a full and an incremental backup, verifies, restores into a second directory and opens it, printing `restore_s_per_gib` and the 100 GiB extrapolation (`rto_100gib_extrapolated_s`). The objective holds on a deployment when that extrapolation, measured **on that deployment's own disks with a cold cache**, is below 900 s. The drill sizes itself with `SENTINEL_DRILL_BIG` (the number of 1 MiB objects, 2048 by default; 102400 is the objective's size and needs about three times that in free disk: the data, the backup and the restore).
+**Recovery time, and how it is measured.** A restore is an I/O-bound sequential copy that rehashes as it goes, so the time is bytes over the backup volume's read rate and the data volume's write rate, **plus the recovery scan**: opening the restored store as a controller does rehashes every committed object (`objects.recover`), a second full read of the data. Both scale with bytes. The drill (`backup_drill.rs`, below) builds a deployment, takes a full and an incremental backup, verifies, restores into a second directory and opens it, printing `restore_s_per_gib` and the 100 GiB extrapolation (`rto_100gib_extrapolated_s`). The objective holds on a deployment when that extrapolation, measured **on that deployment's own disks with a cold cache and without competing load**, is below 900 s. The drill sizes itself with `SENTINEL_DRILL_BIG` (the number of 1 MiB objects, 2048 by default; 102400 is the objective's size and needs about three times that in free disk: the data, the backup and the restore).
 
 Measured on the verification VPS (12 vCPU AMD EPYC 9645, ext4 on a virtio disk), `crates/sentinel-store/tests/backup_drill.rs`, release build; see the record in [`bench/r04-backup-drill.jsonl`](../bench/r04-backup-drill.jsonl):
 
@@ -101,9 +101,21 @@ Measured on the verification VPS (12 vCPU AMD EPYC 9645, ext4 on a virtio disk),
 | Restore: copy back, rehashing | 16.8 s | 2.8 GiB |
 | Restore: open, migrate, recover | 28 ms | the restored directory |
 
-So recovery time is about **6 seconds per GiB** of backed-up data on the reference disk, and the database's share is negligible: at that rate 100 GiB restores in about 10 minutes, and a controller start after it takes seconds. The objective adopted from this measurement is **RTO ≤ 15 minutes for up to 100 GiB** (an extrapolation of a linear, I/O-bound copy). The drill ran with CPU pressure under 1 %; the data had just been written, so part of it was likely still in the page cache, and a cold restore from a slower backup volume takes longer, which is what the margin is for.
+That run restored 2.8 GiB at about **6 seconds per GiB**, with the page cache still holding most of the data; its 28 ms for the open step reflects that, since the scan rehashes every object. The objective adopted from it is **RTO ≤ 15 minutes for up to 100 GiB**, an extrapolation of a linear, I/O-bound copy.
 
-**Not yet measured at the objective's size.** The 2.8 GiB record above is the largest drill on record. No drill has restored 100 GiB, so the extrapolation is unconfirmed. Confirming it needs a host with about 300 GiB of free disk and a quiet window, and is tracked in the R04 item of the tracker.
+The larger drill on the same host (16.75 GiB, `SENTINEL_DRILL_BIG=16384`, run under `nice -n 19 ionice -c3` on a host shared with other work, so I/O ran at idle priority; the cache was not dropped) does not confirm it:
+
+| Step | Time | For |
+|---|---|---|
+| Full backup, online | 138 s | 17,384 objects (16,388 MiB), 200 finished logs (760 MiB), 20,000 runs of metadata |
+| Incremental backup, nothing new | 37.7 s | rehashing every reused copy, a full read of the shared store |
+| Verify (rehash everything) | 36.7 s | the full backup |
+| Restore: copy back, rehashing | 134 s | 16.75 GiB |
+| Restore: open, migrate, recover | 46 s | the recovery scan |
+
+That is **10.8 s per GiB** end to end, which extrapolates to about **1,077 s (18 min) for 100 GiB, over the 900 s objective**. The run was not on a quiet host, so it neither proves the objective unreachable nor meets it: the objective stays unconfirmed (below). Two consequences hold either way. A backup reads the whole shared store again to rehash reused copies, so an incremental backup costs a read of the data, not the 0.3 s of the small drill (about 225 s at 100 GiB at the rate above); and a first full backup of 100 GiB extrapolates to about 14 min, more than the 10 minutes the default interval leaves, so seed a large deployment with an offline `admin backup create` before relying on the schedule.
+
+**Not yet measured at the objective's size.** The 16.75 GiB record above is the largest drill on record. No drill has restored 100 GiB, and the extrapolation from the one that came closest exceeds the objective under load. Settling it needs the reference host on a quiet window with about 300 GiB of free disk (the data, the backup and the restore), and either result goes into `bench/r04-backup-drill.jsonl`. If a quiet run still extrapolates past 900 s, the objective or the design (skipping the recovery scan after a verified restore, or an incremental backup that does not rehash unchanged copies) has to change; neither is done. This is tracked in the R04 item of the tracker.
 
 ## Tests
 

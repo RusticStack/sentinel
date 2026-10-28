@@ -22,4 +22,4 @@ A restored controller's workers reconcile what they held against it, as after an
 - A same-length bit flip in a backup's shared object store is replaced by the next backup (it rehashes a reused copy) and refused by a restore, but between those two it survives until someone runs `admin backup verify`. Verify on a schedule.
 - The kill drills use SIGKILL of a process, which drops its unflushed state but not the page cache; they do not show what a power cut that loses cached writes does. The backup's fsyncs and rename order are what that rests on.
 - Garbage collection and the storage sweep are shown interrupted by rolled-back commits and unlink races, not by a killed process; a killed one only leaves what the sweep already collects.
-- No drill has restored a 100 GiB deployment: the recovery-time objective at that size is an extrapolation ([backup](backup.md#recovery-objectives)).
+- No drill has restored a 100 GiB deployment. The 16.75 GiB drill, run under idle I/O priority on a shared host, extrapolates to 18 minutes against a 15-minute objective, so the recovery-time objective at that size is unconfirmed ([backup](backup.md#recovery-objectives)).
