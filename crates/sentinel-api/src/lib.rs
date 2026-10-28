@@ -14,7 +14,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize},
     },
     time::Duration,
 };
@@ -31,6 +31,14 @@ pub const CONNECTIONS: usize = 64;
 /// Connections one peer address (an IPv6 /64 counts as one) may hold; a configured reverse proxy is exempt.
 pub const CONNECTIONS_PER_PEER: usize = 16;
 pub const PUBLIC_BODIES: usize = 4;
+/// Public body slots that clients behind a trusted proxy hold together; the rest are for direct clients.
+pub const PROXY_BODIES: usize = 3;
+/// The longest a client behind a trusted proxy holds a public body slot (direct clients: 10 s).
+pub const PROXY_BODY_TIME: Duration = Duration::from_secs(5);
+const _: () = assert!(
+    PROXY_BODIES >= 1 && PROXY_BODIES < PUBLIC_BODIES,
+    "forwarded clients must leave a public body slot for direct ones"
+);
 pub const LOG_WAIT: Duration = Duration::from_secs(25);
 pub const TRANSFERS: usize = 3;
 pub const SUBSCRIBERS: usize = 32;
@@ -119,6 +127,8 @@ pub(crate) struct State {
     pub mail: Option<Arc<sentinel_mail::Resend>>,
     pub setup_mail: Outbound,
     pub setup_closed: AtomicBool,
+    /// Until when (milliseconds since the first status request) the last store read of "setup is open" stands.
+    pub setup_open_until: AtomicU64,
     pub store: Arc<Store>,
     pub logs: Arc<LogStore>,
     pub objects: Arc<Objects>,
@@ -240,6 +250,7 @@ impl Server {
             mail: options.mail,
             setup_mail: Outbound::default(),
             setup_closed: AtomicBool::new(false),
+            setup_open_until: AtomicU64::new(0),
             store: config.store,
             logs: config.logs,
             objects: config.objects,

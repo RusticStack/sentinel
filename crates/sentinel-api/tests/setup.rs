@@ -123,6 +123,8 @@ fn status_says_only_whether_setup_is_open() {
         UnixMillis::now(),
     )
     .unwrap();
+    // The open answer is cached for a second (see the cache test below).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     let (_, _, closed) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
     assert_eq!(closed, json!({ "open": false, "mail_configured": false }));
 }
@@ -210,6 +212,79 @@ fn guessing_is_throttled_and_a_locked_setup_refuses_the_right_token() {
     let (status, _, _) = post(&f, "/api/v1/setup", &body(&token_text(&token)));
     assert!(status == 403 || status == 429, "{status}");
     assert!(f.store.read(setup::is_open).unwrap());
+}
+
+#[test]
+fn an_open_answer_is_cached_briefly_and_a_closure_shows_after_it() {
+    let f = fresh();
+    let (_, _, open) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
+    assert_eq!(open["open"], true);
+    local_auth::bootstrap(
+        &f.store,
+        "root",
+        "Root",
+        b"an operator password",
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let (_, _, cached) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
+    assert_eq!(
+        cached["open"], true,
+        "answered from the cache, not the store"
+    );
+    // `admin bootstrap` runs in another process and cannot tell this one: the cached answer may lag
+    // the closure by its lifetime, never longer.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (_, _, closed) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
+    assert_eq!(closed["open"], false);
+}
+
+#[test]
+fn the_status_route_has_an_admission_budget_while_setup_is_open() {
+    let f = fresh();
+    let client = [("x-forwarded-for", "198.51.100.7")];
+    let statuses: Vec<u16> = (0..14)
+        .map(|_| call(&f.base, "GET", "/api/v1/setup", None, &client).0)
+        .collect();
+    assert_eq!(statuses[..10], [200; 10], "{statuses:?}");
+    assert!(statuses[10..].contains(&429), "{statuses:?}");
+    // Another client is unaffected by the first one's spent allowance.
+    let other = [("x-forwarded-for", "198.51.100.8")];
+    assert_eq!(call(&f.base, "GET", "/api/v1/setup", None, &other).0, 200);
+}
+
+#[test]
+fn a_locked_setup_is_escaped_by_the_host_local_bootstrap() {
+    let f = fresh();
+    let token = setup::issue(&f.store, UnixMillis::now()).unwrap().unwrap();
+    for _ in 0..5 {
+        let guess = token_text(&Secret::generate());
+        let _ = call(
+            &f.base,
+            "POST",
+            "/api/v1/setup",
+            Some(&body(&guess)),
+            &[("x-forwarded-for", "198.51.100.9")],
+        );
+    }
+    let (status, _, _) = call(
+        &f.base,
+        "POST",
+        "/api/v1/setup",
+        Some(&body(&token_text(&token))),
+        &[("x-forwarded-for", "198.51.100.10")],
+    );
+    assert!(status == 403 || status == 429, "{status}");
+    // The lock stops the web wizard only; the operator's shell still completes setup.
+    local_auth::bootstrap(
+        &f.store,
+        "root",
+        "Root",
+        b"an operator password",
+        UnixMillis::now(),
+    )
+    .unwrap();
+    assert!(!f.store.read(setup::is_open).unwrap());
 }
 
 #[test]

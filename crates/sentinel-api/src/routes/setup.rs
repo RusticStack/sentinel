@@ -31,7 +31,7 @@ pub(super) fn route(
     parts: &[&str],
 ) -> Option<Route> {
     Some(match (method, parts) {
-        ("GET", ["api", "v1", "setup"]) => status(state),
+        ("GET", ["api", "v1", "setup"]) => status(state, request),
         ("POST", ["api", "v1", "setup"]) => complete(state, request),
         ("POST", ["api", "v1", "setup", "mail-test"]) => mail_test(state, request),
         ("POST", ["api", "v1", "orgs"]) => create_organization(state, request),
@@ -49,22 +49,56 @@ fn setup_error(error: StoreError) -> ApiError {
     }
 }
 
-fn status(state: &State) -> Route {
+/// How long a store read that found setup open stands. `admin bootstrap` runs in another process and
+/// cannot tell this one, so an answer may lag a closure by this long; the wizard closing it in this
+/// process takes effect at once.
+const OPEN_TTL_MS: u64 = 1_000;
+
+/// A monotonic millisecond clock for the status cache: no allocation, no wall-clock jumps.
+fn now_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    u64::try_from(
+        EPOCH
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Whether setup is open. Once closed it stays closed, so that answer is one atomic load and spends no
+/// budget; an open one is admitted per client and answered from a one-second cache before the store.
+fn status(state: &State, request: &Request) -> Route {
     use std::sync::atomic::Ordering;
-    let open = if state.setup_closed.load(Ordering::Acquire) {
-        false
-    } else {
-        let open = state.store.read(setup::is_open).map_err(store_error)?;
-        if !open {
-            state.setup_closed.store(true, Ordering::Release);
-        }
-        open
+    let body = |open: bool| {
+        Ok(Reply::Json(
+            200,
+            json!({ "open": open, "mail_configured": open && state.mail.is_some() }),
+            vec![header("cache-control", "no-store")],
+        ))
     };
-    Ok(Reply::Json(
-        200,
-        json!({ "open": open, "mail_configured": open && state.mail.is_some() }),
-        vec![header("cache-control", "no-store")],
-    ))
+    if state.setup_closed.load(Ordering::Acquire) {
+        return body(false);
+    }
+    if !crate::oauth::admitted(state, request, Budget::SetupStatus) {
+        return Err(
+            err(ErrorCode::RateLimited, "too many requests; retry later")
+                .with_detail("retry_after_ms", 2_000),
+        );
+    }
+    let now = now_ms();
+    if now < state.setup_open_until.load(Ordering::Acquire) {
+        return body(true);
+    }
+    let open = state.store.read(setup::is_open).map_err(store_error)?;
+    if open {
+        state
+            .setup_open_until
+            .store(now.saturating_add(OPEN_TTL_MS), Ordering::Release);
+    } else {
+        state.setup_closed.store(true, Ordering::Release);
+    }
+    body(open)
 }
 
 fn public_json(state: &State, request: &mut Request, budget: Budget) -> Result<Vec<u8>, ApiError> {

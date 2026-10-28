@@ -43,6 +43,7 @@ pub(crate) enum Budget {
     Signup,
     Mail,
     Setup,
+    SetupStatus,
     Organization,
 }
 
@@ -62,6 +63,8 @@ const MAIL_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(15), 8);
 const MAIL_CEILING: Rate = Rate::per_sec(5, 20);
 const SETUP_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(10), 5);
 const SETUP_CEILING: Rate = Rate::per_sec(1, 5);
+const SETUP_STATUS_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(2), 10);
+const SETUP_STATUS_CEILING: Rate = Rate::per_sec(20, 40);
 const ORGANIZATION_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(10), 5);
 const ORGANIZATION_CEILING: Rate = Rate::per_sec(2, 10);
 
@@ -85,6 +88,7 @@ pub(crate) struct OAuthState {
     pub signup_budget: Mutex<Limiter>,
     pub mail_budget: Mutex<Limiter>,
     pub setup_budget: Mutex<Limiter>,
+    pub setup_status_budget: Mutex<Limiter>,
     pub organization_budget: Mutex<Limiter>,
     pub client_metadata: client::MetadataCache,
     pub device_polls: Mutex<HashMap<[u8; 32], (Instant, u32)>>,
@@ -130,6 +134,11 @@ impl OAuthState {
             signup_budget: Mutex::new(Limiter::new(SIGNUP_CLIENT, Some(SIGNUP_CEILING), now)),
             mail_budget: Mutex::new(Limiter::new(MAIL_CLIENT, Some(MAIL_CEILING), now)),
             setup_budget: Mutex::new(Limiter::new(SETUP_CLIENT, Some(SETUP_CEILING), now)),
+            setup_status_budget: Mutex::new(Limiter::new(
+                SETUP_STATUS_CLIENT,
+                Some(SETUP_STATUS_CEILING),
+                now,
+            )),
             organization_budget: Mutex::new(Limiter::new(
                 ORGANIZATION_CLIENT,
                 Some(ORGANIZATION_CEILING),
@@ -322,6 +331,7 @@ pub(crate) fn admitted(state: &State, request: &Request, budget: Budget) -> bool
         Budget::Signup => take(&oauth.signup_budget),
         Budget::Mail => take(&oauth.mail_budget),
         Budget::Setup => take(&oauth.setup_budget),
+        Budget::SetupStatus => take(&oauth.setup_status_budget),
         Budget::Organization => take(&oauth.organization_budget),
     }
 }
