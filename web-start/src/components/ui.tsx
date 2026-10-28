@@ -3,7 +3,7 @@
 import { forwardRef, useEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type TextareaHTMLAttributes } from "react";
 import { Link } from "@tanstack/react-router";
 import {
-  Button as AriaButton, Dialog, Header, Heading, ListBox, ListBoxItem, ListBoxSection, Menu, MenuItem, MenuSection, MenuTrigger,
+  Button as AriaButton, Dialog, Header, Heading, Label, ListBox, ListBoxItem, ListBoxSection, Menu, MenuItem, MenuSection, MenuTrigger,
   Modal, ModalOverlay, Popover, Select as AriaSelect, SelectValue, Separator,
 } from "react-aria-components";
 import { ICONS } from "./icons.ts";
@@ -191,7 +191,7 @@ export function Select({ id, label, ariaLabel, value, onChange, items, groups, p
   return (
     <AriaSelect selectedKey={value ?? null} onSelectionChange={(k) => k !== null && onChange(String(k))} isDisabled={isDisabled}
       aria-label={label ? undefined : ariaLabel} placeholder={placeholder} className={cx("space-y-1", className)}>
-      {label ? <span className={labelHidden ? "sr" : "block text-sm font-medium text-strong"} id={id ? `${id}-label` : undefined}>{label}</span> : null}
+      {label ? <Label className={labelHidden ? "sr" : "block text-sm font-medium text-strong"}>{label}</Label> : null}
       <AriaButton id={id} aria-label={ariaLabel} className={cx(INPUT, "flex items-center gap-2 text-left cursor-pointer")}>
         {icon || find?.icon ? <Icon name={(find?.icon ?? icon)!} className="size-4 text-muted" /> : null}
         <SelectValue className="flex-1 truncate">{({ isPlaceholder }) => (isPlaceholder ? <span className="text-dimmed">{placeholder}</span> : find?.label)}</SelectValue>

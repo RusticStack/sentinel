@@ -57,10 +57,11 @@ export function Toaster() {
   // One polite region for outcomes and one assertive region for refusals, present from the first render.
   return (
     <div className="pointer-events-none fixed bottom-4 right-4 z-[60] flex w-[min(24rem,calc(100vw-2rem))] flex-col gap-2">
-      <div role="status" aria-live="polite" className="contents">
+      {/* Live regions without a role: an empty role=alert would read as a refusal to anything that looks for one. */}
+      <div aria-live="polite" className="contents">
         {mounted && list.filter((t) => t.color !== "error").map((t) => <ToastCard key={t.id} t={t} />)}
       </div>
-      <div role="alert" aria-live="assertive" className="contents">
+      <div aria-live="assertive" className="contents">
         {mounted && list.filter((t) => t.color === "error").map((t) => <ToastCard key={t.id} t={t} />)}
       </div>
     </div>
