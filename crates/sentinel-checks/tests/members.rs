@@ -66,11 +66,13 @@ const ALICE_ID: u64 = 1001;
 
 struct World {
     org_login: String,
+    snapshot_login: String,
     logins: HashMap<u64, String>,
     members: HashMap<String, (u64, &'static str, &'static str)>,
     perms: HashMap<(String, String), (u64, &'static str, &'static str)>,
     fail_memberships: Option<(u16, Option<i64>)>,
     fail_tokens: Option<u16>,
+    fail_repos: HashMap<String, u16>,
     requests: Vec<String>,
 }
 
@@ -88,11 +90,13 @@ impl Stub {
         let addr = listener.local_addr().unwrap();
         let world = Arc::new(Mutex::new(World {
             org_login: "acme".into(),
+            snapshot_login: "acme".into(),
             logins: HashMap::new(),
             members: HashMap::new(),
             perms: HashMap::new(),
             fail_memberships: None,
             fail_tokens: None,
+            fail_repos: HashMap::new(),
             requests: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -219,7 +223,7 @@ fn route(world: &World, method: &str, path: &str) -> (u16, Option<i64>, serde_js
             serde_json::json!({
                 "id": INSTALLATION,
                 "app_id": 1234,
-                "account": {"id": ORG, "login": world.org_login, "type": "Organization"},
+                "account": {"id": ORG, "login": world.snapshot_login, "type": "Organization"},
                 "suspended_at": null,
                 "permissions": {"contents": "read", "checks": "write", "members": "read"},
             }),
@@ -276,6 +280,9 @@ fn route(world: &World, method: &str, path: &str) -> (u16, Option<i64>, serde_js
             }
         }
         ("GET", ["repos", owner, name, "collaborators", login, "permission"]) => {
+            if let Some(status) = world.fail_repos.get(&format!("{owner}/{name}")) {
+                return (*status, None, serde_json::json!({"message": "no"}));
+            }
             match world
                 .perms
                 .get(&(format!("{owner}/{name}"), (*login).to_owned()))
@@ -311,6 +318,7 @@ struct Fixture {
     app: Arc<sentinel_github::app::App>,
     tenant: TenantId,
     repo: RepoId,
+    lib: RepoId,
     alice: UserId,
     notices: Arc<Mutex<Vec<String>>>,
 }
@@ -329,8 +337,13 @@ fn fixture() -> Fixture {
             .with_endpoint(&stub.endpoint())
             .unwrap(),
     );
-    let (tenant, repo, alice, root) =
-        (TenantId::new(), RepoId::new(), UserId::new(), UserId::new());
+    let (tenant, repo, lib, alice, root) = (
+        TenantId::new(),
+        RepoId::new(),
+        RepoId::new(),
+        UserId::new(),
+        UserId::new(),
+    );
     let now = UnixMillis::now();
     let admin = Principal::new(root, Permissions::ALL, None, None);
     store
@@ -382,6 +395,27 @@ fn fixture() -> Fixture {
                 &key,
                 now,
             )?;
+            auth::create_repo(tx, admin, tenant, lib, "lib", now)?;
+            sources::bind(
+                tx,
+                Authority::HostLocal,
+                Some(root),
+                sources::Update {
+                    repo: lib,
+                    expected: 0,
+                    binding: &Binding {
+                        remote: "https://github.com/acme/lib.git".into(),
+                        allowed_refs: vec!["refs/heads/main".into()],
+                        pipeline_path: ".sentinel.yml".into(),
+                        trust: String::new(),
+                    },
+                    credential: &Credential::Public,
+                    forge: Some((installation, GITHUB_REPO + 1)),
+                },
+                &["https://github.com".into()],
+                &key,
+                now,
+            )?;
             github_members::set_backing_trusted(tx, tenant, true, now)
         })
         .unwrap();
@@ -401,6 +435,7 @@ fn fixture() -> Fixture {
         app,
         tenant,
         repo,
+        lib,
         alice,
         notices: Arc::new(Mutex::new(Vec::new())),
     }
@@ -457,7 +492,11 @@ impl Fixture {
     }
 
     fn grant(&self) -> Option<i64> {
-        let (tenant, alice, repo) = (self.tenant, self.alice, self.repo);
+        self.grant_on(self.repo)
+    }
+
+    fn grant_on(&self, repo: RepoId) -> Option<i64> {
+        let (tenant, alice) = (self.tenant, self.alice);
         self.store
             .read(move |c| {
                 Ok(c.query_row(
@@ -683,4 +722,79 @@ fn a_person_without_a_linked_account_is_never_asked_about() {
         "{:?}",
         f.stub.requests()
     );
+}
+
+#[test]
+fn a_repository_that_cannot_be_read_does_not_stop_the_walk_over_the_rest() {
+    let f = fixture();
+    f.stub.with(|w| {
+        w.perms.insert(
+            ("acme/lib".into(), "alice-gh".into()),
+            (ALICE_ID, "read", "read"),
+        );
+        w.fail_repos.insert("acme/lib".into(), 500);
+    });
+    let _lane = f.start();
+    assert_eq!(f.pass(), "joined");
+    assert_eq!(f.role(), Some(2));
+    assert_eq!(f.grant(), Some(3), "the readable repository is settled");
+    assert_eq!(f.grant_on(f.lib), None, "unknown grants nothing new");
+
+    f.stub.with(|w| w.fail_repos.clear());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while f.grant_on(f.lib).is_none() {
+        assert!(Instant::now() < deadline, "the repository was never read");
+        f.pass();
+    }
+    assert_eq!(f.grant_on(f.lib), Some(1), "read maps to read");
+
+    // An existing grant survives a repository that stops answering.
+    f.stub.with(|w| {
+        w.fail_repos.insert("acme/lib".into(), 502);
+    });
+    f.pass();
+    assert_eq!(f.grant_on(f.lib), Some(1), "unknown keeps what exists");
+    assert_eq!(f.grant(), Some(3));
+}
+
+#[test]
+fn a_repository_the_installation_cannot_see_withdraws_only_that_grant() {
+    let f = fixture();
+    f.stub.with(|w| {
+        w.perms.insert(
+            ("acme/lib".into(), "alice-gh".into()),
+            (ALICE_ID, "read", "read"),
+        );
+    });
+    let _lane = f.start();
+    assert_eq!(f.pass(), "joined");
+    assert_eq!(f.grant_on(f.lib), Some(1));
+
+    f.stub.with(|w| {
+        w.fail_repos.insert("acme/lib".into(), 404);
+    });
+    f.pass();
+    assert_eq!(f.grant_on(f.lib), None, "a confirmed 404 is no access");
+    assert_eq!(f.grant(), Some(3), "the other repository is untouched");
+    assert_eq!(f.role(), Some(2), "the person is still a member");
+}
+
+#[test]
+fn a_renamed_organization_answering_404_for_every_repository_withdraws_nothing() {
+    let f = fixture();
+    let _lane = f.start();
+    assert_eq!(f.pass(), "joined");
+    assert_eq!(f.grant(), Some(3));
+
+    // The membership read still works (a cached session), but every repository path is stale and the
+    // fresh installation snapshot names another login: the 404s are not believed.
+    f.stub.with(|w| {
+        w.snapshot_login = "acme-renamed".into();
+        w.fail_repos.insert("acme/app".into(), 404);
+        w.fail_repos.insert("acme/lib".into(), 404);
+    });
+    let outcome = f.pass();
+    assert_eq!(outcome, "kept: unreachable");
+    assert_eq!(f.role(), Some(2));
+    assert_eq!(f.grant(), Some(3));
 }

@@ -296,6 +296,7 @@ impl Worker {
         if role == OrgRole::Owner {
             return Ok(observed);
         }
+        let mut unseen = false;
         for repo in &target.repos {
             let access = match repository_path(&repo.remote) {
                 Some((owner, name)) => {
@@ -303,17 +304,37 @@ impl Worker {
                         Answer::Known(role) => {
                             RepoAccess::Known(github_members::repo_permissions(role))
                         }
-                        Answer::Absent => RepoAccess::Known(sentinel_core::auth::Permissions::NONE),
-                        Answer::Unknown { .. } => RepoAccess::Unknown,
+                        // The token cannot see the repository. That is believed only while the
+                        // organization is still the one the tenant was bound to (checked once
+                        // after the loop): a renamed or transferred organization answers 404 for
+                        // every path under its old name.
+                        Answer::Absent => {
+                            unseen = true;
+                            RepoAccess::Known(sentinel_core::auth::Permissions::NONE)
+                        }
+                        // A rate limit says GitHub wants us to stop: keep what the walk settled so
+                        // far and retry the rest under back-off.
+                        Answer::Unknown {
+                            retry_after_s: Some(_),
+                        } => {
+                            observed.complete = false;
+                            break;
+                        }
+                        // Any other unknown answer is about this repository alone. Its grant is left
+                        // as it is (it lapses with the grace period if GitHub never answers) and the
+                        // walk goes on, so one repository that cannot be read does not hold back the
+                        // rest.
+                        Answer::Unknown {
+                            retry_after_s: None,
+                        } => RepoAccess::Unknown,
                     }
                 }
                 None => RepoAccess::Known(sentinel_core::auth::Permissions::NONE),
             };
-            if access == RepoAccess::Unknown {
-                observed.complete = false;
-                break;
-            }
             observed.repos.push((repo.repo, access));
+        }
+        if unseen {
+            self.confirm_org(app, target, now)?;
         }
         Ok(observed)
     }
@@ -325,6 +346,23 @@ impl Worker {
         github_id: u64,
         now: UnixMillis,
     ) -> Result<Observed, Option<i64>> {
+        self.confirm_org(app, target, now)?;
+        Ok(Observed {
+            github_id: Some(github_id),
+            membership: Membership::Absent,
+            repos: Vec::new(),
+            complete: true,
+        })
+    }
+
+    /// Fetches the installation snapshot again and proves it still names the organization the tenant was
+    /// bound to; otherwise the cached session is dropped and the answer is unreachable, never a removal.
+    fn confirm_org(
+        &mut self,
+        app: &App,
+        target: &Target,
+        now: UnixMillis,
+    ) -> Result<(), Option<i64>> {
         let fresh = match app.installation_status(target.installation, now.0) {
             Ok(Some(installed)) => installed,
             _ => {
@@ -342,12 +380,7 @@ impl Worker {
             self.sessions.remove(&target.installation);
             return Err(None);
         }
-        Ok(Observed {
-            github_id: Some(github_id),
-            membership: Membership::Absent,
-            repos: Vec::new(),
-            complete: true,
-        })
+        Ok(())
     }
 
     fn session(

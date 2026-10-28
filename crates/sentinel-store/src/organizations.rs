@@ -199,7 +199,7 @@ pub fn settings(conn: &Connection, principal: Principal, slug: &str) -> Result<S
             "SELECT t.slug, t.kind, t.membership_source, t.created_ms, m.role,
                     EXISTS(SELECT 1 FROM installations i
                            WHERE i.tenant_id = t.id AND i.provider = 'github'),
-                    m.synced_ms, c.attempts, c.next_ms
+                    m.synced_ms, c.attempts, NULLIF(c.next_ms, 9223372036854775807)
              FROM tenants t
              LEFT JOIN memberships m ON m.tenant_id = t.id AND m.user_id = ?2
              LEFT JOIN github_member_checks c ON c.tenant_id = t.id AND c.user_id = ?2

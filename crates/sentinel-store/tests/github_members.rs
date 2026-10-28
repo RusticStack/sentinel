@@ -288,8 +288,12 @@ fn membership_of(c: &Connection, tenant: TenantId, user: UserId) -> Option<(i64,
 fn check_row(c: &Connection, tenant: TenantId, user: UserId) -> Option<Check> {
     c.query_row(
         "SELECT seq, attempts, cursor FROM github_member_checks
-         WHERE tenant_id = ?1 AND user_id = ?2",
-        params![tenant.as_bytes(), user.as_bytes()],
+         WHERE tenant_id = ?1 AND user_id = ?2 AND next_ms != ?3",
+        params![
+            tenant.as_bytes(),
+            user.as_bytes(),
+            github_members::PARKED_MS
+        ],
         |r| {
             Ok(Check {
                 tenant,
@@ -1215,4 +1219,170 @@ fn a_walk_over_many_repositories_resumes_where_it_stopped() {
     assert!(!target.more);
     assert_eq!(target.org_id, 73);
     assert_eq!(target.github_id, Some(1515));
+}
+
+#[test]
+fn a_finished_pass_keeps_the_on_demand_gap_instead_of_forgetting_the_check() {
+    let f = fixture();
+    f.back();
+    let ned = f.person("ned", Some("1717"));
+    let enqueue = |now: i64| {
+        f.store
+            .writer()
+            .write(move |tx| github_members::enqueue_user(tx, ned, at(now)))
+            .unwrap()
+    };
+    assert_eq!(enqueue(100), 1, "the first sign-in queues a check");
+    let outcome = f
+        .apply(ned, observed(1717, Membership::Absent, vec![]), false, 200)
+        .unwrap();
+    assert_eq!(outcome, "not a member");
+    assert!(f.check(ned).is_none(), "nothing is owed after the pass");
+
+    // Repeated sign-ins inside the gap must not queue GitHub traffic again, even though the pass finished.
+    for now in [300, 10_000, 59_000] {
+        assert_eq!(enqueue(now), 0, "inside the gap at {now}");
+        assert!(f.check(ned).is_none(), "still nothing owed at {now}");
+    }
+    // The gap is measured from the pass that finished, and a later sign-in queues again.
+    assert_eq!(enqueue(200 + github_members::MIN_ON_DEMAND_GAP_MS), 1);
+    assert!(f.check(ned).is_some());
+
+    // A signed event is not on-demand traffic: it wakes a parked row at once.
+    f.apply(
+        ned,
+        observed(1717, Membership::Absent, vec![]),
+        false,
+        70_000,
+    )
+    .unwrap();
+    assert!(f.check(ned).is_none());
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(1717), at(70_100)))
+        .unwrap();
+    assert!(f.check(ned).is_some(), "a signed hint is never held back");
+}
+
+#[test]
+fn parked_rows_do_not_pile_up_and_a_tenant_wide_hint_leaves_them_asleep() {
+    let f = fixture();
+    f.back();
+    let oda = f.person("oda", Some("1818"));
+    let pam = f.person("pam", Some("1919"));
+    for (user, id) in [(oda, 1818), (pam, 1919)] {
+        f.store
+            .writer()
+            .write(move |tx| github_members::enqueue_user(tx, user, at(100)))
+            .unwrap();
+        f.apply(user, observed(id, Membership::Absent, vec![]), false, 200)
+            .unwrap();
+    }
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, None, at(300)))
+        .unwrap();
+    assert!(f.check(oda).is_none() && f.check(pam).is_none());
+
+    let rows = || -> i64 {
+        f.store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM github_member_checks WHERE next_ms = ?1",
+                    [github_members::PARKED_MS],
+                    |r| r.get(0),
+                )
+                .unwrap())
+            })
+            .unwrap()
+    };
+    assert_eq!(rows(), 2);
+    // Another person's sign-in, after the gap, sweeps the parked rows that no longer hold a gap.
+    let quin = f.person("quin", Some("2020"));
+    f.store
+        .writer()
+        .write(move |tx| {
+            github_members::enqueue_user(tx, quin, at(200 + github_members::MIN_ON_DEMAND_GAP_MS))
+        })
+        .unwrap();
+    assert_eq!(rows(), 0);
+}
+
+#[test]
+fn a_repository_that_cannot_be_read_keeps_its_grant_and_does_not_stop_the_walk() {
+    let f = fixture();
+    f.back();
+    let rae = f.person("rae", Some("2121"));
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(2121), at(20)))
+        .unwrap();
+    let mut both = [f.app, f.lib];
+    both.sort_by_key(|r| *r.as_bytes());
+    let (first, second) = (both[0], both[1]);
+    f.apply(
+        rae,
+        observed(
+            2121,
+            Membership::Active(OrgRole::Member),
+            vec![(first, RepoAccess::Known(P::READ))],
+        ),
+        false,
+        30,
+    )
+    .unwrap();
+    assert_eq!(f.grants(rae), vec![(*first.as_bytes(), 1)]);
+
+    // The first repository now answers unknown; the second is still settled in the same pass.
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(2121), at(40)))
+        .unwrap();
+    f.apply(
+        rae,
+        observed(
+            2121,
+            Membership::Active(OrgRole::Member),
+            vec![
+                (first, RepoAccess::Unknown),
+                (second, RepoAccess::Known(P::READ.union(P::RUN))),
+            ],
+        ),
+        false,
+        50,
+    )
+    .unwrap();
+    let mut expected = vec![(*first.as_bytes(), 1), (*second.as_bytes(), 3)];
+    expected.sort();
+    assert_eq!(f.grants(rae), expected, "unknown changes nothing");
+    let check = f.check(rae).unwrap();
+    assert_eq!(
+        check.attempts, 0,
+        "an unreadable repository is not a failed pass"
+    );
+    assert_eq!(check.cursor, None, "the walk finished");
+
+    // Never confirmed again, the unknown repository's grant lapses with the grace period.
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(2121), at(60)))
+        .unwrap();
+    f.apply(
+        rae,
+        observed(
+            2121,
+            Membership::Active(OrgRole::Member),
+            vec![
+                (first, RepoAccess::Unknown),
+                (second, RepoAccess::Known(P::READ.union(P::RUN))),
+            ],
+        ),
+        false,
+        50 + 25 * HOUR,
+    )
+    .unwrap();
+    assert_eq!(f.grants(rae), vec![(*second.as_bytes(), 3)]);
 }
