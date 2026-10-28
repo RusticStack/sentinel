@@ -162,6 +162,35 @@ fn the_web_interface_in_a_real_browser() {
     assert!(status.success(), "ui.mjs failed: {status}");
 }
 
+/// The U08/U14 measurement: `web/bench/web-bench.mjs` against this fixture, on the
+/// reference host. `SENTINEL_BENCH_RECORD` appends the record to a file under the
+/// repository; `SENTINEL_BENCH_HOST_LABEL` names the host in it.
+#[test]
+#[ignore = "benchmark: needs Node, the built web interface and a Chromium-family browser"]
+fn measure_the_web_interface() {
+    let bulk = std::env::var("SENTINEL_BULK_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25);
+    let (f, web, web_addr, origin) = deployment(bulk, false);
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = keep_writing(&f, &stop);
+    let mut cfg = config(&f, &origin, &web_addr, f.dir.path());
+    cfg["web_pid"] = json!(web.0.id());
+    cfg["interface"] = json!(std::env::var("SENTINEL_WEB_INTERFACE").unwrap_or_default());
+    let config_path = f.dir.path().join("bench.json");
+    std::fs::write(&config_path, cfg.to_string()).unwrap();
+    let status = Command::new(node())
+        .arg(repo_root().join("web/bench/web-bench.mjs"))
+        .arg(&config_path)
+        .status()
+        .expect("run node");
+    stop.store(true, Ordering::Release);
+    writer.join().unwrap();
+    drop(web);
+    assert!(status.success(), "web-bench.mjs failed: {status}");
+}
+
 #[test]
 #[ignore = "manual: serves the fixture until the time runs out"]
 fn serve_the_fixture() {
