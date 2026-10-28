@@ -64,8 +64,8 @@ version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' 
 # Entries a package must contain, as paths relative to the archive's top directory.
 expected() {
   case "$1" in
-    server) echo "bin/sentinel BUILD-INFO LICENSE THIRD-PARTY-LICENSES.md examples/server.toml examples/sentinel-server.service examples/sentinel-web.service" ;;
-    worker) echo "bin/sentinel BUILD-INFO LICENSE THIRD-PARTY-LICENSES.md examples/worker.toml examples/sentinel-worker.service" ;;
+    server) echo "bin/sentinel BUILD-INFO LICENSE THIRD-PARTY-LICENSES.md examples/server.toml examples/sentinel-server.service examples/sentinel-web.service examples/server-container.toml examples/Containerfile.server examples/compose.server.yaml examples/sentinel.nginx.conf examples/Caddyfile" ;;
+    worker) echo "bin/sentinel BUILD-INFO LICENSE THIRD-PARTY-LICENSES.md examples/worker.toml examples/sentinel-worker.service examples/Containerfile.worker examples/compose.worker.yaml" ;;
     cli) echo "bin/sentinel BUILD-INFO LICENSE THIRD-PARTY-LICENSES.md" ;;
     agent) echo "bin/sentinel-agent BUILD-INFO LICENSE THIRD-PARTY-LICENSES.md" ;;
   esac
@@ -221,9 +221,11 @@ package() {
 }
 
 cargo build --locked --release -p sentinel --features server
-package server "$target_dir/release/sentinel" examples/server.toml examples/sentinel-server.service examples/sentinel-web.service
+package server "$target_dir/release/sentinel" examples/server.toml examples/sentinel-server.service examples/sentinel-web.service \
+  examples/server-container.toml examples/Containerfile.server examples/compose.server.yaml examples/sentinel.nginx.conf examples/Caddyfile
 cargo build --locked --release -p sentinel --features worker
-package worker "$target_dir/release/sentinel" examples/worker.toml examples/sentinel-worker.service
+package worker "$target_dir/release/sentinel" examples/worker.toml examples/sentinel-worker.service \
+  examples/Containerfile.worker examples/compose.worker.yaml
 cargo build --locked --release -p sentinel
 package cli "$target_dir/release/sentinel"
 if [ $skip_agent = 0 ]; then

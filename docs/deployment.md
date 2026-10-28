@@ -1,6 +1,6 @@
 # Deployment
 
-How the controller and a worker run under systemd. The tasks are V01 ([release packages](releasing.md)) and V02 (the server and worker units); container examples and the TLS/ingress guide stay open under V02 in [TODO](../TODO.md). Configuration is in [configuration](configuration.md), upgrades in [upgrades](upgrades.md), the web process in [web interface](web-ui.md).
+How the controller and a worker run: under systemd, as containers, behind TLS, with GitHub ingress, or fully local. The tasks are V01 ([release packages](releasing.md)) and V02 (the units, the container examples and this guide). Configuration is in [configuration](configuration.md), upgrades in [upgrades](upgrades.md), the web process in [web interface](web-ui.md).
 
 ## Release packages
 
@@ -132,3 +132,112 @@ scripts/release/check-worker-unit.sh <path to a --features worker binary>
 ```
 
 as the unprivileged worker account (or any unprivileged user) with a user systemd instance. The script refuses root. It runs `systemd-analyze verify` on the unit (nothing may be reported about it), requires `systemd-analyze security --offline=true` to score it no worse than 7.0 overall, starts a user-instance copy that keeps every sandbox directive a user instance can apply (only the account, the unit name, the paths, the capability and device directives, and `ReadWritePaths=%t` differ) and requires `sentinel worker --check` to report `worker configuration valid`. When rootless Podman answers for the account it also starts the worker proper, from a copy without `ProtectSystem`, `ProtectHome`, `PrivateTmp` and `PrivateMounts` (see the user unit above), against an address nothing listens on, with Podman's storage, runtime and temporary directories pointed into the test's state directory, and requires the `executor_ready` event and a `SIGTERM` stop that is a clean exit. It writes only below `~/.local/state/sentinel-worker-unit-check` and removes it.
+
+## Container examples
+
+Both examples start from the unpacked release package (so the image holds the verified binary, [releasing](releasing.md)) and ship inside it: `Containerfile.server`, `server-container.toml` and `compose.server.yaml` in the server package, `Containerfile.worker` and `compose.worker.yaml` in the worker package. They are Podman-first; the Compose files use only keys that `podman compose` and `docker compose` share. There is no published image: building one from the verified package is the supported path.
+
+**Base image.** The binary links glibc dynamically and, as built on the reference builder, needs glibc 2.39 or newer (`objdump -T` on your binary shows the symbol versions; read it again for your build). The default `BASE` is `docker.io/library/ubuntu:26.04`; pass `--build-arg BASE=…` for another image whose glibc is at least that of the machine that built the package. Build the controller image with `--format docker` so it keeps its `HEALTHCHECK` (the OCI format drops it).
+
+### The controller
+
+```sh
+tar -xzf sentinel-<version>-<arch>-linux-server.tar.gz && cd sentinel-*/
+podman build --format docker -f examples/Containerfile.server -t localhost/sentinel-server:<version> .
+cp examples/server-container.toml examples/compose.server.yaml .
+export SENTINEL_VERSION=<version>
+podman compose -f compose.server.yaml run --rm --no-deps server admin key create --data-dir /var/lib/sentinel
+podman compose -f compose.server.yaml up -d
+```
+
+The image runs as `sentinel` (uid 10001) with `/var/lib/sentinel` as its only writable path: a volume holding the database and `master.key`, which must be backed up separately from the database ([backup](backup.md)). The Compose file adds a read-only root, a 64 MiB `/tmp`, no capabilities, `no-new-privileges`, `pids_limit` 4096 and `mem_limit` 4 GiB, publishes the API (7080) and the worker link (7443) on the **host's loopback only**, and mounts `server-container.toml` read-only. That configuration binds both listeners on `0.0.0.0` because a published port arrives on the container's interface; what protects them is the published address. Change `127.0.0.1:` in `ports` to a private address only when workers on other machines must reach 7443, and never publish 7080 beyond the reverse proxy ([TLS](#tls-and-a-reverse-proxy)).
+
+- **Secrets.** Files the controller reads as secrets (GitHub App key, sign-in client secret, S3 and mail credentials, `github-webhook.json`) must be owned by uid 10001 with mode `0600`, which a bind mount from a rootless host cannot give. Keep them on the data volume, write them through a throwaway container of the same image (`podman run --rm --entrypoint /bin/sh -v <volume>:/var/lib/sentinel:U …`, `umask 077`; `:U` hands the volume to the image's user) and name them in the configuration by their in-container path.
+- **Health.** The image's `HEALTHCHECK` asks `GET /api/v1/health` over loopback with bash's `/dev/tcp` (the image has no `curl`); `podman healthcheck run <container>` runs it by hand.
+- **Stopping.** `SIGTERM` is the stop signal and `stop_grace_period` is 30 s, the controller's drain bounds ([the unit](#the-controller-as-a-systemd-service)).
+- **`trusted_proxies`.** The controller sees the peer address of the container network, not the proxy's host address. With a proxy on the host list the network's gateway (`podman network inspect`); with a proxy container list its network. At the default (loopback only) every client behind the container network shares one rate-limit allowance.
+- **Not here:** the web interface ([web interface](web-ui.md)) has no image; run it from `sentinel-web.service`.
+
+### A worker
+
+A worker container carries its own rootless Podman, because jobs run in containers the worker's executor starts. That nesting needs more than the controller image does, and the example says so:
+
+```sh
+tar -xzf sentinel-<version>-<arch>-linux-worker.tar.gz && cd sentinel-*/
+podman build -f examples/Containerfile.worker -t localhost/sentinel-worker:<version> .
+cp examples/worker.toml examples/compose.worker.yaml .   # edit worker.toml: controller, fingerprint, enrollment
+SENTINEL_VERSION=<version> podman compose -f compose.worker.yaml up -d
+```
+
+- **Run it from a rootless Podman account** with subordinate ids and `newuidmap`, as for [the unit](#a-worker-as-a-systemd-service). Inside the image the `sentinel-worker` user (uid 10002) has its own range, `20000:30000`, taken from the ids the outer user namespace has (a range above its 65,536 ids makes `newuidmap` fail).
+- **`privileged: true` is required, and weaker than the unit.** Measured with Podman 5.7.0, crun and cgroup v2 (Ubuntu 26.04, kernel 7.0): with default options the executor reports `executor_unavailable` (`cannot set up namespace using "/usr/bin/newuidmap"`); `--cap-add=SYS_ADMIN` lets Podman start but every nested container fails (`crun: open /proc/sys/net/ipv4/ping_group_range: Read-only file system`) because the outer container masks `/proc/sys`; unmasking only `/proc/sys` fails on the `proc` mount; `--privileged` works. On rootless Podman that means all capabilities inside the account's user namespace, no seccomp filter and the host devices the account can open, never root on the host; but the outer container no longer confines what runs in it. Where a systemd unit can be used, it is the better-isolated choice.
+- **Job networking is `none` only.** With the default network or `job_network = "egress"` the nested `pasta` fails (`Couldn't open network namespace … Permission denied`), so egress jobs do not run in this container.
+- **Resource limits.** The nested Podman uses the `cgroupfs` manager with `cpu memory pids` delegated; it accepts `--memory` and `--cpus` (read back with `podman inspect`). Enforcement was inspected, not stress-tested.
+- **No microVMs.** The Firecracker executor needs `/dev/kvm` and its files; mount them yourself on a KVM host, or use the unit.
+- **Disk.** The data volume also holds Podman's images and containers (`.local/share/containers` below it), so it grows with pulled job images.
+
+### What was verified
+
+On the reference host (Podman 5.7.0 rootless, Ubuntu 26.04 base, images built from the **debug** binaries of this commit, not from release packages): both images build. The controller image creates `master.key` as uid 10001, starts with the Compose file's read-only, capability and memory settings, answers `GET /api/v1/health` with 200 through the published loopback port, passes `podman healthcheck run`, and stops on `SIGTERM` with exit 0. `docker compose config` renders both Compose files (an offline check; no compose provider was started, so the Compose start is exercised through the equivalent `podman run` flags). The worker image passes `worker --check`, reports `executor_ready` (`cgroup_manager: cgroupfs`) under `--privileged`, stops with exit 0, and a nested `podman run --network none --memory 64m --cpus 0.5 --pids-limit 100` runs. Not run: a worker enrolled to a real controller executing a job, an arm64 image build, and a build from a real release package (`scripts/release/package.sh` now lists these files in each package; its `build` was not re-run, only `bash -n`).
+
+## TLS and a reverse proxy
+
+Sentinel speaks plain HTTP on `api_listen` (loopback by default) and does not terminate TLS for browsers or CLIs: a reverse proxy does, for the **public origin**, and the controller's `public_url` is exactly that origin (`https://ci.example.com`, [configuration](configuration.md)). Two kinds of traffic exist and only one goes through the proxy:
+
+| Traffic | Port | Through the proxy? |
+|---|---|---|
+| Browser, CLI, MCP, OAuth, GitHub webhooks | `api_listen` (7080), or `sentinel-web` (3000) in front of it | Yes: HTTPS to the proxy, HTTP to loopback |
+| Worker link | `listen` (7443) | **No.** It is its own TLS (a self-signed certificate pinned by fingerprint, or [Tailcat](configuration.md#optional-tailcat-transport)). Expose it on the private address workers reach, or not at all; do not put an HTTP proxy in front of it |
+
+[`examples/sentinel.nginx.conf`](../examples/sentinel.nginx.conf) and [`examples/Caddyfile`](../examples/Caddyfile) are complete, equivalent configurations for the layout the units use (proxy to `sentinel-web` on `127.0.0.1:3000`, which forwards to the controller). What they set, and why:
+
+- **TLS** 1.2 and 1.3 and HSTS, plus a redirect from port 80 (nginx) or automatic certificates (Caddy). The session cookie is `__Host-sentinel_session`, which browsers accept only over HTTPS (or from `localhost`).
+- **`X-Forwarded-For` is overwritten, never appended** (`proxy_set_header X-Forwarded-For $remote_addr`, `header_up X-Forwarded-For {remote_host}`). The controller rate-limits unauthenticated requests per client and, **only for a peer in `trusted_proxies`**, takes the *last* `X-Forwarded-For` entry as the client; with the header overwritten that entry is the proxy's real peer, so a client cannot choose its own bucket. `sentinel-web` needs `NUXT_CLIENT_IP_HEADER=x-forwarded-for` for the same reason ([web interface](web-ui.md#client-addresses)).
+- **Body limit 4 MiB.** The controller's largest body is the GitHub webhook's 4 MiB (it enforces smaller limits on its other routes); the proxy limit only keeps oversized uploads off the controller.
+- **Unbuffered, long reads** (`proxy_buffering off`, `proxy_read_timeout 1h`; Caddy `flush_interval -1`), so log following is not held back.
+- **`X-Forwarded-Proto`** is set by the proxy, but the controller builds its URLs from `public_url`; a wrong `public_url` is the usual cause of an OAuth redirect to the wrong origin.
+
+### `trusted_proxies`
+
+Set it in `server.toml` to exactly the addresses the proxy connects from: at most 64 IPs or CIDR networks with zero host bits (`trusted_proxies = ["127.0.0.1", "10.89.0.0/24"]`). Absent means loopback only, which is right when the proxy or `sentinel-web` runs on the controller's host. A network wider than the proxy lets anything in it pick its own rate-limit bucket with `X-Forwarded-For`. A proxy on another host, or on a container network ([the controller container](#the-controller)), must be listed; if it is missing nothing breaks, all clients behind it merely share one allowance.
+
+### Without the web interface
+
+Point the proxy at `api_listen` (`127.0.0.1:7080`) and send only what the controller serves: `/api/`, `/oauth/`, `/.well-known/`, `/device`, `/auth/github/` and `/mcp` (and, for generic OAuth clients under a path prefix, the host-root RFC 8414 / RFC 9728 locations listed in [configuration](configuration.md)).
+
+### Verification
+
+On the reference host with nginx stable and Caddy 2 in rootless Podman containers (host network, self-signed certificates, test ports instead of 80/443, `ci.example.com` resolved to loopback):
+
+- `nginx -t` and `caddy validate` accept the shipped files unchanged.
+- Against a request-echoing upstream standing in for `sentinel-web`: a client's `X-Forwarded-For: 6.6.6.6` and `X-Forwarded-Proto: spoof` reach the upstream as `['127.0.0.1']` and `https` on both proxies; nginx redirects HTTP to HTTPS (301) and sends HSTS (Caddy sends HSTS); a 5 MB body to `/api/v1/hooks/github` is refused with 413 and a 3.5 MB body passes, on both.
+- With nginx pointed at the controller container's `api_listen`: `GET /api/v1/health` through the proxy returns 200 and the webhook requests in the next section behave as described.
+
+Not run: the `sentinel-web` hop (the web interface is being replaced), Caddy's certificate issuance from a public CA, HTTP/3, and a proxy on a different host than the controller.
+
+## GitHub ingress
+
+GitHub reaches Sentinel in two places, both on the public origin: the **App webhook**, `POST /api/v1/hooks/github`, and the **OAuth callback**, `{public_url}/auth/github/callback`, for sign-in ([GitHub sign-in](github-sign-in.md)). Both need the controller reachable from GitHub over HTTPS at `public_url`; neither works on a loopback-only deployment.
+
+1. Put the controller behind the proxy above and set `public_url`.
+2. Choose the webhook secret (16 to 256 printable ASCII bytes) and store it **owner-only** as `<data_dir>/github-webhook.json`, `{"secret": "…"}`. Without the file the route answers `not_found`. Restart the controller (it reads the file at start). Use the same secret as the GitHub App's webhook secret.
+3. In the GitHub App's settings set the webhook URL to `https://ci.example.com/api/v1/hooks/github`, content type `application/json`, and subscribe to `push`, `pull_request` and the control events that [intake](intake.md) and [checks](checks.md) list. The App id and key for source access and Checks are `<data_dir>/github-app.json` ([configuration](configuration.md)).
+4. Redeliver the `ping` from the App's *Advanced* tab: `200 {"pong":true}` means path, secret and signature are right.
+
+The route enforces, independent of the proxy: HMAC-SHA256 over the **raw body** in `X-Hub-Signature-256` (so the proxy must not rewrite request bodies), `X-GitHub-Delivery` deduplication (a redelivery with the same body returns the recorded outcome; the same id with another body is a conflict), a 4 MiB limit, and a `202` only once the event is durably recorded. The proxy need not allowlist GitHub's addresses for correctness, because an unsigned request is a `401`; allowlisting only reduces noise.
+
+Verified through the nginx configuration above in front of the controller container: a correctly signed `ping` returned `200 {"pong":true}` and a wrong signature `401 invalid credential`. A real GitHub delivery to a public host was not part of this check.
+
+Repositories that are not on GitHub, or a controller GitHub cannot reach, use the other two paths in [intake](intake.md): the `post-receive` hook relay (`POST /api/v1/intake/{repo}` with a per-repository secret, spooled and retried by the sender) and bounded `git ls-remote` polling.
+
+## Fully local operation
+
+Everything except GitHub works with no public name, no certificate and no outbound call:
+
+1. **Bind loopback** (the defaults: `api_listen = "127.0.0.1:7080"`, `listen = "127.0.0.1:7443"`) and leave `public_url` unset; the controller then builds its URLs from the bound address. The session cookie works from `http://localhost:7080` (a `localhost` origin is a secure context); any other hostname needs HTTPS, which is what the proxy is for. Leave the GitHub App, GitHub sign-in and mail files out: absent means disabled.
+2. **Create the first administrator on the host**, with no browser or email: `sentinel admin bootstrap` (or the setup token the controller writes to `<data_dir>/setup-token`, [configuration](configuration.md#first-run-setup-without-a-shell)), then `sentinel admin token issue …` for CLI credentials. Password recovery is `sentinel admin recover`, also on the host.
+3. **Workers** on the same machine connect to `127.0.0.1:7443` with the logged controller fingerprint and an enrollment from `sentinel admin worker enroll` ([worker link](worker-link.md)). Tailcat and any DERP server are optional and off by default. A worker on another machine of the same network uses the controller's private address in `listen` and `controller`, still direct TLS with the pinned fingerprint.
+4. **Sources.** A repository on local disk or a `file://` URL is a valid source ([sources](sources.md)); events arrive through the `post-receive` hook relay to `http://127.0.0.1:7080/api/v1/intake/{repo}` (plain HTTP is acceptable on loopback; the hook secret is a bearer credential, so use HTTPS anywhere else) or by polling. There is no webhook and no public address.
+5. **Images.** Jobs run pinned `name@sha256:…` images and the worker checks `podman image exists` before pulling ([executor](executor.md#the-image-pull)); on a host with no outbound network, load the images into the worker account's Podman store beforehand.
+
+Unavailable locally by design: GitHub sign-in, the GitHub webhook and GitHub Checks (GitHub must reach you and you must reach GitHub), email delivery (`sentinel admin invite` and `account` mint links instead), and the remote cache's S3 backend unless the endpoint is local. The pieces were exercised separately above (controller start, key creation, health, shutdown, the proxy); a full run from a local push to a finished job on a host with no outbound network was not part of this item.

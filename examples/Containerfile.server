@@ -1,0 +1,36 @@
+# The controller (`sentinel server`) as an image, built from the unpacked
+# release package so the image holds exactly the verified binary.
+#
+#   tar -xzf sentinel-<version>-<arch>-linux-server.tar.gz
+#   podman build -f sentinel-*/examples/Containerfile.server -t sentinel-server:<version> sentinel-*/
+#
+# The build context is the unpacked package (bin/sentinel). The binary is
+# dynamically linked against glibc: BASE must carry the glibc of the host the
+# package was built on, or newer (the Ubuntu 26.04 default matches the release
+# builders). See docs/deployment.md#container-examples.
+ARG BASE=docker.io/library/ubuntu:26.04
+FROM ${BASE}
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && (userdel -r ubuntu 2>/dev/null || true) \
+ && groupadd --system --gid 10001 sentinel \
+ && useradd --no-create-home --uid 10001 --gid sentinel --home-dir /var/lib/sentinel \
+      --shell /usr/sbin/nologin sentinel \
+ && install -d -o sentinel -g sentinel -m 0700 /var/lib/sentinel
+COPY --chmod=0755 bin/sentinel /usr/local/bin/sentinel
+COPY --chmod=0644 LICENSE THIRD-PARTY-LICENSES.md BUILD-INFO /usr/share/doc/sentinel/
+USER sentinel
+WORKDIR /var/lib/sentinel
+# The data directory holds the database and master.key: keep it on a volume.
+VOLUME /var/lib/sentinel
+# Worker link and API; examples/server-container.toml binds both on all
+# interfaces of the container. Publish them on the host's loopback or a private
+# address, never on a public one without TLS in front (docs/deployment.md).
+EXPOSE 7443 7080
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD ["/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/7080 && printf 'GET /api/v1/health HTTP/1.0\r\n\r\n' >&3 && read -r status <&3 && [[ $status == *' 200 '* ]]"]
+ENTRYPOINT ["/usr/local/bin/sentinel"]
+CMD ["server", "--config", "/etc/sentinel/server.toml", "--data-dir", "/var/lib/sentinel"]

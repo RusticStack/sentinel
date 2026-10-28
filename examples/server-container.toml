@@ -1,0 +1,13 @@
+# Controller configuration for examples/Containerfile.server: the same as
+# server.toml, with both listeners on all interfaces of the container so that
+# published ports reach them. Mount it read-only at /etc/sentinel/server.toml.
+# The host decides who can connect: publish on 127.0.0.1 or a private address.
+data_dir = "/var/lib/sentinel"
+log_format = "json"
+log_level = "info"
+listen = "0.0.0.0:7443"
+api_listen = "0.0.0.0:7080"
+# The URL clients reach the API at, once a reverse proxy terminates TLS (docs/deployment.md).
+# public_url = "https://ci.example.com"
+# The proxy's address as the container sees it (the network's gateway or the proxy container); loopback is the default.
+# trusted_proxies = ["10.89.0.0/24"]
