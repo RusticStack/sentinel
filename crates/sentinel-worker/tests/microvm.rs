@@ -839,3 +839,103 @@ fn a_restored_guest_keeps_its_network_and_its_policy() {
     b.destroy().unwrap();
     nothing_left(root.path(), &[a_id, b_id]);
 }
+
+// ---------------------------------------------------------------- M06: the warm-start measurement
+
+/// The nearest-rank percentile of a sorted sample.
+fn percentile(sorted: &[u64], p: f64) -> u64 {
+    let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
+/// One sample series: for each VM, the time from the call of `Vm::start` until the first user process (`true`)
+/// has exited, and the guest-ready time the start report itself measured. Every VM is destroyed before the next
+/// starts, so the series is the serial per-attempt cost, not a stampede.
+fn start_samples(
+    root: &std::path::Path,
+    setup: &Setup,
+    workspace: &std::path::Path,
+    n: usize,
+    network: Network,
+) -> (Vec<u64>, Vec<u64>) {
+    let mut first_process = Vec::with_capacity(n);
+    let mut ready = Vec::with_capacity(n);
+    for _ in 0..n {
+        let started = Instant::now();
+        let (id, vm) = start_net(root, setup, workspace, network);
+        let exit = vm.exec(&sh("true", 60), &[]).unwrap();
+        let total = started.elapsed().as_nanos() as u64;
+        assert_eq!(exit.code, Some(0));
+        let report = vm.start_report().clone();
+        assert!(report.fallback.is_none(), "{report:?}");
+        first_process.push(total);
+        ready.push(report.ready_ns);
+        vm.destroy().unwrap();
+        nothing_left(root, &[id]);
+    }
+    first_process.sort_unstable();
+    ready.sort_unstable();
+    (first_process, ready)
+}
+
+/// The M06 gate's measurement (TODO M06): `SENTINEL_MICROVM_BENCH=<n>` takes `n` cold and `n` restored starts of
+/// the same shape on the KVM host and writes one record per path to `SENTINEL_MICROVM_BENCH_OUT` (default: the
+/// test's stderr). The restored series follows a warm-up start that builds the snapshot, so it contains only
+/// restores. It measures the worker's `Vm::start` plus the first step, not the controller's queue time: the
+/// end-to-end figure of the budget (`bench/b03-latency.py` against a microVM worker) is the one that is
+/// published against p95 < 2 s; this one attributes the time. The host label, load and binaries' digests are
+/// the caller's to add when the record is committed.
+#[test]
+fn the_cold_and_restored_start_to_first_process_distributions() {
+    let Some(setup) = setup() else { return };
+    let Some(n) = std::env::var("SENTINEL_MICROVM_BENCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    else {
+        eprintln!("skipped: set SENTINEL_MICROVM_BENCH=<samples per path> on a quiet KVM host");
+        return;
+    };
+    pull();
+    let cpu_pressure = fs::read_to_string("/proc/pressure/cpu").unwrap_or_default();
+    let loadavg = fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let workspace = tempfile::tempdir().unwrap();
+    let mut lines = Vec::new();
+    for (mode, snapshots) in [("cold", false), ("restore", true)] {
+        let mut setup = setup.clone();
+        setup.snapshots = snapshots;
+        let root = tempfile::tempdir().unwrap();
+        if snapshots {
+            // The warm-up builds the snapshot; its cost is the first attempt of a shape, not a restore.
+            let (id, vm) = start_net(root.path(), &setup, workspace.path(), Network::None);
+            assert!(vm.start_report().snapshot_built);
+            vm.destroy().unwrap();
+            nothing_left(root.path(), &[id]);
+        }
+        let (first, ready) = start_samples(root.path(), &setup, workspace.path(), n, Network::None);
+        let stats = |s: &[u64]| {
+            serde_json::json!({
+                "p50_ns": percentile(s, 50.0),
+                "p95_ns": percentile(s, 95.0),
+                "p99_ns": percentile(s, 99.0),
+                "max_ns": s[s.len() - 1],
+            })
+        };
+        lines.push(
+            serde_json::json!({
+                "schema": "sentinel-bench/m06/1",
+                "mode": mode,
+                "samples": n,
+                "start_to_first_process": stats(&first),
+                "guest_ready": stats(&ready),
+                "host": { "loadavg": loadavg.trim(), "cpu_pressure": cpu_pressure.trim() },
+            })
+            .to_string(),
+        );
+    }
+    let out = lines.join("\n") + "\n";
+    match std::env::var_os("SENTINEL_MICROVM_BENCH_OUT") {
+        Some(path) => fs::write(path, &out).unwrap(),
+        None => eprintln!("{out}"),
+    }
+}
