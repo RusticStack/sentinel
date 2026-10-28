@@ -376,6 +376,10 @@ pub trait Report: Send + Sync {
     fn remote(&self) -> Option<Arc<dyn sentinel_cache::remote::Remote>> {
         None
     }
+    /// The worker's measured restore and rebuild costs; without one the fixed default rule applies.
+    fn cost_book(&self) -> Option<&sentinel_cache::CostBook> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -439,11 +443,25 @@ pub fn run(
     let remote = report.remote();
     let mut summary = AttemptSummary::default();
     let prepared = prepare(root, job, cancel, &mut summary, remote.as_deref());
-    for attached in &job.caches {
-        if let Some(costly) = attached.costly_hit() {
-            report.costly_hit(job.attempt, &attached.name, costly, &attached.stats);
-        }
-    }
+    // Judged once, before publication rewrites the carrier's stats, so the notice and the summary agree.
+    let costly: Vec<Option<sentinel_cache::Costly>> = job
+        .caches
+        .iter()
+        .map(|attached| {
+            let verdict = match report.cost_book() {
+                Some(book) => {
+                    let verdict = attached.costly_hit_with(book);
+                    book.observe(attached);
+                    verdict
+                }
+                None => attached.costly_hit(),
+            };
+            if let Some(costly) = verdict {
+                report.costly_hit(job.attempt, &attached.name, costly, &attached.stats);
+            }
+            verdict
+        })
+        .collect();
     let mut sealed: Vec<SealedCache> = Vec::new();
     let verdict = match prepared {
         Err(_) if cancel.load(Ordering::Acquire) => {
@@ -528,8 +546,9 @@ pub fn run(
     summary.caches = job
         .caches
         .iter()
+        .zip(&costly)
         .take(MAX_CACHE_RECORDS)
-        .map(cache_record)
+        .map(|(attached, costly)| cache_record(attached, costly.is_some()))
         .collect();
     match summary.encode() {
         Ok(bytes) => report.finish(job.attempt, job.fence, event, bytes),
@@ -1132,7 +1151,7 @@ fn cache_worthy(verdict: &Verdict) -> bool {
     }
 }
 
-fn cache_record(attached: &sentinel_cache::attach::Attached) -> CacheRecord {
+fn cache_record(attached: &sentinel_cache::attach::Attached, costly_hit: bool) -> CacheRecord {
     let stats = &attached.stats;
     let (staged, reused, dirty, publish) = match stats.committed {
         Some(sentinel_cache::Committed::Sealed {
@@ -1170,7 +1189,7 @@ fn cache_record(attached: &sentinel_cache::attach::Attached) -> CacheRecord {
         reused_bytes: reused,
         dirty_bytes: dirty,
         publish,
-        costly_hit: attached.costly_hit().is_some(),
+        costly_hit,
     }
 }
 
@@ -1575,7 +1594,7 @@ mod tests {
         assert_eq!(mounts[0].host, attached.targets[1].dir);
         assert!(mounts[0].host.is_dir());
 
-        let record = cache_record(attached);
+        let record = cache_record(attached, attached.costly_hit().is_some());
         assert_eq!(record.name, "deps");
         assert_eq!(
             record.class,
@@ -1673,7 +1692,7 @@ mod tests {
                 reused_bytes: 0
             })
         ));
-        let record = cache_record(attached);
+        let record = cache_record(attached, attached.costly_hit().is_some());
         assert_eq!(record.publish.as_deref(), Some("sealed"));
         assert_eq!(record.staged_bytes, Some(3));
         assert_eq!(record.reused_bytes, Some(0));
@@ -1793,7 +1812,7 @@ mod tests {
             attached.costly_hit(),
             Some(sentinel_cache::Costly::CopiedAll)
         );
-        let record = cache_record(attached);
+        let record = cache_record(attached, attached.costly_hit().is_some());
         assert!(record.costly_hit);
         assert_eq!(record.outcome, "hit");
     }

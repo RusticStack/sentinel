@@ -419,6 +419,7 @@ pub struct Inner {
     image_swept: Mutex<Option<std::time::Instant>>,
     notify: Box<dyn Fn(Notice) + Send + Sync>,
     recovered: Recovered,
+    costs: sentinel_cache::CostBook,
 }
 
 const REFUSAL_NOTICE_EVERY: Duration = Duration::from_secs(30);
@@ -573,6 +574,7 @@ impl Executor {
             budgets: Mutex::new(StorageBudgets::default()),
             image_swept: Mutex::new(None),
             recovered,
+            costs: sentinel_cache::CostBook::new(),
         }));
         let watched = Arc::downgrade(&executor.0);
         let _ = thread::Builder::new()
@@ -902,6 +904,11 @@ impl Executor {
 }
 
 impl Inner {
+    /// The measured cache costs the costly-hit rule reads; a cold-rebuild measurement is recorded here.
+    pub fn costs(&self) -> &sentinel_cache::CostBook {
+        &self.costs
+    }
+
     pub fn runtime(&self) -> &podman::Runtime {
         &self.runtime
     }
@@ -1206,6 +1213,9 @@ impl Report for Inner {
             .reporter
             .as_ref()
             .and_then(Reporter::remote_cache)
+    }
+    fn cost_book(&self) -> Option<&sentinel_cache::CostBook> {
+        Some(&self.costs)
     }
 }
 
