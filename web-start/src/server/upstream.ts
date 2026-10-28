@@ -1,4 +1,6 @@
 // Server only: the controller's address and the header rules never reach the browser bundle.
+import http from "node:http";
+import https from "node:https";
 import { clientAddress } from "./guard.ts";
 
 // The old Nuxt names are accepted for one release (docs/compatibility.md).
@@ -70,10 +72,26 @@ export const sleep = (ms: number, signal: AbortSignal) =>
     signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
   });
 
-export async function upstream(request: Request, path: string, signal: AbortSignal): Promise<{ status: number; body: any }> {
-  const response = await fetch(sentinelApi() + path, { headers: forwarded(request), signal });
-  const text = await response.text();
-  let body: any = null;
-  try { body = text ? JSON.parse(text) : null; } catch { body = null; }
-  return { status: response.status, body };
+// The live streams' long polls: plain node:http on one keep-alive agent rather than fetch, whose web-stream machinery
+// costs more CPU per request than the request itself (each log frame is one poll; U14 measures ten streams).
+const agents = { http: new http.Agent({ keepAlive: true, maxSockets: 64 }), https: new https.Agent({ keepAlive: true, maxSockets: 64 }) };
+
+export function upstream(request: Request, path: string, signal: AbortSignal): Promise<{ status: number; body: any }> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(sentinelApi() + path);
+    const secure = url.protocol === "https:";
+    const req = (secure ? https : http).request(url, { method: "GET", headers: forwarded(request), agent: secure ? agents.https : agents.http, signal }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => {
+        const text = chunks.length === 1 ? chunks[0]!.toString("utf8") : Buffer.concat(chunks).toString("utf8");
+        let body: any = null;
+        try { body = text ? JSON.parse(text) : null; } catch { body = null; }
+        resolve({ status: res.statusCode ?? 0, body });
+      });
+      res.on("error", reject);
+    });
+    req.on("error", reject);
+    req.end();
+  });
 }
