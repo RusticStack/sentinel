@@ -765,89 +765,6 @@ fn token(args: &TokenArgs, now: UnixMillis) -> Result<(), Error> {
             })?;
             eprintln!("revoked {id}");
         }
-        WorkerCommand::Policy {
-            data,
-            id,
-            cpu_millis,
-            memory_bytes,
-            disk_bytes,
-            priority,
-        } => {
-            let store = open(data, true)?;
-            let id: WorkerId = id
-                .parse()
-                .map_err(|_| fail("expected a wrk_ worker identifier"))?;
-            let change = (
-                ceiling_flag(cpu_millis.as_deref(), "--cpu-millis")?,
-                ceiling_flag(memory_bytes.as_deref(), "--memory-bytes")?,
-                ceiling_flag(disk_bytes.as_deref(), "--disk-bytes")?,
-                *priority,
-            );
-            let changing = cpu_millis.is_some()
-                || memory_bytes.is_some()
-                || disk_bytes.is_some()
-                || priority.is_some();
-            let view = store
-                .writer()
-                .write(move |tx| {
-                    if changing {
-                        let current = workers::host_view(tx, Authority::HostLocal, id)?.policy;
-                        let policy = workers::HostPolicy {
-                            cpu_millis: change.0.unwrap_or(current.cpu_millis),
-                            memory_bytes: change.1.unwrap_or(current.memory_bytes),
-                            disk_bytes: change.2.unwrap_or(current.disk_bytes),
-                            priority: change.3.unwrap_or(current.priority),
-                        };
-                        workers::set_policy(tx, Authority::HostLocal, id, policy)?;
-                    }
-                    workers::host_view(tx, Authority::HostLocal, id)
-                })
-                .map_err(|error| match error {
-                    sentinel_store::Error::NotFound => fail("no live worker with that identifier"),
-                    sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
-                    other => fail(format!("cannot change the policy: {other}")),
-                })?;
-            let show =
-                |value: Option<i64>| value.map_or_else(|| "none".to_owned(), |v| v.to_string());
-            sentinel::outln!(
-                "approved  cpu_millis={} memory_bytes={} disk_bytes={} priority={}",
-                show(view.policy.cpu_millis),
-                show(view.policy.memory_bytes),
-                show(view.policy.disk_bytes),
-                view.policy.priority
-            );
-            sentinel::outln!(
-                "reported  cpu_millis={} memory_bytes={} disk_bytes={} (0: not stated)",
-                view.reported_cpu_millis,
-                view.reported_memory_bytes,
-                view.reported_disk_bytes
-            );
-            sentinel::outln!(
-                "effective cpu_millis={} memory_bytes={} disk_bytes={} (0 disk: not enforced)",
-                view.effective_cpu_millis,
-                view.effective_memory_bytes,
-                view.effective_disk_bytes
-            );
-            if changing {
-                eprintln!("policy of {id} replaced; running work keeps its resources");
-            }
-        }
-        WorkerCommand::Uninstall { data, id } => {
-            let store = open(data, true)?;
-            let id: WorkerId = id
-                .parse()
-                .map_err(|_| fail("expected a wrk_ worker identifier"))?;
-            store
-                .writer()
-                .write(move |tx| workers::request_uninstall(tx, Authority::HostLocal, id, now))
-                .map_err(|error| match error {
-                    sentinel_store::Error::NotFound => fail("no live worker with that identifier"),
-                    other => fail(format!("cannot request the uninstall: {other}")),
-                })?;
-            eprintln!(
-                "{id} is draining; the controller revokes it, with its node key, once its accepted work has settled"
-            );
-        }
     }
     Ok(())
 }
@@ -1951,6 +1868,89 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
                     other => fail(format!("revocation failed: {other}")),
                 })?;
             eprintln!("revoked {id}");
+        }
+        WorkerCommand::Policy {
+            data,
+            id,
+            cpu_millis,
+            memory_bytes,
+            disk_bytes,
+            priority,
+        } => {
+            let store = open(data, true)?;
+            let id: WorkerId = id
+                .parse()
+                .map_err(|_| fail("expected a wrk_ worker identifier"))?;
+            let change = (
+                ceiling_flag(cpu_millis.as_deref(), "--cpu-millis")?,
+                ceiling_flag(memory_bytes.as_deref(), "--memory-bytes")?,
+                ceiling_flag(disk_bytes.as_deref(), "--disk-bytes")?,
+                *priority,
+            );
+            let changing = cpu_millis.is_some()
+                || memory_bytes.is_some()
+                || disk_bytes.is_some()
+                || priority.is_some();
+            let view = store
+                .writer()
+                .write(move |tx| {
+                    if changing {
+                        let current = workers::host_view(tx, Authority::HostLocal, id)?.policy;
+                        let policy = workers::HostPolicy {
+                            cpu_millis: change.0.unwrap_or(current.cpu_millis),
+                            memory_bytes: change.1.unwrap_or(current.memory_bytes),
+                            disk_bytes: change.2.unwrap_or(current.disk_bytes),
+                            priority: change.3.unwrap_or(current.priority),
+                        };
+                        workers::set_policy(tx, Authority::HostLocal, id, policy)?;
+                    }
+                    workers::host_view(tx, Authority::HostLocal, id)
+                })
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound => fail("no live worker with that identifier"),
+                    sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
+                    other => fail(format!("cannot change the policy: {other}")),
+                })?;
+            let show =
+                |value: Option<i64>| value.map_or_else(|| "none".to_owned(), |v| v.to_string());
+            sentinel::outln!(
+                "approved  cpu_millis={} memory_bytes={} disk_bytes={} priority={}",
+                show(view.policy.cpu_millis),
+                show(view.policy.memory_bytes),
+                show(view.policy.disk_bytes),
+                view.policy.priority
+            );
+            sentinel::outln!(
+                "reported  cpu_millis={} memory_bytes={} disk_bytes={} (0: not stated)",
+                view.reported_cpu_millis,
+                view.reported_memory_bytes,
+                view.reported_disk_bytes
+            );
+            sentinel::outln!(
+                "effective cpu_millis={} memory_bytes={} disk_bytes={} (0 disk: not enforced)",
+                view.effective_cpu_millis,
+                view.effective_memory_bytes,
+                view.effective_disk_bytes
+            );
+            if changing {
+                eprintln!("policy of {id} replaced; running work keeps its resources");
+            }
+        }
+        WorkerCommand::Uninstall { data, id } => {
+            let store = open(data, true)?;
+            let id: WorkerId = id
+                .parse()
+                .map_err(|_| fail("expected a wrk_ worker identifier"))?;
+            store
+                .writer()
+                .write(move |tx| workers::request_uninstall(tx, Authority::HostLocal, id, now))
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound => fail("no live worker with that identifier"),
+                    other => fail(format!("cannot request the uninstall: {other}")),
+                })?;
+            eprintln!(
+                "{id} is draining; the controller revokes it, with its node key, once its accepted work has settled"
+            );
         }
     }
     Ok(())
