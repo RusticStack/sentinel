@@ -162,7 +162,7 @@ const PAGES = {
   organizations: ["/organizations", "!!document.querySelector('#ns-h') && !!document.querySelector('#new-org-h')"],
   settings: ["/t/acme/settings", "!!document.querySelector('#about-h') && !!document.querySelector('#members-h')"],
   invitations: ["/t/acme/admin/invitations", "!!document.querySelector('#invite-h')"],
-  github: ["/setup/github", "document.querySelector('main h1') && document.querySelector('main h1').textContent === 'GitHub App' && document.querySelectorAll('main [role=status], main section').length >= 1"],
+  github: ["/setup/github", "document.querySelector('h1') && document.querySelector('h1').textContent === 'GitHub App' && document.querySelectorAll('main [role=status], main section').length >= 1"],
 };
 
 const PUBLIC_PAGES = {
