@@ -877,8 +877,16 @@ fn repo_authorization_runs_the_same_keyed_probe_for_present_and_absent_objects()
             assert_eq!(found.unwrap(), i.a);
             // A repository of another tenant, one that never existed and a random id are
             // refused by the identical keyed probe, so they cost exactly the same as each other.
-            let (foreign, r1) =
-                vm_steps(c, || auth::require_repo(c, who, i.personal_repo, P::READ));
+            let outsider = principal(i.outsider);
+            let (foreign, r1) = vm_steps(c, || auth::require_repo(c, outsider, i.ar, P::READ));
+            let (never_o, r0) = vm_steps(c, || {
+                auth::require_repo(c, outsider, RepoId::new(), P::READ)
+            });
+            missing(r0);
+            assert_eq!(
+                foreign, never_o,
+                "an existing foreign repository differs from an absent one"
+            );
             let (never, r2) = vm_steps(c, || auth::require_repo(c, who, RepoId::new(), P::READ));
             let (guess, r3) = vm_steps(c, || auth::require_repo(c, who, RepoId::new(), P::READ));
             missing(r1);
@@ -887,10 +895,6 @@ fn repo_authorization_runs_the_same_keyed_probe_for_present_and_absent_objects()
             assert_eq!(never, guess, "two absent ids differ in work");
             // A repository that exists but is not visible to the caller does the same one
             // index probe; the only difference to a hit is the single result row.
-            assert_eq!(
-                foreign, never,
-                "a foreign repository differs from an absent one"
-            );
             assert!(
                 present.abs_diff(never) <= 16,
                 "present {present} vs absent {never}: the probe is not the same shape"
