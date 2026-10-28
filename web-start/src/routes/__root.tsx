@@ -80,9 +80,8 @@ function Root() {
       if (raw !== null && unstashInvitation(raw, Date.now()) === null) sessionStorage.removeItem(INVITATION_STASH);
     } catch { /* storage off: nothing was parked */ }
     // Client-side navigation moves focus to the new view's heading.
-    let first = true;
-    const off = router.subscribe("onResolved", () => {
-      if (first) { first = false; return; }
+    const off = router.subscribe("onRendered", (e) => {
+      if (!e.fromLocation || !e.pathChanged) return;
       requestAnimationFrame(() => {
         const heading = document.querySelector<HTMLElement>("main h1, h1");
         if (!heading) return;

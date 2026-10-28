@@ -2,6 +2,7 @@
 // with no violation and no script error, hydrates, and still serves every unmoved view (the legacy process behind
 // it), the controller's proxied routes and the live streams through the same origin.
 import { readFileSync } from "node:fs";
+import http from "node:http";
 import { launch } from "../../web/test/cdp.mjs";
 
 const cfg = JSON.parse(readFileSync(process.argv[2], "utf8"));
@@ -30,8 +31,17 @@ for (const path of OWN_OUT) {
 
 const proxied = await fetch(cfg.base + "/api/v1/health");
 check("the controller's API is proxied through the front", proxied.status === 200, proxied.status);
-const refused = await fetch(cfg.base + "/api/v1/%2e%2e/metrics");
-check("an ambiguous controller path is refused, not forwarded", refused.status === 400, refused.status);
+// Sent with node:http, which keeps the target as written (fetch would resolve the encoded dots before sending).
+const rawStatus = (target) => new Promise((resolve, reject) => {
+  const u = new URL(cfg.base);
+  const req = http.request({ host: u.hostname, port: u.port, path: target, method: "GET" }, (res) => { res.resume(); resolve(res.statusCode); });
+  req.on("error", reject);
+  req.end();
+});
+for (const target of ["/api/v1/%2e%2e/metrics", "/api/v1/..%2fmetrics", "/x/../api/v1/runs"]) {
+  const status = await rawStatus(target);
+  check(`an ambiguous controller path is refused, not forwarded: ${target}`, status === 400, status);
+}
 
 const browser = await launch();
 const page = await browser.newPage({ width: 1280, height: 860 });

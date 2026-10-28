@@ -153,13 +153,13 @@ export class LogViewer {
   section(index: number) { return this.sections.find((s) => s.index === index); }
 
   build() {
-    this.results = el("ul", { class: "max-h-[30vh] overflow-auto rounded-md border border-default divide-y divide-default text-xs font-mono", hidden: true, "aria-label": "Search results" }) as HTMLUListElement;
+    this.results = el("ul", { class: "max-h-[30vh] overflow-auto rounded-md border border-line divide-y divide-line text-xs font-mono", hidden: true, "aria-label": "Search results" }) as HTMLUListElement;
     this.stateLine = el("p", { class: "text-sm text-muted min-h-5", role: "status", "aria-live": "polite" });
     this.searchBox = el("input", { id: "log-q", type: "search", maxlength: "256", placeholder: "Search this log (literal text)", autocomplete: "off",
-      class: "rounded-md border border-default bg-default px-2.5 py-1.5 text-sm w-72 max-w-full" }) as HTMLInputElement;
+      class: "rounded-md border border-line bg-canvas px-2.5 py-1.5 text-sm w-72 max-w-full" }) as HTMLInputElement;
     this.followBox = el("input", { id: "log-follow", type: "checkbox", checked: this.follow, disabled: !this.live,
       onchange: () => { this.follow = this.followBox.checked; if (this.follow) this.scrollToEnd(); } }) as HTMLInputElement;
-    this.stepList = el("ul", { class: "rounded-md border border-default divide-y divide-default overflow-auto max-h-[30vh] lg:max-h-[70vh]", "aria-label": "Steps" }) as HTMLUListElement;
+    this.stepList = el("ul", { class: "rounded-md border border-line divide-y divide-line overflow-auto max-h-[30vh] lg:max-h-[70vh]", "aria-label": "Steps" }) as HTMLUListElement;
     this.spacer = el("div", { class: "log-spacer" });
     this.viewport = el("div", { id: "log-view", class: "log-view", tabindex: "0", role: "list", "aria-label": "Log lines", "aria-describedby": "log-keys" }, this.spacer);
     this.viewport.addEventListener("scroll", () => this.schedule(), { passive: true });
@@ -167,7 +167,7 @@ export class LogViewer {
     this.resize = new ResizeObserver(() => this.schedule());
     this.resize.observe(this.viewport);
     const button = (label: string, onclick: () => void, primary = false) =>
-      el("button", { type: primary ? "submit" : "button", class: `rounded-md px-2.5 py-1.5 text-sm font-medium ${primary ? "bg-primary text-inverted" : "bg-elevated text-default ring ring-inset ring-accented"}`, onclick: primary ? null : onclick }, label);
+      el("button", { type: primary ? "submit" : "button", class: `rounded-md px-2.5 py-1.5 text-sm font-medium ${primary ? "bg-primary text-on-primary" : "bg-elevated text-fg ring ring-inset ring-line-strong"}`, onclick: primary ? null : onclick }, label);
     const form = el("form", { class: "flex flex-wrap items-center gap-2 mb-2", role: "search", onsubmit: (e: Event) => { e.preventDefault(); this.runSearch(); } },
       el("label", { for: "log-q", class: "sr" }, "Search this log"), this.searchBox,
       button("Find", () => {}, true), button("Clear", () => this.clearSearch()),

@@ -189,29 +189,6 @@ function useOutside(open: boolean, box: React.RefObject<HTMLElement | null>, clo
   }, [open, box]);
 }
 
-// --- popups are fixed to the viewport beside their trigger, so a table's scroll box never clips them ---
-function usePlacement(open: boolean, anchor: React.RefObject<HTMLElement | null>, prefer: "below" | "above") {
-  const [style, setStyle] = useState<React.CSSProperties>({});
-  useLayoutEffect(() => {
-    if (!open) return;
-    const place = () => {
-      const r = anchor.current?.getBoundingClientRect();
-      if (!r) return;
-      const room = { below: window.innerHeight - r.bottom, above: r.top };
-      const above = prefer === "above" ? room.above > 160 || room.above > room.below : room.below < 200 && room.above > room.below;
-      const left = Math.max(8, Math.min(r.left, window.innerWidth - 8 - Math.max(r.width, 160)));
-      setStyle(above
-        ? { position: "fixed", left, bottom: window.innerHeight - r.top + 4, minWidth: r.width, maxHeight: Math.max(120, room.above - 12) }
-        : { position: "fixed", left, top: r.bottom + 4, minWidth: r.width, maxHeight: Math.max(120, room.below - 12) });
-    };
-    place();
-    window.addEventListener("resize", place);
-    window.addEventListener("scroll", place, true);
-    return () => { window.removeEventListener("resize", place); window.removeEventListener("scroll", place, true); };
-  }, [open, anchor, prefer]);
-  return style;
-}
-
 // --- select: a button that opens a listbox (the ARIA "select-only combobox" pattern; options are role=option) ---
 export interface SelectItem { value: string; label: string; description?: string; icon?: string }
 export interface SelectGroup { label?: string; items: SelectItem[] }
@@ -233,7 +210,6 @@ export function Select({ id, label, ariaLabel, value, onChange, items, groups, p
   const list = useRef<HTMLDivElement>(null);
   const typed = useRef({ text: "", at: 0 });
   useOutside(open, box, () => setOpen(false));
-  const placed = usePlacement(open, trigger, "below");
   useLayoutEffect(() => { if (open) list.current?.focus(); }, [open]);
   useEffect(() => { if (open) document.getElementById(`${listId}-${active}`)?.scrollIntoView({ block: "nearest" }); }, [open, active, listId]);
 
@@ -276,7 +252,7 @@ export function Select({ id, label, ariaLabel, value, onChange, items, groups, p
       </button>
       {open ? (
         <div ref={list} id={listId} role="listbox" tabIndex={-1} aria-labelledby={label ? labelId : triggerId} aria-activedescendant={`${listId}-${active}`} onKeyDown={onListKey}
-          style={placed} className="z-50 w-max max-w-[min(20rem,calc(100vw-1rem))] overflow-auto rounded-md border border-line bg-canvas p-1 shadow-lg outline-none">
+          className="absolute left-0 top-full z-50 mt-1 max-h-80 w-max min-w-full max-w-[min(20rem,calc(100vw-2rem))] overflow-auto rounded-md border border-line bg-canvas p-1 shadow-lg outline-none">
           {all.map((g, gi) => (
             <div key={gi} role="group" aria-label={g.label} className={gi ? "mt-1 border-t border-line pt-1" : undefined}>
               {g.label ? <div role="presentation" className="px-2 py-1 text-xs font-semibold text-muted">{g.label}</div> : null}
@@ -316,7 +292,6 @@ export function DropdownMenu({ triggerLabel, trigger, triggerClassName, sections
   const button = useRef<HTMLButtonElement>(null);
   const menu = useRef<HTMLDivElement>(null);
   useOutside(open, box, () => setOpen(false));
-  const placed = usePlacement(open, button, placement === "top" ? "above" : "below");
   const items = () => [...(menu.current?.querySelectorAll<HTMLElement>("[role=menuitem]") ?? [])];
   useLayoutEffect(() => { if (open) { const all = items(); (focusAt === "last" ? all[all.length - 1] : all[0])?.focus(); } }, [open, focusAt]);
   const close = () => { setOpen(false); button.current?.focus(); };
@@ -342,7 +317,7 @@ export function DropdownMenu({ triggerLabel, trigger, triggerClassName, sections
       </button>
       {open ? (
         <div ref={menu} id={menuId} role="menu" aria-label={ariaLabel} onKeyDown={onMenuKey}
-          style={placed} className="z-50 w-56 overflow-auto rounded-md border border-line bg-canvas p-1 shadow-lg">
+          className={cx("absolute left-0 z-50 w-56 rounded-md border border-line bg-canvas p-1 shadow-lg", placement === "top" ? "bottom-full mb-1" : "top-full mt-1")}>
           {sections.map((s, si) => (
             <div key={si} role="group" className={si ? "mt-1 border-t border-line pt-1" : undefined}>
               {s.map((e) => e.kind === "label"
