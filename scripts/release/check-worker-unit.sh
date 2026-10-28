@@ -3,8 +3,9 @@
 # scores no worse than the recorded exposure, a copy of it started in the
 # calling user's systemd instance, with every sandbox directive the instance can
 # apply kept, runs `sentinel worker --check` to success, and, where rootless
-# Podman answers, the worker started from that copy reports `executor_ready`
-# and stops cleanly on SIGTERM.
+# Podman answers, the worker started from a copy without the mount-namespace
+# directives (a user instance cannot run Podman under them) reports
+# `executor_ready` and stops cleanly on SIGTERM.
 #
 #   scripts/release/check-worker-unit.sh <path to a sentinel binary built with --features worker>
 #
@@ -93,8 +94,20 @@ tmp_dir = "$state/containers/tmp"
 static_dir = "$state/containers/static"
 volume_path = "$state/containers/volumes"
 EOF
-make_copy() { # $1 = worker arguments appended to ExecStart, $2 = Type
-  sed \
+# $1 = worker arguments appended to ExecStart, $2 = Type, $3 = "mounts" to keep
+# the mount-namespace directives. A user instance builds a mount namespace inside
+# an unprivileged user namespace of its own, and the setuid newuidmap/newgidmap
+# helpers refuse to write id maps from there, so rootless Podman cannot start in
+# it ("cannot clone: Operation not permitted"). The executor step therefore drops
+# ProtectSystem, ProtectHome, PrivateTmp and PrivateMounts; a system unit has no
+# such namespace (docs/deployment.md).
+make_copy() {
+  local drop=() rw='\nReadWritePaths=%t'
+  if [ "${3:-}" != mounts ]; then
+    drop=(-e '/^ProtectSystem=/d' -e '/^ProtectHome=/d' -e '/^PrivateTmp=/d' -e '/^PrivateMounts=/d')
+    rw=
+  fi
+  sed "${drop[@]}" \
     -e '/^User=/d' -e '/^Group=/d' -e '/^CapabilityBoundingSet=/d' -e '/^AmbientCapabilities=/d' \
     -e '/^DevicePolicy=/d' -e '/^DeviceAllow=/d' \
     -e "s|^StateDirectory=.*|StateDirectory=$name $name/tmp|" \
@@ -103,14 +116,14 @@ make_copy() { # $1 = worker arguments appended to ExecStart, $2 = Type
     -e "s|^Type=simple|Type=$2|" \
     -e "s|^ExecStart=.*|ExecStart=%S/$name/sentinel worker --config %S/$name/worker.toml --data-dir $data $1|" \
     -e "s|^WantedBy=.*|WantedBy=default.target|" \
-    -e "/^\[Service\]/a StandardError=file:%S/$name/stderr.log\nStandardOutput=file:%S/$name/stdout.log\nReadWritePaths=%t" \
+    -e "/^\[Service\]/a StandardError=file:%S/$name/stderr.log\nStandardOutput=file:%S/$name/stdout.log$rw" \
     "$unit" >"$userdir/$name.service"
   : >"$state/stderr.log"
   : >"$state/stdout.log"
   systemctl --user daemon-reload
 }
 
-make_copy --check oneshot
+make_copy --check oneshot mounts
 systemctl --user start "$name.service" || { cat "$state/stderr.log" >&2 || true; systemctl --user status --no-pager "$name.service" >&2 || true; die "the unit's worker --check did not succeed"; }
 grep -q 'worker configuration valid' "$state/stdout.log" || { cat "$state/stdout.log" "$state/stderr.log" >&2 || true; die "worker --check did not report a valid configuration"; }
 echo "ok  started in the user instance; worker --check reported a valid configuration"
