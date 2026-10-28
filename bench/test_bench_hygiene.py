@@ -139,12 +139,18 @@ class RecordStamps(unittest.TestCase):
                     bad.append(f"{name}:{n}: {p}")
         self.assertEqual(bad[:10], [], f"{len(bad)} unstamped records outside LEGACY_UNSTAMPED")
 
-    def test_no_record_leaks_an_address_in_its_host_block(self):
+    def test_no_record_names_a_host_by_address(self):
+        # Kernel versions look like addresses (6.18.33.2), so only the identity fields are checked.
         for path in self.files():
             for n, rec in enumerate(records(path), 1):
                 host = rec.get("host")
-                text = json.dumps(host) if host is not None else ""
-                self.assertIsNone(IPV4.search(text), f"{os.path.basename(path)}:{n}")
+                if not isinstance(host, dict):
+                    continue
+                for key in ("hostname", "ip", "address", "addr", "user", "account"):
+                    self.assertFalse(
+                        IPV4.search(str(host.get(key, ""))) or key in ("ip", "address", "addr", "user", "account") and key in host,
+                        f"{os.path.basename(path)}:{n}: host.{key}",
+                    )
 
     def test_stamp_detection_rejects_what_it_should(self):
         ok = {"build": {"commit": "a" * 40}, "host": {"hostname": "reference-host"}}
