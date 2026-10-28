@@ -104,7 +104,7 @@ mod os {
     fn unsupported() -> io::Error {
         io::Error::new(
             io::ErrorKind::Unsupported,
-            "no OS credential store on this platform; use SENTINEL_CREDENTIAL_STORE=file",
+            "no OS credential store on this platform (Linux keeps credentials in the owner-only file store by decision); use SENTINEL_CREDENTIAL_STORE=file",
         )
     }
     #[cfg(not(windows))]
@@ -118,5 +118,25 @@ mod os {
     #[cfg(not(windows))]
     pub(super) fn delete(_key: &str) -> io::Result<()> {
         Err(unsupported())
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn os_store_is_refused_off_windows_and_names_the_file_store() {
+        assert!(!OS_AVAILABLE);
+        let dir = std::env::temp_dir();
+        let message = read(Backend::Os, &dir, "sentinel:i:p", "p")
+            .expect_err("no OS store off Windows")
+            .to_string();
+        assert!(
+            message.contains("SENTINEL_CREDENTIAL_STORE=file"),
+            "{message}"
+        );
+        assert!(write(Backend::Os, &dir, "k", "p", b"x").is_err());
+        assert!(delete(Backend::Os, &dir, "k", "p").is_err());
     }
 }

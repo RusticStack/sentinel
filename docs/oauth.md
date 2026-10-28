@@ -343,4 +343,4 @@ Known limits:
 - **One profile, one machine.** Two machines sharing one profile's credential present the same refresh token twice, which is replay and revokes the grant; the lock only serializes processes that share one configuration directory. Separate configuration directories on one machine hold separate credentials (the OS-store key names the directory; [CLI](cli.md)).
 - **Narrowing granularity.** A grant narrows to at most one tenant and one repository (the `Principal` shape).
 - **Open consent pages end with the process.** The form key is per process, so a controller restart invalidates consent and device pages that are already open; reloading them works.
-- **Credential stores.** Linux has no Secret Service backend (the owner-only file store is used). Windows uses Credential Manager. macOS is not supported.
+- **Credential stores.** Linux has no Secret Service backend by decision (the owner-only file store is used; the reasoning is in [the CLI's credential storage](cli.md#credential-storage)). Windows uses Credential Manager. macOS is not supported.
