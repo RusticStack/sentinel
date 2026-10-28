@@ -60,7 +60,7 @@ The parts are work packages, listed in the order they are taken; a part's number
 | 17 | Windows workers | Parts 04, 07, 08; N00; Windows guests through M07, or a Windows host (N01) for the native executor | M6 | open |
 | 18 | First-class artifacts | Parts 06 and 13 | M6 | open |
 | 19 | Default tenant storage limits | R01 (Part 13); E01 for retention classes | M6 | open |
-| 20 | Web interface on TanStack Start | Part 12; the U08 baseline before any budget | M6 | open |
+| 20 | Web interface on TanStack Start | Part 12; the U08 baseline before any budget | M6 | U08–U15 done (cut over); U16 and U17 open |
 | 21 | Guided GitHub Actions migration | Part 25 (AR01–AR03) for the label swap; Parts 05 and 14 (B06, B10) for the native path; Part 20 for the wizard's pages | M6 | open |
 | 22 | AI assistance | Part 11; Part 20 for its views; Y06 on X02 reports | M6 | open |
 
