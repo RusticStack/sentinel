@@ -139,6 +139,10 @@ struct Record {
 struct Interleave {
     runtimes: Vec<Runtime>,
     order: &'static str,
+    /// What each record's `conditions` cover: `per-runtime`, only the runs
+    /// of that record's own runtime (see `Window`). A record without this
+    /// field (taken before it existed) holds one block shared by the group.
+    conditions: &'static str,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -172,6 +176,7 @@ struct Conditions {
     cpu_governor: Option<String>,
 }
 
+#[derive(Clone)]
 struct Probe {
     pressure_avg10: Option<f64>,
     pressure_avg60: Option<f64>,
@@ -206,6 +211,85 @@ fn delta(start: Option<u64>, end: Option<u64>) -> Option<u64> {
     start.zip(end).and_then(|(a, b)| b.checked_sub(a))
 }
 
+fn steal_delta(start: &Probe, end: &Probe) -> Option<u64> {
+    start
+        .steal_ns
+        .zip(end.steal_ns)
+        .map(|(a, b)| b.saturating_sub(a))
+}
+
+/// A running sum of one counter's per-run deltas. A counter the kernel did
+/// not expose for some run makes the whole sum absent: a partial sum would
+/// read as a smaller stall than the runtime saw.
+#[derive(Default)]
+struct Sum {
+    total: u64,
+    runs: u32,
+    missing: bool,
+}
+
+impl Sum {
+    fn add(&mut self, value: Option<u64>) {
+        match value {
+            Some(v) => {
+                self.total = self.total.saturating_add(v);
+                self.runs += 1;
+            }
+            None => self.missing = true,
+        }
+    }
+
+    fn get(&self) -> Option<u64> {
+        (!self.missing && self.runs > 0).then_some(self.total)
+    }
+}
+
+/// The conditions one runtime of an interleaved group ran under. The group's
+/// runs alternate, so a single before/after window would charge every
+/// runtime with the load the others generated and with the gaps between
+/// them. Each run is probed on its own and only the stalls and steal seen
+/// while this runtime's runs (and its warm-ups) were executing are summed;
+/// the pressure averages are those at the start of its first run and the end
+/// of its last. The counters are host-wide, so they say what the host was
+/// doing meanwhile, not what the runtime caused.
+#[derive(Default)]
+struct Window {
+    first_start: Option<Probe>,
+    last_end: Option<Probe>,
+    cpu_stall: Sum,
+    io_stall: Sum,
+    io_full_stall: Sum,
+    steal: Sum,
+}
+
+impl Window {
+    fn record(&mut self, start: Probe, end: Probe) {
+        self.cpu_stall
+            .add(delta(start.cpu_total_us, end.cpu_total_us));
+        self.io_stall.add(delta(start.io_total_us, end.io_total_us));
+        self.io_full_stall
+            .add(delta(start.io_full_total_us, end.io_full_total_us));
+        self.steal.add(steal_delta(&start, &end));
+        if self.first_start.is_none() {
+            self.first_start = Some(start);
+        }
+        self.last_end = Some(end);
+    }
+
+    fn conditions(&self) -> Conditions {
+        let (Some(start), Some(end)) = (&self.first_start, &self.last_end) else {
+            return Conditions::default();
+        };
+        Conditions {
+            cpu_stall_us: self.cpu_stall.get(),
+            io_stall_us: self.io_stall.get(),
+            io_full_stall_us: self.io_full_stall.get(),
+            cpu_steal_ns: self.steal.get(),
+            ..conditions(start, end)
+        }
+    }
+}
+
 fn conditions(start: &Probe, end: &Probe) -> Conditions {
     Conditions {
         cpu_pressure_avg10_start: start.pressure_avg10,
@@ -219,10 +303,7 @@ fn conditions(start: &Probe, end: &Probe) -> Conditions {
         cpu_stall_us: delta(start.cpu_total_us, end.cpu_total_us),
         io_stall_us: delta(start.io_total_us, end.io_total_us),
         io_full_stall_us: delta(start.io_full_total_us, end.io_full_total_us),
-        cpu_steal_ns: start
-            .steal_ns
-            .zip(end.steal_ns)
-            .map(|(a, b)| b.saturating_sub(a)),
+        cpu_steal_ns: steal_delta(start, end),
         cpu_governor: read_trim("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
     }
 }
@@ -389,13 +470,25 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         measure(plan, index)
     };
+    let grouped = plans.len() > 1;
+    // A group probes around each run so every runtime gets its own
+    // conditions; a lone runtime keeps one window around the whole run.
+    let mut windows: Vec<Window> = plans.iter().map(|_| Window::default()).collect();
+    let mut timed = |k: usize, index: u32| -> Result<Sample, String> {
+        if !grouped {
+            return once(&plans[k], index);
+        }
+        let start = Probe::read();
+        let sample = once(&plans[k], index)?;
+        windows[k].record(start, Probe::read());
+        Ok(sample)
+    };
     let before = Probe::read();
     for _ in 0..plans[0].warmup {
-        for plan in &plans {
-            check_exit(&once(plan, 0)?)?;
+        for k in 0..plans.len() {
+            check_exit(&timed(k, 0)?)?;
         }
     }
-    let grouped = plans.len() > 1;
     let mut samples: Vec<Vec<Sample>> = plans
         .iter()
         .map(|p| Vec::with_capacity(p.samples as usize))
@@ -404,7 +497,7 @@ fn run(cli: Cli) -> Result<(), String> {
     for index in 0..plans[0].samples {
         // ABBA order: drift across the group cannot favour one runtime.
         for k in abba_order(index, plans.len()) {
-            let mut sample = once(&plans[k], index)?;
+            let mut sample = timed(k, index)?;
             check_exit(&sample)?;
             if grouped {
                 sample.seq = Some(seq);
@@ -413,10 +506,11 @@ fn run(cli: Cli) -> Result<(), String> {
             samples[k].push(sample);
         }
     }
-    let conditions_seen = conditions(&before, &Probe::read());
+    let whole = (!grouped).then(|| conditions(&before, &Probe::read()));
     let mut lines = Vec::with_capacity(plans.len());
     let mut summaries = Vec::with_capacity(plans.len());
-    for ((plan, samples), basis) in plans.into_iter().zip(samples).zip(bases) {
+    for (((plan, samples), basis), window) in plans.into_iter().zip(samples).zip(bases).zip(windows)
+    {
         let summary = summarize(&samples);
         summaries.push(summary_line(plan.runtime, &summary));
         let record = Record {
@@ -431,6 +525,7 @@ fn run(cli: Cli) -> Result<(), String> {
             interleave: grouped.then(|| Interleave {
                 runtimes: runtimes.clone(),
                 order: "abba",
+                conditions: "per-runtime",
             }),
             argv: plan.argv.clone(),
             limits: plan.limits,
@@ -448,7 +543,7 @@ fn run(cli: Cli) -> Result<(), String> {
             contract: plan.stamp,
             toolchain: plan.toolchain,
             warmup: plan.warmup,
-            conditions: conditions_seen.clone(),
+            conditions: whole.clone().unwrap_or_else(|| window.conditions()),
             samples,
             summary,
         };
@@ -1053,6 +1148,76 @@ mod tests {
     fn a_single_sample_has_no_standard_deviation() {
         let s = summarize(&samples(&[42]));
         assert_eq!((s.stddev_ns, s.mad_ns, s.mean_ns), (None, 0, 42));
+    }
+
+    fn probe(avg60: f64, cpu: Option<u64>, io: Option<u64>, steal: Option<u64>) -> Probe {
+        Probe {
+            pressure_avg10: Some(avg60),
+            pressure_avg60: Some(avg60),
+            steal_ns: steal,
+            io_avg10: Some(avg60),
+            io_avg60: Some(avg60),
+            cpu_total_us: cpu,
+            io_total_us: io,
+            io_full_total_us: io,
+        }
+    }
+
+    #[test]
+    fn a_runtimes_window_sums_only_its_own_runs() {
+        // Runs at 100..150 and 400..430; whatever the other runtime did in
+        // between (150..400) must not land on this one.
+        let mut w = Window::default();
+        w.record(
+            probe(1.0, Some(100), Some(10), Some(1_000)),
+            probe(2.0, Some(150), Some(15), Some(1_500)),
+        );
+        w.record(
+            probe(8.0, Some(400), Some(90), Some(9_000)),
+            probe(9.0, Some(430), Some(95), Some(9_100)),
+        );
+        let c = w.conditions();
+        assert_eq!(c.cpu_stall_us, Some(80));
+        assert_eq!(c.io_stall_us, Some(10));
+        assert_eq!(c.io_full_stall_us, Some(10));
+        assert_eq!(c.cpu_steal_ns, Some(600));
+        assert_eq!(c.cpu_pressure_avg60_start, Some(1.0));
+        assert_eq!(c.cpu_pressure_avg60_end, Some(9.0));
+    }
+
+    #[test]
+    fn two_windows_over_the_same_span_diverge_when_the_host_did() {
+        let mut quiet = Window::default();
+        let mut busy = Window::default();
+        quiet.record(
+            probe(0.0, Some(0), Some(0), Some(0)),
+            probe(0.0, Some(5), Some(0), Some(0)),
+        );
+        busy.record(
+            probe(0.0, Some(5), Some(0), Some(0)),
+            probe(40.0, Some(9_005), Some(0), Some(0)),
+        );
+        assert_eq!(quiet.conditions().cpu_stall_us, Some(5));
+        assert_eq!(busy.conditions().cpu_stall_us, Some(9_000));
+        assert_eq!(busy.conditions().cpu_pressure_avg60_end, Some(40.0));
+    }
+
+    #[test]
+    fn a_counter_missing_in_one_run_makes_the_sum_absent() {
+        let mut w = Window::default();
+        w.record(
+            probe(0.0, Some(0), None, Some(0)),
+            probe(0.0, Some(5), None, Some(10)),
+        );
+        w.record(
+            probe(0.0, None, None, Some(10)),
+            probe(0.0, Some(9), None, Some(20)),
+        );
+        let c = w.conditions();
+        assert_eq!(c.cpu_stall_us, None, "a partial sum would understate");
+        assert_eq!(c.io_stall_us, None);
+        assert_eq!(c.cpu_steal_ns, Some(20));
+        assert_eq!(Window::default().conditions().cpu_stall_us, None);
     }
 
     #[test]

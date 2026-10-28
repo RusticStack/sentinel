@@ -37,6 +37,21 @@ B11 is the primary relative target and uses a separate frozen contract, not a re
 - Use actual Blacksmith executions and timestamps. Disclose hosted hardware/network differences and call the result a hosted-service comparison, not a same-hardware architectural win, when equivalent hardware cannot be provided.
 - Vendor multipliers, GitHub self-hosted results and the one-run Blacksmith startup probe are not B11 evidence. **Blocked by: Blacksmith benchmark access.** Part 24 and V06 remain open until B11 passes.
 
+### The frozen B11 contract and harness
+
+[`bench/contracts/b11-blacksmith.json`](../bench/contracts/b11-blacksmith.json) (`sentinel.b11-contract/1`, revision 1, frozen 2026-10-28) fixes the rules above before any sample exists; it holds no measurement. The harness is `sentinel-b11` (`crates/sentinel-bench/src/bin/sentinel-b11.rs`):
+
+```
+sentinel-b11 --contract bench/contracts/b11-blacksmith.json --samples pairs.jsonl [--output report.jsonl]
+```
+
+- **Samples** (`sentinel.b11-samples/1`, JSON lines). The first line names the contract and revision (`{"format", "contract", "revision"}`); samples taken under another revision are refused, never combined. Each following line is one pair: `lane`, `condition`, `pair` (0, 1, 2, ... within the series), `order` (`sentinel-first` in even pairs, `blacksmith-first` in odd ones: the ABBA interleave), and a `sentinel` and a `blacksmith` execution, each with `sha`, `trigger_to_required_ns`, `outcome` (`pass`, `fail`, `incorrect`) and optionally `job_ns` (first job start to last job finish) and `phases` (name to nanoseconds). Both clocks are GitHub's recorded trigger and last-required-check completion (the contract's `clock`). A duration of 0, an unknown lane or condition, a duplicate pair, an unknown field or a malformed SHA is an input error (exit 2, no report).
+- **Statistic.** Per pair `ln(sentinel / blacksmith)`. The gate needs the nearest-rank p95 of Sentinel over that of Blacksmith at most 0.50 **and** the one-sided 95% upper bound of the mean paired log ratio, from a percentile bootstrap over pairs (10,000 resamples, xoshiro256** seeded with the contract's seed, so a report is reproducible byte for byte), strictly below `ln 0.50`. The bootstrap upper bound of the p95 ratio itself is reported beside the gate and does not decide it.
+- **Verdict per series** (lane and condition, independent). `pass`; `fail` when any execution on either side has outcome `fail` or `incorrect` (it stays in every distribution, nothing is dropped), a pair ran different SHAs, the ABBA order is broken, pair numbers have a gap (a dropped pair), or a ratio condition above is not met; `insufficient` below 100 pairs (the figures are still reported, as optimization guidance). A contract series with no samples fails the whole gate (`missing`). The exit code is 0 only when every series passes, 1 for any other verdict, 2 for an input error.
+- **Report** (`sentinel.b11-report/1`, one JSON line): the contract id, revision and BLAKE3, the label `hosted-service comparison` (never same-hardware), per series both sides' distributions (count, min, median, p95, max, mean), the paired ratios in pair order, the ratio estimates and bounds, the failure counts, and `job_ns` and each phase for both sides beside the end-to-end clock (a missing figure is absent, never zero).
+
+Status: the harness is exercised only by synthetic data (`crates/sentinel-bench/tests/b11.rs` and its unit tests). No Blacksmith sample exists, so B11 has no result; the lane selection for the release gate is a revision of this contract made before the first release sample.
+
 ## The runner
 
 `sentinel-bench --contract FILE --lane ID --condition cold|warm|small-edit --root DIR --runtime scoped|podman` behaves as follows:
@@ -48,6 +63,8 @@ B11 is the primary relative target and uses a separate frozen contract, not a re
 - It refuses to start when CPU pressure (`some`, avg60) is 5 % or more.
 
 ## Revision history
+
+- **`b11-blacksmith` revision 1** (2026-10-28): the separate B11 contract and paired-sample harness, rules only; no samples exist ([above](#the-frozen-b11-contract-and-harness)).
 
 - **`pilots-ci` revision 4** (2026-10-24): moved the reference measurement to `kvm-host`, with Sentinel and the GitHub baseline pinned to separate CCDs and allowed to run concurrently. Revision 3 completed no record on `reference-host`.
 

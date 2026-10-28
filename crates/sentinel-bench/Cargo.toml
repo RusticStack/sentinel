@@ -1,5 +1,6 @@
 [package]
 name = "sentinel-bench"
+default-run = "sentinel-bench"
 description = "Reproducible workload and machine-readable benchmark runner for Sentinel"
 version.workspace = true
 edition.workspace = true
