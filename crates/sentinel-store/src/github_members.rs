@@ -86,18 +86,22 @@ pub fn is_github_backed(conn: &Connection, tenant: TenantId) -> Result<bool> {
         .unwrap_or(false))
 }
 
+/// On a GitHub-backed tenant only the tenant's own service accounts can be edited by hand. Every other
+/// id is refused the same way, whether it names a person, an account elsewhere or nothing at all, so the
+/// refusal cannot tell an administrator which `usr_` ids exist.
 pub(crate) fn require_app_managed(
     conn: &Connection,
     tenant: TenantId,
-    human: Option<UserId>,
+    target: Option<UserId>,
 ) -> Result<()> {
     let backed: bool = conn
         .prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM tenants t WHERE t.id = ?1 AND t.membership_source = 1
-             AND (?2 IS NULL OR EXISTS(SELECT 1 FROM users u WHERE u.id = ?2 AND u.kind = 0)))",
+             AND (?2 IS NULL OR NOT EXISTS(SELECT 1 FROM users u WHERE u.id = ?2
+                  AND u.kind = 1 AND u.service_tenant_id = ?1)))",
         )?
         .query_row(
-            params![tenant.as_bytes(), human.as_ref().map(UserId::as_bytes)],
+            params![tenant.as_bytes(), target.as_ref().map(UserId::as_bytes)],
             |r| r.get(0),
         )?;
     if backed {

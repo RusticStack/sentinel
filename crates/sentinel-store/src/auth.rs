@@ -927,9 +927,14 @@ pub(crate) fn apply_repo_grant(
             params![tenant.as_bytes(), user.as_bytes(), repo.as_bytes()],
         )?;
     } else {
-        tx.execute("INSERT INTO repo_grants(tenant_id, user_id, repo_id, permissions) VALUES (?1, ?2, ?3, ?4)
+        // Only a member can hold a grant; anyone else is not found, whether or not the id names an account.
+        let changed = tx.execute("INSERT INTO repo_grants(tenant_id, user_id, repo_id, permissions)
+            SELECT tenant_id, user_id, ?3, ?4 FROM memberships WHERE tenant_id = ?1 AND user_id = ?2
             ON CONFLICT(tenant_id, user_id, repo_id) DO UPDATE SET permissions = excluded.permissions",
             params![tenant.as_bytes(), user.as_bytes(), repo.as_bytes(), permissions.bits()])?;
+        if changed == 0 {
+            return Err(Error::NotFound);
+        }
     }
     crate::tenancy::bump_epoch(tx, tenant)?;
     crate::local_auth::audit(
