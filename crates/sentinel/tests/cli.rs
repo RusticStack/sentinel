@@ -1401,6 +1401,28 @@ mod linux {
             "{}",
             String::from_utf8_lossy(&verified.stdout)
         );
+        // The recovery-point check an operator alerts on: fresh within the objective, stale past a limit of zero.
+        let rpo = |limit: &str| {
+            Command::new(env!("CARGO_BIN_EXE_sentinel"))
+                .args([
+                    "admin",
+                    "backup",
+                    "rpo",
+                    "--dir",
+                    backups.to_str().unwrap(),
+                    "--limit-secs",
+                    limit,
+                ])
+                .output()
+                .unwrap()
+        };
+        let fresh = rpo("3600");
+        assert!(fresh.status.success());
+        let state: serde_json::Value =
+            serde_json::from_slice(fresh.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        assert_eq!(state["newest"], backup_id.as_str());
+        assert_eq!(state["within_limit"], true);
+        assert!(!rpo("0").status.success());
         fs::remove_dir_all(&old_host).unwrap();
 
         let restore = Command::new(env!("CARGO_BIN_EXE_sentinel"))

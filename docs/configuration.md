@@ -103,7 +103,7 @@ backlog_bytes = 67549713920        # unreplicated bytes past which new artifacts
 # server only: scheduled online backups ([backup](backup.md)); absent takes none (use `admin backup create` beside a stopped controller)
 [backup]
 dir = "/mnt/backup/sentinel"       # absolute, outside data_dir: another disk or a mounted volume
-interval_secs = 3600               # 300..604800 (default hourly: the metadata recovery point)
+interval_secs = 3000               # 300..604800 (default 3000: interval + a backup's duration is the recovery point, objective 1 h)
 keep = 24                          # newest backups kept (1..1000, default 24)
 
 # server only: optional email delivery of verification and invitation links through Resend ([admission](admission.md#email-identity-and-email-invitations)); absent = nothing is sent and `sentinel admin` mints links. Needs public_url. Each key has an environment override (below)

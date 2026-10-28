@@ -437,6 +437,8 @@ fn backup(args: &crate::cli::BackupArgs) -> Result<(), Error> {
                             "id": id,
                             "schema": m["schema"],
                             "version": m["version"],
+                            "started_ms": m["started_ms"],
+                            "took_ms": m["took_ms"],
                             "metadata_bytes": m["metadata"]["bytes"],
                             "objects": m["objects"]["rows"],
                             "key_ids": m["key"]["key_ids"],
@@ -459,12 +461,40 @@ fn backup(args: &crate::cli::BackupArgs) -> Result<(), Error> {
                     "objects_checked": check.objects_checked,
                     "objects_remote_only": check.objects_remote,
                     "manifests_checked": check.manifests_checked,
+                    "config_checked": check.config_checked,
                     "missing": check.missing,
                     "corrupt": check.corrupt,
                 })
             );
             if !check.ok() {
                 return Err(fail(format!("backup {id} failed verification")));
+            }
+        }
+        BackupCommand::Rpo { dir, limit_secs } => {
+            let exposure = backup::exposure(dir, sentinel_core::UnixMillis::now())
+                .map_err(|error| fail(format!("cannot read the backups: {error}")))?;
+            let limit_ms = i64::try_from(*limit_secs)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000);
+            let secs = |ms: Option<i64>| ms.map(|ms| ms / 1_000);
+            let within = exposure.age_ms.is_some_and(|age| age <= limit_ms);
+            sentinel::outln!(
+                "{}",
+                serde_json::json!({
+                    "backups": exposure.backups,
+                    "newest": exposure.newest_id,
+                    "age_secs": secs(exposure.age_ms),
+                    "worst_window_secs": secs(exposure.worst_ms),
+                    "limit_secs": limit_secs,
+                    "within_limit": within,
+                })
+            );
+            if !within {
+                return Err(fail(if exposure.backups == 0 {
+                    "no backup in the directory".to_owned()
+                } else {
+                    format!("the newest backup is older than {limit_secs} s")
+                }));
             }
         }
         BackupCommand::Prune { dir, keep } => {
@@ -520,6 +550,7 @@ fn restore(
             "log_files": restored.log_files,
             "config_files": restored.config_files,
             "key_checked": restored.key_checked,
+            "objects_unavailable": restored.objects_unavailable,
             "copy_ms": copied.as_millis() as u64,
             "total_ms": started.elapsed().as_millis() as u64,
             "recovery": {
@@ -529,6 +560,12 @@ fn restore(
             },
         })
     );
+    if !restored.objects_unavailable.is_empty() {
+        eprintln!(
+            "{} objects were already missing or corrupt when the backup was taken and are not restored; recovery names them",
+            restored.objects_unavailable.len()
+        );
+    }
     if restored.objects_remote > 0 {
         eprintln!(
             "{} objects live only in the external S3 copy: configure the same [s3] section to read them",

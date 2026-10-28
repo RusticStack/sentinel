@@ -457,6 +457,15 @@ pub enum BackupCommand {
         #[arg(long, value_name = "ID")]
         id: Option<String>,
     },
+    /// How much a loss now would cost: the newest backup's age and the longest
+    /// window between kept backups; exit 2 when the age passes `--limit-secs`
+    Rpo {
+        #[arg(long, value_name = "DIR")]
+        dir: PathBuf,
+        /// The recovery-point objective in seconds
+        #[arg(long, value_name = "SECS", default_value_t = 3_600)]
+        limit_secs: u64,
+    },
     /// Keep the newest backups and remove the rest and what only they named
     Prune {
         #[arg(long, value_name = "DIR")]
