@@ -30,7 +30,16 @@ loopback, link-local, private, shared, multicast, reserved, or an IPv6 form
 embedding one), and then pins Git's connection to exactly those addresses
 (`http.curloptResolve`), so a second DNS answer cannot rebind the name after
 the check. The option needs Git 2.37; an older or unreadable Git refuses
-unbound remotes rather than fetch them unpinned. A deployment that really
+unbound remotes rather than fetch them unpinned. Only a successfully parsed
+`git --version` is remembered for the life of the process; a probe that fails
+or cannot be parsed refuses that remote and is retried for the next one, so a
+transient failure never latches. The name is resolved by a `getent ahosts`
+child (so `getent` must be on the worker's `PATH`; without it unbound remotes
+are refused) with a cleared environment, in its own process group, under the
+remaining checkout deadline capped at 15 seconds and a 256 KiB output cap. A
+resolver that hangs, floods, exits non-zero or prints a line that is not an
+address is killed and refused; no resolver thread or process outlives the
+call. A deployment that really
 needs an internal manual destination lists its exact authorities,
 comma-separated, in `SENTINEL_MANUAL_DESTINATIONS` (for example
 `https://git.corp.internal:8443`) in **both** the controller's and the
@@ -284,7 +293,9 @@ the event context; a worker below protocol 3 is served `NoSpec`. Intake uses
   manual remotes naming IP literals, bare hostnames or private suffixes are
   refused at admission and at the worker with one message; address
   classification, Git version parsing and the unreadable-`HOME` guarantee are
-  unit tested.
+  unit tested, as are the version-probe cache (fail then succeed), strict
+  `getent ahosts` parsing, helper-injected resolution and a hung or flooding
+  resolver that is killed with no thread or process left behind.
 - `crates/sentinel-github` unit tests: installation identity, account type,
   suspension, permission validity, a read-only scoped token, lifetime bounds
   and redacted debug output.
