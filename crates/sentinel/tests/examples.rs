@@ -177,3 +177,30 @@ fn unit_and_container_command_lines_use_flags_that_exist() {
         "expected two units and four container command lines"
     );
 }
+
+#[test]
+fn worker_check_names_every_missing_microvm_piece() {
+    if !enabled("worker") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().display();
+    let config = dir.path().join("worker.toml");
+    fs::write(
+        &config,
+        format!(
+            "data_dir = \"{root}/data\"\ncontroller = \"10.0.0.5:7443\"\ncontroller_fingerprint = \"{}\"\n\n[microvm]\nfirecracker = \"{root}/firecracker\"\nkernel = \"{root}/vmlinux\"\nagent = \"{root}/sentinel-agent\"\n",
+            "ab".repeat(32)
+        ),
+    )
+    .unwrap();
+    fs::create_dir(dir.path().join("data")).unwrap();
+    let output = sentinel(&["worker", "--config", config.to_str().unwrap(), "--check"]);
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("microvm=unavailable"), "{text}");
+    assert!(text.contains("firecracker "), "{text}");
+    assert!(text.contains("vmlinux: no guest kernel"), "{text}");
+    assert!(text.contains("agent "), "{text}");
+    assert!(text.contains("docs/releasing.md#microvm-assets"), "{text}");
+}

@@ -70,7 +70,7 @@ tailcat_address = "tc…"            # required with `[tailcat] enabled = true`:
 # worker only: Firecracker execution on a KVM host; absent disables microVM execution
 [microvm]
 firecracker = "/usr/local/bin/firecracker"  # Firecracker executable
-kernel = "/var/lib/sentinel-microvm/vmlinux" # pinned Linux guest kernel
+kernel = "/var/lib/sentinel-microvm/vmlinux" # pinned Linux guest kernel; the x86_64 worker package installs all three files (docs/releasing.md#microvm-assets)
 agent = "/usr/local/bin/sentinel-agent"      # static Linux guest agent executable
 
 # either role: the optional pinned Tailcat transport; absent or `enabled = false` = direct TLS

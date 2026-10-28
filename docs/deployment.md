@@ -70,7 +70,7 @@ The account is unprivileged and the unit **refuses to run as root**: a first `Ex
 
 - **Subordinate ids** that overlap no other account (`/etc/subuid`, `/etc/subgid`), and the setuid `newuidmap`/`newgidmap` helpers (package `uidmap`).
 - **A user manager** (`user@<uid>.service`), started by `loginctl enable-linger`. Job limits are enforced by a systemd user scope per job that the executor creates over the account's user bus (`systemd-run --user --scope`, also the microVM executor's cgroup); without the manager there is no `XDG_RUNTIME_DIR` and no limits, so the unit's second `ExecStartPre` refuses to start (status 1, retried: at boot the manager may still be coming up).
-- **`/dev/kvm`** for microVMs, on a host that has it: add the account to the `kvm` group. Omit `[microvm]` elsewhere.
+- **`/dev/kvm`** for microVMs, on a host that has it: add the account to the `kvm` group. The x86_64 worker package carries Firecracker, the guest kernel and the agent: `microvm/install.sh` puts them where `examples/worker.toml` expects them ([releasing](releasing.md#microvm-assets)). Omit `[microvm]` elsewhere.
 
 ```sh
 useradd --system --create-home --home-dir /var/lib/sentinel-worker \
@@ -173,7 +173,7 @@ SENTINEL_VERSION=<version> podman compose -f compose.worker.yaml up -d
 - **`privileged: true` is required, and weaker than the unit.** Measured with Podman 5.7.0, crun and cgroup v2 (Ubuntu 26.04, kernel 7.0): with default options the executor reports `executor_unavailable` (`cannot set up namespace using "/usr/bin/newuidmap"`); `--cap-add=SYS_ADMIN` lets Podman start but every nested container fails (`crun: open /proc/sys/net/ipv4/ping_group_range: Read-only file system`) because the outer container masks `/proc/sys`; unmasking only `/proc/sys` fails on the `proc` mount; `--privileged` works. On rootless Podman that means all capabilities inside the account's user namespace, no seccomp filter and the host devices the account can open, never root on the host; but the outer container no longer confines what runs in it. Where a systemd unit can be used, it is the better-isolated choice.
 - **Job networking is `none` only.** With the default network or `job_network = "egress"` the nested `pasta` fails (`Couldn't open network namespace … Permission denied`), so egress jobs do not run in this container.
 - **Resource limits.** The nested Podman uses the `cgroupfs` manager with `cpu memory pids` delegated; it accepts `--memory` and `--cpus` (read back with `podman inspect`). Enforcement was inspected, not stress-tested.
-- **No microVMs.** The Firecracker executor needs `/dev/kvm` and its files; mount them yourself on a KVM host, or use the unit.
+- **No microVMs.** The Firecracker executor needs `/dev/kvm` and its files; on a KVM host install them from the x86_64 worker package ([releasing](releasing.md#microvm-assets)) and mount them into the container yourself, or use the unit.
 - **Disk.** The data volume also holds Podman's images and containers (`.local/share/containers` below it), so it grows with pulled job images.
 
 ### What was verified
