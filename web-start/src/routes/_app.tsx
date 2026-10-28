@@ -4,7 +4,7 @@ import { createFileRoute, Link, Outlet, useNavigate, useParams, useRouterState }
 import { readCookie } from "../lib/api.ts";
 import { signOut, useSession } from "../lib/session.ts";
 import { shortId } from "../lib/format.ts";
-import { AriaButton, cx, DropdownMenu, Icon, PathLink, Select, type SelectGroup } from "../components/ui.tsx";
+import { cx, DropdownMenu, Icon, PathLink, Select, type SelectGroup } from "../components/ui.tsx";
 import { MenuButtonContext, rememberTenant } from "../components/Page.tsx";
 
 export const Route = createFileRoute("/_app")({
@@ -97,12 +97,9 @@ function AppShell() {
           <nav aria-label="Platform" className="mt-auto"><ul className="space-y-0.5">{platform.map(navItem)}</ul></nav>
         </div>
         <div className="border-t border-line p-3">
-          <DropdownMenu ariaLabel="Account"
-            trigger={
-              <AriaButton aria-label="Account menu" className="flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm text-fg hover:bg-elevated">
-                <Icon name="circle-user" /><span className="flex-1 truncate text-left">{me?.username || "Account"}</span><Icon name="chevrons-up-down" className="size-4 text-dimmed" />
-              </AriaButton>
-            }
+          <DropdownMenu ariaLabel="Account" triggerLabel="Account menu"
+            triggerClassName="flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm text-fg hover:bg-elevated"
+            trigger={<><Icon name="circle-user" /><span className="flex-1 truncate text-left">{me?.username || "Account"}</span><Icon name="chevrons-up-down" className="size-4 text-dimmed" /></>}
             sections={[
               [{ label: me?.username || shortId(me?.user), icon: "user", kind: "label" }],
               [

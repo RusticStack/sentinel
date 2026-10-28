@@ -1,11 +1,9 @@
-// The interface's building blocks: native elements styled with Tailwind where the platform is enough, React Aria
-// Components where a pattern needs managed focus and keyboard behaviour (select, menu, modal dialog).
-import { forwardRef, useEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type TextareaHTMLAttributes } from "react";
+// The interface's building blocks: native elements styled with Tailwind, and three small ARIA widgets where the
+// platform has no styleable equivalent (a listbox select, a menu button, a modal dialog on the native <dialog>).
+// React Aria Components was the first candidate; U09 measured it at about 70 KB of gzipped browser JavaScript for
+// these three patterns, more than the whole run page may add under the U14 budget, so they are written here.
+import { forwardRef, useEffect, useId, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type KeyboardEvent, type ReactNode, type TextareaHTMLAttributes } from "react";
 import { Link } from "@tanstack/react-router";
-import {
-  Button as AriaButton, Dialog, Header, Heading, Label, ListBox, ListBoxItem, ListBoxSection, Menu, MenuItem, MenuSection, MenuTrigger,
-  Modal, ModalOverlay, Popover, Select as AriaSelect, SelectValue, Separator,
-} from "react-aria-components";
 import { ICONS } from "./icons.ts";
 
 export type Color = "primary" | "neutral" | "success" | "info" | "warning" | "error";
@@ -179,93 +177,220 @@ export function Table({ caption, children, className }: { caption?: string; chil
   );
 }
 
-// --- select (React Aria): a button that opens a listbox; options are role=option ---
+// --- shared popup behaviour: closes on a press outside the widget ---
+function useOutside(open: boolean, box: React.RefObject<HTMLElement | null>, close: () => void) {
+  const latest = useRef(close);
+  latest.current = close;
+  useEffect(() => {
+    if (!open) return;
+    const down = (e: PointerEvent) => { if (box.current && !box.current.contains(e.target as Node)) latest.current(); };
+    document.addEventListener("pointerdown", down, true);
+    return () => document.removeEventListener("pointerdown", down, true);
+  }, [open, box]);
+}
+
+// --- popups are fixed to the viewport beside their trigger, so a table's scroll box never clips them ---
+function usePlacement(open: boolean, anchor: React.RefObject<HTMLElement | null>, prefer: "below" | "above") {
+  const [style, setStyle] = useState<React.CSSProperties>({});
+  useLayoutEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const r = anchor.current?.getBoundingClientRect();
+      if (!r) return;
+      const room = { below: window.innerHeight - r.bottom, above: r.top };
+      const above = prefer === "above" ? room.above > 160 || room.above > room.below : room.below < 200 && room.above > room.below;
+      const left = Math.max(8, Math.min(r.left, window.innerWidth - 8 - Math.max(r.width, 160)));
+      setStyle(above
+        ? { position: "fixed", left, bottom: window.innerHeight - r.top + 4, minWidth: r.width, maxHeight: Math.max(120, room.above - 12) }
+        : { position: "fixed", left, top: r.bottom + 4, minWidth: r.width, maxHeight: Math.max(120, room.below - 12) });
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => { window.removeEventListener("resize", place); window.removeEventListener("scroll", place, true); };
+  }, [open, anchor, prefer]);
+  return style;
+}
+
+// --- select: a button that opens a listbox (the ARIA "select-only combobox" pattern; options are role=option) ---
 export interface SelectItem { value: string; label: string; description?: string; icon?: string }
 export interface SelectGroup { label?: string; items: SelectItem[] }
 export function Select({ id, label, ariaLabel, value, onChange, items, groups, placeholder, icon, className, isDisabled, labelHidden }: {
   id?: string; label?: string; ariaLabel?: string; value: string | null | undefined; onChange: (v: string) => void; items?: SelectItem[]; groups?: SelectGroup[];
   placeholder?: string; icon?: string; className?: string; isDisabled?: boolean; labelHidden?: boolean;
 }) {
+  const auto = useId();
+  const triggerId = id ?? `sel-${auto}`;
+  const labelId = `${triggerId}-label`;
+  const listId = `${triggerId}-list`;
   const all = groups ?? [{ items: items ?? [] }];
-  const find = all.flatMap((g) => g.items).find((i) => i.value === value);
+  const flat = all.flatMap((g) => g.items);
+  const selected = flat.find((i) => i.value === value);
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(0);
+  const box = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const list = useRef<HTMLDivElement>(null);
+  const typed = useRef({ text: "", at: 0 });
+  useOutside(open, box, () => setOpen(false));
+  const placed = usePlacement(open, trigger, "below");
+  useLayoutEffect(() => { if (open) list.current?.focus(); }, [open]);
+  useEffect(() => { if (open) document.getElementById(`${listId}-${active}`)?.scrollIntoView({ block: "nearest" }); }, [open, active, listId]);
+
+  const show = (at?: number) => { if (isDisabled || !flat.length) return; setActive(at ?? Math.max(0, flat.findIndex((i) => i.value === value))); setOpen(true); };
+  const close = () => { setOpen(false); trigger.current?.focus(); };
+  const choose = (i: number) => { const item = flat[i]; setOpen(false); trigger.current?.focus(); if (item && item.value !== value) onChange(item.value); };
+  function onTriggerKey(e: KeyboardEvent) {
+    if (["ArrowDown", "ArrowUp", "Enter", " "].includes(e.key)) { e.preventDefault(); show(); }
+  }
+  function onListKey(e: KeyboardEvent) {
+    const last = flat.length - 1;
+    if (e.key === "ArrowDown") { e.preventDefault(); setActive((a) => Math.min(last, a + 1)); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); setActive((a) => Math.max(0, a - 1)); }
+    else if (e.key === "Home") { e.preventDefault(); setActive(0); }
+    else if (e.key === "End") { e.preventDefault(); setActive(last); }
+    else if (e.key === "Enter" || e.key === " ") { e.preventDefault(); choose(active); }
+    else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(); }
+    else if (e.key === "Tab") setOpen(false);
+    else if (e.key.length === 1 && /\S/.test(e.key)) {
+      // Type-ahead: the next option whose label starts with what was typed in the last 0.7 s.
+      const now = Date.now();
+      typed.current = { text: (now - typed.current.at < 700 ? typed.current.text : "") + e.key.toLowerCase(), at: now };
+      const from = typed.current.text.length > 1 ? active : active + 1;
+      const hit = flat.findIndex((i, n) => n >= from && i.label.toLowerCase().startsWith(typed.current.text));
+      const wrap = hit >= 0 ? hit : flat.findIndex((i) => i.label.toLowerCase().startsWith(typed.current.text));
+      if (wrap >= 0) setActive(wrap);
+    }
+  }
+  let n = -1;
   return (
-    <AriaSelect selectedKey={value ?? null} onSelectionChange={(k) => k !== null && onChange(String(k))} isDisabled={isDisabled}
-      aria-label={label ? undefined : ariaLabel} placeholder={placeholder} className={cx("space-y-1", className)}>
-      {label ? <Label className={labelHidden ? "sr" : "block text-sm font-medium text-strong"}>{label}</Label> : null}
-      <AriaButton id={id} aria-label={ariaLabel} className={cx(INPUT, "flex items-center gap-2 text-left cursor-pointer")}>
-        {icon || find?.icon ? <Icon name={(find?.icon ?? icon)!} className="size-4 text-muted" /> : null}
-        <SelectValue className="flex-1 truncate">{({ isPlaceholder }) => (isPlaceholder ? <span className="text-dimmed">{placeholder}</span> : find?.label)}</SelectValue>
+    <div ref={box} className={cx("relative space-y-1", className)}>
+      {label ? <span id={labelId} className={labelHidden ? "sr" : "block text-sm font-medium text-strong"}>{label}</span> : null}
+      <button ref={trigger} type="button" id={triggerId} disabled={isDisabled} aria-label={ariaLabel} aria-labelledby={ariaLabel ? undefined : label ? `${labelId} ${triggerId}` : undefined}
+        aria-haspopup="listbox" aria-expanded={open} aria-controls={open ? listId : undefined}
+        onClick={() => (open ? setOpen(false) : show())} onKeyDown={onTriggerKey}
+        className={cx(INPUT, "flex cursor-pointer items-center gap-2 text-left")}>
+        {icon || selected?.icon ? <Icon name={(selected?.icon ?? icon)!} className="size-4 text-muted" /> : null}
+        <span className="flex-1 truncate">{selected ? selected.label : <span className="text-dimmed">{placeholder ?? "Choose"}</span>}</span>
         <Icon name="chevrons-up-down" className="size-4 text-dimmed" />
-      </AriaButton>
-      <Popover className="min-w-(--trigger-width) max-h-80 overflow-auto rounded-md border border-line bg-canvas p-1 shadow-lg">
-        <ListBox className="outline-none">
+      </button>
+      {open ? (
+        <div ref={list} id={listId} role="listbox" tabIndex={-1} aria-labelledby={label ? labelId : triggerId} aria-activedescendant={`${listId}-${active}`} onKeyDown={onListKey}
+          style={placed} className="z-50 w-max max-w-[min(20rem,calc(100vw-1rem))] overflow-auto rounded-md border border-line bg-canvas p-1 shadow-lg outline-none">
           {all.map((g, gi) => (
-            <ListBoxSection key={gi} className="[&+&]:mt-1 [&+&]:border-t [&+&]:border-line [&+&]:pt-1">
-              {g.label ? <Header className="px-2 py-1 text-xs font-semibold text-muted">{g.label}</Header> : null}
-              {g.items.map((i) => (
-                <ListBoxItem key={i.value} id={i.value} textValue={i.label}
-                  className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm text-fg outline-none data-[focused]:bg-elevated data-[selected]:font-semibold">
-                  {i.icon ? <Icon name={i.icon} className="size-4 text-muted" /> : null}
-                  <span className="flex-1">
-                    <span className="block">{i.label}</span>
-                    {i.description ? <span className="block text-xs text-muted">{i.description}</span> : null}
-                  </span>
-                </ListBoxItem>
-              ))}
-            </ListBoxSection>
+            <div key={gi} role="group" aria-label={g.label} className={gi ? "mt-1 border-t border-line pt-1" : undefined}>
+              {g.label ? <div role="presentation" className="px-2 py-1 text-xs font-semibold text-muted">{g.label}</div> : null}
+              {g.items.map((i) => {
+                const at = ++n;
+                return (
+                  <div key={i.value} id={`${listId}-${at}`} role="option" aria-selected={i.value === value}
+                    onPointerMove={() => setActive(at)} onClick={() => choose(at)}
+                    className={cx("flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm text-fg", at === active && "bg-elevated", i.value === value && "font-semibold")}>
+                    {i.icon ? <Icon name={i.icon} className="size-4 text-muted" /> : null}
+                    <span className="flex-1">
+                      <span className="block">{i.label}</span>
+                      {i.description ? <span className="block text-xs text-muted">{i.description}</span> : null}
+                    </span>
+                    {i.value === value ? <Icon name="check" className="size-4 text-primary" /> : null}
+                  </div>
+                );
+              })}
+            </div>
           ))}
-        </ListBox>
-      </Popover>
-    </AriaSelect>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
-// --- menu (React Aria) ---
-export interface MenuEntry { label: string; icon?: string; onAction?: () => void; href?: string; kind?: "label" }
-export function DropdownMenu({ trigger, sections, ariaLabel }: { trigger: ReactNode; sections: MenuEntry[][]; ariaLabel: string }) {
+// --- menu button: a button that opens a menu of actions (role=menu, items role=menuitem) ---
+export interface MenuEntry { label: string; icon?: string; onAction?: () => void; kind?: "label" }
+export function DropdownMenu({ triggerLabel, trigger, triggerClassName, sections, ariaLabel, placement = "top" }: {
+  triggerLabel: string; trigger: ReactNode; triggerClassName?: string; sections: MenuEntry[][]; ariaLabel: string; placement?: "top" | "bottom";
+}) {
+  const auto = useId();
+  const menuId = `menu-${auto}`;
+  const [open, setOpen] = useState(false);
+  const [focusAt, setFocusAt] = useState<"first" | "last">("first");
+  const box = useRef<HTMLDivElement>(null);
+  const button = useRef<HTMLButtonElement>(null);
+  const menu = useRef<HTMLDivElement>(null);
+  useOutside(open, box, () => setOpen(false));
+  const placed = usePlacement(open, button, placement === "top" ? "above" : "below");
+  const items = () => [...(menu.current?.querySelectorAll<HTMLElement>("[role=menuitem]") ?? [])];
+  useLayoutEffect(() => { if (open) { const all = items(); (focusAt === "last" ? all[all.length - 1] : all[0])?.focus(); } }, [open, focusAt]);
+  const close = () => { setOpen(false); button.current?.focus(); };
+  function onButtonKey(e: KeyboardEvent) {
+    if (e.key === "ArrowDown" || e.key === "Enter" || e.key === " ") { e.preventDefault(); setFocusAt("first"); setOpen(true); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); setFocusAt("last"); setOpen(true); }
+  }
+  function onMenuKey(e: KeyboardEvent) {
+    const all = items();
+    const at = all.indexOf(document.activeElement as HTMLElement);
+    if (e.key === "ArrowDown") { e.preventDefault(); all[(at + 1) % all.length]?.focus(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); all[(at - 1 + all.length) % all.length]?.focus(); }
+    else if (e.key === "Home") { e.preventDefault(); all[0]?.focus(); }
+    else if (e.key === "End") { e.preventDefault(); all[all.length - 1]?.focus(); }
+    else if (e.key === "Escape") { e.preventDefault(); close(); }
+    else if (e.key === "Tab") setOpen(false);
+  }
   return (
-    <MenuTrigger>
-      {trigger}
-      <Popover placement="top" className="w-56 rounded-md border border-line bg-canvas p-1 shadow-lg">
-        <Menu aria-label={ariaLabel} className="outline-none">
+    <div ref={box} className="relative">
+      <button ref={button} type="button" aria-label={triggerLabel} aria-haspopup="menu" aria-expanded={open} aria-controls={open ? menuId : undefined}
+        onClick={() => { setFocusAt("first"); setOpen((o) => !o); }} onKeyDown={onButtonKey} className={triggerClassName}>
+        {trigger}
+      </button>
+      {open ? (
+        <div ref={menu} id={menuId} role="menu" aria-label={ariaLabel} onKeyDown={onMenuKey}
+          style={placed} className="z-50 w-56 overflow-auto rounded-md border border-line bg-canvas p-1 shadow-lg">
           {sections.map((s, si) => (
-            <MenuSection key={si}>
-              {si > 0 ? <Separator className="my-1 border-t border-line" /> : null}
+            <div key={si} role="group" className={si ? "mt-1 border-t border-line pt-1" : undefined}>
               {s.map((e) => e.kind === "label"
-                ? <Header key={e.label} className="flex items-center gap-2 px-2 py-1.5 text-sm font-semibold text-strong">{e.icon ? <Icon name={e.icon} /> : null}{e.label}</Header>
+                ? <div key={e.label} role="presentation" className="flex items-center gap-2 px-2 py-1.5 text-sm font-semibold text-strong">{e.icon ? <Icon name={e.icon} /> : null}{e.label}</div>
                 : (
-                  <MenuItem key={e.label} id={e.label} href={e.href} onAction={e.onAction} textValue={e.label}
-                    className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm text-fg outline-none data-[focused]:bg-elevated">
+                  <button key={e.label} type="button" role="menuitem" tabIndex={-1} onClick={() => { setOpen(false); button.current?.focus(); e.onAction?.(); }}
+                    className="flex w-full cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left text-sm text-fg hover:bg-elevated focus:bg-elevated">
                     {e.icon ? <Icon name={e.icon} className="size-4 text-muted" /> : null}{e.label}
-                  </MenuItem>
+                  </button>
                 ))}
-            </MenuSection>
+            </div>
           ))}
-        </Menu>
-      </Popover>
-    </MenuTrigger>
+        </div>
+      ) : null}
+    </div>
   );
 }
-export { AriaButton };
 
-// --- modal dialog (React Aria): focus is trapped, Escape closes unless the dialog says otherwise ---
+// --- modal dialog on the native <dialog>: the browser traps focus and makes the page behind it inert ---
 export function DialogModal({ isOpen, onClose, title, description, children, dismissable = true, footer, wide }: {
   isOpen: boolean; onClose: () => void; title: string; description?: ReactNode; children?: ReactNode; dismissable?: boolean; footer?: ReactNode; wide?: boolean;
 }) {
+  const auto = useId();
+  const ref = useRef<HTMLDialogElement>(null);
+  const latest = useRef({ onClose, dismissable });
+  latest.current = { onClose, dismissable };
+  useLayoutEffect(() => {
+    const d = ref.current;
+    if (!isOpen || !d) return;
+    const opener = document.activeElement as HTMLElement | null;
+    if (!d.open) d.showModal();
+    return () => { if (d.open) d.close(); if (opener?.isConnected) opener.focus(); };
+  }, [isOpen]);
+  if (!isOpen) return null;
   return (
-    <ModalOverlay isOpen={isOpen} onOpenChange={(open) => { if (!open) onClose(); }} isDismissable={dismissable} isKeyboardDismissDisabled={!dismissable}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <Modal className={cx("w-full rounded-lg border border-line bg-canvas shadow-xl", wide ? "max-w-2xl" : "max-w-md")}>
-        <Dialog className="outline-none">
-          <div className="space-y-1 border-b border-line px-4 py-3">
-            <Heading slot="title" className="text-base font-semibold text-strong">{title}</Heading>
-            {description ? <div className="text-sm text-muted">{description}</div> : null}
-          </div>
-          {children ? <div className="space-y-4 px-4 py-3">{children}</div> : null}
-          {footer ? <div className="flex flex-wrap justify-end gap-2 border-t border-line px-4 py-3">{footer}</div> : null}
-        </Dialog>
-      </Modal>
-    </ModalOverlay>
+    <dialog ref={ref} role="dialog" aria-modal="true" aria-labelledby={`${auto}-t`} aria-describedby={description ? `${auto}-d` : undefined}
+      onCancel={(e) => { e.preventDefault(); if (latest.current.dismissable) latest.current.onClose(); }}
+      // A browser may close a dialog on a repeated Escape whatever the page says; one that must stay (shown once) reopens.
+      onClose={() => { if (!latest.current.dismissable && ref.current?.isConnected && !ref.current.open) ref.current.showModal(); }}
+      onClick={(e) => { if (e.target === ref.current && latest.current.dismissable) latest.current.onClose(); }}
+      className={cx("m-auto w-[calc(100vw-2rem)] rounded-lg border border-line bg-canvas p-0 text-fg shadow-xl backdrop:bg-black/50", wide ? "max-w-2xl" : "max-w-md")}>
+      <div className="space-y-1 border-b border-line px-4 py-3">
+        <h2 id={`${auto}-t`} className="text-base font-semibold text-strong">{title}</h2>
+        {description ? <div id={`${auto}-d`} className="text-sm text-muted">{description}</div> : null}
+      </div>
+      {children ? <div className="space-y-4 px-4 py-3">{children}</div> : null}
+      {footer ? <div className="flex flex-wrap justify-end gap-2 border-t border-line px-4 py-3">{footer}</div> : null}
+    </dialog>
   );
 }
 
