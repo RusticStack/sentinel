@@ -193,8 +193,8 @@ fn create_run_as(
                 let id = DeliveryId::new();
                 tx.execute(
                     "INSERT INTO webhook_deliveries(id, tenant_id, repo_id, provider, external_id,
-                        event, ref_name, old_sha, new_sha, state, received_ms, authentication)
-                     VALUES (?1, ?2, ?3, 'github', ?4, 'push', 'refs/heads/main', ?5, ?5, 2, ?6, ?7)",
+                        event, ref_name, old_sha, new_sha, state, received_ms, settled_ms, authentication)
+                     VALUES (?1, ?2, ?3, 'github', ?4, 'push', 'refs/heads/main', ?5, ?5, 2, ?6, ?6, ?7)",
                     rusqlite::params![
                         id.as_bytes(),
                         tenant.as_bytes(),
