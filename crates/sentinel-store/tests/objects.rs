@@ -1094,10 +1094,10 @@ fn truncated_extended_and_vanished_files_are_refused_on_read_and_named_by_recove
             .objects
             .read(&fx.conn, fx.tenant, digest, &mut out)
             .unwrap_err();
-        let expected = if damage == 2 {
-            "object missing"
-        } else {
-            "object length"
+        let expected = match damage {
+            2 => "object missing",
+            1 => "object length",
+            _ => "object content",
         };
         assert!(
             matches!(err, Error::Corrupt(what) if what == expected),
