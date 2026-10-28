@@ -197,6 +197,19 @@ fn caches_image(avail_images: &[u8], key: &[u8; IMAGE_KEY_BYTES]) -> bool {
         .any(|chunk| chunk == key)
 }
 
+/// The key identities are grouped by as one physical host: the machine identity a worker states, scoped by
+/// the architecture it is built for. One machine cannot run two architectures' workers, so two identities that
+/// state the same machine with different architectures are different machines (a cloned image, or a claim),
+/// and neither is charged for the other's attempts.
+pub fn scope_host(host: &[u8; 16], arch: &str) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new_derive_key("sentinel host key v1");
+    hasher.update(host);
+    hasher.update(arch.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    out
+}
+
 pub struct ReportedProfile<'a> {
     pub labels: &'a [String],
     pub host_id: Option<[u8; 16]>,
@@ -225,6 +238,16 @@ pub fn report_profile(
     for key in profile.avail_images {
         images.extend_from_slice(key);
     }
+    let host = match profile.host_id {
+        Some(host) => {
+            let arch: Option<String> = tx
+                .prepare_cached("SELECT arch FROM workers WHERE id = ?1 AND revoked_ms IS NULL")?
+                .query_row([worker.as_bytes()], |r| r.get(0))
+                .optional()?;
+            Some(scope_host(&host, &arch.ok_or(Error::NotFound)?))
+        }
+        None => None,
+    };
     let changed = tx
         .prepare_cached(
             "UPDATE workers SET labels = ?2, host_id = COALESCE(?3, host_id),
@@ -235,7 +258,7 @@ pub fn report_profile(
         .execute(params![
             worker.as_bytes(),
             labels,
-            profile.host_id.as_ref().map(|h| h.as_slice()),
+            host.as_ref().map(|h| h.as_slice()),
             images,
             profile.cache_bytes,
             profile.load_ns

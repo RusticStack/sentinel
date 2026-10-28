@@ -2387,6 +2387,7 @@ mod worker_role {
         git_mirrors: bool,
         spool: (Option<u64>, Option<u64>),
         budgets: [Option<u64>; 3],
+        measured_disk: bool,
         network: sentinel_worker::podman::Network,
         runtime: sentinel_worker::attempt::Runtime,
         metrics: Arc<crate::worker_metrics::Metrics>,
@@ -2482,6 +2483,7 @@ mod worker_role {
                     image_bytes = budgets.image_bytes
                 );
                 executor.set_storage_budgets(budgets);
+                executor.set_measured_disk(measured_disk);
                 executor.set_job_network(network);
                 executor.set_runtime(runtime);
                 if network == sentinel_worker::podman::Network::Egress {
@@ -2602,11 +2604,7 @@ mod worker_role {
     fn profile_disk(link: &WorkerLink, data_dir: &Path) -> u64 {
         match link.disk_bytes {
             Some(bytes) => bytes,
-            None => {
-                let free = disk_free(data_dir);
-                let reserve = (free / 8).clamp(512 << 20, 2 << 30);
-                free.saturating_sub(reserve)
-            }
+            None => sentinel_worker::executor::job_disk_room(disk_free(data_dir)),
         }
     }
 
@@ -2839,6 +2837,7 @@ mod worker_role {
             link.git_mirrors,
             (link.spool_reserve_bytes, link.spool_quota_bytes),
             link.budgets,
+            link.disk_bytes.is_none(),
             network,
             runtime,
             Arc::clone(&metrics),

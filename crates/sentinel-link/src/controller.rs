@@ -265,6 +265,7 @@ struct Peer {
     seen_recorded_ms: AtomicI64,
     fingerprint: Digest,
     protocol: u16,
+    arch: sentinel_protocol::negotiate::Arch,
     transport: Mutex<Option<TransportStats>>,
     logging: Mutex<HashMap<AttemptId, (RunId, JobId)>>,
     bulk: Mutex<Option<Sender>>,
@@ -690,6 +691,7 @@ impl Inner {
             seen_recorded_ms: AtomicI64::new(0),
             fingerprint: session.fingerprint,
             protocol: session.admitted.negotiated.protocol.0,
+            arch: session.admitted.negotiated.arch,
             transport: Mutex::new(None),
             logging: Mutex::new(HashMap::new()),
             bulk: Mutex::new(None),
@@ -1996,7 +1998,10 @@ impl SessionHandler for Inner {
             peer.load_ns.store(load_ns.unwrap_or(0), Ordering::Relaxed);
             peer.cache_bytes
                 .store(cache_bytes.unwrap_or(0), Ordering::Relaxed);
-            *peer.host.lock().unwrap_or_else(|p| p.into_inner()) = host_id;
+            // The store scopes the stated machine by architecture when it records it; the placement key
+            // must be the same value, so it is scoped here too.
+            *peer.host.lock().unwrap_or_else(|p| p.into_inner()) =
+                host_id.map(|h| dispatch::scope_host(&h, peer.arch.as_str()));
         }
         self.write(move |tx| {
             dispatch::report_capacity(tx, worker, capacity)?;

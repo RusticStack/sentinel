@@ -107,7 +107,7 @@ counts attached bulk connections (`Stats::bulk_attached`) and refusals
 Immediately after `Welcome`, a protocol-7 worker sends `Profile`: the
 scheduling labels it selects work by (`labels`, at most
 `MAX_PROFILE_LABELS` = 16), the machine identity it shares with sibling
-worker processes (`host_id`, all zero when unknown), the scratch disk it
+worker processes (`host_id`, all zero when unknown: a digest of the machine id and the boot id), the scratch disk it
 offers jobs (`disk_bytes`, zero = not measured), and its availability
 (`images`, `cache_bytes`, `load_ns`; zero = not measured). The extras are a
 **message**, not new `Hello` fields, on purpose: postcard is not
@@ -131,6 +131,8 @@ that worker. `GET /workers` emits this zero in `capacity` and `free`, and
 `sentinel_workers{state="no_disk"}` counts it; legacy workers omit disk. A
 hello below protocol 7 clears the disk figure with the labels and warm images
 it can no longer refresh.
+
+**Refreshing the disk (Q12).** From protocol 8 (`CACHE_CANCEL_MIN`) a worker re-sends its `Profile` on a heartbeat when its warm images or cache bytes changed, and also when the executor reports a new measured scratch disk (`Executor::disk_room`; `None` for an operator-stated `disk_bytes`, which is never replaced) that differs from the last one sent by at least 256 MiB or a sixteenth. The controller applies it through the same `report_capacity` under the approved disk ceiling. The figure is the data directory's free space less the admission reserve, measured on the file system every identity of the machine shares, so it already excludes what any of them keeps there (workspaces, caches, mirrors, images, spools); the reservations of the host's attempts are subtracted from it once ([storage](storage.md#fleet-placement-q01q04)). The `Profile` wire shape is unchanged. `tests/host_disk.rs` covers a measured figure that shrinks, wobbles and recovers, and a stated figure that is left alone.
 
 `Transport` carries what the process measured about its own path: `path`
 (`Direct` without a helper; with one, what the helper's `tailcat ping`

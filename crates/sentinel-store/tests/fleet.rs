@@ -139,11 +139,34 @@ fn runtime_worker(f: &Fixture, capabilities: Capabilities) -> WorkerId {
 fn worker_with(
     f: &Fixture,
     pool: PoolId,
+    size: (i64, i64, i64),
+    labels: &[&str],
+    host_id: Option<[u8; 16]>,
+    avail_images: &[[u8; 8]],
+    capabilities: Capabilities,
+) -> WorkerId {
+    worker_on(
+        f,
+        pool,
+        size,
+        labels,
+        host_id,
+        avail_images,
+        capabilities,
+        Arch::X86_64,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn worker_on(
+    f: &Fixture,
+    pool: PoolId,
     (cpu_millis, memory_bytes, disk_bytes): (i64, i64, i64),
     labels: &[&str],
     host_id: Option<[u8; 16]>,
     avail_images: &[[u8; 8]],
     capabilities: Capabilities,
+    arch: Arch,
 ) -> WorkerId {
     let id = WorkerId::new();
     let fp = Secret::generate().digest();
@@ -165,7 +188,7 @@ fn worker_with(
                     negotiated: Negotiated {
                         protocol: ProtocolVersion(7),
                         capabilities,
-                        arch: Arch::X86_64,
+                        arch,
                     },
                 },
                 NOW,
@@ -661,6 +684,175 @@ jobs:
     assert_eq!(free1.memory_bytes, 4 << 30);
     assert_eq!(place(&f, w2, pool, at(2_200)), None);
     assert_eq!(reason(&f, job_b, &[w2]), WaitReason::Capacity);
+}
+
+fn free(f: &Fixture, w: WorkerId) -> Capacity {
+    f.store
+        .read(move |c| dispatch::free_capacity(c, w))
+        .unwrap()
+}
+
+/// A worker states its size again, as a heartbeat does after its caches, mirrors and images changed what is free.
+fn restate(f: &Fixture, w: WorkerId, size: Capacity) {
+    f.store
+        .writer()
+        .write(move |tx| dispatch::report_capacity(tx, w, size))
+        .unwrap();
+}
+
+fn state_host(f: &Fixture, w: WorkerId, host: [u8; 16]) {
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::report_profile(
+                tx,
+                w,
+                &dispatch::ReportedProfile {
+                    labels: &[],
+                    host_id: Some(host),
+                    avail_images: &[],
+                    cache_bytes: Some(0),
+                    load_ns: Some(0),
+                },
+            )
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_shared_hosts_disk_is_reserved_once_across_identities_and_follows_its_measurement() {
+    const GIB: i64 = 1 << 30;
+    let size = |disk: i64| Capacity {
+        cpu_millis: 8_000,
+        memory_bytes: 16 << 30,
+        disk_bytes: disk,
+    };
+    let f = fixture();
+    let w1 = worker(&f, f.pool, 8_000, 16 << 30, 20 * GIB, &[], Some(HOST), &[]);
+    let w2 = worker(&f, f.pool, 8_000, 16 << 30, 20 * GIB, &[], Some(HOST), &[]);
+    let (run_id, _) = run(
+        &f,
+        f.tenant,
+        f.repo,
+        "schema: 1
+on: [push]
+jobs:
+  a:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB, disk: 12GiB }
+    steps: [{ id: s, run: 'true' }]
+  b:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB, disk: 12GiB }
+    steps: [{ id: s, run: 'true' }]
+",
+        at(2_000),
+    );
+    let (job_a, job_b) = (named(&f, run_id, "a"), named(&f, run_id, "b"));
+    assert_eq!(place(&f, w1, f.pool, at(2_100)).unwrap().job, job_a);
+    // The second identity measures the same disk: the first one's reservation is already taken from it.
+    assert_eq!(free(&f, w2).disk_bytes, 8 * GIB);
+    assert_eq!(place(&f, w2, f.pool, at(2_200)), None);
+    assert_eq!(reason(&f, job_b, &[w2]), WaitReason::Capacity);
+    // Caches, mirrors and images grow and a heartbeat reports less room: the host has less, for both identities.
+    restate(&f, w1, size(16 * GIB));
+    restate(&f, w2, size(16 * GIB));
+    assert_eq!(free(&f, w1).disk_bytes, 4 * GIB);
+    assert_eq!(free(&f, w2).disk_bytes, 4 * GIB);
+    assert_eq!(place(&f, w2, f.pool, at(2_300)), None);
+    // Space returns; the second identity places the job without any other change.
+    restate(&f, w2, size(30 * GIB));
+    assert_eq!(free(&f, w2).disk_bytes, 18 * GIB);
+    assert_eq!(place(&f, w2, f.pool, at(2_400)).unwrap().job, job_b);
+    // The first identity's figure is smaller than what the host now holds, so it offers nothing more.
+    assert_eq!(free(&f, w1).disk_bytes, 16 * GIB - 24 * GIB);
+}
+
+#[test]
+fn identities_stating_one_machine_on_different_architectures_are_different_hosts() {
+    let f = fixture();
+    let size = (4_000, 8 << 30, 20 << 30);
+    let intel = worker_on(
+        &f,
+        f.pool,
+        size,
+        &[],
+        Some(HOST),
+        &[],
+        Capabilities::REQUIRED,
+        Arch::X86_64,
+    );
+    let arm = worker_on(
+        &f,
+        f.pool,
+        size,
+        &[],
+        Some(HOST),
+        &[],
+        Capabilities::REQUIRED,
+        Arch::Aarch64,
+    );
+    // The same machine id on both is a cloned image or a claim, not one machine: neither pays for the other.
+    let (run_id, _) = run(
+        &f,
+        f.tenant,
+        f.repo,
+        &single_job(3, "4GiB", "1GiB"),
+        at(2_000),
+    );
+    let job = named(&f, run_id, "one");
+    assert_eq!(place(&f, intel, f.pool, at(2_100)).unwrap().job, job);
+    assert_eq!(free(&f, intel).cpu_millis, 1_000);
+    assert_eq!(free(&f, arm).cpu_millis, 4_000);
+    assert_eq!(free(&f, arm).disk_bytes, 20 << 30);
+    // Another identity on the first machine still shares it.
+    let sibling = worker(&f, f.pool, 4_000, 8 << 30, 20 << 30, &[], Some(HOST), &[]);
+    assert_eq!(free(&f, sibling).cpu_millis, 1_000);
+}
+
+#[test]
+fn an_identity_whose_machine_key_changed_is_no_longer_charged_for_the_old_one() {
+    let f = fixture();
+    let w1 = worker(&f, f.pool, 4_000, 8 << 30, 20 << 30, &[], Some(HOST), &[]);
+    let w2 = worker(&f, f.pool, 4_000, 8 << 30, 20 << 30, &[], Some(HOST), &[]);
+    let (run_id, _) = run(
+        &f,
+        f.tenant,
+        f.repo,
+        &single_job(3, "4GiB", "1GiB"),
+        at(2_000),
+    );
+    assert_eq!(
+        place(&f, w1, f.pool, at(2_100)).unwrap().job,
+        named(&f, run_id, "one")
+    );
+    assert_eq!(free(&f, w2).cpu_millis, 1_000);
+    // The second identity restarts on a rebooted or cloned machine and states its new key.
+    state_host(&f, w2, [9u8; 16]);
+    assert_eq!(free(&f, w2).cpu_millis, 4_000);
+    assert_eq!(free(&f, w1).cpu_millis, 1_000);
+    // Stating the old key again joins the old machine's identities again.
+    state_host(&f, w2, HOST);
+    assert_eq!(free(&f, w2).cpu_millis, 1_000);
+}
+
+#[test]
+fn identities_that_state_no_machine_are_each_accounted_alone() {
+    let f = fixture();
+    let w1 = worker(&f, f.pool, 4_000, 8 << 30, 20 << 30, &[], None, &[]);
+    let w2 = worker(&f, f.pool, 4_000, 8 << 30, 20 << 30, &[], None, &[]);
+    let (run_id, _) = run(
+        &f,
+        f.tenant,
+        f.repo,
+        &single_job(3, "4GiB", "1GiB"),
+        at(2_000),
+    );
+    assert_eq!(
+        place(&f, w1, f.pool, at(2_100)).unwrap().job,
+        named(&f, run_id, "one")
+    );
+    assert_eq!(free(&f, w2).cpu_millis, 4_000);
 }
 
 #[test]
