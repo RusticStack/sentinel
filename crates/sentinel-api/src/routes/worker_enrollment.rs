@@ -55,6 +55,7 @@ pub(super) fn route(
         ("PUT", ["api", "v1", "admin", "workers", worker, "policy"]) => {
             set_host_policy(state, request, worker)
         }
+        ("GET", ["api", "v1", "admin", "placement"]) => placement(state, request),
         ("POST", ["api", "v1", "admin", "workers", worker, "uninstall"]) => {
             uninstall(state, request, worker)
         }
@@ -284,6 +285,7 @@ fn script(state: &State, request: &Request, enrollment: &str) -> Route {
 }
 
 fn view_json(view: &workers::HostView) -> Value {
+    let over = view.over_cap();
     json!({
         "approved": policy_json(&view.policy),
         "reported": {
@@ -296,7 +298,41 @@ fn view_json(view: &workers::HostView) -> Value {
             "memory_bytes": view.effective_memory_bytes,
             "disk_bytes": view.effective_disk_bytes,
         },
+        "reserved": {
+            "cpu_millis": view.reserved_cpu_millis,
+            "memory_bytes": view.reserved_memory_bytes,
+            "disk_bytes": view.reserved_disk_bytes,
+        },
+        "over_cap": {
+            "over": over.is_over(),
+            "cpu_millis": over.cpu_millis,
+            "memory_bytes": over.memory_bytes,
+            "disk_bytes": over.disk_bytes,
+        },
     })
+}
+
+/// The order the next placement round uses for the free workers, and why each is ahead of the next.
+fn placement(state: &State, request: &Request) -> Route {
+    super::admin::platform(state, request, false)?;
+    let ranking = state.controller.placement_ranking();
+    let ranked: Vec<Value> = ranking
+        .iter()
+        .enumerate()
+        .map(|(position, r)| {
+            json!({
+                "position": position + 1,
+                "worker": r.worker.to_string(),
+                "priority": r.priority,
+                "expected_finish_ns": r.expected_finish_ns,
+                "ahead_because": r.ahead_because.map(|factor| factor.as_str()),
+            })
+        })
+        .collect();
+    ok(json!({
+        "order": state.controller.placement_order().as_str(),
+        "workers": ranked,
+    }))
 }
 
 fn host_policy(state: &State, request: &Request, worker: &str) -> Route {

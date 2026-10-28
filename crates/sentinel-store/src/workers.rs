@@ -818,11 +818,52 @@ pub struct HostView {
     pub effective_cpu_millis: i64,
     pub effective_memory_bytes: i64,
     pub effective_disk_bytes: i64,
+    /// What the unreleased attempts of the worker's whole machine reserve right now.
+    pub reserved_cpu_millis: i64,
+    pub reserved_memory_bytes: i64,
+    pub reserved_disk_bytes: i64,
+}
+
+/// How far the work a machine already accepted exceeds what the controller now offers it. All zero
+/// means within the cap. A ceiling lowered under running work leaves this positive until that work
+/// settles: nothing new is placed on the machine meanwhile, and nothing accepted is stopped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OverCap {
+    pub cpu_millis: i64,
+    pub memory_bytes: i64,
+    pub disk_bytes: i64,
+}
+
+impl OverCap {
+    pub fn is_over(&self) -> bool {
+        self.cpu_millis > 0 || self.memory_bytes > 0 || self.disk_bytes > 0
+    }
+}
+
+impl HostView {
+    /// The amount by which the reservations exceed the effective size, per resource. A size the
+    /// controller does not enforce (0: a worker that has not stated it, or a disk nobody measured)
+    /// is never over.
+    pub fn over_cap(&self) -> OverCap {
+        let over = |reserved: i64, effective: i64| {
+            if effective > 0 {
+                (reserved - effective).max(0)
+            } else {
+                0
+            }
+        };
+        OverCap {
+            cpu_millis: over(self.reserved_cpu_millis, self.effective_cpu_millis),
+            memory_bytes: over(self.reserved_memory_bytes, self.effective_memory_bytes),
+            disk_bytes: over(self.reserved_disk_bytes, self.effective_disk_bytes),
+        }
+    }
 }
 
 /// The policy, report and effective size of one live worker (platform administration only).
 pub fn host_view(conn: &Connection, authority: Authority, worker: WorkerId) -> Result<HostView> {
     authority.require_platform(conn)?;
+    let reserved = crate::dispatch::reserved_on_host(conn, worker)?;
     conn.prepare_cached(
         "SELECT cpu_ceiling_millis, memory_ceiling_bytes, disk_ceiling_bytes, priority,
                 reported_cpu_millis, reported_memory_bytes, reported_disk_bytes,
@@ -831,6 +872,9 @@ pub fn host_view(conn: &Connection, authority: Authority, worker: WorkerId) -> R
     )?
     .query_row([worker.as_bytes()], |r| {
         Ok(HostView {
+            reserved_cpu_millis: reserved.cpu_millis,
+            reserved_memory_bytes: reserved.memory_bytes,
+            reserved_disk_bytes: reserved.disk_bytes,
             policy: HostPolicy {
                 cpu_millis: r.get(0)?,
                 memory_bytes: r.get(1)?,
@@ -1033,4 +1077,47 @@ pub fn revoked(conn: &Connection, worker: WorkerId) -> Result<bool> {
         .query_row([worker.as_bytes()], |row| row.get::<_, bool>(0))
         .optional()?
         .unwrap_or(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view(reserved: (i64, i64, i64), effective: (i64, i64, i64)) -> HostView {
+        HostView {
+            policy: HostPolicy::default(),
+            reported_cpu_millis: 8_000,
+            reported_memory_bytes: 8,
+            reported_disk_bytes: 8,
+            effective_cpu_millis: effective.0,
+            effective_memory_bytes: effective.1,
+            effective_disk_bytes: effective.2,
+            reserved_cpu_millis: reserved.0,
+            reserved_memory_bytes: reserved.1,
+            reserved_disk_bytes: reserved.2,
+        }
+    }
+
+    #[test]
+    fn over_cap_is_the_reservation_beyond_the_offered_size_per_resource() {
+        let within = view((1_000, 4, 10), (2_000, 4, 10));
+        assert!(
+            !within.over_cap().is_over(),
+            "exactly at the cap is within it"
+        );
+        let over = view((2_500, 9, 10), (1_000, 4, 10)).over_cap();
+        assert_eq!(
+            (over.cpu_millis, over.memory_bytes, over.disk_bytes),
+            (1_500, 5, 0)
+        );
+        assert!(over.is_over());
+    }
+
+    #[test]
+    fn a_size_nobody_stated_is_never_over() {
+        // A worker that has not reported (0) or a disk nobody measured (0) is not enforced, so held
+        // work cannot be over it.
+        let over = view((1_000, 4, 10), (0, 0, 0)).over_cap();
+        assert!(!over.is_over());
+    }
 }

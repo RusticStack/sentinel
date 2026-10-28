@@ -721,6 +721,26 @@ fn an_administrator_reads_and_replaces_a_workers_host_policy_and_requests_its_un
     assert_eq!(body["reported"]["cpu_millis"], 16_000);
     assert_eq!(body["effective"]["cpu_millis"], 4000);
     assert_eq!(body["effective"]["memory_bytes"], 64u64 << 30);
+    // Nothing is running, so nothing is reserved and the host is within its cap.
+    assert_eq!(body["reserved"]["cpu_millis"], 0);
+    assert_eq!(body["over_cap"]["over"], false);
+    assert_eq!(body["over_cap"]["cpu_millis"], 0);
+
+    // The placement order is readable by platform administrators only.
+    let order = send(
+        &d,
+        "GET",
+        "/api/v1/admin/placement",
+        None,
+        &session.headers(),
+    );
+    assert_eq!(order.status, 200, "{}", order.text);
+    assert_eq!(order.json()["order"], "fastest");
+    assert_eq!(order.json()["workers"], json!([]));
+    assert_eq!(
+        send(&d, "GET", "/api/v1/admin/placement", None, &[]).status,
+        401
+    );
 
     // Replacing the policy needs a fresh step-up and platform administration.
     let unsure = sign_in(&d);

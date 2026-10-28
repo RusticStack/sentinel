@@ -1268,6 +1268,69 @@ pub fn held_by_worker(conn: &Connection) -> Result<HashMap<WorkerId, i64>> {
     Ok(out)
 }
 
+/// What the controller offers one live worker (its effective size, the report under the approved
+/// ceilings) and the operator priority approved for it: what a placement pass ranks by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Approved {
+    pub size: Capacity,
+    pub priority: i32,
+}
+
+/// The effective size and approved priority of every live worker, one read of a small table. The
+/// placement pass ranks and groups by these, never by the size a worker claimed in its hello, so a
+/// ceiling or a priority changed after the worker connected is used by the next pass.
+pub fn approved_by_worker(conn: &Connection) -> Result<HashMap<WorkerId, Approved>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, cpu_millis, memory_bytes, disk_bytes, priority
+         FROM workers WHERE revoked_ms IS NULL",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, [u8; 16]>(0)?,
+            Approved {
+                size: Capacity {
+                    cpu_millis: r.get(1)?,
+                    memory_bytes: r.get(2)?,
+                    disk_bytes: r.get(3)?,
+                },
+                priority: r.get(4)?,
+            },
+        ))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (worker, approved) = row?;
+        out.insert(
+            WorkerId::from_bytes(worker).map_err(|_| Error::Corrupt("worker id"))?,
+            approved,
+        );
+    }
+    Ok(out)
+}
+
+/// What the unreleased attempts of the worker's whole machine reserve (every identity that states the
+/// same host, as `free_capacity` charges them). Disk is the sum of the reservations whatever the
+/// worker measured; compare it with the effective size only when that is non-zero.
+pub fn reserved_on_host(conn: &Connection, worker: WorkerId) -> Result<Capacity> {
+    conn.prepare_cached(
+        "SELECT COALESCE(SUM(a.cpu_millis), 0), COALESCE(SUM(a.memory_bytes), 0),
+                COALESCE(SUM(a.disk_bytes), 0)
+         FROM workers me JOIN workers h
+              ON ((me.host_id IS NOT NULL AND h.host_id = me.host_id)
+                  OR (me.host_id IS NULL AND h.id = me.id))
+         JOIN attempts a ON a.worker_id = h.id AND a.released_ms IS NULL
+         WHERE me.id = ?1",
+    )?
+    .query_row([worker.as_bytes()], |r| {
+        Ok(Capacity {
+            cpu_millis: r.get(0)?,
+            memory_bytes: r.get(1)?,
+            disk_bytes: r.get(2)?,
+        })
+    })
+    .map_err(Error::from)
+}
+
 pub fn revocations(conn: &Connection) -> Result<(i64, i64)> {
     Ok(conn
         .prepare_cached(

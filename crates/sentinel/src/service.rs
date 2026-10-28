@@ -73,6 +73,7 @@ struct FileConfig {
     api_listen: Option<String>,
     public_url: Option<String>,
     trusted_proxies: Option<Vec<String>>,
+    placement_order: Option<String>,
     controller: Option<String>,
     controller_fingerprint: Option<String>,
     controller_fingerprint_also: Option<Vec<String>>,
@@ -572,6 +573,9 @@ enum Role {
         tailcat: Option<TailcatFile>,
         remote_cache: bool,
         remote_cache_budget: Option<u64>,
+        /// `placement_order = "priority"`: the operator's host priority orders free workers ahead of
+        /// speed (after hard admission). `false` is the default, fastest eligible first.
+        priority_placement: bool,
     },
     Worker(Option<WorkerLink>),
 }
@@ -736,11 +740,21 @@ impl Config {
                     "trusted_proxies must list at most 64 IP addresses or CIDR networks with zero host bits, as in [\"127.0.0.1\", \"10.0.0.0/24\"]",
                 ));
             }
+            let priority_placement = match file.placement_order.as_deref() {
+                None | Some("fastest") => false,
+                Some("priority") => true,
+                Some(_) => {
+                    return Err(Error::config(
+                        "placement_order must be \"fastest\" (the default) or \"priority\"",
+                    ));
+                }
+            };
             Role::Server {
                 listen,
                 api_listen,
                 public_url,
                 trusted_proxies,
+                priority_placement,
                 tailcat: file.tailcat,
                 remote_cache: file
                     .remote_cache
@@ -770,9 +784,10 @@ impl Config {
                 || file.api_listen.is_some()
                 || file.public_url.is_some()
                 || file.trusted_proxies.is_some()
+                || file.placement_order.is_some()
             {
                 return Err(Error::config(
-                    "listen, api_listen, public_url and trusted_proxies apply to the server role only",
+                    "listen, api_listen, public_url, trusted_proxies and placement_order apply to the server role only",
                 ));
             }
             let link = match (file.controller, file.controller_fingerprint) {
@@ -1720,7 +1735,7 @@ fn start_server(
     public_url: Option<String>,
     trusted_proxies: Option<&[String]>,
     tailcat: Option<&TailcatFile>,
-    (remote_cache, remote_cache_budget): (bool, Option<u64>),
+    (remote_cache, remote_cache_budget, priority_placement): (bool, Option<u64>, bool),
 ) -> Result<Running, Error> {
     let path = config.data_dir.join(sentinel_store::METADATA_FILE);
     let (store, snapshot) =
@@ -1830,6 +1845,9 @@ fn start_server(
     controller.set_storage_policy(sentinel_link::controller::StoragePolicy {
         interval_ms: config.storage.sweep_interval_ms,
     });
+    if priority_placement {
+        controller.set_placement_order(sentinel_link::controller::PlacementOrder::Priority);
+    }
     if remote_cache {
         let root = config.data_dir.join("remote-cache");
         fs::create_dir_all(&root).map_err(|error| {
@@ -2942,6 +2960,7 @@ fn initialize_and_wait(
                 tailcat,
                 remote_cache,
                 remote_cache_budget,
+                priority_placement,
             } => start_server(
                 config,
                 *listen,
@@ -2949,7 +2968,7 @@ fn initialize_and_wait(
                 public_url.clone(),
                 trusted_proxies.as_deref(),
                 tailcat.as_ref(),
-                (*remote_cache, *remote_cache_budget),
+                (*remote_cache, *remote_cache_budget, *priority_placement),
             ),
             #[cfg(feature = "worker")]
             Role::Worker(Some(link)) => worker_role::start(config, link),

@@ -1932,6 +1932,23 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
                 view.effective_memory_bytes,
                 view.effective_disk_bytes
             );
+            sentinel::outln!(
+                "reserved  cpu_millis={} memory_bytes={} disk_bytes={} (the whole machine's accepted work)",
+                view.reserved_cpu_millis,
+                view.reserved_memory_bytes,
+                view.reserved_disk_bytes
+            );
+            let over = view.over_cap();
+            if over.is_over() {
+                sentinel::outln!(
+                    "over-cap  cpu_millis={} memory_bytes={} disk_bytes={} (accepted work finishes; nothing new is placed until it fits)",
+                    over.cpu_millis,
+                    over.memory_bytes,
+                    over.disk_bytes
+                );
+            } else {
+                sentinel::outln!("over-cap  no");
+            }
             if changing {
                 eprintln!("policy of {id} replaced; running work keeps its resources");
             }

@@ -17,7 +17,7 @@ use sentinel_core::{
 };
 use sentinel_link::{
     Error,
-    controller::{Controller, RECONCILE_INTERVAL},
+    controller::{Controller, OrderFactor, PlacementOrder, RECONCILE_INTERVAL},
     identity::Identity,
     session::{self, Capacity, Executor, Offer},
     worker,
@@ -233,8 +233,12 @@ impl Deployment {
     }
 
     fn enrollment_with(&self, policy: workers::HostPolicy) -> Secret {
+        self.enrollment_in(self.pool, policy)
+    }
+
+    fn enrollment_in(&self, pool: PoolId, policy: workers::HostPolicy) -> Secret {
         let terms = workers::EnrollmentTerms {
-            pool: self.pool,
+            pool,
             lifetime_ms: 60_000,
             policy,
             tailcat: false,
@@ -1048,18 +1052,30 @@ fn start_fleet(
     d: &Deployment,
     profiles: Vec<Profile>,
 ) -> (Vec<WorkerId>, Vec<Arc<Recorder>>, Vec<WorkerProcess>) {
-    let n = profiles.len();
+    let members = profiles
+        .into_iter()
+        .map(|profile| (profile, d.enrollment()))
+        .collect();
+    start_members(d, members)
+}
+
+/// Workers that each bring their own enrollment (so their own pool, ceilings and priority).
+fn start_members(
+    d: &Deployment,
+    members: Vec<(Profile, Secret)>,
+) -> (Vec<WorkerId>, Vec<Arc<Recorder>>, Vec<WorkerProcess>) {
+    let n = members.len();
     let ids: Vec<WorkerId> = (0..n).map(|_| WorkerId::new()).collect();
     let recorders: Vec<Arc<Recorder>> = (0..n).map(|_| Recorder::new()).collect();
-    let processes: Vec<WorkerProcess> = profiles
+    let processes: Vec<WorkerProcess> = members
         .into_iter()
         .enumerate()
-        .map(|(i, profile)| {
+        .map(|(i, (profile, enrollment))| {
             WorkerProcess::start(
                 d,
                 Identity::generate(&format!("ranked-{i}")).unwrap(),
                 ids[i],
-                d.enrollment(),
+                enrollment,
                 STANDARD,
                 profile,
                 Arc::clone(&recorders[i]),
@@ -1317,6 +1333,317 @@ fn a_worker_that_claims_more_than_its_approved_ceiling_is_offered_no_more() {
     });
 
     assert_eq!(d.held(id).len(), 8);
+    process.stop().unwrap();
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
+}
+
+const GPU_JOB: &str = "schema: 1
+on: [push]
+jobs:
+  needs-gpu:
+    image: alpine:3
+    runs_on: { labels: [gpu] }
+    resources: { cpu: \"0.25\", memory: 128MiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+";
+
+const TWO_CORES: &str = "schema: 1
+on: [push]
+jobs:
+  wide:
+    image: alpine:3
+    resources: { cpu: \"2\", memory: 256MiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+";
+
+fn priority(priority: i32) -> workers::HostPolicy {
+    workers::HostPolicy {
+        priority,
+        ..workers::HostPolicy::default()
+    }
+}
+
+/// The operator's priority is an explicit policy that orders the free workers ahead of speed. By
+/// default the fastest eligible host wins, whatever priority it was given.
+#[test]
+fn priority_orders_free_workers_ahead_of_speed_only_when_the_policy_is_on() {
+    for (order, prefers_busy_priority_host) in [
+        (PlacementOrder::Fastest, false),
+        (PlacementOrder::Priority, true),
+    ] {
+        let d = deployment();
+        d.controller().set_placement_order(order);
+        // Host 100 is idle and neutral; host 101 is saturated by work we did not place and has priority 20.
+        let (ids, recorders, processes) = start_members(
+            &d,
+            vec![
+                (measured(100, 0, 0), d.enrollment_with(priority(0))),
+                (
+                    measured(101, FIVE_CORES_NS, 0),
+                    d.enrollment_with(priority(20)),
+                ),
+            ],
+        );
+        assert_eq!(d.controller().handle().placement_order(), order);
+        let ranking = d.controller().handle().placement_ranking();
+        assert_eq!(ranking.len(), 2);
+        let (idle, busy) = (ids[0], ids[1]);
+        let ahead = if prefers_busy_priority_host {
+            busy
+        } else {
+            idle
+        };
+        assert_eq!(ranking[0].worker, ahead, "{order:?}");
+        assert_eq!(
+            ranking[0].ahead_because,
+            Some(if prefers_busy_priority_host {
+                OrderFactor::Priority
+            } else {
+                OrderFactor::ExpectedFinish
+            }),
+            "{order:?}: the explanation names what decided the order"
+        );
+        assert_eq!(ranking[1].ahead_because, None);
+        let finish_of = |worker: WorkerId| {
+            ranking
+                .iter()
+                .find(|r| r.worker == worker)
+                .unwrap()
+                .expected_finish_ns
+        };
+        assert!(
+            finish_of(idle) < finish_of(busy),
+            "the idle host is faster either way"
+        );
+
+        let job = d.runs(vec![(d.tenant_a, d.repo_a, noise_of(1))]);
+        d.controller().wake();
+        eventually("the job leased", || {
+            d.state(d.tenant_a, job[0][0]) == JobState::Leased
+        });
+        eventually("the offer delivered", || {
+            offered(&recorders).iter().sum::<usize>() >= 1
+        });
+        let want = if prefers_busy_priority_host {
+            vec![0, 1]
+        } else {
+            vec![1, 0]
+        };
+        assert_eq!(offered(&recorders), want, "{order:?}");
+        finish(d, processes);
+    }
+}
+
+/// Priority is an ordering of workers that already passed hard admission, never a way around it:
+/// a pool the tenant does not own or share, a label the worker lacks, a CPU ceiling and the host's
+/// capacity all still refuse the job on the highest-priority host.
+#[test]
+fn priority_cannot_bypass_ownership_capabilities_or_capacity() {
+    let d = deployment();
+    d.controller().set_placement_order(PlacementOrder::Priority);
+
+    // A private pool only tenant A may use.
+    let private = PoolId::new();
+    let tenant_a = d.tenant_a;
+    d.store
+        .writer()
+        .write(move |tx| {
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                private,
+                "private",
+                PoolKind::Shared,
+                UnixMillis(1),
+            )?;
+            tenancy::grant_pool(tx, Authority::HostLocal, private, tenant_a, UnixMillis(1))
+        })
+        .unwrap();
+
+    // 0: the highest priority, in the private pool, one approved core, no labels.
+    // 1: neutral, in the shared pool, five cores, labelled gpu.
+    let mut gpu = profile(111, 128 << 30);
+    gpu.labels = vec!["gpu".into()];
+    let capped = workers::HostPolicy {
+        cpu_millis: Some(1_000),
+        priority: 100,
+        ..workers::HostPolicy::default()
+    };
+    let (ids, recorders, processes) = start_members(
+        &d,
+        vec![
+            (profile(110, 128 << 30), d.enrollment_in(private, capped)),
+            (gpu, d.enrollment_with(priority(0))),
+        ],
+    );
+    let ranking = d.controller().handle().placement_ranking();
+    assert_eq!(ranking[0].worker, ids[0], "the capped host is ranked first");
+    assert_eq!(ranking[0].priority, 100);
+
+    // Ownership: tenant B has no grant on the private pool, so its job goes to the neutral host.
+    let by_b = d.runs(vec![(d.tenant_b, d.repo_b, noise_of(1))])[0][0];
+    // Capability: a job that needs the gpu label cannot run on the unlabeled priority host.
+    let labeled = d.runs(vec![(d.tenant_a, d.repo_a, GPU_JOB.to_owned())])[0][0];
+    // Capacity: two cores exceed the one approved core, though the hello claimed five.
+    let wide = d.runs(vec![(d.tenant_a, d.repo_a, TWO_CORES.to_owned())])[0][0];
+    d.controller().wake();
+    eventually("the three jobs leased", || {
+        d.state(d.tenant_b, by_b) == JobState::Leased
+            && d.state(d.tenant_a, labeled) == JobState::Leased
+            && d.state(d.tenant_a, wide) == JobState::Leased
+    });
+    eventually("every offer delivered", || {
+        offered(&recorders).iter().sum::<usize>() >= 3
+    });
+    assert_eq!(
+        offered(&recorders),
+        vec![0, 3],
+        "none of them may land on the priority host"
+    );
+    assert!(d.held(ids[0]).is_empty());
+
+    // Where the priority host is eligible it is used first, and it is never oversubscribed: of eight
+    // quarter-core jobs it takes four (its approved core), not eight; the rest overflows.
+    let burst = d.runs(vec![(d.tenant_a, d.repo_a, noise())])[0].clone();
+    assert_eq!(burst.len(), 8);
+    d.controller().wake();
+    eventually("the burst leased", || {
+        burst
+            .iter()
+            .all(|job| d.state(d.tenant_a, *job) == JobState::Leased)
+    });
+    eventually("every offer delivered", || {
+        offered(&recorders).iter().sum::<usize>() >= 11
+    });
+    let got = offered(&recorders);
+    assert_eq!(
+        got[0], 4,
+        "the priority host takes its approved core and no more: {got:?}"
+    );
+    assert_eq!(got[1], 7, "the rest goes to the other host: {got:?}");
+    finish(d, processes);
+}
+
+/// Lowering a ceiling below what a host already holds is not an eviction: nothing new is placed on it
+/// at once, every accepted attempt keeps running, the over-cap state is visible, and placement resumes
+/// only when the accepted work has settled enough to fit under the new ceiling.
+#[test]
+fn lowering_a_ceiling_blocks_new_placements_and_lets_accepted_work_finish() {
+    let mut d = deployment();
+    let id = WorkerId::new();
+    let recorder = Recorder::new();
+    let process = WorkerProcess::start(
+        &d,
+        Identity::generate("lowered").unwrap(),
+        id,
+        d.enrollment_with(workers::HostPolicy {
+            cpu_millis: Some(2_000),
+            ..workers::HostPolicy::default()
+        }),
+        STANDARD,
+        profile(120, 128 << 30),
+        Arc::clone(&recorder),
+    );
+    process.wait_for("Connected", 1);
+    eventually("fleet", || d.controller().connected() == vec![id]);
+    let view = |d: &Deployment| {
+        d.store
+            .read(move |c| workers::host_view(c, Authority::HostLocal, id))
+            .unwrap()
+    };
+
+    // Four quarter-core jobs are accepted under the 2-core ceiling.
+    let first = d.runs(vec![(d.tenant_a, d.repo_a, noise_of(4))])[0].clone();
+    d.controller().wake();
+    eventually("four offers", || recorder.offers.lock().unwrap().len() == 4);
+    eventually("all four acknowledged", || {
+        d.held(id).iter().filter(|h| h.acknowledged).count() == 4
+    });
+    assert!(!view(&d).over_cap().is_over());
+    assert_eq!(view(&d).reserved_cpu_millis, 1_000);
+
+    // The ceiling drops to half a core: the host now holds twice what it is offered.
+    d.store
+        .writer()
+        .write(move |tx| {
+            workers::set_policy(
+                tx,
+                Authority::HostLocal,
+                id,
+                workers::HostPolicy {
+                    cpu_millis: Some(500),
+                    ..workers::HostPolicy::default()
+                },
+            )
+        })
+        .unwrap();
+    let over = view(&d).over_cap();
+    assert!(over.is_over());
+    assert_eq!(
+        (over.cpu_millis, over.memory_bytes, over.disk_bytes),
+        (500, 0, 0)
+    );
+
+    // New work is not placed, and the accepted attempts are untouched.
+    let more = d.runs(vec![(d.tenant_a, d.repo_a, noise_of(4))])[0].clone();
+    d.controller().wake();
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        recorder.offers.lock().unwrap().len(),
+        4,
+        "placed while over the cap"
+    );
+    for job in &more {
+        assert_eq!(d.state(d.tenant_a, *job), JobState::Queued);
+    }
+    assert_eq!(d.held(id).len(), 4);
+    assert!(
+        recorder.stopped.lock().unwrap().is_empty(),
+        "accepted work was stopped"
+    );
+    for job in &first {
+        assert_eq!(d.state(d.tenant_a, *job), JobState::Leased);
+    }
+    assert!(view(&d).over_cap().is_over());
+
+    // Two of the four settle: exactly at the cap is not over it, and still no room for a new job.
+    pass(&d, &[(id, &recorder)], d.tenant_a, first[0]);
+    pass(&d, &[(id, &recorder)], d.tenant_a, first[1]);
+    d.controller().wake();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(view(&d).reserved_cpu_millis, 500);
+    assert!(!view(&d).over_cap().is_over());
+    assert_eq!(
+        recorder.offers.lock().unwrap().len(),
+        4,
+        "placed with no room left"
+    );
+
+    // One more settles: a quarter core is free under the new ceiling, so exactly one job is placed.
+    pass(&d, &[(id, &recorder)], d.tenant_a, first[2]);
+    d.controller().wake();
+    eventually("one new offer", || {
+        recorder.offers.lock().unwrap().len() == 5
+    });
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        recorder.offers.lock().unwrap().len(),
+        5,
+        "the ceiling holds"
+    );
+    assert_eq!(view(&d).reserved_cpu_millis, 500);
+    assert_eq!(
+        more.iter()
+            .filter(|job| d.state(d.tenant_a, **job) == JobState::Leased)
+            .count(),
+        1
+    );
+
     process.stop().unwrap();
     assert!(
         d.controller

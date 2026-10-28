@@ -265,6 +265,37 @@ mod linux {
     }
 
     #[test]
+    fn placement_order_is_fastest_or_priority_for_the_server_only() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("config.toml");
+        let data = temp.path().join("data");
+        let check = |role: &str, order: &str| {
+            fs::write(
+                &file,
+                format!(
+                    "data_dir = '{}'
+placement_order = '{order}'",
+                    data.display()
+                ),
+            )
+            .unwrap();
+            invoke(&[role, "--config", file.to_str().unwrap(), "--check"])
+        };
+        if cfg!(feature = "server") {
+            for accepted in ["fastest", "priority"] {
+                assert!(check("server", accepted).status.success(), "{accepted}");
+            }
+            for refused in ["", "Priority", "speed", "fastest,priority"] {
+                assert_eq!(check("server", refused).status.code(), Some(2), "{refused}");
+            }
+        }
+        if cfg!(feature = "worker") {
+            assert_eq!(check("worker", "priority").status.code(), Some(2));
+        }
+        assert!(!data.exists());
+    }
+
+    #[test]
     fn spool_limits_are_worker_link_settings_and_a_zero_quota_is_refused() {
         let temp = tempdir().unwrap();
         let file = temp.path().join("config.toml");

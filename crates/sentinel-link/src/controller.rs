@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -402,6 +402,7 @@ struct Inner {
     artifacts: Mutex<ArtifactState>,
     storage: Mutex<Option<StoragePolicy>>,
     remote_budget: AtomicU64,
+    order: AtomicU8,
     last_storage: AtomicI64,
     maintenance: (Mutex<bool>, Condvar),
     remote_cache: Mutex<Option<std::path::PathBuf>>,
@@ -486,6 +487,151 @@ fn rank(standing: Standing) -> (i64, i64, i64) {
         standing.cpu_millis,
         standing.memory_bytes,
     )
+}
+
+/// How the sweep orders the free workers once hard admission has decided what each may take.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlacementOrder {
+    /// Earliest expected finish first (the default): the fastest eligible worker.
+    #[default]
+    Fastest,
+    /// Highest operator priority first, then earliest expected finish. The operator's priority
+    /// overrides speed and nothing else: the order only decides which free worker is asked first, and
+    /// a worker is asked to take only work that tenant, pool, architecture, OS, isolation, label,
+    /// disk, CPU and memory admission already let it have ([`dispatch::place_in_fleet`]).
+    Priority,
+}
+
+impl PlacementOrder {
+    pub fn parse(text: &str) -> Option<PlacementOrder> {
+        match text {
+            "fastest" => Some(PlacementOrder::Fastest),
+            "priority" => Some(PlacementOrder::Priority),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlacementOrder::Fastest => "fastest",
+            PlacementOrder::Priority => "priority",
+        }
+    }
+}
+
+/// The first thing that puts one worker ahead of the next in the order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderFactor {
+    /// A higher operator priority (only under [`PlacementOrder::Priority`]).
+    Priority,
+    /// An earlier expected finish.
+    ExpectedFinish,
+    /// Equal finish: the smaller worker, which keeps the larger one free.
+    BestFit,
+    /// Everything equal: the worker identifier, so the order is deterministic.
+    Identity,
+}
+
+impl OrderFactor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OrderFactor::Priority => "priority",
+            OrderFactor::ExpectedFinish => "expected_finish",
+            OrderFactor::BestFit => "best_fit",
+            OrderFactor::Identity => "identity",
+        }
+    }
+}
+
+/// One free worker as the next placement round orders it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ranked {
+    pub worker: WorkerId,
+    /// The priority the controller approved for the host (0 when it has none).
+    pub priority: i32,
+    pub expected_finish_ns: i64,
+    /// Why this worker is ahead of the next one; `None` for the last.
+    pub ahead_because: Option<OrderFactor>,
+}
+
+type OrderKey = (i32, (i64, i64, i64));
+
+/// The sort key of one worker: the (negated) priority first under [`PlacementOrder::Priority`] and a
+/// constant under [`PlacementOrder::Fastest`], then the speed rank. Lower sorts first.
+fn order_key(order: PlacementOrder, priority: i32, standing: Standing) -> OrderKey {
+    let lead = match order {
+        PlacementOrder::Fastest => 0,
+        PlacementOrder::Priority => priority.saturating_neg(),
+    };
+    (lead, rank(standing))
+}
+
+fn ahead_because(ahead: OrderKey, behind: OrderKey) -> OrderFactor {
+    if ahead.0 != behind.0 {
+        OrderFactor::Priority
+    } else if (ahead.1).0 != (behind.1).0 {
+        OrderFactor::ExpectedFinish
+    } else if ((ahead.1).1, (ahead.1).2) != ((behind.1).1, (behind.1).2) {
+        OrderFactor::BestFit
+    } else {
+        OrderFactor::Identity
+    }
+}
+
+/// The order the next round uses, with the reason each worker is ahead of the next. The placement
+/// pass sorts by the same [`order_key`], so this is the order, not a description of it.
+fn ranking(order: PlacementOrder, entries: &[(WorkerId, i32, Standing)]) -> Vec<Ranked> {
+    let mut keyed: Vec<(OrderKey, WorkerId, i32)> = entries
+        .iter()
+        .map(|(w, priority, standing)| (order_key(order, *priority, *standing), *w, *priority))
+        .collect();
+    keyed.sort_unstable_by_key(|(key, worker, _)| (*key, *worker));
+    (0..keyed.len())
+        .map(|i| Ranked {
+            worker: keyed[i].1,
+            priority: keyed[i].2,
+            expected_finish_ns: (keyed[i].0.1).0,
+            ahead_because: keyed
+                .get(i + 1)
+                .map(|next| ahead_because(keyed[i].0, next.0)),
+        })
+        .collect()
+}
+
+/// The size the controller offers a worker: the store's effective size (the report under the approved
+/// ceilings), not the size its hello claimed. A worker the store has not listed yet keeps its hello.
+fn effective_size(peer: &Peer, approved: Option<&dispatch::Approved>) -> dispatch::Capacity {
+    match approved {
+        Some(a) => dispatch::Capacity {
+            cpu_millis: a.size.cpu_millis,
+            memory_bytes: a.size.memory_bytes,
+            disk_bytes: if peer.protocol >= PROFILE_MIN.0 {
+                a.size.disk_bytes
+            } else {
+                i64::MAX
+            },
+        },
+        None => peer.size(),
+    }
+}
+
+/// Per machine: the CPU its identities hold and the busy cores the machine measured. Identities are
+/// grouped by machine over the whole fleet, busy sessions included: their attempts and their
+/// measurements are still the host's.
+fn host_commitments(
+    fleet: &[(WorkerId, Arc<Peer>)],
+    hosts: &HashMap<WorkerId, [u8; 16]>,
+    held: &HashMap<WorkerId, i64>,
+) -> (HashMap<[u8; 16], i64>, HashMap<[u8; 16], i64>) {
+    let mut host_held: HashMap<[u8; 16], i64> = HashMap::new();
+    let mut host_busy: HashMap<[u8; 16], i64> = HashMap::new();
+    for (worker, peer) in fleet {
+        let host = hosts[worker];
+        *host_held.entry(host).or_default() += held.get(worker).copied().unwrap_or(0);
+        let busy = host_busy.entry(host).or_default();
+        *busy = (*busy).max(busy_millis(peer.load_ns.load(Ordering::Relaxed)));
+    }
+    (host_held, host_busy)
 }
 
 /// The machine key placement groups identities by: the reported host, or the worker itself when it
@@ -985,6 +1131,61 @@ impl Inner {
         }
     }
 
+    fn placement_order(&self) -> PlacementOrder {
+        if self.order.load(Ordering::Relaxed) == PlacementOrder::Priority as u8 {
+            PlacementOrder::Priority
+        } else {
+            PlacementOrder::Fastest
+        }
+    }
+
+    /// The order the next placement round would use, from the same inputs and the same sort key as
+    /// the pass, with the reason each free worker is ahead of the next. Read-only.
+    fn placement_ranking(&self) -> Vec<Ranked> {
+        let fleet: Vec<(WorkerId, Arc<Peer>)> = self
+            .fleet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(w, p)| (*w, Arc::clone(p)))
+            .collect();
+        let (held, approved) = match (
+            self.store.read(dispatch::held_by_worker),
+            self.store.read(dispatch::approved_by_worker),
+        ) {
+            (Ok(held), Ok(approved)) => (held, approved),
+            _ => return Vec::new(),
+        };
+        let hosts: HashMap<WorkerId, [u8; 16]> = fleet
+            .iter()
+            .map(|(w, p)| (*w, host_key(*w, p.host())))
+            .collect();
+        let (host_held, host_busy) = host_commitments(&fleet, &hosts, &held);
+        let entries: Vec<(WorkerId, i32, Standing)> = fleet
+            .iter()
+            .filter(|(_, p)| session::is_free(&p.sender))
+            .map(|(w, p)| {
+                let size = effective_size(p, approved.get(w));
+                let host = hosts[w];
+                (
+                    *w,
+                    approved.get(w).map_or(0, |a| a.priority),
+                    Standing {
+                        cpu_millis: size.cpu_millis,
+                        memory_bytes: size.memory_bytes,
+                        committed_millis: host_held
+                            .get(&host)
+                            .copied()
+                            .unwrap_or(0)
+                            .max(host_busy.get(&host).copied().unwrap_or(0)),
+                        cache_bytes: p.cache_bytes.load(Ordering::Relaxed),
+                    },
+                )
+            })
+            .collect();
+        ranking(self.placement_order(), &entries)
+    }
+
     fn placement_pass(&self) {
         if !self.objects.admission().is_none_or(|a| a.is_open()) {
             return;
@@ -1013,10 +1214,31 @@ impl Inner {
             Ok(held) => held,
             Err(e) => return self.failed(true, "held", &e),
         };
-        peers.sort_unstable_by_key(|(worker, p)| (p.cpu_millis, p.memory_bytes, *worker));
-        let reach = Reach::of(peers.iter().map(|(_, p)| (p.pool, p.size())));
-        // Identities are grouped by machine over the whole fleet, busy sessions included: their
-        // attempts and their measurements are still the host's.
+        // The effective size and the approved priority come from the store on every pass, so a
+        // ceiling lowered or a priority changed after a worker connected is used at once.
+        let approved = match self.store.read(dispatch::approved_by_worker) {
+            Ok(approved) => approved,
+            Err(e) => return self.failed(true, "approved", &e),
+        };
+        peers.sort_unstable_by_key(|(worker, p)| {
+            let size = effective_size(p, approved.get(worker));
+            (size.cpu_millis, size.memory_bytes, *worker)
+        });
+        let sizes: Vec<dispatch::Capacity> = peers
+            .iter()
+            .map(|(w, p)| effective_size(p, approved.get(w)))
+            .collect();
+        let priorities: Vec<i32> = peers
+            .iter()
+            .map(|(w, _)| approved.get(w).map_or(0, |a| a.priority))
+            .collect();
+        let order = self.placement_order();
+        let reach = Reach::of(
+            peers
+                .iter()
+                .zip(&sizes)
+                .map(|((_, p), size)| (p.pool, *size)),
+        );
         let hosts: HashMap<WorkerId, [u8; 16]> = fleet
             .iter()
             .map(|(w, p)| (*w, host_key(*w, p.host())))
@@ -1027,28 +1249,25 @@ impl Inner {
             if active.is_empty() {
                 return;
             }
-            let mut host_held: HashMap<[u8; 16], i64> = HashMap::new();
-            let mut host_busy: HashMap<[u8; 16], i64> = HashMap::new();
-            for (worker, peer) in &fleet {
-                let host = hosts[worker];
-                *host_held.entry(host).or_default() += held.get(worker).copied().unwrap_or(0);
-                let busy = host_busy.entry(host).or_default();
-                *busy = (*busy).max(busy_millis(peer.load_ns.load(Ordering::Relaxed)));
-            }
+            let (host_held, host_busy) = host_commitments(&fleet, &hosts, &held);
             active.sort_by_cached_key(|&i| {
                 let (worker, peer) = &peers[i];
                 let host = host_of[i];
                 (
-                    rank(Standing {
-                        cpu_millis: peer.cpu_millis,
-                        memory_bytes: peer.memory_bytes,
-                        committed_millis: host_held
-                            .get(&host)
-                            .copied()
-                            .unwrap_or(0)
-                            .max(host_busy.get(&host).copied().unwrap_or(0)),
-                        cache_bytes: peer.cache_bytes.load(Ordering::Relaxed),
-                    }),
+                    order_key(
+                        order,
+                        priorities[i],
+                        Standing {
+                            cpu_millis: sizes[i].cpu_millis,
+                            memory_bytes: sizes[i].memory_bytes,
+                            committed_millis: host_held
+                                .get(&host)
+                                .copied()
+                                .unwrap_or(0)
+                                .max(host_busy.get(&host).copied().unwrap_or(0)),
+                            cache_bytes: peer.cache_bytes.load(Ordering::Relaxed),
+                        },
+                    ),
                     *worker,
                 )
             });
@@ -2707,6 +2926,12 @@ impl Controller {
         *self.inner.storage.lock().unwrap_or_else(|p| p.into_inner()) = Some(policy);
     }
 
+    /// Choose how free workers are ordered (default [`PlacementOrder::Fastest`]). Takes effect on the
+    /// next placement pass.
+    pub fn set_placement_order(&self, order: PlacementOrder) {
+        self.inner.order.store(order as u8, Ordering::Relaxed);
+    }
+
     pub fn set_remote_cache_budget(&self, bytes: u64) {
         self.inner.remote_budget.store(bytes, Ordering::Relaxed);
     }
@@ -2786,6 +3011,7 @@ impl Controller {
             artifacts: Mutex::new(ArtifactState::default()),
             storage: Mutex::new(None),
             remote_budget: AtomicU64::new(sentinel_cache::remote::STORE_BUDGET_BYTES),
+            order: AtomicU8::new(PlacementOrder::Fastest as u8),
             last_storage: AtomicI64::new(0),
             maintenance: (Mutex::new(false), Condvar::new()),
             remote_cache: Mutex::new(None),
@@ -2982,6 +3208,19 @@ impl Handle {
 
     pub fn stats(&self) -> &Stats {
         &self.0.stats
+    }
+
+    /// The configured order of the free workers.
+    pub fn placement_order(&self) -> PlacementOrder {
+        self.0.placement_order()
+    }
+
+    /// The free workers in the order the next placement round uses, each with its approved priority,
+    /// its expected finish and the first factor that puts it ahead of the next. It answers "why this
+    /// host before that one"; whether a worker may take a given job is hard admission, explained per
+    /// job by the queue's wait reasons.
+    pub fn placement_ranking(&self) -> Vec<Ranked> {
+        self.0.placement_ranking()
     }
 
     pub fn connected(&self) -> Vec<WorkerId> {
@@ -3528,6 +3767,95 @@ mod tests {
         assert_eq!(
             expected_finish_ns(standing(8_000, 0, 4 << 30)),
             expected_finish_ns(standing(8_000, 0, i64::MAX))
+        );
+    }
+
+    fn wrk(n: u8) -> WorkerId {
+        WorkerId::from_bytes([n; 16]).unwrap()
+    }
+
+    fn order_of(order: PlacementOrder, entries: &[(WorkerId, i32, Standing)]) -> Vec<WorkerId> {
+        ranking(order, entries)
+            .into_iter()
+            .map(|r| r.worker)
+            .collect()
+    }
+
+    #[test]
+    fn the_default_order_ignores_priority() {
+        let idle = standing(8_000, 0, 0);
+        let busy = standing(8_000, 4_000, 0);
+        let entries = [(wrk(1), 100, busy), (wrk(2), -100, idle)];
+        assert_eq!(
+            order_of(PlacementOrder::Fastest, &entries),
+            vec![wrk(2), wrk(1)],
+            "the fastest eligible host goes first however it is ranked by the operator"
+        );
+        let ranked = ranking(PlacementOrder::Fastest, &entries);
+        assert_eq!(ranked[0].ahead_because, Some(OrderFactor::ExpectedFinish));
+        assert_eq!(ranked[1].ahead_because, None);
+    }
+
+    #[test]
+    fn priority_overrides_speed_and_falls_back_to_speed_within_a_priority() {
+        let idle = standing(8_000, 0, 0);
+        let busy = standing(8_000, 4_000, 0);
+        let entries = [
+            (wrk(1), 0, idle),
+            (wrk(2), 10, busy),
+            (wrk(3), 10, idle),
+            (wrk(4), -5, idle),
+        ];
+        let ranked = ranking(PlacementOrder::Priority, &entries);
+        assert_eq!(
+            ranked.iter().map(|r| r.worker).collect::<Vec<_>>(),
+            vec![wrk(3), wrk(2), wrk(1), wrk(4)]
+        );
+        assert_eq!(
+            ranked.iter().map(|r| r.ahead_because).collect::<Vec<_>>(),
+            vec![
+                Some(OrderFactor::ExpectedFinish),
+                Some(OrderFactor::Priority),
+                Some(OrderFactor::Priority),
+                None
+            ],
+            "the busy priority-10 host is ahead of the idle neutral one because of priority, not speed"
+        );
+        assert_eq!(ranked[1].priority, 10);
+        assert!(ranked[1].expected_finish_ns > ranked[2].expected_finish_ns);
+    }
+
+    #[test]
+    fn equal_priority_and_finish_go_to_the_smaller_worker_then_the_identifier() {
+        let small = standing(2_500, 0, 0);
+        let large = standing(8_000, 0, 0);
+        let order = PlacementOrder::Priority;
+        // The smaller worker is first among equals, whatever the input order.
+        for entries in [
+            [(wrk(1), 7, large), (wrk(2), 7, small)],
+            [(wrk(2), 7, small), (wrk(1), 7, large)],
+        ] {
+            let ranked = ranking(order, &entries);
+            assert_eq!(ranked[0].worker, wrk(2));
+            assert_eq!(ranked[0].ahead_because, Some(OrderFactor::BestFit));
+        }
+        let twins = [(wrk(9), 7, small), (wrk(3), 7, small)];
+        let ranked = ranking(order, &twins);
+        assert_eq!(ranked[0].worker, wrk(3));
+        assert_eq!(ranked[0].ahead_because, Some(OrderFactor::Identity));
+    }
+
+    #[test]
+    fn the_priority_bounds_order_without_overflow() {
+        let idle = standing(8_000, 0, 0);
+        let entries = [
+            (wrk(1), -100, idle),
+            (wrk(2), 100, idle),
+            (wrk(3), i32::MIN, idle),
+        ];
+        assert_eq!(
+            order_of(PlacementOrder::Priority, &entries),
+            vec![wrk(2), wrk(1), wrk(3)]
         );
     }
 

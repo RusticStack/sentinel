@@ -6,6 +6,10 @@ log_level = "info"
 listen = "127.0.0.1:7443"
 # API address, proxied by sentinel-web; put TLS in front before exposing it.
 api_listen = "127.0.0.1:7080"
+# How free workers are ordered once hard admission has decided what each may take:
+# "fastest" (default) offers work to the earliest expected finish; "priority" puts the operator's
+# host priority (sentinel admin worker policy --priority) first and speed second.
+# placement_order = "fastest"
 
 # Optional NAT-traversing transport; without it (or with enabled = false) the link uses direct TLS.
 # The tc… address in <data_dir>/tailcat/address is a credential (owner-only).
