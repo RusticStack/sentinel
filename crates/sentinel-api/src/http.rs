@@ -1903,9 +1903,14 @@ mod tests {
         conns.close();
     }
 
-    // Only 127.0.0.1 is the proxy; 127.0.0.2 reaches the same socket as a direct client (Linux loopback).
+    // The listener is dual-stack. Only ::1 is the proxy; a client that connects to 127.0.0.1 arrives as the
+    // untrusted ::ffff:127.0.0.1. (A connection to 127.0.0.2 would not do: Linux picks 127.0.0.1 as its
+    // source, which would make every "direct" client the proxy.)
+    const PROXY_HOST: &str = "::1";
+    const DIRECT_HOST: &str = "127.0.0.1";
+
     fn proxy_listener(proxy_time: Duration) -> (Conns, u16) {
-        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let listener = TcpListener::bind("[::]:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let conns = listen(
             listener,
@@ -1927,7 +1932,7 @@ mod tests {
                 proxy_body_time: proxy_time,
                 ..tune()
             },
-            vec![TrustedProxy::parse("127.0.0.1").unwrap()],
+            vec![TrustedProxy::parse(PROXY_HOST).unwrap()],
         )
         .unwrap();
         (conns, port)
@@ -1963,11 +1968,11 @@ mod tests {
     #[test]
     fn forwarded_clients_cannot_take_the_slot_direct_clients_need() {
         let (conns, port) = proxy_listener(Duration::from_millis(1500));
-        let _slow = post_via("127.0.0.1", port, Some("198.51.100.1"), "x", 100);
+        let _slow = post_via(PROXY_HOST, port, Some("198.51.100.1"), "x", 100);
         thread::sleep(Duration::from_millis(150));
 
         // A direct client still gets the remaining slot while a forwarded reader is held.
-        let mut direct = post_via("127.0.0.2", port, None, "o", 2);
+        let mut direct = post_via(DIRECT_HOST, port, None, "o", 2);
         thread::sleep(Duration::from_millis(100));
         direct.write_all(b"k").unwrap();
         let direct = reply_of(direct, Duration::from_millis(400));
@@ -1975,7 +1980,7 @@ mod tests {
 
         // Another forwarded address waits for the proxy share although a slot is free, and is served
         // once the first reader's shorter hold ends.
-        let mut other = post_via("127.0.0.1", port, Some("198.51.100.2"), "o", 2);
+        let mut other = post_via(PROXY_HOST, port, Some("198.51.100.2"), "o", 2);
         thread::sleep(Duration::from_millis(100));
         other.write_all(b"k").unwrap();
         other
@@ -1992,13 +1997,13 @@ mod tests {
     fn a_forwarded_reader_holds_its_slot_for_less_than_a_direct_one() {
         let (conns, port) = proxy_listener(Duration::from_millis(500));
         let started = Instant::now();
-        let forwarded = post_via("127.0.0.1", port, Some("198.51.100.1"), "x", 100);
+        let forwarded = post_via(PROXY_HOST, port, Some("198.51.100.1"), "x", 100);
         let reply = reply_of(forwarded, Duration::from_millis(2500));
         assert!(reply.starts_with(b"HTTP/1.1 400"), "got {reply:?}");
         assert!(started.elapsed() < Duration::from_millis(2000));
 
         // The same trickle from a direct client is still being waited on after the forwarded limit.
-        let mut direct = post_via("127.0.0.2", port, None, "x", 100);
+        let mut direct = post_via(DIRECT_HOST, port, None, "x", 100);
         direct
             .set_read_timeout(Some(Duration::from_millis(1200)))
             .unwrap();
