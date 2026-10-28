@@ -98,6 +98,7 @@ struct FileConfig {
     s3: Option<S3File>,
     backup: Option<BackupFile>,
     mail: Option<MailFile>,
+    worker_bootstrap: Option<WorkerBootstrapFile>,
     tailcat_address: Option<String>,
 }
 
@@ -229,6 +230,126 @@ impl MailFile {
             api_key_file: key_file,
             from,
         }))
+    }
+}
+
+/// What the controller's worker-enrollment bootstrap script pins: where workers dial, where the release lives and
+/// its V01 `SHA256SUMS`, and (for Tailcat enrollments) the pinned helper builds. Server role only.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerBootstrapFile {
+    /// IP address and port workers dial for a direct TLS enrollment (the link listener as workers reach it).
+    controller: String,
+    /// Directory URL holding the release archives.
+    release_url: String,
+    /// The release's `SHA256SUMS` file.
+    release_sums: PathBuf,
+    tailcat: Option<BootstrapTailcatFile>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapTailcatFile {
+    /// Defaults to the helper version this build pins.
+    version: Option<String>,
+    x86_64_url: Option<String>,
+    /// Defaults to the pinned build's digest.
+    x86_64_sha256: Option<String>,
+    aarch64_url: Option<String>,
+    aarch64_sha256: Option<String>,
+}
+
+impl WorkerBootstrapFile {
+    fn check(&self, server_tailcat: Option<&TailcatFile>) -> Result<(), Error> {
+        if self.controller.parse::<SocketAddr>().is_err() {
+            return Err(Error::config(
+                "[worker_bootstrap] controller must be an IP address and port, as in 10.0.0.5:7443",
+            ));
+        }
+        if !self.release_sums.is_absolute() {
+            return Err(Error::config(
+                "[worker_bootstrap] release_sums must be an absolute path",
+            ));
+        }
+        if let Some(tailcat) = &self.tailcat {
+            if !server_tailcat.is_some_and(|t| t.enabled == Some(true)) {
+                return Err(Error::config(
+                    "[worker_bootstrap.tailcat] needs the controller's own [tailcat] enabled = true: the generated script hands workers its address",
+                ));
+            }
+            if tailcat.x86_64_url.is_none() && tailcat.aarch64_url.is_none() {
+                return Err(Error::config(
+                    "[worker_bootstrap.tailcat] needs x86_64_url or aarch64_url",
+                ));
+            }
+            if tailcat.aarch64_url.is_some() != tailcat.aarch64_sha256.is_some() {
+                return Err(Error::config(
+                    "[worker_bootstrap.tailcat] aarch64_url and aarch64_sha256 are set together: this build pins no arm64 helper digest",
+                ));
+            }
+            if tailcat.x86_64_url.is_none() && tailcat.x86_64_sha256.is_some() {
+                return Err(Error::config(
+                    "[worker_bootstrap.tailcat] x86_64_sha256 needs x86_64_url",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "server")]
+    fn build(
+        &self,
+        data_dir: &Path,
+        fingerprint: &str,
+        server_tailcat: Option<&TailcatFile>,
+    ) -> Result<sentinel_api::WorkerBootstrap, Error> {
+        let sums = sentinel::bounded::text(&self.release_sums, 1 << 20).map_err(|error| {
+            Error::config(format!(
+                "cannot read [worker_bootstrap] release_sums {}: {error}",
+                self.release_sums.display()
+            ))
+        })?;
+        let tailcat = self.tailcat.as_ref().map(|t| {
+            let pin = |url: &Option<String>, sha256: Option<String>| {
+                url.clone().map(|url| sentinel_api::Pin {
+                    url,
+                    sha256: sha256.unwrap_or_default(),
+                })
+            };
+            sentinel_api::TailcatRelease {
+                version: t
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| sentinel_link::tailcat::PINNED_VERSION.to_owned()),
+                x86_64: pin(
+                    &t.x86_64_url,
+                    Some(
+                        t.x86_64_sha256
+                            .clone()
+                            .unwrap_or_else(|| sentinel_link::tailcat::PINNED_SHA256.to_owned()),
+                    ),
+                ),
+                aarch64: pin(&t.aarch64_url, t.aarch64_sha256.clone()),
+                derpmap_url: server_tailcat.and_then(|s| s.derpmap_url.clone()),
+                region: server_tailcat.and_then(|s| s.region.clone()),
+            }
+        });
+        sentinel_api::WorkerBootstrap::new(sentinel_api::WorkerBootstrapSettings {
+            controller: self
+                .controller
+                .parse()
+                .map_err(|_| Error::config("[worker_bootstrap] controller is not an address"))?,
+            fingerprint: fingerprint.to_owned(),
+            release_url: self.release_url.clone(),
+            release_sums: sums,
+            tailcat_address_file: tailcat.is_some().then(|| {
+                data_dir
+                    .join("tailcat")
+                    .join(sentinel_link::tailcat::ADDRESS_FILE)
+            }),
+            tailcat,
+        })
+        .map_err(|error| Error::config(format!("[worker_bootstrap] {error}")))
     }
 }
 
@@ -465,6 +586,8 @@ struct Config {
     s3: Option<S3File>,
     #[cfg(feature = "server")]
     backup: Option<BackupFile>,
+    #[cfg(feature = "server")]
+    worker_bootstrap: Option<WorkerBootstrapFile>,
     #[cfg(feature = "server")]
     mail: Option<MailSettings>,
     #[cfg(feature = "server")]
@@ -870,6 +993,14 @@ impl Config {
             }
             backup.check(&data_dir)?;
         }
+        if let Some(bootstrap) = &file.worker_bootstrap {
+            let Role::Server { tailcat, .. } = &role else {
+                return Err(Error::config(
+                    "[worker_bootstrap] applies to the server role only",
+                ));
+            };
+            bootstrap.check(tailcat.as_ref())?;
+        }
         let mail = match &role {
             Role::Server { public_url, .. } => {
                 let mail = file
@@ -909,6 +1040,8 @@ impl Config {
             s3: file.s3,
             #[cfg(feature = "server")]
             backup: file.backup,
+            #[cfg(feature = "server")]
+            worker_bootstrap: file.worker_bootstrap,
             #[cfg(feature = "server")]
             mail,
             #[cfg(feature = "server")]
@@ -1644,6 +1777,7 @@ fn start_server(
         controller.set_remote_cache_budget(budget);
         controller.set_remote_cache(root);
     }
+    let tailcat_file = tailcat;
     let tailcat = start_tailcat(config, &store, tailcat, listen, controller.handle())?;
     let destinations = crate::source_admin::load_destinations(&config.data_dir)
         .map_err(|_| Error::runtime("cannot load source destination policy"))?;
@@ -1851,7 +1985,20 @@ fn start_server(
     let (mail, mail_sender) = start_mail(config, public_url.as_deref(), &store, key.as_ref())?;
     announce_setup(&config.data_dir, &store)?;
     record_auto_join(&config.auto_join, &store)?;
+    let worker_bootstrap = match &config.worker_bootstrap {
+        Some(file) => {
+            let built = file.build(&config.data_dir, &fingerprint, tailcat_file)?;
+            tracing::info!(
+                event = "worker_bootstrap_enabled",
+                release = built.release_version(),
+                tailcat = built.tailcat_configured()
+            );
+            Some(Arc::new(built))
+        }
+        None => None,
+    };
     let options = sentinel_api::Options {
+        worker_bootstrap,
         mail: mail_sender,
         auto_join: config
             .auto_join
@@ -3022,6 +3169,43 @@ mod tests {
             assert!(parse(bad).check(data).is_err(), "{bad}");
         }
         assert!(toml::from_str::<BackupFile>("dir = '/x'\nextra = 1").is_err());
+    }
+
+    #[test]
+    fn worker_bootstrap_settings_need_a_dialable_controller_and_the_controllers_own_tailcat() {
+        let parse = |text: &str| toml::from_str::<WorkerBootstrapFile>(text).unwrap();
+        let tailcat_on = TailcatFile {
+            enabled: Some(true),
+            ..TailcatFile::default()
+        };
+        let base = "controller = '10.0.0.5:7443'\nrelease_url = 'https://r.example.test/0.1.0'\nrelease_sums = '/etc/sentinel/SHA256SUMS'\n";
+        assert!(parse(base).check(None).is_ok());
+        let with_helper =
+            format!("{base}[tailcat]\nx86_64_url = 'https://r.example.test/tailcat'\n");
+        assert!(parse(&with_helper).check(Some(&tailcat_on)).is_ok());
+        // A script that hands out the controller's Tailcat address needs the controller to serve one.
+        assert!(parse(&with_helper).check(None).is_err());
+        assert!(
+            parse(&with_helper)
+                .check(Some(&TailcatFile::default()))
+                .is_err()
+        );
+        for bad in [
+            "controller = 'ci.example.test:7443'\nrelease_url = 'https://r.example.test'\nrelease_sums = '/s'\n",
+            "controller = '10.0.0.5:7443'\nrelease_url = 'https://r.example.test'\nrelease_sums = 'SHA256SUMS'\n",
+        ] {
+            assert!(parse(bad).check(None).is_err(), "{bad}");
+        }
+        // No arm64 digest is pinned by this build, so an arm64 helper must state its own.
+        let arm_without_digest =
+            format!("{base}[tailcat]\naarch64_url = 'https://r.example.test/tailcat-arm'\n");
+        assert!(parse(&arm_without_digest).check(Some(&tailcat_on)).is_err());
+        let empty_helper = format!("{base}[tailcat]\nversion = '0.6.0'\n");
+        assert!(parse(&empty_helper).check(Some(&tailcat_on)).is_err());
+        assert!(
+            toml::from_str::<WorkerBootstrapFile>(&format!("{base}extra = 1")).is_err(),
+            "unknown keys are refused"
+        );
     }
 
     #[test]

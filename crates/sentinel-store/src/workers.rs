@@ -207,7 +207,120 @@ pub fn revoke_enrollment(
     if changed == 0 {
         return Err(Error::NotFound);
     }
-    Ok(())
+    audit(
+        tx,
+        Event::WorkerEnrollmentRevoked,
+        authority.actor(),
+        None,
+        authority.host_local(),
+        Some(&id.to_string()),
+    )
+}
+
+/// Where an enrollment stands. `Expired` is derived from the clock; the others are stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnrollmentState {
+    Pending,
+    Redeemed,
+    Revoked,
+    Expired,
+}
+
+/// An enrollment as an administrator sees it: the terms, never the secret (only its digest is stored).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnrollmentStatus {
+    pub id: TokenId,
+    pub pool: PoolId,
+    pub created: UnixMillis,
+    pub expires: UnixMillis,
+    pub policy: HostPolicy,
+    pub tailcat: bool,
+    pub state: EnrollmentState,
+}
+
+fn enrollment_status_of(
+    conn: &Connection,
+    id: TokenId,
+    now: UnixMillis,
+) -> Result<EnrollmentStatus> {
+    let (pool, created, expires, redeemed, revoked, policy, tailcat) = conn
+        .prepare_cached(
+            "SELECT pool_id, created_ms, expires_ms, redeemed_ms, revoked_ms,
+                    cpu_ceiling_millis, memory_ceiling_bytes, disk_ceiling_bytes, priority, tailcat
+             FROM worker_enrollments WHERE id = ?1",
+        )?
+        .query_row([id.as_bytes()], |r| {
+            Ok((
+                r.get::<_, PoolBytes>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                HostPolicy {
+                    cpu_millis: r.get(5)?,
+                    memory_bytes: r.get(6)?,
+                    disk_bytes: r.get(7)?,
+                    priority: r.get(8)?,
+                },
+                r.get::<_, bool>(9)?,
+            ))
+        })
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    let state = if revoked.is_some() {
+        EnrollmentState::Revoked
+    } else if redeemed.is_some() {
+        EnrollmentState::Redeemed
+    } else if expires <= now.0 {
+        EnrollmentState::Expired
+    } else {
+        EnrollmentState::Pending
+    };
+    Ok(EnrollmentStatus {
+        id,
+        pool: PoolId::from_bytes(pool).map_err(|_| Error::Corrupt("pool id"))?,
+        created: UnixMillis(created),
+        expires: UnixMillis(expires),
+        policy,
+        tailcat,
+        state,
+    })
+}
+
+/// Read one enrollment's terms and state (platform administration only).
+pub fn enrollment_status(
+    conn: &Connection,
+    authority: Authority,
+    id: TokenId,
+    now: UnixMillis,
+) -> Result<EnrollmentStatus> {
+    authority.require_platform(conn)?;
+    enrollment_status_of(conn, id, now)
+}
+
+/// Record that the bootstrap script of a *pending* enrollment was handed out, and return the terms
+/// it was rendered for, in one transaction: a spent, revoked or expired enrollment is `Conflict`
+/// and leaves no row, so a script is never issued for an enrollment that can no longer be redeemed.
+pub fn note_bootstrap_download(
+    tx: &Transaction<'_>,
+    authority: Authority,
+    id: TokenId,
+    now: UnixMillis,
+) -> Result<EnrollmentStatus> {
+    authority.require_platform(tx)?;
+    let status = enrollment_status_of(tx, id, now)?;
+    if status.state != EnrollmentState::Pending {
+        return Err(Error::Conflict);
+    }
+    audit(
+        tx,
+        Event::WorkerBootstrapDownloaded,
+        authority.actor(),
+        None,
+        authority.host_local(),
+        Some(&id.to_string()),
+    )?;
+    Ok(status)
 }
 
 #[derive(Clone, Debug)]

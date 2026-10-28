@@ -1,0 +1,656 @@
+//! Q11: platform administrators issue worker enrollments and download the worker-only bootstrap script.
+
+use std::sync::Arc;
+
+use sentinel_api::{Pin, TailcatRelease, WorkerBootstrap, WorkerBootstrapSettings};
+use sentinel_core::{PoolId, UnixMillis, UserId};
+use sentinel_link::{controller::Controller, identity::Identity};
+use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
+use sentinel_store::{
+    Durability, Store,
+    auth::Authority,
+    local_auth,
+    logs::LogStore,
+    objects::Objects,
+    tenancy::{self, PoolKind},
+    tokens::{self, Grant},
+    workers::{self, Presentation},
+};
+use serde_json::{Value, json};
+
+const PASSWORD: &str = "correct horse battery staple";
+const X86: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const ARM: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const HELPER: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const FINGERPRINT: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const TAILCAT_ADDRESS: &str = "tcQ2w3E4r5T6y7U8i9O0p1A2s3D4f5G6h7J8";
+const NODE_KEY: [u8; 32] = [7; 32];
+
+struct Deployment {
+    _dir: tempfile::TempDir,
+    store: Arc<Store>,
+    _controller: Controller,
+    server: Option<sentinel_api::Server>,
+    base: String,
+    pool: PoolId,
+    root: UserId,
+}
+
+impl Drop for Deployment {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.take() {
+            server.shutdown();
+        }
+    }
+}
+
+fn bootstrap(dir: &std::path::Path, with_tailcat: bool) -> Arc<WorkerBootstrap> {
+    let address_file = dir.join("address");
+    std::fs::write(&address_file, format!("{TAILCAT_ADDRESS}\n")).unwrap();
+    Arc::new(
+        WorkerBootstrap::new(WorkerBootstrapSettings {
+            controller: "10.0.0.5:7443".parse().unwrap(),
+            fingerprint: FINGERPRINT.into(),
+            release_url: "https://releases.example.test/sentinel/0.1.0".into(),
+            release_sums: format!(
+                "{X86}  sentinel-0.1.0-x86_64-linux-worker.tar.gz\n\
+                 {ARM}  sentinel-0.1.0-aarch64-linux-worker.tar.gz\n"
+            ),
+            tailcat: with_tailcat.then(|| TailcatRelease {
+                version: "0.6.0".into(),
+                x86_64: Some(Pin {
+                    url: "https://releases.example.test/tailcat/0.6.0/tailcat-linux-amd64".into(),
+                    sha256: HELPER.into(),
+                }),
+                aarch64: None,
+                derpmap_url: None,
+                region: None,
+            }),
+            tailcat_address_file: with_tailcat.then_some(address_file),
+        })
+        .unwrap(),
+    )
+}
+
+fn deployment(configured: Option<bool>) -> Deployment {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
+    let logs = Arc::new(LogStore::open(dir.path().join("logs")).unwrap());
+    let key_path = dir.path().join("master.key");
+    sentinel_auth::sealed::Key::create(&key_path).unwrap();
+    let key = Arc::new(sentinel_auth::sealed::Key::load(&key_path).unwrap());
+    let root = local_auth::bootstrap(
+        &store,
+        "root",
+        "Root",
+        PASSWORD.as_bytes(),
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let pool = PoolId::new();
+    store
+        .writer()
+        .write(move |tx| {
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                pool,
+                "builders",
+                PoolKind::Shared,
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+    let objects = Arc::new(Objects::open(dir.path()).unwrap());
+    let controller = Controller::start(
+        Arc::clone(&store),
+        Arc::clone(&logs),
+        Arc::clone(&objects),
+        Identity::generate("controller").unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
+    let server = sentinel_api::Server::start_with(
+        sentinel_api::Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            store: Arc::clone(&store),
+            logs,
+            objects,
+            controller: controller.handle(),
+            secret_key: Some(key),
+            sessions: local_auth::Policy::default(),
+            github_webhook_secret: None,
+            intake: None,
+            public_url: None,
+            github_sign_in: None,
+            trusted_proxies: sentinel_api::TrustedProxy::loopback(),
+        },
+        sentinel_api::Options {
+            worker_bootstrap: configured.map(|tailcat| bootstrap(dir.path(), tailcat)),
+            ..sentinel_api::Options::default()
+        },
+    )
+    .unwrap();
+    let base = format!("http://{}", server.local_addr());
+    Deployment {
+        _dir: dir,
+        store,
+        _controller: controller,
+        server: Some(server),
+        base,
+        pool,
+        root,
+    }
+}
+
+struct Reply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    text: String,
+}
+
+impl Reply {
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.text).unwrap_or(Value::Null)
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+fn send(
+    d: &Deployment,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    headers: &[(&str, &str)],
+) -> Reply {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build(),
+    );
+    let url = format!("{}{path}", d.base);
+    let response = match method {
+        "GET" | "DELETE" => {
+            let mut request = if method == "GET" {
+                agent.get(&url).force_send_body()
+            } else {
+                agent.delete(&url).force_send_body()
+            };
+            for (k, v) in headers {
+                request = request.header(*k, *v);
+            }
+            request.send_empty()
+        }
+        _ => {
+            let mut request = agent.post(&url).header("content-type", "application/json");
+            for (k, v) in headers {
+                request = request.header(*k, *v);
+            }
+            request.send(
+                body.map_or_else(|| "{}".to_owned(), Value::to_string)
+                    .as_bytes(),
+            )
+        }
+    }
+    .unwrap();
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(n, v)| {
+            (
+                n.as_str().to_ascii_lowercase(),
+                v.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let text = response.into_body().read_to_string().unwrap_or_default();
+    Reply {
+        status,
+        headers,
+        text,
+    }
+}
+
+struct Session {
+    cookie: String,
+    csrf: String,
+}
+
+impl Session {
+    fn headers(&self) -> [(&str, &str); 2] {
+        [("cookie", &self.cookie), ("x-sentinel-csrf", &self.csrf)]
+    }
+}
+
+fn sign_in(d: &Deployment) -> Session {
+    let reply = send(
+        d,
+        "POST",
+        "/api/v1/login",
+        Some(&json!({ "username": "root", "password": PASSWORD })),
+        &[],
+    );
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    Session {
+        cookie: reply
+            .header("set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned(),
+        csrf: reply.json()["csrf"].as_str().unwrap().to_owned(),
+    }
+}
+
+fn step_up(d: &Deployment, session: &Session) {
+    let reply = send(
+        d,
+        "POST",
+        "/api/v1/step-up",
+        Some(&json!({ "method": "password", "code": PASSWORD })),
+        &session.headers(),
+    );
+    assert_eq!(reply.status, 200, "{}", reply.text);
+}
+
+fn administrator(d: &Deployment) -> Session {
+    let session = sign_in(d);
+    step_up(d, &session);
+    session
+}
+
+fn issue(d: &Deployment, session: &Session, body: Value) -> Reply {
+    send(
+        d,
+        "POST",
+        "/api/v1/admin/worker-enrollments",
+        Some(&body),
+        &session.headers(),
+    )
+}
+
+fn audit_events(d: &Deployment, session: &Session) -> Vec<String> {
+    let reply = send(
+        d,
+        "GET",
+        "/api/v1/admin/audit?limit=100",
+        None,
+        &session.headers(),
+    );
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    reply.json()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["event"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn negotiated() -> Negotiated {
+    Negotiated {
+        protocol: ProtocolVersion(1),
+        capabilities: Capabilities::REQUIRED,
+        arch: Arch::X86_64,
+    }
+}
+
+fn redeem(d: &Deployment, secret: &str, node_key: Option<[u8; 32]>) -> bool {
+    let secret = sentinel_auth::token::parse(secret).expect("a well-formed secret");
+    d.store
+        .writer()
+        .write(move |tx| {
+            workers::redeem_bound(
+                tx,
+                &secret,
+                Presentation {
+                    worker: sentinel_core::WorkerId::new(),
+                    fingerprint: sentinel_auth::secret::Secret::generate().digest(),
+                    name: "builder-1",
+                    negotiated: negotiated(),
+                },
+                node_key,
+                UnixMillis::now(),
+            )
+            .map(|w| w.is_some())
+        })
+        .unwrap()
+}
+
+#[test]
+fn issuing_needs_a_fresh_step_up_and_the_secret_is_returned_once() {
+    let d = deployment(Some(true));
+    let body = json!({
+        "pool": d.pool.to_string(),
+        "cpu_millis": 4000,
+        "memory_bytes": 8_589_934_592u64,
+        "priority": 5,
+    });
+    assert_eq!(
+        send(
+            &d,
+            "POST",
+            "/api/v1/admin/worker-enrollments",
+            Some(&body),
+            &[]
+        )
+        .status,
+        401
+    );
+
+    let session = sign_in(&d);
+    let refused = issue(&d, &session, body.clone());
+    assert_eq!(refused.status, 403, "{}", refused.text);
+    assert_eq!(refused.json()["details"]["step_up"], true);
+
+    // A bearer token never steps up: only a browser session can issue a machine's way into the fleet.
+    let granted = tokens::provision(
+        &d.store,
+        Grant::new(d.root, "ops", sentinel_core::auth::Permissions::ALL),
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let bearer = format!("Bearer {}", sentinel_auth::token::format(&granted.secret));
+    let by_token = send(
+        &d,
+        "POST",
+        "/api/v1/admin/worker-enrollments",
+        Some(&body),
+        &[("authorization", &bearer)],
+    );
+    assert_eq!(by_token.status, 403, "{}", by_token.text);
+
+    step_up(&d, &session);
+    let issued = issue(&d, &session, body);
+    assert_eq!(issued.status, 201, "{}", issued.text);
+    assert_eq!(issued.header("cache-control"), Some("no-store"));
+    let issued = issued.json();
+    let secret = issued["secret"].as_str().unwrap().to_owned();
+    assert!(secret.starts_with("sntl_") && secret.len() == "sntl_".len() + 64);
+    assert_eq!(issued["transport"], "tailcat");
+    assert_eq!(issued["tailcat_address"], TAILCAT_ADDRESS);
+    assert_eq!(issued["release_version"], "0.1.0");
+    assert_eq!(issued["host"]["cpu_millis"], 4000);
+    assert_eq!(issued["host"]["priority"], 5);
+    assert_eq!(issued["host"]["disk_bytes"], Value::Null);
+    let id = issued["id"].as_str().unwrap();
+    assert_eq!(
+        issued["bootstrap_path"],
+        format!("/api/v1/admin/worker-enrollments/{id}/bootstrap.sh")
+    );
+
+    // Nothing the controller serves afterwards repeats the secret or the Tailcat address.
+    let state = send(
+        &d,
+        "GET",
+        &format!("/api/v1/admin/worker-enrollments/{id}"),
+        None,
+        &session.headers(),
+    );
+    assert_eq!(state.status, 200, "{}", state.text);
+    assert_eq!(state.json()["state"], "pending");
+    assert_eq!(state.json()["transport"], "tailcat");
+    assert_eq!(state.json()["host"]["memory_bytes"], 8_589_934_592u64);
+    let audit = send(
+        &d,
+        "GET",
+        "/api/v1/admin/audit?limit=100",
+        None,
+        &session.headers(),
+    );
+    for served in [&state.text, &audit.text] {
+        assert!(!served.contains(&secret[5..]) && !served.contains(TAILCAT_ADDRESS));
+    }
+    assert!(audit_events(&d, &session).contains(&"worker-enrollment-issued".to_owned()));
+
+    // The issued secret is exactly the pool-bound, single-use enrollment of the store layer: a Tailcat one
+    // refuses a worker that presents no node key, then binds both halves of the identity at once.
+    assert!(!redeem(&d, &secret, None));
+    assert!(redeem(&d, &secret, Some(NODE_KEY)));
+    assert!(!redeem(&d, &secret, Some([8; 32])));
+    let spent = send(
+        &d,
+        "GET",
+        &format!("/api/v1/admin/worker-enrollments/{id}"),
+        None,
+        &session.headers(),
+    );
+    assert_eq!(spent.json()["state"], "redeemed");
+}
+
+#[test]
+fn a_direct_enrollment_has_no_address_and_refuses_a_node_key() {
+    let d = deployment(Some(false));
+    let session = administrator(&d);
+    let issued = issue(
+        &d,
+        &session,
+        json!({ "pool": d.pool.to_string(), "transport": "direct", "lifetime_ms": 600_000 }),
+    );
+    assert_eq!(issued.status, 201, "{}", issued.text);
+    let issued = issued.json();
+    assert_eq!(issued["transport"], "direct");
+    assert_eq!(issued["tailcat_address"], Value::Null);
+    let secret = issued["secret"].as_str().unwrap();
+    assert!(!redeem(&d, secret, Some(NODE_KEY)));
+    assert!(redeem(&d, secret, None));
+}
+
+#[test]
+fn issuing_refuses_what_cannot_work_with_a_stated_reason() {
+    let d = deployment(Some(false));
+    let session = administrator(&d);
+    let pool = d.pool.to_string();
+    let tailcat = issue(&d, &session, json!({ "pool": pool }));
+    assert_eq!(tailcat.status, 409, "{}", tailcat.text);
+    assert!(tailcat.text.contains("no Tailcat helper"));
+    for (body, status) in [
+        (json!({ "pool": pool, "transport": "wireguard" }), 400),
+        (
+            json!({ "pool": pool, "transport": "direct", "lifetime_ms": 0 }),
+            400,
+        ),
+        (
+            json!({ "pool": pool, "transport": "direct", "lifetime_ms": 90_000_000 }),
+            400,
+        ),
+        (
+            json!({ "pool": pool, "transport": "direct", "cpu_millis": 0 }),
+            400,
+        ),
+        (
+            json!({ "pool": pool, "transport": "direct", "priority": 101 }),
+            400,
+        ),
+        (
+            json!({ "pool": pool, "transport": "direct", "secret": "x" }),
+            400,
+        ),
+        (json!({ "pool": "not-a-pool", "transport": "direct" }), 400),
+        (
+            json!({ "pool": PoolId::new().to_string(), "transport": "direct" }),
+            404,
+        ),
+    ] {
+        let reply = issue(&d, &session, body.clone());
+        assert_eq!(reply.status, status, "{body}: {}", reply.text);
+    }
+
+    // A Tailcat enrollment waits for the controller's own address instead of handing out a script that cannot connect.
+    let d = deployment(Some(true));
+    let session = administrator(&d);
+    std::fs::remove_file(d._dir.path().join("address")).unwrap();
+    let reply = issue(&d, &session, json!({ "pool": d.pool.to_string() }));
+    assert_eq!(reply.status, 409, "{}", reply.text);
+    assert!(reply.text.contains("Tailcat address"));
+
+    let d = deployment(None);
+    let session = administrator(&d);
+    let reply = issue(&d, &session, json!({ "pool": d.pool.to_string() }));
+    assert_eq!(reply.status, 409, "{}", reply.text);
+    assert!(reply.text.contains("[worker_bootstrap]"));
+    let path = format!("/api/v1/admin/worker-enrollments/{}/bootstrap.sh", "tok_x");
+    assert_eq!(send(&d, "GET", &path, None, &session.headers()).status, 409);
+}
+
+fn script_of(d: &Deployment, session: &Session, id: &str) -> Reply {
+    send(
+        d,
+        "GET",
+        &format!("/api/v1/admin/worker-enrollments/{id}/bootstrap.sh"),
+        None,
+        &session.headers(),
+    )
+}
+
+#[test]
+fn the_script_is_a_secret_free_attachment_served_only_for_a_pending_enrollment() {
+    let d = deployment(Some(true));
+    let session = administrator(&d);
+    let issued = issue(&d, &session, json!({ "pool": d.pool.to_string() })).json();
+    let (id, secret) = (
+        issued["id"].as_str().unwrap().to_owned(),
+        issued["secret"].as_str().unwrap().to_owned(),
+    );
+
+    let anonymous = send(
+        &d,
+        "GET",
+        &format!("/api/v1/admin/worker-enrollments/{id}/bootstrap.sh"),
+        None,
+        &[],
+    );
+    assert_eq!(anonymous.status, 401);
+
+    let script = script_of(&d, &session, &id);
+    assert_eq!(script.status, 200, "{}", script.text);
+    assert_eq!(
+        script.header("content-type"),
+        Some("text/x-shellscript; charset=utf-8")
+    );
+    assert!(
+        script
+            .header("content-disposition")
+            .is_some_and(|v| v.starts_with("attachment;"))
+    );
+    assert_eq!(script.header("x-content-type-options"), Some("nosniff"));
+    assert_eq!(script.header("cache-control"), Some("no-store"));
+    let text = &script.text;
+    assert!(text.starts_with("#!/bin/sh\n"));
+    for pinned in [
+        "TRANSPORT='tailcat'",
+        &format!("CONTROLLER_FINGERPRINT='{FINGERPRINT}'"),
+        &format!("WORKER_SHA256_X86_64='{X86}'"),
+        &format!("WORKER_SHA256_AARCH64='{ARM}'"),
+        &format!("TAILCAT_SHA256_X86_64='{HELPER}'"),
+        "WORKER_URL_X86_64='https://releases.example.test/sentinel/0.1.0/sentinel-0.1.0-x86_64-linux-worker.tar.gz'",
+    ] {
+        assert!(text.contains(pinned), "missing {pinned}");
+    }
+    // No credential reaches the script: not the enrollment secret, not the controller's Tailcat address.
+    assert!(!text.contains(&secret[5..]) && !text.contains(TAILCAT_ADDRESS));
+    // Nothing in it hands a download to a shell through a pipe.
+    assert!(
+        !text.lines().any(|l| l
+            .split('|')
+            .skip(1)
+            .any(|seg| matches!(seg.split_whitespace().next(), Some("sh" | "bash" | "dash")))),
+        "a line pipes into a shell"
+    );
+
+    script_of(&d, &session, &id);
+    let downloads = audit_events(&d, &session)
+        .iter()
+        .filter(|e| *e == "worker-bootstrap-downloaded")
+        .count();
+    assert_eq!(downloads, 2);
+
+    // Once spent, the enrollment gets no further script and no audit row for the refusal's request.
+    assert!(redeem(&d, &secret, Some(NODE_KEY)));
+    let spent = script_of(&d, &session, &id);
+    assert_eq!(spent.status, 409, "{}", spent.text);
+    let after = audit_events(&d, &session)
+        .iter()
+        .filter(|e| *e == "worker-bootstrap-downloaded")
+        .count();
+    assert_eq!(after, 2);
+}
+
+#[test]
+fn withdrawing_closes_an_unspent_enrollment_and_its_script() {
+    let d = deployment(Some(false));
+    let session = administrator(&d);
+    let issued = issue(
+        &d,
+        &session,
+        json!({ "pool": d.pool.to_string(), "transport": "direct" }),
+    )
+    .json();
+    let (id, secret) = (
+        issued["id"].as_str().unwrap().to_owned(),
+        issued["secret"].as_str().unwrap().to_owned(),
+    );
+    let path = format!("/api/v1/admin/worker-enrollments/{id}");
+    assert_eq!(send(&d, "DELETE", &path, None, &[]).status, 401);
+    assert_eq!(
+        send(&d, "DELETE", &path, None, &session.headers()).status,
+        204
+    );
+    assert_eq!(
+        send(&d, "DELETE", &path, None, &session.headers()).status,
+        404
+    );
+    let state = send(&d, "GET", &path, None, &session.headers());
+    assert_eq!(state.json()["state"], "revoked");
+    assert_eq!(script_of(&d, &session, &id).status, 409);
+    assert!(!redeem(&d, &secret, None));
+    assert!(audit_events(&d, &session).contains(&"worker-enrollment-revoked".to_owned()));
+    assert_eq!(
+        send(
+            &d,
+            "GET",
+            "/api/v1/admin/worker-enrollments/tok_00000000-0000-4000-8000-000000000000",
+            None,
+            &session.headers()
+        )
+        .status,
+        404
+    );
+}
+
+#[test]
+fn issuing_and_downloading_are_rate_limited_per_administrator() {
+    let d = deployment(Some(false));
+    let session = administrator(&d);
+    let body = json!({ "pool": d.pool.to_string(), "transport": "direct" });
+    let mut first = None;
+    let mut statuses = Vec::new();
+    for _ in 0..8 {
+        let reply = issue(&d, &session, body.clone());
+        if first.is_none() {
+            first = Some(reply.json()["id"].as_str().unwrap().to_owned());
+        }
+        statuses.push(reply.status);
+    }
+    assert_eq!(&statuses[..5], &[201; 5], "{statuses:?}");
+    assert!(statuses[5..].iter().all(|s| *s == 429), "{statuses:?}");
+    let limited = issue(&d, &session, body);
+    assert_eq!(limited.json()["details"]["retry_after_ms"], 6_000);
+
+    let id = first.unwrap();
+    let mut codes = Vec::new();
+    for _ in 0..14 {
+        codes.push(script_of(&d, &session, &id).status);
+    }
+    assert_eq!(&codes[..10], &[200; 10], "{codes:?}");
+    assert!(codes[10..].iter().all(|c| *c == 429), "{codes:?}");
+}

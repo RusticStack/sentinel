@@ -9,6 +9,7 @@ mod metrics;
 mod oauth;
 mod routes;
 mod secret_routes;
+mod worker_bootstrap;
 
 use std::{
     net::SocketAddr,
@@ -25,6 +26,9 @@ use sentinel_store::{Store, logs::LogStore, objects::Objects};
 
 pub use github::GithubSignIn;
 pub use oauth::limit::TrustedProxy;
+pub use worker_bootstrap::{
+    Pin, Settings as WorkerBootstrapSettings, TailcatRelease, WorkerBootstrap,
+};
 
 pub const WORKERS: usize = 8;
 pub const CONNECTIONS: usize = 64;
@@ -112,11 +116,14 @@ pub struct AutoJoinRule {
 pub struct Options {
     pub auto_join: Vec<AutoJoinRule>,
     pub mail: Option<Arc<sentinel_mail::Resend>>,
+    /// Lets platform administrators issue worker enrollments and download their bootstrap script (Q11).
+    pub worker_bootstrap: Option<Arc<WorkerBootstrap>>,
 }
 
 pub(crate) struct State {
     pub auto_join: Vec<AutoJoinRule>,
     pub mail: Option<Arc<sentinel_mail::Resend>>,
+    pub worker_bootstrap: Option<Arc<WorkerBootstrap>>,
     pub setup_mail: Outbound,
     pub setup_closed: AtomicBool,
     pub store: Arc<Store>,
@@ -238,6 +245,7 @@ impl Server {
         let state = Arc::new(State {
             auto_join: options.auto_join,
             mail: options.mail,
+            worker_bootstrap: options.worker_bootstrap,
             setup_mail: Outbound::default(),
             setup_closed: AtomicBool::new(false),
             store: config.store,

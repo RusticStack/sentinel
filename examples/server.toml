@@ -17,3 +17,12 @@ api_listen = "127.0.0.1:7080"
 # region = "derp.example.com"     # region name in that map; omit to fix a region
 # listen_port = 7443              # the link port the helper serves; match `listen`
 # Admitted workers: <data_dir>/tailcat-allow, one `nodekey:<hex> wrk_<worker id>` per line (owner-only); an empty list admits none.
+
+# Optional: lets platform administrators issue worker enrollments and download the generated worker-only
+# install script (docs/worker-bootstrap.md). `controller` is the IP:port workers dial for direct TLS.
+# [worker_bootstrap]
+# controller = "203.0.113.5:7443"
+# release_url = "https://releases.example.com/sentinel/0.1.0"   # directory holding the release archives
+# release_sums = "/etc/sentinel/SHA256SUMS"                     # the release's SHA256SUMS
+# [worker_bootstrap.tailcat]                                    # needs the controller's [tailcat] enabled
+# x86_64_url = "https://releases.example.com/tailcat/tailcat-0.6.0-linux-amd64"   # sha256 defaults to the pinned build

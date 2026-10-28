@@ -207,6 +207,10 @@ Rotation leaves revocation unchanged. Every allow-list line names its worker, so
 
 **Telemetry.** With the helper enabled, the worker's `Transport` telemetry carries the helper's version, the path its first `tailcat ping` reported (`Relay` for a pong via DERP, `Direct` for one from an `ip:port`, `Unknown` when the probe failed or said neither — never guessed) with that pong's own latency as the seed RTT, then the control session's measured round-trip time. Later probes keep the helper's own telemetry current; the link reports the path measured at start (see [worker link](worker-link.md)).
 
+### Worker bootstrap
+
+An optional `[worker_bootstrap]` section (server role only) lets platform administrators issue worker enrollments and download the generated worker-only install script through the API. `controller` is the IP address and port workers dial for a direct TLS enrollment, `release_url` the directory holding the release archives and `release_sums` the release's `SHA256SUMS` (absolute path); the optional `[worker_bootstrap.tailcat]` section (`x86_64_url`, `x86_64_sha256`, `aarch64_url`, `aarch64_sha256`, `version`) pins the Tailcat helper builds and needs the controller's own `[tailcat] enabled = true`. Unknown keys are refused. The script, the host checks and the layout are in [worker bootstrap](worker-bootstrap.md).
+
 ### Email delivery
 
 Verification links and email invitations ([admission](admission.md#email-identity-and-email-invitations)) are delivered through [Resend](https://resend.com)'s HTTP API, drained from a durable outbox by the controller's mail lane. Configure it in `[mail]` or in the environment of the controller; the environment wins key by key, so a container needs no configuration file for it:

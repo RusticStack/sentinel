@@ -111,6 +111,8 @@ pub enum Event {
     MfaEnrollmentStarted = 75,
     WorkerUninstallRequested = 90,
     WorkerUninstalled = 91,
+    WorkerBootstrapDownloaded = 92,
+    WorkerEnrollmentRevoked = 93,
 }
 
 impl Event {
@@ -185,6 +187,8 @@ impl Event {
             Event::MfaEnrollmentStarted => "mfa-enrollment-started",
             Event::WorkerUninstallRequested => "worker-uninstall-requested",
             Event::WorkerUninstalled => "worker-uninstalled",
+            Event::WorkerBootstrapDownloaded => "worker-bootstrap-downloaded",
+            Event::WorkerEnrollmentRevoked => "worker-enrollment-revoked",
         }
     }
 
@@ -259,6 +263,8 @@ impl Event {
             75 => Event::MfaEnrollmentStarted,
             90 => Event::WorkerUninstallRequested,
             91 => Event::WorkerUninstalled,
+            92 => Event::WorkerBootstrapDownloaded,
+            93 => Event::WorkerEnrollmentRevoked,
             _ => return None,
         })
     }

@@ -43,6 +43,7 @@ mod email;
 mod failure;
 mod setup;
 mod views;
+mod worker_enrollment;
 use failure::attempt_failure;
 
 pub(crate) enum Reply {
@@ -52,6 +53,8 @@ pub(crate) enum Reply {
     Stream(u16, Box<dyn Read + Send>, u64, Vec<Header>),
     Html(u16, String, Vec<Header>),
     Text(u16, &'static str, String),
+    /// A generated shell script for the administrator to save and run: an attachment, never rendered.
+    Script(u16, String),
 }
 pub(crate) type Route = Result<Reply, ApiError>;
 
@@ -128,7 +131,8 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
         | Reply::Empty(s, ..)
         | Reply::Stream(s, ..)
         | Reply::Html(s, ..)
-        | Reply::Text(s, ..) => *s,
+        | Reply::Text(s, ..)
+        | Reply::Script(s, ..) => *s,
     };
     state.requests.observe(status, started.elapsed());
     match reply {
@@ -136,6 +140,18 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
             let response = Response::from_string(body)
                 .with_status_code(StatusCode(status))
                 .with_header(header("content-type", content_type))
+                .with_header(header("cache-control", "no-store"));
+            let _ = request.respond(response);
+        }
+        Reply::Script(status, body) => {
+            let response = Response::from_string(body)
+                .with_status_code(StatusCode(status))
+                .with_header(header("content-type", "text/x-shellscript; charset=utf-8"))
+                .with_header(header(
+                    "content-disposition",
+                    "attachment; filename=\"sentinel-worker-bootstrap.sh\"",
+                ))
+                .with_header(header("x-content-type-options", "nosniff"))
                 .with_header(header("cache-control", "no-store"));
             let _ = request.respond(response);
         }
@@ -386,6 +402,9 @@ pub(crate) fn route(
         return reply;
     }
     if let Some(reply) = admin::route(state, request, method, &parts, query) {
+        return reply;
+    }
+    if let Some(reply) = worker_enrollment::route(state, request, method, &parts) {
         return reply;
     }
     match (method, parts.as_slice()) {

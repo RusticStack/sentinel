@@ -44,6 +44,8 @@ pub(crate) enum Budget {
     Mail,
     Setup,
     Organization,
+    Enrollment,
+    Bootstrap,
 }
 
 const TOKEN_CLIENT: Rate = Rate::per_sec(10, 20);
@@ -64,6 +66,11 @@ const SETUP_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(10), 5);
 const SETUP_CEILING: Rate = Rate::per_sec(1, 5);
 const ORGANIZATION_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(10), 5);
 const ORGANIZATION_CEILING: Rate = Rate::per_sec(2, 10);
+// Per platform administrator, not per address: one enrollment per 6 s sustained, 5 in a burst; 1 a second overall.
+const ENROLLMENT_ACTOR: Rate = Rate::new(std::time::Duration::from_secs(6), 5);
+const ENROLLMENT_CEILING: Rate = Rate::per_sec(1, 5);
+const BOOTSTRAP_ACTOR: Rate = Rate::new(std::time::Duration::from_secs(2), 10);
+const BOOTSTRAP_CEILING: Rate = Rate::per_sec(2, 10);
 
 pub(crate) struct OAuthState {
     pub issuer: String,
@@ -86,6 +93,8 @@ pub(crate) struct OAuthState {
     pub mail_budget: Mutex<Limiter>,
     pub setup_budget: Mutex<Limiter>,
     pub organization_budget: Mutex<Limiter>,
+    pub enrollment_budget: Mutex<Limiter>,
+    pub bootstrap_budget: Mutex<Limiter>,
     pub client_metadata: client::MetadataCache,
     pub device_polls: Mutex<HashMap<[u8; 32], (Instant, u32)>>,
     pub user_code_failures: Mutex<device::WrongCodes>,
@@ -133,6 +142,16 @@ impl OAuthState {
             organization_budget: Mutex::new(Limiter::new(
                 ORGANIZATION_CLIENT,
                 Some(ORGANIZATION_CEILING),
+                now,
+            )),
+            enrollment_budget: Mutex::new(Limiter::new(
+                ENROLLMENT_ACTOR,
+                Some(ENROLLMENT_CEILING),
+                now,
+            )),
+            bootstrap_budget: Mutex::new(Limiter::new(
+                BOOTSTRAP_ACTOR,
+                Some(BOOTSTRAP_CEILING),
                 now,
             )),
             client_metadata: client::MetadataCache::default(),
@@ -302,7 +321,11 @@ pub(crate) fn admit(state: &State, request: &Request, budget: Budget) -> Result<
 }
 
 pub(crate) fn admitted(state: &State, request: &Request, budget: Budget) -> bool {
-    let client = client_of(state, request);
+    admitted_as(state, client_of(state, request), budget)
+}
+
+/// Like [`admitted`], for a budget kept per authenticated actor instead of per client address.
+pub(crate) fn admitted_as(state: &State, client: u128, budget: Budget) -> bool {
     let now = Instant::now();
     let take = |limiter: &Mutex<Limiter>| {
         limiter
@@ -323,6 +346,8 @@ pub(crate) fn admitted(state: &State, request: &Request, budget: Budget) -> bool
         Budget::Mail => take(&oauth.mail_budget),
         Budget::Setup => take(&oauth.setup_budget),
         Budget::Organization => take(&oauth.organization_budget),
+        Budget::Enrollment => take(&oauth.enrollment_budget),
+        Budget::Bootstrap => take(&oauth.bootstrap_budget),
     }
 }
 
