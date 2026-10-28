@@ -615,3 +615,87 @@ fn the_audit_trail_names_the_organization_and_never_the_address() {
     assert!(joined[0].contains(SLUG), "{}", joined[0]);
     assert_eq!(leaked, 0);
 }
+
+impl Fixture {
+    fn tenant_id(&self, slug: &'static str) -> TenantId {
+        let bytes: [u8; 16] = self
+            .store
+            .read(|c| {
+                c.query_row("SELECT id FROM tenants WHERE slug = ?1", [slug], |r| {
+                    r.get(0)
+                })
+                .map_err(Error::from)
+            })
+            .unwrap();
+        TenantId::from_bytes(bytes).unwrap()
+    }
+
+    fn remove(&self, slug: &'static str, user: UserId, now: i64) {
+        let (admin, tenant) = (self.admin, self.tenant_id(slug));
+        self.store
+            .writer()
+            .write(move |tx| auth::remove_membership(tx, admin, tenant, user, at(now)))
+            .unwrap();
+    }
+
+    fn add(&self, slug: &'static str, user: UserId, role: sentinel_core::auth::Role) {
+        let (admin, tenant) = (self.admin, self.tenant_id(slug));
+        self.store
+            .writer()
+            .write(move |tx| auth::set_membership(tx, admin, tenant, user, role))
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_member_removed_by_an_administrator_is_not_re_added_by_the_domain() {
+    let f = fixture();
+    assert!(f.rules("example.com").is_empty());
+    let _ana = f.verified("ana@example.com");
+    let bruno = f.verified("bruno@example.com");
+    assert_eq!(f.role_in(SLUG, bruno), 1);
+    let joins = f.count(Event::DomainAutoJoined);
+
+    f.remove(SLUG, bruno, 100);
+    assert_eq!(f.role_in(SLUG, bruno), 0);
+
+    // Sign-in runs `auto_join::apply`; two sign-ins prove the veto is not consumed.
+    f.sign_in("bruno@example.com");
+    f.sign_in("bruno@example.com");
+    assert_eq!(f.role_in(SLUG, bruno), 0, "the removal stands");
+    assert_eq!(
+        f.count(Event::DomainAutoJoined),
+        joins,
+        "no join was audited"
+    );
+
+    // The veto is per person and per organization.
+    let carla = f.verified("carla@example.com");
+    assert_eq!(f.role_in(SLUG, carla), 1, "others still join");
+    assert_eq!(f.tenants_named(SLUG), 1);
+}
+
+#[test]
+fn an_administrator_can_add_a_removed_member_back_and_a_second_removal_still_holds() {
+    let f = fixture();
+    assert!(f.rules("example.com").is_empty());
+    let _ana = f.verified("ana@example.com");
+    let bruno = f.verified("bruno@example.com");
+    f.remove(SLUG, bruno, 100);
+
+    f.add(SLUG, bruno, sentinel_core::auth::Role::Operator);
+    f.sign_in("bruno@example.com");
+    assert_eq!(f.role_in(SLUG, bruno), 2, "an explicit add is not undone");
+
+    f.remove(SLUG, bruno, 300);
+    f.sign_in("bruno@example.com");
+    assert_eq!(f.role_in(SLUG, bruno), 0);
+    let rows: i64 = f
+        .store
+        .read(|c| {
+            c.query_row("SELECT COUNT(*) FROM membership_removals", [], |r| r.get(0))
+                .map_err(Error::from)
+        })
+        .unwrap();
+    assert_eq!(rows, 1, "one tombstone per person and organization");
+}

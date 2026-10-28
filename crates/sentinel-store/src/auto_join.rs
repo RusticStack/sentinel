@@ -216,6 +216,22 @@ pub fn set_rules(store: &Store, rules: &Rules) -> Result<Vec<Ignored>> {
 
 const JOINED_ROLE: Role = Role::Reader;
 
+/// Remembers that an administrator removed `user` from `tenant`, so `apply` never re-adds them.
+/// Idempotent; the newest removal time wins.
+pub(crate) fn record_removal(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    user: UserId,
+    now: UnixMillis,
+) -> Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO membership_removals(tenant_id, user_id, removed_ms) VALUES (?1, ?2, ?3)
+         ON CONFLICT(tenant_id, user_id) DO UPDATE SET removed_ms = excluded.removed_ms",
+    )?
+    .execute(params![tenant.as_bytes(), user.as_bytes(), now.0])?;
+    Ok(())
+}
+
 pub(crate) fn apply(
     tx: &Transaction<'_>,
     user: UserId,
@@ -238,7 +254,9 @@ pub(crate) fn apply(
         Target::Open(tenant) => {
             let added = tx
                 .prepare_cached(
-                    "INSERT INTO memberships(tenant_id, user_id, role) VALUES (?1, ?2, ?3)
+                    "INSERT INTO memberships(tenant_id, user_id, role) SELECT ?1, ?2, ?3
+                     WHERE NOT EXISTS(SELECT 1 FROM membership_removals
+                                      WHERE tenant_id = ?1 AND user_id = ?2)
                      ON CONFLICT(tenant_id, user_id) DO NOTHING",
                 )?
                 .execute(params![

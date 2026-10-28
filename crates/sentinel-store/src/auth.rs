@@ -785,6 +785,8 @@ pub fn remove_membership(
     if removed == 0 {
         return Err(Error::NotFound);
     }
+    // Domain auto-join must not undo this removal at the person's next sign-in.
+    crate::auto_join::record_removal(tx, tenant, user, now)?;
     tx.execute(
         "UPDATE api_tokens SET revoked_ms = ?3 WHERE user_id = ?1 AND tenant_id = ?2
          AND revoked_ms IS NULL",
