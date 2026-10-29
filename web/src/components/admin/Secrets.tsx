@@ -2,8 +2,9 @@ import { useRef, useState } from "react";
 import { api } from "../../lib/api.ts";
 import { act } from "../../lib/act.tsx";
 import { useSession } from "../../lib/session.ts";
-import { useLoaded } from "../../lib/hooks.ts";
+import { attempt, useLoad, type Load } from "../../lib/loaded.ts";
 import { loadRepos, type RepoList } from "../../lib/repos.ts";
+import { LoadFailed } from "../LoadFailed.tsx";
 import { RelTime } from "../RelTime.tsx";
 import { StateBadge } from "../StateBadge.tsx";
 import { Button, Select, Table } from "../ui.tsx";
@@ -14,7 +15,7 @@ interface SecretMeta { name: string; version: number; active: boolean; updated_m
 interface Binding { job: string | null; step: string | null; name: string; override_tenant?: boolean; from_tenant?: boolean }
 interface SecretsScope { secrets: SecretMeta[]; bindings: Binding[] | null }
 const TENANT = "__tenant__";
-export interface SecretsLoad { repos: RepoList | null; scope: SecretsScope | null }
+export interface SecretsLoad { repos: Load<RepoList>; scope: Load<SecretsScope> }
 
 async function readScope(slug: string, scope: string): Promise<SecretsScope> {
   const base = `/api/v1/tenants/${encodeURIComponent(slug)}`;
@@ -25,17 +26,17 @@ async function readScope(slug: string, scope: string): Promise<SecretsScope> {
 }
 
 export async function loadSecrets(slug: string): Promise<SecretsLoad> {
-  const [repos, scope] = await Promise.all([loadRepos(slug).catch(() => null), readScope(slug, "").catch(() => null)]);
+  const [repos, scope] = await Promise.all([attempt(() => loadRepos(slug)), attempt(() => readScope(slug, ""))]);
   return { repos, scope };
 }
 
 export function Secrets({ slug, initial }: { slug: string; initial: SecretsLoad }) {
   const { me } = useSession();
   const [scope, setScope] = useState("");
-  const [data, setData] = useLoaded(initial.scope);
+  const { data, setData, failure } = useLoad(initial.scope);
   const latest = useRef("");
   // The tenant scope is the empty repository name; the menu needs a non-empty key for it.
-  const scopes = [{ label: "Tenant secrets", value: TENANT }, ...(initial.repos?.repos ?? []).map((r) => ({ label: `Repository ${r.name}`, value: r.name }))];
+  const scopes = [{ label: "Tenant secrets", value: TENANT }, ...(initial.repos.value?.repos ?? []).map((r) => ({ label: `Repository ${r.name}`, value: r.name }))];
   const refresh = (which = scope) => readScope(slug, which).then(
     (next) => { if (latest.current === which) setData(next); },
     () => { if (latest.current === which) setData(null); },
@@ -61,8 +62,9 @@ export function Secrets({ slug, initial }: { slug: string; initial: SecretsLoad 
     <section aria-labelledby="secrets-h" className="space-y-3">
       <h2 id="secrets-h" className="text-base font-semibold text-strong">Secrets</h2>
       <p className="text-sm text-muted">Names, versions and where they apply. Values are write-only (<code>sentinel secrets set</code>) and never shown.</p>
+      {initial.repos.failure ? <LoadFailed what="the repositories" words={initial.repos.failure} /> : null}
       <Select id="s-scope" label="Scope" ariaLabel="Scope" value={scope || TENANT} onChange={pick} items={scopes} className="w-64 max-w-full" />
-      <Table caption="Secrets">
+      {failure ? <LoadFailed what="the secrets" words={failure} /> : <Table caption="Secrets">
         <thead><tr><th>Name</th><th>Version</th><th>State</th><th>Updated</th><th>Actions</th></tr></thead>
         <tbody>
           {secrets.length ? secrets.map((s) => (
@@ -77,7 +79,7 @@ export function Secrets({ slug, initial }: { slug: string; initial: SecretsLoad 
             </tr>
           )) : <tr><td colSpan={5} className="text-center text-muted">No secrets in this scope.</td></tr>}
         </tbody>
-      </Table>
+      </Table>}
       {data?.bindings ? (
         <>
           <h3 className="text-sm font-semibold text-strong">Bindings</h3>

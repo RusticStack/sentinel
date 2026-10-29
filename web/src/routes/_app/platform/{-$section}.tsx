@@ -71,7 +71,7 @@ function PlatformView() {
       {data.section === "registrations" ? <Registrations initial={data.registrations} />
         : data.section === "tenants" ? <Tenants initial={data.tenants} />
         : data.section === "pools" ? <Pools initial={data.pools} />
-        : data.section === "storage" ? <><Storage data={data.storage} /><Backups initial={data.backups} /></>
+        : data.section === "storage" ? <><Storage load={data.storage} /><Backups initial={data.backups} /></>
         : data.section === "policy" ? <Policy key={JSON.stringify(data.policy)} initial={data.policy} />
         : <Audit initial={data.audit} />}
     </Page>

@@ -1,19 +1,20 @@
 import { api } from "../../lib/api.ts";
 import { act } from "../../lib/act.tsx";
 import { useSession } from "../../lib/session.ts";
-import { useLoaded } from "../../lib/hooks.ts";
+import { attempt, useLoad, type Load } from "../../lib/loaded.ts";
 import { shortId } from "../../lib/format.ts";
+import { LoadFailed } from "../LoadFailed.tsx";
 import { RelTime } from "../RelTime.tsx";
 import { Button, Table } from "../ui.tsx";
 
 interface Applicant { user: string; display_name: string; applied_ms: number | null }
 export interface RegistrationsPage { pending: Applicant[] }
 const readRegistrations = () => api<RegistrationsPage>("/api/v1/admin/registrations?limit=100");
-export const loadRegistrations = () => readRegistrations().catch(() => null);
+export const loadRegistrations = () => attempt(readRegistrations);
 
-export function Registrations({ initial }: { initial: RegistrationsPage | null }) {
+export function Registrations({ initial }: { initial: Load<RegistrationsPage> }) {
   const { me } = useSession();
-  const [data, setData] = useLoaded(initial);
+  const { data, setData, failure } = useLoad(initial);
   async function decide(a: Applicant, approve: boolean) {
     if (await act(me, `${approve ? "Approve" : "Reject"} ${a.display_name}`, () => api(`/api/v1/admin/registrations/${a.user}/${approve ? "approve" : "reject"}`, { method: "POST", body: {} }))) {
       await readRegistrations().then(setData, () => {});
@@ -24,7 +25,7 @@ export function Registrations({ initial }: { initial: RegistrationsPage | null }
   return (
     <section aria-labelledby="reg-h" className="space-y-3">
       <h2 id="reg-h" className="text-base font-semibold text-strong">Pending registrations</h2>
-      <Table caption="Pending registrations">
+      {failure ? <LoadFailed what="the pending registrations" words={failure} /> : <Table caption="Pending registrations">
         <thead><tr><th>Applicant</th><th>Applied</th><th>Actions</th></tr></thead>
         <tbody>
           {pending.length ? pending.map((a) => (
@@ -43,7 +44,7 @@ export function Registrations({ initial }: { initial: RegistrationsPage | null }
             </tr>
           )) : <tr><td colSpan={3} className="text-center text-muted">No applications are waiting.</td></tr>}
         </tbody>
-      </Table>
+      </Table>}
     </section>
   );
 }

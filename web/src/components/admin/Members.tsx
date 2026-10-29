@@ -4,21 +4,22 @@ import { api } from "../../lib/api.ts";
 import { act } from "../../lib/act.tsx";
 import { refreshTenants, useSession } from "../../lib/session.ts";
 import { useOverride } from "../../lib/override.ts";
-import { useLoaded } from "../../lib/hooks.ts";
+import { attempt, useLoad, type Load } from "../../lib/loaded.ts";
 import { shortId } from "../../lib/format.ts";
 import { Alert, Badge, Button, ButtonLink, Field, Input, Select, Table, TextLink } from "../ui.tsx";
+import { LoadFailed } from "../LoadFailed.tsx";
 import { confirmChange } from "./Confirm.tsx";
 
 export interface MembersPage { members: Member[]; next: string | null }
 const ROLES = [{ label: "Reader", value: "reader" }, { label: "Operator", value: "operator" }, { label: "Admin", value: "admin" }];
 const readMembers = (slug: string) => api<MembersPage>(`/api/v1/tenants/${encodeURIComponent(slug)}/members?limit=100`);
-export const loadMembers = (slug: string) => readMembers(slug).catch(() => null);
+export const loadMembers = (slug: string) => attempt(() => readMembers(slug));
 const nameOf = (m: Member) => m.username || m.display_name;
 
-export function Members({ slug, settings, initial }: { slug: string; settings: NamespaceSettings | null; initial: MembersPage | null }) {
+export function Members({ slug, settings, initial }: { slug: string; settings: NamespaceSettings | null; initial: Load<MembersPage> }) {
   const { me } = useSession();
   const { ready, withReason } = useOverride(slug);
-  const [data, setData] = useLoaded(initial);
+  const { data, setData, failure } = useLoad(initial);
   const refresh = () => readMembers(slug).then(setData, () => {});
   const githubManaged = settings?.membership === "github";
   const personal = settings?.kind === "personal";
@@ -56,7 +57,7 @@ export function Members({ slug, settings, initial }: { slug: string; settings: N
     <>
       <section aria-labelledby="members-h" className="space-y-3">
         <h2 id="members-h" className="text-base font-semibold text-strong">Members</h2>
-        <Table caption="Members">
+        {failure ? <LoadFailed what="the members" words={failure} /> : <Table caption="Members">
           <thead><tr><th>Member</th><th>Kind</th><th>Role</th><th>Actions</th></tr></thead>
           <tbody>
             {members.length ? members.map((m) => (
@@ -81,7 +82,7 @@ export function Members({ slug, settings, initial }: { slug: string; settings: N
               </tr>
             )) : <tr><td colSpan={4} className="text-center text-muted">No data</td></tr>}
           </tbody>
-        </Table>
+        </Table>}
         {data?.next ? <p className="text-sm text-muted">Only the first 100 members are shown.</p> : null}
       </section>
 
