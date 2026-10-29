@@ -1,0 +1,25 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "tailcat-live",
+  "revision": 1,
+  "harness": {
+    "script": "bench/run-ignored.sh",
+    "build": "cargo test --release --locked -p sentinel-link --test tailcat_live --no-run"
+  },
+  "run": {
+    "args": ["sentinel-link", "tailcat_live", "the_helper_carries_the_link_port_and_reports_telemetry"],
+    "smoke_args": ["--list-only", "sentinel-link", "tailcat_live", "the_helper_carries_the_link_port_and_reports_telemetry"]
+  },
+  "ordering": {
+    "scheme": "single",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/ignored-test/1",
+    "out": "bench/tailcat-live.jsonl"
+  },
+  "notes": "The live helper test against a pinned tailcat build (SENTINEL_TAILCAT_LIVE) and rootful Podman; a host without them skips, which the runner reports as pending. Further tailcat_live tests get their own contracts when they are measured."
+}

@@ -1,0 +1,25 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "queue-explain",
+  "revision": 1,
+  "harness": {
+    "script": "bench/run-ignored.sh",
+    "build": "cargo test --release --locked -p sentinel-store --test fleet_load --no-run"
+  },
+  "run": {
+    "args": ["sentinel-store", "fleet_load", "listing_a_five_thousand_job_queue_explains_only_the_page"],
+    "smoke_args": ["--list-only", "sentinel-store", "fleet_load", "listing_a_five_thousand_job_queue_explains_only_the_page"]
+  },
+  "ordering": {
+    "scheme": "single",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/ignored-test/1",
+    "out": "bench/queue-explain.jsonl"
+  },
+  "notes": "One run of the queue-listing test over 5,000 queued jobs; list_queue timings come back under reports."
+}

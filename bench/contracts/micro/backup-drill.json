@@ -1,0 +1,25 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "backup-drill",
+  "revision": 1,
+  "harness": {
+    "script": "bench/run-ignored.sh",
+    "build": "cargo test --release --locked -p sentinel-store --test backup_drill --no-run"
+  },
+  "run": {
+    "args": ["sentinel-store", "backup_drill", "drill"],
+    "smoke_args": ["--list-only", "sentinel-store", "backup_drill", "drill"]
+  },
+  "ordering": {
+    "scheme": "single",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/ignored-test/1",
+    "out": "bench/backup-drill.jsonl"
+  },
+  "notes": "The backup and restore drill. SENTINEL_DRILL_DIR names the disk under test and SENTINEL_DRILL_BIG the object count; the 100 GiB objective (R04) needs three times that in free disk and is a Wave 2 run."
+}
