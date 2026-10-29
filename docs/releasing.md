@@ -188,3 +188,5 @@ The crate inventory above covers Rust code. The release also carries, or names f
 | Tailcat v0.6.0 | not packaged: the worker enrollment script (Q11) downloads it | BSD-3-Clause | digest of the executable and of the upstream archive, both architectures | https://github.com/tailscale/tailcat/releases/tag/v0.6.0 |
 
 Produced by a documented command that fails on a disallowed licence: `cargo licenses` (policy) and `scripts/release/check-inventory.sh` (policy and current `THIRD-PARTY-LICENSES.md`), both runnable on the verification hosts with `cargo-deny` and `cargo-about` installed; `cargo deny check advisories` adds the security advisories before a release. Duplicate crate versions are reported as warnings by the `bans` check. The web (pnpm) inventory belongs to the web interface and is not part of this one.
+
+Qualifying a release as a whole (install, upgrade, recovery, revocation, worker loss, secrets, caches, diagnostics, egress, compatibility) is `scripts/qualify/qualify.sh`; see [qualification](qualification.md).

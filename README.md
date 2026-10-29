@@ -126,7 +126,7 @@ The v0.1 release still requires Part 24 correctness rework, deployment packaging
 
 Start with the task you want to accomplish:
 
-- **Run Sentinel:** [development setup](docs/development.md), [configuration](docs/configuration.md), [CLI reference](docs/cli.md), [deployment](docs/deployment.md) and [building and verifying a release](docs/releasing.md).
+- **Run Sentinel:** [development setup](docs/development.md), [configuration](docs/configuration.md), [CLI reference](docs/cli.md), [deployment](docs/deployment.md) and [building and verifying a release](docs/releasing.md) and [release qualification](docs/qualification.md); the [v0.1 release notes](docs/release-notes.md) are a draft.
 - **Write pipelines:** [schema](docs/pipeline-schema.md), [cache recipes](docs/recipes.md) and [examples](examples/).
 - **Understand the system:** [architecture and product plan](plan.md), [runtime foundations](docs/runtime-foundation.md), [storage](docs/storage.md), [executor](docs/executor.md) and [worker link](docs/worker-link.md).
 - **Integrate:** [HTTP API](docs/api.md), [MCP](docs/mcp.md), [sources and intake](docs/intake.md) and [compatibility policy](docs/compatibility.md).
