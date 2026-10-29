@@ -506,6 +506,17 @@ fn verify_store(root: &Path, p: &Promises, golden: &Golden, bad: &mut Vec<String
                 }
             }
         }
+        // Log 0 stores 1, 2, 3, 6, 4: once 6 is acknowledged the jump's record (the `jump` sidecar, written before
+        // the frame and renamed durably) must be on disk, so the line that starts at 6 is not exact even after
+        // the fill of 4 closed the hole.
+        if log == 0 && p.stored[0].contains(&6) {
+            match store.seek_line(run, job, attempt, 4) {
+                Ok(seek) if !seek.exact => {}
+                other => bad.push(format!(
+                    "log 0: a line behind the jump reads {other:?} after a crash"
+                )),
+            }
+        }
         for (op, _) in golden.ops.iter().zip(&golden.outcomes) {
             match op {
                 Op::StoreAppend { log: l, seq, bytes } if *l == log => {
