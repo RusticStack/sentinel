@@ -330,10 +330,13 @@ class Rehearsal(unittest.TestCase):
     # -- fleet mode ------------------------------------------------------------------------------------------
 
     def test_a_fleet_scenario_drives_its_hosts_through_the_exec_prefix_and_releases_them(self):
-        work = os.path.join(self.d, "fleetwork")
-        os.makedirs(work)
+        # One work_dir per host, as on a real fleet: hosts that shared one would write each other's worker config,
+        # enrollment and identity files (the slot numbers restart at 1 on every host).
+        works = {lb: os.path.join(self.d, f"fleetwork-{lb}") for lb in ("alpha", "beta", "gamma")}
+        for w in works.values():
+            os.makedirs(w)
         fleet = {"controller": {"address": "127.0.0.1", "worker_bootstrap": {"release_url": "https://r.example.test/x", "release_sums": "/etc/SUMS"}},
-                 "hosts": [{"label": lb, "exec": ["env"], "sentinel": os.path.join(self.kit, "sentinel"), "work_dir": work,
+                 "hosts": [{"label": lb, "exec": ["env"], "sentinel": os.path.join(self.kit, "sentinel"), "work_dir": works[lb],
                             "api_url": f"http://127.0.0.1:{self.base + 1}", "identities": 1} for lb in ("alpha", "beta", "gamma")]}
         path = os.path.join(self.d, "fleet.json")
         with open(path, "w") as f:
@@ -349,7 +352,8 @@ class Rehearsal(unittest.TestCase):
         self.assertEqual(sorted(rec["runs_by_host"]), ["alpha", "beta", "gamma"], "every host ran something")
         self.assertEqual(sorted(rec["summary_by_host"]), ["alpha", "beta", "gamma"])
         self.assertIn("fleet", rec["scenario"])
-        self.assertFalse(os.path.exists(os.path.join(work, "b09-fleet-w3-burst")), "the hosts were released")
+        for lb, w in works.items():
+            self.assertFalse(os.path.exists(os.path.join(w, "b09-fleet-w3-burst")), f"host {lb} was released")
         self.assertEqual(os.listdir(os.path.join(self.root, "fleet")), [])
         self.assertEqual(self.leftovers(), {})
         leaked = subprocess.run(["pgrep", "-f", os.path.join(self.kit, "fake-sentinel.py") + " worker"], capture_output=True, text=True)
