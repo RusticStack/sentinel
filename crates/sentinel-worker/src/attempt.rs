@@ -50,6 +50,8 @@ pub struct Job {
     pub prepare_hold: std::time::Duration,
     pub network: podman::Network,
     pub runtime: Runtime,
+    /// The image store the attempt runs in, decided once by the executor ([`store_for`]).
+    pub store: podman::Store,
 }
 
 /// What a worker runs jobs on: its default executor and, where microVMs can run, their setup.
@@ -79,8 +81,15 @@ pub fn secret_root(root: &Path) -> PathBuf {
     crate::runtime_dir(root).join("secret-delivery")
 }
 
-pub fn store_for(root: &Path, job: &Job) -> Result<podman::Store> {
-    let private = job.secret_bundle.targets.iter().any(|target| {
+/// The image store an attempt runs in: the shared one, or its tenant's own when it carries registry credentials.
+/// The executor decides this once per attempt ([`Job::store`]) and every later call to Podman for the attempt,
+/// from the cancel paths too, uses that one.
+pub fn store_for(
+    root: &Path,
+    bundle: &sentinel_protocol::secrets::DeliveryBundle,
+    tenant: Option<sentinel_core::TenantId>,
+) -> Result<podman::Store> {
+    let private = bundle.targets.iter().any(|target| {
         matches!(
             target.target,
             sentinel_protocol::secrets::TargetKind::RegistryAuth
@@ -89,10 +98,8 @@ pub fn store_for(root: &Path, job: &Job) -> Result<podman::Store> {
     if !private {
         return Ok(podman::Store::Shared);
     }
-    let tenant = job
-        .context
-        .tenant
-        .ok_or_else(|| Error::Preparation("registry auth without a tenant".into()))?;
+    let tenant =
+        tenant.ok_or_else(|| Error::Preparation("registry auth without a tenant".into()))?;
     podman::Store::private(root, *tenant.as_bytes())
 }
 
@@ -382,6 +389,12 @@ pub trait Report: Send + Sync {
     fn cost_book(&self) -> Option<&sentinel_cache::CostBook> {
         None
     }
+    /// A tree the attempt left could not be removed: `what` names it (`workspace`, `sandbox`). The executor
+    /// retries the removal while the process lives (`executor::Inner::reap_leftovers`).
+    fn cleanup_failed(&self, _attempt: AttemptId, _what: &'static str, _error: &str) {}
+    /// The storage guard did not see all of the attempt's storage: part of it was unreadable, or a sample ran
+    /// out of its time budget. The figures it acted on were lower bounds.
+    fn storage_unmeasured(&self, _attempt: AttemptId, _unreadable: bool, _timed_out: bool) {}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -444,7 +457,7 @@ pub fn run(
     report.event(job.attempt, job.fence, Event::PreparationStarted);
     let remote = report.remote();
     let mut summary = AttemptSummary::default();
-    let prepared = prepare(root, job, cancel, &mut summary, remote.as_deref());
+    let prepared = prepare(root, job, report, cancel, &mut summary, remote.as_deref());
     // Judged once, before publication rewrites the carrier's stats, so the notice and the summary agree.
     let costly: Vec<Option<sentinel_cache::Costly>> = job
         .caches
@@ -483,6 +496,7 @@ pub fn run(
             let started = Instant::now();
             let verdict = execute(
                 job,
+                report,
                 &prepared.sandbox,
                 prepared.workspace.path(),
                 prepared.secret_directory.as_ref(),
@@ -599,9 +613,14 @@ fn failure_detail(why: &str, fallback: &str) -> String {
     }
 }
 
+/// Attempts whose checkout thread started, so a test can assert that one never did.
+#[cfg(test)]
+static CHECKOUTS_STARTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 fn prepare(
     root: &Path,
     job: &mut Job,
+    report: &dyn Report,
     cancel: &Cancel,
     summary: &mut AttemptSummary,
     remote: Option<&dyn sentinel_cache::remote::Remote>,
@@ -626,12 +645,39 @@ fn prepare(
         match SecretDirectory::create(root, job.attempt) {
             Ok(directory) => Some(directory),
             Err(error) => {
-                let _ = workspace.destroy();
+                discard_workspace(report, job.attempt, workspace);
                 return Err(error);
             }
         }
     };
     let outcome = (|| {
+        // Everything that can fail on a plain error happens before the checkout thread exists: a return after
+        // the spawn would destroy the workspace under a git process still writing into it.
+        let registry_auth = job.secret_bundle.targets.iter().find(|target| {
+            matches!(
+                target.target,
+                sentinel_protocol::secrets::TargetKind::RegistryAuth
+            )
+        });
+        let has_registry_auth = registry_auth.is_some();
+        let (authfile, credential) = match registry_auth {
+            Some(target) => {
+                let value = job
+                    .secret_bundle
+                    .values
+                    .get(target.value as usize)
+                    .ok_or_else(|| Error::Preparation("registry auth target".into()))?
+                    .expose();
+                let directory = secret_directory
+                    .as_ref()
+                    .ok_or_else(|| Error::Preparation("registry auth directory".into()))?;
+                (
+                    directory.write_registry_auth(value)?,
+                    *blake3::hash(value).as_bytes(),
+                )
+            }
+            None => (job.images.anonymous_authfile().to_path_buf(), [0; 32]),
+        };
         let spawned = std::thread::Builder::new()
             .name(format!("sentinel-checkout-{}", job.attempt))
             .spawn({
@@ -644,6 +690,11 @@ fn prepare(
                 let lease = job.attempt.to_string();
                 let cancel = Arc::clone(cancel);
                 move || -> Result<(checkout::Outcome, Option<u64>)> {
+                    #[cfg(test)]
+                    CHECKOUTS_STARTED
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(lease.clone());
                     sentinel_git::cancel_scope(cancel, || {
                         let started = Instant::now();
                         let outcome = checkout::checkout_mirrored(
@@ -676,49 +727,20 @@ fn prepare(
             join_checkout(&mut co, summary)?;
         }
         let started = Instant::now();
-        let registry_auth = job.secret_bundle.targets.iter().find(|target| {
-            matches!(
-                target.target,
-                sentinel_protocol::secrets::TargetKind::RegistryAuth
-            )
-        });
-        let has_registry_auth = registry_auth.is_some();
-        let (authfile, credential) = match registry_auth {
-            Some(target) => {
-                let value = job
-                    .secret_bundle
-                    .values
-                    .get(target.value as usize)
-                    .ok_or_else(|| Error::Preparation("registry auth target".into()))?
-                    .expose();
-                let directory = secret_directory
-                    .as_ref()
-                    .ok_or_else(|| Error::Preparation("registry auth directory".into()))?;
-                (
-                    directory.write_registry_auth(value)?,
-                    *blake3::hash(value).as_bytes(),
-                )
-            }
-            None => (job.images.anonymous_authfile().to_path_buf(), [0; 32]),
-        };
         let tenant = job
             .context
             .tenant
             .map(|tenant| *tenant.as_bytes())
             .unwrap_or(*job.attempt.as_bytes());
-        let store = store_for(root, job);
-        let pulled = match &store {
-            Ok(store) => job.images.pull_for_tenant(
-                &image,
-                tenant,
-                credential,
-                &authfile,
-                store,
-                podman::IMAGE_PULL_TIMEOUT,
-                cancel,
-            ),
-            Err(_) => Err(Error::Preparation("private image store".into())),
-        };
+        let pulled = job.images.pull_for_tenant(
+            &image,
+            tenant,
+            credential,
+            &authfile,
+            &job.store,
+            podman::IMAGE_PULL_TIMEOUT,
+            cancel,
+        );
         if has_registry_auth {
             wipe_file(&authfile);
             let _ = fs::remove_file(&authfile);
@@ -732,7 +754,7 @@ fn prepare(
             return Err(Error::Preparation("canceled".into()));
         }
         checked_out.and(pulled)?;
-        let store = store?;
+        let store = job.store.clone();
         let mut mounts = restore_caches(root, job, &declared, workspace.path(), &image, remote);
         let (mut files, mut env) = (false, false);
         for target in &job.secret_bundle.targets {
@@ -824,7 +846,7 @@ fn prepare(
             secret_directory,
         }),
         Err(e) => {
-            let _ = workspace.destroy();
+            discard_workspace(report, job.attempt, workspace);
             Err(e)
         }
     }
@@ -941,8 +963,10 @@ fn runtime_failure(exit: &podman::Exit) -> bool {
     matches!(exit.code, Some(125..=127)) && last.starts_with("Error:")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute(
     job: &Job,
+    report: &dyn Report,
     container: &Sandbox,
     workspace: &Path,
     secret_directory: Option<&SecretDirectory>,
@@ -978,11 +1002,17 @@ fn execute(
     // the declared disk (docs/executor.md#disk). A microVM's scratch disk is the bound there.
     let guard = container.guard_storage(workspace, compiled.resources.disk_bytes);
     let over_disk = |index: usize| {
-        guard.as_ref().and_then(|g| g.exceeded()).map(|used| {
-            (
-                FailureClass::CommandFailed,
-                disk_exceeded(index, used, compiled.resources.disk_bytes),
-            )
+        guard.as_ref().and_then(|g| {
+            g.exceeded().map(|used| {
+                (
+                    FailureClass::CommandFailed,
+                    if g.too_deep() {
+                        too_deep(index)
+                    } else {
+                        disk_exceeded(index, used, compiled.resources.disk_bytes)
+                    },
+                )
+            })
         })
     };
     for (index, step) in compiled.steps.iter().enumerate() {
@@ -1209,6 +1239,11 @@ fn execute(
         summary.steps.push(record);
         failure = why;
     }
+    if let Some(g) = &guard
+        && (g.unreadable() || g.timed_out())
+    {
+        report.storage_unmeasured(job.attempt, g.unreadable(), g.timed_out());
+    }
     match failure {
         None => Verdict::Passed,
         Some((class, why)) => Verdict::Failed(class, why),
@@ -1242,6 +1277,15 @@ pub fn capture_artifacts(
 fn disk_exceeded(step: usize, used: u64, limit: u64) -> String {
     format!(
         "step {step} exceeded the job's disk limit: the workspace and /tmp held {used} bytes of the {limit} declared as resources.disk"
+    )
+}
+
+/// The verdict text for a step stopped because a directory tree in the workspace or `/tmp` nests deeper than the
+/// storage guard can follow, so the bytes below that level cannot be counted against the declared disk.
+fn too_deep(step: usize) -> String {
+    format!(
+        "step {step} exceeded the job's disk limit: a directory tree in the workspace or /tmp nests deeper than the {} levels the storage guard follows, so its size cannot be bounded",
+        crate::quota::MAX_DEPTH
     )
 }
 
@@ -1396,15 +1440,24 @@ fn finalize(
         secret_directory,
     } = prepared;
     // Stop the sandbox first: no job process may rewrite the views publication reads.
-    let _ = sandbox.destroy();
+    if let Err(error) = sandbox.destroy() {
+        report.cleanup_failed(job.attempt, "sandbox", &error.to_string());
+    }
     drop(secret_directory);
     let sealed = if synced && cache_worthy(verdict) {
         publish_caches(root, job, report, cancel)
     } else {
         Vec::new()
     };
-    let _ = workspace.destroy();
+    discard_workspace(report, job.attempt, workspace);
     sealed
+}
+
+/// Removes an attempt's workspace and job `/tmp`; what stays behind is reported, and the executor retries it.
+fn discard_workspace(report: &dyn Report, attempt: AttemptId, workspace: Workspace) {
+    if let Err(error) = workspace.destroy() {
+        report.cleanup_failed(attempt, "workspace", &error.to_string());
+    }
 }
 
 struct SealedCache {
@@ -1677,6 +1730,7 @@ mod tests {
             network: podman::Network::None,
             runtime: Default::default(),
             secret_bundle: sentinel_protocol::secrets::DeliveryBundle::empty(),
+            store: crate::podman::Store::Shared,
         }
     }
 
@@ -1725,8 +1779,73 @@ mod tests {
         assert!(!record.costly_hit);
     }
 
+    #[test]
+    fn a_registry_auth_failure_ends_prepare_before_any_checkout_starts() {
+        use sentinel_protocol::secrets::{
+            DeliveryBundle, DeliveryTarget, DeliveryValue, TargetKind,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("worker");
+        fs::create_dir_all(&root).unwrap();
+        let mut job = job(spec());
+        // The target names a value the bundle does not hold: the registry-auth step fails after the secret
+        // directory exists, which is where a full disk or a failed write would fail it.
+        job.secret_bundle = DeliveryBundle {
+            values: vec![DeliveryValue::new(b"{\"auths\":{}}".to_vec())],
+            targets: vec![DeliveryTarget {
+                step: 0,
+                name: "AUTH".into(),
+                value: 9,
+                target: TargetKind::RegistryAuth,
+            }],
+        };
+        let attempt = job.attempt;
+        let cancel: Cancel = Arc::new(AtomicBool::new(false));
+        let mut summary = AttemptSummary::default();
+        let prepared = prepare(
+            &root,
+            &mut job,
+            &Notes::default(),
+            &cancel,
+            &mut summary,
+            None,
+        );
+        assert!(prepared.is_err());
+        assert!(
+            !CHECKOUTS_STARTED
+                .lock()
+                .unwrap()
+                .contains(&attempt.to_string()),
+            "a checkout thread was left running while the workspace was destroyed"
+        );
+        assert!(Workspace::leftovers(&root).unwrap().is_empty());
+        assert!(!secret_root(&root).join(attempt.to_string()).exists());
+    }
+
+    #[test]
+    fn a_workspace_that_cannot_be_removed_is_reported_not_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt = AttemptId::new();
+        let workspace = Workspace::create(temp.path(), attempt).unwrap();
+        // A file where the directory should be cannot be removed as a tree, whoever runs the test.
+        fs::remove_dir(workspace.path()).unwrap();
+        fs::write(workspace.path(), b"x").unwrap();
+        let notes = Notes::default();
+        discard_workspace(&notes, attempt, workspace);
+        let cleanups = notes.cleanups.lock().unwrap();
+        assert_eq!(cleanups.len(), 1);
+        assert_eq!((cleanups[0].0, cleanups[0].1), (attempt, "workspace"));
+
+        // A workspace that is removed reports nothing.
+        let fine = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+        let quiet = Notes::default();
+        discard_workspace(&quiet, attempt, fine);
+        assert!(quiet.cleanups.lock().unwrap().is_empty());
+    }
+
     #[derive(Default)]
     struct Notes {
+        cleanups: Mutex<Vec<(AttemptId, &'static str, String)>>,
         cache_notes: Mutex<Vec<CacheNote>>,
         costly: Mutex<Vec<(String, sentinel_cache::Costly)>>,
         remote: Mutex<Option<Arc<dyn sentinel_cache::remote::Remote>>>,
@@ -1748,6 +1867,12 @@ mod tests {
         }
         fn remote(&self) -> Option<Arc<dyn sentinel_cache::remote::Remote>> {
             self.remote.lock().unwrap().clone()
+        }
+        fn cleanup_failed(&self, attempt: AttemptId, what: &'static str, error: &str) {
+            self.cleanups
+                .lock()
+                .unwrap()
+                .push((attempt, what, error.to_owned()));
         }
     }
 

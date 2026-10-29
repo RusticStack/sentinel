@@ -500,9 +500,14 @@ mod tests {
         assert_eq!(started.recv_timeout(Duration::from_secs(10)).unwrap(), kept);
         let follower = {
             let (images, kept) = (images.clone(), kept.clone());
+            // The way an attempt pulls: as its tenant, with the worker's anonymous authfile, into the shared store.
             thread::spawn(move || {
-                images.pull(
+                images.pull_for_tenant(
                     &kept,
+                    [3; 16],
+                    [0; 32],
+                    images.anonymous_authfile(),
+                    &crate::podman::Store::Shared,
                     Duration::from_secs(30),
                     &Arc::new(AtomicBool::new(false)),
                 )

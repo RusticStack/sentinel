@@ -164,6 +164,7 @@ fn make_job(worker_dir: &Path, repo_dir: &Path, sha: &str, repo: RepoId, trust: 
         prepare_hold: Duration::ZERO,
         network: sentinel_worker::podman::Network::None,
         runtime: isolation::runtime().unwrap_or_default(),
+        store: sentinel_worker::podman::Store::Shared,
     }
 }
 

@@ -147,6 +147,7 @@ fn the_pull_overlaps_the_checkout() {
         prepare_hold: Duration::ZERO,
         network: sentinel_worker::podman::Network::None,
         runtime: Default::default(),
+        store: sentinel_worker::podman::Store::Shared,
     };
     let rec = Rec {
         events: Mutex::new(Vec::new()),

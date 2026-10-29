@@ -245,6 +245,16 @@ impl LogPipe {
         self.progress.notify_all();
     }
 
+    /// Removes the attempt's spool without ending it, for an attempt that failed before it ran a step: the
+    /// controller is told the failure by an event, and nothing was logged that needs a delivered end record.
+    pub fn discard(&self) {
+        let mut st = self.lock();
+        st.ended = true;
+        if let Some(spool) = st.spool.take() {
+            let _ = spool.remove();
+        }
+    }
+
     pub fn end_acked(&self) {
         let mut st = self.lock();
         st.end_acked = true;

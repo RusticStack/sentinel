@@ -72,6 +72,21 @@ pub enum Notice {
         left: usize,
         handed_back: usize,
     },
+    /// A tree an attempt left behind could not be removed (`what` is `workspace` or `sandbox`). The worker keeps
+    /// retrying while it runs; the notice comes once per attempt, not once per retry.
+    CleanupFailed {
+        attempt: AttemptId,
+        what: &'static str,
+        error: String,
+    },
+    /// Workspaces that finished attempts left behind were removed while the worker ran.
+    WorkspacesReaped(usize),
+    /// The storage guard did not see all of an attempt's storage, so the figures it acted on were lower bounds.
+    StorageUnmeasured {
+        attempt: AttemptId,
+        unreadable: bool,
+        timed_out: bool,
+    },
 }
 
 pub fn admission_floor(total: u64) -> u64 {
@@ -478,6 +493,13 @@ pub struct Inner {
     cache_version: std::sync::atomic::AtomicU64,
     budgets: Mutex<StorageBudgets>,
     image_swept: Mutex<Option<std::time::Instant>>,
+    leftover_swept: Mutex<Option<Instant>>,
+    /// A leftover pass is running on its own thread, so the watchdog starts no second one and never waits for it.
+    leftover_reaping: std::sync::atomic::AtomicBool,
+    /// Attempts whose leftover tree already raised a notice, so a tree that stays stuck does not repeat it.
+    leftover_reported: Mutex<HashSet<AttemptId>>,
+    /// A sandbox removal failed since the last container pass, so a pass is worth its `podman ps`.
+    sandbox_leak: std::sync::atomic::AtomicBool,
     notify: Box<dyn Fn(Notice) + Send + Sync>,
     recovered: Recovered,
     costs: sentinel_cache::CostBook,
@@ -486,6 +508,9 @@ pub struct Inner {
 const REFUSAL_NOTICE_EVERY: Duration = Duration::from_secs(30);
 
 const IMAGE_SWEEP_EVERY: Duration = Duration::from_secs(60);
+
+/// How often the worker retries the removal of trees that finished attempts left behind.
+const LEFTOVER_SWEEP_EVERY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageBudgets {
@@ -612,9 +637,55 @@ impl Executor {
             crate::prefetch::Bounds::default(),
             crate::prefetch::PodmanProbe::new(),
         );
+        let executor = Executor::assemble(
+            root,
+            worker,
+            runtime,
+            images,
+            prefetch,
+            mirrors,
+            Box::new(notify),
+            recovered,
+            leftovers,
+        );
+        let watched = Arc::downgrade(&executor.0);
+        let _ = thread::Builder::new()
+            .name("sentinel-cache-gc".into())
+            .spawn(move || {
+                if let Some(inner) = watched.upgrade() {
+                    inner.sweep_caches();
+                }
+            });
+        let watched = Arc::downgrade(&executor.0);
+        thread::Builder::new()
+            .name("sentinel-lease-watchdog".into())
+            .spawn(move || {
+                while let Some(inner) = watched.upgrade() {
+                    inner.watch_lease();
+                    inner.watch_specs();
+                    Inner::spawn_reaper(&inner);
+                    drop(inner);
+                    thread::sleep(WATCHDOG_INTERVAL);
+                }
+            })?;
+        Ok(executor)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        root: PathBuf,
+        worker: sentinel_core::WorkerId,
+        runtime: podman::Runtime,
+        images: Images,
+        prefetch: crate::prefetch::Prefetcher,
+        mirrors: Option<crate::checkout::Mirrors>,
+        notify: Box<dyn Fn(Notice) + Send + Sync>,
+        recovered: Recovered,
+        leftovers: Vec<Leftover>,
+    ) -> Executor {
         let spool = SpoolSpace::new(root.clone(), DEFAULT_SPOOL_RESERVE, DEFAULT_SPOOL_QUOTA);
         let floor = admission_floor(crate::spool::filesystem_bytes(&root).unwrap_or(0));
-        let executor = Executor(Arc::new(Inner {
+        Executor(Arc::new(Inner {
             root,
             worker,
             runtime,
@@ -642,35 +713,19 @@ impl Executor {
             admission_floor: std::sync::atomic::AtomicU64::new(floor),
             measured_disk: std::sync::atomic::AtomicBool::new(false),
             refusal_noted: Mutex::new(None),
-            notify: Box::new(notify),
+            notify,
             gc_lock: Mutex::new(sentinel_cache::gc::Cursor::default()),
             cache_bytes: std::sync::atomic::AtomicU64::new(0),
             cache_version: std::sync::atomic::AtomicU64::new(0),
             budgets: Mutex::new(StorageBudgets::default()),
             image_swept: Mutex::new(None),
+            leftover_swept: Mutex::new(None),
+            leftover_reaping: std::sync::atomic::AtomicBool::new(false),
+            leftover_reported: Mutex::new(HashSet::new()),
+            sandbox_leak: std::sync::atomic::AtomicBool::new(false),
             recovered,
             costs: sentinel_cache::CostBook::new(),
-        }));
-        let watched = Arc::downgrade(&executor.0);
-        let _ = thread::Builder::new()
-            .name("sentinel-cache-gc".into())
-            .spawn(move || {
-                if let Some(inner) = watched.upgrade() {
-                    inner.sweep_caches();
-                }
-            });
-        let watched = Arc::downgrade(&executor.0);
-        thread::Builder::new()
-            .name("sentinel-lease-watchdog".into())
-            .spawn(move || {
-                while let Some(inner) = watched.upgrade() {
-                    inner.watch_lease();
-                    inner.watch_specs();
-                    drop(inner);
-                    thread::sleep(WATCHDOG_INTERVAL);
-                }
-            })?;
-        Ok(executor)
+        }))
     }
 
     pub fn set_spool_limits(&self, reserve: u64, quota: u64) {
@@ -866,6 +921,8 @@ impl Executor {
             let mut state = self.state();
             let canceled = state.starting.remove(&offer.attempt).unwrap_or(false);
             if state.draining {
+                drop(state);
+                logs.discard();
                 return;
             }
             cancel.store(canceled, Ordering::Release);
@@ -892,6 +949,19 @@ impl Executor {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .cache_bytes;
+        // Decided once: the cancel, stop, lease-loss and shutdown paths run podman against this store, so the
+        // attempt must run in the same one. A store that cannot be prepared fails the attempt; it never falls back.
+        let Ok(store) = attempt::store_for(&self.root, &secret_bundle, context.tenant) else {
+            self.state().live.remove(&offer.attempt);
+            logs.discard();
+            self.send(
+                offer.attempt,
+                offer.fence,
+                Event::Failed(sentinel_core::FailureClass::Preparation),
+                None,
+            );
+            return;
+        };
         let mut job = Job {
             worker: self.worker,
             attempt: offer.attempt,
@@ -908,14 +978,15 @@ impl Executor {
             network,
             runtime,
             secret_bundle,
+            store: store.clone(),
         };
-        let store = attempt::store_for(&self.root, &job).unwrap_or(podman::Store::Shared);
         if let Some(live) = self.state().live.get_mut(&offer.attempt) {
             live.store = store.clone();
         }
         // A crash after this point must leave a marker for recovery, so an unwritable marker means the attempt must not start.
         if recovery::mark(&self.root, offer.attempt, offer.fence).is_err() {
             self.state().live.remove(&offer.attempt);
+            logs.discard();
             self.send(
                 offer.attempt,
                 offer.fence,
@@ -924,6 +995,7 @@ impl Executor {
             );
             return;
         }
+        let unstarted = Arc::clone(&logs);
         let spawned = thread::Builder::new()
             .name(format!("sentinel-attempt-{}", offer.attempt))
             .spawn(move || {
@@ -941,12 +1013,14 @@ impl Executor {
                     Err(_) => {
                         cancel.store(true, Ordering::Release);
                         let _ = crate::sandbox::remove(&executor.root, attempt, &store);
-                        let _ = crate::workspace::remove_tree(
+                        if let Err(error) = crate::workspace::remove_attempt_dirs(
                             &executor
                                 .root
                                 .join(crate::workspace::WORKSPACES_DIR)
                                 .join(attempt.to_string()),
-                        );
+                        ) {
+                            executor.cleanup_failed(attempt, "workspace", &error.to_string());
+                        }
                         if attempt::Output::complete(&*pipe) {
                             recovery::mark_ended(&executor.root, attempt);
                         }
@@ -984,6 +1058,7 @@ impl Executor {
         if spawned.is_err() {
             self.state().live.remove(&offer.attempt);
             recovery::unmark(&self.root, offer.attempt);
+            unstarted.discard();
             self.send(
                 offer.attempt,
                 offer.fence,
@@ -1151,6 +1226,127 @@ impl Inner {
         }
     }
 
+    /// Records a tree an attempt could not remove: one notice per attempt, and a container pass is armed.
+    fn cleanup_failed(&self, attempt: AttemptId, what: &'static str, error: &str) {
+        if what == "sandbox" {
+            self.sandbox_leak
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let first = what != "workspace"
+            || self
+                .leftover_reported
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(attempt);
+        if first {
+            (self.notify)(Notice::CleanupFailed {
+                attempt,
+                what,
+                error: error.to_owned(),
+            });
+        }
+    }
+
+    /// Whether `attempt` may still have a workspace or a container in progress in this process.
+    fn is_active(&self, attempt: AttemptId) -> bool {
+        let state = self.state();
+        state.live.contains_key(&attempt)
+            || state.awaiting.contains_key(&attempt)
+            || state.starting.contains_key(&attempt)
+    }
+
+    /// Whether a leftover pass is due, and if so claims it: at most one pass at a time, and at most one per
+    /// [`LEFTOVER_SWEEP_EVERY`]. The claim is released by [`ReapDone`].
+    fn claim_leftover_pass(&self) -> bool {
+        use std::sync::atomic::Ordering::AcqRel;
+        let mut swept = self
+            .leftover_swept
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if swept.is_some_and(|at| at.elapsed() < LEFTOVER_SWEEP_EVERY) {
+            return false;
+        }
+        if self.leftover_reaping.swap(true, AcqRel) {
+            return false;
+        }
+        *swept = Some(Instant::now());
+        true
+    }
+
+    /// The leftover pass, at most every [`LEFTOVER_SWEEP_EVERY`]: a tree a finished attempt could not remove would
+    /// otherwise hold its disk until the next start, and a worker short of disk refuses the very offers whose
+    /// attempts would have run the sweep. Started on a thread of its own when one is due. Removing a large or hostile tree can
+    /// take minutes, and the watchdog loop that calls this also notices a lost lease and answers spec waits,
+    /// so it never waits for the pass. The thread holds the executor only weakly.
+    fn spawn_reaper(inner: &Arc<Inner>) {
+        if !inner.claim_leftover_pass() {
+            return;
+        }
+        let watched = Arc::downgrade(inner);
+        let spawned = thread::Builder::new()
+            .name("sentinel-leftover-reaper".into())
+            .spawn(move || {
+                if let Some(inner) = watched.upgrade() {
+                    let _done = ReapDone(&inner);
+                    inner.reap_leftovers();
+                }
+            });
+        if spawned.is_err() {
+            // No thread now: release the claim; the pass is due again after the interval.
+            drop(ReapDone(inner));
+        }
+    }
+
+    /// Removes the workspaces and job `/tmp` directories of attempts that are no longer running, and the
+    /// containers of such attempts after a failed removal. Notices name what could not be removed, once.
+    fn reap_leftovers(&self) {
+        let Ok(reaped) =
+            crate::workspace::reap_leftovers(&self.root, |attempt| self.is_active(attempt))
+        else {
+            return;
+        };
+        if reaped.removed > 0 {
+            (self.notify)(Notice::WorkspacesReaped(reaped.removed));
+        }
+        for (attempt, error) in &reaped.failed {
+            self.cleanup_failed(*attempt, "workspace", error);
+        }
+        // What is gone is forgotten, so a later failure of the same attempt is reported again.
+        self.leftover_reported
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|attempt| reaped.failed.iter().any(|(failed, _)| failed == attempt));
+        self.reap_containers();
+    }
+
+    /// Removes the containers of finished attempts that an earlier removal failed to remove: an exited
+    /// container pins its image, so image reclaim would skip it for good. Costs a `podman ps` only after such
+    /// a failure.
+    fn reap_containers(&self) {
+        use std::sync::atomic::Ordering::{AcqRel, Release};
+        if !self.sandbox_leak.swap(false, AcqRel) {
+            return;
+        }
+        let mut clean = true;
+        for store in podman::Store::all(&self.root) {
+            let Ok(owned) = podman::owned_in(self.worker, &store) else {
+                clean = false;
+                continue;
+            };
+            for (attempt, name) in owned {
+                // Listed before asked about, as for workspaces: a container of an attempt that is not active
+                // when asked belongs to no step in progress.
+                if self.is_active(attempt) {
+                    continue;
+                }
+                clean &= podman::remove_named(&name, &store).is_ok();
+            }
+        }
+        if !clean {
+            self.sandbox_leak.store(true, Release);
+        }
+    }
+
     fn watch_lease(&self) {
         let lost: Vec<(AttemptId, Cancel, podman::Store)> = {
             let mut state = self.state();
@@ -1303,6 +1499,16 @@ impl Report for Inner {
     }
     fn cache_note(&self, attempt: AttemptId, note: CacheNote) {
         (self.notify)(Notice::CachePublished { attempt, note });
+    }
+    fn cleanup_failed(&self, attempt: AttemptId, what: &'static str, error: &str) {
+        Inner::cleanup_failed(self, attempt, what, error);
+    }
+    fn storage_unmeasured(&self, attempt: AttemptId, unreadable: bool, timed_out: bool) {
+        (self.notify)(Notice::StorageUnmeasured {
+            attempt,
+            unreadable,
+            timed_out,
+        });
     }
     fn costly_hit(
         &self,
@@ -1840,6 +2046,29 @@ impl LinkExecutor for Executor {
     }
 }
 
+/// Releases the claim on the leftover pass when the pass ends, however it ends, and counts the interval from
+/// the end: a pass longer than the interval is not followed at once by another.
+struct ReapDone<'a>(&'a Inner);
+
+impl ReapDone<'_> {
+    fn release(&self) {
+        self.0
+            .leftover_reaping
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for ReapDone<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .leftover_swept
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+        self.release();
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
         for live in self.state().live.values() {
@@ -2055,5 +2284,374 @@ mod tests {
         assert!(map.contains_key(&a), "still held and renewing its lease");
         forget_unconfirmed(&mut map, t0 + REPORT_KEEP);
         assert!(map.is_empty());
+    }
+}
+
+/// The executor without a Podman: enough of it to exercise its own bookkeeping.
+#[cfg(test)]
+mod bookkeeping_tests {
+    use std::path::Path;
+
+    use super::*;
+    use sentinel_core::{JobId, RepoId, RunId, TenantId};
+    use sentinel_link::session::EventContext;
+    use sentinel_pipeline::{PinnedSource, compile_str};
+    use sentinel_protocol::{
+        cache::Trust,
+        secrets::{DeliveryBundle, DeliveryTarget, DeliveryValue, TargetKind},
+    };
+
+    fn executor(root: &Path) -> (Executor, Arc<Mutex<Vec<String>>>) {
+        for dir in [
+            crate::workspace::WORKSPACES_DIR,
+            crate::spool::SPOOL_DIR,
+            recovery::ATTEMPTS_DIR,
+        ] {
+            crate::private_dir_all(&root.join(dir)).unwrap();
+        }
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&notices);
+        let images = Images::with_download(|_, _, _, _, _| Ok(false));
+        let prefetch = crate::prefetch::Prefetcher::new(
+            images.clone(),
+            crate::prefetch::Bounds::default(),
+            crate::prefetch::PodmanProbe::new(),
+        );
+        let executor = Executor::assemble(
+            root.to_path_buf(),
+            sentinel_core::WorkerId::new(),
+            podman::Runtime {
+                version: String::new(),
+                oci_runtime: String::new(),
+                cgroup_version: String::new(),
+                cgroup_manager: String::new(),
+            },
+            images,
+            prefetch,
+            None,
+            Box::new(move |notice| {
+                let line = match notice {
+                    Notice::WorkspacesReaped(n) => format!("reaped {n}"),
+                    Notice::CleanupFailed { attempt, what, .. } => {
+                        format!("failed {what} {attempt}")
+                    }
+                    other => format!("{other:?}"),
+                };
+                seen.lock().unwrap().push(line);
+            }),
+            Recovered::default(),
+            Vec::new(),
+        );
+        (executor, notices)
+    }
+
+    /// The watchdog's decision to run a pass, with the pass run on the calling thread.
+    fn reap_due_now(executor: &Executor) {
+        if executor.claim_leftover_pass() {
+            let _done = ReapDone(executor);
+            executor.reap_leftovers();
+        }
+    }
+
+    fn plant(root: &Path, attempt: AttemptId) {
+        let ws = crate::workspace::Workspace::create(root, attempt).unwrap();
+        ws.create_tmp().unwrap();
+        std::fs::write(ws.path().join("f"), b"x").unwrap();
+    }
+
+    fn exists(root: &Path, attempt: AttemptId) -> bool {
+        let parent = root.join(crate::workspace::WORKSPACES_DIR);
+        parent.join(attempt.to_string()).exists() || parent.join(format!("{attempt}.tmp")).exists()
+    }
+
+    #[test]
+    fn a_workspace_left_by_a_finished_attempt_is_reaped_by_the_running_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, notices) = executor(dir.path());
+        let (left, running) = (AttemptId::new(), AttemptId::new());
+        plant(dir.path(), left);
+        plant(dir.path(), running);
+        // An attempt between its spec arriving and its live entry has no workspace yet, but is not a leftover either.
+        executor.state().starting.insert(running, false);
+        executor.reap_leftovers();
+        assert!(!exists(dir.path(), left), "the leftover stayed");
+        assert!(
+            exists(dir.path(), running),
+            "an attempt in progress lost its workspace"
+        );
+        assert_eq!(*notices.lock().unwrap(), vec!["reaped 1".to_string()]);
+        // Once it is no longer in progress its tree is a leftover like any other.
+        executor.state().starting.remove(&running);
+        executor.reap_leftovers();
+        assert!(!exists(dir.path(), running));
+    }
+
+    #[test]
+    fn a_leftover_that_cannot_be_removed_is_reported_once_and_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, notices) = executor(dir.path());
+        let stuck = AttemptId::new();
+        // A file where the workspace should be cannot be removed as a tree, whoever runs the test.
+        let path = dir
+            .path()
+            .join(crate::workspace::WORKSPACES_DIR)
+            .join(stuck.to_string());
+        std::fs::write(&path, b"x").unwrap();
+        executor.reap_leftovers();
+        executor.reap_leftovers();
+        assert_eq!(
+            *notices.lock().unwrap(),
+            vec![format!("failed workspace {stuck}")],
+            "one notice per attempt, not per retry"
+        );
+        // Whatever held it is gone: the next pass removes it and forgets the failure, so a new one is reported.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        executor.reap_leftovers();
+        assert!(!path.exists());
+        std::fs::write(&path, b"x").unwrap();
+        executor.reap_leftovers();
+        assert_eq!(notices.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn the_leftover_pass_is_rate_limited_but_runs_the_first_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, _) = executor(dir.path());
+        let (first, second) = (AttemptId::new(), AttemptId::new());
+        plant(dir.path(), first);
+        reap_due_now(&executor);
+        assert!(!exists(dir.path(), first));
+        plant(dir.path(), second);
+        reap_due_now(&executor);
+        assert!(
+            exists(dir.path(), second),
+            "a second pass ran inside the interval"
+        );
+    }
+
+    #[test]
+    fn a_pass_in_progress_is_never_joined_by_a_second_one_and_the_watchdog_does_not_wait() {
+        use std::sync::atomic::Ordering::Acquire;
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, _) = executor(dir.path());
+        let left = AttemptId::new();
+        plant(dir.path(), left);
+        // A long pass holds the claim (as a deletion of millions of files would) ...
+        assert!(executor.claim_leftover_pass());
+        *executor.leftover_swept.lock().unwrap() = None;
+        // ... so the watchdog's tick returns at once, starts nothing, and leaves the tree for the running pass.
+        Inner::spawn_reaper(&executor.0);
+        assert!(exists(dir.path(), left), "a second pass started");
+        assert!(executor.leftover_reaping.load(Acquire));
+        // When the pass ends, the claim is released and the interval counts from that moment.
+        drop(ReapDone(&executor));
+        assert!(!executor.leftover_reaping.load(Acquire));
+        assert!(
+            !executor.claim_leftover_pass(),
+            "the interval restarts at the end of a pass"
+        );
+    }
+
+    #[test]
+    fn the_watchdog_hands_a_due_pass_to_a_thread_of_its_own() {
+        use std::sync::atomic::Ordering::Acquire;
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, notices) = executor(dir.path());
+        let left = AttemptId::new();
+        plant(dir.path(), left);
+        Inner::spawn_reaper(&executor.0);
+        let until = Instant::now() + Duration::from_secs(20);
+        while (exists(dir.path(), left) || executor.leftover_reaping.load(Acquire))
+            && Instant::now() < until
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!exists(dir.path(), left), "the pass never ran");
+        assert_eq!(*notices.lock().unwrap(), vec!["reaped 1".to_string()]);
+        // Not due again inside the interval.
+        let again = AttemptId::new();
+        plant(dir.path(), again);
+        Inner::spawn_reaper(&executor.0);
+        thread::sleep(Duration::from_millis(100));
+        assert!(exists(dir.path(), again));
+    }
+
+    #[test]
+    fn a_failed_workspace_removal_reported_by_an_attempt_is_not_repeated_by_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, notices) = executor(dir.path());
+        let attempt = AttemptId::new();
+        Report::cleanup_failed(&*executor, attempt, "workspace", "busy");
+        let path = dir
+            .path()
+            .join(crate::workspace::WORKSPACES_DIR)
+            .join(attempt.to_string());
+        std::fs::write(&path, b"x").unwrap();
+        executor.reap_leftovers();
+        assert_eq!(
+            *notices.lock().unwrap(),
+            vec![format!("failed workspace {attempt}")]
+        );
+    }
+
+    #[test]
+    fn a_failed_sandbox_removal_arms_the_container_pass_and_a_workspace_failure_does_not() {
+        use std::sync::atomic::Ordering::Acquire;
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, _) = executor(dir.path());
+        Report::cleanup_failed(&*executor, AttemptId::new(), "workspace", "busy");
+        assert!(!executor.sandbox_leak.load(Acquire));
+        Report::cleanup_failed(&*executor, AttemptId::new(), "sandbox", "podman rm");
+        assert!(executor.sandbox_leak.load(Acquire));
+    }
+
+    #[test]
+    fn the_panic_cleanup_removes_the_job_tmp_with_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = AttemptId::new();
+        plant(dir.path(), attempt);
+        assert!(exists(dir.path(), attempt));
+        crate::workspace::remove_attempt_dirs(
+            &dir.path()
+                .join(crate::workspace::WORKSPACES_DIR)
+                .join(attempt.to_string()),
+        )
+        .unwrap();
+        assert!(
+            !exists(dir.path(), attempt),
+            "the job /tmp outlived its workspace"
+        );
+    }
+
+    fn spec() -> RunSpec {
+        let yaml = "schema: 1\non: [push]\njobs:\n  build:\n    image: busybox\n    secrets: [OCI_AUTH]\n    registry_auth: OCI_AUTH\n    steps:\n      - id: test\n        run: echo test\n";
+        RunSpec::new(
+            PinnedSource::new("file:///nowhere", &"a".repeat(40), None).unwrap(),
+            compile_str(yaml).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn context(tenant: Option<TenantId>) -> JobContext {
+        JobContext {
+            source: None,
+            source_valid_until: None,
+            run: RunId::new(),
+            repo: RepoId::new(),
+            repo_name: "app".into(),
+            job: JobId::new(),
+            job_name: "build".into(),
+            sha: "a".repeat(40),
+            event: EventContext {
+                name: "push".into(),
+                ref_name: "main".into(),
+                base_ref: None,
+                pr_number: None,
+                key: "k".into(),
+            },
+            cancelled: false,
+            needs: Vec::new(),
+            tenant,
+            trust: Trust::Protected,
+        }
+    }
+
+    fn registry_bundle() -> DeliveryBundle {
+        DeliveryBundle {
+            values: vec![DeliveryValue::new(b"{\"auths\":{}}".to_vec())],
+            targets: vec![DeliveryTarget {
+                step: 0,
+                name: "OCI_AUTH".into(),
+                value: 0,
+                target: TargetKind::RegistryAuth,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_decided_fails_the_attempt_and_never_runs_it_in_the_shared_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, _) = executor(dir.path());
+        let offer = Offer {
+            attempt: AttemptId::new(),
+            tenant: TenantId::new(),
+            run: RunId::new(),
+            job: JobId::new(),
+            fence: Fence(1),
+            lease_until: UnixMillis(i64::MAX),
+            cpu_millis: 1000,
+            memory_bytes: 128 << 20,
+            image_digest: format!("sha256:{}", "0".repeat(64)),
+            image_platform: "linux/amd64".into(),
+            job_index: 0,
+        };
+        let attempt = offer.attempt;
+        // Registry credentials need the tenant's own store, and this job's context names no tenant.
+        executor.spawn(
+            offer,
+            spec(),
+            context(None),
+            0,
+            Vec::new(),
+            registry_bundle(),
+        );
+        let state = executor.state();
+        assert!(
+            state.live.is_empty(),
+            "an attempt that cannot get its store must not run"
+        );
+        assert!(state.pending.iter().any(|(id, _, event, _)| {
+            *id == attempt
+                && matches!(
+                    event,
+                    Event::Failed(sentinel_core::FailureClass::Preparation)
+                )
+        }));
+        assert!(
+            recovery::leftovers(dir.path()).unwrap().is_empty(),
+            "no marker for an attempt that never started"
+        );
+        drop(state);
+        assert!(
+            crate::spool::Spool::leftovers(dir.path())
+                .unwrap()
+                .is_empty(),
+            "the spool of an attempt that never started stayed until the next process start"
+        );
+    }
+
+    #[test]
+    fn an_offer_that_arrives_while_draining_leaves_no_spool_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, _) = executor(dir.path());
+        executor.state().draining = true;
+        let offer = Offer {
+            attempt: AttemptId::new(),
+            tenant: TenantId::new(),
+            run: RunId::new(),
+            job: JobId::new(),
+            fence: Fence(1),
+            lease_until: UnixMillis(i64::MAX),
+            cpu_millis: 1000,
+            memory_bytes: 128 << 20,
+            image_digest: format!("sha256:{}", "0".repeat(64)),
+            image_platform: "linux/amd64".into(),
+            job_index: 0,
+        };
+        executor.spawn(
+            offer,
+            spec(),
+            context(None),
+            0,
+            Vec::new(),
+            registry_bundle(),
+        );
+        assert!(executor.state().live.is_empty());
+        assert!(
+            crate::spool::Spool::leftovers(dir.path())
+                .unwrap()
+                .is_empty()
+        );
     }
 }

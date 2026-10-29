@@ -287,6 +287,7 @@ mod imp {
             prepare_hold: Duration::ZERO,
             network: sentinel_worker::podman::Network::None,
             runtime,
+            store: sentinel_worker::podman::Store::Shared,
         };
         let notes = Notes::default();
         let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
