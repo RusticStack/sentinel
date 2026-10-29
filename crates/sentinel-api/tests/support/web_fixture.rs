@@ -19,7 +19,7 @@ use sentinel_store::{
     auth::{self as authz, Authority, NamespaceKind},
     checks, dispatch, jobs, local_auth,
     logs::LogStore,
-    lookup,
+    lookup, mfa,
     objects::Objects,
     provenance,
     registration::{self, Applicant, DeploymentPolicy, Terms},
@@ -32,6 +32,15 @@ use serde_json::{Value, json};
 
 pub const PASSWORD: &str = "correct horse battery staple";
 const BUSYBOX: &str = "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
+
+/// What `Fixture::seed_step_up_users` made, for the browser script's configuration.
+pub struct StepUpSeed {
+    pub ivy: UserId,
+    pub mia: UserId,
+    /// The authenticator's base32 key, as the enrollment page shows it.
+    pub mfa_key: String,
+    pub recovery: Vec<String>,
+}
 
 pub struct Fixture {
     pub dir: tempfile::TempDir,
@@ -290,6 +299,15 @@ impl Fixture {
 
     /// Sign-in checks `Origin` against `public_url`, so browser tests pass the web origin.
     pub fn serving(bulk_mib: usize, public_url: Option<String>) -> Fixture {
+        Fixture::serving_with(bulk_mib, public_url, sentinel_api::Options::default())
+    }
+
+    /// `serving` with the controller's options, such as a GitHub App setup that points at a test double.
+    pub fn serving_with(
+        bulk_mib: usize,
+        public_url: Option<String>,
+        options: sentinel_api::Options,
+    ) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let store =
             Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
@@ -458,20 +476,23 @@ impl Fixture {
             "127.0.0.1:0".parse().unwrap(),
         )
         .unwrap();
-        let server = sentinel_api::Server::start(sentinel_api::Config {
-            listen: "127.0.0.1:0".parse().unwrap(),
-            store: Arc::clone(&store),
-            logs: Arc::clone(&logs),
-            objects: Arc::clone(&objects),
-            controller: controller.handle(),
-            secret_key: Some(key),
-            sessions: local_auth::Policy::default(),
-            github_webhook_secret: None,
-            intake: None,
-            public_url,
-            github_sign_in: None,
-            trusted_proxies: sentinel_api::TrustedProxy::loopback(),
-        })
+        let server = sentinel_api::Server::start_with(
+            sentinel_api::Config {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                store: Arc::clone(&store),
+                logs: Arc::clone(&logs),
+                objects: Arc::clone(&objects),
+                controller: controller.handle(),
+                secret_key: Some(key),
+                sessions: local_auth::Policy::default(),
+                github_webhook_secret: None,
+                intake: None,
+                public_url,
+                github_sign_in: None,
+                trusted_proxies: sentinel_api::TrustedProxy::loopback(),
+            },
+            options,
+        )
         .unwrap();
         let base = format!("http://{}", server.local_addr());
 
@@ -832,6 +853,82 @@ impl Fixture {
 
     pub fn member(&self, user: UserId) -> String {
         self.bearer(user, P::REPOSITORY.union(P::TENANT_ADMIN))
+    }
+
+    /// Accounts for the step-up and shown-once browser checks (`web/test/ui.mjs`), kept out of `serving` because
+    /// they add members to `acme` that other tests count. Both administer `acme` and sign in with `PASSWORD`:
+    /// `ivy`'s session is the one the five-wrong-proofs scenario ends, `mia` has an enrolled authenticator.
+    pub fn seed_step_up_users(&self) -> StepUpSeed {
+        let acme = self.acme;
+        let admit = |name: &str| {
+            let secret = self
+                .store
+                .writer()
+                .write(move |tx| {
+                    registration::invite(
+                        tx,
+                        Authority::HostLocal,
+                        Terms {
+                            tenant: Some(acme),
+                            role: Some(Role::TenantAdmin),
+                            identity: None,
+                            lifetime_ms: 3_600_000,
+                        },
+                        UnixMillis::now(),
+                    )
+                })
+                .unwrap()
+                .secret;
+            match registration::register(
+                &self.store,
+                Applicant::Local {
+                    display_name: name,
+                    username: &name.to_ascii_lowercase(),
+                    password: PASSWORD.as_bytes(),
+                },
+                Some(&secret),
+                UnixMillis::now(),
+            )
+            .unwrap()
+            {
+                registration::Admission::Admitted(user) => user,
+                other => panic!("{other:?}"),
+            }
+        };
+        let ivy = admit("Ivy");
+        let mia = admit("Mia");
+
+        let key = sentinel_auth::sealed::Key::load(&self.dir.path().join("master.key")).unwrap();
+        let now = UnixMillis::now();
+        let enrollment =
+            mfa::begin_enrollment_host_local(&self.store, &key, mia, "Sentinel", "mia", now)
+                .unwrap();
+        let uri = enrollment.provisioning_uri;
+        let start = uri.find("secret=").unwrap() + "secret=".len();
+        let end = uri[start..].find('&').map_or(uri.len(), |e| start + e);
+        let mfa_key = uri[start..end].to_owned();
+        let seed = sentinel_auth::mfa::Seed::from_base32(&mfa_key).unwrap();
+        // The oldest code still accepted: the code the browser computes later is always from a newer step, so the
+        // replay guard (a step is accepted once) never refuses it.
+        let seconds = now.0 as u64 / 1000;
+        let (_, code) = (0..1_000_000u32)
+            .filter_map(|n| {
+                let code = format!("{n:06}");
+                sentinel_auth::mfa::check(&seed, &code, seconds).map(|step| (step, code))
+            })
+            .min()
+            .expect("some six-digit code matches the current step");
+        let recovery = mfa::confirm_enrollment_host_local(&self.store, &key, mia, &code, now)
+            .unwrap()
+            .iter()
+            .map(|c| c.expose().to_owned())
+            .collect();
+        StepUpSeed {
+            ivy,
+            mia,
+            mfa_key,
+            recovery,
+        }
     }
 
     pub fn tenant_id(&self, slug: &str) -> TenantId {

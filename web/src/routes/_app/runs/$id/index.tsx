@@ -83,7 +83,7 @@ function RunView() {
     act(me, `${job.terminal ? "Rerun" : "Cancel"} ${job.name}`, () => api(`/api/v1/jobs/${job.id}/${job.terminal ? "rerun" : "cancel"}`, { method: "POST", body: {} }));
   async function toggleManifest(a: any) {
     if (manifests[a.id]) { const { [a.id]: _, ...rest } = manifests; setManifests(rest); return; }
-    const detail = await act(me, `Files of ${a.name}`, () => api<any>(`/api/v1/runs/${id}/artifacts/${a.id}`));
+    const detail = await act(me, `Files of ${a.name}`, () => api<any>(`/api/v1/runs/${id}/artifacts/${a.id}`), false);
     if (detail?.manifest) setManifests((m) => ({ ...m, [a.id]: detail }));
   }
 

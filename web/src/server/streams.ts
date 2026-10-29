@@ -30,6 +30,35 @@ function eventStream(request: Request, body: (push: (e: { event?: string; id?: s
   });
 }
 
+// The controller refuses a park (429) before it waits and states when to ask again, so the retry follows that figure
+// with no growth. A network error, a 5xx and a 429 that states no figure (a proxy's, not the controller's) have none to
+// follow and back off exponentially, so an unannotated refusal never retries at a fixed rate for good.
+export const tuning = { minRetryMs: 250, maxBackoffMs: 15000, parkedProofMs: 1000 };
+
+type Answer = { status: number; body: any };
+
+/** How long to pause before the next request, and the backoff to carry into the one after. */
+export function pause(answer: Answer | null, backoff: number, random: () => number = Math.random): { ms: number; backoff: number } {
+  const jitter = 0.8 + random() * 0.4;
+  if (answer?.status === 429) {
+    const stated = Number(answer.body?.details?.retry_after_ms);
+    if (Number.isFinite(stated) && stated > 0) {
+      return { ms: Math.min(Math.max(stated, tuning.minRetryMs), tuning.maxBackoffMs) * jitter, backoff };
+    }
+  }
+  return { ms: backoff * jitter, backoff: Math.min(backoff * 2, tuning.maxBackoffMs) };
+}
+
+/**
+ * One long poll. The controller takes a subscriber slot, or refuses with 429, before it starts to wait, so a poll still
+ * unanswered after `parkedProofMs` is parked: `onParked` then lifts a "busy" notice at once instead of leaving it up
+ * until the park ends (up to 25 s).
+ */
+async function poll(request: Request, path: string, signal: AbortSignal, onParked?: () => void): Promise<Answer> {
+  const timer = onParked ? setTimeout(onParked, tuning.parkedProofMs) : undefined;
+  try { return await upstream(request, path, signal); } finally { clearTimeout(timer); }
+}
+
 const bad = (text: string) => new Response(text, { status: 400, headers: { "content-type": "text/plain; charset=utf-8" } });
 
 // Pushes a run event only when the version changes, so the browser keeps one idle stream instead of polling.
@@ -41,21 +70,23 @@ export function runStream(request: Request, id: string): Response {
     let state = "live";
     const status = (next: string) => { if (next !== state) { state = next; push({ event: "status", data: next }); } };
     while (!signal.aborted) {
-      let answer;
+      let answer: Answer;
       try {
-        answer = await upstream(request, `/api/v1/runs/${id}/wait?timeout_ms=25000${version ? `&since=${version}` : ""}`, signal);
+        answer = await poll(request, `/api/v1/runs/${id}/wait?timeout_ms=25000${version ? `&since=${version}` : ""}`, signal,
+          state === "busy" ? () => status("live") : undefined);
       } catch {
         if (signal.aborted) break;
         status("reconnecting");
-        await sleep(backoff, signal);
-        backoff = Math.min(backoff * 2, 15000);
+        const next = pause(null, backoff);
+        await sleep(next.ms, signal);
+        backoff = next.backoff;
         continue;
       }
       if (answer.status === 429 || answer.status >= 500) {
         status(answer.status === 429 ? "busy" : "reconnecting");
-        const wait = Math.max(answer.body?.details?.retry_after_ms ?? 0, backoff);
-        await sleep(wait * (0.8 + Math.random() * 0.4), signal);
-        backoff = Math.min(backoff * 2, 15000);
+        const next = pause(answer, backoff);
+        await sleep(next.ms, signal);
+        backoff = next.backoff;
         continue;
       }
       if (answer.status !== 200) {
@@ -88,21 +119,23 @@ export function logStream(request: Request, attempt: string, query: URLSearchPar
     let state = "live";
     const status = (next: string) => { if (next !== state) { state = next; push({ event: "status", data: next }); } };
     while (!signal.aborted) {
-      let page;
+      let page: Answer;
       try {
-        page = await upstream(request, `/api/v1/attempts/${attempt}/logs?step=${step}&after=${after}&limit=500&wait=1`, signal);
+        page = await poll(request, `/api/v1/attempts/${attempt}/logs?step=${step}&after=${after}&limit=500&wait=1`, signal,
+          state === "busy" ? () => status("live") : undefined);
       } catch {
         if (signal.aborted) break;
         status("reconnecting");
-        await sleep(backoff, signal);
-        backoff = Math.min(backoff * 2, 15000);
+        const next = pause(null, backoff);
+        await sleep(next.ms, signal);
+        backoff = next.backoff;
         continue;
       }
       if (page.status === 429 || page.status >= 500) {
         status(page.status === 429 ? "busy" : "reconnecting");
-        const wait = Math.max(page.body?.details?.retry_after_ms ?? 0, backoff);
-        await sleep(wait * (0.8 + Math.random() * 0.4), signal);
-        backoff = Math.min(backoff * 2, 15000);
+        const next = pause(page, backoff);
+        await sleep(next.ms, signal);
+        backoff = next.backoff;
         continue;
       }
       if (page.status !== 200) {

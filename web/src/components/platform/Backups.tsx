@@ -2,24 +2,32 @@ import type { Backups as BackupsData } from "../../lib/types";
 import { api } from "../../lib/api.ts";
 import { act } from "../../lib/act.tsx";
 import { useSession } from "../../lib/session.ts";
-import { useLoaded } from "../../lib/hooks.ts";
+import { attempt, useLoad, type Load } from "../../lib/loaded.ts";
 import { fmtBytes, fmtMs } from "../../lib/format.ts";
+import { LoadFailed } from "../LoadFailed.tsx";
 import { RelTime } from "../RelTime.tsx";
 import { Alert, Button, Table, useInterval } from "../ui.tsx";
 
 const readBackups = () => api<BackupsData>("/api/v1/admin/backups");
-export const loadBackups = () => readBackups().catch(() => null);
+export const loadBackups = () => attempt(readBackups);
 
-export function Backups({ initial }: { initial: BackupsData | null }) {
+export function Backups({ initial }: { initial: Load<BackupsData> }) {
   const { me } = useSession();
-  const [data, setData] = useLoaded(initial);
+  const { data, setData, failure } = useLoad(initial);
   const refresh = () => readBackups().then(setData, () => {});
   useInterval(() => { void refresh(); }, 5000);
   async function now() {
     if (await act(me, "Backup", () => api("/api/v1/admin/backups", { method: "POST", body: {} }))) await refresh();
   }
 
-  if (!data) return null;
+  if (!data) {
+    return (
+      <section aria-labelledby="backups-h" className="space-y-3">
+        <h2 id="backups-h" className="text-base font-semibold text-strong">Backups</h2>
+        <LoadFailed what="the backups" words={failure ?? ""} />
+      </section>
+    );
+  }
   const scheduler = data.scheduler;
   return (
     <section aria-labelledby="backups-h" className="space-y-3">

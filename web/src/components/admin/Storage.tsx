@@ -3,19 +3,20 @@ import type { TenantStorage } from "../../lib/types";
 import { api } from "../../lib/api.ts";
 import { act } from "../../lib/act.tsx";
 import { useSession } from "../../lib/session.ts";
-import { useLoaded } from "../../lib/hooks.ts";
+import { attempt, useLoad, type Load } from "../../lib/loaded.ts";
 import { fmtBytes } from "../../lib/format.ts";
+import { LoadFailed } from "../LoadFailed.tsx";
 import { StoragePolicyForm, type StoragePolicyBody } from "../StoragePolicyForm.tsx";
 import { Button, Card, DialogModal, Table } from "../ui.tsx";
 
 const DAY = 86_400_000;
 const readStorage = (slug: string) => api<TenantStorage>(`/api/v1/tenants/${encodeURIComponent(slug)}/storage`);
-export const loadStorage = (slug: string) => readStorage(slug).catch(() => null);
+export const loadStorage = (slug: string) => attempt(() => readStorage(slug));
 const days = (ms: number) => Math.round((ms / DAY) * 10) / 10;
 
-export function Storage({ slug, initial }: { slug: string; initial: TenantStorage | null }) {
+export function Storage({ slug, initial }: { slug: string; initial: Load<TenantStorage> }) {
   const { me } = useSession();
-  const [data, setData] = useLoaded(initial);
+  const { data, setData, failure } = useLoad(initial);
   const refresh = () => readStorage(slug).then(setData, () => {});
   const [editing, setEditing] = useState<string | null>(null);
 
@@ -26,7 +27,14 @@ export function Storage({ slug, initial }: { slug: string; initial: TenantStorag
     }
   }
 
-  if (!data) return null;
+  if (!data) {
+    return (
+      <section aria-labelledby="storage-h" className="space-y-3">
+        <h2 id="storage-h" className="text-base font-semibold text-strong">Storage</h2>
+        <LoadFailed what="the storage figures" words={failure ?? ""} />
+      </section>
+    );
+  }
   const total = data.usage.object_bytes + data.usage.log_bytes;
   const quota = data.effective.tenant_quota_bytes ?? 0;
   const edited = editing ? data.repos.find((r) => r.name === editing) : undefined;
