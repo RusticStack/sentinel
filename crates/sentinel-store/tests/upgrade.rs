@@ -362,9 +362,10 @@ fn upgrade_sources() -> Vec<u32> {
 }
 
 #[test]
-fn every_readable_by_release_upgrades_and_the_rollback_matrix_matches_the_docs() {
-    // docs/upgrades.md: a database at schema N runs on release R only when no migration in
-    // (R, N] declares a readable_by above R. Rows are R, columns are N = 53, 55, 58, LATEST.
+fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expects() {
+    // docs/upgrades.md (tests/compat_doc.rs compares it with the code): a database at schema N
+    // runs on release R only when no migration in (R, N] declares a readable_by above R. Rows
+    // are R, columns are N = 53, 55, 58, LATEST.
     let readable = |db: &Connection, release: u32, newest: u32| -> bool {
         let needs: u32 = db
             .query_row(
