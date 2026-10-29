@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+. "$(dirname "$0")/../lib.sh"
+fake_start mvn "$@"
+offline=0; repo=
+for a in "$@"; do
+  [ "$a" = -o ] && offline=1
+  case "$a" in -Dmaven.repo.local=*) repo="${a#-Dmaven.repo.local=}" ;; esac
+done
+case "${1:-}" in -v|--version) echo "Apache Maven fake"; exit 0 ;; esac
+[ -n "$repo" ] || { echo "mvn: no local repository given" >&2; exit 1; }
+if [ $offline = 1 ] && ! has_files "$repo"; then echo "mvn: offline and the local repository is empty" >&2; exit 1; fi
+[ $offline = 1 ] || populate "$repo" 3
+populate target 3

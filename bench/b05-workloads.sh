@@ -7,11 +7,19 @@
 #   b05-workloads.sh run <lang>...    cold / downloads-only / warm job timings, n=REPS each, leaving the warm trees
 #   b05-workloads.sh clean            delete data/tools, data/wl, data/locks
 # Languages: go rust js python java custom
+# Languages are measured in an order shuffled from SHUF_SEED for each repetition; every record names shuffle_seed and
+# the language's position. `--profile smoke` (first argument) is the harness check: B05_DATA and B05_TOOLS point it at a
+# scratch tree and at stub toolchains (bench/fake/b05), it takes no lock unless B05_TAKE_LOCK=1, exits 75 on a busy
+# host, marks records "smoke":true and refuses an OUT inside bench/ (docs/benchmarking.md#b05-matrix-and-its-smoke-profile).
 set -uo pipefail
 
+PROFILE=full
+if [ "${1:-}" = --profile ]; then PROFILE="${2:-}"; shift 2 || true; fi
+case "$PROFILE" in full|smoke) ;; *) echo "b05: --profile must be full or smoke" >&2; exit 2 ;; esac
+
 ROOT="${ROOT:-/srv/sentinel-p14-b05}"
-D="$ROOT/data"
-T="$D/tools"
+D="${B05_DATA:-$ROOT/data}"
+T="${B05_TOOLS:-$D/tools}"
 W="$D/wl"
 FX="$ROOT/bench/b05-fixtures"
 LOCKS="$D/locks"
@@ -22,14 +30,32 @@ REPS="${REPS:-3}"
 CUSTOM_COUNT="${CUSTOM_COUNT:-4096}"
 CUSTOM_BYTES="${CUSTOM_BYTES:-262144}"
 export PATH="$HOME/.cargo/bin:$T/go/bin:$T/jdk/bin:$T/maven/bin:$PATH"
+# Stub toolchains (bench/fake/b05) sit in $T/bin and win over anything installed.
+[ -n "${B05_TOOLS:-}" ] && export PATH="$T/bin:$PATH"
 export JAVA_HOME="$T/jdk"
+FAILED=0
+POS=0
 
 log() { printf 'b05 %s %s\n' "$(date +%T)" "$*" >&2; }
 
 # Every record carries the build and host stamp of bench/stamp.sh (SENTINEL_SRC names the checkout the
 # measured build came from, SENTINEL_BENCH_HOST_LABEL the host); b05-timed.sh splices it into each line.
 . "$(dirname "${BASH_SOURCE[0]}")/stamp.sh"
-stamped() { [ -n "${B05_STAMP:-}" ] || { stamp_init || exit 2; B05_STAMP="$STAMP_BODY"; export B05_STAMP; }; }
+stamped() {
+    [ -n "${B05_STAMP:-}" ] && return 0
+    stamp_init || exit 2
+    shuffle_init
+    B05_STAMP="$STAMP_BODY"
+    [ "$PROFILE" = smoke ] && B05_STAMP="$B05_STAMP,\"smoke\":true"
+    export B05_STAMP
+}
+
+# A smoke run takes no lock unless B05_TAKE_LOCK=1: the verification helper that started it already holds it.
+lockrun() {
+    if [ "$PROFILE" = smoke ] && [ "${B05_TAKE_LOCK:-}" != 1 ]; then "$@"; else flock -x -o "$LOCK" "$@"; fi
+}
+
+[ "$PROFILE" = smoke ] && smoke_guard "$OUT"
 
 fixture() { # lang file -> path of the committed file, else the generated one
     if [ -f "$FX/$1/$2" ]; then echo "$FX/$1/$2"; else echo "$LOCKS/$1/$2"; fi
@@ -40,12 +66,13 @@ tm() { # lang variant step rep -- command...
     shift 5
     mkdir -p "$W/logs"
     log "$lang $variant $step rep$rep"
-    flock -x -o "$LOCK" "$ROOT/bench/b05-timed.sh" "$OUT" \
-        "\"workload\":\"$lang\",\"variant\":\"$variant\",\"step\":\"$step\",\"rep\":$rep" \
+    lockrun bash "$ROOT/bench/b05-timed.sh" "$OUT" \
+        "\"workload\":\"$lang\",\"variant\":\"$variant\",\"step\":\"$step\",\"rep\":$rep,\"shuffle_seed\":\"$SHUF_SEED\",\"position\":$POS" \
         "$W/logs/$lang-$variant-$step-$rep.log" -- "$@"
 }
 
 tools() {
+    if [ -n "${B05_TOOLS:-}" ]; then echo "b05: B05_TOOLS names stub toolchains; there is nothing to install" >&2; exit 2; fi
     mkdir -p "$T"
     if [ ! -x "$T/go/bin/go" ]; then
         ver="$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -1)"
@@ -147,15 +174,13 @@ reset() { # lang state
     esac
 }
 
-measure() { # lang
-    local lang="$1" rep state
-    prep "$lang"
-    for rep in $(seq 1 "$REPS"); do
-        for state in cold deps warm; do
-            [ "$lang" = custom ] && [ "$state" = deps ] && continue
-            reset "$lang" "$state"
-            tm "$lang" "$state" job "$rep" -- bash -c "$(job_cmd "$lang" "$state")" || log "$lang $state rep$rep failed (see $W/logs)"
-        done
+measure() { # lang rep position: one repetition of the cold / deps / warm sequence for one language
+    local lang="$1" rep="$2" state
+    POS="$3"
+    for state in cold deps warm; do
+        [ "$lang" = custom ] && [ "$state" = deps ] && continue
+        reset "$lang" "$state"
+        tm "$lang" "$state" job "$rep" -- bash -c "$(job_cmd "$lang" "$state")" || { FAILED=$((FAILED + 1)); log "$lang $state rep$rep failed (see $W/logs)"; }
     done
 }
 
@@ -171,15 +196,30 @@ report_trees() { # lang -> one line per entry directory: files, bytes, symlinks
 }
 
 run() {
-    local lang
+    local lang rep position
     stamped
-    for lang in "$@"; do
-        measure "$lang"
-        report_trees "$lang"
+    log "shuffle seed $SHUF_SEED"
+    for lang in "$@"; do prep "$lang"; done
+    # Repetitions are the outer loop and the languages are shuffled within each, so no language always runs first
+    # (or right after the same neighbour) and a host that drifts over the run spreads over all of them.
+    for rep in $(seq 1 "$REPS"); do
+        position=0
+        for lang in $(printf '%s\n' "$@" | shuffle_lines "$SHUF_SEED/rep$rep"); do
+            position=$((position + 1))
+            measure "$lang" "$rep" "$position"
+        done
     done
+    for lang in "$@"; do report_trees "$lang"; done
+    if [ "$FAILED" -gt 0 ]; then
+        log "$FAILED timed job(s) failed; the measurement is incomplete"
+        return 1
+    fi
 }
 
-clean() { rmtree "$T" "$W" "$LOCKS"; }
+clean() {
+    # Stub toolchains are tracked files: B05_TOOLS is never deleted.
+    if [ -n "${B05_TOOLS:-}" ]; then rmtree "$W" "$LOCKS"; else rmtree "$T" "$W" "$LOCKS"; fi
+}
 
 cmd="${1:-}"
 shift || true
@@ -188,5 +228,5 @@ case "$cmd" in
     locks) locks ;;
     run) run "$@" ;;
     clean) clean ;;
-    *) echo "usage: $0 tools|locks|run <lang>...|clean" >&2; exit 2 ;;
+    *) echo "usage: $0 [--profile full|smoke] tools|locks|run <lang>...|clean" >&2; exit 2 ;;
 esac

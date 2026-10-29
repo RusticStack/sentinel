@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+. "$(dirname "$0")/../lib.sh"
+fake_start rustc "$@"
+echo "rustc fake"

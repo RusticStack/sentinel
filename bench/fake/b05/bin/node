@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+. "$(dirname "$0")/../lib.sh"
+fake_start node "$@"
+echo "v0.0.0-fake"
