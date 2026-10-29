@@ -31,6 +31,8 @@ use sentinel_store::{
 use serde_json::{Value, json};
 
 pub const PASSWORD: &str = "correct horse battery staple";
+/// The controller's Tailcat address the fixture writes for worker enrollment. A credential: tests assert it never leaks.
+pub const TAILCAT_ADDRESS: &str = "tcQ2w3E4r5T6y7U8i9O0p1A2s3D4f5G6h7J8";
 const BUSYBOX: &str = "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
 
 /// What `Fixture::seed_step_up_users` made, for the browser script's configuration.
@@ -292,6 +294,52 @@ fn write_log(
     }
 }
 
+/// Worker enrollment, as a controller with a Tailcat helper pinned and an `api_url` would offer it: workers redeem at the
+/// web origin (a loopback address in tests), so the enrollment page can be driven end to end.
+fn worker_bootstrap(
+    dir: &std::path::Path,
+    origin: Option<&str>,
+) -> Arc<sentinel_api::WorkerBootstrap> {
+    use sentinel_api::{Pin, TailcatRelease, WorkerBootstrap, WorkerBootstrapSettings};
+    let address_file = dir.join("tailcat-address");
+    std::fs::write(
+        &address_file,
+        format!(
+            "{TAILCAT_ADDRESS}
+"
+        ),
+    )
+    .unwrap();
+    let digest = |byte: &str| byte.repeat(64);
+    Arc::new(
+        WorkerBootstrap::new(WorkerBootstrapSettings {
+            controller: "10.0.0.5:7443".parse().unwrap(),
+            fingerprint: digest("d"),
+            release_url: "https://releases.example.test/sentinel/0.1.0".into(),
+            release_sums: format!(
+                "{}  sentinel-0.1.0-x86_64-linux-worker.tar.gz
+{}  sentinel-0.1.0-aarch64-linux-worker.tar.gz
+",
+                digest("a"),
+                digest("b")
+            ),
+            tailcat: Some(TailcatRelease {
+                version: "0.6.0".into(),
+                x86_64: Some(Pin {
+                    url: "https://releases.example.test/tailcat/0.6.0/tailcat-linux-amd64".into(),
+                    sha256: digest("c"),
+                }),
+                aarch64: None,
+                derpmap_url: None,
+                region: None,
+            }),
+            tailcat_address_file: Some(address_file),
+            api_url: Some(origin.unwrap_or("http://127.0.0.1:8080").to_owned()),
+        })
+        .unwrap(),
+    )
+}
+
 impl Fixture {
     pub fn new(bulk_mib: usize) -> Fixture {
         Fixture::serving(bulk_mib, None)
@@ -476,6 +524,7 @@ impl Fixture {
             "127.0.0.1:0".parse().unwrap(),
         )
         .unwrap();
+        let worker_bootstrap = worker_bootstrap(dir.path(), public_url.as_deref());
         let server = sentinel_api::Server::start_with(
             sentinel_api::Config {
                 listen: "127.0.0.1:0".parse().unwrap(),
@@ -491,7 +540,10 @@ impl Fixture {
                 github_sign_in: None,
                 trusted_proxies: sentinel_api::TrustedProxy::loopback(),
             },
-            options,
+            sentinel_api::Options {
+                worker_bootstrap: Some(worker_bootstrap),
+                ..options
+            },
         )
         .unwrap();
         let base = format!("http://{}", server.local_addr());

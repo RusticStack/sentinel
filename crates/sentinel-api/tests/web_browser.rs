@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use fixture::{Fixture, PASSWORD};
+use fixture::{Fixture, PASSWORD, TAILCAT_ADDRESS};
 use serde_json::json;
 
 fn repo_root() -> std::path::PathBuf {
@@ -159,6 +159,8 @@ fn config(f: &Fixture, base: &str, web: &str, out: &std::path::Path) -> serde_js
         "rui": f.rui.to_string(),
         "pat": f.pat.to_string(),
         "subscribers_per_user": sentinel_api::SUBSCRIBERS_PER_USER,
+        "web_log": f.dir.path().join("web.log"),
+        "tailcat_address": TAILCAT_ADDRESS,
     })
 }
 
@@ -185,7 +187,7 @@ fn deployment(bulk_mib: usize, relayed: bool) -> (Arc<Fixture>, Web, String, Str
             )
         })
         .unwrap();
-    let web = Web::start(port, &f.base);
+    let web = Web::start_with(port, &f.base, &[], Some(&f.dir.path().join("web.log")));
     (f, web, web_addr, origin)
 }
 
@@ -215,6 +217,18 @@ fn the_web_interface_in_a_real_browser() {
     stop.store(true, Ordering::Release);
     writer.join().unwrap();
     drop(web);
+    if !status.success() {
+        let log = std::fs::read_to_string(f.dir.path().join("web.log")).unwrap_or_default();
+        let tail: Vec<&str> = log.lines().rev().take(40).collect();
+        eprintln!(
+            "web process output (last lines):
+{}",
+            tail.into_iter().rev().collect::<Vec<_>>().join(
+                "
+"
+            )
+        );
+    }
     assert!(status.success(), "ui.mjs failed: {status}");
 }
 
@@ -267,7 +281,12 @@ fn the_setup_wizard_in_a_real_browser() {
         .unwrap();
     let mut token_text = String::new();
     token.expose(&mut token_text);
-    let web = Web::start(port, &format!("http://{}", server.local_addr()));
+    let web = Web::start_with(
+        port,
+        &format!("http://{}", server.local_addr()),
+        &[],
+        Some(&dir.path().join("web.log")),
+    );
     let out = match std::env::var_os("SENTINEL_UI_OUT") {
         Some(dir) => std::path::PathBuf::from(dir),
         None => dir.path().join("ui"),

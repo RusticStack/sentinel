@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, existsSync, readdi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { launch } from "./cdp.mjs";
 
 const cfg = JSON.parse(readFileSync(process.argv[2], "utf8"));
@@ -167,6 +167,7 @@ const PAGES = {
   organizations: ["/organizations", "!!document.querySelector('#ns-h') && !!document.querySelector('#new-org-h')"],
   settings: ["/t/acme/settings", "!!document.querySelector('#about-h') && !!document.querySelector('#members-h')"],
   invitations: ["/t/acme/admin/invitations", "!!document.querySelector('#invite-h')"],
+  workers: ["/platform/workers", "!!document.querySelector('#w-add-h') && !!document.querySelector('#w-pool')"],
   github: ["/setup/github", "document.querySelector('h1') && document.querySelector('h1').textContent === 'GitHub App' && document.querySelectorAll('main [role=status], main section').length >= 1"],
 };
 
@@ -945,6 +946,231 @@ await scenario("service credential shown once", async () => {
   check("revoking marks it revoked and takes the button away", true);
   check("the controller has it revoked", (await grants()).find((g) => g.name === "agent-1").revoked === true);
   await sc.close();
+  current = page;
+});
+
+await scenario("worker enrollment page", async () => {
+  const made = await root("POST", "/api/v1/admin/pools", { name: "fleet", kind: "shared" });
+  check("a shared pool exists to enrol machines into", made.status === 201, made);
+
+  // A fresh browser context has no step-up stamp, and every request, answer and console line it makes is recorded.
+  const enr = await browser.newPage({ width: 1280, height: 860 });
+  current = enr;
+  const requests = [];
+  const answers = [];
+  browser.on("Network.requestWillBeSent", (p, s) => {
+    if (s === enr.sessionId) requests.push({ method: p.request.method, url: p.request.url, headers: JSON.stringify(p.request.headers), post: p.request.postData ?? "" });
+  });
+  browser.on("Network.responseReceived", (p, s) => {
+    if (s === enr.sessionId) answers.push({ url: p.response.url, status: p.response.status, cache: p.response.headers["cache-control"] ?? p.response.headers["Cache-Control"] ?? "" });
+  });
+  await signIn(enr, "root");
+
+  const READY = "!!document.querySelector('#w-add-h') && !!document.querySelector('#w-pool')";
+  await go(enr, "/platform/workers", READY);
+  check("a platform administrator sees the Workers section", await enr.eval("[...document.querySelectorAll('nav[aria-label=Sections] a')].some((a) => a.textContent.trim() === 'Workers' && a.getAttribute('aria-current') === 'page')"));
+  await axAudit(enr, "worker enrollment page");
+
+  const pick = async (trigger, text) => {
+    await enr.click(trigger);
+    await enr.waitFor("!!document.querySelector('[role=option]')", 5000, "options");
+    await enr.clickText("[role=option]", text);
+    await enr.waitFor("!document.querySelector('[role=option]')", 5000, "options closed");
+  };
+  await pick("#w-pool", "fleet");
+  check("the pool is chosen from the active pools", (await enr.eval("document.querySelector('#w-pool').textContent")).includes("fleet"));
+  check("Tailcat is preselected when the controller offers it", (await enr.eval("document.querySelector('#w-transport').textContent")).includes("Tailcat"));
+
+  // A bad ceiling is refused in the page, before anything is sent.
+  const issues = () => requests.filter((r) => r.method === "POST" && r.url.endsWith("/api/v1/admin/worker-enrollments")).length;
+  await enr.fill("#w-mem", "1.5");
+  await enr.key("Enter");
+  await enr.waitFor("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('whole number of GiB'))", 5000, "ceiling refused");
+  check("a fractional memory ceiling is refused in the page and nothing is sent", issues() === 0);
+  await enr.fill("#w-cpu", "4");
+  await enr.fill("#w-mem", "16");
+  await enr.fill("#w-disk", "100");
+  await enr.fill("#w-priority", "5");
+  await enr.fill("#w-hours", "2");
+
+  const secrets = [];
+  const dialogValues = "[...document.querySelectorAll('[role=dialog] li [data-secret], [role=dialog] li')].filter((e, i, all) => !all.some((o) => o !== e && e.contains(o))).map((e) => e.textContent.trim())";
+  async function saveAndClose(expected) {
+    await enr.waitFor(`(${dialogValues}).length === ${expected}`, 15000, "the shown-once dialog");
+    const values = await enr.eval(dialogValues);
+    check(`the dialog lists exactly ${expected} value${expected === 1 ? "" : "s"}`, values.length === expected, values.length);
+    check("Done stays disabled until the person says they saved it",
+      await enr.eval(`[...document.querySelectorAll('[role=dialog] button')].find((b) => b.textContent.trim() === 'Done').disabled`));
+    secrets.push(...values);
+    await enr.click("[role=dialog] [role=checkbox]");
+    await enr.clickText("[role=dialog] button", "Done");
+    await enr.waitFor("!document.querySelector('[role=dialog]')", 8000, "dialog closed");
+    return values;
+  }
+
+  await enr.key("Enter");
+  await enr.waitFor("!!document.querySelector('#stepup-code')", 10000, "step-up dialog");
+  check("issuing asks a fresh session for a second factor", true);
+  check("nothing was issued before the second factor", (await root("GET", "/api/v1/admin/worker-enrollments")).body.enrollments.length === 0);
+  await enr.fill("#stepup-code", cfg.password);
+  await enr.key("Enter");
+  const [secret, address] = await saveAndClose(2);
+  check("line one is an enrollment secret", /^sntl_[0-9a-f]{64}$/.test(secret), secret.replace(/[0-9a-f]{64}/, "…"));
+  check("line two is the controller's Tailcat address", address === cfg.tailcat_address);
+  const issuedPost = answers.find((a) => a.url.endsWith("/api/v1/admin/worker-enrollments") && a.status === 201);
+  check("the issuing answer is not cacheable", issuedPost && issuedPost.cache.includes("no-store"), issuedPost);
+  check("neither value is in the page once the dialog is closed",
+    !(await enr.eval(`document.documentElement.outerHTML.includes(${JSON.stringify(secret.slice(5))}) || document.documentElement.outerHTML.includes(${JSON.stringify(address)})`)));
+
+  await enr.waitFor("!!document.querySelector('#w-next-h')", 10000, "next steps");
+  check("next steps appear for the new enrollment", true);
+  const { body: listed } = await root("GET", "/api/v1/admin/worker-enrollments");
+  const first = listed.enrollments[0];
+  check("the enrollment is pending in the fleet pool with the approved ceilings",
+    first.state === "pending" && first.transport === "tailcat" && first.host.cpu_millis === 4000 && first.host.memory_bytes === 16 * 2 ** 30 && first.host.disk_bytes === 100 * 2 ** 30 && first.host.priority === 5, first);
+
+  // The script, checked by the page against the controller's digest and by this process against the bytes.
+  await enr.clickText("button", "Download script");
+  await enr.waitFor("document.querySelector('#w-script-status').textContent.includes('matches the controller digest')", 15000, "digest verified");
+  check("the page recomputed the script's SHA-256 and it matches the controller's", true);
+  const shown = await enr.eval("document.querySelector('#w-script-status code').textContent");
+  const served = await fetch(`${cfg.base}/api/v1/admin/worker-enrollments/${first.id}/bootstrap.sh`, { headers: { authorization: cfg.auth } });
+  const text = await served.text();
+  check("the digest shown is the SHA-256 of the script the controller serves", createHash("sha256").update(text).digest("hex") === shown, shown);
+  check("the script holds neither the secret nor the Tailcat address", !text.includes(secret.slice(5)) && !text.includes(address));
+  const steps = await enr.eval("document.querySelector('#w-next-h').closest('section').textContent");
+  check("the install command is given, with no secret in it", steps.includes("sudo sh sentinel-worker-bootstrap.sh install") && !steps.includes(secret.slice(5)));
+  check("rollback and uninstall instructions are on the page", (await enr.eval("document.body.textContent")).includes("sentinel-worker-bootstrap.sh rollback") && (await enr.eval("document.body.textContent")).includes("sentinel-worker-bootstrap.sh uninstall"));
+  check("this controller redeems over HTTPS, so no node-key form is offered", !(await enr.eval("!!document.querySelector('#w-identity')")));
+
+  // A layout, contrast and keyboard pass over the page in the state a person works in.
+  for (const dark of [false, true]) {
+    await enr.scheme(dark);
+    await sleep(300);
+    const result = await enr.eval(CONTRAST);
+    check(`worker enrollment page, ${dark ? "dark" : "light"}: text contrast meets WCAG AA (${result.checked} elements)`, result.count === 0, result.bad);
+  }
+  await enr.scheme(false);
+  await enr.screenshot(join(cfg.out, "workers-1280.png"));
+  await enr.viewport(360, 800);
+  await sleep(300);
+  const narrow = await enr.eval(OVERFLOW);
+  check("worker enrollment page at 360px: no horizontal page scroll", narrow.scroll <= narrow.width + 1, narrow);
+  await enr.screenshot(join(cfg.out, "workers-360.png"));
+  await enr.viewport(1280, 860);
+  await enr.eval("(() => { document.activeElement && document.activeElement.blur(); document.body.tabIndex = -1; document.body.focus(); document.body.removeAttribute('tabindex'); })()");
+  const stops = [];
+  for (let i = 0; i < 90; i++) {
+    await enr.key("Tab");
+    const f = await enr.eval(FOCUS_RING);
+    if (!f) break;
+    stops.push(f);
+  }
+  check("worker enrollment page: the form and the install steps are keyboard reachable",
+    stops.some((s) => s.text.startsWith("Issue enrollment")) && stops.some((s) => s.text.startsWith("Download script")), stops.map((s) => s.text).slice(0, 40));
+  const blind = stops.filter((s) => !s.ring || !s.visible);
+  check("worker enrollment page: every tab stop shows a focus indicator", blind.length === 0, blind.slice(0, 5));
+
+  // The machine redeems through the API URL; the page then says plainly that the script is no longer served.
+  const redeemBody = (secretText, worker, print) => JSON.stringify({ secret: secretText, worker, name: "ui-1", fingerprint: print, arch: "x86_64", node_key: `nodekey:${"07".repeat(32)}` });
+  const post = (body) => fetch(`${cfg.base}/api/v1/worker-enrollments/redeem`, { method: "POST", headers: { "content-type": "application/json" }, body });
+  const worker = `wrk_${randomUUID()}`;
+  const redeemed = await post(redeemBody(secret, worker, "11".repeat(32)));
+  const redeemedBody = await redeemed.json();
+  check("the machine redeems its enrollment at the API URL", redeemed.status === 200 && redeemedBody.worker === worker && redeemedBody.tailcat_address === cfg.tailcat_address, redeemedBody.message);
+  const again = await post(redeemBody(secret, `wrk_${randomUUID()}`, "22".repeat(32)));
+  check("a second machine presenting the same secret gets the uniform refusal", again.status === 403, again.status);
+  await enr.clickText("button", "Download script");
+  await enr.waitFor("[...document.querySelectorAll('#w-script-status [role=alert]')].some((a) => a.textContent.includes('no longer pending'))", 10000, "409 sentence");
+  check("a spent enrollment's download is refused in plain words", true);
+  check("a refused download offers no file", !(await enr.eval("document.querySelector('#w-script-status').textContent.includes('matches')")));
+
+  // A direct-TLS enrollment withdrawn elsewhere while the page still lists it: the 404 is said, not hidden.
+  const stepUpIfAsked = async () => {
+    await sleep(400);
+    if (await enr.eval("!!document.querySelector('#stepup-code')")) {
+      await enr.fill("#stepup-code", cfg.password);
+      await enr.key("Enter");
+      await enr.waitFor("!document.querySelector('#stepup-code')", 10000, "step-up done");
+    }
+  };
+  await pick("#w-transport", "Direct TLS");
+  await enr.eval("document.querySelector('#w-hours').focus()");
+  await enr.key("Enter");
+  const [direct, directAddress] = await saveAndClose(1);
+  check("a direct enrollment shows the secret alone", /^sntl_[0-9a-f]{64}$/.test(direct) && directAddress === undefined);
+  await enr.waitFor("[...document.querySelectorAll('main table tbody tr')].some((r) => r.textContent.includes('pending') && r.textContent.includes('Direct TLS'))", 10000, "pending row");
+  const { body: now } = await root("GET", "/api/v1/admin/worker-enrollments");
+  const stale = now.enrollments.find((e) => e.state === "pending");
+  const gone = await root("DELETE", `/api/v1/admin/worker-enrollments/${stale.id}`);
+  check("the enrollment is withdrawn behind the page's back", gone.status === 204, gone);
+  await enr.click('main table button[aria-label^="Withdraw"]');
+  await enr.waitFor("!!document.querySelector('#w-list-error')", 10000, "404 sentence");
+  const sentence = await enr.eval("document.querySelector('#w-list-error').textContent");
+  check("withdrawing what is already gone says so plainly", sentence.includes("already used, withdrawn or gone"), sentence);
+
+  // The rate limit: issuing again and again spends the burst; the next answer says how long to wait, and the wait counts down.
+  let limited = false;
+  for (let i = 0; i < 9 && !limited; i++) {
+    await enr.eval("document.querySelector('#w-hours').focus()");
+    await enr.key("Enter");
+    await enr.waitFor("!!document.querySelector('#stepup-code') || !!document.querySelector('[role=dialog] li') || [...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('Too many requests'))", 15000, "an answer");
+    await stepUpIfAsked();
+    if (await enr.eval("!!document.querySelector('[role=dialog] li')")) await saveAndClose(1);
+    else limited = await enr.eval("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('Too many requests'))");
+  }
+  check("issuing in a burst is told to wait in plain words", limited);
+  const label = await enr.eval("[...document.querySelectorAll('form[aria-label=\"Issue a worker enrollment\"] button[type=submit]')].map((b) => b.textContent.trim() + '|' + b.disabled).join()");
+  check("a rate-limited issue disables the button and counts down", /Try again in \d+ s\|true/.test(label), label);
+  await enr.waitFor("[...document.querySelectorAll('form[aria-label=\"Issue a worker enrollment\"] button[type=submit]')].some((b) => b.textContent.trim() === 'Issue enrollment' && !b.disabled)", 20000, "countdown over");
+  check("the wait ends and the button comes back", true);
+
+  // A pending enrollment withdrawn from the page.
+  const pending = async () => (await root("GET", "/api/v1/admin/worker-enrollments")).body.enrollments.filter((e) => e.state === "pending").length;
+  const before = await pending();
+  check("enrollments are pending to withdraw", before >= 1, before);
+  await enr.click('main table button[aria-label^="Withdraw"]');
+  for (let i = 0; i < 100 && (await pending()) === before; i++) await sleep(100);
+  check("a pending enrollment is withdrawn from the page", (await pending()) === before - 1, { before, after: await pending() });
+
+  // A worker's uninstall is requested from the page, behind a confirmation.
+  await enr.waitFor("[...document.querySelectorAll('main table tbody tr')].some((r) => r.textContent.includes('ui-1'))", 10000, "worker listed");
+  await enr.click('main table button[aria-label^="Request the uninstall of"]');
+  await enr.waitFor("!!document.querySelector('[role=dialog]')", 5000, "confirmation");
+  await enr.clickText("[role=dialog] button", "Request uninstall");
+  await stepUpIfAsked();
+  let hosts = (await root("GET", "/api/v1/admin/workers")).body.workers;
+  for (let i = 0; i < 50 && hosts.some((h) => !h.uninstall_requested_ms); i++) {
+    await sleep(100);
+    hosts = (await root("GET", "/api/v1/admin/workers")).body.workers;
+  }
+  check("the uninstall is requested on the controller (or has already settled)", hosts.length === 0 || hosts.every((h) => h.uninstall_requested_ms), hosts);
+
+  // The canary: no place the page, the browser or the web process could keep the values holds them.
+  const needles = secrets.flatMap((s) => (s.startsWith("sntl_") ? [s.slice(5)] : [s]));
+  const where = (name, text) => needles.filter((n) => text.includes(n)).map(() => name);
+  const found = [];
+  for (const r of requests) found.push(...where(`request ${r.method} ${r.url.slice(0, 80)}`, `${r.url}\n${r.headers}\n${r.post}`));
+  const history = await enr.send("Page.getNavigationHistory");
+  found.push(...where("navigation history", history.entries.map((e) => e.url).join("\n")));
+  found.push(...where("location", await enr.eval("location.href")));
+  found.push(...where("web storage", await enr.eval("JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage), document.cookie])")));
+  const cookies = await enr.send("Network.getAllCookies");
+  found.push(...where("cookies", JSON.stringify(cookies.cookies)));
+  found.push(...where("indexedDB and caches", await enr.eval("(async () => JSON.stringify([await (indexedDB.databases ? indexedDB.databases() : []), await caches.keys()]))()")));
+  found.push(...where("console", enr.console.join("\n")));
+  found.push(...where("script errors", enr.errors.join("\n")));
+  found.push(...where("page text", await enr.eval("document.documentElement.outerHTML")));
+  for (const path of ["/api/v1/admin/worker-enrollments", `/api/v1/admin/worker-enrollments/${first.id}`, "/api/v1/admin/workers", "/api/v1/admin/worker-bootstrap", "/api/v1/admin/audit?limit=100"]) {
+    found.push(...where(`later answer ${path}`, JSON.stringify((await root("GET", path)).body)));
+  }
+  found.push(...where("the web process log", readFileSync(cfg.web_log, "utf8")));
+  check("the secret and the Tailcat address appear in no URL, header, request body, history, storage, cookie, console line, error, later answer or web-process log",
+    found.length === 0, found);
+  check("the canary had something to look for", needles.length >= 3 && needles.every((n) => n.length >= 30), needles.length);
+  const scriptErrors = enr.errors.filter((e) => !e.startsWith("network:"));
+  check("the enrollment page raised no script errors", scriptErrors.length === 0, scriptErrors);
+  await enr.close();
   current = page;
 });
 

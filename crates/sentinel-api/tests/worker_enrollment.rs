@@ -51,7 +51,7 @@ impl Drop for Deployment {
     }
 }
 
-fn bootstrap(dir: &std::path::Path, with_tailcat: bool) -> Arc<WorkerBootstrap> {
+fn bootstrap(dir: &std::path::Path, with_tailcat: bool, https: bool) -> Arc<WorkerBootstrap> {
     let address_file = dir.join("address");
     std::fs::write(&address_file, format!("{TAILCAT_ADDRESS}\n")).unwrap();
     Arc::new(
@@ -74,13 +74,18 @@ fn bootstrap(dir: &std::path::Path, with_tailcat: bool) -> Arc<WorkerBootstrap> 
                 region: None,
             }),
             tailcat_address_file: with_tailcat.then_some(address_file),
-            api_url: Some("http://127.0.0.1:8080".into()),
+            api_url: https.then(|| "http://127.0.0.1:8080".into()),
         })
         .unwrap(),
     )
 }
 
 fn deployment(configured: Option<bool>) -> Deployment {
+    deployment_with(configured, true)
+}
+
+/// `https` false leaves out `api_url`: workers then present the secret with the first link hello.
+fn deployment_with(configured: Option<bool>, https: bool) -> Deployment {
     let dir = tempfile::tempdir().unwrap();
     let store =
         Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
@@ -137,7 +142,7 @@ fn deployment(configured: Option<bool>) -> Deployment {
             trusted_proxies: sentinel_api::TrustedProxy::loopback(),
         },
         sentinel_api::Options {
-            worker_bootstrap: configured.map(|tailcat| bootstrap(dir.path(), tailcat)),
+            worker_bootstrap: configured.map(|tailcat| bootstrap(dir.path(), tailcat, https)),
             on_worker_enrolled: Some(sentinel_api::Notify(Arc::new(move || {
                 counted.fetch_add(1, Ordering::SeqCst);
             }))),
@@ -913,6 +918,11 @@ fn only_a_platform_administrator_reaches_any_enrollment_or_host_route() {
         ("PUT", format!("/api/v1/admin/workers/{worker}/policy")),
         ("POST", format!("/api/v1/admin/workers/{worker}/uninstall")),
         ("GET", "/api/v1/admin/placement".to_owned()),
+        ("GET", "/api/v1/admin/worker-bootstrap".to_owned()),
+        (
+            "POST",
+            format!("/api/v1/admin/worker-enrollments/{id}/node-key"),
+        ),
     ];
     let body = json!({ "pool": d.pool.to_string() });
     for (method, path) in &routes {
@@ -943,6 +953,7 @@ fn only_a_platform_administrator_reaches_any_enrollment_or_host_route() {
         "worker-uninstall-requested",
         "worker-policy-changed",
         "worker-bootstrap-downloaded",
+        "worker-node-key-authorized",
     ] {
         assert!(!events.contains(&forbidden.to_owned()), "{forbidden}");
     }
@@ -1369,4 +1380,393 @@ fn guessing_is_rate_limited_per_address_and_the_audit_trail_stays_small() {
         .filter(|e| *e == "worker-enrollment-refused")
         .count();
     assert_eq!(refused, 5);
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn options(d: &Deployment, session: &Session) -> Reply {
+    send(
+        d,
+        "GET",
+        "/api/v1/admin/worker-bootstrap",
+        None,
+        &session.headers(),
+    )
+}
+
+#[test]
+fn the_options_route_states_what_can_be_issued_and_the_digest_of_the_script_served() {
+    let d = deployment(Some(true));
+    assert_eq!(
+        send(&d, "GET", "/api/v1/admin/worker-bootstrap", None, &[]).status,
+        401
+    );
+    let tenant = tenant_administrator(&d);
+    let refused = send(
+        &d,
+        "GET",
+        "/api/v1/admin/worker-bootstrap",
+        None,
+        &[("authorization", tenant.as_str())],
+    );
+    assert!(matches!(refused.status, 403 | 404), "{}", refused.text);
+
+    let admin = administrator(&d);
+    let listed = options(&d, &admin);
+    assert_eq!(listed.status, 200, "{}", listed.text);
+    assert_eq!(listed.header("cache-control"), Some("no-store"));
+    let o = listed.json();
+    assert_eq!(o["configured"], true);
+    assert_eq!(o["release_version"], "0.1.0");
+    assert_eq!(o["redeem"], "https");
+    assert_eq!(o["archs"], json!(["x86_64", "aarch64"]));
+    assert_eq!(o["transports"]["direct"]["available"], true);
+    assert_eq!(o["transports"]["tailcat"]["available"], true);
+    assert_eq!(o["transports"]["tailcat"]["address_ready"], true);
+    assert_eq!(o["transports"]["tailcat"]["helper_version"], "0.6.0");
+
+    // The digest names the exact bytes the download serves, and the issue answer repeats it.
+    for (transport, tailcat) in [("tailcat", true), ("direct", false)] {
+        let issued = issue(
+            &d,
+            &admin,
+            json!({ "pool": d.pool.to_string(), "transport": transport }),
+        );
+        assert_eq!(issued.status, 201, "{}", issued.text);
+        let issued = issued.json();
+        let served = script_of(&d, &admin, issued["id"].as_str().unwrap());
+        assert_eq!(served.status, 200, "{}", served.text);
+        let digest = sha256_hex(served.text.as_bytes());
+        assert_eq!(o["transports"][transport]["bootstrap_sha256"], digest);
+        assert_eq!(issued["bootstrap_sha256"], digest);
+        assert_eq!(issued["redeem"], "https");
+        assert_eq!(tailcat, issued["tailcat_address"].is_string());
+        // Nothing the options carry is a credential, before or after an issue.
+        let after = options(&d, &admin);
+        assert_eq!(after.json(), o);
+        let secret = issued["secret"].as_str().unwrap();
+        assert!(!after.text.contains(&secret[5..]) && !after.text.contains(TAILCAT_ADDRESS));
+    }
+    assert_ne!(
+        o["transports"]["direct"]["bootstrap_sha256"],
+        o["transports"]["tailcat"]["bootstrap_sha256"]
+    );
+
+    // A controller that has not written its Tailcat address yet says so, before an administrator tries.
+    std::fs::remove_file(d._dir.path().join("address")).unwrap();
+    let waiting = options(&d, &admin).json();
+    assert_eq!(waiting["transports"]["tailcat"]["available"], true);
+    assert_eq!(waiting["transports"]["tailcat"]["address_ready"], false);
+}
+
+#[test]
+fn the_options_say_when_enrollment_is_unconfigured_or_direct_only_or_redeems_over_the_link() {
+    let off = deployment(None);
+    let admin = administrator(&off);
+    let answer = options(&off, &admin);
+    assert_eq!(answer.status, 200, "{}", answer.text);
+    assert_eq!(answer.json(), json!({ "configured": false }));
+
+    let direct = deployment(Some(false));
+    let admin = administrator(&direct);
+    let o = options(&direct, &admin).json();
+    assert_eq!(o["configured"], true);
+    assert_eq!(o["transports"]["direct"]["available"], true);
+    assert_eq!(o["transports"]["tailcat"]["available"], false);
+    assert_eq!(o["transports"]["tailcat"]["address_ready"], false);
+    assert_eq!(o["transports"]["tailcat"]["helper_version"], Value::Null);
+    assert_eq!(o["transports"]["tailcat"]["bootstrap_sha256"], Value::Null);
+
+    let link = deployment_with(Some(true), false);
+    let admin = administrator(&link);
+    assert_eq!(options(&link, &admin).json()["redeem"], "link");
+    let issued = issue(&link, &admin, json!({ "pool": link.pool.to_string() }));
+    assert_eq!(issued.json()["redeem"], "link");
+}
+
+fn node_key_path(enrollment: &str) -> String {
+    format!("/api/v1/admin/worker-enrollments/{enrollment}/node-key")
+}
+
+fn post_node_key(
+    d: &Deployment,
+    headers: &[(&str, &str)],
+    enrollment: &str,
+    worker: WorkerId,
+    key: u8,
+) -> Reply {
+    send(
+        d,
+        "POST",
+        &node_key_path(enrollment),
+        Some(&json!({ "worker": worker.to_string(), "node_key": node_key_text(key) })),
+        headers,
+    )
+}
+
+fn pending_keys(d: &Deployment) -> Vec<(WorkerId, [u8; 32])> {
+    d.store
+        .read(|c| workers::pending_node_keys(c, UnixMillis::now()))
+        .unwrap()
+}
+
+#[test]
+fn authorizing_a_node_key_needs_a_fresh_step_up_and_wakes_the_allow_list_pass() {
+    let d = deployment_with(Some(true), false);
+    let admin = administrator(&d);
+    let (_, id) = issue_secret(&d, &admin, "tailcat");
+    let worker = WorkerId::new();
+
+    assert_eq!(post_node_key(&d, &[], &id, worker, 7).status, 401);
+    // A browser session without a recent second factor is told to step up, and nothing is admitted.
+    let cold = sign_in(&d);
+    let asked = post_node_key(&d, &cold.headers(), &id, worker, 7);
+    assert_eq!(asked.status, 403, "{}", asked.text);
+    assert_eq!(asked.json()["details"]["step_up"], true);
+    // A bearer token never steps up: admitting a key to the Tailcat network stays a browser or host-local act.
+    let granted = tokens::provision(
+        &d.store,
+        Grant::new(d.root, "ops", Permissions::ALL),
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let bearer = format!("Bearer {}", sentinel_auth::token::format(&granted.secret));
+    let by_token = post_node_key(&d, &[("authorization", &bearer)], &id, worker, 7);
+    assert_eq!(by_token.status, 403, "{}", by_token.text);
+    assert!(pending_keys(&d).is_empty());
+    assert_eq!(d.enrolled_calls.load(Ordering::SeqCst), 0);
+
+    let done = post_node_key(&d, &admin.headers(), &id, worker, 7);
+    assert_eq!(done.status, 204, "{}", done.text);
+    assert_eq!(pending_keys(&d), vec![(worker, [7; 32])]);
+    assert_eq!(d.enrolled_calls.load(Ordering::SeqCst), 1);
+    let audit = send(
+        &d,
+        "GET",
+        "/api/v1/admin/audit?limit=100",
+        None,
+        &admin.headers(),
+    );
+    assert!(audit_events(&d, &admin).contains(&"worker-node-key-authorized".to_owned()));
+    assert!(!audit.text.contains(&"07".repeat(32)) && !audit.text.contains(&worker.to_string()));
+
+    // The same pair again is the same answer.
+    let again = post_node_key(&d, &admin.headers(), &id, worker, 7);
+    assert_eq!(again.status, 204, "{}", again.text);
+    assert_eq!(pending_keys(&d).len(), 1);
+}
+
+#[test]
+fn a_node_key_conflict_is_a_plain_409_that_changes_nothing() {
+    let d = deployment_with(Some(true), false);
+    let admin = administrator(&d);
+    let (_, first) = issue_secret(&d, &admin, "tailcat");
+    let (_, second) = issue_secret(&d, &admin, "tailcat");
+    let worker = WorkerId::new();
+    assert_eq!(
+        post_node_key(&d, &admin.headers(), &first, worker, 7).status,
+        204
+    );
+
+    // A second, different pair for the same enrollment.
+    let other = post_node_key(&d, &admin.headers(), &first, worker, 8);
+    assert_eq!(other.status, 409, "{}", other.text);
+    // A key another pending enrollment already holds.
+    let taken = post_node_key(&d, &admin.headers(), &second, WorkerId::new(), 7);
+    assert_eq!(taken.status, 409, "{}", taken.text);
+    assert_eq!(pending_keys(&d), vec![(worker, [7; 32])]);
+}
+
+#[test]
+fn a_node_key_is_refused_for_what_cannot_take_one() {
+    let d = deployment_with(Some(true), false);
+    let admin = administrator(&d);
+    let (_, direct) = issue_secret(&d, &admin, "direct");
+    let (_, spent) = issue_secret(&d, &admin, "tailcat");
+    let worker = WorkerId::new();
+
+    let on_direct = post_node_key(&d, &admin.headers(), &direct, worker, 7);
+    assert_eq!(on_direct.status, 400, "{}", on_direct.text);
+    let unknown = post_node_key(
+        &d,
+        &admin.headers(),
+        "tok_00000000-0000-4000-8000-000000000000",
+        worker,
+        7,
+    );
+    assert_eq!(unknown.status, 404, "{}", unknown.text);
+    // Withdrawn: a spent or expired enrollment takes the same path.
+    let revoked: sentinel_core::TokenId = spent.parse().unwrap();
+    d.store
+        .writer()
+        .write(move |tx| {
+            workers::revoke_enrollment(tx, Authority::HostLocal, revoked, UnixMillis::now())
+        })
+        .unwrap();
+    let late = post_node_key(&d, &admin.headers(), &spent, worker, 7);
+    assert_eq!(late.status, 409, "{}", late.text);
+    assert!(pending_keys(&d).is_empty());
+    assert_eq!(d.enrolled_calls.load(Ordering::SeqCst), 0);
+
+    // Malformed input is refused before anything is charged or written.
+    let path = node_key_path(&spent);
+    for body in [
+        json!({ "worker": worker.to_string(), "node_key": "nodekey:abc" }),
+        json!({ "worker": worker.to_string(), "node_key": "7".repeat(64) }),
+        json!({ "worker": worker.to_string(), "node_key": node_key_text(7).to_uppercase() }),
+        json!({ "worker": "not-a-worker", "node_key": node_key_text(7) }),
+        json!({ "worker": worker.to_string() }),
+        json!({ "worker": worker.to_string(), "node_key": node_key_text(7), "extra": 1 }),
+    ] {
+        let refused = send(&d, "POST", &path, Some(&body), &admin.headers());
+        assert_eq!(refused.status, 400, "{body}: {}", refused.text);
+    }
+    assert!(pending_keys(&d).is_empty());
+}
+
+#[test]
+fn node_key_authorizations_share_the_issuing_rate_limit() {
+    let d = deployment_with(Some(true), false);
+    let admin = administrator(&d);
+    let (_, id) = issue_secret(&d, &admin, "tailcat");
+    let worker = WorkerId::new();
+    let statuses: Vec<u16> = (0..7)
+        .map(|_| post_node_key(&d, &admin.headers(), &id, worker, 7).status)
+        .collect();
+    assert_eq!(&statuses[..4], &[204; 4], "{statuses:?}");
+    assert!(statuses[4..].iter().all(|s| *s == 429), "{statuses:?}");
+    let limited = post_node_key(&d, &admin.headers(), &id, worker, 7);
+    assert_eq!(limited.json()["details"]["retry_after_ms"], 6_000);
+}
+
+#[test]
+fn a_redemption_over_https_binds_only_the_authorized_worker_and_key() {
+    let d = deployment(Some(true));
+    let admin = administrator(&d);
+    let (secret, id) = issue_secret(&d, &admin, "tailcat");
+    let worker = WorkerId::new();
+    assert_eq!(
+        post_node_key(&d, &admin.headers(), &id, worker, 7).status,
+        204
+    );
+
+    // Another identifier, or another key, cannot spend a secret that was authorized for this pair.
+    let stranger = post_redeem(&d, &redeem_body(&secret, WorkerId::new(), PRINT_A, Some(7)));
+    assert_eq!(stranger.status, 403, "{}", stranger.text);
+    let wrong_key = post_redeem(&d, &redeem_body(&secret, worker, PRINT_A, Some(8)));
+    assert_eq!(wrong_key.status, 403, "{}", wrong_key.text);
+    assert_eq!(enrollment_state(&d, &admin, &id), "pending");
+
+    let reply = post_redeem(&d, &redeem_body(&secret, worker, PRINT_A, Some(7)));
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    assert_eq!(reply.json()["worker"], worker.to_string());
+    assert_eq!(enrollment_state(&d, &admin, &id), "redeemed");
+    // Spent: no further authorization, and the key leaves the pending list for the worker's own.
+    let spent = post_node_key(&d, &admin.headers(), &id, worker, 7);
+    assert_eq!(spent.status, 409, "{}", spent.text);
+    assert!(pending_keys(&d).is_empty());
+}
+
+#[test]
+fn no_credential_outlives_the_issuing_response() {
+    let d = deployment(Some(true));
+    let admin = administrator(&d);
+    let issued = issue(
+        &d,
+        &admin,
+        json!({ "pool": d.pool.to_string(), "transport": "tailcat" }),
+    );
+    assert_eq!(issued.status, 201, "{}", issued.text);
+    let issued = issued.json();
+    let (id, secret) = (
+        issued["id"].as_str().unwrap().to_owned(),
+        issued["secret"].as_str().unwrap().to_owned(),
+    );
+    let canaries = [&secret[5..], TAILCAT_ADDRESS];
+
+    // Every read an administrator has, before the machine redeems.
+    let reads = [
+        "/api/v1/admin/worker-enrollments".to_owned(),
+        format!("/api/v1/admin/worker-enrollments/{id}"),
+        format!("/api/v1/admin/worker-enrollments/{id}/bootstrap.sh"),
+        "/api/v1/admin/worker-bootstrap".to_owned(),
+        "/api/v1/admin/workers".to_owned(),
+        "/api/v1/admin/placement".to_owned(),
+        "/api/v1/admin/pools".to_owned(),
+        "/api/v1/admin/audit?limit=100".to_owned(),
+    ];
+    let mut served = Vec::new();
+    for path in &reads {
+        let reply = send(&d, "GET", path, None, &admin.headers());
+        assert_eq!(reply.status, 200, "{path}: {}", reply.text);
+        served.push(format!("{path}\n{:?}\n{}", reply.headers, reply.text));
+    }
+
+    // The machine redeems: its answer is the one place the address is meant to reach, and it never repeats the secret.
+    let reply = post_redeem(&d, &redeem_body(&secret, WorkerId::new(), PRINT_A, Some(7)));
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    assert!(reply.text.contains(TAILCAT_ADDRESS));
+    assert!(!reply.text.contains(&secret[5..]));
+    // Another enrollment is withdrawn, and a direct one issued and redeemed.
+    let (direct_secret, direct_id) = issue_secret(&d, &admin, "direct");
+    let (_, withdrawn) = issue_secret(&d, &admin, "tailcat");
+    let gone = send(
+        &d,
+        "DELETE",
+        &format!("/api/v1/admin/worker-enrollments/{withdrawn}"),
+        None,
+        &admin.headers(),
+    );
+    assert_eq!(gone.status, 204);
+    let direct = post_redeem(
+        &d,
+        &redeem_body(&direct_secret, WorkerId::new(), PRINT_B, None),
+    );
+    assert_eq!(direct.status, 200, "{}", direct.text);
+    assert!(!direct.text.contains(&direct_secret[5..]));
+
+    // And every read again, after.
+    for path in &reads {
+        let reply = send(&d, "GET", path, None, &admin.headers());
+        served.push(format!("{path}\n{:?}\n{}", reply.headers, reply.text));
+    }
+    served.push(
+        send(
+            &d,
+            "GET",
+            &format!("/api/v1/admin/worker-enrollments/{direct_id}"),
+            None,
+            &admin.headers(),
+        )
+        .text,
+    );
+    let served = served.join("\n");
+    for canary in canaries {
+        assert!(!served.contains(canary), "{canary} in an answer");
+    }
+
+    // Only the digest of the secret is stored; the address is never stored by the API at all.
+    let mut files = 0;
+    for entry in std::fs::read_dir(d._dir.path()).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.starts_with("metadata.sqlite") {
+            continue;
+        }
+        files += 1;
+        let bytes = std::fs::read(&path).unwrap();
+        for canary in canaries.iter().chain(&[&direct_secret[5..]]) {
+            assert!(
+                !bytes.windows(canary.len()).any(|w| w == canary.as_bytes()),
+                "{canary} in {name}"
+            );
+        }
+    }
+    assert!(files >= 1);
 }
