@@ -190,11 +190,17 @@ fn store_fault(
         Err(error) if error.is_transient() => Fault::Down,
         // A row that rejects even the write that parks it would stay at the head of the queue and be
         // retried before every healthy row. Leave it out of the batch in memory instead.
+        // The strikes are kept one short of the limit: when the skip lapses the row goes straight back to
+        // the park write instead of breaking the batch for two more back-off rounds ahead of the healthy rows.
         Err(_) if poison.skipped.len() < MAX_SKIPPED || poison.skipped.contains_key(&id) => {
             poison.skipped.insert(id, Instant::now() + SKIP_FOR);
+            poison.strikes.insert(id, QUARANTINE_AFTER - 1);
             Fault::Skipped
         }
-        Err(_) => Fault::Down,
+        Err(_) => {
+            poison.strikes.insert(id, QUARANTINE_AFTER - 1);
+            Fault::Down
+        }
     }
 }
 
@@ -303,7 +309,7 @@ fn run(
             let deadline = if hidden {
                 (polled + config.idle).min(next_rearm)
             } else {
-                wake_at(store, config, polled, next_rearm)
+                wake_at(store, config, polled, next_rearm, seen)
             };
             store.changes().wait_past(seen, deadline);
             if let Some(rest) = COMMIT_GAP.min(config.idle).checked_sub(polled.elapsed()) {
@@ -446,8 +452,18 @@ fn run(
     }
 }
 
-fn wake_at(store: &Store, config: &Config, from: Instant, next_rearm: Instant) -> Instant {
+fn wake_at(
+    store: &Store,
+    config: &Config,
+    from: Instant,
+    next_rearm: Instant,
+    seen: u64,
+) -> Instant {
     let ceiling = (from + config.idle).min(next_rearm);
+    // A commit since `seen` ends the wait at once, so the earliest-row read would be wasted.
+    if store.changes().generation() != seen {
+        return ceiling;
+    }
     match store.read(checks::next_due_ms) {
         Ok(Some(due_ms)) => {
             let wait_ms = due_ms.saturating_sub(UnixMillis::now().0).max(0) as u64;
@@ -508,5 +524,40 @@ mod tests {
         }
         assert!(poison.strikes.is_empty());
         assert!(poison.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_skipped_row_goes_straight_back_to_the_park_write_when_the_skip_lapses() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
+        // With the table gone, every write that parks a row fails for a reason that is not transient.
+        store
+            .writer()
+            .write(|tx| {
+                tx.execute_batch(
+                    "ALTER TABLE check_publications RENAME TO check_publications_gone",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let error = StoreError::InvalidInput("row");
+        let mut poison = Poison::default();
+        let id = CheckId::new();
+        for _ in 0..QUARANTINE_AFTER - 1 {
+            assert!(matches!(
+                store_fault(&store, &mut poison, id, 1, &error),
+                Fault::Down
+            ));
+        }
+        assert!(matches!(
+            store_fault(&store, &mut poison, id, 1, &error),
+            Fault::Skipped
+        ));
+        // The skip lapses: the next failure must not break the batch with two more strikes first.
+        poison.skipped.clear();
+        assert!(matches!(
+            store_fault(&store, &mut poison, id, 1, &error),
+            Fault::Skipped
+        ));
     }
 }

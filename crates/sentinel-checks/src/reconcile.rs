@@ -463,12 +463,18 @@ fn sleep_until_work(
     polled: Instant,
 ) {
     let ceiling = polled + config.idle;
-    let deadline = match store.read(github_events::next_due_ms) {
-        Ok(Some(due_ms)) => {
-            let wait_ms = due_ms.saturating_sub(UnixMillis::now().0).max(0) as u64;
-            (polled + Duration::from_millis(wait_ms)).min(ceiling)
+    // A commit since `seen` ends the wait at once, so the earliest-row read would be wasted: on a busy
+    // store this keeps the lane at one read per gap, as the fixed poll it replaced.
+    let deadline = if store.changes().generation() != seen {
+        ceiling
+    } else {
+        match store.read(github_events::next_due_ms) {
+            Ok(Some(due_ms)) => {
+                let wait_ms = due_ms.saturating_sub(UnixMillis::now().0).max(0) as u64;
+                (polled + Duration::from_millis(wait_ms)).min(ceiling)
+            }
+            _ => ceiling,
         }
-        _ => ceiling,
     };
     store.changes().wait_past(seen, deadline);
     if let Some(rest) = COMMIT_GAP.min(config.idle).checked_sub(polled.elapsed()) {
