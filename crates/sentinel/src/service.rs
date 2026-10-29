@@ -1404,6 +1404,7 @@ pub(crate) fn check_worker(config: PathBuf, data_dir: PathBuf) -> Result<(), Err
         check: true,
         log_format: None,
         log_level: None,
+        manual_destinations: None,
     };
     let mut io = Executor::new(WorkClass::BlockingIo, 1)
         .map_err(|error| Error::runtime(format!("cannot start I/O lane: {error}")))?;
@@ -1909,7 +1910,7 @@ fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
     let wall = sentinel_core::UnixMillis::now();
     // Idempotency keys are stamped by the deadline clock, so their TTL is judged on it.
     let steady = sentinel_core::UnixMillis::steady();
-    let purges: [(&str, Purge, sentinel_core::UnixMillis); 9] = [
+    let purges: [(&str, Purge, sentinel_core::UnixMillis); 10] = [
         ("setup", sentinel_store::setup::purge, wall),
         ("github_app_states", sentinel_store::github_app::purge, wall),
         ("oauth", sentinel_store::oauth::purge_expired, wall),

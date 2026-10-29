@@ -2294,6 +2294,8 @@ mod tests {
             firecracker: dir.path().join("firecracker"),
             kernel: dir.path().join("vmlinux"),
             agent: dir.path().join("sentinel-agent"),
+            snapshots: true,
+            guard: net::Guard::default(),
         };
         let error = setup.check().unwrap_err();
         assert!(error.contains("firecracker "), "{error}");
