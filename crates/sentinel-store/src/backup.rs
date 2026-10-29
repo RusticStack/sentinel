@@ -63,6 +63,7 @@ fn private_dir_all(dir: &Path) -> std::io::Result<()> {
 
 /// Files this module creates are owner-only from the first byte, so the key files are never readable between a copy and a chmod.
 fn private_file() -> OpenOptions {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = OpenOptions::new();
     #[cfg(unix)]
     {
