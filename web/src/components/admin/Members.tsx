@@ -1,7 +1,8 @@
 import { useState } from "react";
 import type { Member, NamespaceSettings } from "../../lib/types";
-import { api } from "../../lib/api.ts";
+import { api, ApiError } from "../../lib/api.ts";
 import { act } from "../../lib/act.tsx";
+import { memberTarget } from "../../lib/members.ts";
 import { refreshTenants, useSession } from "../../lib/session.ts";
 import { useOverride } from "../../lib/override.ts";
 import { attempt, useLoad, type Load } from "../../lib/loaded.ts";
@@ -24,6 +25,7 @@ export function Members({ slug, settings, initial }: { slug: string; settings: N
   const githubManaged = settings?.membership === "github";
   const personal = settings?.kind === "personal";
   const [who, setWho] = useState("");
+  const [whoError, setWhoError] = useState("");
   const [role, setRole] = useState("reader");
   const base = `/api/v1/tenants/${encodeURIComponent(slug)}/members`;
 
@@ -36,7 +38,18 @@ export function Members({ slug, settings, initial }: { slug: string; settings: N
   async function add(e: React.FormEvent) {
     e.preventDefault();
     if (!ready()) return;
-    if (await act(me, `Add ${who}`, () => api(`${base}/${encodeURIComponent(who)}`, { method: "PUT", body: withReason({ role }) }))) {
+    const target = memberTarget(who, data?.members ?? [], !data?.next);
+    if ("problem" in target) { setWhoError(target.problem); return; }
+    setWhoError("");
+    const name = who.trim();
+    const call = () => api(`${base}/${encodeURIComponent(target.path)}`, { method: "PUT", body: withReason({ role }) });
+    // A name beyond the first page that is no member's is the controller's `not_found`; say what it means here.
+    const added = await act(me, `Add ${name}`, target.unlisted ? () => call().catch((x) => {
+      throw x instanceof ApiError && x.code === "not_found"
+        ? new ApiError(400, { code: "invalid_request", message: "no member has that name; add someone who is not a member yet by user id (usr_…)" })
+        : x;
+    }) : call);
+    if (added) {
       setWho("");
       await refresh();
     }
@@ -100,8 +113,10 @@ export function Members({ slug, settings, initial }: { slug: string; settings: N
             ? <p className="text-sm text-muted">To add someone who has no account yet, <TextLink to={`/t/${slug}/admin/invitations`}>invite them by email</TextLink>.</p>
             : null}
           <form className="flex flex-wrap items-end gap-3" aria-label="Add a member" onSubmit={add}>
-            <Field label="Username or user id" htmlFor="m-user">
-              <Input id="m-user" name="who" value={who} onChange={(e) => setWho(e.target.value)} required autoComplete="off" className="w-56 max-w-full" />
+            <Field label="User id (usr_…)" htmlFor="m-user" error={whoError}
+              help="A member's username also works, to change their role.">
+              <Input id="m-user" name="who" value={who} onChange={(e) => { setWho(e.target.value); setWhoError(""); }} required autoComplete="off" spellCheck={false}
+                aria-invalid={whoError ? true : undefined} className="w-72 max-w-full" />
             </Field>
             <Select id="m-role" label="Role" ariaLabel="Role" value={role} onChange={setRole} items={ROLES} className="w-36" />
             <Button type="submit" icon="user-plus" label="Add or change" />

@@ -182,6 +182,7 @@ function Account() {
   return (
     <Page id="account" title="Account security">
       <div className="max-w-3xl space-y-6">
+        {me ? <p className="text-sm text-muted">Your user id is <code id="my-user-id" className="select-all font-mono text-strong">{me.user}</code>. An organization&apos;s administrator needs it to add you.</p> : null}
         {loadError || !security ? (
           <Alert color="error" icon="circle-alert" title="Could not load your account's security settings." description={loadError} role="alert">
             <Button size="sm" color="neutral" variant="outline" label="Try again" className="mt-1" onClick={() => { void refresh(); }} />
