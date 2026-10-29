@@ -46,7 +46,7 @@ scripts/release/package.sh verify --out dist
 
 ## Verification record
 
-`package.sh build` and `verify` ran clean from a clean checkout of the same commit on both Linux hosts: x86_64 (12 cores, with the pinned microVM inputs; the worker package carries `microvm/`) and aarch64 (2 vCPU, about 11 minutes of release builds). On aarch64 the worker package holds a `AArch64` binary, no `microvm/` and no Firecracker or kernel file, `worker --check` accepts a configuration, and the manifest lists `tailcat` for both architectures. `worker --check` on the x86_64 host reports `microvm=unavailable: no usable /dev/kvm` because that host has no KVM; a microVM run needs a KVM host. Digests of that build (the digests change with every commit, so re-run it for a release):
+`package.sh build` and `verify` ran clean from a clean checkout of the same commit on both Linux hosts: x86_64 (12 cores, with the pinned microVM inputs; the worker package carries `microvm/`) and aarch64 (2 vCPU). On aarch64 the worker package holds a `AArch64` binary, no `microvm/` and no Firecracker or kernel file, `worker --check` accepts a configuration, and the manifest lists `tailcat` for both architectures. `worker --check` on the x86_64 host reports `microvm=unavailable: no usable /dev/kvm` because that host has no KVM; a microVM run needs a KVM host. Digests of that build (the digests change with every commit, so re-run it for a release):
 
 ```
 x86_64  cli     a6ba30e0f7fe4579590257d89347b4bc77cf6933fc231a75f04b3f5ee54f5241

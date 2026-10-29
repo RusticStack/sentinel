@@ -60,7 +60,7 @@ Not covered: the `io` and `cpuset` controllers are not delegated in this rootles
 Findings and decision:
 
 - Reflink clones are about 15 µs per file regardless of size, so a 20k-file cache tree attaches in ~0.3 s and shares blocks. On XFS and Btrfs `std::fs::copy` (`copy_file_range`) already reflinks transparently, which is why it matches `FICLONE`; on ext4 it still copies bytes but stays fast for small files through the kernel path.
-- The safe copy costs 1–2 s for 312 MiB of small files: acceptable as a fallback but 3–6x a reflink, and it grows with bytes rather than file count.
+- The safe copy costs 1–2 s for 312 MiB of small files: acceptable as a fallback but on the order of 3–6x a reflink (order-confounded, see above), and it grows with bytes rather than file count.
 - **First-touch cost is real and separate:** reading a fresh reflink clone took 0.7–1.1 s because its pages were not in cache, while the byte copy's pages were. Cache attachment time must never be reported as cache readiness; the [cache](cache.md) contract already says so.
 - Per-file cost dominates for small files, so any clone backend will be `O(files)`; whole-tree snapshots (Btrfs subvolume, LVM) are the only way below that and remain a later, measured option.
 - **Decision: implement cache materialisation as `FICLONE` per file with an explicit read/write fallback, detected per filesystem at worker start; recommend XFS with `reflink=1` or Btrfs for worker cache volumes and document ext4 as the slow-but-correct path.**
@@ -102,10 +102,10 @@ Findings and decision:
 
 Findings and decision:
 
-- The snapshot is ~40x the per-file reflink and ~370x the byte copy at this shape — one `btrfs subvolume snapshot` syscall replaces the whole walk, so its cost is O(1) in files where the others are O(files).
+- The snapshot is on the order of 40x the per-file reflink and 370x the byte copy at this shape (order-confounded, see above) — one `btrfs subvolume snapshot` syscall replaces the whole walk, so its cost is O(1) in files where the others are O(files).
 - Adopting it is not a backend flag, it is a layout commitment: the source of a snapshot must itself be a btrfs subvolume, so every generation's `payload/<i>` would have to be created as a subvolume by publish, GC would need `btrfs subvolume delete` instead of `rm -rf`, and the on-disk layout would differ between btrfs and every other filesystem.
 - The win also only exists on btrfs: XFS — the other recommended cache filesystem — has reflinks but no subvolume snapshots, and ext4 has neither. A snapshot backend therefore *adds* a second layout without removing the per-file path every other filesystem still needs.
-- **Decision: keep per-file `FICLONE` with the explicit copy fallback.** The measured per-file cost (~12 µs, 0.38 s for 20k files) is already small against any job that restores a cache; the snapshot's 40x margin does not justify a filesystem-specific store layout. Revisit only if restore time is ever shown to dominate short jobs — the subvolume layout is the documented escape hatch, and `--mode snapshot` stays in the probe for exactly that re-measurement.
+- **Decision: keep per-file `FICLONE` with the explicit copy fallback.** The measured per-file cost (~12 µs, 0.38 s for 20k files) is already small against any job that restores a cache; the snapshot's lower cost does not justify a filesystem-specific store layout, given the layout commitments in the bullets above. Revisit only if restore time is ever shown to dominate short jobs — the subvolume layout is the documented escape hatch, and `--mode snapshot` stays in the probe for exactly that re-measurement.
 
 ## What remains
 

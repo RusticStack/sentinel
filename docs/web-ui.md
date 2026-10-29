@@ -146,7 +146,7 @@ The reverse proxy terminates TLS and sends everything for the public origin to `
 
 ## Stack choice
 
-`web/bench/log-view.mjs` renders the same 200,000-line log (127-character lines in 32 KiB frames) four ways in a real browser, three fresh pages each, and records medians in [`bench/u01-log-view.jsonl`](../bench/u01-log-view.jsonl) (Edge 154, i7-13700KF):
+`web/bench/log-view.mjs` renders the same 200,000-line log (127-character lines in 32 KiB frames) four ways in a real browser, five fresh pages each (three in the earlier VPS record), and records medians in [`bench/u01-log-view.jsonl`](../bench/u01-log-view.jsonl) (Edge 154, i7-13700KF):
 
 | Candidate | Shipped JS (gzip) | Ingest + first paint | Elements | Work per scroll jump |
 |---|---|---|---|---|
