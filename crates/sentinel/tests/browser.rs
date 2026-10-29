@@ -8,6 +8,7 @@ use std::{
 
 const URL: &str = "SENTINEL_BROWSER_TEST_URL";
 const LAUNCH: &str = "SENTINEL_BROWSER_TEST_LAUNCH";
+const MISSING: &str = "SENTINEL_BROWSER_TEST_MISSING";
 const ARGV_FILE: &str = "argv.bin";
 const ENV_FILE: &str = "env.bin";
 
@@ -25,7 +26,12 @@ fn main() -> ExitCode {
     if let Some(url) = std::env::var_os(URL) {
         let url = url.into_string().expect("a UTF-8 URL");
         let launch = std::env::var_os(LAUNCH).is_some();
-        if cfg!(windows) {
+        if std::env::var_os(MISSING).is_some() {
+            let absent = me.with_file_name("no-such-opener");
+            sentinel::browser::open_with(&url, launch, |url| {
+                sentinel::browser::command_with(&absent, url)
+            });
+        } else if cfg!(windows) {
             let stand_in = me.with_file_name(OPENER);
             sentinel::browser::open_with(&url, launch, |url| {
                 sentinel::browser::command_with(&stand_in, url)
@@ -35,7 +41,7 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
-    let tests: [(&str, fn()); 4] = [
+    let tests: [(&str, fn()); 6] = [
         (
             "the_opener_command_is_the_platform_launcher_with_the_url_as_one_argument",
             the_opener_command_is_the_platform_launcher_with_the_url_as_one_argument,
@@ -51,6 +57,14 @@ fn main() -> ExitCode {
         (
             "no_browser_prints_the_url_and_launches_nothing",
             no_browser_prints_the_url_and_launches_nothing,
+        ),
+        (
+            "a_launcher_that_cannot_start_falls_back_to_the_printed_url_without_leaking_it",
+            a_launcher_that_cannot_start_falls_back_to_the_printed_url_without_leaking_it,
+        ),
+        (
+            "a_missing_platform_opener_on_path_falls_back_to_the_printed_url",
+            a_missing_platform_opener_on_path_falls_back_to_the_printed_url,
         ),
     ];
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -136,6 +150,18 @@ impl Stage {
     }
 
     fn open(&self, url: &str, launch: bool) -> String {
+        let output = self.run(url, launch, false, false);
+        String::from_utf8(output.stderr).expect("UTF-8 stderr")
+    }
+
+    /// `missing` swaps in a launcher that does not exist; `no_opener_on_path` (Unix) hides the stand-in from `PATH`.
+    fn run(
+        &self,
+        url: &str,
+        launch: bool,
+        missing: bool,
+        no_opener_on_path: bool,
+    ) -> std::process::Output {
         let mut command = Command::new(&self.runner);
         command
             .env(URL, url)
@@ -147,17 +173,26 @@ impl Stage {
         } else {
             command.env_remove(LAUNCH);
         }
+        if missing {
+            command.env(MISSING, "1");
+        }
         if cfg!(unix) {
-            let mut path = OsString::from(self.dir.path());
-            if let Some(inherited) = std::env::var_os("PATH") {
-                path.push(":");
-                path.push(inherited);
+            if no_opener_on_path {
+                let empty = self.dir.path().join("empty-path");
+                fs::create_dir_all(&empty).expect("empty PATH directory");
+                command.env("PATH", empty);
+            } else {
+                let mut path = OsString::from(self.dir.path());
+                if let Some(inherited) = std::env::var_os("PATH") {
+                    path.push(":");
+                    path.push(inherited);
+                }
+                command.env("PATH", path);
             }
-            command.env("PATH", path);
         }
         let output = command.output().expect("run the runner");
         assert!(output.status.success(), "the runner failed: {output:?}");
-        String::from_utf8(output.stderr).expect("UTF-8 stderr")
+        output
     }
 
     /// Call after [`Stage::received`]: the environment is recorded before the argv is published.
@@ -259,4 +294,54 @@ fn no_browser_prints_the_url_and_launches_nothing() {
     assert!(stderr.contains(url), "{stderr}");
     assert!(!stderr.contains("A browser window should open"), "{stderr}");
     stage.assert_nothing_launched();
+}
+
+/// The URL carries the one-time `state` and PKCE challenge, so it is printed once for the user and appears nowhere else.
+fn assert_fell_back(stage: &Stage, output: &std::process::Output, url: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches(url).count(),
+        1,
+        "the URL appears once: {stderr}"
+    );
+    assert!(stderr.contains("Could not start a browser"), "{stderr}");
+    assert!(stderr.contains("open the URL above yourself"), "{stderr}");
+    assert!(!stderr.contains("A browser window should open"), "{stderr}");
+    let error_line = stderr
+        .lines()
+        .find(|l| l.contains("Could not start a browser"))
+        .expect("the fallback line");
+    assert!(!error_line.contains("state="), "{error_line}");
+    assert!(
+        output.stdout.is_empty(),
+        "stdout carries nothing: {output:?}"
+    );
+    stage.assert_nothing_launched();
+    for entry in fs::read_dir(stage.dir.path()).expect("list the stage") {
+        let path = entry.expect("entry").path();
+        if path.is_file() && path != stage.runner && path.file_name().is_some_and(|n| n != OPENER) {
+            let text = fs::read(&path).expect("read");
+            assert!(
+                !String::from_utf8_lossy(&text).contains("state="),
+                "{path:?} leaked the URL"
+            );
+        }
+    }
+}
+
+fn a_launcher_that_cannot_start_falls_back_to_the_printed_url_without_leaking_it() {
+    let stage = Stage::new();
+    let url = "https://example.test/sign-in?state=abc123&code_challenge=zzz";
+    let output = stage.run(url, true, true, false);
+    assert_fell_back(&stage, &output, url);
+}
+
+fn a_missing_platform_opener_on_path_falls_back_to_the_printed_url() {
+    if !cfg!(unix) {
+        return;
+    }
+    let stage = Stage::new();
+    let url = "https://example.test/sign-in?state=def456&code_challenge=yyy";
+    let output = stage.run(url, true, false, true);
+    assert_fell_back(&stage, &output, url);
 }
