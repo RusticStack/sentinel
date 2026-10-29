@@ -3891,6 +3891,48 @@ mod tests {
         assert!(rank(huge) < rank(tiny));
     }
 
+    /// The ordering step of one placement round (the sort key of every free worker, then the sort) at
+    /// the fleet size of `tests/fleet_sessions.rs`. Ignored because it measures time:
+    /// `cargo test --release -p sentinel-link --lib ranking_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "ordering cost: cargo test --release -p sentinel-link --lib ranking_cost -- --ignored --nocapture"]
+    fn ranking_cost_stays_microseconds_for_a_hundred_and_a_thousand_workers() {
+        for (workers, bound_us) in [(100usize, 2_000u128), (1_000, 20_000)] {
+            let entries: Vec<(WorkerId, i32, Standing)> = (0..workers)
+                .map(|i| {
+                    let n = i as i64;
+                    let key = u32::try_from(i).unwrap().to_be_bytes();
+                    let mut bytes = [0u8; 16];
+                    bytes[..4].copy_from_slice(&key);
+                    bytes[6] = 0x40;
+                    bytes[8] = 0x80;
+                    (
+                        WorkerId::from_bytes(bytes).unwrap(),
+                        i32::try_from(i % 7).unwrap() - 3,
+                        standing(2_000 + (n % 5) * 2_000, (n % 9) * 500, (n % 4) * (1 << 30)),
+                    )
+                })
+                .collect();
+            for order in [PlacementOrder::Fastest, PlacementOrder::Priority] {
+                let rounds = 200u32;
+                let start = std::time::Instant::now();
+                for _ in 0..rounds {
+                    std::hint::black_box(ranking(order, std::hint::black_box(&entries)));
+                }
+                let per_round = start.elapsed() / rounds;
+                println!(
+                    "ranking_cost workers={workers} order={} per_round_ns={}",
+                    order.as_str(),
+                    per_round.as_nanos()
+                );
+                assert!(
+                    per_round.as_micros() < bound_us,
+                    "ordering {workers} workers took {per_round:?} per round"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_spec_desk_serves_a_burst_past_its_resolver_bound_in_order() {
         let desk = std::sync::Arc::new(SpecDesk::<usize>::new());
