@@ -64,6 +64,24 @@ async function browserApi<T>(path: string, opts: ApiOptions): Promise<T> {
   return body as T;
 }
 
+/** The bytes of a GET answer, for a download the page checks before it offers it. Browser only: never part of a server render. */
+export async function apiBytes(path: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+  let response: Response;
+  try {
+    response = await fetch(path, { method: "GET", credentials: "same-origin", signal });
+  } catch (e) {
+    if ((e as Error)?.name === "AbortError") throw e;
+    throw new ApiError(0, null);
+  }
+  if (!response.ok) {
+    let body: any = null;
+    try { body = JSON.parse(await response.text()); } catch { body = null; }
+    if (response.status === 401) unauthorized?.();
+    throw new ApiError(response.status, body);
+  }
+  return response.arrayBuffer();
+}
+
 const call = createIsomorphicFn()
   .server(async (path: string, opts: ApiOptions): Promise<unknown> => {
     const { serverApi } = await import("./api.server.ts");

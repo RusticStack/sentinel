@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use fixture::{Fixture, PASSWORD};
+use fixture::{Fixture, PASSWORD, TAILCAT_ADDRESS};
 use serde_json::json;
 
 fn repo_root() -> std::path::PathBuf {
@@ -41,19 +41,27 @@ fn free_port() -> u16 {
 /// names another build of it.
 struct Web(Vec<Child>);
 
-fn spawn_web(server: &std::path::Path, port: u16, envs: &[(&str, String)]) -> Child {
+/// The web process writes everything it prints to `log`, so a test can assert it never held a secret.
+fn spawn_web(
+    server: &std::path::Path,
+    port: u16,
+    envs: &[(&str, String)],
+    log: &std::path::Path,
+) -> Child {
     assert!(
         server.exists(),
         "build the web interface first: {} is missing",
         server.display()
     );
+    let out = std::fs::File::create(log).expect("create the web log");
+    let err = out.try_clone().expect("share the web log");
     let mut command = Command::new(node());
     command
         .arg(server)
         .env("PORT", port.to_string())
         .env("HOST", "127.0.0.1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err));
     for (k, v) in envs {
         command.env(k, v);
     }
@@ -70,7 +78,7 @@ fn spawn_web(server: &std::path::Path, port: u16, envs: &[(&str, String)]) -> Ch
 }
 
 impl Web {
-    fn start(port: u16, api: &str) -> Web {
+    fn start(port: u16, api: &str, log: &std::path::Path) -> Web {
         let server = std::env::var_os("SENTINEL_WEB_SERVER")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| repo_root().join("web/.output/server/index.mjs"));
@@ -81,7 +89,12 @@ impl Web {
         } else {
             "SENTINEL_API"
         };
-        Web(vec![spawn_web(&server, port, &[(name, api.to_owned())])])
+        Web(vec![spawn_web(
+            &server,
+            port,
+            &[(name, api.to_owned())],
+            log,
+        )])
     }
 
     fn pids(&self) -> Vec<u32> {
@@ -128,6 +141,8 @@ fn config(f: &Fixture, base: &str, web: &str, out: &std::path::Path) -> serde_js
         "dana": f.dana.to_string(),
         "rui": f.rui.to_string(),
         "subscribers_per_user": sentinel_api::SUBSCRIBERS_PER_USER,
+        "web_log": f.dir.path().join("web.log"),
+        "tailcat_address": TAILCAT_ADDRESS,
     })
 }
 
@@ -154,7 +169,7 @@ fn deployment(bulk_mib: usize, relayed: bool) -> (Arc<Fixture>, Web, String, Str
             )
         })
         .unwrap();
-    let web = Web::start(port, &f.base);
+    let web = Web::start(port, &f.base, &f.dir.path().join("web.log"));
     (f, web, web_addr, origin)
 }
 
@@ -183,6 +198,18 @@ fn the_web_interface_in_a_real_browser() {
     stop.store(true, Ordering::Release);
     writer.join().unwrap();
     drop(web);
+    if !status.success() {
+        let log = std::fs::read_to_string(f.dir.path().join("web.log")).unwrap_or_default();
+        let tail: Vec<&str> = log.lines().rev().take(40).collect();
+        eprintln!(
+            "web process output (last lines):
+{}",
+            tail.into_iter().rev().collect::<Vec<_>>().join(
+                "
+"
+            )
+        );
+    }
     assert!(status.success(), "ui.mjs failed: {status}");
 }
 
@@ -235,7 +262,11 @@ fn the_setup_wizard_in_a_real_browser() {
         .unwrap();
     let mut token_text = String::new();
     token.expose(&mut token_text);
-    let web = Web::start(port, &format!("http://{}", server.local_addr()));
+    let web = Web::start(
+        port,
+        &format!("http://{}", server.local_addr()),
+        &dir.path().join("web.log"),
+    );
     let out = match std::env::var_os("SENTINEL_UI_OUT") {
         Some(dir) => std::path::PathBuf::from(dir),
         None => dir.path().join("ui"),

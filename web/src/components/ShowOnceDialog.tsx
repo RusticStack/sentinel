@@ -3,13 +3,14 @@ import { useEffect, useRef, useState } from "react";
 import { openOverlay } from "../lib/overlay.tsx";
 import { Button, Checkbox, DialogModal } from "./ui.tsx";
 
-export interface ShowOnce { title: string; description: string; secrets: string[]; filename: string; note?: string }
+/** `labels` name each value on screen and to assistive technology; the copied and downloaded text stays the bare values. */
+export interface ShowOnce { title: string; description: string; secrets: string[]; filename: string; note?: string; labels?: string[] }
 
 export function showOnce(props: ShowOnce): Promise<void> {
   return openOverlay<void>((close) => <ShowOnceDialog {...props} onClose={() => close()} />);
 }
 
-function ShowOnceDialog({ title, description, secrets, filename, note, onClose }: ShowOnce & { onClose: () => void }) {
+function ShowOnceDialog({ title, description, secrets, filename, note, labels, onClose }: ShowOnce & { onClose: () => void }) {
   const [values, setValues] = useState<string[]>([...secrets]);
   const [saved, setSaved] = useState(false);
   const [status, setStatus] = useState("");
@@ -44,7 +45,12 @@ function ShowOnceDialog({ title, description, secrets, filename, note, onClose }
     <DialogModal isOpen dismissable={false} onClose={() => {}} title={title} description={description} wide={values.length > 1}
       footer={<Button label="Done" disabled={!saved} onClick={done} />}>
       <ul className={values.length > 1 ? "grid grid-cols-1 gap-2 sm:grid-cols-2" : ""} aria-label={title}>
-        {values.map((v, i) => <li key={i} className="select-all break-all rounded-md border border-line bg-subtle px-3 py-2 font-mono text-sm">{v}</li>)}
+        {values.map((v, i) => labels?.[i] ? (
+          <li key={i} className="break-all rounded-md border border-line bg-subtle px-3 py-2">
+            <span className="block text-xs text-muted">{labels[i]}</span>
+            <span data-secret="" className="select-all font-mono text-sm">{v}</span>
+          </li>
+        ) : <li key={i} className="select-all break-all rounded-md border border-line bg-subtle px-3 py-2 font-mono text-sm">{v}</li>)}
       </ul>
       {note ? <p className="text-sm text-muted">{note}</p> : null}
       <div className="flex flex-wrap gap-2">
