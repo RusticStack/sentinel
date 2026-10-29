@@ -1,0 +1,26 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "store-cost",
+  "revision": 1,
+  "harness": {
+    "example": "store-cost-bench",
+    "build": "cargo build --release --locked -p sentinel-store --example store-cost-bench"
+  },
+  "run": {
+    "args": ["--modes", "reapply,checkpoint,capacity", "--rounds", "5", "--rows", "100000", "--batches", "64,512,8192", "--readers", "1,4", "--wal-rows", "2000", "--history", "1000,10000,100000", "--calls", "2000", "--seed", "1", "--max-gib", "4"],
+    "smoke_args": ["--modes", "reapply,checkpoint,capacity", "--rounds", "2", "--rows", "300", "--batches", "16,64", "--readers", "1", "--wal-rows", "50", "--history", "50,300", "--calls", "50", "--seed", "1", "--max-gib", "1"],
+    "dir": true
+  },
+  "ordering": {
+    "scheme": "abba",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/store-cost/1",
+    "out": "bench/store-cost.jsonl"
+  },
+  "notes": "Case order reverses every round (ABBA) inside the reapply and checkpoint modes; the capacity history grows, so its sizes run ascending. The bench refuses a combination above --max-gib before writing anything."
+}
