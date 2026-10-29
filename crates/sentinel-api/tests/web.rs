@@ -1205,6 +1205,26 @@ fn a_full_external_copy_backlog_is_what_the_queue_and_the_storage_report_say() {
     assert_eq!(body["admission_open"], false);
     assert_eq!(body["s3"]["state"], "degraded");
     assert_eq!(body["s3"]["backlog_full"], true);
+    // Skipped objects are visible beside a healthy-looking copy: in the status and as metrics.
+    status
+        .local_faults
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+    status
+        .parked_items
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    let (_, body) = get(&f, "/api/v1/admin/storage", &f.auth);
+    assert_eq!(body["s3"]["local_faults"], 3);
+    assert_eq!(body["s3"]["parked_items"], 2);
+    let (_, _, text) = call(
+        &f.base,
+        "GET",
+        "/metrics",
+        None,
+        &[("authorization", &f.auth)],
+    );
+    let text = text.as_str().expect("text exposition");
+    assert!(text.contains("sentinel_s3_local_faults_total 3"), "{text}");
+    assert!(text.contains("sentinel_s3_parked_items 2"), "{text}");
 
     admission.set_backlog_full(false);
     assert_eq!(reasons(), before);

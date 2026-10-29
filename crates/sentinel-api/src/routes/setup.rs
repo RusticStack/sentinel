@@ -274,7 +274,9 @@ fn mail_test(state: &State, request: &mut Request) -> Route {
     match sent {
         Ok(()) => ok(json!({ "sent": true })),
         Err(Failure::Transient { why, .. }) => not_sent("transient", brief(&why)),
-        Err(Failure::Permanent(reason)) => not_sent("permanent", brief(&reason)),
+        Err(Failure::Permanent(reason) | Failure::Service(reason)) => {
+            not_sent("permanent", brief(&reason))
+        }
     }
 }
 

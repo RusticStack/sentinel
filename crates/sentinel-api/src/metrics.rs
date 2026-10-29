@@ -409,6 +409,53 @@ pub(crate) fn render(state: &State) -> String {
             "Replicator passes failed in a row.",
             r.consecutive_failures.load(Relaxed),
         );
+        out.one(
+            "sentinel_s3_local_faults_total",
+            "counter",
+            "Distinct objects and logs found damaged or missing locally since start, each counted once; healthy stays 1 while they are skipped.",
+            r.local_faults.load(Relaxed),
+        );
+        out.one(
+            "sentinel_s3_parked_items",
+            "gauge",
+            "Objects, logs and queued deletes set aside after a local fault or a refusal for that item, retried with a growing delay.",
+            r.parked_items.load(Relaxed),
+        );
+        out.one(
+            "sentinel_s3_parked_bytes",
+            "gauge",
+            "Bytes of parked objects. They still count in the backlog.",
+            r.parked_bytes.load(Relaxed),
+        );
+    }
+    if state
+        .store
+        .read(sentinel_store::email::delivery_enabled)
+        .unwrap_or(false)
+        && let Ok((pending, delivered, abandoned)) = state.store.read(sentinel_store::email::counts)
+    {
+        out.family(
+            "sentinel_mail_outbox",
+            "gauge",
+            "Messages in the mail outbox by state; delivered and abandoned rows are purged after a while.",
+        );
+        out.value("sentinel_mail_outbox", "state=\"pending\"", pending);
+        out.value("sentinel_mail_outbox", "state=\"delivered\"", delivered);
+        out.value("sentinel_mail_outbox", "state=\"abandoned\"", abandoned);
+        let oldest = state
+            .store
+            .read(sentinel_store::email::oldest_pending_ms)
+            .ok()
+            .flatten()
+            .map_or(0.0, |at| {
+                (sentinel_core::UnixMillis::now().0 - at).max(0) as f64 / 1e3
+            });
+        out.one(
+            "sentinel_mail_oldest_pending_seconds",
+            "gauge",
+            "Age of the oldest message still waiting for delivery; 0 when none waits.",
+            oldest,
+        );
     }
     if let Some(b) = state.objects.backups() {
         let status = b.status();

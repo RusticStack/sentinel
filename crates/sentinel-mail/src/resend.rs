@@ -3,7 +3,7 @@
 
 use std::{path::Path, time::Duration};
 
-use sentinel_auth::secret::wipe;
+use sentinel_auth::secret::{wipe, wipe_string};
 
 use crate::{Failure, Mail, Transport};
 
@@ -181,15 +181,19 @@ impl Resend {
             "text": mail.body,
         }))
         .map_err(|_| Failure::Permanent("the message cannot be encoded".into()))?;
+        let mut bearer = self.key.bearer();
         let request = ureq::http::Request::builder()
             .method("POST")
             .uri(self.endpoint.as_str())
             .header("content-type", "application/json")
             .header("accept", "application/json")
-            .header("authorization", self.key.bearer())
+            .header("authorization", bearer.as_str())
             .header("idempotency-key", idempotency_key(mail))
-            .body(body)
-            .map_err(|_| Failure::Permanent("the request cannot be built".into()))?;
+            .body(body);
+        // Best effort: the request holds its own copy of the header, which this crate cannot reach.
+        wipe_string(&mut bearer);
+        let request =
+            request.map_err(|_| Failure::Permanent("the request cannot be built".into()))?;
         let mut response = self.agent.run(request).map_err(transport)?;
         let status = response.status().as_u16();
         if (200..300).contains(&status) {
@@ -261,7 +265,17 @@ pub(crate) fn classify(
         None => format!("resend {what} ({status})"),
     };
     match status {
-        401 | 403 => Err(Failure::Permanent(label("refused the API key"))),
+        // The same answer for every message: the key or the sender, not this message. A 403 with any other name may be
+        // about one resource, so it stays a refusal of this message.
+        401 => Err(Failure::Service(label("refused the API key"))),
+        403 if matches!(
+            name,
+            Some("invalid_api_key" | "restricted_api_key" | "missing_api_key" | "validation_error")
+        ) =>
+        {
+            Err(Failure::Service(label("refused the API key or the sender")))
+        }
+        403 => Err(Failure::Permanent(label("refused the message"))),
         409 if name == Some("concurrent_idempotent_requests") => Err(Failure::Transient {
             why: label("is still processing the message"),
             retry_after,

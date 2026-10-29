@@ -555,6 +555,7 @@ fn restore(
             "total_ms": started.elapsed().as_millis() as u64,
             "recovery": {
                 "orphans": recovery.orphans.len(),
+                "evicted_leftovers": recovery.evicted_leftovers,
                 "corrupt": recovery.corrupt.len(),
                 "missing": recovery.missing.len(),
             },
@@ -2085,6 +2086,7 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
                 "{}",
                 serde_json::json!({
                     "staged": report.staged,
+                    "evicted_leftovers": report.evicted_leftovers,
                     "orphans": report.orphans.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                     "corrupt": report.corrupt.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                     "missing": report.missing.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
