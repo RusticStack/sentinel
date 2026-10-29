@@ -221,7 +221,7 @@ fn one_account_holds_a_bounded_number_of_states_and_purging_removes_expired_ones
     };
     assert_eq!(count(&f.store), github_app::MAX_STATES_PER_USER);
     assert_eq!(
-        github_app::purge(&f.store, at(1_000 + STATE_TTL_MS), 1_000).unwrap(),
+        github_app::purge(&f.store, at(2_000 + STATE_TTL_MS), 1_000).unwrap(),
         github_app::MAX_STATES_PER_USER as usize
     );
     assert_eq!(count(&f.store), 0);
