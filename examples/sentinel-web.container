@@ -1,0 +1,45 @@
+# The web interface as a Podman Quadlet, beside sentinel-server.container
+# (same Quadlet requirements; build localhost/sentinel-web:<version> from
+# Containerfile.web with --format docker first). For a rootless account:
+#
+#   install -D -m 0644 sentinel-web.container ~/.config/containers/systemd/sentinel-web.container
+#   install -D -m 0644 sentinel.network ~/.config/containers/systemd/sentinel.network
+#   systemctl --user daemon-reload && systemctl --user start sentinel-web.service
+#
+# It requires sentinel-server.service, so starting it starts the controller.
+# 3000 is published on the host's loopback for the reverse proxy
+# (docs/deployment.md#tls-and-a-reverse-proxy); never publish it beyond that,
+# because SENTINEL_CLIENT_IP_HEADER trusts what reaches it.
+[Unit]
+Description=Sentinel web interface (container)
+After=sentinel-server.service
+Requires=sentinel-server.service
+
+[Container]
+Image=localhost/sentinel-web:0.1.0-dev
+ContainerName=sentinel-web
+# Reached by the controller as a trusted proxy (trusted_proxies in server-container.toml).
+Network=sentinel.network
+IP=10.89.77.10
+Environment=NODE_ENV=production
+Environment=HOST=0.0.0.0
+Environment=PORT=3000
+Environment=SENTINEL_API=http://sentinel-server:7080
+Environment=SENTINEL_CLIENT_IP_HEADER=x-forwarded-for
+PublishPort=127.0.0.1:3000:3000
+ReadOnly=true
+Tmpfs=/tmp:size=16m,mode=1777
+DropCapability=ALL
+NoNewPrivileges=true
+PidsLimit=256
+Memory=512m
+PodmanArgs=--init
+StopSignal=SIGTERM
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=120
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
