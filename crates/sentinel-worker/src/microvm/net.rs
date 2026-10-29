@@ -260,18 +260,24 @@ pub fn interface() -> serde_json::Value {
 
 /// Runs as the root of the VM's own mount and network namespaces (inside the user namespace `podman unshare`
 /// joins; that user namespace's mount namespace is shared by every `podman unshare` of the account, so the VMM
-/// takes a mount namespace of its own or its bind mount would be every other VM's): binds the VM's directory over the fixed
-/// run path when asked, builds the tap and loads the rules when the VM has a network, and becomes the VMM.
-/// Arguments: the VM directory, the run path (or `-`), then the VMM and its arguments.
+/// takes a mount namespace of its own or its bind mounts would be every other VM's): builds the tap and loads the
+/// rules when the VM has a network, then puts the VMM in a chroot that is the VM's directory and becomes it.
+/// The chroot holds exactly what the VMM opens, as bind mounts made in this mount namespace: the VMM binary,
+/// the guest kernel and initramfs, the guest image, `/dev/kvm`, `/dev/net/tun` (a VM with a network) and, for a
+/// restore, the snapshot's directory at `/snap`; the VM's own files (scratch disk, sockets, configuration) are
+/// the directory itself. Every path a snapshot saves is therefore the same in every VM and independent of where
+/// the worker's data directory is.
+/// Arguments: the VM directory, the kernel, the initramfs, the guest image, the snapshot directory (or `-`),
+/// then the VMM binary and its arguments.
 const NETNS_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 dir=$1
-run=$2
-shift 2
+kernel=$2
+initrd=$3
+image=$4
+snap=$5
+shift 5
 PATH="$PATH:/usr/sbin:/sbin"
-if [ "$run" != "-" ]; then
-	mount --bind "$dir" "$run"
-fi
 if [ -f "$dir/egress.nft" ]; then
 	echo "$$" > "$dir/netns.pid.tmp"
 	mv "$dir/netns.pid.tmp" "$dir/netns.pid"
@@ -282,7 +288,30 @@ if [ -f "$dir/egress.nft" ]; then
 	echo 1 > /proc/sys/net/ipv4/ip_forward
 	nft -f "$dir/egress.nft"
 fi
-exec "$@"
+jail_file() {
+	: > "$dir/$2"
+	mount --bind "$1" "$dir/$2"
+}
+vmm=$1
+shift
+jail_file "$vmm" firecracker
+jail_file "$kernel" kernel
+jail_file "$initrd" initrd
+jail_file "$image" image.ext4
+mount -o remount,bind,ro "$dir/image.ext4" 2>/dev/null || true
+# Plain mkdir: a VM directory removed under this script (a worker killed during the start, then recovered) must
+# stay removed, and mkdir -p would make it again.
+mkdir "$dir/dev" "$dir/dev/net"
+jail_file /dev/kvm dev/kvm
+if [ -f "$dir/egress.nft" ]; then
+	jail_file /dev/net/tun dev/net/tun
+fi
+if [ "$snap" != "-" ]; then
+	mkdir "$dir/snap"
+	mount --bind "$snap" "$dir/snap"
+	mount -o remount,bind,ro "$dir/snap" 2>/dev/null || true
+fi
+exec chroot "$dir" /firecracker "$@"
 "#;
 
 /// Runs in the VM's systemd scope as the worker account: starts the namespaces and the VMM, and when the VM

@@ -25,7 +25,9 @@ use std::{
 
 use super::{DIR, STAMP_AFTER};
 
-const FORMAT: u64 = 1;
+/// 2: the VMM runs in a chroot that is the VM's directory, so a snapshot's saved paths no longer name the
+/// worker's data directory.
+const FORMAT: u64 = 2;
 /// A guest with more memory than this boots cold: its memory file would be written whole at every build.
 pub(super) const MAX_MEMORY_MIB: u64 = 8192;
 /// After a snapshot of a shape failed to build, the shape boots cold for this long before another try.
@@ -33,13 +35,6 @@ const RETRY_AFTER: Duration = Duration::from_secs(600);
 
 pub(super) fn dir(root: &Path) -> PathBuf {
     root.join(DIR).join("snapshots")
-}
-
-/// The fixed path the VMM sees its VM directory at, so the paths saved inside a snapshot stay valid for every
-/// restore (Firecracker cannot rebind a drive on restore). Each VMM has the real VM directory bound there in
-/// its own mount namespace; on the host it is an empty directory.
-pub(super) fn run_path(root: &Path) -> PathBuf {
-    root.join(DIR).join("run")
 }
 
 /// What a snapshot's guest is configured with; all of it is baked into the saved state.
@@ -288,7 +283,14 @@ pub(super) fn sweep(root: &Path, has_image: impl Fn(&str) -> bool, max_age: Dura
         let orphan = if name.starts_with('.') {
             age >= max_age
         } else if is_name(&name) {
-            !name.split_once('-').is_some_and(|(key, _)| has_image(key)) && age >= max_age
+            // No complete image owns it, or it is of a format this worker does not restore (never counted in
+            // the budget, so nothing else would remove it).
+            let stale = fs::read(entry.path().join("meta.json"))
+                .ok()
+                .and_then(|text| parse_meta(&text))
+                .is_none();
+            (stale || !name.split_once('-').is_some_and(|(key, _)| has_image(key)))
+                && age >= max_age
         } else {
             age >= max_age
         };
@@ -588,6 +590,30 @@ mod tests {
         assert!(open(root.path(), &kept).is_some());
         assert!(open(root.path(), &gone).is_none());
         assert!(!staging_dir.exists());
+    }
+
+    #[test]
+    fn a_snapshot_of_an_older_format_is_not_opened_and_is_swept_with_its_image_present() {
+        let root = tempfile::tempdir().unwrap();
+        let old = format!("{KEY}-aaaaaaaaaaaaaaaa");
+        let current = format!("{KEY}-bbbbbbbbbbbbbbbb");
+        plant(root.path(), &old, 4);
+        plant(root.path(), &current, 4);
+        fs::write(
+            dir(root.path()).join(&old).join("meta.json"),
+            br#"{"format":1,"bytes":4}"#,
+        )
+        .unwrap();
+        assert!(open(root.path(), &old).is_none());
+        assert!(open(root.path(), &current).is_some());
+        // Its image is still there, so only its format marks it for the sweep (and a fresh one is left alone).
+        assert_eq!(
+            sweep(root.path(), |k| k == KEY, Duration::from_secs(3600)),
+            0
+        );
+        assert_eq!(sweep(root.path(), |k| k == KEY, Duration::ZERO), 1);
+        assert!(!dir(root.path()).join(&old).exists());
+        assert!(open(root.path(), &current).is_some());
     }
 
     #[test]

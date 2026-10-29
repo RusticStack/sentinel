@@ -58,6 +58,19 @@ pub const DIR: &str = "microvm";
 const JOB_ROOT: &str = "/job";
 /// The guest CID Firecracker gives the VM; the host side is the vsock socket file.
 const GUEST_CID: u32 = 3;
+/// The paths the VMM sees: it runs in a chroot that is the VM's directory (see `net::NETNS_SCRIPT`), so these are
+/// the same in every VM, a snapshot saves them as they are, and it restores wherever the worker's data
+/// directory has been moved to.
+const JAIL_KERNEL: &str = "/kernel";
+const JAIL_INITRD: &str = "/initrd";
+const JAIL_IMAGE: &str = "/image.ext4";
+const JAIL_SCRATCH: &str = "/scratch.ext4";
+const JAIL_VSOCK: &str = "/vsock.sock";
+const JAIL_CPU_CONFIG: &str = "/cpu.json";
+const JAIL_API: &str = "/api.sock";
+const JAIL_CONFIG: &str = "/vm.json";
+/// Where a restoring VMM sees the snapshot's directory.
+const JAIL_SNAPSHOT: &str = "/snap";
 const BOOT_TIMEOUT: Duration = Duration::from_secs(60);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const IMAGE_BUILD_TIMEOUT: Duration = Duration::from_secs(900);
@@ -1165,15 +1178,15 @@ impl Plan<'_> {
         Ok(Some(net::Policy::new(&host, &self.setup.guard).rules()))
     }
 
-    /// Starts the VMM in its scope. `bind` is the fixed run path the VM directory is bound to inside the VMM's
-    /// mount namespace (snapshot builds and restores); `tap` is the rules of a VM with a tap and whether it
+    /// Starts the VMM in its scope, in a chroot that is `dir` with the kernel, the initramfs, the guest image and
+    /// (for a restore) the directory `snapshot` bound in; `tap` is the rules of a VM with a tap and whether it
     /// also gets an uplink.
     fn spawn(
         &self,
         dir: &Path,
         unit: &str,
         limits: Limits,
-        bind: Option<&Path>,
+        snapshot: Option<&Path>,
         tap: Option<(&str, bool)>,
         args: &[OsString],
     ) -> Result<Child> {
@@ -1199,7 +1212,10 @@ impl Plan<'_> {
             .args(["--", "/bin/sh"])
             .arg(net::launch_script(dir))
             .arg(dir)
-            .arg(bind.map_or(OsStr::new("-"), Path::as_os_str))
+            .arg(&self.setup.kernel)
+            .arg(self.initrd)
+            .arg(&self.guest.rootfs)
+            .arg(snapshot.map_or(OsStr::new("-"), Path::as_os_str))
             .arg(&self.setup.firecracker)
             .args(args)
             .stdin(Stdio::null())
@@ -1229,22 +1245,8 @@ impl Plan<'_> {
 
     /// The cold boot: the pinned kernel, the initramfs, the image and a fresh scratch disk.
     fn cold(&self) -> Result<(Child, Client)> {
-        let scratch = self.dir.join("scratch.ext4");
-        scratch_disk(&scratch, self.shape.scratch_bytes)?;
-        let config = vm_config(
-            self.setup,
-            self.initrd,
-            &self.guest.rootfs,
-            &scratch,
-            &self.dir.join("vsock.sock"),
-            &self.dir.join("cpu.json"),
-            &self.shape,
-        );
-        fs::write(self.dir.join("cpu.json"), CPU_CONFIG)?;
-        fs::write(
-            self.dir.join("vm.json"),
-            serde_json::to_vec_pretty(&config).map_err(io::Error::other)?,
-        )?;
+        scratch_disk(&self.dir.join("scratch.ext4"), self.shape.scratch_bytes)?;
+        self.write_config(self.dir)?;
         let rules = self.rules()?;
         let mut child = self.spawn(
             self.dir,
@@ -1254,13 +1256,23 @@ impl Plan<'_> {
             rules.as_deref().map(|r| (r, true)),
             &[
                 "--api-sock".into(),
-                self.dir.join("api.sock").into(),
+                JAIL_API.into(),
                 "--config-file".into(),
-                self.dir.join("vm.json").into(),
+                JAIL_CONFIG.into(),
             ],
         )?;
         let client = self.await_agent(&mut child, self.dir, self.unit)?;
         Ok((child, client))
+    }
+
+    /// The VMM's configuration and CPU template, as files of the VM directory (the chroot).
+    fn write_config(&self, dir: &Path) -> Result<()> {
+        fs::write(dir.join("cpu.json"), CPU_CONFIG)?;
+        fs::write(
+            dir.join("vm.json"),
+            serde_json::to_vec_pretty(&vm_config(&self.shape)).map_err(io::Error::other)?,
+        )?;
+        Ok(())
     }
 
     /// The warm start. `Ok(None)` when no snapshot is usable right now and the VM should boot cold without
@@ -1364,24 +1376,8 @@ impl Plan<'_> {
     }
 
     fn build_in(&self, dir: &Path, unit: &str, name: &str, builder: AttemptId) -> Result<()> {
-        let run = snapshot::run_path(self.root);
-        fs::create_dir_all(&run)?;
-        std::os::unix::fs::symlink(&self.guest.rootfs, dir.join("image.ext4"))?;
         scratch_disk(&dir.join("scratch.ext4"), self.shape.scratch_bytes)?;
-        let config = vm_config(
-            self.setup,
-            self.initrd,
-            &run.join("image.ext4"),
-            &run.join("scratch.ext4"),
-            &run.join("vsock.sock"),
-            &run.join("cpu.json"),
-            &self.shape,
-        );
-        fs::write(dir.join("cpu.json"), CPU_CONFIG)?;
-        fs::write(
-            dir.join("vm.json"),
-            serde_json::to_vec_pretty(&config).map_err(io::Error::other)?,
-        )?;
+        self.write_config(dir)?;
         // The template has the tap and the rules a VM of its shape has, but no uplink: it never runs a job.
         let rules = self
             .shape
@@ -1396,13 +1392,13 @@ impl Plan<'_> {
             dir,
             unit,
             limits,
-            Some(&run),
+            None,
             rules.as_deref().map(|r| (r, false)),
             &[
                 "--api-sock".into(),
-                run.join("api.sock").into(),
+                JAIL_API.into(),
                 "--config-file".into(),
-                run.join("vm.json").into(),
+                JAIL_CONFIG.into(),
             ],
         )?;
         let saved = (|| -> Result<()> {
@@ -1424,8 +1420,8 @@ impl Plan<'_> {
                 "/snapshot/create",
                 Some(&serde_json::json!({
                     "snapshot_type": "Full",
-                    "snapshot_path": run.join("state"),
-                    "mem_file_path": run.join("mem"),
+                    "snapshot_path": "/state",
+                    "mem_file_path": "/mem",
                 })),
                 SNAPSHOT_TIMEOUT,
             )?;
@@ -1448,21 +1444,18 @@ impl Plan<'_> {
         moved
     }
 
-    /// Restores a VM from `snap`: the snapshot's scratch disk cloned for this attempt, the image linked, a VMM
+    /// Restores a VM from `snap`: the snapshot's scratch disk cloned for this attempt, the image bound into its chroot, a VMM
     /// with no configuration that loads the snapshot, then the agent told the time and given fresh entropy.
     fn restore(&self, snap: &snapshot::Snapshot) -> Result<(Child, Client)> {
         snapshot::clone_file(&snap.scratch, &self.dir.join("scratch.ext4"))?;
-        std::os::unix::fs::symlink(&self.guest.rootfs, self.dir.join("image.ext4"))?;
-        let run = snapshot::run_path(self.root);
-        fs::create_dir_all(&run)?;
         let rules = self.rules()?;
         let mut child = self.spawn(
             self.dir,
             self.unit,
             self.limits,
-            Some(&run),
+            snap.state.parent(),
             rules.as_deref().map(|r| (r, true)),
-            &["--api-sock".into(), run.join("api.sock").into()],
+            &["--api-sock".into(), JAIL_API.into()],
         )?;
         let resumed = (|| -> Result<Client> {
             self.await_api(&mut child)?;
@@ -1471,8 +1464,8 @@ impl Plan<'_> {
                 "PUT",
                 "/snapshot/load",
                 Some(&serde_json::json!({
-                    "snapshot_path": snap.state,
-                    "mem_backend": { "backend_path": snap.mem, "backend_type": "File" },
+                    "snapshot_path": format!("{JAIL_SNAPSHOT}/state"),
+                    "mem_backend": { "backend_path": format!("{JAIL_SNAPSHOT}/mem"), "backend_type": "File" },
                     "resume_vm": true,
                 })),
                 RESTORE_TIMEOUT,
@@ -1968,28 +1961,20 @@ pub(crate) const CPU_CONFIG: &str = r#"{
 }
 "#;
 
-fn vm_config(
-    setup: &Setup,
-    initrd: &Path,
-    rootfs: &Path,
-    scratch: &Path,
-    socket: &Path,
-    cpu_config: &Path,
-    shape: &snapshot::Shape,
-) -> serde_json::Value {
+fn vm_config(shape: &snapshot::Shape) -> serde_json::Value {
     let mut config = serde_json::json!({
         "boot-source": {
-            "kernel_image_path": setup.kernel,
-            "initrd_path": initrd,
+            "kernel_image_path": JAIL_KERNEL,
+            "initrd_path": JAIL_INITRD,
             "boot_args": boot_args(shape.net),
         },
         "drives": [
-            { "drive_id": "image", "path_on_host": rootfs, "is_root_device": false, "is_read_only": true },
-            { "drive_id": "scratch", "path_on_host": scratch, "is_root_device": false, "is_read_only": false },
+            { "drive_id": "image", "path_on_host": JAIL_IMAGE, "is_root_device": false, "is_read_only": true },
+            { "drive_id": "scratch", "path_on_host": JAIL_SCRATCH, "is_root_device": false, "is_read_only": false },
         ],
         "machine-config": { "vcpu_count": shape.vcpus, "mem_size_mib": shape.mib, "smt": false },
-        "cpu-config": cpu_config,
-        "vsock": { "guest_cid": GUEST_CID, "uds_path": socket },
+        "cpu-config": JAIL_CPU_CONFIG,
+        "vsock": { "guest_cid": GUEST_CID, "uds_path": JAIL_VSOCK },
     });
     if shape.net {
         config["network-interfaces"] = net::interface();
@@ -2949,7 +2934,7 @@ mod tests {
         };
         let attempt = AttemptId::new();
         let dir = vm_files(&root, attempt);
-        // The files a snapshot start leaves: the link to the cached image, sockets, the saved state.
+        // The files a start leaves: a link to the cached image (what older workers made), sockets, the saved state.
         std::os::unix::fs::symlink(&rootfs, dir.join("image.ext4")).unwrap();
         for file in ["state", "mem", "netns.pid", "uplink"] {
             fs::write(dir.join(file), b"x").unwrap();
@@ -3040,28 +3025,13 @@ mod tests {
 
     #[test]
     fn the_guest_is_given_no_way_to_nest_virtualization() {
-        let setup = Setup {
-            firecracker: "/fc".into(),
-            kernel: "/vmlinux".into(),
-            agent: "/agent".into(),
-            snapshots: true,
-            guard: net::Guard::default(),
-        };
         let mut shape = snapshot::Shape {
             vcpus: 2,
             mib: 512,
             scratch_bytes: 1 << 30,
             net: false,
         };
-        let config = vm_config(
-            &setup,
-            Path::new("/initrd"),
-            Path::new("/image.ext4"),
-            Path::new("/scratch.ext4"),
-            Path::new("/vsock.sock"),
-            Path::new("/cpu.json"),
-            &shape,
-        );
+        let config = vm_config(&shape);
         // A new top-level section (a device could carry /dev/kvm) must be reviewed against the isolation
         // contract before this test is changed.
         let mut sections: Vec<&str> = config
@@ -3082,6 +3052,11 @@ mod tests {
             ]
         );
         assert_eq!(config["cpu-config"], "/cpu.json");
+        // Every path is inside the VMM's chroot: nothing names the worker's data directory, so a snapshot
+        // that saves them restores wherever that directory has gone.
+        assert_eq!(config["boot-source"]["kernel_image_path"], "/kernel");
+        assert_eq!(config["boot-source"]["initrd_path"], "/initrd");
+        assert_eq!(config["vsock"]["uds_path"], "/vsock.sock");
         let machine = config["machine-config"].as_object().unwrap();
         assert!(!machine.contains_key("cpu_template"));
         assert!(!config.to_string().to_ascii_lowercase().contains("kvm"));
@@ -3104,15 +3079,7 @@ mod tests {
 
         // A guest granted egress gets exactly one more section: its one network interface, backed by the tap.
         shape.net = true;
-        let granted = vm_config(
-            &setup,
-            Path::new("/initrd"),
-            Path::new("/image.ext4"),
-            Path::new("/scratch.ext4"),
-            Path::new("/vsock.sock"),
-            Path::new("/cpu.json"),
-            &shape,
-        );
+        let granted = vm_config(&shape);
         let mut sections: Vec<&str> = granted
             .as_object()
             .unwrap()

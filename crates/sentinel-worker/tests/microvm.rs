@@ -548,8 +548,9 @@ fn observe(name: &str, millis: u128) {
     }
 }
 
-/// The processes whose command line mentions `needle` (the VMM, its namespace holder and `pasta` name the
-/// VM's directory), other than this one.
+/// The processes whose command line mentions `needle` (the namespace holder and `pasta` name the VM's
+/// directory) or whose root directory is below it (the VMM runs in a chroot that is the VM's directory), other
+/// than this one.
 fn processes_mentioning(needle: &str) -> Vec<u32> {
     let me = std::process::id();
     let mut found = Vec::new();
@@ -567,10 +568,11 @@ fn processes_mentioning(needle: &str) -> Vec<u32> {
         if pid == me {
             continue;
         }
-        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        if String::from_utf8_lossy(&cmdline).contains(needle) {
+        let chrooted = fs::read_link(entry.path().join("root"))
+            .is_ok_and(|root| root.to_string_lossy().contains(needle));
+        let named = fs::read(entry.path().join("cmdline"))
+            .is_ok_and(|cmdline| String::from_utf8_lossy(&cmdline).contains(needle));
+        if chrooted || named {
             found.push(pid);
         }
     }
@@ -603,7 +605,7 @@ fn pid_alive(pid: u32) -> bool {
 
 /// Everything a VM can leave behind, checked after its removal: no directory (so no scratch overlay, console
 /// log, rules or socket), no scope, no process of the VM's (VMM, namespace holder, `pasta`), hence no tap and
-/// no network namespace, nothing in the fixed run path and no `vmtap` on the host.
+/// no network namespace and no `vmtap` on the host.
 fn assert_vm_left_nothing(root: &std::path::Path, attempt: AttemptId, pids: &[u32]) {
     assert!(!microvm::exists(root, attempt), "the VM directory remains");
     assert!(microvm::owned(root).is_empty(), "a VM directory remains");
@@ -622,13 +624,6 @@ fn assert_vm_left_nothing(root: &std::path::Path, attempt: AttemptId, pids: &[u3
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let run = root.join(microvm::DIR).join("run");
-    assert!(
-        run.read_dir()
-            .map(|mut d| d.next().is_none())
-            .unwrap_or(true),
-        "the fixed run path is not empty"
-    );
     let links = std::process::Command::new("ip")
         .args(["-o", "link", "show", "vmtap"])
         .output()
@@ -1058,13 +1053,6 @@ fn nothing_left(root: &std::path::Path, attempts: &[AttemptId]) {
     for attempt in attempts {
         assert_scope_gone(root, *attempt);
     }
-    let run = root.join(microvm::DIR).join("run");
-    assert!(
-        run.read_dir()
-            .map(|mut d| d.next().is_none())
-            .unwrap_or(true),
-        "the fixed run path is an empty directory on the host"
-    );
     assert!(
         snapshots(root)
             .iter()
@@ -1271,6 +1259,272 @@ fn vm_image_bytes(root: &std::path::Path) -> u64 {
         .sum()
 }
 
+// ---------------------------------------------------------------- M06: isolation between restored attempts
+
+/// A random marker no file of the guest or the host has any reason to hold.
+fn marker() -> String {
+    let mut bytes = [0u8; 16];
+    std::io::Read::read_exact(&mut fs::File::open("/dev/urandom").unwrap(), &mut bytes).unwrap();
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sentinel-m06-secret-{hex}")
+}
+
+/// The guest-side pattern for any marker [`marker`] makes. The pattern is not a marker itself, so a step that
+/// carries it does not match its own search.
+const MARKER_PATTERN: &str = "sentinel-m06-secret-[0-9a-f]{32}";
+
+/// Whether `needle` occurs anywhere in the file, read in blocks that overlap by the needle's length.
+fn file_holds(path: &std::path::Path, needle: &[u8]) -> bool {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path).unwrap();
+    let mut block = vec![0u8; 8 << 20];
+    let mut kept = 0;
+    loop {
+        let read = file.read(&mut block[kept..]).unwrap();
+        if read == 0 {
+            return false;
+        }
+        let end = kept + read;
+        if block[..end].windows(needle.len()).any(|w| w == needle) {
+            return true;
+        }
+        kept = (needle.len() - 1).min(end);
+        block.copy_within(end - kept..end, 0);
+    }
+}
+
+fn digest_of(path: &std::path::Path) -> String {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path).unwrap();
+    let mut hasher = blake3::Hasher::new();
+    let mut block = vec![0u8; 8 << 20];
+    loop {
+        let read = file.read(&mut block).unwrap();
+        if read == 0 {
+            return hasher.finalize().to_hex().to_string();
+        }
+        hasher.update(&block[..read]);
+    }
+}
+
+/// The files that make a snapshot and what is in them.
+fn snapshot_digests(snapshot: &std::path::Path) -> Vec<(&'static str, String)> {
+    ["state", "mem", "scratch.ext4"]
+        .into_iter()
+        .map(|file| (file, digest_of(&snapshot.join(file))))
+        .collect()
+}
+
+#[test]
+fn two_restored_attempts_share_no_writable_state_and_no_secrets() {
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let (wa, wb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a_id, a) = start_net(root.path(), &setup, wa.path(), Network::None);
+    assert_eq!(a.start_report().mode, microvm::Start::Restored);
+    let snapshot = snapshots(root.path()).remove(0);
+    let pristine = snapshot_digests(&snapshot);
+    let (b_id, b) = start_net(root.path(), &setup, wb.path(), Network::None);
+    assert_eq!(b.start_report().mode, microvm::Start::Restored);
+    assert!(!b.start_report().snapshot_built && b.start_report().fallback.is_none());
+
+    // Each attempt's scratch disk is a file of its own, not the snapshot's.
+    let vms = root.path().join(microvm::DIR).join("vms");
+    let scratch = |id: AttemptId| vms.join(id.to_string()).join("scratch.ext4");
+    let inodes = [
+        fs::metadata(snapshot.join("scratch.ext4")).unwrap().ino(),
+        fs::metadata(scratch(a_id)).unwrap().ino(),
+        fs::metadata(scratch(b_id)).unwrap().ino(),
+    ];
+    assert!(
+        inodes[0] != inodes[1] && inodes[0] != inodes[2] && inodes[1] != inodes[2],
+        "a scratch disk is shared: {inodes:?}"
+    );
+
+    // A is given a secret (a file and an environment file, both in guest memory), uses it, and keeps it while B runs.
+    let secret = marker();
+    let (files, env) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    fs::write(files.path().join("token"), &secret).unwrap();
+    fs::write(
+        env.path().join("step-0.sh"),
+        format!("export TOKEN='{secret}'\n"),
+    )
+    .unwrap();
+    a.deliver_secrets(&[
+        (files.path(), "/run/sentinel-secrets"),
+        (env.path(), "/run/sentinel-env"),
+    ])
+    .unwrap();
+    let used = a
+        .exec(
+            &sh(
+                ". /run/sentinel-env/step-0.sh; test \"$TOKEN\" = \"$(cat /run/sentinel-secrets/token)\"; \
+                 echo \"$TOKEN\" > /tmp/a-copy; echo \"$TOKEN\" > /dev/shm/a-copy; \
+                 echo mine-a > /tmp/same; echo mine-a > /dev/shm/same",
+                60,
+            ),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(used.code, Some(0), "{}", text(&used.stderr));
+
+    // B writes the same names with other content, and looks for A's secret and files everywhere it can.
+    let mine = b
+        .exec(
+            &sh("echo mine-b > /tmp/same; echo mine-b > /dev/shm/same", 60),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(mine.code, Some(0), "{}", text(&mine.stderr));
+    let looked = b
+        .exec(
+            &sh(
+                &format!(
+                    "for f in /tmp/a-copy /dev/shm/a-copy; do [ ! -e $f ] || echo \"LEAK $f\"; done; \
+                     [ \"$(cat /tmp/same)\" = mine-b ] || echo LEAK tmp-same; \
+                     [ \"$(cat /dev/shm/same)\" = mine-b ] || echo LEAK shm-same; \
+                     env | grep -c '{MARKER_PATTERN}' || true; \
+                     grep -rEsl '{MARKER_PATTERN}' /etc /tmp /run /var /root /dev/shm /job /workspace || true; \
+                     echo looked"
+                ),
+                120,
+            ),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        text(&looked.stdout),
+        "0\nlooked",
+        "B saw A's state or secret: {}{}",
+        text(&looked.stdout),
+        text(&looked.stderr)
+    );
+    // A's own state is intact, B's writes did not reach it.
+    let own = a
+        .exec(&sh("cat /tmp/same /dev/shm/same /tmp/a-copy", 60), &[])
+        .unwrap();
+    assert_eq!(text(&own.stdout), format!("mine-a\nmine-a\n{secret}"));
+
+    // While A still holds the secret in its memory, the snapshot's files are what they were: the guest memory
+    // is a private mapping, so no page A dirtied went back to the file, and the disk A writes is a clone.
+    assert_eq!(snapshot_digests(&snapshot), pristine);
+    for file in ["state", "mem", "scratch.ext4"] {
+        assert!(
+            !file_holds(&snapshot.join(file), secret.as_bytes()),
+            "A's secret is in the snapshot's {file}"
+        );
+    }
+    a.retract_secrets().unwrap();
+    a.destroy().unwrap();
+    b.destroy().unwrap();
+
+    // A later restore of the same snapshot starts from the pristine state: nothing of A or B.
+    let (c_id, c) = start_net(root.path(), &setup, wa.path(), Network::None);
+    assert_eq!(c.start_report().mode, microvm::Start::Restored);
+    let fresh = c
+        .exec(
+            &sh(
+                &format!(
+                    "for f in /tmp/same /dev/shm/same /tmp/a-copy; do [ ! -e $f ] || echo \"LEAK $f\"; done; \
+                     grep -rEsl '{MARKER_PATTERN}' /etc /tmp /run /var /root /dev/shm /job /workspace || true; \
+                     echo clean"
+                ),
+                120,
+            ),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(text(&fresh.stdout), "clean", "{}", text(&fresh.stderr));
+    c.destroy().unwrap();
+    assert_eq!(snapshot_digests(&snapshot), pristine);
+    nothing_left(root.path(), &[a_id, b_id, c_id]);
+}
+
+#[test]
+fn a_snapshot_restores_after_the_data_directory_moved() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let parent = tempfile::tempdir().unwrap();
+    let (before, after) = (parent.path().join("before"), parent.path().join("after"));
+    fs::create_dir(&before).unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (a_id, a) = start_net(&before, &setup, workspace.path(), Network::None);
+    assert!(a.start_report().snapshot_built);
+    a.destroy().unwrap();
+    assert_eq!(snapshots(&before).len(), 1);
+
+    // The whole data directory (guest image, initramfs and snapshot) now lives at another path.
+    fs::rename(&before, &after).unwrap();
+    let (b_id, b) = start_net(&after, &setup, workspace.path(), Network::None);
+    let report = b.start_report().clone();
+    assert_eq!(report.mode, microvm::Start::Restored, "{report:?}");
+    assert!(
+        !report.snapshot_built && report.fallback.is_none(),
+        "the moved snapshot was not used as it was: {report:?}"
+    );
+    assert_eq!(snapshots(&after).len(), 1);
+    let ran = b
+        .exec(&sh("echo restored-after-the-move", 60), &[])
+        .unwrap();
+    assert_eq!(text(&ran.stdout), "restored-after-the-move");
+    b.destroy().unwrap();
+    nothing_left(&after, &[a_id, b_id]);
+}
+
+#[test]
+fn a_changed_agent_or_kernel_makes_a_new_snapshot_and_never_a_stale_hit() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (a_id, a) = start_net(root.path(), &setup, workspace.path(), Network::None);
+    assert!(a.start_report().snapshot_built);
+    a.destroy().unwrap();
+    assert_eq!(snapshots(root.path()).len(), 1);
+
+    // An agent with other bytes is another initramfs and so another snapshot.
+    let mut changed = setup.clone();
+    changed.agent = scratch.path().join("agent");
+    let mut bytes = fs::read(&setup.agent).unwrap();
+    bytes.push(0);
+    fs::write(&changed.agent, bytes).unwrap();
+    fs::set_permissions(
+        &changed.agent,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let (b_id, b) = start_net(root.path(), &changed, workspace.path(), Network::None);
+    assert!(
+        b.start_report().snapshot_built,
+        "a changed agent restored the old snapshot: {:?}",
+        b.start_report()
+    );
+    b.destroy().unwrap();
+    assert_eq!(snapshots(root.path()).len(), 2);
+
+    // A kernel file that is not the one the snapshot was taken with is a miss as well.
+    let mut other = setup.clone();
+    other.kernel = scratch.path().join("vmlinux");
+    fs::copy(&setup.kernel, &other.kernel).unwrap();
+    let (c_id, c) = start_net(root.path(), &other, workspace.path(), Network::None);
+    assert!(
+        c.start_report().snapshot_built,
+        "a different kernel file restored the old snapshot: {:?}",
+        c.start_report()
+    );
+    c.destroy().unwrap();
+    assert_eq!(snapshots(root.path()).len(), 3);
+
+    // And the original setup still finds its own.
+    let (d_id, d) = start_net(root.path(), &setup, workspace.path(), Network::None);
+    assert!(!d.start_report().snapshot_built && d.start_report().fallback.is_none());
+    d.destroy().unwrap();
+    nothing_left(root.path(), &[a_id, b_id, c_id, d_id]);
+}
+
 // ---------------------------------------------------------------- M05: network
 
 /// A listener the guest must never reach; it records whether anything connected.
@@ -1430,6 +1684,268 @@ fn a_restored_guest_keeps_its_network_and_its_policy() {
     assert!(link.accept().is_err());
     b.destroy().unwrap();
     nothing_left(root.path(), &[a_id, b_id]);
+}
+
+// ---------------------------------------------------------------- M05: the boundary, probed from inside
+
+/// The pids of a VM's network namespace holder, as the launch script recorded them (see [`network_pids`]).
+fn netns_id(root: &std::path::Path, attempt: AttemptId) -> String {
+    let pid = network_pids(root, attempt)[0];
+    fs::read_link(format!("/proc/{pid}/ns/net"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[test]
+fn two_granted_guests_share_no_network_and_cannot_reach_each_other() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let (wa, wb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a_id, a) = start_net(root.path(), &setup, wa.path(), Network::Egress);
+    let (b_id, b) = start_net(root.path(), &setup, wb.path(), Network::Egress);
+    // Two VMs, two network namespaces: the same guest address in each is a different host to the other.
+    assert_ne!(
+        netns_id(root.path(), a_id),
+        netns_id(root.path(), b_id),
+        "two VMs share a network namespace"
+    );
+    for vm in [&a, &b] {
+        let addr = vm.exec(&sh("ip -4 -o addr show eth0", 30), &[]).unwrap();
+        assert!(
+            text(&addr.stdout).contains("10.211.0.2/30"),
+            "{}",
+            text(&addr.stdout)
+        );
+    }
+
+    // B listens on all its addresses (in the background: a guest runs one step at a time); A tries every address
+    // either of them has; then B proves with a connection of its own that the listener was up the whole time.
+    let up = b
+        .exec(
+            &sh(
+                "nohup timeout 60 nc -l -p 9000 > /tmp/heard 2>/dev/null < /dev/null & sleep 1; echo up",
+                30,
+            ),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(text(&up.stdout), "up", "{}", text(&up.stderr));
+    for target in ["10.211.0.2", "10.211.0.1"] {
+        let sent = a
+            .exec(
+                &sh(
+                    &format!("echo from-a | nc -w 2 {target} 9000 && echo SENT || echo REFUSED"),
+                    30,
+                ),
+                &[],
+            )
+            .unwrap();
+        assert!(
+            text(&sent.stdout).ends_with("REFUSED"),
+            "A reached {target}:9000: {}",
+            text(&sent.stdout)
+        );
+    }
+    let before = b.exec(&sh("cat /tmp/heard", 30), &[]).unwrap();
+    assert_eq!(text(&before.stdout), "", "B's listener heard A");
+    let control = b
+        .exec(
+            &sh(
+                "echo control | nc -w 2 127.0.0.1 9000; sleep 1; cat /tmp/heard",
+                30,
+            ),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        text(&control.stdout),
+        "control",
+        "the listener was not up: {}",
+        text(&control.stderr)
+    );
+    a.destroy().unwrap();
+    b.destroy().unwrap();
+    nothing_left(root.path(), &[a_id, b_id]);
+}
+
+#[test]
+fn a_granted_guest_reaches_no_controller_or_control_service_on_the_worker_host() {
+    let Some(mut setup) = setup() else { return };
+    pull();
+    // A controller on the worker's own host, listening on every address: the API, the link port and the
+    // worker's admin socket's TCP stand-ins. The link endpoint is the one the worker would be configured with.
+    let control = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    control.set_nonblocking(true).unwrap();
+    let port = control.local_addr().unwrap().port();
+    let hosts: Vec<std::net::Ipv4Addr> = microvm::net::host_addresses().unwrap();
+    let link = hosts
+        .iter()
+        .find(|a| !a.is_loopback())
+        .copied()
+        .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+    setup.guard.link = vec![std::net::SocketAddr::from((link, port))];
+    let control6 = std::net::TcpListener::bind("[::1]:0").ok();
+    if let Some(listener) = &control6 {
+        listener.set_nonblocking(true).unwrap();
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (id, vm) = start_net(root.path(), &setup, workspace.path(), Network::Egress);
+    for host in &hosts {
+        assert!(
+            !connects(&vm, &host.to_string(), port),
+            "the guest reached the control service at {host}:{port}"
+        );
+    }
+    // The guest has no IPv6 address or route at all.
+    let v6 = vm
+        .exec(
+            &sh(
+                "ip -6 -o addr | grep -c global || true; ip -6 route | grep -c default || true",
+                30,
+            ),
+            &[],
+        )
+        .unwrap();
+    let lines: Vec<String> = text(&v6.stdout).lines().map(str::to_owned).collect();
+    assert_eq!(
+        lines[..2],
+        ["0", "0"],
+        "the guest has IPv6 routing: {lines:?}"
+    );
+    if let Some(listener) = &control6 {
+        let port6 = listener.local_addr().unwrap().port();
+        assert!(
+            !connects(&vm, "::1", port6),
+            "the guest reached a service on the host's IPv6 loopback"
+        );
+        assert!(listener.accept().is_err());
+    }
+    // The namespace's own side of the link answers nothing on any port a worker or controller commonly uses.
+    for probe in [22u16, 80, 443, 7443, 8080, port] {
+        assert!(
+            !connects(&vm, "10.211.0.1", probe),
+            "the guest reached its gateway's port {probe}"
+        );
+    }
+    assert!(
+        control.accept().is_err(),
+        "something connected to the control service the guest must not reach"
+    );
+    vm.destroy().unwrap();
+    nothing_left(root.path(), &[id]);
+}
+
+/// What a job step can observe of its network, one `key=verdict` per probe, the same script in a container and in a guest.
+fn network_view(
+    run: &dyn Fn(&str) -> String,
+    loopback_port: u16,
+    egress: &(String, u16),
+) -> Vec<String> {
+    let script = format!(
+        "nics=$(ls /sys/class/net | grep -vx lo | wc -l); echo nics=$nics; \
+         if ip route | grep -q '^default'; then echo route=yes; else echo route=no; fi; \
+         gw=$(ip route | awk '/^default/ {{print $3}}'); \
+         try() {{ if nc -w 2 \"$1\" \"$2\" </dev/null >/dev/null 2>&1; then echo \"$3=reached\"; else echo \"$3=refused\"; fi; }}; \
+         try 127.0.0.1 {loopback_port} loopback; \
+         if [ -n \"$gw\" ]; then try \"$gw\" {loopback_port} gateway; else echo gateway=none; fi; \
+         try 169.254.169.254 80 metadata; \
+         try {} {} egress",
+        egress.0, egress.1
+    );
+    run(&script).lines().map(str::to_owned).collect()
+}
+
+#[test]
+fn the_container_and_the_microvm_job_networks_agree() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let (loopback, loopback_addr) = listener("127.0.0.1");
+    let port = loopback_addr.port();
+    let egress = egress_target();
+    let temp = tempfile::tempdir().unwrap();
+    let mut views = Vec::new();
+    for network in [Network::None, Network::Egress] {
+        // The container.
+        let attempt = AttemptId::new();
+        let ws = sentinel_worker::workspace::Workspace::create(temp.path(), attempt).unwrap();
+        let container = podman::Container::start(
+            WorkerId::new(),
+            attempt,
+            IMAGE,
+            Limits {
+                cpu_millis: 500,
+                memory_bytes: 128 << 20,
+                pids: 64,
+                disk_bytes: 0,
+                lifetime_secs: 0,
+            },
+            ws.path(),
+            &[],
+            &Store::Shared,
+            network,
+        )
+        .unwrap();
+        let in_container = network_view(
+            &|script| {
+                let exit = container.exec(&sh(script, 60), &[]).unwrap();
+                assert_eq!(exit.code, Some(0), "{}", text(&exit.stderr));
+                text(&exit.stdout)
+            },
+            port,
+            &egress,
+        );
+        container.destroy().unwrap();
+
+        // The guest, with the host's addresses guarded as a worker would.
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (id, vm) = start_net(root.path(), &setup, workspace.path(), network);
+        let in_guest = network_view(
+            &|script| {
+                let exit = vm.exec(&sh(script, 60), &[]).unwrap();
+                assert_eq!(exit.code, Some(0), "{}", text(&exit.stderr));
+                text(&exit.stdout)
+            },
+            port,
+            &egress,
+        );
+        vm.destroy().unwrap();
+        nothing_left(root.path(), &[id]);
+        eprintln!("{network:?}: container {in_container:?}, guest {in_guest:?}");
+        assert_eq!(
+            in_container, in_guest,
+            "the container and the guest see different job networks under {network:?}"
+        );
+        views.push(in_guest);
+    }
+    // And the views are what the policy says: nothing without a grant, a route out but no host, link or metadata with one.
+    assert_eq!(
+        views[0],
+        [
+            "nics=0",
+            "route=no",
+            "loopback=refused",
+            "gateway=none",
+            "metadata=refused",
+            "egress=refused"
+        ]
+    );
+    assert_eq!(views[1][0], "nics=1");
+    assert_eq!(
+        views[1][1..],
+        [
+            "route=yes",
+            "loopback=refused",
+            "gateway=refused",
+            "metadata=refused",
+            "egress=reached"
+        ]
+    );
+    assert!(loopback.accept().is_err());
 }
 
 // ---------------------------------------------------------------- M06: the warm-start measurement
