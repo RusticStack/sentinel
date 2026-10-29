@@ -65,10 +65,12 @@ No metric has a tenant, repository, user or worker label, so a scrape never name
 | `sentinel_remote_cache_bytes`, `sentinel_log_writers_open` | gauge | the remote cache store and open attempt log writers |
 | `sentinel_storage_free_bytes`, `_reserve_bytes`, `_inflight_bytes`, `_admission_open`, `_metadata_bytes`, `_stored_bytes` | gauge | disk, reserve, admission ([retention](retention.md)) |
 | `sentinel_s3_healthy`, `_backlog_bytes`, `_backlog_full`, `_replicated_bytes_total`, `_consecutive_failures` | gauge/counter | the external copy, when configured ([s3](s3.md)) |
+| `sentinel_s3_local_faults_total`, `_parked_items`, `_parked_bytes` | counter/gauge | objects and logs skipped because their local files are damaged or missing (each counted once), and the items parked now ([s3](s3.md#degraded-durability-and-admission)); `sentinel_s3_healthy` stays `1` while they are skipped |
+| `sentinel_mail_outbox{state}`, `sentinel_mail_oldest_pending_seconds` | gauge | the mail outbox by state (`pending`, `delivered`, `abandoned`) and the age of the oldest message waiting, when delivery is configured ([configuration](configuration.md)) |
 | `sentinel_backup_last_success_seconds`, `sentinel_backup_last_failed` | gauge | the backup scheduler, when configured ([backup](backup.md)) |
 | `sentinel_github_check_publications{state}`, `sentinel_github_oldest_pending_seconds` | gauge | the GitHub Checks outbox: `pending` and `refused` publications, and the age of the oldest pending one ([checks](checks.md)) |
 
-Suggested alerts: `sentinel_storage_admission_open == 0`; `sentinel_s3_healthy == 0` for 15 minutes; `sentinel_workers{state="no_disk"} > 0`; `time() - sentinel_backup_last_success_seconds` above twice the backup interval; `sentinel_jobs_oldest_queued_seconds` above your queue objective while `sentinel_workers{state="connected"} > 0`; `sentinel_github_oldest_pending_seconds > 600`; a 5xx rate above zero.
+Suggested alerts: `sentinel_storage_admission_open == 0`; `sentinel_s3_healthy == 0` for 15 minutes; `increase(sentinel_s3_local_faults_total[1h]) > 0`; `sentinel_s3_parked_items > 0` for an hour; `sentinel_mail_oldest_pending_seconds` above 1800; `sentinel_workers{state="no_disk"} > 0`; `time() - sentinel_backup_last_success_seconds` above twice the backup interval; `sentinel_jobs_oldest_queued_seconds` above your queue objective while `sentinel_workers{state="connected"} > 0`; `sentinel_github_oldest_pending_seconds > 600`; a 5xx rate above zero.
 
 ## Worker metrics
 
