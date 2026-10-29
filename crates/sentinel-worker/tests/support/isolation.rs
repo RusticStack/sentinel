@@ -105,7 +105,7 @@ pub fn start_sandbox(
     store: &Store,
 ) -> Sandbox {
     match setup() {
-        Some(setup) => Sandbox::Vm(
+        Some(setup) => Sandbox::Vm(Box::new(
             microvm::Vm::start(
                 worker_dir,
                 &setup,
@@ -119,7 +119,7 @@ pub fn start_sandbox(
                 Network::None,
             )
             .unwrap(),
-        ),
+        )),
         None => Sandbox::Container(
             podman::Container::start(
                 worker,

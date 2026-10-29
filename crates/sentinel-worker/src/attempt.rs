@@ -771,7 +771,7 @@ fn prepare(
                 )?;
                 // The digest the guest ran is the one it was built and checked against.
                 summary.guest_image = Some(vm.guest_image().clone());
-                Sandbox::Vm(vm)
+                Sandbox::Vm(Box::new(vm))
             }
         };
         summary.container_start_ns = ns(started);

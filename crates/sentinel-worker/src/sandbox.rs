@@ -14,7 +14,7 @@ use crate::{
 #[derive(Debug)]
 pub enum Sandbox {
     Container(Container),
-    Vm(microvm::Vm),
+    Vm(Box<microvm::Vm>),
 }
 
 impl Sandbox {

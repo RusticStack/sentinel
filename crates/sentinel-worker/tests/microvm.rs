@@ -41,6 +41,14 @@ fn setup() -> Option<Setup> {
 }
 
 fn pull() {
+    // The image is pinned by digest, so a copy in the store is the image: the registry is asked only once.
+    let present = std::process::Command::new("podman")
+        .args(["image", "exists", IMAGE])
+        .status()
+        .is_ok_and(|status| status.success());
+    if present {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let authfile = sentinel_worker::images::prepare_anonymous_authfile(temp.path()).unwrap();
     podman::pull(
@@ -523,6 +531,490 @@ fn a_cancel_during_the_start_leaves_no_vm() {
     assert!(starting.join().unwrap().is_err());
     assert!(!microvm::exists(root.path(), attempt));
     assert_scope_gone(root.path(), attempt);
+}
+
+// ---------------------------------------------------------------- M04: lifecycle (cancel, lease loss, crashes)
+
+/// Records a functional observation: on stderr, and as a JSON line in `SENTINEL_MICROVM_LIFECYCLE_OUT` when set.
+/// These are single runs on a host that does other work, not benchmarks.
+fn observe(name: &str, millis: u128) {
+    eprintln!("m04 observation: {name} = {millis} ms");
+    if let Some(out) = std::env::var_os("SENTINEL_MICROVM_LIFECYCLE_OUT") {
+        use std::io::Write as _;
+        let line = format!("{{\"observation\":\"{name}\",\"ms\":{millis}}}\n");
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(out) {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
+
+/// The processes whose command line mentions `needle` (the VMM, its namespace holder and `pasta` name the
+/// VM's directory), other than this one.
+fn processes_mentioning(needle: &str) -> Vec<u32> {
+    let me = std::process::id();
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if String::from_utf8_lossy(&cmdline).contains(needle) {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+fn scope_active(root: &std::path::Path, attempt: AttemptId) -> bool {
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "is-active", &microvm::scope_name(root, attempt)])
+        .output()
+        .unwrap();
+    text(&status.stdout) == "active"
+}
+
+/// The pids of the VM's network namespace holder and `pasta`, as the launch script recorded them.
+fn network_pids(root: &std::path::Path, attempt: AttemptId) -> Vec<u32> {
+    let dir = root
+        .join(microvm::DIR)
+        .join("vms")
+        .join(attempt.to_string());
+    ["netns.pid", "pasta.pid"]
+        .iter()
+        .filter_map(|name| fs::read_to_string(dir.join(name)).ok()?.trim().parse().ok())
+        .collect()
+}
+
+fn pid_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Everything a VM can leave behind, checked after its removal: no directory (so no scratch overlay, console
+/// log, rules or socket), no scope, no process of the VM's (VMM, namespace holder, `pasta`), hence no tap and
+/// no network namespace, nothing in the fixed run path and no `vmtap` on the host.
+fn assert_vm_left_nothing(root: &std::path::Path, attempt: AttemptId, pids: &[u32]) {
+    assert!(!microvm::exists(root, attempt), "the VM directory remains");
+    assert!(microvm::owned(root).is_empty(), "a VM directory remains");
+    assert_scope_gone(root, attempt);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let needle = root.to_string_lossy().into_owned();
+    loop {
+        let alive: Vec<u32> = pids.iter().copied().filter(|p| pid_alive(*p)).collect();
+        let named = processes_mentioning(&needle);
+        if alive.is_empty() && named.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "processes of the VM remain: {alive:?} {named:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let run = root.join(microvm::DIR).join("run");
+    assert!(
+        run.read_dir()
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(true),
+        "the fixed run path is not empty"
+    );
+    let links = std::process::Command::new("ip")
+        .args(["-o", "link", "show", "vmtap"])
+        .output()
+        .unwrap();
+    assert!(
+        !links.status.success(),
+        "a tap named vmtap exists on the host"
+    );
+}
+
+/// A cancel to a running step, then the attempt's own teardown of the VM: the outcome and the time from the
+/// cancel until the VM is gone.
+fn cancel_to_gone(
+    setup: &Setup,
+    network: Network,
+    script: &str,
+    grace: Duration,
+) -> (Terminated, Duration) {
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    // The first VM of a shape builds its snapshot; the measured one restores it, as a worker's VMs do.
+    let (_, warm) = start_net(root.path(), setup, workspace.path(), network);
+    warm.destroy().unwrap();
+    let (attempt, vm) = start_net(root.path(), setup, workspace.path(), network);
+    let vm = Arc::new(vm);
+    let running = {
+        let vm = Arc::clone(&vm);
+        let script = script.to_owned();
+        std::thread::spawn(move || vm.exec(&sh(&script, 600), &[]))
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    let pids = network_pids(root.path(), attempt);
+    let started = Instant::now();
+    let outcome = microvm::terminate_named(root.path(), attempt, grace).unwrap();
+    let ended = running.join().unwrap();
+    assert!(ended.is_ok(), "{ended:?}");
+    // The attempt thread's teardown once its step has ended.
+    Arc::try_unwrap(vm)
+        .expect("the step's thread has ended")
+        .destroy()
+        .unwrap();
+    let gone = started.elapsed();
+    assert_vm_left_nothing(root.path(), attempt, &pids);
+    (outcome, gone)
+}
+
+#[test]
+fn a_polite_cancel_has_the_vm_gone_within_two_seconds() {
+    let Some(setup) = setup() else { return };
+    for (name, network) in [("none", Network::None), ("egress", Network::Egress)] {
+        let (outcome, gone) = cancel_to_gone(
+            &setup,
+            network,
+            "trap 'exit 3' TERM; sleep 600 & wait",
+            Duration::from_secs(5),
+        );
+        assert_eq!(outcome, Terminated::Graceful);
+        observe(
+            &format!("polite_cancel_to_vm_gone_{name}"),
+            gone.as_millis(),
+        );
+        assert!(
+            gone < Duration::from_secs(2),
+            "cancel to VM gone took {gone:?} ({name})"
+        );
+    }
+}
+
+#[test]
+fn a_stubborn_step_costs_its_grace_period_and_then_under_two_seconds() {
+    let Some(setup) = setup() else { return };
+    let grace = Duration::from_millis(700);
+    let (outcome, gone) = cancel_to_gone(
+        &setup,
+        Network::None,
+        "trap '' TERM; while :; do sleep 1; done",
+        grace,
+    );
+    assert_eq!(outcome, Terminated::Forced);
+    observe("forced_cancel_to_vm_gone_none_grace_700", gone.as_millis());
+    assert!(
+        gone >= grace && gone < grace + Duration::from_secs(2),
+        "forced cancel to VM gone took {gone:?}"
+    );
+}
+
+#[test]
+fn a_cancel_to_an_unresponsive_guest_still_has_the_vm_gone_within_two_seconds() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (attempt, vm) = start_net(root.path(), &setup, workspace.path(), Network::None);
+    let vm = Arc::new(vm);
+    let running = {
+        let vm = Arc::clone(&vm);
+        std::thread::spawn(move || vm.exec(&sh("sleep 600", 600), &[]))
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    // Freeze the VMM, so the guest agent cannot answer.
+    let needle = root.path().to_string_lossy().into_owned();
+    let vmm: Vec<u32> = processes_mentioning(&needle)
+        .into_iter()
+        .filter(|pid| {
+            fs::read_to_string(format!("/proc/{pid}/comm"))
+                .map(|comm| comm.trim() == "firecracker")
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(vmm.len(), 1, "one VMM: {vmm:?}");
+    // SAFETY: stopping a process this test started.
+    unsafe { libc::kill(i32::try_from(vmm[0]).unwrap(), libc::SIGSTOP) };
+    let started = Instant::now();
+    let outcome =
+        microvm::terminate_named(root.path(), attempt, Duration::from_millis(500)).unwrap();
+    assert_eq!(outcome, Terminated::Forced);
+    assert!(running.join().unwrap().is_err());
+    let _ = Arc::try_unwrap(vm).map(|vm| vm.destroy());
+    let gone = started.elapsed();
+    observe("unresponsive_guest_cancel_to_vm_gone", gone.as_millis());
+    assert_vm_left_nothing(root.path(), attempt, &vmm);
+    assert!(
+        gone < Duration::from_secs(2),
+        "a cancel to a frozen guest took {gone:?}"
+    );
+}
+
+#[test]
+fn losing_the_lease_has_the_vm_gone_within_two_seconds_with_or_without_a_network() {
+    let Some(setup) = setup() else { return };
+    pull();
+    for (name, network) in [("none", Network::None), ("egress", Network::Egress)] {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (attempt, vm) = start_net(root.path(), &setup, workspace.path(), network);
+        let vm = Arc::new(vm);
+        let running = {
+            let vm = Arc::clone(&vm);
+            std::thread::spawn(move || vm.exec(&sh("sleep 600", 600), &[]))
+        };
+        std::thread::sleep(Duration::from_millis(500));
+        let pids = network_pids(root.path(), attempt);
+        let started = Instant::now();
+        // What the executor's lease watchdog does.
+        sentinel_worker::sandbox::remove(root.path(), attempt, &Store::Shared).unwrap();
+        let gone = started.elapsed();
+        assert!(
+            running.join().unwrap().is_err(),
+            "the step is cut off with its VM"
+        );
+        observe(&format!("lease_loss_to_vm_gone_{name}"), gone.as_millis());
+        assert!(
+            gone < Duration::from_secs(2),
+            "lease loss to VM gone took {gone:?} ({name})"
+        );
+        assert_vm_left_nothing(root.path(), attempt, &pids);
+        // The attempt thread still holds the handle: dropping it after the removal changes nothing.
+        drop(vm);
+        assert_vm_left_nothing(root.path(), attempt, &pids);
+    }
+}
+
+#[test]
+fn a_handle_dropped_without_destroy_takes_its_vm_with_it() {
+    let Some(setup) = setup() else { return };
+    pull();
+    for network in [Network::None, Network::Egress] {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (attempt, vm) = start_net(root.path(), &setup, workspace.path(), network);
+        let pids = network_pids(root.path(), attempt);
+        // An attempt thread that panics drops the handle on its way out.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = vm;
+            panic!("the attempt failed");
+        }));
+        assert!(panicked.is_err());
+        assert_vm_left_nothing(root.path(), attempt, &pids);
+    }
+}
+
+/// The role of a re-executed copy of this test binary: a worker that starts a VM, runs a step in it and waits
+/// to be killed by the parent. `SENTINEL_M04_VICTIM` is `<data root>|<egress 0 or 1>|<ready file>`.
+fn run_as_victim(spec: &str) {
+    let mut parts = spec.splitn(3, '|');
+    let root = PathBuf::from(parts.next().unwrap());
+    let network = if parts.next() == Some("1") {
+        Network::Egress
+    } else {
+        Network::None
+    };
+    let ready = PathBuf::from(parts.next().unwrap());
+    let setup = setup().expect("the victim runs with the parent's environment");
+    let workspace = tempfile::tempdir().unwrap();
+    let attempt = AttemptId::new();
+    let vm = Vm::start(
+        &root,
+        &setup,
+        WorkerId::new(),
+        attempt,
+        IMAGE,
+        limits(),
+        workspace.path(),
+        &[],
+        &Store::Shared,
+        network,
+    )
+    .unwrap();
+    let vm = Arc::new(vm);
+    {
+        let vm = Arc::clone(&vm);
+        std::thread::spawn(move || {
+            let _ = vm.exec(&sh("sleep 600", 600), &[]);
+        });
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    fs::write(&ready, attempt.to_string()).unwrap();
+    // The parent kills this process: it must never reach a destructor.
+    std::thread::sleep(Duration::from_secs(600));
+}
+
+/// A re-executed copy of this test binary playing a worker, killed with SIGKILL by the test.
+struct Victim {
+    child: std::process::Child,
+}
+
+impl Victim {
+    fn spawn(
+        test: &str,
+        root: &std::path::Path,
+        network: Network,
+        ready: &std::path::Path,
+    ) -> Self {
+        let spec = format!(
+            "{}|{}|{}",
+            root.display(),
+            u8::from(network == Network::Egress),
+            ready.display()
+        );
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env("SENTINEL_M04_VICTIM", spec)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        Victim { child }
+    }
+
+    fn kill9(&mut self) {
+        // SAFETY: SIGKILL to the child this test started.
+        unsafe { libc::kill(i32::try_from(self.child.id()).unwrap(), libc::SIGKILL) };
+        let status = self.child.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL),
+            "the victim was killed, not exited: {status:?}"
+        );
+    }
+}
+
+impl Drop for Victim {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Removes whatever a failed test left, so one failure does not leak VMs.
+struct Sweep<'a>(&'a std::path::Path);
+
+impl Drop for Sweep<'_> {
+    fn drop(&mut self) {
+        let _ = microvm::reconcile(self.0);
+    }
+}
+
+#[test]
+fn a_worker_killed_with_sigkill_mid_attempt_leaves_only_what_recovery_removes() {
+    const NAME: &str = "a_worker_killed_with_sigkill_mid_attempt_leaves_only_what_recovery_removes";
+    if let Ok(spec) = std::env::var("SENTINEL_M04_VICTIM") {
+        run_as_victim(&spec);
+        return;
+    }
+    let Some(_setup) = setup() else { return };
+    pull();
+    for (name, network) in [("none", Network::None), ("egress", Network::Egress)] {
+        let root = tempfile::tempdir().unwrap();
+        let _sweep = Sweep(root.path());
+        let ready = root.path().join("ready");
+        let mut victim = Victim::spawn(NAME, root.path(), network, &ready);
+        let deadline = Instant::now() + Duration::from_secs(300);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "the victim never became ready");
+            assert!(
+                victim.child.try_wait().unwrap().is_none(),
+                "the victim ended early"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let attempt: AttemptId = fs::read_to_string(&ready).unwrap().parse().unwrap();
+        let pids = network_pids(root.path(), attempt);
+        if network == Network::Egress {
+            assert_eq!(pids.len(), 2, "a namespace holder and pasta: {pids:?}");
+        }
+        victim.kill9();
+        // The VM outlives its worker (it runs in a scope of its own): this is what recovery exists for.
+        assert!(scope_active(root.path(), attempt));
+        assert!(microvm::exists(root.path(), attempt));
+        let started = Instant::now();
+        let (recovered, _) =
+            sentinel_worker::recovery::recover(root.path(), WorkerId::new()).unwrap();
+        let took = started.elapsed();
+        assert_eq!(recovered.containers_removed, 1, "{recovered:?}");
+        observe(&format!("recovery_after_kill9_{name}"), took.as_millis());
+        assert!(took < Duration::from_secs(5), "recovery took {took:?}");
+        assert_vm_left_nothing(root.path(), attempt, &pids);
+        // A second pass finds nothing.
+        let (again, _) = sentinel_worker::recovery::recover(root.path(), WorkerId::new()).unwrap();
+        assert_eq!(again.containers_removed, 0, "{again:?}");
+    }
+}
+
+#[test]
+fn a_worker_killed_at_any_point_of_a_vm_start_leaves_nothing_after_recovery() {
+    const NAME: &str = "a_worker_killed_at_any_point_of_a_vm_start_leaves_nothing_after_recovery";
+    if let Ok(spec) = std::env::var("SENTINEL_M04_VICTIM") {
+        run_as_victim(&spec);
+        return;
+    }
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let _sweep = Sweep(root.path());
+    let workspace = tempfile::tempdir().unwrap();
+    // The guest image and a snapshot of each network shape exist, so the victim's start is a restore of
+    // under a second and the kills land in different phases of it.
+    for network in [Network::None, Network::Egress] {
+        let (_, warm) = start_net(root.path(), &setup, workspace.path(), network);
+        warm.destroy().unwrap();
+    }
+    let mut round = 0u64;
+    for network in [Network::None, Network::Egress] {
+        for delay_ms in [0u64, 20, 60, 120, 250, 500] {
+            round += 1;
+            let ready = root.path().join(format!("ready-{round}"));
+            let mut victim = Victim::spawn(NAME, root.path(), network, &ready);
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while microvm::owned(root.path()).is_empty() && !ready.exists() {
+                assert!(Instant::now() < deadline, "the victim never started a VM");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            victim.kill9();
+            let started = Instant::now();
+            let (recovered, _) =
+                sentinel_worker::recovery::recover(root.path(), WorkerId::new()).unwrap();
+            let took = started.elapsed();
+            eprintln!(
+                "round {round}: killed {delay_ms} ms after the VM directory appeared (network {network:?}, step {}), recovery removed {} in {took:?}",
+                if ready.exists() {
+                    "running"
+                } else {
+                    "not yet running"
+                },
+                recovered.containers_removed
+            );
+            assert!(took < Duration::from_secs(10), "recovery took {took:?}");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let needle = root.path().to_string_lossy().into_owned();
+            while !processes_mentioning(&needle).is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "round {round}: processes of the killed worker's VM remain: {:?}",
+                    processes_mentioning(&needle)
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            nothing_left(root.path(), &[]);
+            assert_eq!(
+                microvm::reconcile(root.path()).unwrap(),
+                0,
+                "round {round}: a second pass found something"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------- M06: snapshot warm start

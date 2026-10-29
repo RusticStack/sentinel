@@ -68,10 +68,11 @@ const VMM_OVERHEAD: u64 = 256 << 20;
 /// that outgrows it is OOM-killed inside the guest and the agent stays able to say so, the way a container
 /// is, instead of the whole guest running out of memory with it.
 const GUEST_OVERHEAD_MIB: u64 = 64;
-/// How long a cancel waits for the guest agent to confirm a signal before it kills the VM instead.
-const CANCEL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a cancel waits for the guest agent to confirm a signal before it kills the VM instead. A healthy
+/// agent answers in milliseconds; the bound keeps cancel to VM gone under 2 s (TODO M04) when it cannot.
+const CANCEL_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a cancel waits to reach the agent at all.
-const CANCEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const CANCEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// A cached guest image is stamped on use only when its stamp is older than this, so the stamp stays within
 /// it of the last use while a hit costs no write; image GC keeps everything used within `images::IMAGE_KEEP`.
 const STAMP_AFTER: Duration = Duration::from_secs(60);
@@ -822,7 +823,11 @@ fn connect(socket: &Path, deadline: Instant, alive: &mut dyn FnMut() -> bool) ->
     loop {
         let attempt = (|| -> io::Result<Client> {
             let mut stream = UnixStream::connect(socket)?;
-            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            // The handshake never outlives the caller's deadline: a cancel to a frozen VMM must not wait out 5 s.
+            let left = deadline.saturating_duration_since(Instant::now());
+            stream.set_read_timeout(Some(
+                left.clamp(Duration::from_millis(50), Duration::from_secs(5)),
+            ))?;
             stream.write_all(format!("CONNECT {}\n", agent::PORT).as_bytes())?;
             let mut line = String::new();
             BufReader::new(stream.try_clone()?).read_line(&mut line)?;
@@ -1112,6 +1117,8 @@ pub struct Vm {
     writable: Vec<(String, PathBuf)>,
     /// Keeps image GC off this VM's root file system until the VM is gone.
     _image: Arc<ImageLease>,
+    /// Set once the scope is confirmed stopped and the directory removed, so dropping the handle is then a no-op.
+    gone: AtomicBool,
 }
 
 impl std::fmt::Debug for Vm {
@@ -1666,6 +1673,7 @@ impl Vm {
             next_id: AtomicU32::new(1),
             writable: Vec::new(),
             _image: guest.lease,
+            gone: AtomicBool::new(false),
         };
         let prepared = (|| -> Result<()> {
             vm.client.send(&Request::MemoryLimit {
@@ -1909,7 +1917,19 @@ impl Vm {
                 Err(e)
             }
         })?;
+        self.gone.store(true, Ordering::Release);
         Ok(())
+    }
+}
+
+/// A handle that goes away without `destroy` (an attempt thread that panics, an early return) must not leave
+/// its VM running: the scope is killed and the directory removed, as `destroy` does. A worker that dies
+/// without running destructors (`kill -9`, power loss) leaves the VM to startup reconciliation instead.
+impl Drop for Vm {
+    fn drop(&mut self) {
+        if !self.gone.load(Ordering::Acquire) {
+            let _ = self.destroy_inner();
+        }
     }
 }
 
@@ -3443,6 +3463,29 @@ mod tests {
             Terminated::Forced
         );
         assert!(!exists(&root, attempt));
+    }
+
+    #[test]
+    fn a_cancel_to_a_frozen_vmm_waits_no_longer_than_its_connect_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("d");
+        let attempt = AttemptId::new();
+        let dir = vm_files(&root, attempt);
+        // A VMM that is stopped still has its socket accepted by the kernel; it never answers the handshake.
+        let listener = std::os::unix::net::UnixListener::bind(dir.join("vsock.sock")).unwrap();
+        let systemctl = FakeSystemctl::new(temp.path(), "inactive", "", 0);
+        let started = Instant::now();
+        assert_eq!(
+            terminate(&systemctl, &root, attempt, Duration::ZERO).unwrap(),
+            Terminated::Forced
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the handshake read ignored the deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(!exists(&root, attempt));
+        drop(listener);
     }
 
     #[test]
