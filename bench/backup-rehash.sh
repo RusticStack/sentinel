@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
 # Backup verification rehash cost at configurable object counts, through backup::verify, beside a bare BLAKE3 read of the same files.
-#   SENTINEL_SRC=/checkout SENTINEL_BIN=target/release/examples/backup-rehash-bench DIR=/srv/bench/backup-rehash bench/backup-rehash.sh [bench args]
-# DIR must sit on the file system under test; the bench removes what it creates there.
-# Appends one stamped record to OUT (default bench/backup-rehash.jsonl).
-# The measured binary is the example built from SENTINEL_SRC: cargo build --release -p sentinel-store --example backup-rehash-bench
+#   SENTINEL_SRC=/checkout SENTINEL_BIN=target/release/examples/backup-rehash-bench SENTINEL_BENCH_HOST_LABEL=<label> DIR=/var/tmp/backup-rehash bench/backup-rehash.sh [extra bench args]
+# Runs through bench/micro-run.sh and bench/contracts/micro/backup-rehash.json: the contract fixes the arguments, the case
+# order and the record; the runner takes the shared verification lock, refuses a host that is not quiet, stamps the
+# build and host and appends the record to bench/backup-rehash.jsonl (OUT overrides). `bench/micro-run.sh <contract> --smoke`
+# is the tiny-parameter harness check. The measured binary is built from SENTINEL_SRC:
+#   cargo build --release --locked -p sentinel-store --example backup-rehash-bench
 set -euo pipefail
-. "$(dirname "${BASH_SOURCE[0]}")/stamp.sh"
-stamp_init
-BIN="${SENTINEL_BIN:?set SENTINEL_BIN to the backup-rehash-bench binary built from SENTINEL_SRC}"
-DIR="${DIR:?set DIR to a directory on the file system under test}"
-OUT="${OUT:-$(dirname "${BASH_SOURCE[0]}")/backup-rehash.jsonl}"
-STAMP_SED="$(stamp_sed)"
-"$BIN" --dir "$DIR" "$@" | sed "s/^{/{$STAMP_SED,/" >> "$OUT"
-echo "record appended to $OUT" >&2
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec bash "$here/micro-run.sh" "$here/contracts/micro/backup-rehash.json" -- "$@"

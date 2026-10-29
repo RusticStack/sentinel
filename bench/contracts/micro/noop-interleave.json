@@ -1,0 +1,27 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "noop-interleave",
+  "revision": 1,
+  "harness": {
+    "example": "sentinel-bench",
+    "build": "cargo build --release --locked -p sentinel-bench",
+    "target_path": "release/sentinel-bench"
+  },
+  "run": {
+    "args": ["--workload", "noop", "--runtime", "direct", "--interleave", "scoped", "--warm-state", "warm", "--samples", "20", "--warmup", "2"],
+    "smoke_args": ["--workload", "noop", "--runtime", "direct", "--warm-state", "warm", "--samples", "3", "--warmup", "1"]
+  },
+  "ordering": {
+    "scheme": "abba",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/1",
+    "out": "bench/noop-interleave.jsonl",
+    "own_stamp": true
+  },
+  "notes": "sentinel-bench stamps its own build and host and alternates the interleaved runtimes in ABBA order, reversing every sample. The Podman leg needs --interleave podman --image <digest-pinned image>, passed after --."
+}

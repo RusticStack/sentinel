@@ -1,0 +1,36 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "f07-storage",
+  "revision": 1,
+  "harness": {
+    "script": "bench/f07-storage.sh"
+  },
+  "run": {
+    "args": [],
+    "smoke_args": [],
+    "smoke_env": {
+      "FSLIST": "ext4",
+      "EXT4": "{scratch}/ext4",
+      "FILES": "40",
+      "BYTES": "1024",
+      "JOBS": "50",
+      "BACKLOG": "500",
+      "ROUNDS": "2"
+    }
+  },
+  "ordering": {
+    "scheme": "shuffle",
+    "seed": {
+      "env": "SHUF_SEED",
+      "recorded_as": "shuffle_seed"
+    }
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "f07-storage",
+    "out": "bench/f07-storage.jsonl"
+  },
+  "notes": "The script writes its own stamped records (build, host, shuffle_seed, round, position, caches_dropped). Needs PROBE (sentinel-probes), root for the loop mounts and cache drops. A measured run appends and refuses a non-empty OUT unless REPLACE=1."
+}

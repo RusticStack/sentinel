@@ -1,0 +1,25 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "s3-hash",
+  "revision": 1,
+  "harness": {
+    "example": "s3-hash-bench",
+    "build": "cargo build --release --locked -p sentinel-s3 --example s3-hash-bench"
+  },
+  "run": {
+    "args": ["--sizes", "4096,65536,1048576,16777216", "--sample-mib", "64", "--rounds", "7", "--sign-iterations", "20000"],
+    "smoke_args": ["--sizes", "4096,65536", "--sample-mib", "2", "--rounds", "2", "--sign-iterations", "500"]
+  },
+  "ordering": {
+    "scheme": "abba",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/s3-hash/1",
+    "out": "bench/s3-hash.jsonl"
+  },
+  "notes": "Pure CPU; case order reverses every round (ABBA)."
+}
