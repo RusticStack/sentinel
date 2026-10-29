@@ -22,13 +22,14 @@
 set -uo pipefail
 SP_DIR=${1:?server package dir}; WP_DIR=${2:?worker package dir}; R=${3:?work dir}; mkdir -p "$R/tmp"; R=$(cd "$R" && pwd)
 HOOK_SRC=$(cd "$(dirname "$0")/../.." && pwd)/examples/hooks/post-receive; ME=$(id -un)
+cd "$R"
 S=$SP_DIR/bin/sentinel
 W=$WP_DIR/bin/sentinel
 export HOME=$(getent passwd "$ME" | cut -d: -f6) XDG_RUNTIME_DIR=/run/user/$(id -u) TMPDIR=$R/tmp
 export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
 DATA=$R/controller; WDATA=$R/worker
-PIDS=
+PIDS=; SSHD=
 cleanup() { for p in $PIDS; do kill $p 2>/dev/null; done; }
 trap cleanup EXIT
 step() { echo; echo "=== $*"; }
@@ -57,7 +58,7 @@ UsePAM no
 StrictModes no
 C
 /usr/sbin/sshd -f $R/ssh/sshd_config -D -e > $R/ssh/sshd.log 2>&1 &
-PIDS="$PIDS $!"
+PIDS="$PIDS $!"; SSHD=$!
 git init -q --bare --initial-branch=main $R/origin.git
 REPO=ssh://$ME@127.0.0.1:42222$R/origin.git
 git init -q --initial-branch=main $R/work
@@ -93,7 +94,6 @@ $S admin source --actor $ACTOR --data-dir $DATA bind --repo $REPOID --expected 0
 HOOK=$($S admin source --actor $ACTOR --data-dir $DATA hook-token --repo $REPOID | tr -d '\n')
 echo "hook token issued: ${HOOK:0:14}..."
 adm "worker enroll" --pool local > $WDATA/enrollment; chmod 600 $WDATA/enrollment
-TOKEN=$(adm "token issue" --user root --name smoke --scope read,run --expires-in 1h | tr -d '\n')
 
 step "start controller"
 cat > $R/server.toml <<C
@@ -136,18 +136,16 @@ chmod 600 $R/origin.git/hooks/sentinel-hook.env; mkdir -p $R/spool
 (cd $R/work && GIT_SSH_COMMAND="ssh -F /dev/null -i $R/ssh/deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" git push $REPO main 2>&1)
 step "wait for the run"
 for i in $(seq 1 120); do
-  RUNS=$(curl -sS -m 5 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:47080/api/v1/tenants/acme/repos/app/runs?limit=5")
-  echo "$RUNS" | grep -q '"state":"\(passed\|failed\|cancelled\)"' && break
+  grep -q "\"event\":\"attempt_finished\"" "$R/worker.log" && break
   sleep 1
 done
-echo "$RUNS"
 grep -o '"outcome":"[^"]*"' $R/server.log | head
 ATT=$(grep -o 'att_[0-9a-f-]*' $R/server.log $R/worker.log | head -1 | cut -d: -f2); echo "attempt=$ATT"
 
 step "stop"
 kill -TERM $WP; wait $WP; WRC=$?; echo "worker exit=$WRC"
 kill -TERM $SP; wait $SP; SRC=$?; echo "controller exit=$SRC"
-PIDS=
+PIDS=$SSHD
 [ -n "$ATT" ] && adm logs --attempt $ATT
 $S admin intake --data-dir $DATA list --repo $REPOID
 if grep -q "\"verdict\":\"Passed\"" "$R/worker.log" && [ "$WRC" = 0 ] && [ "$SRC" = 0 ]; then echo "ok  a push ran a job to Passed with no outbound network"; else echo "FAIL" >&2; exit 1; fi
