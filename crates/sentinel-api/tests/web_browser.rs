@@ -88,10 +88,6 @@ fn spawn_web(
 }
 
 impl Web {
-    fn start(port: u16, api: &str) -> Web {
-        Web::start_with(port, api, &[], None)
-    }
-
     /// With more environment (such as `SENTINEL_GITHUB_WEB_URL`) and, optionally, a file for its output.
     fn start_with(
         port: u16,
