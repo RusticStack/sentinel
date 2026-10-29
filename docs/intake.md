@@ -124,6 +124,18 @@ the secret in the same transaction — a revoked repository receives nothing.
 The secret is a bearer credential. Send it over TLS (the API itself speaks
 plain HTTP behind the operator's reverse proxy) or over loopback.
 
+A hook-secret delivery (authentication level 1) is trusted as presented: its
+ref and revisions are stored as sent, and intake does not check that the new
+revision is the remote's advertised tip of that ref (only
+[ref polling](#ref-polling) reads the real tip). The secret therefore carries
+the authority to start a run, with the protected cache scope and bound
+[secrets](secrets.md#who-may-cause-a-delivery), for any commit that exists on
+the remote, under any ref the binding allows. Keep it in a server-side hook,
+not in a client. A per-delivery tip check would add a `git ls-remote` round
+trip to every delivery and turn a push that races its follow-up into an
+ignored delivery, so none is made; the signed GitHub path trusts the signed
+payload's ref and revision in the same way.
+
 ## The post-receive hook and relay
 
 `examples/hooks/post-receive` is a POSIX `sh` hook plus a `--flush` mode for a
@@ -340,6 +352,11 @@ The controller is the only writer: `intake::dispatch` inserts the run and its
 dispatch leaves neither, and a run without a row reads as a `manual` event. The
 worker only reads the facts (`provenance::event_facts`, carried in the worker
 protocol) when it builds its expression context; it never records them.
+
+Provenance records what triggered a run, not who. A manual run carries no
+caller, and a webhook's sender is not parsed; for a manual run the only trace
+of the calling principal is its `Idempotency-Key` record, when the caller sent
+one. The actor columns are a planned additive migration.
 
 Settled rows are terminal — the store's trigger refuses reopening one — and
 each settlement is logged as `intake_settled` with its delivery and outcome,
