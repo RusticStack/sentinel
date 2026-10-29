@@ -6,7 +6,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { api, ApiError, setCsrfToken } from "../../lib/api.ts";
 import { refusal, retryAfter, useRetryWait } from "../../lib/act.tsx";
 import {
-  baseUrlProblem, DRAFT_KEY, emptyDraft, isSetupToken, looksLikeEmail, parseDraft, passwordAdvice, serializeDraft, slugProblem,
+  baseUrlProblem, DRAFT_KEY, emptyDraft, isSetupToken, looksLikeEmail, parseDraft, passwordAdvice, persistedStep, serializeDraft, slugProblem,
   type RegistrationChoice, type TenantCreationChoice, type WizardDraft,
 } from "../../lib/onboarding.ts";
 import { loadSession, useSession } from "../../lib/session.ts";
@@ -108,8 +108,9 @@ function Setup() {
 
   useEffect(() => {
     if (!dirty.current || done.current) return;
-    try { sessionStorage.setItem(DRAFT_KEY, serializeDraft({ ...draft, step: Math.min(step, LAST_DRAFT_STEP) })); } catch { /* storage off: no resume */ }
-  }, [draft, step]);
+    // Until the resume is walked through, the stored place stays the one the person left, whatever step they are on.
+    try { sessionStorage.setItem(DRAFT_KEY, serializeDraft({ ...draft, step: persistedStep(step, resumeAt, LAST_DRAFT_STEP) })); } catch { /* storage off: no resume */ }
+  }, [draft, step, resumeAt]);
 
   // Each step's heading takes focus as it opens (not on the first render: the token field has it then).
   const opened = useRef(false);
