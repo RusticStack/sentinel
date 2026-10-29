@@ -115,7 +115,8 @@ PY
 measure)
   CONDITION=$4 SAMPLES=$5 WARMUP=$6 OUT=$7
   : "${SENTINEL_SRC:?set SENTINEL_SRC to the checkout the sentinel binary was built from}"
-  git -C "$SENTINEL_SRC" rev-parse HEAD >/dev/null || { echo "cannot read the commit of $SENTINEL_SRC" >&2; exit 1; }
+  # Refuses before the first sample: no readable commit or tracked-change state, or no anonymized SENTINEL_BENCH_HOST_LABEL.
+  python3 "$(dirname "$0")/benchstamp.py" --source "$SENTINEL_SRC" >/dev/null || exit 1
   cd "$ROOT"
   API="http://$(cat api.addr)/api/v1" TOKEN=$(cat token)
   settle() {

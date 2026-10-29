@@ -56,12 +56,16 @@ import urllib.error
 import urllib.request
 import uuid
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import benchstamp  # noqa: E402
+
 SCHEMA = "sentinel-bench/b09/1"
 BENCH_USER = "benchmark"
 IMAGE = "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
 BRIDGE, SUBNET, BRIDGE_ADDR = "b09br", "10.99.0", "10.99.0.1"
 LINK_PORT, API_PORT, GIT_PORT = 47443, 47480, 47490
-LOCK = "/srv/sentinel/runs/p14.lock"
+# The one benchmark and verification lock of the host (scripts/qualify/qualify.sh and the b05 scripts take the same file).
+LOCK = os.environ.get("SENTINEL_VERIFY_LOCK") or "/var/tmp/sentinel-verify.lock"
 # The harness runs git as root against repositories it hands to the bench user; git refuses those as dubious ownership.
 # Local transport strips GIT_CONFIG_* before it starts receive-pack, so pushes carry the setting themselves.
 os.environ.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="safe.directory", GIT_CONFIG_VALUE_0="*")
@@ -444,27 +448,16 @@ def settle(limit_s=900):
 
 
 def stamp(source, binary, fleet=None):
-    def git(*args):
-        r = subprocess.run(["git", "-C", source, *args], capture_output=True, text=True)
-        return r.stdout.strip() if r.returncode == 0 else None
-    commit = git("rev-parse", "HEAD")
-    if commit is None:
-        raise SystemExit(f"cannot read the source commit of {source}; no record is written without it")
-    status = git("status", "--porcelain", "--untracked-files=no")
-    with open(binary, "rb") as f:
-        digest = hashlib.sha256(f.read()).hexdigest()
-    mem = field("/proc/meminfo", "MemTotal")
-    host = {"hostname": os.environ.get("SENTINEL_BENCH_HOST_LABEL") or None,
-            "kernel": read_first("/proc/sys/kernel/osrelease"),
-            "cpu_model": field("/proc/cpuinfo", "model name"), "cpus_online": os.cpu_count(),
-            "mem_total_kib": int(mem.split()[0]) if mem else None,
-            "cpu_governor": read_first("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
-            "shared_host": "all workers, the controller and the Git fixture run on this one host"}
+    """The build and host block of every record; bench/benchstamp.py refuses (before any scenario runs) a source
+    commit or dirty state git cannot report and a missing or malformed host label."""
+    label = benchstamp.host_label()
+    built = benchstamp.build(source, binary)
+    host = benchstamp.host(label)
+    host["shared_host"] = "all workers, the controller and the Git fixture run on this one host"
     if fleet:
         host["shared_host"] = ("the controller and the Git fixture run on this host; the workers run on the fleet's "
                                "hosts (see fleet), so this host's figures describe the control plane only")
-    return {"build": {"commit": commit, "dirty": None if status is None else bool(status), "binary_sha256": digest},
-            "host": {k: v for k, v in host.items() if v is not None}}
+    return {"build": built, "host": host}
 
 
 def percentile(sorted_values, q):
@@ -1462,13 +1455,28 @@ RELIABILITY = {"restart-controller-kill": r_restart_controller, "restart-control
                "tailcat-relay": r_blocked}
 
 
+def take_lock(path):
+    """Takes the host lock exclusively. The descriptor Python opens is not inherited by the processes this
+    harness starts, so a process a scenario leaves behind cannot keep the lock."""
+    try:
+        f = open(path, "a")
+    except OSError as e:
+        raise Blocked(f"the benchmark lock {path} cannot be opened: {e.strerror}")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
 def run_scenario(a, name, out, stamp_):
     spec = SCENARIOS[name]
     install_lock = None
     if not a.no_lock:
         log(f"{name}: waiting for the exclusive lock {LOCK}")
-        install_lock = open(LOCK, "a")
-        fcntl.flock(install_lock, fcntl.LOCK_EX)
+        try:
+            install_lock = take_lock(LOCK)
+        except Blocked as b:
+            emit(out, stamp_, {"kind": "blocked", "scenario": {"id": name}, "blocked_by": str(b)})
+            log(f"{name}: Blocked by: {b}")
+            return
     try:
         settle()
         if spec["kind"] == "blocked":

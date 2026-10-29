@@ -9,7 +9,7 @@
 
 A sample is spawn-of-the-VMM-process -> the guest agent's `Ready` over vsock (Firecracker's and Cloud
 Hypervisor's hybrid vsock: a Unix socket, `CONNECT <port>`), for a cold boot; for a restore, the same from a
-snapshot of a booted guest. Every record carries the host block and the binaries' SHA-256.
+snapshot of a booted guest. Every record carries the build (commit and dirty state of --source), the host block and the binaries' SHA-256.
 """
 import argparse
 import hashlib
@@ -24,6 +24,9 @@ import subprocess
 import sys
 import tempfile
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import benchstamp  # noqa: E402
 
 AGENT_PORT = 1024
 CPU_SET = os.environ.get("M02_CPUS", "")
@@ -44,7 +47,7 @@ def host():
         except OSError:
             return None
     model = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), None)
-    return {"hostname": os.environ.get("SENTINEL_BENCH_HOST_LABEL") or None,
+    return {"hostname": benchstamp.host_label(),
             "kernel": platform.release(), "cpu_model": model,
             "cpus_online": os.cpu_count(), "governor": first("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
             "loadavg": first("/proc/loadavg"), "cpu_pressure": first("/proc/pressure/cpu")}
@@ -229,7 +232,7 @@ def snapshot_fc(a, work):
 def run(a):
     out = open(a.out, "a") if a.out else sys.stdout
     common = {"schema": "sentinel-bench/m02/1", "vmm": a.vmm, "mode": a.mode, "sandbox": a.sandbox,
-              "vcpus": a.vcpus, "mem_mib": a.mem, "host": host(),
+              "vcpus": a.vcpus, "mem_mib": a.mem, "build": a.build, "host": host(),
               "binaries": {"vmm": sha(a.bin), "kernel": sha(a.kernel), "initrd": sha(a.initrd), "rootfs": sha(a.rootfs)}}
     with tempfile.TemporaryDirectory(dir=a.workdir) as work:
         a.scratch_template = os.path.join(work, "scratch-template.ext4")
@@ -321,7 +324,7 @@ def memory(a):
             stop(p)
         rec = {"schema": "sentinel-bench/m02/1", "kind": "idle_memory", "vmm": a.vmm, "sandbox": a.sandbox,
                "vcpus": a.vcpus, "mem_mib": a.mem, "count": a.count, "pss_bytes": per,
-               "pss_median": statistics.median(per), "host": host()}
+               "pss_median": statistics.median(per), "build": a.build, "host": host()}
         print(json.dumps(rec), file=out, flush=True)
         print(f"{a.vmm} idle x{a.count}: PSS median {statistics.median(per)/2**20:.1f} MiB per VM", file=sys.stderr)
 
@@ -350,7 +353,16 @@ def main():
         p.add_argument("--count", type=int, default=10)
         p.add_argument("--workdir", default=None)
         p.add_argument("--out")
+        p.add_argument("--source", default=os.environ.get("SENTINEL_SRC"),
+                       help="the checkout the VMM, kernel, initrd and guest agent under test were built from "
+                            "(or SENTINEL_SRC); its commit and dirty state go into every record")
     a = ap.parse_args()
+    if a.cmd in ("run", "memory"):
+        # Before the first VM boots: a record that names no build or no anonymized host is not written.
+        if not a.source:
+            ap.error("--source (or SENTINEL_SRC) is required: a record must name the build it measured")
+        benchstamp.host_label()
+        a.build = benchstamp.build(a.source)
     if a.cmd == "image":
         image(a.name, a.out)
     elif a.cmd == "initrd":

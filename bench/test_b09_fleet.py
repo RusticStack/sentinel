@@ -216,5 +216,40 @@ class RemoteCleanup(unittest.TestCase):
             self.assertEqual(os.listdir(os.path.join(tmp, "fleet")), [])
 
 
+class HostLock(unittest.TestCase):
+    """The harness takes the host's one verification lock, not a file under /srv/sentinel."""
+
+    def test_the_default_lock_is_the_shared_verification_lock(self):
+        if "SENTINEL_VERIFY_LOCK" not in os.environ:
+            self.assertEqual(h.LOCK, "/var/tmp/sentinel-verify.lock")
+        self.assertNotIn("/srv/sentinel", h.LOCK)
+
+    def test_a_lock_that_cannot_be_opened_is_blocked_not_a_traceback(self):
+        with self.assertRaises(h.Blocked) as caught:
+            h.take_lock(os.path.join(tempfile.gettempdir(), "no-such-dir-b09", "x.lock"))
+        self.assertIn("cannot be opened", str(caught.exception))
+
+    def test_a_scenario_whose_lock_is_unavailable_records_blocked_and_runs_nothing(self):
+        import io
+        out, saved = io.StringIO(), h.LOCK
+        h.LOCK = os.path.join(tempfile.gettempdir(), "no-such-dir-b09", "x.lock")
+        try:
+            h.run_scenario(types.SimpleNamespace(no_lock=False), "w1-steady", out, {})
+        finally:
+            h.LOCK = saved
+        rec = json.loads(out.getvalue())
+        self.assertEqual((rec["kind"], rec["scenario"]["id"]), ("blocked", "w1-steady"))
+        self.assertIn("benchmark lock", rec["blocked_by"])
+
+    @unittest.skipUnless(hasattr(h.fcntl, "flock"), "needs fcntl")
+    def test_the_lock_descriptor_is_not_inherited_by_children(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = h.take_lock(os.path.join(tmp, "lock"))
+            try:
+                self.assertFalse(os.get_inheritable(f.fileno()))
+            finally:
+                f.close()
+
+
 if __name__ == "__main__":
     unittest.main()
