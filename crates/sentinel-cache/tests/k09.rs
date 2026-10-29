@@ -758,6 +758,215 @@ fn parallel_writers_are_serialized_and_never_double_promote() {
     }
 }
 
+#[test]
+fn only_a_jobs_own_trust_promotes_or_is_served_across_every_pairing() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("cache");
+    let d = decl(&["view"]);
+    let base = test_scope(Trust::Protected);
+    let scope_for = |trust: Trust| {
+        let mut s = base.clone();
+        s.trust = trust;
+        s
+    };
+
+    // A mismatched pairing is refused before a directory exists; the matching one seals its own bytes.
+    for scope_trust in Trust::ALL {
+        for job_trust in Trust::ALL {
+            let view = temp
+                .path()
+                .join(format!("view-{scope_trust:?}-{job_trust:?}"));
+            put(&view, "lib", format!("{scope_trust:?}").as_bytes());
+            let scope = scope_for(scope_trust);
+            let a = attached(scope.clone(), &d, vec![target(view)]);
+            let entry = entry_of(&root, &scope, KEY);
+            let had_current = current_gen(&entry);
+            let out = publish::commit(
+                &root,
+                &a,
+                job_trust,
+                UnixMillis(1_000),
+                Instant::now() + Duration::from_secs(60),
+                &|| false,
+            );
+            if scope_trust == job_trust {
+                assert!(matches!(out, Ok(Published::Sealed { .. })), "{out:?}");
+            } else {
+                assert!(
+                    matches!(out, Err(PublishError::TrustMismatch)),
+                    "{scope_trust:?} scope under a {job_trust:?} job: {out:?}"
+                );
+                assert_eq!(
+                    current_gen(&entry),
+                    had_current,
+                    "a refused commit must not move {scope_trust:?} state"
+                );
+            }
+        }
+    }
+
+    // Each trust class holds exactly the one generation its own matching job sealed.
+    for trust in Trust::ALL {
+        let scope = scope_for(trust);
+        let entry = entry_of(&root, &scope, KEY);
+        assert_eq!(gens(&entry).len(), 1, "{trust:?} sealed once");
+        let ws = temp.path().join(format!("ws-{trust:?}"));
+        fs::create_dir(&ws).unwrap();
+        let r = restore::restore(&env(&root, &ws), &d, Some(KEY.to_owned()), scope, "own");
+        assert!(r.outcome.is_hit(), "{trust:?}: {:?}", r.outcome);
+        assert_eq!(
+            fs::read(ws.join("view/lib")).unwrap(),
+            format!("{trust:?}").as_bytes()
+        );
+    }
+
+    // A generation moved under another trust's entry directory is a typed miss, in every direction.
+    for from in Trust::ALL {
+        for to in Trust::ALL.into_iter().filter(|t| *t != from) {
+            let source = entry_of(&root, &scope_for(from), KEY);
+            let name = current_gen(&source).unwrap();
+            let dest = entry_of(&root, &scope_for(to), KEY);
+            let backup = temp.path().join(format!("held-{from:?}-{to:?}"));
+            fs::rename(&dest, &backup).unwrap();
+            fs::create_dir_all(&dest).unwrap();
+            copy_tree(&gdir(&source, &name), &dest.join(&name));
+            fs::write(dest.join(scope::CURRENT_NAME), &name).unwrap();
+            let ws = temp.path().join(format!("mws-{from:?}-{to:?}"));
+            fs::create_dir(&ws).unwrap();
+            let r = restore::restore(
+                &env(&root, &ws),
+                &d,
+                Some(KEY.to_owned()),
+                scope_for(to),
+                "moved",
+            );
+            assert_eq!(
+                r.outcome,
+                Outcome::Miss(Miss::WrongTrust),
+                "{from:?} state under {to:?}"
+            );
+            assert!(
+                !ws.join("view/lib").exists(),
+                "wrong-trust bytes reached a view"
+            );
+            drop(r);
+            fs::remove_dir_all(&dest).unwrap();
+            fs::rename(&backup, &dest).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_sweep_running_inside_a_publish_cannot_take_the_entry_being_written() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("cache");
+    let view = temp.path().join("view");
+    let scope = test_scope(Trust::Protected);
+    let sibling = named_scope(&scope, "vendor");
+    let d = decl(&["view"]);
+    let d2 = Cache {
+        name: "vendor".into(),
+        ..decl(&["view"])
+    };
+    let entry = entry_of(&root, &scope, KEY);
+    let sibling_entry = entry_of(&root, &sibling, KEY);
+    put(&view, "blob", &[1u8; 400]);
+    let mut first = None;
+    for (s, dd) in [(&scope, &d), (&sibling, &d2)] {
+        let a = attached(s.clone(), dd, vec![target(view.clone())]);
+        let Published::Sealed { generation, .. } = commit(&root, &a, 1_000).unwrap() else {
+            panic!("setup publish must seal")
+        };
+        first.get_or_insert(generation);
+    }
+    let gen_a = first.unwrap();
+
+    // A one-byte budget forces whole-entry eviction of every entry the pass may take. The sweep runs from
+    // inside the commit (the cancel poll), while the commit's pin and writer marker are held.
+    put(&view, "blob", &[2u8; 500]);
+    let mut b = attached(scope.clone(), &d, vec![target(view.clone())]);
+    b.generation = Some(gen_a.clone());
+    // The first poll precedes the pin; the second is the plan check, with the pin and the marker held.
+    let polls = std::sync::atomic::AtomicUsize::new(0);
+    let during = Mutex::new(None);
+    let cancel = || {
+        if polls.fetch_add(1, Ordering::SeqCst) == 1 {
+            *during.lock().unwrap() = Some(gc::sweep(&root, 1, gc::DEFAULT_PASS_WORK));
+        }
+        false
+    };
+    let out = publish::commit(
+        &root,
+        &b,
+        Trust::Protected,
+        UnixMillis(2_000),
+        Instant::now() + Duration::from_secs(60),
+        &cancel,
+    )
+    .unwrap();
+    let stats = during.lock().unwrap().take().expect("the cancel poll ran");
+    assert!(
+        stats.leases_active >= 1,
+        "the commit's pin was visible: {stats:?}"
+    );
+    assert!(
+        !sibling_entry.exists(),
+        "control: the same sweep did evict the unwritten entry: {stats:?}"
+    );
+    let Published::Sealed {
+        generation: gen_b, ..
+    } = out
+    else {
+        panic!("the publish must survive the sweep, got {out:?}")
+    };
+    assert_eq!(current_gen(&entry).as_deref(), Some(gen_b.as_str()));
+    verify_generation(&entry, &gen_b);
+    assert!(
+        entry.join(&gen_a).is_dir(),
+        "the source generation was kept"
+    );
+    assert!(staged_gens(&entry).is_empty());
+}
+
+#[test]
+fn a_live_writer_keeps_its_entry_through_eviction_and_a_busy_loser_leaves_it_alone() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("cache");
+    let view = temp.path().join("view");
+    put(&view, "f", &[3u8; 300]);
+    let scope = test_scope(Trust::Protected);
+    let d = decl(&["view"]);
+    let a = attached(scope.clone(), &d, vec![target(view)]);
+    let entry = entry_of(&root, &scope, KEY);
+    let Published::Sealed { generation, .. } = commit(&root, &a, 1_000).unwrap() else {
+        panic!("setup publish must seal")
+    };
+
+    let writer = WriteLock::acquire(&entry, "other-process")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        commit(&root, &a, 2_000).unwrap(),
+        Published::Skipped(SkipReason::Busy)
+    );
+    assert!(
+        lease::writing_lock_live(&entry, now_ms()),
+        "the loser must not have removed the holder's marker"
+    );
+    let stats = gc::sweep(&root, 1, gc::DEFAULT_PASS_WORK);
+    assert_eq!(stats.entries_removed, 0, "{stats:?}");
+    assert_eq!(current_gen(&entry).as_deref(), Some(generation.as_str()));
+    verify_generation(&entry, &generation);
+
+    drop(writer);
+    let stats = gc::sweep(&root, 1, gc::DEFAULT_PASS_WORK);
+    assert_eq!(
+        stats.entries_removed, 1,
+        "released, the entry is evictable: {stats:?}"
+    );
+    assert!(!entry.exists());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn a_full_filesystem_fails_the_publish_cleanly() {

@@ -1,5 +1,8 @@
 #[cfg(target_os = "linux")]
 pub mod artifacts;
+/// The cache crate the executor's notices are typed in, for roles that count them.
+#[cfg(target_os = "linux")]
+pub use sentinel_cache as cache;
 #[cfg(target_os = "linux")]
 pub mod attempt;
 #[cfg(target_os = "linux")]

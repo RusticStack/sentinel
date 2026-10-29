@@ -60,6 +60,8 @@ pub enum Notice {
         stats: sentinel_cache::Stats,
     },
     Availability(Availability),
+    /// One attempt's cache figures, summed over its entries.
+    CacheFigures(CacheTotals),
     OfferRefused {
         attempt: AttemptId,
         free_bytes: u64,
@@ -86,8 +88,56 @@ fn admits(free: Option<u64>, floor: u64) -> bool {
     free.is_none_or(|free| free >= floor)
 }
 
+/// What one attempt's cache entries cost and did, summed; durations are monotonic nanoseconds, and a phase that
+/// never ran adds nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheTotals {
+    pub entries: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub costly_hits: u64,
+    pub lock_wait_ns: u64,
+    pub clone_ns: u64,
+    pub first_touch_ns: u64,
+    pub commit_ns: u64,
+    /// Bytes and copied bytes of the hits only: a miss restored nothing.
+    pub restored_bytes: u64,
+    pub copied_bytes: u64,
+    pub staged_bytes: u64,
+    pub dirty_bytes: u64,
+}
+
+impl CacheTotals {
+    pub fn of(records: &[sentinel_protocol::summary::CacheRecord]) -> CacheTotals {
+        let mut totals = CacheTotals::default();
+        for r in records {
+            totals.entries += 1;
+            if r.outcome == "hit" {
+                totals.hits += 1;
+                totals.restored_bytes = totals.restored_bytes.saturating_add(r.bytes);
+                totals.copied_bytes = totals.copied_bytes.saturating_add(r.copied_bytes);
+            } else {
+                totals.misses += 1;
+            }
+            totals.costly_hits += u64::from(r.costly_hit);
+            let add = |sum: &mut u64, value: Option<u64>| {
+                *sum = sum.saturating_add(value.unwrap_or(0));
+            };
+            add(&mut totals.lock_wait_ns, r.lock_wait_ns);
+            add(&mut totals.clone_ns, r.clone_ns);
+            add(&mut totals.first_touch_ns, r.first_touch_ns);
+            add(&mut totals.commit_ns, r.commit_ns);
+            add(&mut totals.staged_bytes, r.staged_bytes);
+            add(&mut totals.dirty_bytes, r.dirty_bytes);
+        }
+        totals
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Availability {
+    /// The measured restore and rebuild cost per cache class, settled estimates only (docs/cache.md).
+    pub cache_costs: [sentinel_cache::ClassFigures; 3],
     pub images_held: Vec<String>,
     pub images_in_flight: usize,
     pub cache_entries: u64,
@@ -426,6 +476,7 @@ pub struct Inner {
     image_swept: Mutex<Option<std::time::Instant>>,
     notify: Box<dyn Fn(Notice) + Send + Sync>,
     recovered: Recovered,
+    costs: sentinel_cache::CostBook,
 }
 
 const REFUSAL_NOTICE_EVERY: Duration = Duration::from_secs(30);
@@ -591,6 +642,7 @@ impl Executor {
             budgets: Mutex::new(StorageBudgets::default()),
             image_swept: Mutex::new(None),
             recovered,
+            costs: sentinel_cache::CostBook::new(),
         }));
         let watched = Arc::downgrade(&executor.0);
         let _ = thread::Builder::new()
@@ -927,6 +979,11 @@ impl Executor {
 }
 
 impl Inner {
+    /// The measured cache costs the costly-hit rule reads; a cold-rebuild measurement is recorded here.
+    pub fn costs(&self) -> &sentinel_cache::CostBook {
+        &self.costs
+    }
+
     pub fn runtime(&self) -> &podman::Runtime {
         &self.runtime
     }
@@ -1047,6 +1104,7 @@ impl Inner {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         (self.notify)(Notice::Availability(Availability {
+            cache_costs: self.costs.figures(),
             images_held: self.images.held(),
             images_in_flight: self.images.in_flight(),
             cache_entries: stats.entries_seen,
@@ -1226,11 +1284,21 @@ impl Report for Inner {
             stats: *stats,
         });
     }
+    fn cache_records(
+        &self,
+        _attempt: AttemptId,
+        records: &[sentinel_protocol::summary::CacheRecord],
+    ) {
+        (self.notify)(Notice::CacheFigures(CacheTotals::of(records)));
+    }
     fn remote(&self) -> Option<std::sync::Arc<dyn sentinel_cache::remote::Remote>> {
         self.state()
             .reporter
             .as_ref()
             .and_then(Reporter::remote_cache)
+    }
+    fn cost_book(&self) -> Option<&sentinel_cache::CostBook> {
+        Some(&self.costs)
     }
 }
 
@@ -1744,6 +1812,66 @@ mod tests {
     use super::live::{DIGEST, IMAGE, Live, eventually, podman_enabled};
     use super::*;
     use sentinel_core::{FailureClass, JobState, Outcome};
+
+    fn record(outcome: &str) -> sentinel_protocol::summary::CacheRecord {
+        sentinel_protocol::summary::CacheRecord {
+            name: "deps".into(),
+            class: 1,
+            outcome: outcome.into(),
+            lookup_ns: Some(1),
+            lock_wait_ns: None,
+            clone_ns: None,
+            first_touch_ns: None,
+            files: 0,
+            bytes: 0,
+            copied_bytes: 0,
+            reflink: false,
+            commit_ns: None,
+            staged_bytes: None,
+            reused_bytes: None,
+            dirty_bytes: None,
+            publish: None,
+            costly_hit: false,
+        }
+    }
+
+    #[test]
+    fn cache_totals_sum_hits_misses_and_only_the_phases_that_ran() {
+        let mut hit = record("hit");
+        hit.lock_wait_ns = Some(5);
+        hit.clone_ns = Some(7);
+        hit.first_touch_ns = Some(11);
+        hit.bytes = 1000;
+        hit.copied_bytes = 400;
+        hit.costly_hit = true;
+        hit.commit_ns = Some(13);
+        hit.staged_bytes = Some(300);
+        hit.dirty_bytes = Some(120);
+        let mut miss = record("absent");
+        miss.bytes = 99;
+        miss.copied_bytes = 99;
+        miss.commit_ns = Some(17);
+        let totals = CacheTotals::of(&[hit, miss, record("hit")]);
+        assert_eq!(
+            totals,
+            CacheTotals {
+                entries: 3,
+                hits: 2,
+                misses: 1,
+                costly_hits: 1,
+                lock_wait_ns: 5,
+                clone_ns: 7,
+                first_touch_ns: 11,
+                commit_ns: 30,
+                restored_bytes: 1000,
+                copied_bytes: 400,
+                staged_bytes: 300,
+                dirty_bytes: 120,
+            },
+            "a miss restored nothing, so its bytes are not restored bytes"
+        );
+        assert_eq!(CacheTotals::of(&[]), CacheTotals::default());
+    }
 
     #[test]
     fn a_panicking_attempt_is_torn_down_and_reported() {
