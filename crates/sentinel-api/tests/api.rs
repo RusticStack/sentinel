@@ -4122,6 +4122,38 @@ fn raw_request(
     (status, body)
 }
 
+/// A password login as the bootstrap administrator: the session cookie pair and its CSRF token.
+fn session_cookie(d: &Deployment) -> (String, String) {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let response = agent
+        .post(&format!("{}/api/v1/login", d.base))
+        .header("content-type", "application/json")
+        .send(
+            serde_json::json!({ "username": "root", "password": "correct horse battery staple" })
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let cookie = response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let body: serde_json::Value =
+        serde_json::from_str(&response.into_body().read_to_string().unwrap()).unwrap();
+    (cookie, body["csrf"].as_str().unwrap().to_owned())
+}
+
 #[test]
 fn every_route_class_enforces_its_own_body_limit() {
     use sentinel_core::auth::Scopes;
@@ -4134,6 +4166,7 @@ fn every_route_class_enforces_its_own_body_limit() {
     let auth = bearer(&d);
     let hook = hook_bearer(&d);
     let (mcp_auth, _) = mcp_session(&d, "body-limit-reader", Scopes::MCP);
+    let (session, csrf) = session_cookie(&d);
 
     let content = vec![7u8; 40_000];
     let digest = blake3::hash(&content).to_hex().to_string();
@@ -4162,6 +4195,12 @@ fn every_route_class_enforces_its_own_body_limit() {
         error: &'static str,
     }
     let json = ("content-type", "application/json");
+    let form = ("content-type", "application/x-www-form-urlencoded");
+    let signed_in = [
+        json,
+        ("cookie", session.as_str()),
+        ("x-sentinel-csrf", csrf.as_str()),
+    ];
     let class = |name, method, path, headers, limit, error| Class {
         name,
         method,
@@ -4242,6 +4281,54 @@ fn every_route_class_enforces_its_own_body_limit() {
             MAX_OAUTH_FORM_BYTES,
             "invalid_request",
         ),
+        class(
+            "OAuth consent form (MAX_OAUTH_FORM_BYTES)",
+            "POST",
+            "/oauth/authorize",
+            vec![form],
+            MAX_OAUTH_FORM_BYTES,
+            "invalid_request",
+        ),
+        class(
+            "device page form, signed in (MAX_OAUTH_FORM_BYTES)",
+            "POST",
+            "/device",
+            vec![form, ("cookie", session.as_str())],
+            MAX_OAUTH_FORM_BYTES,
+            "too large",
+        ),
+        class(
+            "account security (4 KiB)",
+            "POST",
+            "/api/v1/password",
+            signed_in.to_vec(),
+            4 << 10,
+            "payload_too_large",
+        ),
+        class(
+            "signed-in email (8 KiB)",
+            "POST",
+            "/api/v1/me/email",
+            signed_in.to_vec(),
+            8 << 10,
+            "payload_too_large",
+        ),
+        class(
+            "tenant invitations (8 KiB)",
+            "POST",
+            "/api/v1/tenants/acme/invitations",
+            signed_in.to_vec(),
+            8 << 10,
+            "payload_too_large",
+        ),
+        class(
+            "GitHub App (4 KiB)",
+            "POST",
+            "/api/v1/github/app/installation",
+            signed_in.to_vec(),
+            4 << 10,
+            "payload_too_large",
+        ),
     ];
 
     for class in &classes {
@@ -4291,6 +4378,18 @@ fn every_route_class_enforces_its_own_body_limit() {
         &padding,
     );
     assert_eq!(status, 413, "chunked login body over the limit: {answer}");
+    // The signed-in device page reads its form the same way: a chunked form is cut off too.
+    let padding = vec![b' '; MAX_OAUTH_FORM_BYTES + 1];
+    let (status, answer) = raw_request(
+        &d,
+        "POST",
+        "/device",
+        &[form, ("cookie", session.as_str())],
+        Framing::Chunked,
+        &padding,
+    );
+    assert_eq!(status, 413, "chunked device form over the limit: {answer}");
+    assert!(answer.contains("too large"), "{answer}");
 }
 
 #[test]

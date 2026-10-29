@@ -5,7 +5,7 @@ use std::{
 
 use sentinel_auth::{cookie, oauth as forms, secret::Digest};
 use sentinel_core::{RepoId, TenantId, UnixMillis, UserId, auth::Scopes};
-use sentinel_protocol::limits::MAX_OAUTH_FORM_BYTES;
+use sentinel_protocol::{error::ErrorCode, limits::MAX_OAUTH_FORM_BYTES};
 use sentinel_store::{
     Error as StoreError, auth as authz, local_auth,
     oauth::device::{self, Decision, DeviceView},
@@ -261,12 +261,16 @@ fn submit(state: &State, request: &mut Request, who: &Identity, csrf: &Digest) -
     if routes::header_value(request, "origin").is_some_and(|origin| origin != state.oauth.origin) {
         return html::error_page(403, "This form must be sent from this server's own page.");
     }
-    let form = match routes::body_limit(request, MAX_OAUTH_FORM_BYTES)
-        .ok()
-        .and_then(|bytes| Form::parse(&bytes).ok())
-    {
-        Some(form) => form,
-        None => return html::error_page(400, "The form could not be read."),
+    // The signed-in read has no body slot to wait for, so a failure is too large or unreadable.
+    let bytes = match routes::body_limit(request, MAX_OAUTH_FORM_BYTES) {
+        Ok(bytes) => bytes,
+        Err(e) if e.code == ErrorCode::PayloadTooLarge => {
+            return html::error_page(413, "The form is too large.");
+        }
+        Err(_) => return html::error_page(400, "The form could not be read."),
+    };
+    let Ok(form) = Form::parse(&bytes) else {
+        return html::error_page(400, "The form could not be read.");
     };
     if !cookie::form_token_accepted(&state.oauth.form_key, csrf, form.get("form_token")) {
         return html::error_page(403, "This form has expired. Enter the code again.");
