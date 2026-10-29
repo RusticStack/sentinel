@@ -31,8 +31,10 @@ pub const MIN_INTERVAL: Duration = Duration::from_millis(500);
 pub const MAX_INTERVAL: Duration = Duration::from_secs(5);
 /// A walk that takes longer than this stops where it is and is reported incomplete.
 pub const WALK_BUDGET: Duration = Duration::from_secs(3);
-/// Directory levels followed; a deeper tree is reported incomplete (the walk holds one descriptor per level).
-const MAX_DEPTH: usize = 128;
+/// Directory levels followed (the walk holds one descriptor per level). No real checkout nests this deep, so a
+/// tree that does is refused as over the limit instead of being measured short: a job must not be able to hide
+/// bytes below the level the walk can reach.
+pub(crate) const MAX_DEPTH: usize = 128;
 /// Hard-linked files remembered so each is charged once; beyond this each further link is charged again.
 const MAX_LINKS_TRACKED: usize = 1 << 20;
 const CHECK_TIME_EVERY: u64 = 512;
@@ -44,9 +46,16 @@ pub struct Usage {
     pub bytes: u64,
     /// Entries visited.
     pub entries: u64,
-    /// False when the walk stopped early (time budget, depth) or met a directory it could not read; `bytes` is
-    /// then a lower bound.
+    /// False when the walk stopped early (time budget, abort, depth) or met a directory it could not read;
+    /// `bytes` is then a lower bound.
     pub complete: bool,
+    /// The walk ran out of its time budget or was aborted: it did not see the whole tree.
+    pub timed_out: bool,
+    /// A directory lay deeper than the walk follows. The tree is refused rather than measured short; `bytes`
+    /// stays the honest lower bound.
+    pub too_deep: bool,
+    /// A directory could not be entered, so what is inside it is not counted.
+    pub unreadable: bool,
 }
 
 struct Walk<'a> {
@@ -57,12 +66,15 @@ struct Walk<'a> {
     bytes: u64,
     entries: u64,
     complete: bool,
+    timed_out: bool,
+    too_deep: bool,
+    unreadable: bool,
     links: HashSet<(u64, u64)>,
 }
 
 impl Walk<'_> {
     fn over(&self) -> bool {
-        self.bytes > self.limit
+        self.bytes > self.limit || self.too_deep
     }
 
     fn out_of_time(&mut self) -> bool {
@@ -70,6 +82,7 @@ impl Walk<'_> {
             && (Instant::now() >= self.deadline || self.abort.load(Ordering::Relaxed))
         {
             self.complete = false;
+            self.timed_out = true;
             return true;
         }
         false
@@ -122,11 +135,13 @@ fn charge(walk: &mut Walk, stat: &libc::stat) {
 fn descend(dir: &OwnedFd, depth: usize, walk: &mut Walk) {
     let Ok(entries) = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())) else {
         walk.complete = false;
+        walk.unreadable = true;
         return;
     };
     for entry in entries {
         let Ok(entry) = entry else {
             walk.complete = false;
+            walk.unreadable = true;
             continue;
         };
         walk.entries += 1;
@@ -150,16 +165,21 @@ fn descend(dir: &OwnedFd, depth: usize, walk: &mut Walk) {
             }
             if depth >= MAX_DEPTH {
                 walk.complete = false;
-                continue;
+                walk.too_deep = true;
+                return;
             }
             match open_dir(dir.as_raw_fd(), &name) {
                 Some(child) => descend(&child, depth + 1, walk),
-                None => walk.complete = false,
+                None => {
+                    walk.complete = false;
+                    walk.unreadable = true;
+                }
             }
         } else {
             charge(walk, &stat);
         }
         if walk.over() || (!walk.complete && Instant::now() >= walk.deadline) {
+            walk.timed_out |= !walk.over();
             return;
         }
     }
@@ -191,6 +211,9 @@ pub fn measure(
         bytes: 0,
         entries: 0,
         complete: true,
+        timed_out: false,
+        too_deep: false,
+        unreadable: false,
         links: HashSet::new(),
     };
     charge(&mut walk, &stat);
@@ -201,6 +224,9 @@ pub fn measure(
         bytes: walk.bytes,
         entries: walk.entries,
         complete: walk.complete,
+        timed_out: walk.timed_out,
+        too_deep: walk.too_deep,
+        unreadable: walk.unreadable,
     })
 }
 
@@ -212,6 +238,9 @@ pub fn next_interval(walked: Duration) -> Duration {
 struct Shared {
     abort: AtomicBool,
     exceeded: AtomicBool,
+    too_deep: AtomicBool,
+    unreadable: AtomicBool,
+    timed_out: AtomicBool,
     used: AtomicU64,
     stopped: Mutex<bool>,
     wake: Condvar,
@@ -233,6 +262,9 @@ impl Guard {
         let shared = Arc::new(Shared {
             abort: AtomicBool::new(false),
             exceeded: AtomicBool::new(false),
+            too_deep: AtomicBool::new(false),
+            unreadable: AtomicBool::new(false),
+            timed_out: AtomicBool::new(false),
             used: AtomicU64::new(0),
             stopped: Mutex::new(false),
             wake: Condvar::new(),
@@ -256,12 +288,30 @@ impl Guard {
         }
     }
 
-    /// The bytes the job's directories occupied when they passed the limit, once they have.
+    /// The bytes the job's directories occupied when they passed the limit, once they have. When the cause was a
+    /// tree nested too deep to measure ([`Guard::too_deep`]) this is the lower bound the walk reached, which
+    /// may be under the limit.
     pub fn exceeded(&self) -> Option<u64> {
         self.shared
             .exceeded
             .load(Ordering::Acquire)
             .then(|| self.shared.used.load(Ordering::Acquire))
+    }
+
+    /// A directory lay deeper than the walk follows, which is refused as over the limit.
+    pub fn too_deep(&self) -> bool {
+        self.shared.too_deep.load(Ordering::Acquire)
+    }
+
+    /// Some sample could not enter a directory, so what is inside it was not counted: the figures are lower
+    /// bounds and a job can hide bytes there (docs/executor.md#disk).
+    pub fn unreadable(&self) -> bool {
+        self.shared.unreadable.load(Ordering::Acquire)
+    }
+
+    /// Some sample ran out of its time budget before it saw the whole tree, so it measured up to that point.
+    pub fn timed_out(&self) -> bool {
+        self.shared.timed_out.load(Ordering::Acquire)
     }
 
     pub fn limit(&self) -> u64 {
@@ -294,19 +344,35 @@ fn wait_stopped(shared: &Shared, wait: Duration) -> bool {
     *stopped
 }
 
-/// The bytes `roots` occupy together, stopping once the total passes `limit`. A root that cannot be read is not
-/// over its limit: the steps are ending or it is already gone.
-fn measure_all(roots: &[PathBuf], limit: u64, abort: &AtomicBool) -> u64 {
-    let mut total = 0u64;
+/// What one sample of all roots found.
+struct Sample {
+    bytes: u64,
+    too_deep: bool,
+    unreadable: bool,
+    timed_out: bool,
+}
+
+/// The bytes `roots` occupy together, stopping once the total passes `limit` or a tree is too deep to follow. A
+/// root that cannot be opened is not over its limit: the steps are ending or it is already gone.
+fn measure_all(roots: &[PathBuf], limit: u64, abort: &AtomicBool) -> Sample {
+    let mut sample = Sample {
+        bytes: 0,
+        too_deep: false,
+        unreadable: false,
+        timed_out: false,
+    };
     for root in roots {
-        if let Ok(usage) = measure(root, limit.saturating_sub(total), WALK_BUDGET, abort) {
-            total = total.saturating_add(usage.bytes);
+        if let Ok(usage) = measure(root, limit.saturating_sub(sample.bytes), WALK_BUDGET, abort) {
+            sample.bytes = sample.bytes.saturating_add(usage.bytes);
+            sample.too_deep |= usage.too_deep;
+            sample.unreadable |= usage.unreadable;
+            sample.timed_out |= usage.timed_out;
         }
-        if total > limit {
+        if sample.bytes > limit || sample.too_deep {
             break;
         }
     }
-    total
+    sample
 }
 
 fn watch(shared: &Shared, roots: &[PathBuf], limit: u64, stop: impl FnOnce()) {
@@ -316,9 +382,19 @@ fn watch(shared: &Shared, roots: &[PathBuf], limit: u64, stop: impl FnOnce()) {
             return;
         }
         let started = Instant::now();
-        let used = measure_all(roots, limit, &shared.abort);
-        if used > limit && !shared.abort.load(Ordering::Relaxed) {
-            shared.used.store(used, Ordering::Release);
+        let sample = measure_all(roots, limit, &shared.abort);
+        if shared.abort.load(Ordering::Relaxed) {
+            return;
+        }
+        if sample.unreadable {
+            shared.unreadable.store(true, Ordering::Release);
+        }
+        if sample.timed_out {
+            shared.timed_out.store(true, Ordering::Release);
+        }
+        if sample.bytes > limit || sample.too_deep {
+            shared.used.store(sample.bytes, Ordering::Release);
+            shared.too_deep.store(sample.too_deep, Ordering::Release);
             shared.exceeded.store(true, Ordering::Release);
             stop();
             return;
@@ -332,7 +408,7 @@ mod tests {
     use std::{
         fs,
         io::Write,
-        os::unix::fs::symlink,
+        os::{fd::AsRawFd, unix::fs::symlink},
         sync::atomic::{AtomicUsize, Ordering},
     };
 
@@ -417,8 +493,70 @@ mod tests {
         fs::set_permissions(dir.path().join("sealed"), fs::Permissions::from_mode(0o000)).unwrap();
         let usage = measure(dir.path(), u64::MAX, BUDGET, &NO_ABORT).unwrap();
         fs::set_permissions(dir.path().join("sealed"), fs::Permissions::from_mode(0o700)).unwrap();
-        // Running as root reads it anyway; otherwise the walk says it could not.
+        // Running as root reads it anyway; otherwise the walk says it could not, and says why.
         assert!(usage.complete || usage.bytes >= 1 << 20, "{usage:?}");
+        assert_eq!(usage.unreadable, !usage.complete, "{usage:?}");
+        assert!(!usage.timed_out && !usage.too_deep, "{usage:?}");
+    }
+
+    fn deep_tree_with_payload(dir: &Path, levels: usize, bytes: usize) -> Vec<fs::File> {
+        let chain = crate::workspace::build_deep(dir, levels);
+        let deepest = chain.last().unwrap();
+        let payload = format!("/proc/self/fd/{}/payload", deepest.as_raw_fd());
+        fill(Path::new(&payload), bytes);
+        chain
+    }
+
+    #[test]
+    fn a_tree_deeper_than_the_walk_cannot_hide_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let _chain = deep_tree_with_payload(dir.path(), MAX_DEPTH + 2, 2 << 20);
+        let usage = measure(dir.path(), 1 << 20, BUDGET, &NO_ABORT).unwrap();
+        assert!(usage.too_deep && !usage.complete, "{usage:?}");
+        assert!(!usage.timed_out && !usage.unreadable, "{usage:?}");
+
+        let stops = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&stops);
+        let guard = Guard::start(vec![dir.path().to_path_buf()], 1 << 20, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        while guard.exceeded().is_none() && started.elapsed() < Duration::from_secs(15) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            guard.exceeded().is_some(),
+            "the bytes below the walk limit were not refused"
+        );
+        assert!(guard.too_deep());
+        drop(guard);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_tree_just_inside_the_walk_limit_is_measured_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let _chain = deep_tree_with_payload(dir.path(), MAX_DEPTH, 2 << 20);
+        let usage = measure(dir.path(), u64::MAX, BUDGET, &NO_ABORT).unwrap();
+        assert!(usage.complete && !usage.too_deep, "{usage:?}");
+        assert!(usage.bytes >= 2 << 20, "{usage:?}");
+    }
+
+    #[test]
+    fn a_walk_that_never_completes_is_reported_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..1500 {
+            fs::File::create(dir.path().join(format!("f{i}"))).unwrap();
+        }
+        let usage = measure(dir.path(), u64::MAX, Duration::ZERO, &NO_ABORT).unwrap();
+        assert!(!usage.complete, "{usage:?}");
+        assert!(usage.timed_out, "{usage:?}");
+        assert!(!usage.too_deep && !usage.unreadable, "{usage:?}");
+        assert!(usage.entries < 1500, "{usage:?}");
+        // The same tree with time to spare is complete, so the flag is not a constant.
+        let usage = measure(dir.path(), u64::MAX, BUDGET, &NO_ABORT).unwrap();
+        assert!(usage.complete && !usage.timed_out, "{usage:?}");
+        assert!(usage.entries >= 1500, "{usage:?}");
     }
 
     #[test]

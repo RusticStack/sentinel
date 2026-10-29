@@ -2771,6 +2771,15 @@ mod worker_role {
                     sentinel_worker::executor::Notice::ShutDown { ended, left, handed_back } => {
                         tracing::info!(event = "attempts_shut_down", ended, left, handed_back);
                     }
+                    sentinel_worker::executor::Notice::CleanupFailed { attempt, what, error } => {
+                        tracing::warn!(event = "attempt_cleanup_failed", attempt = %attempt, what, error = %error, "a tree the attempt left could not be removed; the worker retries while it runs, and its disk stays held until it succeeds");
+                    }
+                    sentinel_worker::executor::Notice::WorkspacesReaped(removed) => {
+                        tracing::info!(event = "workspaces_reaped", removed);
+                    }
+                    sentinel_worker::executor::Notice::StorageUnmeasured { attempt, unreadable, timed_out } => {
+                        tracing::warn!(event = "storage_unmeasured", attempt = %attempt, unreadable, timed_out, "the storage guard did not see all of the job's storage; its figures were lower bounds");
+                    }
                     sentinel_worker::executor::Notice::CacheFigures(_) => {}
                     sentinel_worker::executor::Notice::Availability(snapshot) => {
                         tracing::info!(event = "availability", images_held = snapshot.images_held.len(), images_in_flight = snapshot.images_in_flight, cache_entries = snapshot.cache_entries, cache_generations = snapshot.cache_generations, cache_bytes = snapshot.cache_bytes, truncated = snapshot.truncated);
