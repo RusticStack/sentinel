@@ -77,6 +77,24 @@ impl Capabilities {
         Capabilities(self.0 & !other.0)
     }
     pub const KNOWN: Capabilities = Capabilities((1 << 17) - 1);
+
+    /// The names of the host-runtime bits set here (`kvm`, `kvm.nested`, `isolation.*`, `os.*`), as the plan
+    /// and `worker --check` spell them.
+    pub fn runtime_names(self) -> Vec<&'static str> {
+        [
+            (Self::KVM, "kvm"),
+            (Self::KVM_NESTED, "kvm.nested"),
+            (Self::ISOLATION_CONTAINER, "isolation.container"),
+            (Self::ISOLATION_MICROVM, "isolation.microvm"),
+            (Self::ISOLATION_NATIVE, "isolation.native"),
+            (Self::OS_LINUX, "os.linux"),
+            (Self::OS_WINDOWS, "os.windows"),
+        ]
+        .into_iter()
+        .filter(|(bit, _)| self.contains(*bit))
+        .map(|(_, name)| name)
+        .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -235,6 +253,45 @@ mod tests {
         );
         assert!(n.capabilities.contains(Capabilities::REFLINK));
         assert!(!n.capabilities.contains(future_bit));
+    }
+
+    #[test]
+    fn runtime_bits_survive_negotiation_and_are_never_required() {
+        let kvm = Capabilities::REQUIRED
+            .union(Capabilities::KVM)
+            .union(Capabilities::KVM_NESTED)
+            .union(Capabilities::ISOLATION_CONTAINER)
+            .union(Capabilities::ISOLATION_MICROVM)
+            .union(Capabilities::OS_LINUX);
+        let n = negotiate(&hello(1, 11, kvm)).unwrap();
+        assert_eq!(
+            n.capabilities.runtime_names(),
+            [
+                "kvm",
+                "kvm.nested",
+                "isolation.container",
+                "isolation.microvm",
+                "os.linux"
+            ]
+        );
+        // A worker with no KVM, or one that predates the bits, still negotiates: they are placement facts.
+        assert!(negotiate(&hello(1, 11, Capabilities::REQUIRED)).is_ok());
+        assert_eq!(
+            Capabilities::REQUIRED.intersection(Capabilities::RUNTIME),
+            Capabilities::NONE
+        );
+        // Every defined bit is known, so none is masked; `kvm` and `kvm.nested` are not in RUNTIME because
+        // they describe the host, not what a job may ask for.
+        for bit in [
+            Capabilities::KVM,
+            Capabilities::KVM_NESTED,
+            Capabilities::OS_WINDOWS,
+            Capabilities::ISOLATION_NATIVE,
+        ] {
+            assert!(Capabilities::KNOWN.contains(bit));
+        }
+        assert!(!Capabilities::RUNTIME.contains(Capabilities::KVM));
+        assert!(!Capabilities::RUNTIME.contains(Capabilities::KVM_NESTED));
     }
 
     #[test]

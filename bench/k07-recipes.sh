@@ -8,7 +8,16 @@ STAMP_SED="$(stamp_sed)"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIX="$ROOT/fixtures/recipes"
 WORK="${WORK:-/srv/k07}"
-OUT="${OUT:-$ROOT/bench/k07-recipes.jsonl}"
+# ISOLATION=container (default) runs rootless Podman; ISOLATION=microvm runs each attempt in a Firecracker VM
+# on a KVM host (SENTINEL_FIRECRACKER, SENTINEL_GUEST_KERNEL and SENTINEL_GUEST_AGENT name the setup). A microVM
+# run is functional only and never overwrites the committed container records.
+ISOLATION="${ISOLATION:-container}"
+case "$ISOLATION" in
+    container) OUT="${OUT:-$ROOT/bench/k07-recipes.jsonl}" ;;
+    microvm) OUT="${OUT:-$ROOT/bench/k07-recipes-microvm.jsonl}" ;;
+    *) echo "k07 ISOLATION must be container or microvm" >&2; exit 2 ;;
+esac
+export SENTINEL_K07_ISOLATION="$ISOLATION"
 DRIVER="${DRIVER:-$ROOT/target/wsl/release/examples/k07-recipes}"
 LOGS="$WORK/logs"
 RECIPES="${RECIPES:-custom-tool go rust npm pnpm bun python maven gradle}"

@@ -27,6 +27,16 @@ Freshness: every required test runs on every sample (the cli lane sets `GOFLAGS=
 
 **Current B08 assessment (2026-10-24): unmet.** The largest recorded GitHub baselines are 109 s (cli), 88 s (gson) and 30 s (ripgrep), so no lane has the required >=300 s baseline. Sentinel warm nearest-rank p95 over ten non-warmup samples is 64.08 s (cli), 44.02 s (gson) and 21.39 s (ripgrep), computed from `bench/p14-pilot-*.jsonl`. These small samples are development evidence, not a release-grade tail. Do not change the baseline threshold or substitute another comparison to close B08.
 
+## `pilots-ci-isolation` revision 1: microVM against container (M08)
+
+[`bench/contracts/pilots-ci-isolation.json`](../bench/contracts/pilots-ci-isolation.json), frozen 2026-10-29. Revision 4 above stays frozen and unchanged; this is a separate contract that inherits every revision-4 item (host, CCD placement, 10 CPUs and 26 GiB, source commits, image digests, the three conditions and the freshness rules) and adds one thing: every job states `runs_on.isolation`. Its records are never compared with revision-4 records, whose jobs ran on the worker's default executor.
+
+- **Same hardware.** `kvm-host` only (the one host with usable KVM). Two series per lane and condition, `container` (rootless Podman) and `microvm` (Firecracker), from the same sentinel binary, host, caps and day, back to back and never concurrently, with CPU pressure under 2 % at each start.
+- **Harness.** `bench/p14-pilot.sh prep KIT ROOT PILOT container|microvm` (or `SENTINEL_BENCH_ISOLATION`) rewrites the committed copy of the lane's pipeline so each job reads `runs_on: { labels: [egress], isolation: <value> }` and refuses when it cannot state it on every job; one ROOT per isolation, and a ROOT keeps the isolation it was prepared with. The record's `contract` block becomes `{id: pilots-ci-isolation, revision: 1, lane, condition, isolation}`. Without an isolation the harness writes revision-4 records as before.
+- **B03 budgets re-measured.** `SENTINEL_BENCH_ISOLATION=container|microvm bench/b03-setup.sh setup ...` states the isolation on the probe job of every fixture branch, and `bench/b03-latency.py` stamps each record with `isolation`; the budgets are the [latency budgets](latency-budgets.md) ones, measured once per isolation on the same host.
+- **Overhead and the gate.** `python3 bench/m08_overhead.py container.jsonl microvm.jsonl` pairs the series per lane and condition, leaves out warm-ups and failed samples, and reports count, min, median, nearest-rank p95 and max of intake to finished, the median queue-to-running and running-to-terminal phases, and the overhead `microvm / container - 1` on the p95 (the B09 gate, 10 %) and on the median. Exit 0 means every pair is within the gate, 1 means one is over it, 2 means a series is missing or has under 10 non-warm-up samples (development evidence, not a gate result), 3 means the input was not revision-1 records. A lane over the gate is a bug to fix in M04-M06; the microVM default on KVM hosts is not changed silently and the gate is not raised. Its tests are `bench/test_m08_overhead.py`.
+- **Results.** None yet: no sample has been recorded under this contract. The comparison needs a quiet window on `kvm-host` and the Part 14 pilot mirrors; until the records are committed under `bench/`, M08 reports no overhead figure and none should be quoted.
+
 ## B11: the 2× Blacksmith gate
 
 B11 is the primary relative target and uses a separate frozen contract, not a reinterpretation of revision-4 GitHub self-hosted records. For every selected lane and condition, `Sentinel trigger-to-required-check p95 / Blacksmith trigger-to-required-check p95 <= 0.50`.
@@ -86,6 +96,7 @@ Status: the extraction, outcome rules, ABBA pairing, commit construction and cen
 ## Revision history
 
 - **`b11-blacksmith` revision 1** (2026-10-28): the separate B11 contract and paired-sample harness, rules only; no samples exist ([above](#the-frozen-b11-contract-and-harness)).
+- **`pilots-ci-isolation` revision 1** (2026-10-29, [`bench/contracts/pilots-ci-isolation.json`](../bench/contracts/pilots-ci-isolation.json)): new contract for M08, the revision-4 lanes with `runs_on.isolation` stated as `container` or `microvm`; revision 4 is unchanged and no record exists under the new contract yet.
 
 - **`pilots-ci` revision 4** (2026-10-24): moved the reference measurement to `kvm-host`, with Sentinel and the GitHub baseline pinned to separate CCDs and allowed to run concurrently. Revision 3 completed no record on `reference-host`.
 

@@ -2,7 +2,8 @@
 # Part 14 pilot lanes (cli, ripgrep, gson) through Sentinel; the successor of
 # b02-sentinel.sh's Legacy Go pilot lane, with the same deployment shape: one
 # controller, one worker and a local HTTPS Git fixture, no forge. One pilot per ROOT.
-#   p14-pilot.sh prep  KIT ROOT PILOT   clone the fork at its pinned commit and commit its live pipeline
+#   p14-pilot.sh prep  KIT ROOT PILOT [ISOLATION]   clone the fork at its pinned commit and commit its live pipeline;
+#                      ISOLATION (or SENTINEL_BENCH_ISOLATION) container or microvm states runs_on.isolation on every job
 #   p14-pilot.sh setup KIT ROOT         controller, tenant, repository, pool and worker enrollment
 #   p14-pilot.sh start|stop KIT ROOT
 #   p14-pilot.sh measure KIT ROOT CONDITION SAMPLES WARMUP OUT   CONDITION: cold, warm or small-edit
@@ -11,6 +12,9 @@
 # dependencies as the GitHub jobs do and a cold sample includes those downloads. Pushes go to the fork's default branch.
 # KIT also holds seed-membership.py (bench/seed-membership.py), which gives the platform admin its tenant membership through the API.
 # The fixture commits use the account's own git identity (user.name and user.email in its git config).
+# M08: with an ISOLATION the lane is measured under contract pilots-ci-isolation revision 1 (bench/contracts/
+# pilots-ci-isolation.json), which keeps every revision-4 input and adds only that one stated field; one ROOT per
+# isolation, on the same host and caps, compared by bench/m08_overhead.py. Without one the records stay revision 4.
 set -euo pipefail
 MODE=$1 KIT=$2 ROOT=$3
 BIN="$KIT/sentinel"
@@ -52,14 +56,23 @@ stop_group() { # stop_group <pgid file>
 
 case "$MODE" in
 prep)
-  PILOT=$4
+  PILOT=$4 ISOLATION=${5:-${SENTINEL_BENCH_ISOLATION:-}}
+  case "$ISOLATION" in ""|container|microvm) ;; *) echo "ISOLATION must be container or microvm" >&2; exit 2 ;; esac
   [ -n "${FORK[$PILOT]}" ] || { echo "set SENTINEL_PILOT_${PILOT^^}_URL to the private mirror URL" >&2; exit 2; }
   mkdir -p "$ROOT" && cd "$ROOT"
   echo "$PILOT" > pilot
+  # An existing ROOT keeps the isolation its source commit was prepared with.
+  [ ! -d work ] || [ "$(cat isolation 2>/dev/null || true)" = "$ISOLATION" ] || { echo "ROOT was prepared with isolation '$(cat isolation 2>/dev/null)'" >&2; exit 2; }
+  printf '%s' "$ISOLATION" > isolation
   if [ ! -d work ]; then
     git clone -q "${FORK[$PILOT]}" work
     git -C work checkout -q -B "${BRANCH[$PILOT]}" "${COMMIT[$PILOT]}"
     cp "$KIT/pilots/$PILOT.sentinel.yml" work/.sentinel.yml
+    if [ -n "$ISOLATION" ]; then # state the isolation on every job; the caps, images and steps stay as frozen
+      want=$(grep -c 'runs_on: { labels: \[egress\] }' work/.sentinel.yml)
+      sed -i "s/runs_on: { labels: \[egress\] }/runs_on: { labels: [egress], isolation: $ISOLATION }/" work/.sentinel.yml
+      [ "$want" -gt 0 ] && [ "$(grep -c "isolation: $ISOLATION" work/.sentinel.yml)" = "$want" ] || { echo "could not state the isolation on every job of $PILOT" >&2; exit 1; }
+    fi
     git -C work add -f .sentinel.yml
     git -C work commit -q -m "bench: $PILOT pilot source (live pipeline)"
     mkdir -p git
@@ -200,9 +213,9 @@ measure)
       sep=,
     done
     steps="$steps}" summary="$summary}"
-    python3 - "$PILOT" "$CONDITION" "$([ "$i" -le "$WARMUP" ] && echo 1 || echo 0)" "$pressure" "$start" "$dispatched" "$end" "$run" "$new" "$body" "$steps" "$summary" "$("$BIN" --version)" "$SENTINEL_SRC" "$BIN" "$raw" "$KIT" >> "$OUT" <<'PY'
+    python3 - "$PILOT" "$CONDITION" "$([ "$i" -le "$WARMUP" ] && echo 1 || echo 0)" "$pressure" "$start" "$dispatched" "$end" "$run" "$new" "$body" "$steps" "$summary" "$("$BIN" --version)" "$SENTINEL_SRC" "$BIN" "$raw" "$KIT" "$(cat isolation 2>/dev/null || true)" >> "$OUT" <<'PY'
 import hashlib, json, os, subprocess, sys
-pilot, condition, warmup, pressure, start, dispatched, end, run, sha, body, steps, summary, version, src, binary, raw, kit = sys.argv[1:]
+pilot, condition, warmup, pressure, start, dispatched, end, run, sha, body, steps, summary, version, src, binary, raw, kit, isolation = sys.argv[1:]
 jobs = json.loads(body)["run"]["jobs"]
 steps, summary = json.loads(steps), json.loads(summary)
 def git(*a):
@@ -243,7 +256,8 @@ print(json.dumps({
     "build": {"commit": git("rev-parse", "HEAD"), "dirty": None if status is None else bool(status),
               "binary_sha256": hashlib.sha256(open(binary, "rb").read()).hexdigest()},
     "host": {k: v for k, v in host.items() if v is not None},
-    "contract": {"id": "pilots-ci", "revision": 4, "lane": pilot, "condition": condition},
+    "contract": {"id": "pilots-ci-isolation", "revision": 1, "lane": pilot, "condition": condition, "isolation": isolation}
+                if isolation else {"id": "pilots-ci", "revision": 4, "lane": pilot, "condition": condition},
     "sentinel": version, "warmup": warmup == "1", "cpu_pressure_avg60": float(pressure),
     "run": run, "sha": sha,
     "job_state": "passed" if jobs and all(j.get("state") == "passed" for j in jobs) else "failed",

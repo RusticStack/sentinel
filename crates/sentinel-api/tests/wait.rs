@@ -14,7 +14,7 @@ use sentinel_protocol::{
     cursor::{Cursor, Seq},
     logs::{Frame, Stream},
     oauth::CLI_CLIENT_ID,
-    summary::{AttemptSummary, CacheRecord, StepOutcome, StepRecord},
+    summary::{AttemptSummary, CacheRecord, GuestImageRecord, StepOutcome, StepRecord},
 };
 use sentinel_store::{
     Durability, Store,
@@ -831,6 +831,12 @@ fn an_attempt_summary_needs_cache_read_and_reports_cache_records() {
             publish: None,
             costly_hit: false,
         }],
+        guest_image: Some(GuestImageRecord {
+            digest: format!("sha256:{}", "1f".repeat(32)),
+            rootfs_bytes: 4096,
+            built: false,
+            build_ns: None,
+        }),
         ..AttemptSummary::default()
     };
     pass(&d, leased, summary.encode().unwrap());
@@ -838,6 +844,19 @@ fn an_attempt_summary_needs_cache_read_and_reports_cache_records() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["present"], true);
     assert_eq!(body["image_present"], true);
+    // The steps view carries the digest the microVM attempt ran.
+    let steps = format!("/api/v1/attempts/{attempt}/steps");
+    let (status, steps_body) = call(&d.base, "GET", &steps, &bearer(&runs_only));
+    assert_eq!(status, 200, "{steps_body}");
+    assert_eq!(
+        steps_body["guest_image"],
+        json!({
+            "digest": format!("sha256:{}", "1f".repeat(32)),
+            "rootfs_bytes": 4096,
+            "built": false,
+            "build_ns": null,
+        })
+    );
     assert_eq!(body["caches"][0]["name"], "deps");
     assert_eq!(body["caches"][0]["outcome"], "hit");
     assert_eq!(body["caches"][0]["files"], 40);

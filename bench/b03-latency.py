@@ -347,6 +347,10 @@ def main():
         return
     if not a.root or not a.out:
         p.error("root and out are required")
+    try:  # written by b03-setup.sh: the isolation the fixture's pipelines state, empty for the worker's default
+        STAMP["isolation"] = open(os.path.join(a.root, "isolation")).read().strip() or "default"
+    except OSError:
+        STAMP["isolation"] = "default"
     d = Deployment(a.root)
     with open(a.out, "a") as out:
         first(d, out, a.first)

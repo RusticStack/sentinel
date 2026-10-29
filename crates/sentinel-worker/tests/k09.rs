@@ -1,5 +1,11 @@
 #![cfg(target_os = "linux")]
 
+//! Cache publication under the isolation of the run: rootless containers, or Firecracker microVMs with
+//! `SENTINEL_MICROVM_TESTS=1` (see `support/isolation.rs`; TODO M04's gate).
+
+#[path = "support/isolation.rs"]
+mod isolation;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -50,11 +56,7 @@ jobs:
 "#;
 
 fn enabled() -> bool {
-    if std::env::var_os("SENTINEL_PODMAN_TESTS").is_some() {
-        return true;
-    }
-    eprintln!("skipped: set SENTINEL_PODMAN_TESTS=1 as a rootless Podman account to run");
-    false
+    isolation::enabled()
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -161,7 +163,7 @@ fn make_job(worker_dir: &Path, repo_dir: &Path, sha: &str, repo: RepoId, trust: 
         mirrors: None,
         prepare_hold: Duration::ZERO,
         network: sentinel_worker::podman::Network::None,
-        runtime: Default::default(),
+        runtime: isolation::runtime().unwrap_or_default(),
     }
 }
 
@@ -257,17 +259,15 @@ fn publish_runs_with_the_container_stopped() {
         return;
     }
     struct Probe {
+        worker: WorkerId,
+        worker_dir: PathBuf,
         container_alive_at_publish: Mutex<Vec<bool>>,
     }
     impl Report for Probe {
         fn event(&self, _: AttemptId, _: Fence, _: Event) {}
         fn finish(&self, _: AttemptId, _: Fence, _: Event, _: Vec<u8>) {}
         fn cache_note(&self, attempt: AttemptId, _: CacheNote) {
-            let alive = Command::new("podman")
-                .args(["container", "exists", &format!("sentinel-{attempt}")])
-                .status()
-                .unwrap()
-                .success();
+            let alive = isolation::sandbox_exists(self.worker, &self.worker_dir, attempt);
             self.container_alive_at_publish.lock().unwrap().push(alive);
         }
     }
@@ -288,6 +288,8 @@ fn publish_runs_with_the_container_stopped() {
     );
     job.spec = RunSpec::new(job.spec.source.clone(), compile_str(&yaml).unwrap()).unwrap();
     let probe = Probe {
+        worker: job.worker,
+        worker_dir: worker_dir.clone(),
         container_alive_at_publish: Mutex::new(Vec::new()),
     };
     let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -304,7 +306,8 @@ fn publish_runs_with_the_container_stopped() {
     assert_eq!(
         *probe.container_alive_at_publish.lock().unwrap(),
         [false],
-        "the container must be gone before publication reads the views"
+        "the {} must be gone before publication reads the views",
+        isolation::name()
     );
 }
 

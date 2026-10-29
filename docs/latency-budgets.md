@@ -6,6 +6,8 @@ The [plan's latency budgets](../plan.md#12-performance-targets-and-evidence), me
 
 ## Method
 
+**Per isolation (M08).** With `SENTINEL_BENCH_ISOLATION=container|microvm` at setup, every fixture pipeline states `runs_on.isolation`, and each record carries `isolation` (`default` when unset), so the budgets can be measured under either executor on one KVM host; see [`pilots-ci-isolation`](benchmark-contracts.md#pilots-ci-isolation-revision-1-microvm-against-container-m08). No microVM figures are recorded here yet.
+
 [`bench/b03-setup.sh`](../bench/b03-setup.sh) builds a deployment as the bench user on the reference host (the reference-host VPS of the [benchmark contract](benchmark-contracts.md)):
 
 - a controller and a rootless worker on one host, both release builds;

@@ -24,13 +24,21 @@ stop_group() {
   rm -f "$1"
 }
 
+# SENTINEL_BENCH_ISOLATION=container|microvm (M08) states runs_on.isolation on the probe job, so one deployment
+# measures the B03 budgets under either executor on the same host; unset, the job takes the worker's default.
+ISOLATION=${SENTINEL_BENCH_ISOLATION:-}
+case "$ISOLATION" in ""|container|microvm) ;; *) echo "SENTINEL_BENCH_ISOLATION must be container or microvm" >&2; exit 2 ;; esac
+
 pipeline() { # pipeline <job body>: a one-job pipeline on the warm image
-  printf 'schema: 1\non: [push]\njobs:\n  probe:\n    image: %s\n    resources: { cpu: 1, memory: 512MiB }\n    timeout: 20m\n%s\n' "$IMAGE" "$1"
+  local runs_on=""
+  [ -z "$ISOLATION" ] || runs_on="    runs_on: { isolation: $ISOLATION }\n"
+  printf "schema: 1\non: [push]\njobs:\n  probe:\n    image: %s\n${runs_on}    resources: { cpu: 1, memory: 512MiB }\n    timeout: 20m\n%s\n" "$IMAGE" "$1"
 }
 
 case "$MODE" in
 setup)
   mkdir -p "$ROOT" && cd "$ROOT"
+  printf '%s' "$ISOLATION" > isolation
   if [ ! -d work ]; then
     git init -q -b main work
     echo "B03 latency fixture" > work/README

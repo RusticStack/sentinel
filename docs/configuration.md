@@ -61,7 +61,7 @@ cpu_millis = 8000                  # override measured capacity (default: every 
 memory_bytes = 34359738368         # override measured capacity (default: total less a host reserve); the whole host's
 git_mirrors = true                 # keep per-repository object mirrors under <data_dir>/mirrors (default on; [mirrors](mirrors.md))
 labels = ["linux", "gpu"]          # scheduling labels this worker selects work by; at most 16, each 1-128 bytes (default none)
-job_network = "none"               # "egress" gives job containers outbound network (rootless pasta, no route to this host's loopback) and adds the label "egress"; operator-granted, trusted code only (default "none"; [executor](executor.md#job-network))
+job_network = "none"               # "egress" gives job containers and microVM guests outbound network (rootless pasta; containers have no route to this host's loopback, guests none to the host's addresses, loopback, link-local and metadata addresses or the controller link) and adds the label "egress"; operator-granted, trusted code only (default "none"; [executor](executor.md#job-network), [microVM network](executor.md#network-m05))
 isolation = "auto"                 # default executor for jobs that state none: "auto" (a microVM where /dev/kvm is usable and the microVM executor is set up, else rootless Podman), "container" or "microvm" (refused at start where microVMs cannot run); the worker logs runtime_selected with what it detected ([plan 16.8](../plan.md#168-microvm-execution-on-kvm-hosts))
 disk_bytes = 1073741824            # scratch disk offered to jobs; default: the data directory's free space less an eighth (clamped to 512 MiB-2 GiB), re-measured while the worker runs; a stated value is fixed; a platform that cannot measure it offers none, and no job is placed there
 spool_reserve_bytes = 1073741824   # free space the log spools never write the data directory below (default 1 GiB; 0 = none)
@@ -77,6 +77,7 @@ tailcat_address = "tc…"            # required with `[tailcat] enabled = true`:
 firecracker = "/usr/local/bin/firecracker"  # Firecracker executable
 kernel = "/var/lib/sentinel-microvm/vmlinux" # pinned Linux guest kernel; the x86_64 worker package installs all three files (docs/releasing.md#microvm-assets)
 agent = "/usr/local/bin/sentinel-agent"      # static Linux guest agent executable
+snapshots = true                             # start VMs from snapshots of a booted guest of their shape (default true); false boots every VM cold ([executor](executor.md#snapshot-warm-start-m06))
 
 # either role: the optional pinned Tailcat transport; absent or `enabled = false` = direct TLS
 [tailcat]
@@ -157,7 +158,7 @@ Optional on-disk controller state configures sources ([sources](sources.md)), ev
 
 Source credentials themselves are sealed with `<data_dir>/master.key` (`admin key create`), the same key-outside-database file second factors use. Repository hook secrets are digests and need no key. Resolution also uses `<data_dir>/intake-work/` as per-delivery scratch space for the repository fetches it makes; it is emptied at startup and never reused.
 
-`--check` validates syntax, effective path shape and currently inspectable filesystem metadata. It does not prove future write access, reserve the directory or validate networking/runtime prerequisites. Actual startup creates missing directories and reports initialization failures.
+`--check` validates syntax, effective path shape and currently inspectable filesystem metadata. It does not prove future write access, reserve the directory or validate networking/runtime prerequisites. The one exception is the worker role, which ends its `--check` line with a `runtime:` record of what the host would state (`kvm`, `nested`, the default executor and the capability bits such as `isolation.microvm`, plus the reason KVM is absent when it is); it opens `/dev/kvm` and creates and closes a throwaway VM to do so, starts nothing else and writes nothing. With no controller configured it describes the host with `isolation = "auto"` and no `[microvm]` section, so `isolation.microvm` appears only when a controller link and a usable `[microvm]` setup are configured. An `isolation = "microvm"` that cannot be met fails `--check` with the same error as startup. Actual startup creates missing directories and reports initialization failures.
 
 ### Optional Tailcat transport
 
