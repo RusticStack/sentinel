@@ -163,6 +163,8 @@ struct Parked {
     retry_at: Instant,
     delay: Duration,
     bytes: u64,
+    /// The bucket's answer when a pass judged this item's refusal to be its own, not the credential's.
+    refusal: Option<String>,
 }
 
 enum Shelved {
@@ -177,6 +179,7 @@ struct Shelf {
     items: HashMap<Item, Parked>,
     min: Duration,
     max: Duration,
+    limit: usize,
 }
 
 impl Shelf {
@@ -190,7 +193,7 @@ impl Shelf {
             parked.retry_at = now + parked.delay;
             return Shelved::Again;
         }
-        if self.items.len() >= MAX_PARKED {
+        if self.items.len() >= self.limit {
             return Shelved::Full;
         }
         self.items.insert(
@@ -199,6 +202,7 @@ impl Shelf {
                 retry_at: now + self.min,
                 delay: self.min,
                 bytes,
+                refusal: None,
             },
         );
         Shelved::New
@@ -229,6 +233,8 @@ fn is_log(item: &Item) -> bool {
 enum Class {
     Put,
     Delete,
+    /// A listing is judged by other listings: a key may be allowed to write and delete yet not to list.
+    List,
 }
 
 struct Refusal {
@@ -236,6 +242,8 @@ struct Refusal {
     class: Class,
     what: &'static str,
     message: String,
+    /// The item was parked by an earlier pass for this same answer: an item retried alone is still that item's.
+    repeat: bool,
 }
 
 /// What one pass learned about the bucket: which kinds of request it accepted, and what it refused for good.
@@ -243,6 +251,7 @@ struct Refusal {
 struct Run {
     put_ok: bool,
     delete_ok: bool,
+    list_ok: bool,
     refused: Vec<Refusal>,
 }
 
@@ -305,6 +314,7 @@ impl Replicator {
                 items: HashMap::new(),
                 min: PARK_MIN,
                 max: PARK_MAX,
+                limit: MAX_PARKED,
             }),
         }
     }
@@ -317,6 +327,13 @@ impl Replicator {
             parking.min = min;
             parking.max = max.max(min);
         }
+        self
+    }
+
+    /// Sets how many items may wait at once; past it a damaged item is tried every pass and a refused one fails the pass.
+    #[must_use]
+    pub fn with_park_limit(self, limit: usize) -> Replicator {
+        self.parking().limit = limit;
         self
     }
 
@@ -436,24 +453,31 @@ impl Replicator {
             self.failed(what, &error);
             return Err(error.message);
         }
-        if matches!(
-            self.parking().park(item, bytes, Instant::now()),
-            Shelved::Full
-        ) {
-            self.failed(what, &error);
-            return Err(error.message);
-        }
+        let repeat = {
+            let mut parking = self.parking();
+            let repeat = parking
+                .items
+                .get(&item)
+                .is_some_and(|p| p.refusal.as_deref() == Some(error.message.as_str()));
+            if matches!(parking.park(item, bytes, Instant::now()), Shelved::Full) {
+                drop(parking);
+                self.failed(what, &error);
+                return Err(error.message);
+            }
+            repeat
+        };
         run.refused.push(Refusal {
             item,
             class,
             what,
             message: error.message,
+            repeat,
         });
         Ok(())
     }
 
-    /// Permanent refusals are an item's own only if the bucket accepted other requests of that kind in the same pass.
-    /// Otherwise a replaced credential or a corrected endpoint must catch up at once, so nothing stays parked and
+    /// Permanent refusals are an item's own only if the bucket accepted other requests of that kind in the same pass,
+    /// or an earlier pass already judged the same answer to be the item's. Otherwise a replaced credential or a corrected endpoint must catch up at once, so nothing stays parked and
     /// the pass fails as one.
     fn settle_refusals(&self, pass: &mut Pass, run: Run) -> Option<(&'static str, String)> {
         let mut global: Option<(&'static str, String)> = None;
@@ -462,12 +486,17 @@ impl Replicator {
         {
             let mut parking = self.parking();
             for refusal in run.refused {
-                let accepted = match refusal.class {
-                    Class::Put => run.put_ok,
-                    Class::Delete => run.delete_ok,
-                };
+                let accepted = refusal.repeat
+                    || match refusal.class {
+                        Class::Put => run.put_ok,
+                        Class::Delete => run.delete_ok,
+                        Class::List => run.list_ok,
+                    };
                 if accepted {
                     parked += 1;
+                    if let Some(entry) = parking.items.get_mut(&refusal.item) {
+                        entry.refusal = Some(refusal.message.clone());
+                    }
                     latest = Some(refusal.message);
                 } else {
                     parking.items.remove(&refusal.item);
@@ -506,7 +535,7 @@ impl Replicator {
         let full = due.len() >= DELETES_PER_PASS as usize;
         let mut progressed = false;
         for delete in due.into_iter().take(DELETES_PER_PASS as usize) {
-            let result = match delete {
+            let result: std::result::Result<(), (Class, BucketError)> = match delete {
                 Delete::Object { id, tenant, digest } => {
                     // A digest queued for deletion may be committed again meanwhile; the recheck and dropping the delete are one transaction.
                     let live = self
@@ -519,7 +548,10 @@ impl Replicator {
                         progressed = true;
                         continue;
                     }
-                    self.bucket.delete(&remote_key(tenant, &digest))
+                    self.bucket
+                        .delete(&remote_key(tenant, &digest))
+                        .map(|()| run.delete_ok = true)
+                        .map_err(|e| (Class::Delete, e))
                 }
                 Delete::Log {
                     run: run_id,
@@ -528,18 +560,27 @@ impl Replicator {
                     ..
                 } => {
                     let prefix = offload::log_prefix(run_id, job, attempt);
-                    self.bucket
-                        .list(&prefix)
-                        .and_then(|keys| keys.iter().try_for_each(|k| self.bucket.delete(k)))
+                    match self.bucket.list(&prefix) {
+                        Err(e) => Err((Class::List, e)),
+                        Ok(keys) => {
+                            run.list_ok = true;
+                            keys.iter()
+                                .try_for_each(|k| {
+                                    self.bucket.delete(k)?;
+                                    run.delete_ok = true;
+                                    Ok::<(), BucketError>(())
+                                })
+                                .map_err(|e| (Class::Delete, e))
+                        }
+                    }
                 }
             };
             let id = delete.id();
-            if let Err(e) = result {
-                self.refused(run, "delete", Class::Delete, Item::Delete(id), 0, e)?;
+            if let Err((class, e)) = result {
+                self.refused(run, "delete", class, Item::Delete(id), 0, e)?;
                 progressed = true;
                 continue;
             }
-            run.delete_ok = true;
             self.store
                 .writer()
                 .write(move |tx| offload::delete_done(tx, id))
@@ -558,8 +599,9 @@ impl Replicator {
         pass.local_faults += 1;
         let parking = self.parking().park(item, bytes, Instant::now());
         match parking {
-            Shelved::Again => {}
-            Shelved::New | Shelved::Full => {
+            // A full shelf cannot remember the item, so counting it on every pass would never settle.
+            Shelved::Again | Shelved::Full => {}
+            Shelved::New => {
                 self.status.local_faults.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -845,9 +887,12 @@ impl Replicator {
                 sent.insert(key);
             }
             let keys = match self.bucket.list(&prefix) {
-                Ok(keys) => keys,
+                Ok(keys) => {
+                    run.list_ok = true;
+                    keys
+                }
                 Err(e) => {
-                    self.refused(run, "log", Class::Put, item, 0, e)?;
+                    self.refused(run, "log", Class::List, item, 0, e)?;
                     progressed = true;
                     continue;
                 }
@@ -1069,6 +1114,7 @@ mod tests {
             items: HashMap::new(),
             min: Duration::from_secs(min),
             max: Duration::from_secs(max),
+            limit: MAX_PARKED,
         }
     }
 

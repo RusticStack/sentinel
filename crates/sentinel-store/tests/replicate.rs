@@ -60,6 +60,8 @@ struct Fake {
     /// Keys containing this text are refused for good: put, part and delete answer a permanent error.
     refuse: Mutex<Option<String>>,
     refused_calls: AtomicU32,
+    /// Every list answers a permanent refusal, as a key without `s3:ListBucket` does.
+    refuse_list: AtomicBool,
     completes: AtomicU32,
     /// Runs once, after the first put of a key containing the text.
     on_put: Mutex<Option<(String, Hook)>>,
@@ -260,6 +262,13 @@ impl Bucket for Fake {
     }
     fn list(&self, prefix: &str) -> BucketResult<Vec<String>> {
         self.up()?;
+        if self.refuse_list.load(Ordering::Relaxed) {
+            return Err(BucketError {
+                transient: false,
+                not_found: false,
+                message: "AccessDenied: s3:ListBucket is not allowed".into(),
+            });
+        }
         Ok(self
             .keys()
             .into_iter()
@@ -1173,6 +1182,116 @@ fn one_object_the_bucket_refuses_for_good_does_not_stop_the_queue() {
     let calls = f.bucket.refused_calls.load(Ordering::Relaxed);
     assert_eq!(r.pass().unwrap().parked, 0);
     assert_eq!(f.bucket.refused_calls.load(Ordering::Relaxed), calls);
+}
+
+#[test]
+fn a_key_that_may_write_logs_but_not_list_them_degrades_the_copy_and_parks_nothing() {
+    let f = fixture();
+    let (run, job, attempt) = f.finished_log();
+    f.bucket.refuse_list.store(true, Ordering::Relaxed);
+    let r = f.replicator(SETTINGS);
+    // The log files are accepted first, so a write that went through must not make the list refusal the log's own.
+    assert!(
+        r.pass().is_err(),
+        "the listing is refused for the whole key"
+    );
+    let status = r.status();
+    assert_eq!(status.parked_items.load(Ordering::Relaxed), 0);
+    assert_eq!(status.state(), "degraded");
+    assert!(
+        status
+            .last_error
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|m| m.contains("ListBucket"))
+    );
+
+    f.bucket.refuse_list.store(false, Ordering::Relaxed);
+    assert_eq!(
+        r.pass().unwrap().logs,
+        1,
+        "no waiting once the grant is fixed"
+    );
+    assert!(
+        !f.bucket
+            .list(&offload::log_prefix(run, job, attempt))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(status.state(), "healthy");
+}
+
+#[test]
+fn a_parked_delete_retried_alone_stays_parked_and_backs_off_instead_of_failing_each_pass() {
+    let f = fixture();
+    let (locked, gone) = (
+        f.put(b"held by an object lock"),
+        f.put(b"reclaimed normally"),
+    );
+    let r = f.replicator(SETTINGS).with_park_delays(
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_millis(150),
+    );
+    r.pass().unwrap();
+    reclaim(&f, locked);
+    reclaim(&f, gone);
+    *f.bucket.refuse.lock().unwrap() = Some(locked.to_string());
+    let pass = r
+        .pass()
+        .expect("judged the item's own beside a delete that succeeded");
+    assert_eq!((pass.deleted, pass.parked), (1, 1));
+
+    // At the retry the locked delete is the only one: no other delete succeeds beside it to vouch for it.
+    sleep_ms(200);
+    let calls = f.bucket.refused_calls.load(Ordering::Relaxed);
+    let pass = r.pass().expect("the same answer is still the item's own");
+    assert_eq!((pass.deleted, pass.parked), (0, 1));
+    assert_eq!(f.bucket.refused_calls.load(Ordering::Relaxed), calls + 1);
+    let status = r.status();
+    assert_eq!(status.state(), "healthy");
+    assert_eq!(status.consecutive_failures.load(Ordering::Relaxed), 0);
+    assert_eq!(status.parked_items.load(Ordering::Relaxed), 1);
+
+    // Backed off again: not asked on the next pass.
+    r.pass().unwrap();
+    assert_eq!(f.bucket.refused_calls.load(Ordering::Relaxed), calls + 1);
+
+    // The lock is lifted: the delete goes through at the next retry and the shelf empties.
+    *f.bucket.refuse.lock().unwrap() = None;
+    sleep_ms(300);
+    assert_eq!(r.pass().unwrap().deleted, 1);
+    assert_eq!(status.parked_items.load(Ordering::Relaxed), 0);
+    assert_eq!(queued_deletes(&f), 0);
+}
+
+#[test]
+fn damaged_objects_past_a_full_shelf_are_counted_once_not_on_every_pass() {
+    let f = fixture();
+    let first = f.put(b"first damaged object");
+    sleep_ms(5);
+    let second = f.put(b"second damaged object");
+    damage(&f, first);
+    damage(&f, second);
+    let r = f.replicator(SETTINGS).with_park_limit(1);
+    assert_eq!(r.pass().unwrap().local_faults, 2);
+    assert_eq!(
+        r.status().local_faults.load(Ordering::Relaxed),
+        1,
+        "one fits on the shelf"
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            r.pass().unwrap().local_faults,
+            1,
+            "the one left over is found again"
+        );
+    }
+    assert_eq!(
+        r.status().local_faults.load(Ordering::Relaxed),
+        1,
+        "an object the shelf cannot hold is not counted again on every pass"
+    );
 }
 
 #[test]

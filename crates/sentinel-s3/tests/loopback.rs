@@ -285,3 +285,63 @@ fn a_404_on_a_delete_is_done_only_for_the_missing_key() {
             .is_err()
     );
 }
+
+/// Accepts one request and drains its body at about 6 MB/s, then answers 200 with an ETag.
+fn slow_sink() -> (u16, JoinHandle<u64>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).unwrap() == 0 {
+                return 0;
+            }
+            head.push(byte[0]);
+        }
+        let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        let declared: u64 = text
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:")?.trim().parse().ok())
+            .unwrap();
+        let mut chunk = vec![0u8; 64 * 1024];
+        let mut seen = 0u64;
+        while seen < declared {
+            let want = chunk.len().min((declared - seen) as usize);
+            match stream.read(&mut chunk[..want]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen += n as u64,
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\netag: \"e1\"\r\nconnection: close\r\n\r\n",
+        );
+        seen
+    });
+    (port, thread)
+}
+
+#[test]
+fn a_part_slower_than_the_base_timeout_is_given_time_in_proportion_to_its_size() {
+    // 32 MiB at the 4 MiB/s floor is a budget of 8 s; the sink takes about 5 s, far beyond the 1 s base timeout.
+    // Kernel buffers hold part of the body, but not all of it, so the send itself is blocked for longer than 1 s.
+    let body = vec![7u8; 32 << 20];
+    let (port, sink) = slow_sink();
+    let client = client(port, Duration::from_secs(1));
+
+    let started = Instant::now();
+    let etag = client
+        .upload_part("k", "u", 1, &body)
+        .expect("the budget scales with the part");
+    assert_eq!(etag, "e1");
+    assert!(
+        started.elapsed() > Duration::from_secs(2),
+        "the transfer outlasted the base timeout, so the scaled budget is what let it finish"
+    );
+    assert_eq!(sink.join().unwrap(), body.len() as u64);
+}
