@@ -220,6 +220,7 @@ mod imp {
             spec,
             context: JobContext {
                 source: None,
+                source_valid_until: None,
                 run: RunId::new(),
                 repo: args.repo_id,
                 repo_name: recipe.to_owned(),

@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sentinel_core::RepoId;
 use sentinel_pipeline::PinnedSource;
@@ -40,6 +40,22 @@ fn map(error: sentinel_git::Error) -> Error {
     }
 }
 
+/// Caps `timeout` by the access's remaining monotonic validity and refuses an expired one, before anything
+/// reads the credential or opens a connection. `None` is an access with no monotonic bound (the controller's
+/// wall-clock check in `sentinel-git` still applies).
+fn bounded(valid_until: Option<Instant>, timeout: Duration) -> Result<Duration> {
+    let Some(until) = valid_until else {
+        return Ok(timeout);
+    };
+    let left = until.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(Error::Preparation(EXPIRED.into()));
+    }
+    Ok(timeout.min(left))
+}
+
+const EXPIRED: &str = "source access expired";
+
 pub fn checkout(
     workspace: &Path,
     source: &PinnedSource,
@@ -53,17 +69,21 @@ pub fn checkout_authorized(
     workspace: &Path,
     source: &PinnedSource,
     access: &Access,
+    valid_until: Option<Instant>,
     timeout: Duration,
 ) -> Result<Checkout> {
+    let timeout = bounded(valid_until, timeout)?;
     sentinel_git::checkout_authorized(workspace, source, access, timeout).map_err(map)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn checkout_mirrored(
     workspace: &Path,
     mirrors: Option<&Mirrors>,
     repo: &RepoId,
     source: &PinnedSource,
     access: Option<&Access>,
+    valid_until: Option<Instant>,
     lease: &str,
     timeout: Duration,
 ) -> Result<Outcome> {
@@ -75,10 +95,11 @@ pub fn checkout_mirrored(
             repo,
             source,
             Some(access),
+            valid_until,
             lease,
             timeout,
         ),
-        _ => direct(workspace, source, access, timeout).map(|checkout| Outcome {
+        _ => direct(workspace, source, access, valid_until, timeout).map(|checkout| Outcome {
             checkout,
             route: CheckoutRoute::Direct,
             fallback_reason: None,
@@ -87,16 +108,22 @@ pub fn checkout_mirrored(
 }
 
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn through_mirror(
     workspace: &Path,
     mirrors: &Mirrors,
     repo: &RepoId,
     source: &PinnedSource,
     access: Option<&Access>,
+    valid_until: Option<Instant>,
     lease: &str,
     timeout: Duration,
 ) -> Result<Outcome> {
-    let deadline = std::time::Instant::now() + timeout;
+    let timeout = match access {
+        Some(_) => bounded(valid_until, timeout)?,
+        None => timeout,
+    };
+    let deadline = Instant::now() + timeout;
     let share = timeout / 2;
     let attempted = match access {
         Some(access) => mirrors.checkout_authorized(workspace, repo, source, access, lease, share),
@@ -114,12 +141,12 @@ pub fn through_mirror(
             | sentinel_git::Error::Timeout(_)),
         ) => {
             let reason: String = e.to_string().chars().take(300).collect();
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(map(e));
             }
             clear(workspace)?;
-            let checkout = direct(workspace, source, access, left)?;
+            let checkout = direct(workspace, source, access, valid_until, left)?;
             Ok(Outcome {
                 checkout,
                 route: CheckoutRoute::MirrorFallback,
@@ -134,12 +161,11 @@ fn direct(
     workspace: &Path,
     source: &PinnedSource,
     access: Option<&Access>,
+    valid_until: Option<Instant>,
     timeout: Duration,
 ) -> Result<Checkout> {
     match access {
-        Some(access) => {
-            sentinel_git::checkout_authorized(workspace, source, access, timeout).map_err(map)
-        }
+        Some(access) => checkout_authorized(workspace, source, access, valid_until, timeout),
         None => sentinel_git::checkout(workspace, source, None, timeout).map_err(map),
     }
 }

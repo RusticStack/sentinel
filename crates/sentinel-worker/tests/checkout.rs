@@ -132,7 +132,7 @@ fn private_https_checkout_checks_ca_rotated_credentials_and_cleanup() {
     };
     let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
     let checkout =
-        checkout::checkout_authorized(ws.path(), &source, &access, Duration::from_secs(20))
+        checkout::checkout_authorized(ws.path(), &source, &access, None, Duration::from_secs(20))
             .unwrap();
     assert_eq!(checkout.sha, first);
     assert!(!ws.path().with_extension("askpass").exists());
@@ -144,8 +144,9 @@ fn private_https_checkout_checks_ca_rotated_credentials_and_cleanup() {
     ws.destroy().unwrap();
     fs::write(&password, "rotated-source-token").unwrap();
     let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
-    let error = checkout::checkout_authorized(ws.path(), &source, &access, Duration::from_secs(20))
-        .unwrap_err();
+    let error =
+        checkout::checkout_authorized(ws.path(), &source, &access, None, Duration::from_secs(20))
+            .unwrap_err();
     assert!(!error.to_string().contains("source-token"));
     assert!(!ws.path().with_extension("askpass").exists());
     ws.destroy().unwrap();
@@ -155,13 +156,14 @@ fn private_https_checkout_checks_ca_rotated_credentials_and_cleanup() {
     };
     let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
     assert!(
-        checkout::checkout_authorized(ws.path(), &source, &access, Duration::from_secs(20)).is_ok()
+        checkout::checkout_authorized(ws.path(), &source, &access, None, Duration::from_secs(20))
+            .is_ok()
     );
     ws.destroy().unwrap();
     access.binding.trust.clear();
     let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
     assert!(
-        checkout::checkout_authorized(ws.path(), &source, &access, Duration::from_secs(20))
+        checkout::checkout_authorized(ws.path(), &source, &access, None, Duration::from_secs(20))
             .is_err()
     );
     assert!(!ws.path().with_extension("askpass").exists());
@@ -437,7 +439,7 @@ fn ssh_deploy_keys_use_pinned_host_trust_and_leave_no_private_files() {
     assert!(access.validate(sentinel_core::UnixMillis::now().0));
     let ws = Workspace::create(&root, AttemptId::new()).unwrap();
     let checkout =
-        checkout::checkout_authorized(ws.path(), &source, &access, Duration::from_secs(30))
+        checkout::checkout_authorized(ws.path(), &source, &access, None, Duration::from_secs(30))
             .unwrap();
     assert_eq!(checkout.sha, first);
     assert!(!ws.path().with_extension("askpass").exists());
@@ -452,15 +454,22 @@ fn ssh_deploy_keys_use_pinned_host_trust_and_leave_no_private_files() {
     wrong_host.binding.remote = remote.replacen("127.0.0.1", "localhost", 1);
     let ws = Workspace::create(&root, AttemptId::new()).unwrap();
     assert!(matches!(
-        checkout::checkout_authorized(ws.path(), &source, &wrong_host, Duration::from_secs(5)),
+        checkout::checkout_authorized(
+            ws.path(),
+            &source,
+            &wrong_host,
+            None,
+            Duration::from_secs(5)
+        ),
         Err(Error::Preparation(_))
     ));
     assert!(!ws.path().with_extension("askpass").exists());
     ws.destroy().unwrap();
     access.binding.trust = "127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n".into();
     let ws = Workspace::create(&root, AttemptId::new()).unwrap();
-    let error = checkout::checkout_authorized(ws.path(), &source, &access, Duration::from_secs(20))
-        .unwrap_err();
+    let error =
+        checkout::checkout_authorized(ws.path(), &source, &access, None, Duration::from_secs(20))
+            .unwrap_err();
     assert!(!error.to_string().contains("PRIVATE KEY"));
     assert!(!ws.path().with_extension("askpass").exists());
     ws.destroy().unwrap();
@@ -489,4 +498,91 @@ fn a_credential_is_delivered_through_askpass_and_removed_afterwards() {
     let config = fs::read_to_string(ws.path().join(".git/config")).unwrap();
     assert!(!config.contains("ghs_do_not_leak"));
     assert!(!config.contains("x-access-token"));
+}
+
+/// A public HTTPS access to a local listener that never answers: any connection that reaches it is observable.
+fn silent_access() -> (std::net::TcpListener, Access) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let access = Access {
+        binding: Binding {
+            remote: format!("https://127.0.0.1:{port}/team/repo.git"),
+            allowed_refs: vec!["refs/heads/main".into()],
+            pipeline_path: ".sentinel.yml".into(),
+            trust: String::new(),
+        },
+        version: 1,
+        // The controller's wall clock says the access is live for a minute; only the monotonic expiry differs.
+        expires_ms: sentinel_core::UnixMillis::now().0 + 60_000,
+        credential: SourceCredential::Public,
+    };
+    (listener, access)
+}
+
+#[test]
+fn an_expired_monotonic_validity_refuses_a_direct_checkout_before_any_io() {
+    let temp = tempfile::tempdir().unwrap();
+    let (listener, access) = silent_access();
+    let source = PinnedSource::new(
+        &access.binding.remote,
+        &"a".repeat(40),
+        Some("refs/heads/main"),
+    )
+    .unwrap();
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    let error = checkout::checkout_authorized(
+        ws.path(),
+        &source,
+        &access,
+        Some(Instant::now()),
+        Duration::from_secs(20),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, Error::Preparation(what) if what == "source access expired"),
+        "{error:?}"
+    );
+    assert!(!ws.path().join(".git").exists(), "no git state was created");
+    assert!(
+        matches!(
+            listener.accept(),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "an expired access opened a connection"
+    );
+    ws.destroy().unwrap();
+}
+
+#[test]
+fn the_remaining_validity_caps_a_direct_checkout_deadline() {
+    let temp = tempfile::tempdir().unwrap();
+    let (listener, access) = silent_access();
+    let source = PinnedSource::new(
+        &access.binding.remote,
+        &"a".repeat(40),
+        Some("refs/heads/main"),
+    )
+    .unwrap();
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    let started = Instant::now();
+    // A minute of budget against an access with two seconds left and a remote that never answers.
+    let error = checkout::checkout_authorized(
+        ws.path(),
+        &source,
+        &access,
+        Some(Instant::now() + Duration::from_secs(2)),
+        Duration::from_secs(60),
+    )
+    .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{error:?} after {:?}",
+        started.elapsed()
+    );
+    assert!(
+        listener.accept().is_ok(),
+        "the checkout never reached the remote"
+    );
+    ws.destroy().unwrap();
 }

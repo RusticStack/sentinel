@@ -1239,6 +1239,11 @@ pub struct ServiceArgs {
     /// Internal diagnostic verbosity; defaults to info
     #[arg(long, value_enum)]
     pub log_level: Option<LogLevel>,
+
+    /// Comma-separated exact https://host[:port] authorities an unbound repository's manual remote may name
+    /// although they are internal; overrides the configuration file and SENTINEL_MANUAL_DESTINATIONS
+    #[arg(long, value_name = "AUTHORITIES", value_delimiter = ',')]
+    pub manual_destinations: Option<Vec<String>>,
 }
 
 /// `sentinel worker`: the service itself, or one of the host-management subcommands the generated

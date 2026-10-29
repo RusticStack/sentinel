@@ -618,6 +618,7 @@ fn prepare(
                 let path = workspace.path().to_path_buf();
                 let source = job.spec.source.clone();
                 let access = job.context.source.clone();
+                let valid_until = job.context.source_valid_until;
                 let mirrors = job.mirrors.clone();
                 let repo = job.context.repo;
                 let lease = job.attempt.to_string();
@@ -631,6 +632,7 @@ fn prepare(
                             &repo,
                             &source,
                             access.as_ref(),
+                            valid_until,
                             &lease,
                             CHECKOUT_TIMEOUT,
                         )?;
@@ -739,6 +741,15 @@ fn prepare(
                 });
             }
         }
+        let isolation = job.runtime.for_job(stated_isolation);
+        if matches!(isolation, Isolation::Container) {
+            // The job's `/tmp` lives on the workspace disk, under the same disk budget, not in memory.
+            mounts.push(podman::Mount {
+                host: workspace.create_tmp()?,
+                container: podman::TMP_MOUNT.into(),
+                read_only: false,
+            });
+        }
         let started = Instant::now();
         let limits = Limits {
             cpu_millis: resources.cpu_millis,
@@ -749,7 +760,7 @@ fn prepare(
                 .max(1)
                 .saturating_add(podman::KEEPALIVE_SLACK_SECS),
         };
-        let sandbox = match job.runtime.for_job(stated_isolation) {
+        let sandbox = match isolation {
             Isolation::Container => Sandbox::Container(Container::start_canceled(
                 job.worker,
                 job.attempt,
@@ -1583,6 +1594,7 @@ mod tests {
             spec,
             context: JobContext {
                 source: None,
+                source_valid_until: None,
                 run: RunId::new(),
                 repo: RepoId::new(),
                 repo_name: "app".into(),

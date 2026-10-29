@@ -265,7 +265,7 @@ pub fn run(command: Command, deadline: Instant, what: &'static str) -> Result<Ou
     run_capped(command, deadline, what, None)
 }
 
-fn run_capped(
+pub(crate) fn run_capped(
     mut command: Command,
     deadline: Instant,
     what: &'static str,

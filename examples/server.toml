@@ -10,6 +10,8 @@ api_listen = "127.0.0.1:7080"
 # "fastest" (default) offers work to the earliest expected finish; "priority" puts the operator's
 # host priority (sentinel admin worker policy --priority) first and speed second.
 # placement_order = "fastest"
+# Internal https authorities that a manual remote may name (default: none, public hosts only).
+# manual_destinations = ["https://git.corp.internal:8443"]
 
 # Optional NAT-traversing transport; without it (or with enabled = false) the link uses direct TLS.
 # The tc… address in <data_dir>/tailcat/address is a credential (owner-only).

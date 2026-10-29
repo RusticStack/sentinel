@@ -383,7 +383,7 @@ jobs:
     resources: {{ cpu: 1, memory: 128MiB }}
     steps:
       - id: fill
-        run: 'dd if=/dev/zero of=/tmp/x bs=1M count=300'
+        run: 'dd if=/dev/zero of=/dev/null bs=300M count=1'
   fat:
     image: {IMAGE}@{DIGEST}
     resources: {{ cpu: 1, memory: 512MiB, disk: 1GiB }}

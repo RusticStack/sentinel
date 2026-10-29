@@ -253,9 +253,12 @@ impl Access {
 
 pub const MANUAL_DESTINATIONS_ENV: &str = "SENTINEL_MANUAL_DESTINATIONS";
 
+const MAX_MANUAL_DESTINATIONS: usize = 128;
+
+static LISTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
 fn listed_manual_destinations() -> &'static [String] {
-    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
+    LISTED.get_or_init(|| {
         std::env::var(MANUAL_DESTINATIONS_ENV)
             .map(|v| {
                 v.split(',')
@@ -266,6 +269,36 @@ fn listed_manual_destinations() -> &'static [String] {
             })
             .unwrap_or_default()
     })
+}
+
+/// Checks a configured manual-destination list: at most 128 distinct exact `https://host[:port]`
+/// authorities. Unlike the environment variable, a malformed entry is an error, not skipped.
+pub fn validate_manual_destinations(list: &[String]) -> Result<(), String> {
+    if list.len() > MAX_MANUAL_DESTINATIONS {
+        return Err(format!(
+            "manual_destinations lists more than {MAX_MANUAL_DESTINATIONS} authorities"
+        ));
+    }
+    for (i, entry) in list.iter().enumerate() {
+        let exact = entry.starts_with("https://")
+            && remote(&format!("{entry}/r")).is_some_and(|authority| authority == entry);
+        if !exact {
+            return Err(
+                "manual_destinations entries must be exact https://host[:port] authorities (lower-case host, no path, user or query)"
+                    .to_owned(),
+            );
+        }
+        if list[..i].contains(entry) {
+            return Err("manual_destinations lists an authority twice".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Installs the configured list for this process; it replaces the environment variable, which is
+/// then ignored. Returns false when the list was already read or set (the first one stands).
+pub fn set_manual_destinations(list: Vec<String>) -> bool {
+    LISTED.set(list).is_ok()
 }
 
 pub fn manual_destination_listed(remote_url: &str) -> bool {
@@ -314,6 +347,32 @@ pub fn manual_destination_allowed(remote_url: &str) -> bool {
 #[cfg(test)]
 mod destination_tests {
     use super::*;
+
+    #[test]
+    fn a_configured_destination_list_is_validated_strictly() {
+        let ok = |l: &[&str]| {
+            validate_manual_destinations(&l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+        };
+        assert!(ok(&[]).is_ok());
+        assert!(ok(&["https://git.corp.internal:8443", "https://10.0.0.5"]).is_ok());
+        for bad in [
+            "http://git.corp.internal",
+            "ssh://git@host",
+            "https://git.corp.internal/",
+            "https://git.corp.internal/r",
+            "https://user@host",
+            "https://Host",
+            "https://host:0",
+            "https://",
+            "git.corp.internal",
+            "",
+        ] {
+            assert!(ok(&[bad]).is_err(), "{bad}");
+        }
+        assert!(ok(&["https://a.test", "https://a.test"]).is_err());
+        let many: Vec<String> = (0..129).map(|i| format!("https://h{i}.test")).collect();
+        assert!(validate_manual_destinations(&many).is_err());
+    }
 
     #[test]
     fn public_names_pass_and_internal_forms_do_not() {
