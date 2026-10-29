@@ -30,13 +30,19 @@ case "$1" in
     if [ -e "$dir/fail-ps-$id" ]; then echo "Error: cannot list containers" >&2; exit 1; fi
     cat "$dir/owned-$id" 2>/dev/null
     exit 0 ;;
+  container)
+    name="$4"
+    if [ -e "$dir/gone-$name" ]; then exit 1; fi
+    exit 0 ;;
   rm)
     name="$4"
+    if [ -e "$dir/gone-$name" ]; then echo "Error: no container with name or ID $name found: no such container" >&2; exit 1; fi
     if [ -e "$dir/fail-rm-$name" ]; then echo "Error: cannot remove" >&2; exit 1; fi
     echo "$name" >> "$dir/removed"
     exit 0 ;;
   stop)
     name="$5"
+    if [ -e "$dir/gone-$name" ]; then echo "Error: no such container" >&2; exit 125; fi
     if [ -e "$dir/fail-stop-$name" ]; then echo "Error: stop timed out" >&2; exit 125; fi
     exit 0 ;;
   create)
@@ -182,6 +188,35 @@ fn teardown_removes_the_container_even_when_its_stop_fails() {
     .unwrap();
     assert!(container.destroy().is_err());
     assert!(removed().contains(&name), "{:?}", removed());
+}
+
+#[test]
+fn teardown_of_a_container_already_removed_is_not_a_failure() {
+    let dir = shim();
+    let (worker, attempt) = (WorkerId::new(), AttemptId::new());
+    let name = format!("sentinel-{attempt}");
+    let workspace = tempfile::tempdir().unwrap();
+    let container = Container::start(
+        worker,
+        attempt,
+        "example.org/image@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        Limits {
+            cpu_millis: 1_000,
+            memory_bytes: 1 << 30,
+            pids: 64,
+            disk_bytes: 0,
+            lifetime_secs: 0,
+        },
+        workspace.path(),
+        &[],
+        &podman::Store::Shared,
+        sentinel_worker::podman::Network::None,
+    )
+    .unwrap();
+    // A cancel, a lease loss or the storage guard removed it by name first: both the stop and the remove now
+    // fail with "no such container", and that is the outcome teardown wanted.
+    fs::write(dir.join(format!("gone-{name}")), "").unwrap();
+    container.destroy().unwrap();
 }
 
 #[test]
