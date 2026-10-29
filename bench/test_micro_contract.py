@@ -374,5 +374,15 @@ class Runner(unittest.TestCase):
         self.assertFalse(os.path.exists(self.out + "2"), "without from_stdout the script is its own writer and nothing is appended")
 
 
+@unittest.skipUnless(LINUX, "needs Linux, flock and sh")
+class LockRefusal(unittest.TestCase):
+    def test_a_lock_that_cannot_be_opened_is_a_refusal_naming_it_not_a_traceback(self):
+        path = os.path.join(tempfile.gettempdir(), "no-such-dir-micro", "verify.lock")
+        with self.assertRaises(micro_contract.Refused) as caught:
+            micro_contract.take_lock(path)
+        self.assertEqual(caught.exception.code, 3)
+        self.assertIn(path, str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

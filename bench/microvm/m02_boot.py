@@ -47,7 +47,10 @@ def take_lock(a):
         return {"path": path, "held": False}
     if fcntl is None:
         raise SystemExit("m02_boot: the shared verification lock needs Linux (flock); --no-lock is for a dry run only")
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    except OSError as e:
+        raise SystemExit(f"m02_boot: the shared verification lock {path} cannot be opened ({e.strerror or type(e).__name__}); --no-lock is for a dry run only") from None
     started = time.monotonic_ns()
     fcntl.flock(fd, fcntl.LOCK_EX)
     a.lock_fd = fd

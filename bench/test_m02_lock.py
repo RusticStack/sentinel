@@ -48,6 +48,13 @@ class Lock(unittest.TestCase):
         self.assertEqual(self.m02.take_lock(a), {"path": self.path, "held": False})
         self.assertFalse(hasattr(a, "lock_fd"))
 
+    def test_a_lock_that_cannot_be_opened_exits_naming_it_not_a_traceback(self):
+        bad = os.path.join(self.tmp, "no-such-dir", "verify.lock")
+        os.environ["SENTINEL_VERIFY_LOCK"] = bad
+        with self.assertRaises(SystemExit) as caught:
+            self.m02.take_lock(argparse.Namespace(no_lock=False))
+        self.assertIn(bad, str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

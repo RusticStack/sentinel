@@ -197,7 +197,11 @@ def under_bench_dir(path):
 def take_lock(path):
     """Exclusive lock on `path`; (fd, waited_ns). Python opens the descriptor non-inheritable, so the bench and
     whatever it leaves behind never hold the lock after this process exits."""
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    except OSError as e:
+        # Typically a lock file another account created 0644 (flock(1) opens it read-only): name the lock, not a traceback.
+        raise Refused(f"the shared verification lock {path} cannot be opened ({e.strerror or type(e).__name__})", 3) from None
     t0 = time.monotonic_ns()
     fcntl.flock(fd, fcntl.LOCK_EX)
     return fd, time.monotonic_ns() - t0
