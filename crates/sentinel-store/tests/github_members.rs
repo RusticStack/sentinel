@@ -1491,3 +1491,50 @@ fn a_repository_that_cannot_be_read_keeps_its_grant_and_does_not_stop_the_walk()
     .unwrap();
     assert_eq!(f.grants(rae), vec![(*second.as_bytes(), 3)]);
 }
+
+// GitHub is the independent authority for a backed tenant, so a platform administrator whose
+// linked GitHub account GitHub confirms becomes a member like anyone else (documented in
+// step-up.md and admission.md); nothing else makes one a member.
+#[test]
+fn a_platform_administrator_is_derived_as_a_member_only_when_github_confirms_the_linked_account() {
+    let f = fixture();
+    f.back();
+    let root = f.admin.user;
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| {
+            provisioning::link_verified_identity(tx, root, "github", "9009", at(1))?;
+            github_members::hint(tx, tenant, Some(9009), at(20))
+        })
+        .unwrap();
+    assert!(f.check(root).is_some(), "the hint queued the administrator");
+    assert_eq!(f.membership(root), None, "a hint grants nothing");
+
+    let outcome = f
+        .apply(root, observed(9009, Membership::Absent, vec![]), false, 30)
+        .unwrap();
+    assert_eq!(outcome, "not a member");
+    assert_eq!(
+        f.membership(root),
+        None,
+        "GitHub did not confirm: no access"
+    );
+    assert_eq!(f.audit("joined"), 0);
+
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(9009), at(40)))
+        .unwrap();
+    let outcome = f
+        .apply(
+            root,
+            observed(9009, Membership::Active(OrgRole::Owner), vec![]),
+            false,
+            50,
+        )
+        .unwrap();
+    assert_eq!(outcome, "joined");
+    assert_eq!(role_of(f.membership(root)), Some(3));
+    assert_eq!(f.audit("joined"), 1);
+}
