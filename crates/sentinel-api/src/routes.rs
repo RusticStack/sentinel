@@ -1276,6 +1276,7 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
     let (slug, name) = (slug.to_owned(), name.to_owned());
     let principal = who.principal;
     let principal_text = who.user.to_string();
+    let triggered_by = who.user;
     let created = state
         .store
         .writer()
@@ -1302,7 +1303,7 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
             for (job, (digest, platform)) in jobs.iter().zip(&images) {
                 runs::resolve_image(tx, tenant, *job, digest, platform)?;
             }
-            provenance::insert(
+            provenance::insert_with_actor(
                 tx,
                 &provenance::Provenance {
                     tenant,
@@ -1323,6 +1324,7 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
                 },
                 run,
                 now,
+                Some(triggered_by),
             )?;
             // A manual run publishes nothing: it must never satisfy the required aggregate.
             checks::record_run(tx, tenant, run, now)?;
@@ -1628,12 +1630,14 @@ fn ready(state: &State) -> Route {
     {
         degraded.push("external_copy");
     }
-    if state
-        .objects
-        .backups()
-        .is_some_and(|b| !b.status()["last_failure"].is_null())
-    {
-        degraded.push("backup_failing");
+    if let Some(backups) = state.objects.backups() {
+        let status = backups.status();
+        if !status["last_failure"].is_null() {
+            degraded.push("backup_failing");
+        }
+        if crate::metrics::backup_objects_lost(&status).is_some_and(|lost| lost > 0) {
+            degraded.push("backup_incomplete");
+        }
     }
     if state.controller.connected().is_empty() {
         degraded.push("no_workers_connected");

@@ -1,12 +1,14 @@
 import type { DeploymentStorage } from "../../lib/types";
 import { api } from "../../lib/api.ts";
+import { attempt, type Load } from "../../lib/loaded.ts";
 import { fmtBytes } from "../../lib/format.ts";
+import { LoadFailed } from "../LoadFailed.tsx";
 import { RelTime } from "../RelTime.tsx";
 import { StateBadge } from "../StateBadge.tsx";
 import { Alert, Card } from "../ui.tsx";
 
 const DAY = 86_400_000;
-export const loadDeploymentStorage = () => api<DeploymentStorage>("/api/v1/admin/storage").catch(() => null);
+export const loadDeploymentStorage = () => attempt(() => api<DeploymentStorage>("/api/v1/admin/storage"));
 
 function Tile({ label, value, note }: { label: string; value: React.ReactNode; note: React.ReactNode }) {
   return (
@@ -18,8 +20,16 @@ function Tile({ label, value, note }: { label: string; value: React.ReactNode; n
   );
 }
 
-export function Storage({ data }: { data: DeploymentStorage | null }) {
-  if (!data) return null;
+export function Storage({ load }: { load: Load<DeploymentStorage> }) {
+  const data = load.value;
+  if (!data) {
+    return (
+      <section aria-labelledby="disk-h" className="space-y-3">
+        <h2 id="disk-h" className="text-base font-semibold text-strong">Disk</h2>
+        <LoadFailed what="the deployment's storage figures" words={load.failure ?? ""} />
+      </section>
+    );
+  }
   const used = data.filesystem_bytes && data.free_bytes !== null ? data.filesystem_bytes - data.free_bytes : null;
   const s3 = data.s3;
 

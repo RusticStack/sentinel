@@ -84,6 +84,19 @@ impl Out {
     }
 }
 
+/// Objects the last successful backup recorded as missing or corrupt at the source; absent when no backup has succeeded since start.
+pub(crate) fn backup_objects_lost(status: &serde_json::Value) -> Option<u64> {
+    let last = status["last_backup"].as_object()?;
+    Some(
+        last.get("objects_corrupt")
+            .and_then(serde_json::Value::as_u64)?
+            .saturating_add(
+                last.get("objects_missing")
+                    .and_then(serde_json::Value::as_u64)?,
+            ),
+    )
+}
+
 fn label(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -409,7 +422,60 @@ pub(crate) fn render(state: &State) -> String {
             "Replicator passes failed in a row.",
             r.consecutive_failures.load(Relaxed),
         );
+        out.one(
+            "sentinel_s3_local_faults_total",
+            "counter",
+            "Distinct objects and logs found damaged or missing locally since start, each counted once; healthy stays 1 while they are skipped.",
+            r.local_faults.load(Relaxed),
+        );
+        out.one(
+            "sentinel_s3_parked_items",
+            "gauge",
+            "Objects, logs and queued deletes set aside after a local fault or a refusal for that item, retried with a growing delay.",
+            r.parked_items.load(Relaxed),
+        );
+        out.one(
+            "sentinel_s3_parked_bytes",
+            "gauge",
+            "Bytes of parked objects. They still count in the backlog.",
+            r.parked_bytes.load(Relaxed),
+        );
     }
+    if state
+        .store
+        .read(sentinel_store::email::delivery_enabled)
+        .unwrap_or(false)
+        && let Ok((pending, delivered, abandoned)) = state.store.read(sentinel_store::email::counts)
+    {
+        out.family(
+            "sentinel_mail_outbox",
+            "gauge",
+            "Messages in the mail outbox by state; delivered and abandoned rows are purged after a while.",
+        );
+        out.value("sentinel_mail_outbox", "state=\"pending\"", pending);
+        out.value("sentinel_mail_outbox", "state=\"delivered\"", delivered);
+        out.value("sentinel_mail_outbox", "state=\"abandoned\"", abandoned);
+        let oldest = state
+            .store
+            .read(sentinel_store::email::oldest_pending_ms)
+            .ok()
+            .flatten()
+            .map_or(0.0, |at| {
+                (sentinel_core::UnixMillis::now().0 - at).max(0) as f64 / 1e3
+            });
+        out.one(
+            "sentinel_mail_oldest_pending_seconds",
+            "gauge",
+            "Age of the oldest message still waiting for delivery; 0 when none waits.",
+            oldest,
+        );
+    }
+    out.one(
+        "sentinel_maintenance_rows_skipped_total",
+        "counter",
+        "Rows a maintenance batch passed over (an id that did not decode, or a manifest file that could not be read), since start; a row that stays damaged is counted every time a batch meets it.",
+        sentinel_store::skipped::total(),
+    );
     if let Some(b) = state.objects.backups() {
         let status = b.status();
         if let Some(at) = status["last_success_ms"].as_i64() {
@@ -426,6 +492,14 @@ pub(crate) fn render(state: &State) -> String {
             "The most recent backup attempt failed (1).",
             u8::from(!status["last_failure"].is_null()),
         );
+        if let Some(lost) = backup_objects_lost(&status) {
+            out.one(
+                "sentinel_backup_last_objects_lost",
+                "gauge",
+                "Objects the last successful backup recorded as missing or corrupt at the source.",
+                lost,
+            );
+        }
     }
 
     if let Ok((pending, refused, oldest)) = state.store.read(|c| {

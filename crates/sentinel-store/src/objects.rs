@@ -356,6 +356,9 @@ pub struct Manifest {
 #[derive(Debug, Default)]
 pub struct Recovery {
     pub staged: u32,
+    /// Local files of objects marked evicted, left by an eviction that stopped between its mark and its unlink.
+    /// The external copy is verified, so they were removed.
+    pub evicted_leftovers: u32,
     pub orphans: Vec<PathBuf>,
     pub corrupt: Vec<PathBuf>,
     pub missing: Vec<PathBuf>,
@@ -1386,7 +1389,13 @@ impl Objects {
                 let digest = Digest::parse(&name.to_string_lossy());
                 match (valid_name, digest) {
                     (true, Ok(digest)) => match committed.remove(&(tenant, digest)) {
-                        Some((len, _)) if entry.metadata()?.len() == len => {
+                        Some((_, true)) => {
+                            // Evicted rows are committed only after the external copy is verified, and nothing reads the file
+                            // while the row says so; at startup no fetch is placing one either.
+                            fs::remove_file(&path)?;
+                            report.evicted_leftovers += 1;
+                        }
+                        Some((len, false)) if entry.metadata()?.len() == len => {
                             if !content_matches(&path, len, digest, buf) {
                                 report.corrupt.push(path);
                             }
@@ -1806,7 +1815,18 @@ impl Objects {
         )?;
         let staged = plan.staged.as_ref().ok_or(Error::Corrupt("upload seal"))?;
         debug_assert_eq!(staged.len, plan.len);
-        self.commit(tx, staged)?;
+        if !self.commit(tx, staged)? {
+            // The bytes were already stored. If nothing references them their grace ran from their first creation and may be spent:
+            // restart it here, or the next pass could reclaim an object this committed session authorizes reads of.
+            tx.prepare_cached(
+                "UPDATE object_unreferenced SET created_ms = ?3 WHERE tenant_id = ?1 AND digest = ?2",
+            )?
+            .execute(params![
+                plan.tenant.as_bytes().as_slice(),
+                plan.digest.as_bytes().as_slice(),
+                UnixMillis::now().0
+            ])?;
+        }
         if plan.dedup {
             let _ = fs::remove_file(self.upload_path(plan.id));
         }
@@ -1894,6 +1914,8 @@ impl Objects {
                 .ok()
                 .and_then(|body| decode_manifest(&body).ok().map(|(_, _, e)| e));
             let Some(entries) = entries else {
+                // Its tenant stays unable to reclaim until the manifest reads again, so the skip is reported, not silent.
+                crate::skipped::note_blob("manifests", tenant.as_bytes());
                 continue;
             };
             {
@@ -2166,8 +2188,14 @@ impl Objects {
     /// Writes a manifest's entries below `dest`. On Unix the walk is descriptor-relative: `dest` is resolved once,
     /// and every component below it is created and opened relative to the directory descriptor before it without
     /// following a symlink, so a destination changed while the extract runs cannot redirect a write outside the
-    /// directories this call opened. Elsewhere the checks are path-based and `dest` must not be writable by
-    /// untrusted users.
+    /// directories this call opened. Elsewhere the checks are path-based.
+    ///
+    /// On every platform `dest` must be a private directory: mode 0700, owned by the caller and not under a shared
+    /// or world-writable directory. The walk defends only against a change made by someone who cannot already
+    /// write `dest`. It still follows symlinks in `dest`'s ancestors, opens `dest` itself without refusing a
+    /// symlink, enters a subdirectory another user pre-created, and creates directories 0777 and files 0666 (less
+    /// the umask) before the entry's mode is applied, which is skipped for mode 0. No controller path calls this;
+    /// a new caller creates `dest` itself.
     pub fn materialize(
         &self,
         conn: &Connection,

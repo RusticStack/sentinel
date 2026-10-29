@@ -1,28 +1,31 @@
 import { useState } from "react";
 import type { Member, NamespaceSettings } from "../../lib/types";
-import { api } from "../../lib/api.ts";
+import { api, ApiError } from "../../lib/api.ts";
 import { act } from "../../lib/act.tsx";
+import { listComplete, memberTarget } from "../../lib/members.ts";
 import { refreshTenants, useSession } from "../../lib/session.ts";
 import { useOverride } from "../../lib/override.ts";
-import { useLoaded } from "../../lib/hooks.ts";
+import { attempt, useLoad, type Load } from "../../lib/loaded.ts";
 import { shortId } from "../../lib/format.ts";
 import { Alert, Badge, Button, ButtonLink, Field, Input, Select, Table, TextLink } from "../ui.tsx";
+import { LoadFailed } from "../LoadFailed.tsx";
 import { confirmChange } from "./Confirm.tsx";
 
 export interface MembersPage { members: Member[]; next: string | null }
 const ROLES = [{ label: "Reader", value: "reader" }, { label: "Operator", value: "operator" }, { label: "Admin", value: "admin" }];
 const readMembers = (slug: string) => api<MembersPage>(`/api/v1/tenants/${encodeURIComponent(slug)}/members?limit=100`);
-export const loadMembers = (slug: string) => readMembers(slug).catch(() => null);
+export const loadMembers = (slug: string) => attempt(() => readMembers(slug));
 const nameOf = (m: Member) => m.username || m.display_name;
 
-export function Members({ slug, settings, initial }: { slug: string; settings: NamespaceSettings | null; initial: MembersPage | null }) {
+export function Members({ slug, settings, initial }: { slug: string; settings: NamespaceSettings | null; initial: Load<MembersPage> }) {
   const { me } = useSession();
   const { ready, withReason } = useOverride(slug);
-  const [data, setData] = useLoaded(initial);
+  const { data, setData, failure } = useLoad(initial);
   const refresh = () => readMembers(slug).then(setData, () => {});
   const githubManaged = settings?.membership === "github";
   const personal = settings?.kind === "personal";
   const [who, setWho] = useState("");
+  const [whoError, setWhoError] = useState("");
   const [role, setRole] = useState("reader");
   const base = `/api/v1/tenants/${encodeURIComponent(slug)}/members`;
 
@@ -35,7 +38,18 @@ export function Members({ slug, settings, initial }: { slug: string; settings: N
   async function add(e: React.FormEvent) {
     e.preventDefault();
     if (!ready()) return;
-    if (await act(me, `Add ${who}`, () => api(`${base}/${encodeURIComponent(who)}`, { method: "PUT", body: withReason({ role }) }))) {
+    const target = memberTarget(who, data?.members ?? [], listComplete(data));
+    if ("problem" in target) { setWhoError(target.problem); return; }
+    setWhoError("");
+    const name = who.trim();
+    const call = () => api(`${base}/${encodeURIComponent(target.path)}`, { method: "PUT", body: withReason({ role }) });
+    // A name beyond the first page that is no member's is the controller's `not_found`; say what it means here.
+    const added = await act(me, `Add ${name}`, target.unlisted ? () => call().catch((x) => {
+      throw x instanceof ApiError && x.code === "not_found"
+        ? new ApiError(400, { code: "invalid_request", message: "no member has that name; add someone who is not a member yet by user id (usr_…)" })
+        : x;
+    }) : call);
+    if (added) {
       setWho("");
       await refresh();
     }
@@ -56,7 +70,7 @@ export function Members({ slug, settings, initial }: { slug: string; settings: N
     <>
       <section aria-labelledby="members-h" className="space-y-3">
         <h2 id="members-h" className="text-base font-semibold text-strong">Members</h2>
-        <Table caption="Members">
+        {failure ? <LoadFailed what="the members" words={failure} /> : <Table caption="Members">
           <thead><tr><th>Member</th><th>Kind</th><th>Role</th><th>Actions</th></tr></thead>
           <tbody>
             {members.length ? members.map((m) => (
@@ -81,7 +95,7 @@ export function Members({ slug, settings, initial }: { slug: string; settings: N
               </tr>
             )) : <tr><td colSpan={4} className="text-center text-muted">No data</td></tr>}
           </tbody>
-        </Table>
+        </Table>}
         {data?.next ? <p className="text-sm text-muted">Only the first 100 members are shown.</p> : null}
       </section>
 
@@ -99,8 +113,10 @@ export function Members({ slug, settings, initial }: { slug: string; settings: N
             ? <p className="text-sm text-muted">To add someone who has no account yet, <TextLink to={`/t/${slug}/admin/invitations`}>invite them by email</TextLink>.</p>
             : null}
           <form className="flex flex-wrap items-end gap-3" aria-label="Add a member" onSubmit={add}>
-            <Field label="Username or user id" htmlFor="m-user">
-              <Input id="m-user" name="who" value={who} onChange={(e) => setWho(e.target.value)} required autoComplete="off" className="w-56 max-w-full" />
+            <Field label="User id (usr_…)" htmlFor="m-user" error={whoError}
+              help="A member's username also works, to change their role.">
+              <Input id="m-user" name="who" value={who} onChange={(e) => { setWho(e.target.value); setWhoError(""); }} required autoComplete="off" spellCheck={false}
+                aria-invalid={whoError ? true : undefined} className="w-72 max-w-full" />
             </Field>
             <Select id="m-role" label="Role" ariaLabel="Role" value={role} onChange={setRole} items={ROLES} className="w-36" />
             <Button type="submit" icon="user-plus" label="Add or change" />

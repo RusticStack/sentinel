@@ -73,6 +73,19 @@ Refs are limited to `refs/heads/` and `refs/tags/`; a trailing `*` in an
 allowed ref is a prefix match (`refs/tags/v*`). The bound ref on a run must be
 allowed for the binding.
 
+`allowed_refs` gates ref names and the pinned remote, not commits. A manual
+dispatch on a bound repository names a revision and an optional ref; the ref,
+when given, must be allowed, but nothing relates the revision to that ref's
+tip, and the ref may be left out. The worker fetches the revision with the
+binding's credential, so holding `RUN` on a bound repository is effectively
+read access to any commit that credential can fetch by hash, whether or not a
+ref is named (a caller who holds `RUN` could already submit a pipeline that
+reads the checkout). Manual runs never receive secrets
+([secrets](secrets.md#who-may-cause-a-delivery)). An ancestry check against
+the ref tip would be bypassed by omitting the ref and would refuse reruns of
+older commits, so none is made; enforcing it would be a separate,
+compatibility-reviewed change that also requires a ref on bound dispatch.
+
 ## Credentials are sealed, delivered per attempt, and never persisted
 
 The credential reference is **not** a run-spec field. It is sealed with the

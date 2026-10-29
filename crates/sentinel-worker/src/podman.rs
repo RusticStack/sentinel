@@ -857,10 +857,26 @@ impl Container {
         }
     }
 
+    /// Stops and removes the container. A container someone else already removed (a cancel, a lease loss or the
+    /// storage guard's stop removes it by name before the attempt's own teardown) is a clean outcome, not a leak:
+    /// a failure is reported only while the runtime still knows the container.
     pub fn destroy(self) -> Result<()> {
         let stopped = self.stop(Duration::from_secs(2));
         let removed = self.remove();
-        removed.and(stopped)
+        let failed = removed.and(stopped);
+        if failed.is_err() && self.is_gone() {
+            return Ok(());
+        }
+        failed
+    }
+
+    /// Whether the runtime reports that no such container exists (`podman container exists` exits 1). Any other
+    /// answer, including an error asking, counts as not gone, so a real failure is never hidden.
+    fn is_gone(&self) -> bool {
+        let mut cmd = podman_in(&self.store);
+        cmd.args(["container", "exists", "--", &self.name]);
+        process::run(cmd, deadline(STOP_TIMEOUT), "podman container exists")
+            .is_ok_and(|output| output.code == Some(1))
     }
 
     pub fn attempt(&self) -> AttemptId {

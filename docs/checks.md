@@ -67,6 +67,12 @@ configured base and a fixed route table. The base is the `public_url` of
 `github-app.json` when set, otherwise the server's `public_url`
 ([configuration](configuration.md)); it is the origin the web interface answers
 on. A deployment with neither publishes checks without a link, never a guess.
+The web interface is served at the root of its origin, so a base that is not an
+`http(s)` origin with no path is no base: `github-app.json` refuses a
+`public_url` with a path at startup, and a server `public_url` that carries a
+path prefix (valid for the API and the OAuth issuer) publishes checks without a
+link unless `github-app.json` names the web interface's origin. A prefixed link
+would 404, and a completed check is never updated again.
 
 | Check kind | `details_url` |
 |---|---|
@@ -138,9 +144,13 @@ Retries, refusals and rate limits are explicit:
 - **exhausted final status**: a completed check refused with `attempts` is put
   back in the queue with a fresh budget at lane start and then once per
   `Config::rearm_interval` (one hour by default). Each pass is bounded to 1000
-  rows settled within the last seven days and schedules its next monotonic
-  deadline even if the store write fails, so publisher recovery needs no
-  restart and a re-arm failure cannot hot-loop;
+  rows created within the last seven days (`REARM_WINDOW_MS`, measured from the
+  row's immutable `created_ms`: a row that exhausts again is refused again and
+  would restart a window measured from the refusal, so a check that never
+  publishes would be re-armed for ever; a new generation of a row older than
+  the window is not re-armed either) and schedules its next monotonic deadline
+  even if the store write fails, so publisher recovery needs no restart and a
+  re-arm failure cannot hot-loop;
 - **rate limit** (403/429 with `Retry-After`, or `X-RateLimit-Remaining: 0`
   with a reset): GitHub limits per installation, so only that installation is
   parked. Its rows are deferred until the reset (at most one hour) **without
@@ -150,13 +160,26 @@ Retries, refusals and rate limits are explicit:
   installation id, so it is never held back by another installation's limit
   (a scope of 0 would throttle unrelated installations);
 - **poison rows**: `checks::due` isolates an undecodable row by its raw durable
-  ID, and the lane defers it for an hour without trusting its other columns;
-  healthy rows in the batch still publish. A row whose outcome cannot be written
-  (the store rejects the update three passes in a row) is also parked for an
-  hour instead of retried at the head of the queue, so one bad row never blocks
-  other checks or tenants. Transient store faults back off the lane without
-  counting toward a row's quarantine. A generation that moved under the
-  publisher is simply re-read;
+  key, exactly as stored (a key kept as text instead of a 16-byte blob
+  included), and the lane defers it for an hour without trusting its other
+  columns; healthy rows in the batch still publish. A row whose outcome cannot
+  be written (the store rejects the update three passes in a row) is also parked
+  for an hour instead of retried at the head of the queue, so one bad row never
+  blocks other checks or tenants. If even the parking write is rejected, the
+  lane leaves that row out of its batches in memory for a minute (at most 64
+  rows, each read asking for that many extra rows) and goes on with the rest;
+  the first two failed passes still stop the batch, because a store that is
+  failing for every row must not have the lane publish rows it cannot record.
+  The row keeps its strikes while it is left out, so when the minute lapses it
+  goes straight back to the parking write and a row that stays unwritable costs
+  no further stopped batches; it is retried once a minute for as long as it
+  stays unwritable.
+  Transient store faults back off the lane without counting toward a row's
+  quarantine. A generation that moved under the publisher is simply re-read;
+- **what is logged**: a quarantined row (`checks_quarantined`), undecodable rows
+  parked (`checks_corrupt_parked`) and the store failing (`checks_store_unavailable`,
+  once when it starts, `checks_store_recovered` when it ends) are warnings with
+  counts only, never a row's content;
 - **permanent** (403 without rate-limit evidence, update/create 404, 422): the row records the
   bounded reason (never empty; a blank GitHub message is recorded as
   `invalid request`) and is not retried. A later state change starts a fresh
@@ -251,7 +274,12 @@ handle is cleared (above), so the rerequest surfaces as **new** check runs —
 and a second rerequest sent against the old, superseded check-run handle no
 longer resolves to the active generation: it is `unknown_check`, never a
 double rerun. Candidates are capped at 64; more is `rerequest_limit`, never
-an unbounded fan-out.
+an unbounded fan-out. A candidate the binding no longer allows (revoked,
+repointed, or its ref no longer allowed) is skipped on its own and the others
+of the same head are still decided; when nothing reran and one was skipped for
+that reason the receipt is `source_not_allowed`, recorded like any other
+outcome and replayed identically. Damage (an unreadable run, a job set that does
+not match its run) and a stale snapshot still fail the event.
 
 **Lifecycle events** disable first and verify after. A deletion or suspension
 event disables issuance immediately; an access removal, rename, transfer,
@@ -285,7 +313,18 @@ schedule.
   binding blob) is parked under the retry back-off like any failed pass, and
   after twelve failures the row waits an hour between attempts; a pass that
   could not record its outcome at all backs the lane off instead of picking the
-  same row again at once.
+  same row again at once. The same holds for a row whose stored content cannot
+  be read as the type its column promises (a malformed identifier, a text value
+  in an integer column): it is settled with a retry, while a fault of the
+  database itself (I/O, a full or read-only disk) backs the lane off.
+- **Idle lanes do not poll.** With nothing due, the reconcile and membership
+  lanes sleep on the store's commit notifier until the earliest queued row
+  (`github_events::next_due_ms`, `github_members::next_due_ms`, one read of the
+  head of the `next_ms` index) falls due; a commit wakes them at most once per
+  250 ms, and `Config::idle` (2 s by default) is only the longest sleep without
+  a read. When a commit has already landed since the last read, the earliest-row
+  read is skipped, so a store that commits constantly costs a lane one read per
+  250 ms, as the fixed poll did. The delivery lane waits the same way.
 
 A rerequest resets each job with a compare-and-set on the full terminal state,
 fence and cancellation snapshot it just read; the run cancellation flag is
@@ -344,7 +383,9 @@ holds at most 1024 repository tokens, evicting the earliest expiry at capacity.
   budget reported as refused, an exhausted final check re-armed and published
   after publisher recovery on the same live lane, a throttle parking rows without spending
   attempts, one throttled scope not stopping the others, and a row whose store
-  writes keep failing quarantined without blocking the lane, a publication
+  writes keep failing quarantined without blocking the lane (also when even the
+  parking write is rejected), a row whose key is text parked by that key, the
+  lane reporting quarantine, parked rows and store failure, a publication
   committed to an idle lane (safety re-read two minutes away) delivered by the
   commit notifier, a backed-off row read at its deadline with no commit to wake
   the lane, and an idle lane dropped promptly.

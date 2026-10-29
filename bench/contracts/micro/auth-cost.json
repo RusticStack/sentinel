@@ -1,0 +1,26 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "auth-cost",
+  "revision": 1,
+  "harness": {
+    "example": "auth-cost-bench",
+    "build": "cargo build --release --locked -p sentinel-store --example auth-cost-bench"
+  },
+  "run": {
+    "args": ["--rounds", "5", "--iterations", "2000", "--argon-iterations", "8", "--sessions", "1000", "--tokens", "1000", "--seed", "1"],
+    "smoke_args": ["--rounds", "2", "--iterations", "20", "--argon-iterations", "2", "--sessions", "16", "--tokens", "16", "--seed", "1"],
+    "dir": true
+  },
+  "ordering": {
+    "scheme": "abba",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/auth-cost/1",
+    "out": "bench/auth-cost.jsonl"
+  },
+  "notes": "Operation order reverses every round (ABBA); the credential picks come from --seed, which the record carries. Argon2 and login calls use --argon-iterations, the rest --iterations."
+}

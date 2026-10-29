@@ -9,7 +9,7 @@
 
 A sample is spawn-of-the-VMM-process -> the guest agent's `Ready` over vsock (Firecracker's and Cloud
 Hypervisor's hybrid vsock: a Unix socket, `CONNECT <port>`), for a cold boot; for a restore, the same from a
-snapshot of a booted guest. Every record carries the host block and the binaries' SHA-256.
+snapshot of a booted guest. Every record carries the build (commit and dirty state of --source), the host block and the binaries' SHA-256.
 """
 import argparse
 import hashlib
@@ -25,8 +25,36 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import benchstamp  # noqa: E402
+
+try:
+    import fcntl
+except ImportError:  # not a Linux verification host: the lock is refused below
+    fcntl = None
+
+LOCK_DEFAULT = "/var/tmp/sentinel-verify.lock"
+
 AGENT_PORT = 1024
 CPU_SET = os.environ.get("M02_CPUS", "")
+
+
+def take_lock(a):
+    """Holds the shared verification lock for the whole process; Python opens the descriptor non-inheritable, so no VMM
+    or helper it starts keeps the lock after this process exits. Returns the record's `lock` member."""
+    path = os.environ.get("SENTINEL_VERIFY_LOCK", LOCK_DEFAULT)
+    if a.no_lock:
+        return {"path": path, "held": False}
+    if fcntl is None:
+        raise SystemExit("m02_boot: the shared verification lock needs Linux (flock); --no-lock is for a dry run only")
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    except OSError as e:
+        raise SystemExit(f"m02_boot: the shared verification lock {path} cannot be opened ({e.strerror or type(e).__name__}); --no-lock is for a dry run only") from None
+    started = time.monotonic_ns()
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    a.lock_fd = fd
+    return {"path": path, "held": True, "waited_ns": time.monotonic_ns() - started}
 
 
 def sha(path):
@@ -44,7 +72,7 @@ def host():
         except OSError:
             return None
     model = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), None)
-    return {"hostname": os.environ.get("SENTINEL_BENCH_HOST_LABEL") or None,
+    return {"hostname": benchstamp.host_label(),
             "kernel": platform.release(), "cpu_model": model,
             "cpus_online": os.cpu_count(), "governor": first("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
             "loadavg": first("/proc/loadavg"), "cpu_pressure": first("/proc/pressure/cpu")}
@@ -229,7 +257,9 @@ def snapshot_fc(a, work):
 def run(a):
     out = open(a.out, "a") if a.out else sys.stdout
     common = {"schema": "sentinel-bench/m02/1", "vmm": a.vmm, "mode": a.mode, "sandbox": a.sandbox,
-              "vcpus": a.vcpus, "mem_mib": a.mem, "host": host(),
+              "vcpus": a.vcpus, "mem_mib": a.mem, "build": a.build, "host": host(),
+              "lock": a.lock,
+              "ordering": {"scheme": "sequential", "note": "samples boot one VM at a time in index order; a cold and a restore series are separate runs"},
               "binaries": {"vmm": sha(a.bin), "kernel": sha(a.kernel), "initrd": sha(a.initrd), "rootfs": sha(a.rootfs)}}
     with tempfile.TemporaryDirectory(dir=a.workdir) as work:
         a.scratch_template = os.path.join(work, "scratch-template.ext4")
@@ -321,7 +351,7 @@ def memory(a):
             stop(p)
         rec = {"schema": "sentinel-bench/m02/1", "kind": "idle_memory", "vmm": a.vmm, "sandbox": a.sandbox,
                "vcpus": a.vcpus, "mem_mib": a.mem, "count": a.count, "pss_bytes": per,
-               "pss_median": statistics.median(per), "host": host()}
+               "pss_median": statistics.median(per), "build": a.build, "host": host(), "lock": a.lock}
         print(json.dumps(rec), file=out, flush=True)
         print(f"{a.vmm} idle x{a.count}: PSS median {statistics.median(per)/2**20:.1f} MiB per VM", file=sys.stderr)
 
@@ -350,7 +380,18 @@ def main():
         p.add_argument("--count", type=int, default=10)
         p.add_argument("--workdir", default=None)
         p.add_argument("--out")
+        p.add_argument("--no-lock", action="store_true", help="skip the shared verification lock (a dry run; the record says held=false)")
+        p.add_argument("--source", default=os.environ.get("SENTINEL_SRC"),
+                       help="the checkout the VMM, kernel, initrd and guest agent under test were built from "
+                            "(or SENTINEL_SRC); its commit and dirty state go into every record")
     a = ap.parse_args()
+    if a.cmd in ("run", "memory"):
+        # Before the first VM boots: a record that names no build or no anonymized host is not written.
+        if not a.source:
+            ap.error("--source (or SENTINEL_SRC) is required: a record must name the build it measured")
+        benchstamp.host_label()
+        a.build = benchstamp.build(a.source)
+        a.lock = take_lock(a)
     if a.cmd == "image":
         image(a.name, a.out)
     elif a.cmd == "initrd":

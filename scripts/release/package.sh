@@ -82,7 +82,7 @@ version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' 
 # Entries a package must contain, as paths relative to the archive's top directory.
 expected() {
   case "$1" in
-    server) echo "bin/sentinel BUILD-INFO LICENSE THIRD-PARTY-LICENSES.md examples/server.toml examples/sentinel-server.service examples/sentinel-web.service examples/server-container.toml examples/Containerfile.server examples/compose.server.yaml examples/sentinel.nginx.conf examples/Caddyfile examples/sentinel-server.container examples/sentinel-data.volume" ;;
+    server) echo "bin/sentinel BUILD-INFO LICENSE THIRD-PARTY-LICENSES.md examples/server.toml examples/sentinel-server.service examples/sentinel-web.service examples/server-container.toml examples/Containerfile.server examples/Containerfile.web examples/compose.server.yaml examples/sentinel.nginx.conf examples/Caddyfile examples/sentinel-server.container examples/sentinel-web.container examples/sentinel.network examples/sentinel-data.volume" ;;
     worker)
       echo "bin/sentinel BUILD-INFO LICENSE THIRD-PARTY-LICENSES.md examples/worker.toml examples/sentinel-worker.service examples/Containerfile.worker examples/compose.worker.yaml"
       if [ $with_microvm = 1 ]; then echo "microvm/firecracker microvm/vmlinux microvm/vmlinux.config microvm/vmlinux.build microvm/sentinel-agent microvm/install.sh microvm/build-kernel.sh microvm/SOURCES.md microvm/SHA256SUMS microvm/licenses/firecracker-LICENSE microvm/licenses/firecracker-NOTICE microvm/licenses/firecracker-THIRD-PARTY"; fi
@@ -340,7 +340,7 @@ if [ $skip_agent = 0 ]; then
 fi
 cargo build --locked --release -p sentinel --features server
 package server "$target_dir/release/sentinel" examples/server.toml examples/sentinel-server.service examples/sentinel-web.service \
-  examples/server-container.toml examples/Containerfile.server examples/compose.server.yaml examples/sentinel.nginx.conf examples/Caddyfile examples/sentinel-server.container examples/sentinel-data.volume
+  examples/server-container.toml examples/Containerfile.server examples/Containerfile.web examples/compose.server.yaml examples/sentinel.nginx.conf examples/Caddyfile examples/sentinel-server.container examples/sentinel-web.container examples/sentinel.network examples/sentinel-data.volume
 cargo build --locked --release -p sentinel --features worker
 package worker "$target_dir/release/sentinel" examples/worker.toml examples/sentinel-worker.service \
   examples/Containerfile.worker examples/compose.worker.yaml

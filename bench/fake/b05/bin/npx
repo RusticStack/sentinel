@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+. "$(dirname "$0")/../lib.sh"
+fake_start npx "$@"
+[ -d node_modules/.bin ] || { echo "npx: tsc not found; node_modules is missing" >&2; exit 1; }
+populate dist 2

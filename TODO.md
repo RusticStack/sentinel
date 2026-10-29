@@ -12,15 +12,14 @@
 
 ## Next wave
 
-**Wave 0 — code-only completion.** Start a session with "Let's now fully implement Wave 0".
+**Wave 1 — verification gate.** Start a session with "Let's now fully implement Wave 1".
 
 | Wave | Needs | State |
 |---|---|---|
-| [0 Code-only completion](#wave-0--code-only-completion) | nothing external | **next** |
-| [1 Verification gate](#wave-1--verification-gate) | Wave 0; `reference-host` with the Podman account; `arm64-host` | waiting |
+| [1 Verification gate](#wave-1--verification-gate) | `reference-host` with the Podman account; `arm64-host` | **next** |
 | [2 Measurements](#wave-2--measurements-on-reference-host) | Wave 1; a quiet `reference-host` window | waiting |
 | [3 KVM host](#wave-3--kvm-host) | Wave 1; a `kvm-host` window with nftables privileges | waiting |
-| [4 Real fleet](#wave-4--real-fleet) | Waves 0, 1, 3; all three hosts; X4, X6 | waiting |
+| [4 Real fleet](#wave-4--real-fleet) | Waves 1, 3; all three hosts; X4, X6 | waiting |
 | [5 Pilots and Blacksmith](#wave-5--pilots-and-blacksmith) | Waves 2, 3, 4; X1 for B11 | waiting |
 | [6 Closure and release](#wave-6--closure-and-release) | all earlier waves | waiting |
 
@@ -52,93 +51,6 @@ What a session cannot supply. Ask early.
 | X7 | Real MCP clients (X07), hosted S3 buckets (R03a), a GitLab TLS and a Forgejo SSH fixture (G08a), a desktop browser (O07, CLI login launch), a Resend key and domain, a registered GitHub OAuth app for real github.com sign-in, separate real networks for Tailcat NAT traversal | those checks only | list each as an unverified limit in V06 |
 | X8 | N00's order (Windows guests before the native executor); whether pre-rule evidence ("Parts 09–11 re-audit", WSL2 runs dated 2026-09-27) is re-run before Wave 1 | nothing in v0.1 | leave as recorded |
 
-## Wave 0 — code-only completion
-
-**Goal:**
-- Fix every finding that needs no host window, external access or decision.
-- Build every harness a later wave runs, so Waves 1–3 only run things.
-
-Targeted tests run on `reference-host`. Each review item ends with fixes plus failure-path tests, or with the finding moved to its wave with file and line.
-
-- [ ] **0.1 RW06 review.**
-  - Review against the code, in `sentinel-checks`, `sentinel-mail`, `sentinel-s3` and the store's retention and backup: decode-fault isolation, quarantine counting, re-arm timing, replicate ordering and the rerequest CAS fences.
-  - Check that the checks' `details_url` points at pages `sentinel-web` serves.
-  - R01 was closed on trust: check it against the code.
-  - Check which of R07's failure drills ([resilience](docs/resilience.md)) exist as tests.
-- [ ] **0.2 RW08 review.**
-  - The cache generation cap against small budgets.
-  - Duplicate constants.
-  - `unwrap`/`expect` in the touched code ([development](docs/development.md#panicking-calls-in-production-code)).
-- [ ] **0.3 RW10 review.**
-  - Inventory every figure in `docs/` that has no committed record. For each, schedule it in Wave 2, label it "no record" or remove it.
-  - Every bench record is stamped with build and host, and has `--source` and a shuffle seed.
-  - Scripts take the lock with `flock -o`.
-  - List the missing benches, and check B04's closure.
-- [ ] **0.4 RW05 review.**
-  - Check `manual_destinations` against RW05's manual-remote destination policy.
-  - Review credential discipline and process groups in `sentinel-git`, the `git_can_pin` cache, the GitHub membership walk and run provenance.
-- [ ] **0.5 RW04 review.**
-  - Does image tag resolution (K05) exist outside `pinned_images` (`crates/sentinel-store/src/runs.rs`)?
-  - Re-read against the code:
-    - Workspace and secret cleanup on every exit path.
-    - `identity()` recovery and the keepalive bound.
-    - `private_dir_all` and symlinks.
-    - Pull and cancel races.
-  - Does the storage guard count the job's `/tmp`, now a directory on the workspace disk under rootless Podman (Q12's remainder)?
-- [ ] **0.6 RW07 remainder.**
-  - Decide, then implement or document each of these:
-    - Service grants with no session provenance still use the timestamp-window fallback ([step-up](docs/step-up.md#service-credentials-minted-by-a-session)).
-    - The `usr_` id response difference is not equalized.
-    - Self-service slugs can be squatted for GitHub organizations that never installed the App ([admission](docs/admission.md)).
-    - Auto-join domains have no editing UI.
-  - Add the device page's oversized form to `every_route_class_enforces_its_own_body_limit`. It needs a signed-in session, and today answers `400` HTML, not `413`.
-  - Prove no host-local command lets a platform administrator add itself to a tenant.
-  - Check the route table row by row against [API](docs/api.md).
-  - Add the missing [compatibility](docs/compatibility.md) entries for later routes, authorization changes and migration 54. This is R05's code side.
-- [ ] **0.7 RW12 remainder.**
-  - Recheck in `web/src` these defects found in the removed Nuxt code:
-    - The setup wizard's resume across several refreshes (`web/test/setup.mjs` checks one).
-    - `forgot-password` suggesting `admin recover --username` for email-registered accounts.
-    - The invitations section when settings fail to load.
-    - The service-accounts toast on a GET.
-    - "Your session ended" from an in-flight 401 after a password change.
-    - Members added by typed username.
-  - Give the step-up dialog decision and the shown-once download revoke their own browser checks.
-  - Fix the flaky `an open run page through a busy controller` scenario (`web/test/ui.mjs`, fails about half the runs) at its cause.
-  - Settle the optional API fields.
-- [ ] **0.8 RW09 and RW03 remainder.**
-  - Review the keystore backends and the help text.
-  - Read the Tailcat diagnostics for credential leaks.
-  - Check whether a newer pinned Tailcat helper supports `--allow` reload. Today an allow-list change costs a connected worker 3.3–4.6 s.
-- [ ] **0.9 RW02: `LineSeek.exact`.**
-  - `seek_line` (`crates/sentinel-store/src/logs.rs`) misses late fills stored before its starting checkpoint. Report `exact` false when the log holds late fills, or record fills in the index, before D04 exposes `?line=`.
-  - `Objects::materialize` stays documented as unsafe for shared space.
-- [ ] **0.10 U18 and Q11's remainder: the worker enrollment page.**
-  - A platform-administrator page in `web/` over `POST /api/v1/admin/worker-enrollments` with:
-    - Pool, host ceilings, priority and step-up.
-    - The once-shown secret and Tailcat address.
-    - A copyable and downloadable bootstrap with its digest.
-    - Uninstall and rollback instructions.
-    - The `409`/`404`/`429` states shown plainly.
-  - No secret may reach `sentinel-web`'s logs or a URL.
-  - Add the automatic node-key hand-over for controllers without `api_url` ([worker bootstrap](docs/worker-bootstrap.md#not-built-yet)).
-  - The operator-supplied Tailcat helper is the default until X4 is decided.
-  - Gate: browser checks against a seeded controller, API tests for the step-up and single-use refusals, and a secret-leak canary like U17's.
-- [ ] **0.11 V02's remainder.** Add a `sentinel-web` service to the container and compose examples, and have `crates/sentinel/tests/examples.rs` parse it.
-- [ ] **0.12 U17's remainder.**
-  - A fake GitHub web origin answering `settings/apps/new` and `apps/<slug>/installations/new`, pointed at by the seed's `GithubAppSetup.web_url` and `SENTINEL_GITHUB_WEB_URL`.
-  - The browser flow through it.
-  - The activation-time log line in the secret canary.
-- [ ] **0.13 Harnesses for Waves 2–4.**
-  - Write the missing harness for the API-credential, Argon2id and session-validation timings (`docs/local-authentication.md`, A02/A03).
-  - Give every Wave 2 bench a contract, seed and lock path, plus a smoke run.
-  - Run the B05 matrix and B09 scripts end to end against a fake.
-
-**Gate:**
-- Locally: `cargo fmt-check` and `cargo lint`.
-- On `reference-host`: `cargo lint-linux`, the affected test binaries, `pnpm -C web typecheck` and `test:unit`, and the browser test for 0.7, 0.10 and 0.12.
-- `scripts/check-doc-links.sh`.
-
 ## Wave 1 — verification gate
 
 **Goal:** one clean run of the full suites on the Wave 0 tree, which closes the tasks reopened only for current-tree verification.
@@ -166,6 +78,12 @@ Targeted tests run on `reference-host`. Each review item ends with fixes plus fa
    - Account security and GitHub linking.
    - On a running controller: setup-token file mode 0600 and token voiding on restart.
    - RW05's `members:read` check, if X3 is available.
+6. Carried from Wave 0, tests that could not run there:
+   - Worker, rootless Podman: `tests/podman.rs`, `end_to_end`, `a_panicking_attempt_is_torn_down_and_reported`, recovery and the image integration tests against real Podman, the container reaper (`podman container exists` answering 1 for a removed container), and the sealed-directory permission-denial paths as a non-root user (the Wave 0 host account is root). Also reproduce RW04's workspace trees that other in-namespace UIDs made unreadable or undeletable: the storage guard neither counts nor removes them (`crates/sentinel-worker/src/workspace.rs`). The slice test, the only caller of `permit_any_manual_source_for_tests`, was only compile-checked.
+   - `power_cut_on_dm_flakey` (`SENTINEL_POWER_LOSS_TESTS=1`, root and dm-flakey): the log index sidecar must be durable before a seal (0.9's `LineSeek.exact`).
+   - V02: build the container and web images (`--format docker`), `podman compose --profile web up`, `podman healthcheck run`, SIGTERM, and the Quadlet generator dry run. The web image ships JavaScript dependencies with no licence inventory: decide before release.
+   - Bench: the full Python suite, `bench/smoke.sh` with `SMOKE_COMPILE=1` against release binaries, and `web/bench/web-bench.mjs` once against a live `sentinel-web` (its record spread is only syntax-checked).
+   - Refresh the generic Git timings in `docs/generic-git-verification.md` on the G08 fixtures: they have no record.
 
 **Closes, each only if its own contract holds:**
 - [ ] **C08** transitions and parser limits: malformed input, duplicates, rollback, conflicting update, crash-reopen ([compatibility](docs/compatibility.md))
@@ -177,14 +95,14 @@ Targeted tests run on `reference-host`. Each review item ends with fixes plus fa
 - [ ] **G04** Checks outbox ([checks](docs/checks.md))
 - [ ] **G08** generic Git intake on the fixtures ([generic Git verification](docs/generic-git-verification.md)); Forgejo over SSH and GitLab over HTTPS are G08a (X7)
 - [ ] **D01**, **D02** objects, uploads and reads ([storage](docs/storage.md))
-- [ ] **D04** segmented logs, indexes, replay and spool acknowledgement ([logs](docs/logs.md)); needs 0.9
+- [ ] **D04** segmented logs, indexes, replay and spool acknowledgement ([logs](docs/logs.md)); includes `power_cut_on_dm_flakey` (run 6)
 - [ ] **Q05** control and bulk priority, reconnect jitter, replay, restart reconciliation
 - [ ] **Q08** remote cache hydration
 - [ ] **Q10** the fleet placement stall: `fleet.rs` stress-run clean
 - [ ] **O02**, **O06** tokens, rotation, service grants, `doctor` ([OAuth](docs/oauth.md))
 - [ ] **O07** login, refresh races and logout on the Linux CLI; Windows leg is X2, real browser launch X7
 - [ ] **S05**, **S06**, **S07** secret binding, redaction and cleanup, the end-to-end provisioning test ([auth and secrets](docs/auth-and-secrets.md))
-- [ ] **R05** upgrades and skew ([upgrades](docs/upgrades.md)); needs 0.6's compatibility entries
+- [ ] **R05** upgrades and skew ([upgrades](docs/upgrades.md)); the compatibility entries and the rollback matrix are in and checked against the code by `tests/compat_doc.rs`
 - [ ] **R07** failure drills ([resilience](docs/resilience.md))
 - [ ] **U01–U07** Part 12, carried by Part 20's React port and its browser test; a real screen reader (U06) is a recorded limit
 
@@ -222,6 +140,15 @@ Targeted tests run on `reference-host`. Each review item ends with fixes plus fa
    - API-credential, Argon2id and session-validation timings (0.13's harness).
    - The `docs/cache.md` hydration and offer-hashing figures against `bench/b04-transfer-copies.jsonl`.
    - Spread for `bench/u01-log-view.jsonl`, which holds medians only.
+5. **Carried from Wave 0** (figures the docs now label "no record", and harnesses built but not run):
+   - `ranking_cost`, `fleet_sessions` and `fleet_load` on both trees (3c8b8e5 and the Wave 2 tree), shuffled and stamped, then set the `ranking_cost` bounds as a multiple of the recorded baseline ([worker link](docs/worker-link.md)).
+   - Whether a newer pinned Tailcat helper than v0.6.0 reloads `--allow` without a restart. It cannot be answered offline: it needs the upstream release notes or a test against that build (X4).
+   - A 20k-file cache publish with per-file syncs against one `syncfs` (`docs/cache.md`), and the K07 recipe cases with spread (`docs/benchmarking.md`): the quoted figures are single development runs.
+   - The 0.13 harnesses with a quiet-host record: auth-cost (A02/A03), store-cost, spawn-cost, `q09-fleet-load`, queue-explain, backup-drill (R04), remote-cost, the log-ack and checks-lane contracts, and `tailcat_live` (pinned Tailcat build and rootful Podman). M06's cold and restore series run back to back; interleaving them changes the test body and needs an owner decision. Optional `bench/b05_report.py` once a B05 record schema is committed.
+   - Store maintenance: backup and prune materialize every object row and rebuild path sets for every kept snapshot each interval (`crates/sentinel-store/src/backup.rs`); the backup holds the maintenance lock through the rehash of the shared store, stalling reclaim, log expiry and pressure eviction. Measure both at scale, then cut them.
+   - The checks outbox: a completed create's handle can attach to a newer generation of the row (`crates/sentinel-store/src/checks.rs`); settle it with a check against GitHub.
+   - S3 deletes go one request each; batching them (`DeleteObjects`) needs its own measurement (`crates/sentinel-store/src/replicate.rs`).
+   - Bench record hygiene: `web-bench.mjs`, `measure-profile.sh` and the m01/k07-microvm recorders keep their own record shapes (listed in `LEGACY_UNSTAMPED`); move them to the common build and host stamp when they are re-run. `p14-pilot.sh`, `b02-sentinel.sh`, `b03-latency.py`, c02, k07, k09 and r06 take no shared lock, and `b01a-github.py` still defaults to `/srv/sentinel/runs/p14.lock`: retire that lock on the hosts and move them onto `/var/tmp/sentinel-verify.lock` with `flock -o` (owner decision). `f07-storage.sh` still hardcodes `/srv/f07` and `/mnt/f07-*`, and `k02-cache-clone.sh`/`f07-storage.sh` drop the host-wide page cache as root: settle on a dedicated idle host or a lock-and-idle check.
 
 **Closes:**
 - [ ] **F06** CI baseline on the real CI topology: the Docker/integration lane internals and a concurrent probe during live CI. Without access, it stays `Blocked by` that access ([CI baseline](docs/ci-baseline.md)).
@@ -256,6 +183,11 @@ Targeted tests run on `reference-host`. Each review item ends with fixes plus fa
 - [ ] **B01a** complete and assess the revision-4 baseline and Sentinel samples (`bench/b01a-github.py`, `bench/p14-pilot.sh`), recording per lane whether it reaches 300 s ([benchmark contracts](docs/benchmark-contracts.md)).
 - [ ] **M08** the pilots' Linux lanes in microVMs against rootless Podman on the same host and caps, cold/warm/small-edit, with B03 re-measured (`bench/contracts/pilots-ci-isolation.json`, `bench/m08_overhead.py`). Publish the overhead per lane; anything beyond B09's 10 % is a bug in M04–M06.
 - [ ] **RW10 item** run the feasibility probes on bare metal for a host resource budget.
+- [ ] **Carried from Wave 0:**
+  - Commit `bench/m04-lifecycle.jsonl` from `SENTINEL_MICROVM_LIFECYCLE_OUT` (stamped with host, commit and date; `observe()` writes only name and ms today), then drop the "no record is committed" wording in [executor](docs/executor.md).
+  - Run `tests/microvm.rs` with the new sync-bound and view-clearing tests under `SENTINEL_MICROVM_TESTS=1`.
+  - `PR_SET_PDEATHSIG` still has no test of its own (a killed parent kills the helper).
+  - M01–M08 measurements: `m06-start` and the M02 boot runs skip elsewhere.
 
 ## Wave 4 — real fleet
 
@@ -279,6 +211,10 @@ Targeted tests run on `reference-host`. Each review item ends with fixes plus fa
 - [ ] **Q06**, **Q07** Tailcat helper integration and path telemetry. Helper restart, changing endpoints, NAT failure, relay-only and revoked peers, on separate real networks (X6, X7).
 - [ ] **Q09** the three-worker fleet with real executors under bursts, partitions, restarts, draining, mixed capacities and noisy tenants.
 - [ ] **B09** bursts; 1/3/10 real workers; slow and full disk; direct and relay links; network loss; restarts; noisy tenants. Use `bench/b09-harness.py run --fleet`, with `kvm-host` as controller and `reference-host` and `arm64-host` as workers. Set the noise-aware regression gate: initially 10 % p95 overhead.
+- [ ] **Carried from Wave 0:**
+  - The B09 and Q13 harnesses were run end to end only against a fake; that rehearsal is not evidence.
+  - A real Tailcat address must be absent from a live controller log (the enrollment page's canary covers the direct case; X4, X6).
+  - The enrollment page's "pool no longer active" `404` and its Tailcat node-key form have API tests but no browser scenario: the fixture has `api_url` and no way to deactivate a pool.
 
 ## Wave 5 — pilots and Blacksmith
 
@@ -316,6 +252,14 @@ Targeted tests run on `reference-host`. Each review item ends with fixes plus fa
 - [ ] **V04** dogfood Sentinel's own checks, with a recovery path independent of Sentinel.
 - [ ] **V05** release qualification with `scripts/qualify/qualify.sh` on a disposable fresh host ([qualification](docs/qualification.md)).
 - [ ] **V06** publish the support limits (every X7 item and anything unverified), the `pilots-ci` and B11 benchmarks, and the open blockers; update the [release notes](docs/release-notes.md); tag v0.1. The sub-minute claim stays unmet until B08 qualifies, and "2× Blacksmith" is never claimed before B11 passes.
+- [ ] **Wave 0 leftovers** to close or file (RW02–RW12):
+  - Provenance: a manual run's actor is stored (migration 64) but in no API answer yet; a webhook run's provider sender is not stored (text its author chose).
+  - Installation tokens held by the checks lane are wiped on drop, but the `Bearer` header strings in `sentinel-github/src/http.rs` are not, and `ureq` keeps its own copy.
+  - The 64 MiB cache budget floor is two literals (`sentinel_cache::gc::MIN_BUDGET_BYTES` and `crates/sentinel/src/service.rs`) until `sentinel` may depend on `sentinel-cache` in every build (dependency decision).
+  - Run, job, attempt, run-spec and event rows have no retention, so backup and restore time grow with them ([retention](docs/retention.md); owner decision, default none).
+  - A backup's object and manifest row reads fail closed on an undecodable id, by decision ([compatibility](docs/compatibility.md)).
+  - Web: the GitHub-only step-up state has no browser check (a session for it needs the GitHub sign-in round trip against the double); the "reconnecting" label after a 5xx is untested; the enrollment page does not edit a worker's policy after enrollment (`PUT /admin/workers/{id}/policy`, Q12 interface).
+  - Optional guard: a test that every `bench/<file>` a doc cites exists or sits in a paragraph that says "no record".
 
 ## Log
 
@@ -324,3 +268,4 @@ One row per completed wave. Details go in the PR body.
 | Date | Wave | PR / commits | Evidence summary |
 |---|---|---|---|
 | 2026-10-29 | Part 24 reconciliation (pre-wave) | `edd1dec`, `5d0a9c9`, `70f8c80` | RW01 closed; code-fixable Part 24 findings fixed; history up to here in `git show 70f8c80:TODO.md` |
+| 2026-10-29 | 0 Code-only completion | branch `wave-0-code-only-completion` (migration 64, release 63 readable) | Reviews 0.1–0.6, 0.8, 0.9 fixed with failure-path tests; worker enrollment page, fake GitHub origin and the sentinel-web compose service built; Wave 2–4 harnesses written. Verified on `reference-host`: `cargo lint-linux`, targeted test binaries, `pnpm -C web typecheck` and `test:unit`, the real-browser test 331/331; locally `cargo fmt-check`, `cargo lint`, `scripts/check-doc-links.sh`. Findings that need a later wave moved there with their blockers. |

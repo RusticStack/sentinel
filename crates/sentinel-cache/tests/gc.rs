@@ -410,3 +410,66 @@ fn a_reader_mid_clone_keeps_its_generation_through_budget_eviction() {
     assert_eq!(stats.entries_removed, 1);
     assert!(!entry.exists());
 }
+
+#[test]
+fn a_generation_at_the_publish_cap_survives_a_sweep_at_the_same_budget() {
+    // A publish takes a quarter of the budget, and an entry keeps the current generation and one spare.
+    for budget in [gc::MIN_BUDGET_BYTES, 1 << 30, gc::DEFAULT_BUDGET_BYTES] {
+        let cap = budget / 4;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let scope = test_scope("deps");
+        let entry = entry(&root, &scope, "deps-aa");
+        make_gen(&entry, &scope, "deps-aa", "gen-100-00000001", cap);
+        make_gen(&entry, &scope, "deps-aa", "gen-200-00000002", cap);
+        set_current(&entry, "gen-200-00000002");
+        let stats = sweep_at(&root, budget, gc::DEFAULT_PASS_WORK, now_ms());
+        assert_eq!(stats.generations_removed, 0, "budget {budget}");
+        assert_eq!(stats.entries_removed, 0, "budget {budget}");
+        assert_eq!(gens(&entry).len(), 2, "budget {budget}");
+        assert_eq!(stats.estimated_bytes, 2 * cap, "budget {budget}");
+    }
+}
+
+#[test]
+fn manifest_byte_counts_that_overflow_are_summed_without_wrapping_or_panicking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cache");
+    let scope = test_scope("deps");
+    let entry = entry(&root, &scope, "deps-aa");
+    make_gen(&entry, &scope, "deps-aa", "gen-100-00000001", u64::MAX);
+    make_gen(&entry, &scope, "deps-aa", "gen-200-00000002", u64::MAX);
+    set_current(&entry, "gen-200-00000002");
+    let stats = sweep_at(&root, 1 << 20, gc::DEFAULT_PASS_WORK, now_ms());
+    assert_eq!(stats.generations_seen, 2);
+    assert_eq!(stats.payload_bytes, u64::MAX, "the sum saturates");
+    assert!(stats.bytes_freed > 0, "the budget still bites");
+    assert_eq!(stats.errors, 0);
+}
+
+#[test]
+fn an_entry_with_generations_but_no_current_ages_by_its_newest_generation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cache");
+    let scope = test_scope("deps");
+    let idle_for = gc::IDLE_TTL.as_millis() as i64;
+
+    // A crash between a first publish's rename and its pointer swap leaves exactly this.
+    let old = entry(&root, &scope, "deps-old");
+    let old_name = scope::gen_name(now_ms() - idle_for - 1_000, 1);
+    make_gen(&old, &scope, "deps-old", &old_name, 100);
+    let young = entry(&root, &scope, "deps-young");
+    let young_name = scope::gen_name(now_ms(), 2);
+    make_gen(&young, &scope, "deps-young", &young_name, 100);
+    assert!(!old.join(scope::CURRENT_NAME).exists());
+
+    let stats = sweep_at(
+        &root,
+        gc::DEFAULT_BUDGET_BYTES,
+        gc::DEFAULT_PASS_WORK,
+        now_ms(),
+    );
+    assert_eq!(stats.entries_removed, 1, "{stats:?}");
+    assert!(!old.exists(), "an idle currentless entry is reclaimed");
+    assert!(young.exists(), "a recent one is left to its writer");
+}

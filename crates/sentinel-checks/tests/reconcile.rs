@@ -15,7 +15,7 @@ use sentinel_checks::reconcile::{Config, Reconcile};
 use sentinel_core::{RepoId, TenantId, UnixMillis, UserId};
 use sentinel_protocol::source::{Binding, Credential};
 use sentinel_store::{
-    Durability, Store,
+    Durability, Store, github_events,
     sources::{self},
     sources_forge::{self, Snapshot},
 };
@@ -532,6 +532,81 @@ fn a_transient_failure_retries_without_revoking() {
     let seen = notices.lock().unwrap().clone();
     assert!(seen.contains(&"retry".to_owned()), "{seen:?}");
     assert!(!binding_revoked(&f), "a 500 is not proof of removal");
+    drop(lane);
+}
+
+#[test]
+fn a_row_whose_stored_content_cannot_be_read_is_retried_later_and_starves_nobody() {
+    let f = fixture();
+    f.store
+        .writer()
+        .write(|tx| {
+            // The repository's installation has no readable account, so its pass fails on the row's content
+            // (not on the database). It is the oldest work; the installation refresh is due right after it.
+            tx.execute("UPDATE installations SET account_id = NULL", [])?;
+            tx.execute(
+                "INSERT INTO github_refresh(id, kind, next_ms) SELECT repo_id, 1, 1 FROM source_bindings",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO github_refresh(id, kind, next_ms) SELECT id, 0, 2 FROM installations",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let lane = start(&f, Arc::clone(&notices));
+    until("the work behind the unreadable row", || {
+        notices
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| o.starts_with("refreshed"))
+    });
+    let seen = notices.lock().unwrap().clone();
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("retry"),
+        "the unreadable row is settled with a retry, not reported as a store outage: {seen:?}"
+    );
+    assert!(!seen.contains(&"store".to_owned()), "{seen:?}");
+    drop(lane);
+}
+
+#[test]
+fn a_lane_with_nothing_due_wakes_for_a_commit_without_polling() {
+    let f = fixture();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    // The idle ceiling is far beyond the test, so only the commit notifier or a due time can wake the lane.
+    let lane = {
+        let notices = Arc::clone(&notices);
+        Reconcile::start(
+            Arc::clone(&f.store),
+            Arc::clone(&f.app),
+            Config {
+                idle: Duration::from_secs(120),
+                ..Config::default()
+            },
+            move |notice| notices.lock().unwrap().push(notice.outcome.clone()),
+        )
+    };
+    until_stub(&f, "the first passes", || {
+        notices_have(&notices, "refreshed") && notices_have(&notices, "verified")
+    });
+    thread::sleep(Duration::from_millis(300));
+    let before = notices.lock().unwrap().len();
+    f.store
+        .writer()
+        .write(|tx| {
+            let installation: [u8; 16] =
+                tx.query_row("SELECT id FROM installations", [], |r| r.get(0))?;
+            github_events::schedule(tx, &installation, 0, UnixMillis::now())
+        })
+        .unwrap();
+    until("the scheduled refresh", || {
+        notices.lock().unwrap().len() > before
+    });
     drop(lane);
 }
 

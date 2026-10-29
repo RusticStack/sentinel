@@ -1,0 +1,10 @@
+# The network the controller and the web interface share as Podman Quadlets
+# (sentinel-server.container, sentinel-web.container). The subnet and the web
+# container's fixed address (IP= in sentinel-web.container) are the ones in
+# compose.server.yaml; trusted_proxies in server-container.toml names that
+# address. If 10.89.77.0/24 collides with a network of this host, change the
+# subnet, the gateway, IP= and trusted_proxies together.
+[Network]
+NetworkName=sentinel
+Subnet=10.89.77.0/24
+Gateway=10.89.77.1

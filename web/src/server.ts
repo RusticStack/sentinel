@@ -3,6 +3,7 @@
 // are served here; every other request is rendered by TanStack Start, whole, so its inline scripts can be hashed
 // into the CSP header.
 import { createServerEntry, createStartHandler, defaultRenderHandler } from "@tanstack/react-start/server";
+import { bounceFor } from "./server/bounce.ts";
 import { classifyProxyPath } from "./server/guard.ts";
 import { proxy } from "./server/proxy.ts";
 import { logStream, runStream } from "./server/streams.ts";
@@ -44,6 +45,10 @@ export default createServerEntry({
     const bare = path.split("?", 1)[0]!;
     if (request.method === "GET" && bare.startsWith("/_stream/run/")) return secure(runStream(request, bare.slice(13)));
     if (request.method === "GET" && bare.startsWith("/_stream/log/")) return secure(logStream(request, bare.slice(13), new URL(request.url).searchParams));
+
+    // GitHub's return to the two setup pages starts on another site, where the Strict session cookie is withheld.
+    const bounced = bounceFor(request);
+    if (bounced) return secure(bounced);
 
     const response = await start(request);
     if (!(response.headers.get("content-type") || "").startsWith("text/html")) return secure(response);

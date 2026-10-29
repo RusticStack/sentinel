@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   baseUrlProblem, emptyDraft, fragmentToken, githubStanding, INVITATION_STASH_MS, isSetupToken, parseDraft,
-  passwordAdvice, serializeDraft, slugProblem, stashInvitation, unstashInvitation,
+  passwordAdvice, persistedStep, serializeDraft, slugProblem, stashInvitation, unstashInvitation,
 } from "../src/lib/onboarding.ts";
 
 const HEX = "0123456789abcdef".repeat(4);
@@ -87,6 +87,19 @@ test("a stored draft is read back field by field, and anything malformed falls b
   assert.deepEqual(parseDraft("not json", 6), emptyDraft());
   assert.deepEqual(parseDraft(null, 6), emptyDraft());
   assert.deepEqual(parseDraft("x".repeat(9000), 6), emptyDraft());
+});
+
+test("a resumed wizard stores the place it was left at, not the earlier step it is walking back through", () => {
+  assert.equal(persistedStep(1, 5, 6), 5, "the administrator step on the way back to namespaces");
+  assert.equal(persistedStep(0, 5, 6), 5, "the token step again after a refused token");
+  assert.equal(persistedStep(5, 0, 6), 5, "nothing pending: the step itself");
+  assert.equal(persistedStep(0, 0, 6), 0);
+  assert.equal(persistedStep(6, 0, 6), 6);
+  assert.equal(persistedStep(9, 0, 6), 6, "capped at the last step a draft can hold");
+  assert.equal(persistedStep(2, 9, 6), 6);
+  const text = serializeDraft({ ...emptyDraft(), step: persistedStep(1, 5, 6), token: HEX, password: "a secret password" });
+  assert.equal(JSON.parse(text).step, 5);
+  assert.ok(!text.includes(HEX) && !text.includes("a secret password"), "still no secret");
 });
 
 test("a member's GitHub standing: unanswered checks are unknown before anything else", () => {

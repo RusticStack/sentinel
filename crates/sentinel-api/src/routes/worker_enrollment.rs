@@ -43,6 +43,7 @@ pub(super) fn route(
             list_enrollments(state, request, query)
         }
         ("GET", ["api", "v1", "admin", "workers"]) => list_hosts(state, request, query),
+        ("GET", ["api", "v1", "admin", "worker-bootstrap"]) => bootstrap_options(state, request),
         ("GET", ["api", "v1", "admin", "worker-enrollments", enrollment]) => {
             show(state, request, enrollment)
         }
@@ -60,6 +61,17 @@ pub(super) fn route(
                 "bootstrap.sh",
             ],
         ) => script(state, request, enrollment),
+        (
+            "POST",
+            [
+                "api",
+                "v1",
+                "admin",
+                "worker-enrollments",
+                enrollment,
+                "node-key",
+            ],
+        ) => authorize_key(state, request, enrollment),
         ("GET", ["api", "v1", "admin", "workers", worker, "policy"]) => {
             host_policy(state, request, worker)
         }
@@ -132,6 +144,89 @@ fn script_path(enrollment: TokenId) -> String {
     format!("/api/v1/admin/worker-enrollments/{enrollment}/bootstrap.sh")
 }
 
+fn redeem_mode(bootstrap: &WorkerBootstrap) -> &'static str {
+    if bootstrap.redeems_over_https() {
+        "https"
+    } else {
+        "link"
+    }
+}
+
+/// What an enrollment page needs before it offers a form: whether enrollment is configured, which
+/// transports work now, and the digest of the script each one serves. Nothing here is a credential: no
+/// address, no secret, no URL with user information.
+fn bootstrap_options(state: &State, request: &Request) -> Route {
+    super::admin::platform(state, request, false)?;
+    let Some(bootstrap) = state.worker_bootstrap.as_deref() else {
+        return ok(json!({ "configured": false }));
+    };
+    let tailcat_script = bootstrap.script(true).ok();
+    ok(json!({
+        "configured": true,
+        "release_version": bootstrap.release_version(),
+        "redeem": redeem_mode(bootstrap),
+        "archs": bootstrap.archs().collect::<Vec<_>>(),
+        "transports": {
+            "direct": {
+                "available": true,
+                "bootstrap_sha256": bootstrap.script(false).ok().map(|s| s.sha256()),
+            },
+            "tailcat": {
+                "available": bootstrap.tailcat_configured(),
+                "address_ready": bootstrap.tailcat_configured() && bootstrap.tailcat_address().is_some(),
+                "helper_version": bootstrap.tailcat_version(),
+                "bootstrap_sha256": tailcat_script.map(|s| s.sha256()),
+            },
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeKeyBody {
+    worker: String,
+    /// `nodekey:<64 hex>`, the line `sh bootstrap identity` prints on the worker.
+    node_key: String,
+}
+
+/// An administrator names the worker identifier and Tailcat node key a pending Tailcat enrollment is
+/// for, when the worker cannot reach an API of its own before its tunnel exists (no `api_url`). Admitting
+/// a key to the Tailcat network is the same class of act as issuing the secret, so it needs the same fresh
+/// step-up and is never available to a bearer credential.
+fn authorize_key(state: &State, request: &mut Request, enrollment: &str) -> Route {
+    let who = super::admin::platform(state, request, true)?;
+    let enrollment: TokenId = id(enrollment, "enrollment")?;
+    let body: NodeKeyBody = parse(&body(request)?)?;
+    let worker: WorkerId = id(&body.worker, "worker")?;
+    let key = workers::parse_node_key(&body.node_key).ok_or_else(|| {
+        err(
+            ErrorCode::InvalidRequest,
+            "node_key must be nodekey:<64 hex>",
+        )
+    })?;
+    limited(state, &who, Budget::Enrollment)?;
+    let authority = who.authority();
+    state
+        .store
+        .writer()
+        .write(move |tx| {
+            authority.require_privileged(tx)?;
+            workers::authorize_node_key(tx, authority, enrollment, worker, key, UnixMillis::now())
+        })
+        .map_err(|e| match e {
+            sentinel_store::Error::Conflict => err(
+                ErrorCode::Conflict,
+                "the enrollment is no longer pending, already names another worker or key, or the identity is already enrolled",
+            ),
+            e => store_error(e),
+        })?;
+    // Wakes the Tailcat allow-list pass, so the key is admitted before the worker's first attempt.
+    if let Some(notify) = &state.on_worker_enrolled {
+        (notify.0)();
+    }
+    Ok(Reply::Empty(204, Vec::new()))
+}
+
 fn issue(state: &State, request: &mut Request) -> Route {
     let who = super::admin::platform(state, request, true)?;
     let bootstrap = configured(state)?;
@@ -163,9 +258,9 @@ fn issue(state: &State, request: &mut Request) -> Route {
     } else {
         None
     };
-    // Fail before the write for the one thing that could make the script unrenderable.
-    bootstrap
-        .render(tailcat)
+    // Fail before the write for the one thing that could make the script unavailable.
+    let script = bootstrap
+        .script(tailcat)
         .map_err(|Unavailable::NoTailcat| {
             err(
                 ErrorCode::Conflict,
@@ -205,6 +300,11 @@ fn issue(state: &State, request: &mut Request) -> Route {
             "host": policy_json(&enrollment.policy),
             "release_version": bootstrap.release_version(),
             "bootstrap_path": script_path(enrollment.id),
+            // Of the exact bytes `bootstrap_path` serves, so a page can show that its copy is intact.
+            "bootstrap_sha256": script.sha256(),
+            // How the worker presents its secret: `https` redeems at the API, `link` presents it with the
+            // first link hello (a Tailcat worker then needs its node key authorized by an administrator).
+            "redeem": redeem_mode(bootstrap),
             // Shown once. The worker reads them from a 0600 file or standard input: line one the secret,
             // line two (Tailcat only) the address.
             "secret": sentinel_auth::token::format(&enrollment.secret),
@@ -270,13 +370,15 @@ fn script(state: &State, request: &Request, enrollment: &str) -> Route {
         .read(move |c| workers::enrollment_status(c, authority, enrollment, UnixMillis::now()))
         .map_err(store_error)?;
     let rendered = bootstrap
-        .render(known.tailcat)
+        .script(known.tailcat)
         .map_err(|Unavailable::NoTailcat| {
             err(
                 ErrorCode::Conflict,
                 "this controller pins no Tailcat helper for this enrollment",
             )
-        })?;
+        })?
+        .text()
+        .to_owned();
     // The audit row and the pending check commit together, so a script is handed out only for an
     // enrollment that can still be redeemed.
     state

@@ -34,6 +34,7 @@ pub mod schema;
 pub mod secrets;
 pub mod setup;
 pub mod sign_in;
+pub mod skipped;
 pub mod sources;
 pub mod sources_forge;
 pub mod space;
@@ -147,6 +148,22 @@ impl Error {
             ),
             _ => false,
         }
+    }
+
+    /// The error comes from the content of one stored row (a value that is not the type its column
+    /// promises, a malformed identifier), not from the database as a whole: retrying the same row can only
+    /// fail the same way, while other rows are unaffected. A fault of the database itself (I/O, a full or
+    /// read-only disk, a corrupt file) is not row-specific.
+    pub fn is_row_specific(&self) -> bool {
+        matches!(
+            self,
+            Self::Corrupt(_)
+                | Self::Sqlite(
+                    rusqlite::Error::InvalidColumnType(..)
+                        | rusqlite::Error::FromSqlConversionFailure(..)
+                        | rusqlite::Error::IntegralValueOutOfRange(..)
+                )
+        )
     }
 
     pub fn kind(&self) -> &'static str {

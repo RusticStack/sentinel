@@ -122,6 +122,7 @@ struct Record {
     argv: Vec<String>,
     limits: Limits,
     source: Source,
+    build: Build,
     tools: Tools,
     host: Host,
     image: Option<Image>,
@@ -335,6 +336,66 @@ struct Source {
     git_dirty: Option<bool>,
 }
 
+/// What was compiled, fixed when the runner was built (`build.rs`) and not when it is started:
+/// a checkout moved to another commit afterwards, or a binary copied to another host, still
+/// names the commit it was built from. An unknown value is absent, never a default.
+#[derive(Clone, Serialize)]
+struct Build {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<&'static str>,
+    /// True when a tracked file differed from the commit at build time (untracked files do not count).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dirty: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<&'static str>,
+    /// A build with debug assertions is not a baseline; `--contract` refuses it.
+    debug_assertions: bool,
+    /// BLAKE3 of the running executable, so a record names the exact binary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary_blake3: Option<String>,
+}
+
+fn known(value: &'static str) -> Option<&'static str> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn build_info() -> Build {
+    Build {
+        commit: known(env!("SENTINEL_BENCH_BUILD_COMMIT")),
+        dirty: match env!("SENTINEL_BENCH_BUILD_DIRTY") {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        profile: known(env!("SENTINEL_BENCH_BUILD_PROFILE")),
+        target: known(env!("SENTINEL_BENCH_BUILD_TARGET")),
+        debug_assertions: cfg!(debug_assertions),
+        binary_blake3: binary_digest(),
+    }
+}
+
+/// Hashed once at startup, before any sample, so the read is outside every measured window.
+fn binary_digest() -> Option<String> {
+    let mut file = fs::File::open(std::env::current_exe().ok()?).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(&mut file).ok()?;
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// A contract run produces a baseline; a build with debug assertions is not one.
+fn refuse_unmeasurable_build(contract: bool, debug_assertions: bool) -> Result<(), String> {
+    if contract && debug_assertions {
+        return Err(
+            "this runner was built with debug assertions, so a contract run would not \
+                    be a baseline; build it with --release (`cargo bench-noop` does)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct Tools {
     rustc: Option<String>,
@@ -450,6 +511,8 @@ fn run(cli: Cli) -> Result<(), String> {
     if plans[0].samples == 0 {
         return Err("samples must be at least 1".into());
     }
+    refuse_unmeasurable_build(cli.contract.is_some(), cfg!(debug_assertions))?;
+    let build = build_info();
     let bases = plans
         .iter()
         .map(warm_state_basis)
@@ -530,6 +593,7 @@ fn run(cli: Cli) -> Result<(), String> {
             argv: plan.argv.clone(),
             limits: plan.limits,
             source: source.clone(),
+            build: build.clone(),
             tools: Tools {
                 rustc: Some(env!("SENTINEL_BENCH_RUSTC"))
                     .filter(|v| !v.is_empty())
@@ -1004,7 +1068,16 @@ fn summarize(samples: &[Sample]) -> Summary {
     }
 }
 
+/// The source the runner was built from. The commit and tracked-change state fixed at build time
+/// win: they stay true after the checkout moves or the binary is copied to a host without it, and
+/// they save a `git` process at startup. Only a build made outside git asks the checkout.
 fn source_revision() -> Result<Source, String> {
+    if let Some(source) = source_from_build(
+        env!("SENTINEL_BENCH_BUILD_COMMIT"),
+        env!("SENTINEL_BENCH_BUILD_DIRTY"),
+    ) {
+        return Ok(source);
+    }
     let dir = env!("CARGO_MANIFEST_DIR");
     let git_commit = command_line(&["git", "-C", dir, "rev-parse", "HEAD"]).ok_or_else(|| {
         format!(
@@ -1017,6 +1090,17 @@ fn source_revision() -> Result<Source, String> {
     Ok(Source {
         git_commit: Some(git_commit),
         git_dirty,
+    })
+}
+
+fn source_from_build(commit: &str, dirty: &str) -> Option<Source> {
+    (!commit.is_empty()).then(|| Source {
+        git_commit: Some(commit.to_owned()),
+        git_dirty: match dirty {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
     })
 }
 
@@ -1115,6 +1199,34 @@ fn mount_fs(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_source_is_the_build_not_the_checkout() {
+        let source = source_from_build("abc123", "true").unwrap();
+        assert_eq!(source.git_commit.as_deref(), Some("abc123"));
+        assert_eq!(source.git_dirty, Some(true));
+        assert_eq!(
+            source_from_build("abc123", "false").unwrap().git_dirty,
+            Some(false)
+        );
+        assert_eq!(
+            source_from_build("abc123", "").unwrap().git_dirty,
+            None,
+            "an unknown state is absent, not false"
+        );
+        assert!(
+            source_from_build("", "false").is_none(),
+            "a build made outside git names no commit"
+        );
+    }
+
+    #[test]
+    fn a_debug_build_is_refused_for_a_contract_run_only() {
+        assert!(refuse_unmeasurable_build(true, true).is_err());
+        assert!(refuse_unmeasurable_build(true, false).is_ok());
+        assert!(refuse_unmeasurable_build(false, true).is_ok());
+        assert!(refuse_unmeasurable_build(false, false).is_ok());
+    }
 
     #[test]
     fn dirty_means_tracked_changes_not_untracked_files() {

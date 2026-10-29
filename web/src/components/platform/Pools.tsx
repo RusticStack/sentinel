@@ -2,18 +2,19 @@ import { useState } from "react";
 import { api } from "../../lib/api.ts";
 import { act } from "../../lib/act.tsx";
 import { useSession } from "../../lib/session.ts";
-import { useLoaded } from "../../lib/hooks.ts";
+import { attempt, useLoad, type Load } from "../../lib/loaded.ts";
+import { LoadFailed } from "../LoadFailed.tsx";
 import { Badge, Button, Field, Icon, Input, Select, Table } from "../ui.tsx";
 
 interface PoolRow { id: string; name: string; kind: "shared" | "dedicated"; active: boolean; workers: number; owner?: string | null; grants: string[] }
 export interface PoolsPage { pools: PoolRow[] }
 const readPools = () => api<PoolsPage>("/api/v1/admin/pools");
-export const loadPools = () => readPools().catch(() => null);
+export const loadPools = () => attempt(readPools);
 const KINDS = [{ label: "Shared", value: "shared" }, { label: "Dedicated", value: "dedicated" }];
 
-export function Pools({ initial }: { initial: PoolsPage | null }) {
+export function Pools({ initial }: { initial: Load<PoolsPage> }) {
   const { me } = useSession();
-  const [data, setData] = useLoaded(initial);
+  const { data, setData, failure } = useLoad(initial);
   const refresh = () => readPools().then(setData, () => {});
   const [form, setForm] = useState({ name: "", kind: "shared", tenant: "" });
   const [grantTo, setGrantTo] = useState<Record<string, string>>({});
@@ -39,7 +40,7 @@ export function Pools({ initial }: { initial: PoolsPage | null }) {
     <>
       <section aria-labelledby="pools-h" className="space-y-3">
         <h2 id="pools-h" className="text-base font-semibold text-strong">Worker pools</h2>
-        <Table caption="Pools">
+        {failure ? <LoadFailed what="the worker pools" words={failure} /> : <Table caption="Pools">
           <thead><tr><th>Pool</th><th>Kind</th><th>Workers</th><th>Tenants</th><th>Grant</th></tr></thead>
           <tbody>
             {pools.length ? pools.map((p) => (
@@ -74,7 +75,7 @@ export function Pools({ initial }: { initial: PoolsPage | null }) {
               </tr>
             )) : <tr><td colSpan={5} className="text-center text-muted">No data</td></tr>}
           </tbody>
-        </Table>
+        </Table>}
       </section>
       <section aria-labelledby="new-pool-h" className="space-y-3">
         <h2 id="new-pool-h" className="text-base font-semibold text-strong">Create a pool</h2>

@@ -1,6 +1,6 @@
 # Worker enrollment
 
-The operator's view of adding a machine to the fleet and taking it out again (Q11). This page is the short path and the checklist; the mechanisms are in [worker bootstrap](worker-bootstrap.md) (the script, `sentinel worker enroll`, the install layout), [worker link](worker-link.md) (what the controller stores and enforces) and [API](api.md) (the routes). The web page that drives the routes is not built yet (Part 20), so today the administrator uses the API or the host-local `sentinel admin worker` commands.
+The operator's view of adding a machine to the fleet and taking it out again (Q11). This page is the short path and the checklist; the mechanisms are in [worker bootstrap](worker-bootstrap.md) (the script, `sentinel worker enroll`, the install layout), [worker link](worker-link.md) (what the controller stores and enforces) and [API](api.md) (the routes). The web page that drives the routes is `/platform/workers` ([web interface](web-ui.md#worker-enrollment)); the same steps are available through the API and the host-local `sentinel admin worker` commands.
 
 ## Who decides what
 
@@ -14,9 +14,9 @@ A worker can state what it has; it can never raise what the controller approved.
 
 ## Add a machine
 
-1. Issue the enrollment: `POST /api/v1/admin/worker-enrollments` (platform administrator, fresh step-up), or on the controller host `sentinel admin worker enroll --pool NAME --transport tailcat|direct [--cpu-millis N] [--memory-bytes N] [--disk-bytes N] [--priority N]`. The secret is shown once; the HTTP response also carries the Tailcat address once. Audited as `worker-enrollment-issued`.
-2. Download the script (`GET /api/v1/admin/worker-enrollments/{id}/bootstrap.sh`, audited as `worker-bootstrap-downloaded`) and run it as root on the worker host, passing the secret by file or standard input, never as an argument.
-3. With `api_url` set on the controller the script runs `sentinel worker enroll` as the service account: it checks the host, generates the identities, redeems the secret over HTTPS in one transaction and writes `worker.toml`. Without `api_url` the older first-hello flow applies and a Tailcat key is authorized by an administrator ([worker bootstrap](worker-bootstrap.md#not-built-yet)).
+1. Issue the enrollment: on the web page (Platform, Workers: pick the pool, the transport, the ceilings and priority; confirm with a second factor; save the file the one-time dialog offers as `enrollment`), with `POST /api/v1/admin/worker-enrollments` (platform administrator, fresh step-up), or on the controller host `sentinel admin worker enroll --pool NAME --transport tailcat|direct [--cpu-millis N] [--memory-bytes N] [--disk-bytes N] [--priority N]`. The secret is shown once; the HTTP response also carries the Tailcat address once. Audited as `worker-enrollment-issued`.
+2. Download the script (the page's "Download script", or `GET /api/v1/admin/worker-enrollments/{id}/bootstrap.sh`, audited as `worker-bootstrap-downloaded`) and run it as root on the worker host, passing the secret by file or standard input, never as an argument. The page recomputes the script's SHA-256 and compares it with the controller's `bootstrap_sha256` before offering the file; without the page, `sha256sum` the file and compare it with `bootstrap_sha256` of the issue answer or of `GET /api/v1/admin/worker-bootstrap`. If the secret file is lost, withdraw the enrollment (the page's Withdraw, or `DELETE /api/v1/admin/worker-enrollments/{id}`) and issue another: the controller keeps only the secret's digest.
+3. With `api_url` set on the controller the script runs `sentinel worker enroll` as the service account: it checks the host, generates the identities, redeems the secret over HTTPS in one transaction and writes `worker.toml`. Without `api_url` the older first-hello flow applies and a Tailcat key is authorized by an administrator, on the page (paste the line `sh sentinel-worker-bootstrap.sh identity` prints) or on the host ([worker bootstrap](worker-bootstrap.md#authorizing-a-node-key-without-api_url)).
 4. Confirm: `GET /api/v1/admin/workers?pool=` lists the machine with its `approved`, `reported` and `effective` ceilings and whether it is `connected`.
 
 A refusal is visible and leaves nothing behind: an unsupported host or configuration is refused before the secret is spent; a controller that refuses the secret (one uniform `403` for unknown, spent, expired, withdrawn or wrong-pool secrets) or answers about another worker leaves no identity, key or configuration on the host. A `409` (identity, fingerprint or node key already belongs to another worker) leaves the enrollment unspent. A failure after the controller accepted names the worker identifier so an administrator can uninstall it there.
@@ -29,10 +29,10 @@ A refusal is visible and leaves nothing behind: an unsupported host or configura
 
 Both sides are needed, in this order:
 
-1. On the controller, request the uninstall (`POST /api/v1/admin/workers/{wrk}/uninstall`, or `sentinel admin worker uninstall --id wrk_...`). The worker drains at once and is revoked when its accepted attempts have settled; its session ends, its fingerprint and node key stop being admitted, and a later dial is refused as `Revoked`. Audited as `worker-uninstall-requested` and `worker-uninstalled`.
+1. On the controller, request the uninstall (the page's Request uninstall in the Workers table, `POST /api/v1/admin/workers/{wrk}/uninstall`, or `sentinel admin worker uninstall --id wrk_...`). The worker drains at once and is revoked when its accepted attempts have settled; its session ends, its fingerprint and node key stop being admitted, and a later dial is refused as `Revoked`. Audited as `worker-uninstall-requested` and `worker-uninstalled`.
 2. On the host, run `sh sentinel-worker-bootstrap.sh uninstall [--keep-data]` (which calls `sentinel worker uninstall`). Its final line names the worker and the controller-side step if the controller was not told first.
 
-A host that was uninstalled can enroll again with a new enrollment. What the controller does when a copied data directory dials while the original is connected is a Q13 scenario (`duplicate-identity`) that no real-fleet run has confirmed yet; this page makes no claim about it.
+To undo an upgrade on the host, `sh sentinel-worker-bootstrap.sh rollback` swaps back to the previous release; the page lists both commands under "Roll back or remove a machine". A host that was uninstalled can enroll again with a new enrollment. What the controller does when a copied data directory dials while the original is connected is a Q13 scenario (`duplicate-identity`) that no real-fleet run has confirmed yet; this page makes no claim about it.
 
 ## Verification
 

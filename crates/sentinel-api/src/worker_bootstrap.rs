@@ -66,6 +66,37 @@ pub enum Unavailable {
     NoTailcat,
 }
 
+/// One rendered script and the SHA-256 of its bytes. The script is identical for every enrollment of its
+/// transport and free of secrets, so it is rendered once, when the controller starts.
+#[derive(Debug)]
+pub struct Script {
+    text: String,
+    sha256: String,
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+impl Script {
+    fn of(text: String) -> Script {
+        let digest = ring::digest::digest(&ring::digest::SHA256, text.as_bytes());
+        let mut sha256 = String::with_capacity(64);
+        for byte in digest.as_ref() {
+            sha256.push(char::from(HEX[usize::from(byte >> 4)]));
+            sha256.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+        Script { text, sha256 }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// SHA-256 of the exact bytes [`text`](Self::text) serves, 64 lower-case hex characters.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
 #[derive(Debug)]
 pub struct WorkerBootstrap {
     controller: SocketAddr,
@@ -75,6 +106,8 @@ pub struct WorkerBootstrap {
     tailcat: Option<TailcatRelease>,
     tailcat_address_file: Option<PathBuf>,
     api_url: Option<String>,
+    direct_script: Script,
+    tailcat_script: Option<Script>,
 }
 
 impl WorkerBootstrap {
@@ -143,7 +176,7 @@ impl WorkerBootstrap {
                 return Err("tailcat region must be 1-64 characters of [A-Za-z0-9._-]".into());
             }
         }
-        Ok(WorkerBootstrap {
+        let mut bootstrap = WorkerBootstrap {
             controller,
             fingerprint,
             version,
@@ -151,7 +184,15 @@ impl WorkerBootstrap {
             tailcat,
             tailcat_address_file,
             api_url,
-        })
+            direct_script: Script::of(String::new()),
+            tailcat_script: None,
+        };
+        bootstrap.direct_script = Script::of(bootstrap.build(false));
+        bootstrap.tailcat_script = bootstrap
+            .tailcat
+            .is_some()
+            .then(|| Script::of(bootstrap.build(true)));
+        Ok(bootstrap)
     }
 
     /// Whether a Tailcat enrollment can be offered: a pinned helper and an address file are configured.
@@ -187,10 +228,34 @@ impl WorkerBootstrap {
     }
 
     /// The script for one transport: identical for every enrollment of that transport, and free of secrets.
-    pub fn render(&self, tailcat: bool) -> Result<String, Unavailable> {
-        if tailcat && self.tailcat.is_none() {
-            return Err(Unavailable::NoTailcat);
+    /// Rendered once at construction, so a call allocates nothing.
+    pub fn script(&self, tailcat: bool) -> Result<&Script, Unavailable> {
+        if tailcat {
+            self.tailcat_script.as_ref().ok_or(Unavailable::NoTailcat)
+        } else {
+            Ok(&self.direct_script)
         }
+    }
+
+    /// An owned copy of [`script`](Self::script)'s text.
+    pub fn render(&self, tailcat: bool) -> Result<String, Unavailable> {
+        self.script(tailcat).map(|script| script.text.clone())
+    }
+
+    /// The architectures the pinned release carries a worker archive for.
+    pub fn archs(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.workers
+            .iter()
+            .zip(ARCHES)
+            .filter_map(|(pin, arch)| pin.as_ref().map(|_| arch))
+    }
+
+    /// The version of the pinned Tailcat helper, if one is pinned.
+    pub fn tailcat_version(&self) -> Option<&str> {
+        self.tailcat.as_ref().map(|t| t.version.as_str())
+    }
+
+    fn build(&self, tailcat: bool) -> String {
         let (Some(begin), Some(end)) = (TEMPLATE.find(BEGIN), TEMPLATE.find(END)) else {
             unreachable!("the template is committed with its settings markers");
         };
@@ -238,7 +303,7 @@ impl WorkerBootstrap {
             helper.and_then(|t| t.region.as_deref()).unwrap_or(""),
         );
         script.push_str(&TEMPLATE[end..]);
-        Ok(script)
+        script
     }
 }
 
@@ -559,6 +624,63 @@ mod tests {
         let mut loopback = settings();
         loopback.api_url = Some("http://127.0.0.1:8080".into());
         assert!(WorkerBootstrap::new(loopback).is_ok());
+    }
+
+    fn sha256_of(bytes: &[u8]) -> String {
+        let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+        digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn the_digest_is_the_sha256_of_the_served_bytes_and_the_render_is_stable() {
+        let bootstrap = WorkerBootstrap::new(settings()).unwrap();
+        for tailcat in [false, true] {
+            let script = bootstrap.script(tailcat).unwrap();
+            assert_eq!(script.sha256(), sha256_of(script.text().as_bytes()));
+            assert_eq!(script.sha256().len(), 64);
+            assert!(is_hex64(script.sha256()));
+            assert_eq!(bootstrap.render(tailcat).unwrap(), script.text());
+            // A second read is the same bytes: nothing about the script depends on the request.
+            assert_eq!(bootstrap.script(tailcat).unwrap().sha256(), script.sha256());
+        }
+        // The two transports differ in their pinned settings, so they have different digests.
+        assert_ne!(
+            bootstrap.script(false).unwrap().sha256(),
+            bootstrap.script(true).unwrap().sha256()
+        );
+        // A script built again from the same settings has the same digest (the digest names the content).
+        let again = WorkerBootstrap::new(settings()).unwrap();
+        assert_eq!(
+            again.script(true).unwrap().sha256(),
+            bootstrap.script(true).unwrap().sha256()
+        );
+    }
+
+    #[test]
+    fn a_direct_only_controller_has_no_tailcat_script_or_digest() {
+        let mut direct_only = settings();
+        direct_only.tailcat = None;
+        let bootstrap = WorkerBootstrap::new(direct_only).unwrap();
+        assert!(matches!(
+            bootstrap.script(true),
+            Err(Unavailable::NoTailcat)
+        ));
+        assert!(bootstrap.script(false).is_ok());
+        assert_eq!(bootstrap.tailcat_version(), None);
+        assert_eq!(
+            WorkerBootstrap::new(settings()).unwrap().tailcat_version(),
+            Some("0.6.0")
+        );
+    }
+
+    #[test]
+    fn the_archs_are_those_the_release_carries() {
+        let all = WorkerBootstrap::new(settings()).unwrap();
+        assert_eq!(all.archs().collect::<Vec<_>>(), ["x86_64", "aarch64"]);
+        let mut s = settings();
+        s.release_sums = format!("{X86}  sentinel-0.1.0-x86_64-linux-worker.tar.gz\n");
+        let one = WorkerBootstrap::new(s).unwrap();
+        assert_eq!(one.archs().collect::<Vec<_>>(), ["x86_64"]);
     }
 
     #[test]

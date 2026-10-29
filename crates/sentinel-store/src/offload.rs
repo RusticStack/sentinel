@@ -3,25 +3,23 @@ use sentinel_core::{AttemptId, JobId, RunId, TenantId, UnixMillis};
 
 use crate::{Error, Result, objects::Digest};
 
-fn tenant(bytes: Vec<u8>) -> Result<TenantId> {
-    TenantId::from_bytes(
-        <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| Error::Corrupt("tenant_id"))?,
-    )
-    .map_err(|_| Error::Corrupt("tenant_id"))
+fn tenant(bytes: &[u8]) -> Result<TenantId> {
+    TenantId::from_bytes(<[u8; 16]>::try_from(bytes).map_err(|_| Error::Corrupt("tenant_id"))?)
+        .map_err(|_| Error::Corrupt("tenant_id"))
 }
 
-fn digest(bytes: Vec<u8>) -> Result<Digest> {
+fn digest(bytes: &[u8]) -> Result<Digest> {
     Ok(Digest::from_bytes(
-        <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| Error::Corrupt("object digest"))?,
+        <[u8; 32]>::try_from(bytes).map_err(|_| Error::Corrupt("object digest"))?,
     ))
 }
 
 fn id16<T>(
-    bytes: Vec<u8>,
+    bytes: &[u8],
     f: fn([u8; 16]) -> std::result::Result<T, sentinel_core::InvalidId>,
     what: &'static str,
 ) -> Result<T> {
-    f(<[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| Error::Corrupt(what))?)
+    f(<[u8; 16]>::try_from(bytes).map_err(|_| Error::Corrupt(what))?)
         .map_err(|_| Error::Corrupt(what))
 }
 
@@ -44,11 +42,15 @@ fn object_rows(conn: &Connection, sql: &str, limit: u32) -> Result<Vec<ObjectRef
     let mut out = Vec::new();
     for row in rows {
         let (t, d, len) = row?;
-        out.push(ObjectRef {
-            tenant: tenant(t)?,
-            digest: digest(d)?,
-            len: len.max(0) as u64,
-        });
+        // One damaged row must not stop the rows behind it: it is counted and named, and the batch goes on.
+        match (tenant(&t), digest(&d)) {
+            (Ok(tenant), Ok(digest)) => out.push(ObjectRef {
+                tenant,
+                digest,
+                len: len.max(0) as u64,
+            }),
+            _ => crate::skipped::note_blob("objects", &[t.as_slice(), d.as_slice()].concat()),
+        }
     }
     Ok(out)
 }
@@ -62,9 +64,23 @@ pub fn unreplicated(conn: &Connection, limit: u32) -> Result<Vec<ObjectRef>> {
     )
 }
 
+/// Marks a window of objects before their bytes are sent, in one write. A row deleted while marked queues
+/// the S3 delete, so a crash between the PUT and `replicated` cannot leave a copy nothing removes.
+pub fn mark_puts(tx: &Transaction<'_>, objects: &[ObjectRef]) -> Result<()> {
+    let mut stmt =
+        tx.prepare_cached("INSERT OR IGNORE INTO s3_puts(tenant_id, digest) VALUES (?1, ?2)")?;
+    for object in objects {
+        stmt.execute(params![
+            object.tenant.as_bytes().as_slice(),
+            object.digest.as_bytes().as_slice()
+        ])?;
+    }
+    Ok(())
+}
+
 pub fn replicated(tx: &Transaction<'_>, object: &ObjectRef, now: UnixMillis) -> Result<bool> {
-    Ok(tx
-        .prepare_cached(
+    let recorded =
+        tx.prepare_cached(
             "UPDATE objects SET remote_ms = ?3
              WHERE tenant_id = ?1 AND digest = ?2 AND remote_ms IS NULL",
         )?
@@ -72,8 +88,16 @@ pub fn replicated(tx: &Transaction<'_>, object: &ObjectRef, now: UnixMillis) -> 
             object.tenant.as_bytes().as_slice(),
             object.digest.as_bytes().as_slice(),
             now.0
-        ])?
-        == 1)
+        ])? == 1;
+    if recorded {
+        // The row now says the copy exists, so the mark is spent.
+        tx.prepare_cached("DELETE FROM s3_puts WHERE tenant_id = ?1 AND digest = ?2")?
+            .execute(params![
+                object.tenant.as_bytes().as_slice(),
+                object.digest.as_bytes().as_slice()
+            ])?;
+    }
+    Ok(recorded)
 }
 
 pub fn evictable(conn: &Connection, limit: u32) -> Result<Vec<ObjectRef>> {
@@ -157,6 +181,8 @@ pub struct LogRef {
     pub run: RunId,
     pub job: JobId,
     pub released_ms: i64,
+    /// The attempt's `log_state` when the row was read: the copy counts only if it is unchanged when the copy ends.
+    pub state: i64,
 }
 
 pub fn unreplicated_logs(
@@ -165,7 +191,7 @@ pub fn unreplicated_logs(
     limit: u32,
 ) -> Result<Vec<LogRef>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT a.id, j.run_id, a.job_id, a.released_ms
+        "SELECT a.id, j.run_id, a.job_id, a.released_ms, a.log_state
          FROM attempts a INDEXED BY attempts_log_unreplicated JOIN jobs j ON j.id = a.job_id
          WHERE a.log_expires_ms IS NOT NULL AND a.log_expired_ms IS NULL
            AND a.log_remote_ms IS NULL AND a.released_ms <= ?1
@@ -177,29 +203,75 @@ pub fn unreplicated_logs(
             r.get::<_, Vec<u8>>(1)?,
             r.get::<_, Vec<u8>>(2)?,
             r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (a, r, j, released_ms) = row?;
-        out.push(LogRef {
-            attempt: id16(a, AttemptId::from_bytes, "attempt_id")?,
-            run: id16(r, RunId::from_bytes, "run_id")?,
-            job: id16(j, JobId::from_bytes, "job_id")?,
-            released_ms,
-        });
+        let (a, r, j, released_ms, state) = row?;
+        match (
+            id16(&a, AttemptId::from_bytes, "attempt_id"),
+            id16(&r, RunId::from_bytes, "run_id"),
+            id16(&j, JobId::from_bytes, "job_id"),
+        ) {
+            (Ok(attempt), Ok(run), Ok(job)) => out.push(LogRef {
+                attempt,
+                run,
+                job,
+                released_ms,
+                state,
+            }),
+            _ => crate::skipped::note_blob("attempts", &a),
+        }
     }
     Ok(out)
 }
 
-pub fn log_replicated(tx: &Transaction<'_>, attempt: AttemptId, now: UnixMillis) -> Result<bool> {
-    Ok(tx
+/// What became of a log's copy when it ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogCopy {
+    /// Recorded: the copy matches the log as it was read.
+    Recorded,
+    /// A late end changed the log during the copy; it stays unreplicated and is copied again.
+    Changed,
+    /// Retention expired the log during the copy. Its trigger saw no copy yet, so the delete is queued here.
+    Expired,
+}
+
+pub fn log_replicated(tx: &Transaction<'_>, log: &LogRef, now: UnixMillis) -> Result<LogCopy> {
+    let recorded = tx
         .prepare_cached(
             "UPDATE attempts SET log_remote_ms = ?2
-             WHERE id = ?1 AND log_remote_ms IS NULL AND log_expired_ms IS NULL",
+             WHERE id = ?1 AND log_remote_ms IS NULL AND log_expired_ms IS NULL AND log_state = ?3",
         )?
-        .execute(params![attempt.as_bytes().as_slice(), now.0])?
-        == 1)
+        .execute(params![log.attempt.as_bytes().as_slice(), now.0, log.state])?
+        == 1;
+    if recorded {
+        return Ok(LogCopy::Recorded);
+    }
+    let expired: bool = tx
+        .prepare_cached("SELECT log_expired_ms IS NOT NULL FROM attempts WHERE id = ?1")?
+        .query_row([log.attempt.as_bytes().as_slice()], |r| r.get(0))
+        .optional()?
+        .unwrap_or(false);
+    if !expired {
+        return Ok(LogCopy::Changed);
+    }
+    queue_log_delete(tx, log, now)?;
+    Ok(LogCopy::Expired)
+}
+
+fn queue_log_delete(tx: &Transaction<'_>, log: &LogRef, now: UnixMillis) -> Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO s3_deletes(kind, run_id, job_id, attempt_id, queued_ms) VALUES (1, ?1, ?2, ?3, ?4)",
+    )?
+    .execute(params![
+        log.run.as_bytes().as_slice(),
+        log.job.as_bytes().as_slice(),
+        log.attempt.as_bytes().as_slice(),
+        now.0
+    ])?;
+    Ok(())
 }
 
 pub fn log_prefix(run: RunId, job: JobId, attempt: AttemptId) -> String {
@@ -285,22 +357,36 @@ pub fn deletes(conn: &Connection, limit: u32) -> Result<Vec<Delete>> {
     let mut out = Vec::new();
     for row in rows {
         let (id, kind, t, d, run, job, attempt) = row?;
-        out.push(match (kind, t, d, run, job, attempt) {
-            (0, Some(t), Some(d), _, _, _) => Delete::Object {
-                id,
-                tenant: tenant(t)?,
-                digest: digest(d)?,
-            },
-            (1, _, _, Some(r), Some(j), Some(a)) => Delete::Log {
-                id,
-                run: id16(r, RunId::from_bytes, "run_id")?,
-                job: id16(j, JobId::from_bytes, "job_id")?,
-                attempt: id16(a, AttemptId::from_bytes, "attempt_id")?,
-            },
-            _ => return Err(Error::Corrupt("s3 delete")),
-        });
+        // A damaged queue row must not hold the deletes behind it: it is counted and named, and the batch goes on.
+        match delete_row(
+            id,
+            kind,
+            [&t, &d, &run, &job, &attempt].map(|blob| blob.as_deref()),
+        ) {
+            Ok(delete) => out.push(delete),
+            Err(Error::Corrupt(_)) => crate::skipped::note_int("s3_deletes", id),
+            Err(e) => return Err(e),
+        }
     }
     Ok(out)
+}
+
+/// `blobs` are the tenant, digest, run, job and attempt columns.
+fn delete_row(id: i64, kind: i64, blobs: [Option<&[u8]>; 5]) -> Result<Delete> {
+    Ok(match (kind, blobs) {
+        (0, [Some(t), Some(d), ..]) => Delete::Object {
+            id,
+            tenant: tenant(t)?,
+            digest: digest(d)?,
+        },
+        (1, [_, _, Some(r), Some(j), Some(a)]) => Delete::Log {
+            id,
+            run: id16(r, RunId::from_bytes, "run_id")?,
+            job: id16(j, JobId::from_bytes, "job_id")?,
+            attempt: id16(a, AttemptId::from_bytes, "attempt_id")?,
+        },
+        _ => return Err(Error::Corrupt("s3 delete")),
+    })
 }
 
 pub fn queue_object_delete(

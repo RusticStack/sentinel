@@ -7,7 +7,7 @@ Sentinel has four versioned surfaces, each with its own rules ([compatibility](c
 | Surface | Forward | Skew supported | Backward |
 |---|---|---|---|
 | Metadata database | Forward-only migrations, one transaction each, applied at the controller's (or an `admin` command's) first open | — (one controller owns it) | A newer database runs on an older release **only** when every migration that release does not know declares it readable (`readable_by`, below); otherwise roll back from the pre-migration copy or a backup |
-| Worker protocol | The controller speaks protocols 1–10 (`SUPPORTED_MIN..=SUPPORTED_MAX`) and picks the highest both sides share at every hello | **Upgrade the controller first.** A worker one release behind keeps working; a feature needing a newer protocol (secret delivery, profiles) is simply not offered to it. A structural change raises `SUPPORTED_MAX` first and `SUPPORTED_MIN` only a release later, so a worker never falls out of range in one step | A rolled-back worker renegotiates down at its next hello |
+| Worker protocol | The controller speaks protocols 1–11 (`SUPPORTED_MIN..=SUPPORTED_MAX`; 11 is pushed cancellation) and picks the highest both sides share at every hello | **Upgrade the controller first.** A worker one release behind keeps working; a feature needing a newer protocol (secret delivery, profiles) is simply not offered to it. A structural change raises `SUPPORTED_MAX` first and `SUPPORTED_MIN` only a release later, so a worker never falls out of range in one step | A rolled-back worker renegotiates down at its next hello |
 | HTTP API | Additive within `v1`: new routes and fields, never a removed or retyped one | CLIs, MCP clients and `sentinel-web` of any `v1` release; clients ignore unknown fields | Clients must not depend on fields a rollback removes |
 | Backups | `sentinel.backup/1` | A newer release restores an older backup and migrates it | An older release cannot restore a newer backup's snapshot unless it is readable (as above) |
 
@@ -43,9 +43,9 @@ Each migration from schema 48 on records `readable_by` in `schema_migrations`: t
 
 ### Rollback matrix
 
-A database at schema N runs on release R only when no migration in (R, N] declares a `readable_by` above R. The releases that matter are the `READABLE_BY` targets (44, 47, 48, 51, 56, 57) plus the two releases before the current schema (61, 62):
+A database at schema N runs on release R only when no migration in (R, N] declares a `readable_by` above R. The releases that matter are the `READABLE_BY` targets (44, 47, 48, 51, 56, 57, 63) plus the two releases before the current schema (62, 63):
 
-| Older release R | database at 53 | database at 55 | database at 58 | database at 63 (current) |
+| Older release R | database at 53 | database at 55 | database at 58 | database at 64 (current) |
 |---|---|---|---|---|
 | 44 | copy or backup | copy or backup | copy or backup | copy or backup |
 | 47 | copy or backup | copy or backup | copy or backup | copy or backup |
@@ -53,8 +53,8 @@ A database at schema N runs on release R only when no migration in (R, N] declar
 | 51 | runs as is | copy or backup | copy or backup | copy or backup |
 | 56 | n/a | n/a | copy or backup | copy or backup |
 | 57 | n/a | n/a | runs as is | copy or backup |
-| 61 | n/a | n/a | n/a | copy or backup |
 | 62 | n/a | n/a | n/a | copy or backup |
+| 63 | n/a | n/a | n/a | runs as is |
 
 Because migrations 54, 55, 56 and 59 to 63 are not readable by anything older, **a deployment that has started on the current schema can only go back to an older release from the pre-migration copy or a backup**; rolling back to 62 means restoring `metadata.sqlite.v062`. What the restore loses is what was written after the upgrade: job runtime requirements, session-minted service grants, the GitHub App registered through one-click setup, link-admission and removal records, the auto-join generation, and worker enrollment and host policy. The copy is taken only when the upgrade had a migration to run, so a deployment already at 63 has none for 63 itself.
 
@@ -72,10 +72,11 @@ Everything below is additive on the wire. A client of any `v1` release keeps wor
 | GitHub App by one-click setup | 56 | Credentials sealed in the database; the three GitHub files, when present, take precedence and setup is refused ([GitHub App](github-app.md)) |
 | Delivery authentication, link admission, removal tombstones, auto-join generation | 58 to 61 | Deliveries record how they were authenticated; refused enrollments and removed members are remembered; changing an auto-join rule re-checks everyone ([compatibility](compatibility.md)) |
 | Worker enrollment and host policy | 62, 63 | Approved ceilings and priority live in the controller; a worker's stated size is capped by them ([worker link](worker-link.md)) |
+| Run actor, S3 put marks, rerequest index | 64 | A manual run records who started it; the external copy cannot be orphaned by a crash between an upload and its record; rerequests no longer scan the repository's history. Release 63 can run on the result ([compatibility](compatibility.md)) |
 | Pushed cancellation | protocol 11 | Controller first; a protocol-10 worker still cancels at its next heartbeat |
 
 New routes are listed in the [API](api.md). Check `GET /api/v1/version` before relying on a route a rollback may remove.
 
 ## Verification
 
-`crates/sentinel-store/tests/upgrade.rs`: a database built at schema LATEST−3 migrates with a copy at its old schema taken first, records `readable_by` (45 → 44, 46 → 46, 48 → 47, 49 → 48, 50 → 50, 52 → 51, 53 → 51, 57 → 56, 58 → 57), takes no copy when nothing is pending, and keeps only the newest two copies; a migration that fails (migration 4 against inconsistent ownership) leaves the database at 3 and names the copy — still at 3 — in a message that says how to roll back; a newer database whose unknown migration is readable opens as it is, and one that needs a newer schema is refused and reported blocking by the preflight; the preflight reports pending migrations, room and key without writing a byte; a worker's software label is printable and bounded. `every_readable_by_release_upgrades_and_the_rollback_matrix_matches_the_docs` upgrades a database built at each `READABLE_BY` target (44, 47, 48, 51, 56, 57) and at the two schemas before the latest (61, 62) to the latest schema, checks the pre-migration copy is that release's database, and checks the rollback matrix above against the `readable_by` column; the migration 55 test keeps legacy grant rows with no provenance. `crates/sentinel-store/tests/authorization.rs` still refuses a future version with no declaration.
+`crates/sentinel-store/tests/upgrade.rs`: a database built at schema LATEST−3 migrates with a copy at its old schema taken first, records `readable_by` (45 → 44, 46 → 46, 48 → 47, 49 → 48, 50 → 50, 52 → 51, 53 → 51, 57 → 56, 58 → 57, 64 → 63), takes no copy when nothing is pending, and keeps only the newest two copies; a migration that fails (migration 4 against inconsistent ownership) leaves the database at 3 and names the copy — still at 3 — in a message that says how to roll back; a newer database whose unknown migration is readable opens as it is, and one that needs a newer schema is refused and reported blocking by the preflight; the preflight reports pending migrations, room and key without writing a byte; a worker's software label is printable and bounded. `every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expects` upgrades a database built at each `READABLE_BY` target (44, 47, 48, 51, 56, 57) and at the two schemas before the latest (61, 62) to the latest schema, checks the pre-migration copy is that release's database, and checks which sampled schemas each release can run on against the `readable_by` column; `crates/sentinel-store/tests/compat_doc.rs` reads [compatibility](compatibility.md) and this page and compares them with the constants (the contract table's run spec, attempt summary, metadata database and worker protocol rows and the protocol range stated above, each migration entry's `readable by` statement against `schema::READABLE_BY`, and the rollback matrix above against the `readable_by` column); the migration 55 test keeps legacy grant rows with no provenance. `crates/sentinel-store/tests/authorization.rs` still refuses a future version with no declaration.

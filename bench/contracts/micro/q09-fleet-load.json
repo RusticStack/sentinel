@@ -1,0 +1,26 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "q09-fleet-load",
+  "revision": 1,
+  "harness": {
+    "script": "bench/run-ignored.sh",
+    "build": "cargo test --release --locked -p sentinel-store --test fleet_load --no-run"
+  },
+  "run": {
+    "args": ["sentinel-store", "fleet_load", "one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime"],
+    "smoke_args": ["--list-only", "sentinel-store", "fleet_load", "one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime"]
+  },
+  "ordering": {
+    "scheme": "single",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/ignored-test/1",
+    "out": "bench/q09-fleet-load.jsonl",
+    "from_stdout": true
+  },
+  "notes": "One run of the 10k-job, 100-worker load test; its JSON report comes back under reports. The test seeds its own tenants and jobs, with no random choice."
+}

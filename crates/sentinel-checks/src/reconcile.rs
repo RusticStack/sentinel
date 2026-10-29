@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sentinel_core::UnixMillis;
@@ -21,9 +21,14 @@ use sentinel_store::{Error as StoreError, Store, github_events, sources_forge};
 
 const TOKEN_MARGIN_MS: i64 = 120_000;
 const MAX_CACHED_TOKENS: usize = 1024;
+/// The shortest gap between two reads of the queue: a commit wakes an idle lane, but a busy store must not
+/// turn that into a read per commit.
+const COMMIT_GAP: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
+    /// The longest an idle lane sleeps. It wakes earlier for a commit or when the next row falls due, so this
+    /// is only the net for a write the commit notifier cannot see.
     pub idle: Duration,
     pub min_backoff: Duration,
     pub max_backoff: Duration,
@@ -32,7 +37,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            idle: Duration::from_millis(250),
+            idle: Duration::from_secs(2),
             min_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
         }
@@ -46,6 +51,7 @@ pub struct Notice {
 }
 
 pub struct Reconcile {
+    store: Arc<Store>,
     stop: Arc<AtomicBool>,
     settled: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     thread: Option<thread::JoinHandle<()>>,
@@ -60,6 +66,7 @@ impl Reconcile {
     ) -> Reconcile {
         let stop = Arc::new(AtomicBool::new(false));
         let settled = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let handle = Arc::clone(&store);
         let thread = {
             let (stop, settled) = (Arc::clone(&stop), Arc::clone(&settled));
             thread::Builder::new()
@@ -75,6 +82,7 @@ impl Reconcile {
                 .expect("spawn github reconcile lane")
         };
         Reconcile {
+            store: handle,
             stop,
             settled,
             thread: Some(thread),
@@ -88,6 +96,7 @@ impl Drop for Reconcile {
         let (lock, cv) = &*self.settled;
         *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
         cv.notify_all();
+        self.store.changes().nudge();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -120,7 +129,13 @@ fn run(
         failures = failures.saturating_add(1);
         wait(settled, backoff(config, failures));
     }
-    while !stop.load(Ordering::Acquire) {
+    loop {
+        // Read before the stop flag: a drop that lands in between has already moved the generation.
+        let seen = worker.store.changes().generation();
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let polled = Instant::now();
         let work = match worker
             .store
             .read(|c| github_events::due(c, UnixMillis::now()))
@@ -134,7 +149,7 @@ fn run(
         };
         let Some(work) = work else {
             failures = 0;
-            wait(settled, config.idle);
+            sleep_until_work(&worker.store, config, settled, seen, polled);
             continue;
         };
         let outcome = match work.kind {
@@ -218,10 +233,14 @@ impl Worker {
         if retry { "retry" } else { "settled" }
     }
 
+    /// A row whose stored content cannot be read is settled with a retry, which moves its `next_ms`, so it
+    /// cannot stay at the head of the queue and starve every other installation. A fault of the database
+    /// itself is not that row's: it is reported as a store failure and the lane backs off.
     fn unreadable(&self, work: &github_events::Refresh, error: &StoreError) -> String {
-        match error {
-            StoreError::Corrupt(_) => self.settle(work, true).into(),
-            _ => STORE.into(),
+        if error.is_row_specific() {
+            self.settle(work, true).into()
+        } else {
+            STORE.into()
         }
     }
 
@@ -432,6 +451,34 @@ impl Worker {
             }
             Err(_) => self.settle(work, true).into(),
         }
+    }
+}
+
+/// Sleeps until a commit may have queued work or the earliest row falls due, never longer than `config.idle`.
+fn sleep_until_work(
+    store: &Store,
+    config: &Config,
+    settled: &(std::sync::Mutex<bool>, std::sync::Condvar),
+    seen: u64,
+    polled: Instant,
+) {
+    let ceiling = polled + config.idle;
+    // A commit since `seen` ends the wait at once, so the earliest-row read would be wasted: on a busy
+    // store this keeps the lane at one read per gap, as the fixed poll it replaced.
+    let deadline = if store.changes().generation() != seen {
+        ceiling
+    } else {
+        match store.read(github_events::next_due_ms) {
+            Ok(Some(due_ms)) => {
+                let wait_ms = due_ms.saturating_sub(UnixMillis::now().0).max(0) as u64;
+                (polled + Duration::from_millis(wait_ms)).min(ceiling)
+            }
+            _ => ceiling,
+        }
+    };
+    store.changes().wait_past(seen, deadline);
+    if let Some(rest) = COMMIT_GAP.min(config.idle).checked_sub(polled.elapsed()) {
+        wait(settled, rest);
     }
 }
 

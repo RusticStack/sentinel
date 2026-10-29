@@ -47,6 +47,44 @@ fn io(context: &str, error: std::io::Error) -> Error {
     ))
 }
 
+/// Directories this module creates are owner-only, as the live data directory is: they hold every tenant's objects and the sealed database.
+fn private_dir_all(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(dir)
+}
+
+/// Files this module creates are owner-only from the first byte, so the key files are never readable between a copy and a chmod.
+fn private_file() -> OpenOptions {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
+/// A directory that already existed keeps its mode, so the caller is told when others can open it.
+#[cfg(unix)]
+fn open_to_others(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(dir).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
+}
+
+#[cfg(not(unix))]
+fn open_to_others(_dir: &Path) -> bool {
+    false
+}
+
 fn note_dirs(dirty: &mut BTreeSet<PathBuf>, from: &Path, root: &Path) {
     let mut dir = from;
     loop {
@@ -83,11 +121,11 @@ fn copy_file_into(
 ) -> Result<(Digest, u64)> {
     let mut input = File::open(src).map_err(|e| io(&src.display().to_string(), e))?;
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
+        private_dir_all(parent)?;
         note_dirs(dirty, parent, root);
     }
     let tmp = dst.with_extension("part");
-    let mut out = OpenOptions::new()
+    let mut out = private_file()
         .create(true)
         .truncate(true)
         .write(true)
@@ -114,7 +152,7 @@ fn copy_file_into(
 const LOCK: &str = ".lock";
 
 fn lock_target(target: &Path) -> Result<File> {
-    let file = OpenOptions::new()
+    let file = private_file()
         .create(true)
         .truncate(false)
         .write(true)
@@ -261,6 +299,8 @@ pub struct Report {
     pub objects_corrupt: Vec<String>,
     pub objects_missing: Vec<String>,
     pub partials_removed: u64,
+    /// The target directory already existed and group or other accounts can open it: its mode is the operator's to tighten.
+    pub target_open_to_others: bool,
     pub manifests: u64,
     pub manifests_copied: u64,
     pub log_files_copied: u64,
@@ -278,7 +318,7 @@ pub fn create(
     version: &str,
 ) -> Result<Report> {
     let started = UnixMillis::now();
-    fs::create_dir_all(target)?;
+    private_dir_all(target)?;
     let _writer = lock_target(target)?;
     let mut id = backup_id(started);
     if target.join(&id).exists() {
@@ -288,10 +328,12 @@ pub fn create(
     let _maintenance = objects.hold_maintenance();
     let partials_removed = remove_partials(target)?;
     let staging = target.join(format!(".{id}.partial"));
-    fs::create_dir_all(&staging)?;
+    private_dir_all(&staging)?;
 
     let snapshot_path = staging.join(METADATA);
     store.snapshot_into(&snapshot_path)?;
+    // The staging directory is closed to others already; the file is restricted too in case the backup is ever moved out of it.
+    restrict(&snapshot_path)?;
     File::open(&snapshot_path)?.sync_all()?;
     let (metadata_digest, metadata_bytes) = hash_file(&snapshot_path)?;
     let snapshot = open_snapshot(&snapshot_path)?;
@@ -304,6 +346,7 @@ pub fn create(
         metadata_bytes,
         key_ids: crate::reseal::key_ids(&snapshot)?,
         partials_removed,
+        target_open_to_others: open_to_others(target),
         ..Report::default()
     };
 
@@ -397,7 +440,7 @@ pub fn create(
     sync_dirs(&dirty)?;
 
     let config = staging.join(CONFIG_DIR);
-    fs::create_dir_all(&config)?;
+    private_dir_all(&config)?;
     // The controller's link identity decides whether workers reconnect, so it is checksummed like the database.
     let mut config_sums = BTreeMap::new();
     for name in CONFIG_FILES {
@@ -455,7 +498,11 @@ pub fn create(
     });
     let body =
         serde_json::to_vec_pretty(&manifest).map_err(|_| Error::Corrupt("backup manifest"))?;
-    let mut file = File::create(staging.join(MANIFEST))?;
+    let mut file = private_file()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(staging.join(MANIFEST))?;
     file.write_all(&body)?;
     file.sync_all()?;
     drop(file);
@@ -668,6 +715,8 @@ pub struct Restored {
     pub key_checked: bool,
     /// Objects the backup itself recorded as missing or corrupt at the source: the restore carries on without them and recovery names them.
     pub objects_unavailable: Vec<String>,
+    /// The data directory already existed and group or other accounts can open it: its mode is the operator's to tighten.
+    pub data_dir_open_to_others: bool,
 }
 
 pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> Result<Restored> {
@@ -713,9 +762,11 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
         }
         crate::reseal::verify_key(&snapshot, key)?;
     }
-    fs::create_dir_all(data_dir)?;
+    let existed = data_dir.exists();
+    private_dir_all(data_dir)?;
     let mut out = Restored {
         key_checked: loaded.is_some(),
+        data_dir_open_to_others: existed && open_to_others(data_dir),
         ..Restored::default()
     };
     let mut dirty = BTreeSet::new();
@@ -920,6 +971,26 @@ pub fn prune(target: &Path, keep: usize) -> Result<Pruned> {
     Ok(out)
 }
 
+/// How long a scheduler starting now waits for its first backup: what is left of the interval after the newest backup, never more than one interval.
+///
+/// A controller restarted more often than the interval would otherwise never reach its first deadline. No backup, an overdue one
+/// or one that cannot be read means a backup at once; a newest backup dated in the future (clock skew) waits one interval at most.
+fn first_wait(target: &Path, interval: std::time::Duration) -> std::time::Duration {
+    let newest = list(target)
+        .ok()
+        .and_then(|ids| ids.last().cloned())
+        .and_then(|id| manifest(target, &id).ok())
+        .and_then(|m| m["started_ms"].as_i64());
+    let Some(started) = newest else {
+        return std::time::Duration::ZERO;
+    };
+    let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(i64::MAX);
+    let left = started
+        .saturating_add(interval_ms)
+        .saturating_sub(UnixMillis::now().0);
+    std::time::Duration::from_millis(left.clamp(0, interval_ms).unsigned_abs())
+}
+
 pub trait Control: Send + Sync {
     fn trigger(&self) -> bool;
     fn status(&self) -> Value;
@@ -1004,7 +1075,7 @@ impl Scheduler {
     }
 
     fn run(&self) {
-        let mut next = std::time::Instant::now() + self.interval;
+        let mut next = std::time::Instant::now() + first_wait(&self.target, self.interval);
         loop {
             {
                 let mut state = self.state();
@@ -1079,6 +1150,7 @@ impl Control for Scheduler {
                 "objects_corrupt": r.objects_corrupt.len(),
                 "objects_missing": r.objects_missing.len(),
                 "log_bytes_copied": r.log_bytes_copied,
+                "target_open_to_others": r.target_open_to_others,
             })),
             "last_failure_ms": state.last_failure_ms,
             "last_failure": state.last_failure,

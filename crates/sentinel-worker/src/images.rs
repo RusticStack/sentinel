@@ -108,6 +108,46 @@ fn restrict_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A leader's hold on its slot. Dropping it answers the slot if the download never did (a panic: followers then pull
+/// for themselves instead of waiting out their timeout on a result that cannot come) and releases the slot, but only
+/// if it is still this leader's: a follower whose deadline passed has already dropped it, and a newer leader may have
+/// registered its own under the same key since.
+struct Leading<'a> {
+    images: &'a Images,
+    key: &'a PullKey,
+    slot: &'a Arc<Pull>,
+    answered: bool,
+}
+
+impl Leading<'_> {
+    fn answer(&mut self, shared: std::result::Result<bool, Shared>) {
+        *self.slot.result.lock().unwrap_or_else(|p| p.into_inner()) = Some(shared);
+        self.slot.done.notify_all();
+        self.answered = true;
+    }
+}
+
+impl Drop for Leading<'_> {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.answer(Err(Shared::Abandoned));
+        }
+        let mut state = self.images.state();
+        match state.pulling.get(self.key) {
+            Some(current) if Arc::ptr_eq(current, self.slot) => {
+                state.pulling.remove(self.key);
+                state.prefetching.remove(self.key);
+            }
+            // Nobody holds the key: only this leader's prefetch marker can be left.
+            None => {
+                state.prefetching.remove(self.key);
+            }
+            // A newer leader owns the key and its marker.
+            Some(_) => {}
+        }
+    }
+}
+
 #[derive(Default)]
 struct Pull {
     result: Mutex<Option<std::result::Result<bool, Shared>>>,
@@ -228,6 +268,9 @@ impl Images {
     }
 
     /// The key includes tenant, credential and store, so no tenant or rotated credential inherits another's auth check.
+    /// An anonymous pull into the shared store is the exception: it carries no authority to check (the shared store
+    /// holds only what is anonymously pullable and a digest names immutable content), so it shares one download with
+    /// every tenant and with the prefetch of the same digest.
     #[allow(clippy::too_many_arguments)]
     pub fn pull_for_tenant(
         &self,
@@ -240,12 +283,19 @@ impl Images {
         cancel: &Cancel,
     ) -> Result<bool> {
         validate_pinned_reference(image)?;
+        let anonymous = credential == [0; 32]
+            && *store == podman::Store::Shared
+            && authfile == self.inner.anonymous_authfile;
         self.pull_keyed(
-            PullKey {
-                image: image.into(),
-                tenant: Some(tenant),
-                credential,
-                store: store.clone(),
+            if anonymous {
+                PullKey::anonymous(image)
+            } else {
+                PullKey {
+                    image: image.into(),
+                    tenant: Some(tenant),
+                    credential,
+                    store: store.clone(),
+                }
             },
             image,
             authfile,
@@ -322,10 +372,17 @@ impl Images {
         key: &PullKey,
         image: &str,
         authfile: &Path,
-        slot: &Pull,
+        slot: &Arc<Pull>,
         timeout: Duration,
         cancel: &Cancel,
     ) -> Result<bool> {
+        // However the download ends, even by a panic, the slot is answered and released (see [`Leading`]).
+        let mut leading = Leading {
+            images: self,
+            key,
+            slot,
+            answered: false,
+        };
         let outcome = (self.inner.download)(image, authfile, &key.store, timeout, cancel);
         if outcome.is_ok() && key.store == podman::Store::Shared {
             self.record(image);
@@ -335,11 +392,7 @@ impl Images {
             Err(_) if cancel.load(Ordering::Acquire) => Err(Shared::Abandoned),
             other => other.as_ref().copied().map_err(Shared::of),
         };
-        *slot.result.lock().unwrap_or_else(|p| p.into_inner()) = Some(shared);
-        slot.done.notify_all();
-        let mut state = self.state();
-        state.pulling.remove(key);
-        state.prefetching.remove(key);
+        leading.answer(shared);
         outcome
     }
 
@@ -716,6 +769,222 @@ mod tests {
         assert_eq!(images.in_flight(), 0, "no slot left behind");
         assert!(images.holds(DIGEST));
         assert_eq!(images.held(), vec![DIGEST.to_string()]);
+    }
+
+    fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            assert!(Instant::now() < deadline, "{what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_panicking_download_does_not_strand_followers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let go = Arc::new(AtomicBool::new(false));
+        let images = Images::with_download({
+            let (calls, go) = (Arc::clone(&calls), Arc::clone(&go));
+            move |_, _, _, _, _| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    while !go.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    panic!("injected download panic");
+                }
+                Ok(true)
+            }
+        });
+        let leader = {
+            let (images, cancel) = (images.clone(), cancel());
+            thread::spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    images.pull(IMAGE, Duration::from_secs(30), &cancel)
+                }))
+            })
+        };
+        wait_for("the leader never registered", || {
+            images.attempt_pulls() == 1
+        });
+        let follower = {
+            let (images, cancel) = (images.clone(), cancel());
+            // Short enough to fail the test quickly if the follower is left waiting on a result that never comes.
+            thread::spawn(move || images.pull(IMAGE, Duration::from_secs(5), &cancel))
+        };
+        wait_for("the follower never parked", || images.followers(IMAGE) == 1);
+        let started = Instant::now();
+        go.store(true, Ordering::Release);
+        assert!(leader.join().unwrap().is_err(), "the download panicked");
+        assert!(
+            follower.join().unwrap().unwrap(),
+            "the follower pulled for itself"
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(images.in_flight(), 0, "no slot left behind");
+    }
+
+    #[test]
+    fn a_late_leader_does_not_remove_a_newer_slot() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx_a, rx_a) = mpsc::channel::<()>();
+        let (tx_b, rx_b) = mpsc::channel::<()>();
+        let gates = Arc::new(Mutex::new(vec![rx_b, rx_a]));
+        let images = Images::with_download({
+            let (calls, gates) = (Arc::clone(&calls), Arc::clone(&gates));
+            move |_, _, _, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let gate = gates.lock().unwrap().pop();
+                if let Some(gate) = gate {
+                    let _ = gate.recv();
+                }
+                Ok(false)
+            }
+        });
+        let first = {
+            let (images, cancel) = (images.clone(), cancel());
+            thread::spawn(move || images.pull(IMAGE, Duration::from_secs(30), &cancel))
+        };
+        wait_for("the first leader never registered", || {
+            images.attempt_pulls() == 1
+        });
+        // A follower whose own deadline passes drops the leader's slot, as it must.
+        assert!(matches!(
+            images.pull(IMAGE, Duration::from_millis(100), &cancel()),
+            Err(Error::Timeout("image pull"))
+        ));
+        assert_eq!(images.attempt_pulls(), 0);
+        let second = {
+            let (images, cancel) = (images.clone(), cancel());
+            thread::spawn(move || images.pull(IMAGE, Duration::from_secs(30), &cancel))
+        };
+        wait_for("the second leader never registered", || {
+            images.attempt_pulls() == 1
+        });
+        // The first leader finishes late. The slot under the key is the second leader's, and stays.
+        tx_a.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        assert_eq!(
+            images.attempt_pulls(),
+            1,
+            "a late leader removed the newer leader's slot"
+        );
+        let third = {
+            let (images, cancel) = (images.clone(), cancel());
+            thread::spawn(move || images.pull(IMAGE, Duration::from_secs(30), &cancel))
+        };
+        wait_for("the third caller never parked", || {
+            images.followers(IMAGE) == 1
+        });
+        tx_b.send(()).unwrap();
+        second.join().unwrap().unwrap();
+        third.join().unwrap().unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the third caller started a duplicate pull"
+        );
+        assert_eq!(images.in_flight(), 0);
+    }
+
+    #[test]
+    fn anonymous_tenants_share_one_download_and_join_a_prefetch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let images = Images::with_download({
+            let (calls, release) = (Arc::clone(&calls), Arc::clone(&release));
+            move |_, _, _, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                Ok(false)
+            }
+        });
+        let anonymous = images.anonymous_authfile().to_path_buf();
+        let prefetch = {
+            let images = images.clone();
+            thread::spawn(move || images.prefetch(IMAGE, Duration::from_secs(30), &cancel()))
+        };
+        wait_for("the prefetch never registered", || images.in_flight() == 1);
+        let tenants: Vec<_> = [[1; 16], [2; 16], [3; 16]]
+            .into_iter()
+            .map(|tenant| {
+                let (images, anonymous) = (images.clone(), anonymous.clone());
+                thread::spawn(move || {
+                    images.pull_for_tenant(
+                        IMAGE,
+                        tenant,
+                        [0; 32],
+                        &anonymous,
+                        &podman::Store::Shared,
+                        Duration::from_secs(30),
+                        &cancel(),
+                    )
+                })
+            })
+            .collect();
+        wait_for("the tenants never joined the prefetch", || {
+            images.followers(IMAGE) == 3
+        });
+        release.store(true, Ordering::Release);
+        for tenant in tenants {
+            tenant.join().unwrap().unwrap();
+        }
+        prefetch.join().unwrap().unwrap().unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "three tenants and a prefetch made one download"
+        );
+        assert_eq!(images.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_zero_credential_with_a_real_authfile_or_a_private_store_is_never_shared() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let images = Images::with_download({
+            let (calls, release) = (Arc::clone(&calls), Arc::clone(&release));
+            move |_, _, _, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                Ok(false)
+            }
+        });
+        let private = podman::Store::Private {
+            graph: PathBuf::from("/g"),
+            run: PathBuf::from("/r"),
+        };
+        let anonymous = images.anonymous_authfile().to_path_buf();
+        let pull = |tenant: u8, authfile: PathBuf, store: podman::Store| {
+            let images = images.clone();
+            thread::spawn(move || {
+                images.pull_for_tenant(
+                    IMAGE,
+                    [tenant; 16],
+                    [0; 32],
+                    &authfile,
+                    &store,
+                    Duration::from_secs(30),
+                    &cancel(),
+                )
+            })
+        };
+        let callers = [
+            pull(1, anonymous.clone(), podman::Store::Shared),
+            pull(2, PathBuf::from("real-auth.json"), podman::Store::Shared),
+            pull(3, anonymous, private),
+        ];
+        wait_for("three separate downloads", || {
+            calls.load(Ordering::SeqCst) == 3
+        });
+        release.store(true, Ordering::Release);
+        for caller in callers {
+            caller.join().unwrap().unwrap();
+        }
     }
 
     #[test]

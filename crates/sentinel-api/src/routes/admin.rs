@@ -527,6 +527,10 @@ fn deployment_storage(state: &State, request: &Request) -> Route {
                 "deleted_copies": r.deleted_copies.load(Relaxed),
                 "aborted_uploads": r.aborted_uploads.load(Relaxed),
                 "local_faults": r.local_faults.load(Relaxed),
+                "parked_items": r.parked_items.load(Relaxed),
+                "parked_objects": r.parked_objects.load(Relaxed),
+                "parked_bytes": r.parked_bytes.load(Relaxed),
+                "last_refusal": r.last_refusal.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             })
         }),
     }))

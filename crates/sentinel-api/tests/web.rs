@@ -202,6 +202,10 @@ fn attempt_steps_report_measured_phases_and_leave_the_unmeasured_out() {
     assert_eq!((status, body["present"].as_bool()), (200, Some(false)));
     let (_, page) = get(&f, &format!("/api/v1/attempts/{beta}/logs?step=0"), &f.auth);
     assert_eq!(page["step_done"], true);
+    assert!(
+        page["next"].is_string(),
+        "a live page names its cursor: {page}"
+    );
     let (_, page) = get(
         &f,
         &format!("/api/v1/attempts/{}/logs?step=0", f.live.2),
@@ -1079,6 +1083,8 @@ fn storage_policy_is_administered_per_level_and_an_expired_log_says_so() {
     let (status, body) = get(&f, &format!("/api/v1/attempts/{alpha}/logs"), &f.auth);
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["expired_ms"], 2);
+    // `next` is optional in web/src/lib/types.ts because this reply has none.
+    assert!(body.get("next").is_none(), "{body}");
     assert_eq!(body["frames"].as_array().map(Vec::len), Some(0));
     assert_eq!(body["complete"], true);
     let (status, body) = get(
@@ -1205,6 +1211,26 @@ fn a_full_external_copy_backlog_is_what_the_queue_and_the_storage_report_say() {
     assert_eq!(body["admission_open"], false);
     assert_eq!(body["s3"]["state"], "degraded");
     assert_eq!(body["s3"]["backlog_full"], true);
+    // Skipped objects are visible beside a healthy-looking copy: in the status and as metrics.
+    status
+        .local_faults
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+    status
+        .parked_items
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    let (_, body) = get(&f, "/api/v1/admin/storage", &f.auth);
+    assert_eq!(body["s3"]["local_faults"], 3);
+    assert_eq!(body["s3"]["parked_items"], 2);
+    let (_, _, text) = call(
+        &f.base,
+        "GET",
+        "/metrics",
+        None,
+        &[("authorization", &f.auth)],
+    );
+    let text = text.as_str().expect("text exposition");
+    assert!(text.contains("sentinel_s3_local_faults_total 3"), "{text}");
+    assert!(text.contains("sentinel_s3_parked_items 2"), "{text}");
 
     admission.set_backlog_full(false);
     assert_eq!(reasons(), before);
@@ -1306,4 +1332,200 @@ fn metrics_readiness_and_the_diagnostic_bundle() {
     }
     let (_, without) = get(&f, "/api/v1/admin/diagnostics", &f.auth);
     assert_eq!(without["integrity"], "not checked");
+}
+
+fn wait_until(what: &str, done: &dyn Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !done() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} never happened"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+fn count(f: &Fixture, sql: &'static str) -> i64 {
+    f.store
+        .read(|c| Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))?))
+        .unwrap()
+}
+
+/// A pass that finds a full batch of work goes on, a round at a time, instead of leaving the rest to the next interval: at 256
+/// rows per five minutes a deployment finishing more than about 3,000 attempts an hour would never catch up with its own expiry.
+#[test]
+fn the_maintenance_pass_drains_more_than_one_batch() {
+    let f = Fixture::new(1);
+    let (alpha, _) = f.attempts["alpha"];
+    f.store
+        .writer()
+        .write(move |tx| {
+            // A thousand finished attempts whose logs fell due long ago.
+            tx.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000)
+                 INSERT INTO attempts(id, tenant_id, job_id, fence, worker_id, lease_until_ms, released_ms, log_expires_ms)
+                 SELECT unhex(printf('%08x000040008000%012x', n.i, n.i)), a.tenant_id, a.job_id, 10000 + n.i,
+                        a.worker_id, a.lease_until_ms, a.released_ms, 1
+                 FROM n, attempts a WHERE a.id = ?1",
+                [alpha.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let acme = f.acme;
+    f.store
+        .writer()
+        .write(move |tx| {
+            // Six hundred unreferenced objects that passed their grace long ago.
+            tx.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 600)
+                 INSERT INTO objects(tenant_id, digest, len, created_ms)
+                 SELECT ?1, randomblob(32), 1, 1 FROM n",
+                [acme.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) FROM objects WHERE created_ms = 1"),
+        600
+    );
+
+    // One pass only: the next is an hour away.
+    f.controller
+        .set_storage_policy(sentinel_link::controller::StoragePolicy {
+            interval_ms: 3_600_000,
+        });
+    wait_until("the expiry of every due log", &|| {
+        count(
+            &f,
+            "SELECT COUNT(*) FROM attempts WHERE log_expires_ms = 1 AND log_expired_ms IS NULL",
+        ) == 0
+    });
+    wait_until("the reclaim of every unreferenced object", &|| {
+        count(&f, "SELECT COUNT(*) FROM objects WHERE created_ms = 1") == 0
+    });
+}
+
+/// A backup holds the maintenance lock for its whole run and the pass it keeps out did not happen: it is tried again at the next
+/// tick, not after a full interval.
+#[test]
+fn a_pass_a_backup_kept_out_runs_as_soon_as_the_backup_ends() {
+    let f = Fixture::new(1);
+    let (alpha, _) = f.attempts["alpha"];
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE attempts SET log_expires_ms = 1 WHERE id = ?1",
+                [alpha.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let expired = || {
+        f.store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT log_expired_ms IS NOT NULL FROM attempts WHERE id = ?1",
+                    [alpha.as_bytes().as_slice()],
+                    |r| r.get::<_, bool>(0),
+                )?)
+            })
+            .unwrap()
+    };
+
+    let backup = f.objects.hold_maintenance();
+    f.controller
+        .set_storage_policy(sentinel_link::controller::StoragePolicy {
+            interval_ms: 3_600_000,
+        });
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    assert!(
+        !expired(),
+        "nothing is deleted while a backup holds the lock"
+    );
+    drop(backup);
+    wait_until("the pass the backup kept out", &expired);
+}
+
+struct LostObjects(Value);
+
+impl sentinel_store::backup::Control for LostObjects {
+    fn trigger(&self) -> bool {
+        false
+    }
+    fn status(&self) -> Value {
+        self.0.clone()
+    }
+    fn target(&self) -> &std::path::Path {
+        std::path::Path::new("backups")
+    }
+}
+
+/// A backup that finished but recorded objects it could not copy is still a recovery point with a hole in it.
+#[test]
+fn a_backup_that_recorded_lost_objects_is_reported_as_incomplete() {
+    let readiness = |f: &Fixture| -> Vec<String> {
+        let (status, _, body) = call(&f.base, "GET", "/api/v1/ready", None, &[]);
+        assert_eq!(status, 200, "{body}");
+        body["degraded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    };
+    let lost_gauge = |f: &Fixture| -> Option<f64> {
+        let (_, _, body) = call(
+            &f.base,
+            "GET",
+            "/metrics",
+            None,
+            &[("authorization", &f.auth)],
+        );
+        let text = body.as_str().expect("text exposition").to_owned();
+        text.lines()
+            .find(|l| l.starts_with("sentinel_backup_last_objects_lost "))
+            .and_then(|l| l.rsplit(' ').next()?.parse().ok())
+    };
+    let status = |corrupt: u64, missing: u64| {
+        json!({
+            "last_success_ms": 1,
+            "last_failure": null,
+            "last_backup": { "objects_corrupt": corrupt, "objects_missing": missing },
+        })
+    };
+
+    let hole = Fixture::new(1);
+    hole.objects
+        .set_backups(std::sync::Arc::new(LostObjects(status(1, 2))));
+    assert_eq!(lost_gauge(&hole), Some(3.0));
+    let degraded = readiness(&hole);
+    assert!(
+        degraded.contains(&"backup_incomplete".to_owned()),
+        "{degraded:?}"
+    );
+    assert!(
+        !degraded.contains(&"backup_failing".to_owned()),
+        "{degraded:?}"
+    );
+
+    let whole = Fixture::new(1);
+    whole
+        .objects
+        .set_backups(std::sync::Arc::new(LostObjects(status(0, 0))));
+    assert_eq!(lost_gauge(&whole), Some(0.0));
+    assert!(!readiness(&whole).contains(&"backup_incomplete".to_owned()));
+
+    // Before any backup has finished there is nothing to report, and the gauge is absent rather than zero.
+    let none = Fixture::new(1);
+    none.objects
+        .set_backups(std::sync::Arc::new(LostObjects(json!({
+            "last_success_ms": null,
+            "last_failure": null,
+            "last_backup": null,
+        }))));
+    assert_eq!(lost_gauge(&none), None);
+    assert!(!readiness(&none).contains(&"backup_incomplete".to_owned()));
 }

@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { api } from "../../../../lib/api.ts";
+import { ApiError, api } from "../../../../lib/api.ts";
 import { cpu, fmtBytes, fmtMs, shortId, words } from "../../../../lib/format.ts";
 import { loadRepos } from "../../../../lib/repos.ts";
 import { useLoaded } from "../../../../lib/hooks.ts";
@@ -42,9 +42,18 @@ function explain(r: Waiting["reason"]) {
 
 const readQueue = (slug: string) => api<Queue>(`/api/v1/queue?tenant=${encodeURIComponent(slug)}&limit=200`);
 
+// The queue is the tenant members' view: a platform administrator who is not a member of the tenant gets the
+// controller's `not_found`, which the page shows as an empty queue instead of an error route.
+const EMPTY: Queue = { jobs: [], total: 0, truncated: false, placement_paused: null };
+const readQueueOrEmpty = (slug: string) =>
+  readQueue(slug).catch((e: unknown) => {
+    if (e instanceof ApiError && e.code === "not_found") return EMPTY;
+    throw e;
+  });
+
 export const Route = createFileRoute("/_app/t/$slug/queue")({
   loader: async ({ params }) => {
-    const [repos, queue] = await Promise.all([loadRepos(params.slug), readQueue(params.slug)]);
+    const [repos, queue] = await Promise.all([loadRepos(params.slug), readQueueOrEmpty(params.slug)]);
     return { repos, queue };
   },
   head: ({ params }) => ({ meta: [{ title: `Queue · ${params.slug} · Sentinel` }] }),
@@ -56,7 +65,7 @@ function QueueView() {
   const loaded = Route.useLoaderData();
   const [queue, setQueue] = useLoaded(loaded.queue);
   const names = new Map(loaded.repos.repos.map((r) => [r.id, r.name]));
-  useInterval(() => { readQueue(slug).then(setQueue, () => {}); }, 5000);
+  useInterval(() => { readQueueOrEmpty(slug).then(setQueue, () => {}); }, 5000);
 
   return (
     <Page id="queue" title={`Queue · ${slug}`}>

@@ -3,8 +3,9 @@ import type { DeploymentStorage } from "../../lib/types";
 import { api } from "../../lib/api.ts";
 import { act } from "../../lib/act.tsx";
 import { refreshTenants, useSession } from "../../lib/session.ts";
-import { useLoaded } from "../../lib/hooks.ts";
+import { attempt, useLoad, type Load } from "../../lib/loaded.ts";
 import { fmtBytes } from "../../lib/format.ts";
+import { LoadFailed } from "../LoadFailed.tsx";
 import { StateBadge } from "../StateBadge.tsx";
 import { StoragePolicyForm, type StoragePolicyBody } from "../StoragePolicyForm.tsx";
 import { Button, DialogModal, Field, Input, Table, TextLink } from "../ui.tsx";
@@ -15,20 +16,20 @@ interface TenantRow {
   quota_bytes: number | null; quota_set: boolean; log_retention_ms?: number | null; artifact_retention_ms?: number | null;
 }
 export interface TenantsPage { tenants: TenantRow[]; next: string | null }
-export interface TenantsLoad { page: TenantsPage | null; deployment: DeploymentStorage | null }
+export interface TenantsLoad { page: Load<TenantsPage>; deployment: Load<DeploymentStorage> }
 
 const readTenants = (after: string | null) => api<TenantsPage>(`/api/v1/admin/tenants?limit=50${after ? `&after=${encodeURIComponent(after)}` : ""}`);
 export async function loadTenants(): Promise<TenantsLoad> {
-  const [page, deployment] = await Promise.all([readTenants(null).catch(() => null), api<DeploymentStorage>("/api/v1/admin/storage").catch(() => null)]);
+  const [page, deployment] = await Promise.all([attempt(() => readTenants(null)), attempt(() => api<DeploymentStorage>("/api/v1/admin/storage"))]);
   return { page, deployment };
 }
 
 export function Tenants({ initial }: { initial: TenantsLoad }) {
   const { me } = useSession();
-  const [data, setData] = useLoaded(initial.page);
+  const { data, setData, failure } = useLoad(initial.page);
   const [after, setAfter] = useState<string | null>(null);
   const refresh = (at = after) => readTenants(at).then(setData, () => {});
-  const deployment = initial.deployment;
+  const deployment = initial.deployment.value;
   const [quotas, setQuotas] = useState<Record<string, string>>({});
   const [slug, setSlug] = useState("");
   const [editing, setEditing] = useState<TenantRow | null>(null);
@@ -80,7 +81,7 @@ export function Tenants({ initial }: { initial: TenantsLoad }) {
     <>
       <section aria-labelledby="tenants-h" className="space-y-3">
         <h2 id="tenants-h" className="text-base font-semibold text-strong">Tenants</h2>
-        <Table caption="Tenants">
+        {failure ? <LoadFailed what="the tenants" words={failure} /> : <Table caption="Tenants">
           <thead><tr><th>Tenant</th><th>Kind</th><th>State</th><th>Members</th><th>Storage</th><th>Quota</th><th>Actions</th></tr></thead>
           <tbody>
             {tenants.length ? tenants.map((t) => (
@@ -115,7 +116,7 @@ export function Tenants({ initial }: { initial: TenantsLoad }) {
               </tr>
             )) : <tr><td colSpan={7} className="text-center text-muted">No data</td></tr>}
           </tbody>
-        </Table>
+        </Table>}
         <div className="flex gap-2">
           {after ? <Button color="neutral" variant="outline" label="First page" onClick={() => page(null)} /> : null}
           {data?.next ? <Button color="neutral" variant="outline" label="Next page" trailingIcon="arrow-right" onClick={() => page(data.next)} /> : null}

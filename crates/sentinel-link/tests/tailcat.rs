@@ -1476,3 +1476,67 @@ fn revoking_a_bound_worker_stops_the_helper_serving_its_key_and_a_second_worker_
     assert_eq!(admitted(), remaining);
     server.shutdown();
 }
+
+/// Admin commands and the controller's tick edit the list from separate processes; threads share
+/// the file the same way, so every read-modify-write must exclude the others.
+#[test]
+fn concurrent_allow_list_edits_lose_no_admission_and_leave_no_staging_file() {
+    const WRITERS: u64 = 6;
+    const EACH: u64 = 20;
+    let dir = tempfile::tempdir().unwrap();
+    let live = WorkerId::new();
+    let dead = WorkerId::new();
+    let nodekey = |n: u64| key(&format!("{n:064x}"));
+
+    std::thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let path = dir.path();
+            let nodekey = &nodekey;
+            scope.spawn(move || {
+                for i in 0..EACH {
+                    let admission = Admission {
+                        key: nodekey(1 + writer * EACH + i),
+                        worker: live,
+                    };
+                    assert!(tailcat::admit(path, &admission).unwrap());
+                }
+            });
+        }
+        let path = dir.path();
+        let nodekey = &nodekey;
+        scope.spawn(move || {
+            for i in 0..100 {
+                let admission = Admission {
+                    key: nodekey(10_000 + i),
+                    worker: dead,
+                };
+                assert!(tailcat::admit(path, &admission).unwrap());
+                assert!(tailcat::revoke(path, dead).unwrap() >= 1);
+            }
+        });
+    });
+
+    let listed = tailcat::allow_list(dir.path()).unwrap();
+    assert_eq!(listed.len() as u64, WRITERS * EACH, "an edit was lost");
+    for n in 1..=WRITERS * EACH {
+        assert!(
+            listed.contains(&Admission {
+                key: nodekey(n),
+                worker: live
+            }),
+            "admission {n} is missing"
+        );
+    }
+    assert!(listed.iter().all(|line| line.worker == live));
+    let stray: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(stray.is_empty(), "staging files left: {stray:?}");
+    assert_eq!(
+        mode(&dir.path().join(tailcat::ALLOW_LIST_LOCK_FILE)),
+        0o600,
+        "the lock file is owner-only"
+    );
+}

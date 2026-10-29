@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+. "$(dirname "$0")/../lib.sh"
+fake_start cargo "$@"
+offline=0
+for a in "$@"; do [ "$a" = --offline ] && offline=1; done
+case "${1:-}" in
+  generate-lockfile) touch Cargo.lock; exit 0 ;;
+  -V|--version) echo "cargo fake"; exit 0 ;;
+  build)
+    if [ $offline = 1 ] && ! has_files "${CARGO_HOME:?}/registry"; then
+      echo "error: no matching package found offline: the registry cache is empty" >&2; exit 1
+    fi
+    [ $offline = 1 ] || populate "$CARGO_HOME/registry" 3
+    populate "${CARGO_TARGET_DIR:?}/debug" 4 ;;
+  test) has_files "${CARGO_TARGET_DIR:?}/debug" || { echo "error: nothing built" >&2; exit 1; } ;;
+esac

@@ -36,7 +36,25 @@ fn test_key() -> &'static str {
         String::from_utf8(out.stdout).expect("PEM is ASCII")
     })
 }
-const KEY_CANARY: &str = "lfnygBuVfX5FiM4XtRB7CajdRR18a6A";
+/// Any copy of the private key, whatever its encoding, starts with this line.
+const PEM_MARKER: &str = "-----BEGIN PRIVATE KEY-----";
+/// A run of the private key's body, taken from a line of random key material (the first body lines of a PKCS#8
+/// key are the same in every key), so it is in the key and in nothing else. Derived from the generated key: a
+/// constant copied from another key could never occur anywhere and the scan below would pass without scanning.
+fn key_canary() -> &'static str {
+    static CANARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CANARY.get_or_init(|| {
+        let body: Vec<&str> = test_key()
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let line = body
+            .get(7)
+            .expect("a 2048-bit key has more than 7 body lines");
+        assert!(line.len() >= 48, "{} base64 characters", line.len());
+        line[..40].to_owned()
+    })
+}
 const CLIENT_SECRET: &str = "client-secret-canary-6f1d2a9e0b7c4d3e8f5a";
 const WEBHOOK_SECRET: &str = "webhook-secret-canary-3e9f0a1b2c7d4e5f6a8b";
 
@@ -207,6 +225,15 @@ fn a_stored_app_is_in_force_at_start_and_no_log_line_carries_its_secrets() {
             .unwrap();
     }
 
+    // The positive control: every scanned value is in what was stored, so a scan that finds nothing means it.
+    for canary in [key_canary(), PEM_MARKER] {
+        assert!(
+            test_key().contains(canary),
+            "{canary} is not in the stored key"
+        );
+    }
+    assert_eq!(key_canary().len(), 40);
+
     let mut server = Server::spawn(temp.path(), &data);
     let listening = server.event("api_listening");
     let base = format!("http://{}", listening["fields"]["addr"].as_str().unwrap());
@@ -262,7 +289,7 @@ fn a_stored_app_is_in_force_at_start_and_no_log_line_carries_its_secrets() {
 
     let lines = server.stop();
     assert!(!lines.is_empty());
-    for canary in [KEY_CANARY, CLIENT_SECRET, WEBHOOK_SECRET] {
+    for canary in [key_canary(), PEM_MARKER, CLIENT_SECRET, WEBHOOK_SECRET] {
         assert!(
             !lines.iter().any(|line| line.contains(canary)),
             "{canary} in the controller's output"

@@ -346,6 +346,16 @@ pub fn sweep_expired(
     now: UnixMillis,
     limit: i64,
 ) -> Result<Vec<objects::Doomed>> {
+    Ok(sweep_expired_counted(tx, objects, now, limit)?.0)
+}
+
+/// Like [`sweep_expired`], and also how many artifacts it deleted: a count equal to `limit` means more may be due.
+pub fn sweep_expired_counted(
+    tx: &Transaction<'_>,
+    objects: &Objects,
+    now: UnixMillis,
+    limit: i64,
+) -> Result<(Vec<objects::Doomed>, usize)> {
     type Due = (Vec<u8>, Vec<u8>, Vec<u8>, String, Option<i64>);
     let due: Vec<Due> = tx
         .prepare(
@@ -356,6 +366,7 @@ pub fn sweep_expired(
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
         .collect::<std::result::Result<_, _>>()?;
+    let expired = due.len();
     let mut paths = Vec::new();
     for (id, tenant, job, name, version) in due {
         if let Some(version) = version {
@@ -379,5 +390,5 @@ pub fn sweep_expired(
             params![id.as_slice()],
         )?;
     }
-    Ok(paths)
+    Ok((paths, expired))
 }

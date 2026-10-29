@@ -1,0 +1,26 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "log-ack",
+  "revision": 1,
+  "harness": {
+    "example": "log-ack-bench",
+    "build": "cargo build --release --locked -p sentinel-store --example log-ack-bench"
+  },
+  "run": {
+    "args": ["--frames", "4096", "--frame-bytes", "256", "--rounds", "5", "--bursts", "1,8,64,256"],
+    "smoke_args": ["--frames", "256", "--frame-bytes", "256", "--rounds", "2", "--bursts", "1,8,64"],
+    "dir": true
+  },
+  "ordering": {
+    "scheme": "abba",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/log-ack/1",
+    "out": "bench/log-ack.jsonl"
+  },
+  "notes": "Burst order reverses every round (ABBA); no random order, so no seed. DIR must sit on the file system under test."
+}

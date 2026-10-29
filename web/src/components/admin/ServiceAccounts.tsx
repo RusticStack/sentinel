@@ -4,9 +4,10 @@ import { api } from "../../lib/api.ts";
 import { act } from "../../lib/act.tsx";
 import { useSession } from "../../lib/session.ts";
 import { useOverride } from "../../lib/override.ts";
-import { useLoaded } from "../../lib/hooks.ts";
+import { attempt, useLoad, type Load } from "../../lib/loaded.ts";
 import { loadRepos, type RepoList } from "../../lib/repos.ts";
 import { shortId } from "../../lib/format.ts";
+import { LoadFailed } from "../LoadFailed.tsx";
 import { showOnce } from "../ShowOnceDialog.tsx";
 import { RelTime } from "../RelTime.tsx";
 import { Badge, Button, Empty, Field, Icon, Input, Select, Table } from "../ui.tsx";
@@ -15,7 +16,7 @@ import { confirmChange } from "./Confirm.tsx";
 
 // The refresh token is shown once and never again.
 interface Accounts { accounts: Member[]; partial: boolean }
-export interface ServiceAccountsLoad { accounts: Accounts | null; repos: RepoList | null }
+export interface ServiceAccountsLoad { accounts: Load<Accounts>; repos: Load<RepoList> }
 
 const ROLES = [{ label: "Operator (runs)", value: "operator" }, { label: "Reader", value: "reader" }];
 const ACCESS = [{ label: "Read", value: "read" }, { label: "Run", value: "run" }];
@@ -34,16 +35,16 @@ async function readAccounts(slug: string): Promise<Accounts> {
 }
 
 export async function loadServiceAccounts(slug: string): Promise<ServiceAccountsLoad> {
-  const [accounts, repos] = await Promise.all([readAccounts(slug).catch(() => null), loadRepos(slug).catch(() => null)]);
+  const [accounts, repos] = await Promise.all([attempt(() => readAccounts(slug)), attempt(() => loadRepos(slug))]);
   return { accounts, repos };
 }
 
 export function ServiceAccounts({ slug, initial }: { slug: string; initial: ServiceAccountsLoad }) {
   const { me } = useSession();
   const { ready, withReason } = useOverride(slug);
-  const [data, setData] = useLoaded(initial.accounts);
+  const { data, setData, failure } = useLoad(initial.accounts);
   const refresh = () => readAccounts(slug).then(setData, () => {});
-  const repos = initial.repos?.repos ?? [];
+  const repos = initial.repos.value?.repos ?? [];
   const [name, setName] = useState("");
   const [role, setRole] = useState("operator");
 
@@ -62,13 +63,14 @@ export function ServiceAccounts({ slug, initial }: { slug: string; initial: Serv
       <section aria-labelledby="sa-h" className="space-y-3">
         <h2 id="sa-h" className="text-base font-semibold text-strong">Service accounts</h2>
         <p className="text-sm text-muted">Automation that runs pipelines or reads results without a person's account. Each credential is a refresh token the agent imports; it lasts until it expires or is revoked.</p>
-        {!data?.accounts.length ? (
+        {failure ? <LoadFailed what="the service accounts" words={failure} /> : !data?.accounts.length ? (
           <Empty icon="bot" title="No service accounts yet" description="Create one below, give it access to a repository, then issue it a credential." />
         ) : (
           <div className="grid gap-3 lg:grid-cols-2">
             {data.accounts.map((m) => <AccountCard key={m.user} slug={slug} account={m} repos={repos} />)}
           </div>
         )}
+        {initial.repos.failure ? <LoadFailed what="the repositories (repository access and credentials limited to a repository are unavailable)" words={initial.repos.failure} /> : null}
         {data?.partial ? <p className="text-sm text-muted">Only service accounts among the first 100 members are shown.</p> : null}
       </section>
 

@@ -4,6 +4,10 @@
 
 use std::sync::{Arc, Mutex};
 
+#[path = "support/github_app.rs"]
+mod support;
+use support::{CLIENT_SECRET, WEBHOOK_SECRET, test_key};
+
 use sentinel_core::{
     TenantId, UnixMillis, UserId,
     auth::{Namespace, Permissions as P, Principal, Role},
@@ -23,31 +27,6 @@ use serde_json::{Value, json};
 const PASSWORD: &str = "correct horse battery staple";
 const PUBLIC_URL: &str = "https://ci.example.com";
 const APP_ID: u64 = 4242;
-/// A test-only RSA key generated fresh for this process with the `openssl` CLI; it authenticates nothing and no
-/// private key is committed (see `no_committed_keys` in the `sentinel` crate tests).
-fn test_key() -> &'static str {
-    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    KEY.get_or_init(|| {
-        let out = std::process::Command::new("openssl")
-            .args([
-                "genpkey",
-                "-algorithm",
-                "RSA",
-                "-pkeyopt",
-                "rsa_keygen_bits:2048",
-            ])
-            .output()
-            .expect("the openssl CLI must be installed to generate the test-only App key");
-        assert!(out.status.success(), "openssl genpkey failed");
-        String::from_utf8(out.stdout).expect("PEM is ASCII")
-    })
-}
-/// A run of the private key's body: present in GitHub's answer, never anywhere else.
-const KEY_CANARY: &str = "lfnygBuVfX5FiM4XtRB7CajdRR18a6A";
-const CLIENT_SECRET: &str = "client-secret-canary-6f1d2a9e0b7c4d3e8f5a";
-const WEBHOOK_SECRET: &str = "webhook-secret-canary-3e9f0a1b2c7d4e5f6a8b";
-const CANARIES: [&str; 3] = [KEY_CANARY, CLIENT_SECRET, WEBHOOK_SECRET];
-
 type Seen = Arc<Mutex<Vec<String>>>;
 
 struct Deployment {
@@ -368,7 +347,7 @@ impl Deployment {
     }
 
     fn conversion(&self) -> String {
-        json!({
+        let body = json!({
             "id": APP_ID,
             "slug": "acme-ci",
             "node_id": "A_kwHO",
@@ -380,7 +359,10 @@ impl Deployment {
             "webhook_secret": WEBHOOK_SECRET,
             "pem": test_key(),
         })
-        .to_string()
+        .to_string();
+        // The positive control: the canaries are in what the fake serves, so the scans below can fail.
+        support::assert_present_in_source(&body);
+        body
     }
 
     /// Runs the whole platform-administrator half and returns the stepped-up session.
@@ -620,29 +602,21 @@ fn one_click_setup_puts_the_app_in_force_without_a_restart_and_leaks_no_secret()
 
 /// No answer, audit row or database byte outside the sealed columns holds a canary.
 fn assert_no_canary(d: &Deployment) {
-    let seen = d.seen.lock().unwrap().join("\n");
-    let audit = d.audit_details().join("\n");
-    for canary in CANARIES {
-        assert!(!seen.contains(canary), "{canary} in an HTTP answer");
-        assert!(!audit.contains(canary), "{canary} in the audit log");
-    }
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(d.dir.path()).unwrap() {
-        let path = entry.unwrap().path();
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name.starts_with("metadata.sqlite") {
-            files.push(std::fs::read(&path).unwrap());
-        }
-    }
-    assert!(!files.is_empty());
-    for bytes in files {
-        for canary in CANARIES {
-            assert!(
-                !bytes.windows(canary.len()).any(|w| w == canary.as_bytes()),
-                "{canary} in the database files"
-            );
-        }
-    }
+    support::assert_clean_text(
+        "an HTTP answer",
+        &d.seen.lock().unwrap().join(
+            "
+",
+        ),
+    );
+    support::assert_clean_text(
+        "the audit log",
+        &d.audit_details().join(
+            "
+",
+        ),
+    );
+    support::assert_clean_database(d.dir.path());
 }
 
 #[test]

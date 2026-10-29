@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+. "$(dirname "$0")/../lib.sh"
+fake_start npm "$@"
+case "${1:-}" in
+  -v|--version) echo "0.0.0-fake"; exit 0 ;;
+  install) printf '{"lockfileVersion":3}\n' > package-lock.json; exit 0 ;;
+  ci)
+    populate "${npm_config_cache:?}" 2
+    mkdir -p node_modules/.bin && printf '#!/bin/sh\n' > node_modules/.bin/tsc && populate node_modules/fake 3 ;;
+esac

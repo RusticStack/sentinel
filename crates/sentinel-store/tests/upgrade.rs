@@ -362,9 +362,10 @@ fn upgrade_sources() -> Vec<u32> {
 }
 
 #[test]
-fn every_readable_by_release_upgrades_and_the_rollback_matrix_matches_the_docs() {
-    // docs/upgrades.md: a database at schema N runs on release R only when no migration in
-    // (R, N] declares a readable_by above R. Rows are R, columns are N = 53, 55, 58, LATEST.
+fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expects() {
+    // docs/upgrades.md (tests/compat_doc.rs compares it with the code): a database at schema N
+    // runs on release R only when no migration in (R, N] declares a readable_by above R. Rows
+    // are R, columns are N = 53, 55, 58, LATEST.
     let readable = |db: &Connection, release: u32, newest: u32| -> bool {
         let needs: u32 = db
             .query_row(
@@ -377,11 +378,11 @@ fn every_readable_by_release_upgrades_and_the_rollback_matrix_matches_the_docs()
     };
     assert_eq!(
         schema::LATEST,
-        63,
+        64,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
-    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 61, 62]);
+    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 62, 63]);
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.sqlite");
@@ -396,21 +397,23 @@ fn every_readable_by_release_upgrades_and_the_rollback_matrix_matches_the_docs()
         drop(store);
         assert_eq!(version(&path), schema::LATEST, "from {from}");
         let db = Connection::open(&path).unwrap();
-        let ok: Vec<bool> = [53, 55, 58, 63]
+        let ok: Vec<bool> = [53, 55, 58, 64]
             .iter()
             .map(|&newest| from >= newest || readable(&db, from, newest))
             .collect();
         // 44, 47 and 48 cannot run on schema 53 (migrations 46, 49 and 50 need 46, 48 and 50); 51 can
         // (52 and 53 are readable by 51) but not on 55 (54 needs 54); 56 and 57 are the targets of
         // migrations 57 and 58, so 57 runs on a database at 58 and 56 does not (58 needs 57); nothing
-        // runs on 63 below the migration's own schema (59 to 63 are readable by nothing older).
+        // runs on 64 below migration 63's own schema (59 to 63 are readable by nothing older), but 63
+        // runs on it (64 is readable by 63).
         let expected = match from {
             44 | 47 | 48 => [false, false, false, false],
             51 => [true, false, false, false],
             56 => [true, true, false, false],
-            57 | 61 | 62 => [true, true, true, false],
+            57 | 62 => [true, true, true, false],
+            63 => [true, true, true, true],
             _ => unreachable!(),
         };
-        assert_eq!(ok, expected, "release {from} on schemas 53, 55, 58, 63");
+        assert_eq!(ok, expected, "release {from} on schemas 53, 55, 58, 64");
     }
 }

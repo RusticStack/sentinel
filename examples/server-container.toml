@@ -7,7 +7,12 @@ log_format = "json"
 log_level = "info"
 listen = "0.0.0.0:7443"
 api_listen = "0.0.0.0:7080"
-# The URL clients reach the API at, once a reverse proxy terminates TLS (docs/deployment.md).
+# The public origin: exactly the address the reverse proxy serves, once it
+# terminates TLS (docs/deployment.md). Absent, the OAuth issuer and the links the
+# controller builds are http://0.0.0.0:7080, which no browser can use.
 # public_url = "https://ci.example.com"
-# The proxy's address as the container sees it (the network's gateway or the proxy container); loopback is the default.
-# trusted_proxies = ["10.89.0.0/24"]
+# The addresses the controller sees its proxies connect from, as the container
+# sees them. This is `web` in compose.server.yaml (its fixed address); without it
+# every browser behind `web` shares one rate-limit allowance. Add the proxy's
+# network if a proxy container reaches the controller directly. The default is loopback.
+trusted_proxies = ["10.89.77.10"]

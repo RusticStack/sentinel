@@ -39,6 +39,7 @@ import atexit
 import concurrent.futures
 import fcntl
 import hashlib
+import http.client
 import ipaddress
 import json
 import math
@@ -56,12 +57,33 @@ import urllib.error
 import urllib.request
 import uuid
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import benchstamp  # noqa: E402
+
 SCHEMA = "sentinel-bench/b09/1"
+# Rehearsal (B09_REHEARSAL=1): the harness runs unprivileged against the fake kit and the command shims of
+# bench/fake/b09 (bench/test_b09_rehearsal.py). It proves the orchestration, the cleanup symmetry and that the
+# assertions can fail; it measures nothing. Every record is marked simulated and rehearsal, and bench/b09-gate.py
+# refuses such a record as evidence. Without the variable none of the seams below changes anything.
+REHEARSAL = os.environ.get("B09_REHEARSAL") == "1"
 BENCH_USER = "benchmark"
 IMAGE = "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
 BRIDGE, SUBNET, BRIDGE_ADDR = "b09br", "10.99.0", "10.99.0.1"
 LINK_PORT, API_PORT, GIT_PORT = 47443, 47480, 47490
-LOCK = "/srv/sentinel/runs/p14.lock"
+if REHEARSAL:
+    BRIDGE_ADDR = "127.0.0.1"
+    LINK_PORT = int(os.environ.get("B09_PORT_BASE", "47800"))
+    API_PORT, GIT_PORT = LINK_PORT + 1, LINK_PORT + 2
+# A rehearsal against a fake that stops answering must not take the real scenarios' minutes to notice.
+REHEARSAL_CAP_S = float(os.environ.get("B09_TIMEOUT_CAP", "30"))
+
+
+def cap(seconds):
+    return min(seconds, REHEARSAL_CAP_S) if REHEARSAL else seconds
+
+
+# The one benchmark and verification lock of the host (scripts/qualify/qualify.sh and the b05 scripts take the same file).
+LOCK = os.environ.get("SENTINEL_VERIFY_LOCK") or "/var/tmp/sentinel-verify.lock"
 # The harness runs git as root against repositories it hands to the bench user; git refuses those as dubious ownership.
 # Local transport strips GIT_CONFIG_* before it starts receive-pack, so pushes carry the setting themselves.
 os.environ.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="safe.directory", GIT_CONFIG_VALUE_0="*")
@@ -207,7 +229,7 @@ def load_fleet(path):
         ip = ipaddress.ip_address(c.get("address", ""))
     except ValueError:
         raise SystemExit("fleet file: controller.address must be the IP address the worker hosts dial")
-    if ip.is_loopback or ip.is_unspecified:
+    if (ip.is_loopback and not REHEARSAL) or ip.is_unspecified:
         raise SystemExit("fleet file: controller.address must be reachable from the worker hosts, not loopback")
     wb = c.get("worker_bootstrap")
     if not isinstance(wb, dict) or not all(isinstance(wb.get(k), str) and wb[k] for k in ("release_url", "release_sums")):
@@ -332,6 +354,8 @@ def host_conditions(h):
 
 def settle_fleet(fleet, limit_s=900):
     """Every worker host, like the harness host, must be below the CPU pressure start limit."""
+    if REHEARSAL:
+        return
     deadline = time.monotonic() + limit_s
     while True:
         busy = [h["label"] for h in fleet["hosts"]
@@ -434,6 +458,8 @@ def conditions():
 
 
 def settle(limit_s=900):
+    if REHEARSAL:
+        return  # the rehearsal measures nothing, so it has no quiet start to wait for
     deadline = time.monotonic() + limit_s
     while time.monotonic() < deadline:
         p = psi("cpu")
@@ -444,27 +470,17 @@ def settle(limit_s=900):
 
 
 def stamp(source, binary, fleet=None):
-    def git(*args):
-        r = subprocess.run(["git", "-C", source, *args], capture_output=True, text=True)
-        return r.stdout.strip() if r.returncode == 0 else None
-    commit = git("rev-parse", "HEAD")
-    if commit is None:
-        raise SystemExit(f"cannot read the source commit of {source}; no record is written without it")
-    status = git("status", "--porcelain", "--untracked-files=no")
-    with open(binary, "rb") as f:
-        digest = hashlib.sha256(f.read()).hexdigest()
-    mem = field("/proc/meminfo", "MemTotal")
-    host = {"hostname": os.environ.get("SENTINEL_BENCH_HOST_LABEL") or None,
-            "kernel": read_first("/proc/sys/kernel/osrelease"),
-            "cpu_model": field("/proc/cpuinfo", "model name"), "cpus_online": os.cpu_count(),
-            "mem_total_kib": int(mem.split()[0]) if mem else None,
-            "cpu_governor": read_first("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
-            "shared_host": "all workers, the controller and the Git fixture run on this one host"}
+    """The build and host block of every record; bench/benchstamp.py refuses (before any scenario runs) a source
+    commit or dirty state git cannot report and a missing or malformed host label."""
+    label = benchstamp.host_label()
+    built = benchstamp.build(source, binary)
+    host = benchstamp.host(label)
+    host["shared_host"] = "all workers, the controller and the Git fixture run on this one host"
     if fleet:
         host["shared_host"] = ("the controller and the Git fixture run on this host; the workers run on the fleet's "
                                "hosts (see fleet), so this host's figures describe the control plane only")
-    return {"build": {"commit": commit, "dirty": None if status is None else bool(status), "binary_sha256": digest},
-            "host": {k: v for k, v in host.items() if v is not None}}
+    marks = {"simulated": True, "rehearsal": True} if REHEARSAL else {}
+    return {"build": built, "host": host, **marks}
 
 
 def percentile(sorted_values, q):
@@ -564,7 +580,7 @@ def make_fs(root, name, size_mb, slow_ms=None):
 
 def bench_env():
     uid = int(sh(["id", "-u", BENCH_USER]).stdout)
-    return {"HOME": f"/home/{BENCH_USER}", "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+    return {"HOME": os.environ["B09_BENCH_HOME"] if REHEARSAL else f"/home/{BENCH_USER}", "XDG_RUNTIME_DIR": f"/run/user/{uid}",
             "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
 
@@ -660,6 +676,7 @@ def log_events(path, name, offset=0):
 
 
 def wait_event(path, name, timeout=60, offset=0, count=1):
+    timeout = cap(timeout)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         ev, _ = log_events(path, name, offset)
@@ -961,13 +978,13 @@ class Deploy:
                 json.dump(rec, f)
             self.worker_host[wid.removeprefix("wrk_").replace("-", "")] = p["host"]
             self.worker_ids.append(wid)
-        deadline = time.monotonic() + 180
+        deadline = time.monotonic() + cap(180)
         while True:
             live = {w["id"] for w in self.get("/admin/workers?pool=shared")["workers"] if w.get("connected")}
             if set(self.worker_ids) <= live:
                 return
             if time.monotonic() > deadline:
-                raise RuntimeError(f"workers not connected within 180s: {sorted(set(self.worker_ids) - live)}")
+                raise RuntimeError(f"workers not connected in time: {sorted(set(self.worker_ids) - live)}")
             time.sleep(1)
 
     def up_fleet(self):
@@ -1001,6 +1018,10 @@ class Deploy:
         wait the retry_after_ms it names (1 s if none) and send again, counting retries for the run's record."""
         data = None if body is None else json.dumps(body).encode()
         deadline = time.monotonic() + 300
+        # Only a rehearsal waits for a refused connection (its fake controller restarts under a call). A real run
+        # fails at once: a crashed controller must not be waited on inside a timed window such as intake()'s ack,
+        # and a POST must not be sent twice after a lost answer.
+        down_deadline = time.monotonic() + (cap(120) if REHEARSAL else 0)
         while True:
             req = urllib.request.Request(self.api + path, data=data, method=method)
             req.add_header("authorization", f"Bearer {token or self.token}")
@@ -1014,6 +1035,10 @@ class Deploy:
                     raise
                 _RETRIES.n = getattr(_RETRIES, "n", 0) + 1
                 time.sleep(retry_after_ms(e.read()) / 1000)
+            except (urllib.error.URLError, ConnectionError, http.client.HTTPException) as e:
+                if time.monotonic() > down_deadline:
+                    raise
+                time.sleep(0.2)
 
     def get(self, path, timeout=60):
         return json.loads(self.call("GET", path, timeout=timeout)[1])
@@ -1054,6 +1079,7 @@ class Deploy:
         return json.loads(raw)["delivery"], t0, ack, t0_wall_ms
 
     def wait_finished(self, run, limit_s=300):
+        limit_s = cap(limit_s)
         since, deadline = None, time.monotonic() + limit_s
         while time.monotonic() < deadline:
             body = self.get(f"/runs/{run}/wait?timeout_ms=25000" + (f"&since={since}" if since else ""), timeout=40)
@@ -1220,6 +1246,7 @@ def count_connected(d):
 
 
 def wait_reconnect(d, before, timeout=90):
+    timeout = cap(timeout)
     t0 = time.monotonic_ns()
     got = {}
     deadline = time.monotonic() + timeout
@@ -1462,13 +1489,28 @@ RELIABILITY = {"restart-controller-kill": r_restart_controller, "restart-control
                "tailcat-relay": r_blocked}
 
 
+def take_lock(path):
+    """Takes the host lock exclusively. The descriptor Python opens is not inherited by the processes this
+    harness starts, so a process a scenario leaves behind cannot keep the lock."""
+    try:
+        f = open(path, "a")
+    except OSError as e:
+        raise Blocked(f"the benchmark lock {path} cannot be opened: {e.strerror}")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
 def run_scenario(a, name, out, stamp_):
     spec = SCENARIOS[name]
     install_lock = None
     if not a.no_lock:
         log(f"{name}: waiting for the exclusive lock {LOCK}")
-        install_lock = open(LOCK, "a")
-        fcntl.flock(install_lock, fcntl.LOCK_EX)
+        try:
+            install_lock = take_lock(LOCK)
+        except Blocked as b:
+            emit(out, stamp_, {"kind": "blocked", "scenario": {"id": name}, "blocked_by": str(b)})
+            log(f"{name}: Blocked by: {b}")
+            return
     try:
         settle()
         if spec["kind"] == "blocked":
@@ -1478,6 +1520,12 @@ def run_scenario(a, name, out, stamp_):
             except Blocked as b:
                 emit(out, stamp_, {"kind": "blocked", "scenario": {"id": name}, "blocked_by": str(b)})
                 log(f"{name}: Blocked by: {b}")
+            return
+        if REHEARSAL and name.startswith("disk-full"):
+            # The shimmed mounts are plain directories of the real file system: the scenario's filler would fill that.
+            b = Blocked("rehearsal: the loop mounts are shimmed, so filling the 'disk' would fill the real file system under ROOT")
+            emit(out, stamp_, {"kind": "blocked", "scenario": {"id": name}, "blocked_by": str(b)})
+            log(f"{name}: Blocked by: {b}")
             return
         hard_cleanup(a.root)
         os.makedirs(a.root, exist_ok=True)
@@ -1523,6 +1571,24 @@ def run_scenario(a, name, out, stamp_):
             install_lock.close()
 
 
+def refuse_rehearsal_paths(a):
+    """A rehearsal record or tree inside bench/ could be committed as if it were a measurement."""
+    bench = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+    for label, path in (("--out", getattr(a, "out", None)), ("--root", getattr(a, "root", None))):
+        if path:
+            real = os.path.realpath(path)
+            if real == bench or real.startswith(bench + os.sep):
+                sys.exit(f"B09_REHEARSAL: {label} {path} is inside bench/; a simulated record must never be committed")
+    if not os.environ.get("B09_BENCH_HOME"):
+        sys.exit("B09_REHEARSAL: set B09_BENCH_HOME to a scratch directory standing in for the bench account's home")
+    if not os.environ.get("FAKE_STATE"):
+        sys.exit("B09_REHEARSAL: set FAKE_STATE (and put the shims first on PATH): without the shims the scenarios would touch the real network and mounts")
+    for tool in ("ip", "tc", "losetup", "dmsetup", "mount", "umount", "runuser", "nsenter", "chown", "fallocate"):
+        r = subprocess.run([tool, "--b09-shim"], capture_output=True, text=True) if shutil.which(tool) else None
+        if r is None or r.stdout.strip() != "b09-shim":
+            sys.exit(f"B09_REHEARSAL: {tool} on PATH is not the fake shim; the rehearsal would act on the real host")
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1546,10 +1612,12 @@ def main():
         for k, v in SCENARIOS.items():
             print(f"{k:34} {v['kind']:12} workers={v.get('workers', 1)}{'  needs --fleet' if v.get('fleet') else ''}")
         return
-    if os.geteuid() != 0:
+    if not REHEARSAL and os.geteuid() != 0:
         sys.exit("run as root: the scenarios create namespaces, loop devices and mounts")
+    if REHEARSAL:
+        refuse_rehearsal_paths(a)
     install_traps()
-    os.chdir(f"/home/{BENCH_USER}")
+    os.chdir(os.environ["B09_BENCH_HOME"] if REHEARSAL else f"/home/{BENCH_USER}")
     if a.cmd == "cleanup":
         hard_cleanup(a.root)
         return

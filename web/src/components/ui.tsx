@@ -168,7 +168,7 @@ export function Empty({ icon, title, description, actions, headingLevel = 2 }: {
 export const TABLE = "w-full text-sm [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-medium [&_th]:text-muted [&_td]:px-3 [&_td]:py-2 [&_td]:align-top [&_tbody_tr]:border-t [&_tbody_tr]:border-line";
 export function Table({ caption, children, className }: { caption?: string; children: ReactNode; className?: string }) {
   return (
-    <div className={cx("overflow-x-auto rounded-lg border border-line", className)}>
+    <div className={cx("relative max-w-full overflow-x-auto rounded-lg border border-line", className)}>
       <table className={TABLE}>
         {caption ? <caption className="sr">{caption}</caption> : null}
         {children}

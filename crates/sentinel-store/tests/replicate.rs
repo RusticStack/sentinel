@@ -3,7 +3,7 @@ use std::{
     io::Write,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -36,6 +36,8 @@ const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 type Stored = (Vec<u8>, Option<String>);
+type Hook = Box<dyn FnOnce() + Send>;
+type PartHook = Box<dyn Fn(u32) + Send>;
 
 struct Upload {
     key: String,
@@ -55,6 +57,16 @@ struct Fake {
     parts_sent: AtomicU32,
     next_id: AtomicU32,
     on_delete: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Keys containing this text are refused for good: put, part and delete answer a permanent error.
+    refuse: Mutex<Option<String>>,
+    refused_calls: AtomicU32,
+    /// Every list answers a permanent refusal, as a key without `s3:ListBucket` does.
+    refuse_list: AtomicBool,
+    completes: AtomicU32,
+    /// Runs once, after the first put of a key containing the text.
+    on_put: Mutex<Option<(String, Hook)>>,
+    /// Runs after each part is stored, with its number.
+    on_part: Mutex<Option<PartHook>>,
 }
 
 fn transient(message: &str) -> BucketError {
@@ -87,6 +99,18 @@ impl Fake {
             Ok(())
         }
     }
+    fn refusing(&self, key: &str) -> BucketResult<()> {
+        let refuse = self.refuse.lock().unwrap();
+        if refuse.as_deref().is_some_and(|text| key.contains(text)) {
+            self.refused_calls.fetch_add(1, Ordering::Relaxed);
+            return Err(BucketError {
+                transient: false,
+                not_found: false,
+                message: "AccessDenied: the object is locked".into(),
+            });
+        }
+        Ok(())
+    }
     fn keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = self.objects.lock().unwrap().keys().cloned().collect();
         keys.sort();
@@ -102,10 +126,25 @@ impl Fake {
 impl Bucket for Fake {
     fn put(&self, key: &str, body: &[u8], blake3: Option<&str>) -> BucketResult<()> {
         self.up()?;
+        self.refusing(key)?;
         self.objects
             .lock()
             .unwrap()
             .insert(key.into(), (body.to_vec(), blake3.map(str::to_owned)));
+        let hook = {
+            let mut slot = self.on_put.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|(text, _)| key.contains(text.as_str()))
+            {
+                slot.take().map(|(_, hook)| hook)
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
         Ok(())
     }
     fn create_multipart(&self, key: &str, blake3: Option<&str>) -> BucketResult<String> {
@@ -130,6 +169,7 @@ impl Bucket for Fake {
         body: &[u8],
     ) -> BucketResult<String> {
         self.up()?;
+        self.refusing(key)?;
         if self.fail_part.load(Ordering::Relaxed) == number {
             self.fail_part.store(0, Ordering::Relaxed);
             return Err(transient("reset mid-part"));
@@ -139,6 +179,10 @@ impl Bucket for Fake {
         assert_eq!(u.key, key);
         u.parts.insert(number, body.to_vec());
         self.parts_sent.fetch_add(1, Ordering::Relaxed);
+        drop(uploads);
+        if let Some(hook) = self.on_part.lock().unwrap().as_ref() {
+            hook(number);
+        }
         Ok(format!("e{number}-{}", body.len()))
     }
     fn list_parts(&self, _key: &str, upload: &str) -> BucketResult<Vec<(u32, String, u64)>> {
@@ -152,6 +196,7 @@ impl Bucket for Fake {
     }
     fn complete(&self, key: &str, upload: &str, parts: &[(u32, String)]) -> BucketResult<()> {
         self.up()?;
+        self.completes.fetch_add(1, Ordering::Relaxed);
         let u = self
             .uploads
             .lock()
@@ -208,6 +253,7 @@ impl Bucket for Fake {
     }
     fn delete(&self, key: &str) -> BucketResult<()> {
         self.up()?;
+        self.refusing(key)?;
         self.objects.lock().unwrap().remove(key);
         if let Some(hook) = self.on_delete.lock().unwrap().take() {
             hook();
@@ -216,6 +262,13 @@ impl Bucket for Fake {
     }
     fn list(&self, prefix: &str) -> BucketResult<Vec<String>> {
         self.up()?;
+        if self.refuse_list.load(Ordering::Relaxed) {
+            return Err(BucketError {
+                transient: false,
+                not_found: false,
+                message: "AccessDenied: s3:ListBucket is not allowed".into(),
+            });
+        }
         Ok(self
             .keys()
             .into_iter()
@@ -709,7 +762,17 @@ fn a_damaged_or_lost_local_object_is_skipped_and_holds_nothing_back() {
     assert_eq!(f.totals().unreplicated_bytes, 28 + (3 << 20) + 5 + 30);
     let later = f.put(b"committed after the faults");
     let pass = r.pass().unwrap();
-    assert_eq!((pass.replicated, pass.local_faults), (1, 3));
+    assert_eq!(
+        (pass.replicated, pass.local_faults),
+        (1, 0),
+        "the three damaged objects are parked, not read and hashed again"
+    );
+    assert_eq!(
+        r.status().local_faults.load(Ordering::Relaxed),
+        3,
+        "each damaged object is counted once"
+    );
+    assert_eq!(r.status().parked_objects.load(Ordering::Relaxed), 3);
     assert!(
         f.bucket
             .keys()
@@ -934,4 +997,707 @@ fn a_store_failure_stops_the_pass_and_degrades_health() {
     assert!(status.last_error.lock().unwrap().is_some());
     assert!(r.pass().is_err());
     assert_eq!(status.consecutive_failures.load(Ordering::Relaxed), 2);
+}
+
+fn sleep_ms(ms: u64) {
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}
+
+fn damage(f: &Fixture, digest: Digest) {
+    let path = f.path(digest);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at] ^= 1;
+    std::fs::write(&path, &bytes).unwrap();
+}
+
+fn remote_ms(f: &Fixture, digest: Digest) -> Option<i64> {
+    f.store
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT remote_ms FROM objects WHERE tenant_id = ?1 AND digest = ?2",
+                rusqlite::params![f.tenant.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+fn queued_deletes(f: &Fixture) -> i64 {
+    f.store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM s3_deletes", [], |r| r.get(0))?))
+        .unwrap()
+}
+
+fn reclaim(f: &Fixture, digest: Digest) {
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "DELETE FROM objects WHERE tenant_id = ?1 AND digest = ?2",
+                rusqlite::params![tenant.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_wall_of_damaged_objects_older_than_a_healthy_one_does_not_stop_replication() {
+    let f = fixture();
+    let mut lost = Vec::new();
+    for i in 0..20u8 {
+        lost.push(f.put(&[i; 700]));
+    }
+    sleep_ms(5);
+    let healthy = f.put(b"committed after twenty damaged objects");
+    for digest in &lost {
+        std::fs::remove_file(f.path(*digest)).unwrap();
+    }
+    let r = f.replicator(SETTINGS);
+    let mut passes = 0;
+    let mut replicated = 0;
+    loop {
+        let pass = r.pass().expect("local faults do not fail the pass");
+        replicated += pass.replicated;
+        passes += 1;
+        if !pass.more {
+            break;
+        }
+        assert!(passes < 6, "the passes must converge, not spin");
+    }
+    assert_eq!(replicated, 1, "the healthy object was reached");
+    assert!(remote_ms(&f, healthy).is_some());
+    assert_eq!(r.status().local_faults.load(Ordering::Relaxed), 20);
+    assert_eq!(r.status().parked_objects.load(Ordering::Relaxed), 20);
+    assert_eq!(r.status().parked_bytes.load(Ordering::Relaxed), 20 * 700);
+    assert_eq!(r.status().state(), "healthy");
+
+    // Nothing is read or hashed again while they wait, and an idle pass asks for no more.
+    let pass = r.pass().unwrap();
+    assert_eq!(
+        (pass.local_faults, pass.replicated, pass.more),
+        (0, 0, false)
+    );
+    assert_eq!(r.status().local_faults.load(Ordering::Relaxed), 20);
+}
+
+#[test]
+fn a_parked_object_is_tried_again_after_its_delay_and_released_once_repaired() {
+    let f = fixture();
+    let digest = f.put(b"an object whose file rots and is then restored");
+    let original = std::fs::read(f.path(digest)).unwrap();
+    damage(&f, digest);
+    let r = f.replicator(SETTINGS).with_park_delays(
+        std::time::Duration::from_millis(150),
+        std::time::Duration::from_millis(300),
+    );
+    assert_eq!(r.pass().unwrap().local_faults, 1);
+    assert_eq!(r.pass().unwrap().local_faults, 0, "waiting");
+    std::fs::write(f.path(digest), &original).unwrap();
+    assert_eq!(
+        r.pass().unwrap().replicated,
+        0,
+        "still waiting, though repaired"
+    );
+    sleep_ms(200);
+    let pass = r.pass().unwrap();
+    assert_eq!((pass.replicated, pass.local_faults), (1, 0));
+    assert!(remote_ms(&f, digest).is_some());
+    assert_eq!(r.status().parked_items.load(Ordering::Relaxed), 0);
+    assert_eq!(r.status().local_faults.load(Ordering::Relaxed), 1);
+
+    // Still damaged at the retry: found again, but the same object is not counted twice.
+    let again = f.put(b"a second object that stays damaged");
+    damage(&f, again);
+    assert_eq!(r.pass().unwrap().local_faults, 1);
+    sleep_ms(200);
+    assert_eq!(
+        r.pass().unwrap().local_faults,
+        1,
+        "the retry found it still damaged"
+    );
+    assert_eq!(r.status().local_faults.load(Ordering::Relaxed), 2);
+    assert_eq!(r.status().parked_objects.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn one_delete_the_bucket_refuses_for_good_does_not_stop_the_queue() {
+    let f = fixture();
+    let (locked, gone) = (
+        f.put(b"held by an object lock"),
+        f.put(b"reclaimed normally"),
+    );
+    let r = f.replicator(SETTINGS);
+    r.pass().unwrap();
+    reclaim(&f, locked);
+    reclaim(&f, gone);
+    assert_eq!(
+        queued_deletes(&f),
+        2,
+        "the locked one is first in the queue"
+    );
+    *f.bucket.refuse.lock().unwrap() = Some(locked.to_string());
+    let fresh = f.put(b"written while a delete is stuck");
+
+    let pass = r.pass().expect("one item's refusal does not fail the pass");
+    assert_eq!((pass.deleted, pass.replicated, pass.parked), (1, 1, 1));
+    assert!(remote_ms(&f, fresh).is_some(), "later stages still ran");
+    assert_eq!(queued_deletes(&f), 1, "the refused delete is still queued");
+    let status = r.status();
+    assert_eq!(status.parked_items.load(Ordering::Relaxed), 1);
+    assert!(
+        status
+            .last_refusal
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|m| m.contains("AccessDenied"))
+    );
+    assert_eq!(status.state(), "healthy");
+
+    let calls = f.bucket.refused_calls.load(Ordering::Relaxed);
+    r.pass().unwrap();
+    assert_eq!(
+        f.bucket.refused_calls.load(Ordering::Relaxed),
+        calls,
+        "not asked again on every pass"
+    );
+}
+
+#[test]
+fn one_object_the_bucket_refuses_for_good_does_not_stop_the_queue() {
+    let f = fixture();
+    let refused = f.put(b"the bucket refuses this key");
+    sleep_ms(5);
+    let healthy = f.put(b"a healthy object behind it");
+    *f.bucket.refuse.lock().unwrap() = Some(refused.to_string());
+    let r = f.replicator(SETTINGS);
+    let pass = r.pass().expect("one item's refusal does not fail the pass");
+    assert_eq!((pass.replicated, pass.parked), (1, 1));
+    assert!(remote_ms(&f, healthy).is_some());
+    assert!(remote_ms(&f, refused).is_none());
+    assert_eq!(r.status().parked_items.load(Ordering::Relaxed), 1);
+    let calls = f.bucket.refused_calls.load(Ordering::Relaxed);
+    assert_eq!(r.pass().unwrap().parked, 0);
+    assert_eq!(f.bucket.refused_calls.load(Ordering::Relaxed), calls);
+}
+
+#[test]
+fn a_key_that_may_write_logs_but_not_list_them_degrades_the_copy_and_parks_nothing() {
+    let f = fixture();
+    let (run, job, attempt) = f.finished_log();
+    f.bucket.refuse_list.store(true, Ordering::Relaxed);
+    let r = f.replicator(SETTINGS);
+    // The log files are accepted first, so a write that went through must not make the list refusal the log's own.
+    assert!(
+        r.pass().is_err(),
+        "the listing is refused for the whole key"
+    );
+    let status = r.status();
+    assert_eq!(status.parked_items.load(Ordering::Relaxed), 0);
+    assert_eq!(status.state(), "degraded");
+    assert!(
+        status
+            .last_error
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|m| m.contains("ListBucket"))
+    );
+
+    f.bucket.refuse_list.store(false, Ordering::Relaxed);
+    assert_eq!(
+        r.pass().unwrap().logs,
+        1,
+        "no waiting once the grant is fixed"
+    );
+    assert!(
+        !f.bucket
+            .list(&offload::log_prefix(run, job, attempt))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(status.state(), "healthy");
+}
+
+#[test]
+fn a_parked_delete_retried_alone_stays_parked_and_backs_off_instead_of_failing_each_pass() {
+    let f = fixture();
+    let (locked, gone) = (
+        f.put(b"held by an object lock"),
+        f.put(b"reclaimed normally"),
+    );
+    let r = f.replicator(SETTINGS).with_park_delays(
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_millis(150),
+    );
+    r.pass().unwrap();
+    reclaim(&f, locked);
+    reclaim(&f, gone);
+    *f.bucket.refuse.lock().unwrap() = Some(locked.to_string());
+    let pass = r
+        .pass()
+        .expect("judged the item's own beside a delete that succeeded");
+    assert_eq!((pass.deleted, pass.parked), (1, 1));
+
+    // At the retry the locked delete is the only one: no other delete succeeds beside it to vouch for it.
+    sleep_ms(200);
+    let calls = f.bucket.refused_calls.load(Ordering::Relaxed);
+    let pass = r.pass().expect("the same answer is still the item's own");
+    assert_eq!((pass.deleted, pass.parked), (0, 1));
+    assert_eq!(f.bucket.refused_calls.load(Ordering::Relaxed), calls + 1);
+    let status = r.status();
+    assert_eq!(status.state(), "healthy");
+    assert_eq!(status.consecutive_failures.load(Ordering::Relaxed), 0);
+    assert_eq!(status.parked_items.load(Ordering::Relaxed), 1);
+
+    // Backed off again: not asked on the next pass.
+    r.pass().unwrap();
+    assert_eq!(f.bucket.refused_calls.load(Ordering::Relaxed), calls + 1);
+
+    // The lock is lifted: the delete goes through at the next retry and the shelf empties.
+    *f.bucket.refuse.lock().unwrap() = None;
+    sleep_ms(300);
+    assert_eq!(r.pass().unwrap().deleted, 1);
+    assert_eq!(status.parked_items.load(Ordering::Relaxed), 0);
+    assert_eq!(queued_deletes(&f), 0);
+}
+
+#[test]
+fn damaged_objects_past_a_full_shelf_are_counted_once_not_on_every_pass() {
+    let f = fixture();
+    let first = f.put(b"first damaged object");
+    sleep_ms(5);
+    let second = f.put(b"second damaged object");
+    damage(&f, first);
+    damage(&f, second);
+    let r = f.replicator(SETTINGS).with_park_limit(1);
+    assert_eq!(r.pass().unwrap().local_faults, 2);
+    assert_eq!(
+        r.status().local_faults.load(Ordering::Relaxed),
+        1,
+        "one fits on the shelf"
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            r.pass().unwrap().local_faults,
+            1,
+            "the one left over is found again"
+        );
+    }
+    assert_eq!(
+        r.status().local_faults.load(Ordering::Relaxed),
+        1,
+        "an object the shelf cannot hold is not counted again on every pass"
+    );
+}
+
+#[test]
+fn a_refusal_with_no_success_beside_it_is_the_credential_and_nothing_stays_parked() {
+    let f = fixture();
+    let a = f.put(b"first");
+    sleep_ms(2);
+    f.put(b"second");
+    f.bucket.refused.store(true, Ordering::Relaxed);
+    let r = f.replicator(SETTINGS);
+    assert!(r.pass().is_err());
+    assert_eq!(r.status().parked_items.load(Ordering::Relaxed), 0);
+    f.bucket.refused.store(false, Ordering::Relaxed);
+    assert_eq!(
+        r.pass().unwrap().replicated,
+        2,
+        "the first pass after the credential is replaced catches up"
+    );
+    assert!(remote_ms(&f, a).is_some());
+}
+
+#[test]
+fn a_log_that_expires_while_it_is_copied_leaves_no_copy_behind() {
+    let f = fixture();
+    let (run, job, attempt) = f.finished_log();
+    let prefix = offload::log_prefix(run, job, attempt);
+    let store = Arc::clone(&f.store);
+    *f.bucket.on_put.lock().unwrap() = Some((
+        "logs/".into(),
+        Box::new(move || {
+            let due = vec![retention::Expiring { attempt, run, job }];
+            let at = UnixMillis(UnixMillis::now().0 + 400 * 86_400_000);
+            store
+                .writer()
+                .write(move |tx| {
+                    tx.execute(
+                        "UPDATE attempts SET log_expires_ms = 1 WHERE id = ?1",
+                        [attempt.as_bytes().as_slice()],
+                    )?;
+                    retention::expire(tx, &due, at)
+                })
+                .unwrap();
+        }),
+    ));
+    let r = f.replicator(SETTINGS);
+    let pass = r.pass().unwrap();
+    assert_eq!(pass.logs, 0, "an expired log is not recorded as copied");
+    assert!(
+        !f.bucket.list(&prefix).unwrap().is_empty(),
+        "the copy exists"
+    );
+    assert_eq!(queued_deletes(&f), 1, "its delete was queued");
+    assert_eq!(r.pass().unwrap().deleted, 1);
+    assert!(f.bucket.list(&prefix).unwrap().is_empty());
+}
+
+fn late_end(f: &Fixture, attempt: AttemptId) {
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE attempts SET log_state = 1 WHERE id = ?1 AND log_state = 0",
+                [attempt.as_bytes().as_slice()],
+            )?;
+            tx.execute(
+                "UPDATE attempts SET log_state = 2 WHERE id = ?1",
+                [attempt.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_late_end_during_the_copy_makes_the_log_be_copied_again() {
+    let f = fixture();
+    let (_, _, attempt) = f.finished_log();
+    let store = Arc::clone(&f.store);
+    *f.bucket.on_put.lock().unwrap() = Some((
+        "logs/".into(),
+        Box::new(move || {
+            store
+                .writer()
+                .write(move |tx| {
+                    tx.execute(
+                        "UPDATE attempts SET log_state = 1 WHERE id = ?1 AND log_state = 0",
+                        [attempt.as_bytes().as_slice()],
+                    )?;
+                    tx.execute(
+                        "UPDATE attempts SET log_state = 2 WHERE id = ?1",
+                        [attempt.as_bytes().as_slice()],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }),
+    ));
+    let r = f.replicator(SETTINGS);
+    assert_eq!(
+        r.pass().unwrap().logs,
+        0,
+        "the log changed under the copy, so the copy is not the log"
+    );
+    assert_eq!(r.pass().unwrap().logs, 1, "copied again, as it is now");
+    assert_eq!(r.pass().unwrap().logs, 0);
+}
+
+#[test]
+fn a_log_whose_local_directory_is_gone_keeps_its_external_copy() {
+    let f = fixture();
+    let (run, job, attempt) = f.finished_log();
+    let prefix = offload::log_prefix(run, job, attempt);
+    let r = f.replicator(SETTINGS);
+    assert_eq!(r.pass().unwrap().logs, 1);
+    let copied = f.bucket.list(&prefix).unwrap();
+    assert!(!copied.is_empty());
+    // A late end resets the copy's record, and the local directory is lost.
+    late_end(&f, attempt);
+    std::fs::remove_dir_all(f.logs.attempt_dir(run, job, attempt)).unwrap();
+    let pass = r.pass().unwrap();
+    assert_eq!((pass.logs, pass.local_faults), (0, 1));
+    assert_eq!(
+        f.bucket.list(&prefix).unwrap(),
+        copied,
+        "the only copy is not deleted"
+    );
+    assert_eq!(r.status().local_faults.load(Ordering::Relaxed), 1);
+}
+
+fn big_object(f: &Fixture) -> (Digest, String) {
+    let body: Vec<u8> = (0..(5u32 << 20) + 17).map(|i| (i % 251) as u8).collect();
+    let digest = f.put(&body);
+    let key = objects::remote_key(f.tenant, &digest);
+    (digest, key)
+}
+
+#[test]
+fn a_large_object_that_changes_while_it_is_uploaded_is_never_completed() {
+    let f = fixture();
+    let (digest, key) = big_object(&f);
+    let path = f.path(digest);
+    // The file rots after the first part is sent, in a part not yet read.
+    *f.bucket.on_part.lock().unwrap() = Some(Box::new(move |number| {
+        if number == 1 {
+            let mut bytes = std::fs::read(&path).unwrap();
+            let at = bytes.len() - 100;
+            bytes[at] ^= 0xff;
+            std::fs::write(&path, &bytes).unwrap();
+        }
+    }));
+    let r = f.replicator(SETTINGS);
+    let pass = r.pass().unwrap();
+    assert_eq!((pass.replicated, pass.local_faults), (0, 1));
+    assert_eq!(
+        f.bucket.completes.load(Ordering::Relaxed),
+        0,
+        "never completed"
+    );
+    assert!(
+        f.bucket.keys().is_empty(),
+        "nothing visible under the digest's name"
+    );
+    assert!(
+        f.bucket.uploads.lock().unwrap().is_empty(),
+        "the upload was aborted"
+    );
+    assert!(
+        f.store
+            .read(|c| offload::upload(c, &key))
+            .unwrap()
+            .is_none()
+    );
+    assert!(remote_ms(&f, digest).is_none());
+}
+
+#[test]
+fn a_resumed_upload_still_checks_the_parts_the_bucket_already_holds() {
+    let f = fixture();
+    let (digest, key) = big_object(&f);
+    f.bucket.fail_part.store(4, Ordering::Relaxed);
+    assert!(f.replicator(SETTINGS).pass().is_err());
+    assert_eq!(f.bucket.parts_sent.load(Ordering::Relaxed), 3);
+    // Rot in a part the bucket already holds: the resumed pass reads it, though it does not send it.
+    let path = f.path(digest);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[10] ^= 0xff;
+    std::fs::write(&path, &bytes).unwrap();
+    let r = f.replicator(SETTINGS);
+    let pass = r.pass().unwrap();
+    assert_eq!((pass.replicated, pass.local_faults), (0, 1));
+    assert_eq!(f.bucket.completes.load(Ordering::Relaxed), 0);
+    assert!(f.bucket.keys().is_empty());
+    assert!(
+        f.store
+            .read(|c| offload::upload(c, &key))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn the_abort_sweep_leaves_other_applications_uploads_alone() {
+    let f = fixture();
+    let foreign = f.bucket.create_multipart("foreign/app/x", None).unwrap();
+    let old = f.bucket.create_multipart("objects/x/old", None).unwrap();
+    for id in [&foreign, &old] {
+        f.bucket
+            .uploads
+            .lock()
+            .unwrap()
+            .get_mut(id)
+            .unwrap()
+            .initiated = Some(1);
+    }
+    let r = f.replicator(SETTINGS);
+    assert_eq!(r.pass().unwrap().aborted, 1);
+    let open: Vec<String> = f.bucket.uploads.lock().unwrap().keys().cloned().collect();
+    assert_eq!(
+        open,
+        vec![foreign],
+        "only the engine's own key family is swept"
+    );
+}
+
+#[test]
+fn a_file_left_behind_by_an_interrupted_eviction_is_collected_at_startup() {
+    let f = fixture();
+    let digest = f.put(b"evicted, then the process died before the unlink");
+    let kept = f.put(b"a neighbour that stays");
+    f.replicator(SETTINGS).pass().unwrap();
+    let (tenant, now) = (f.tenant, UnixMillis::now());
+    // The mark commits; the unlink never happens.
+    f.store
+        .writer()
+        .write(move |tx| offload::evicted(tx, &[(tenant, digest)], now))
+        .unwrap();
+    assert!(f.local(digest));
+    let before = f.totals().local_bytes;
+    assert_eq!(before, 22, "the mark already took it off the books");
+    let report = f.store.read(|c| f.objects.recover(c)).unwrap();
+    assert_eq!(report.evicted_leftovers, 1);
+    assert!(report.missing.is_empty() && report.corrupt.is_empty());
+    assert!(!f.local(digest), "the file is gone");
+    assert!(f.local(kept));
+    assert_eq!(f.totals().local_bytes, before);
+    assert_eq!(
+        f.read(digest).unwrap(),
+        b"evicted, then the process died before the unlink",
+        "the verified external copy serves it"
+    );
+}
+
+fn pressure_marks() -> Watermarks {
+    Watermarks {
+        reserve: 1 << 20,
+        low: 1 << 20,
+        high: 2 << 20,
+        floor: 1 << 17,
+    }
+}
+
+fn probed(free: &Arc<AtomicU64>) -> Arc<Admission> {
+    let probe = Arc::clone(free);
+    Arc::new(
+        Admission::with_probe(pressure_marks(), move || Ok(probe.load(Ordering::Relaxed))).unwrap(),
+    )
+}
+
+/// `Admission` caches its probe for a second.
+fn let_the_probe_cache_lapse() {
+    sleep_ms(1_100);
+}
+
+#[test]
+fn disk_pressure_evicts_only_replicated_objects_and_stops_when_the_disk_has_room() {
+    let f = fixture();
+    let free = Arc::new(AtomicU64::new(1 << 40));
+    f.objects.set_admission(probed(&free));
+    let (a, b) = (f.put(&[1u8; 900]), f.put(&[2u8; 900]));
+    let r = f.replicator(SETTINGS);
+    r.pass().unwrap();
+    let damaged = f.put(&[3u8; 900]);
+    std::fs::remove_file(f.path(damaged)).unwrap();
+    r.pass().unwrap();
+    assert!(remote_ms(&f, a).is_some() && remote_ms(&f, b).is_some());
+    assert!(
+        remote_ms(&f, damaged).is_none(),
+        "a lost local file cannot be copied"
+    );
+    assert_eq!(
+        r.pass().unwrap().evicted,
+        0,
+        "room on the disk: nothing is evicted"
+    );
+
+    free.store(1 << 20, Ordering::Relaxed);
+    let_the_probe_cache_lapse();
+    let pass = r.pass().unwrap();
+    assert_eq!(
+        pass.evicted, 2,
+        "the replicated objects go, under no budget"
+    );
+    assert!(!f.local(a) && !f.local(b));
+    assert_eq!(
+        f.totals().unreplicated_bytes,
+        900,
+        "the unreplicated one stays on the books"
+    );
+
+    free.store(1 << 40, Ordering::Relaxed);
+    let_the_probe_cache_lapse();
+    let fresh = f.put(&[4u8; 900]);
+    let pass = r.pass().unwrap();
+    assert_eq!(
+        (pass.replicated, pass.evicted),
+        (1, 0),
+        "admission reopened: eviction stops"
+    );
+    assert!(f.local(fresh));
+}
+
+#[test]
+fn a_full_backlog_does_not_evict_for_pressure() {
+    let f = fixture();
+    let free = Arc::new(AtomicU64::new(1 << 40));
+    f.objects.set_admission(probed(&free));
+    let a = f.put(&[1u8; 900]);
+    let r = f.replicator(Settings {
+        backlog_bytes: 100,
+        ..SETTINGS
+    });
+    r.pass().unwrap();
+    let damaged = f.put(&[3u8; 900]);
+    std::fs::remove_file(f.path(damaged)).unwrap();
+    r.pass().unwrap();
+    assert!(
+        r.status().backlog_full.load(Ordering::Relaxed),
+        "900 bytes past 100"
+    );
+    let pass = r.pass().unwrap();
+    assert_eq!(
+        pass.evicted, 0,
+        "the backlog closes admission, and eviction does not relieve a backlog"
+    );
+    assert!(f.local(a));
+}
+
+fn put_marks(f: &Fixture) -> i64 {
+    f.store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM s3_puts", [], |r| r.get(0))?))
+        .unwrap()
+}
+
+fn delete_row(f: &Fixture, digest: Digest) {
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "DELETE FROM objects WHERE tenant_id = ?1 AND digest = ?2",
+                rusqlite::params![tenant.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_row_removed_after_its_bytes_may_have_been_sent_queues_the_remote_delete() {
+    let f = fixture();
+    let sent = f.put(b"sent before the crash");
+    let unsent = f.put(b"never sent");
+    let object = f
+        .store
+        .read(|c| offload::unreplicated(c, 2))
+        .unwrap()
+        .into_iter()
+        .find(|o| o.digest == sent)
+        .unwrap();
+    // The replicator marked the object, the PUT reached the bucket, and the process died before the record.
+    f.store
+        .writer()
+        .write(move |tx| offload::mark_puts(tx, &[object]))
+        .unwrap();
+    assert_eq!(put_marks(&f), 1);
+    delete_row(&f, unsent);
+    assert_eq!(
+        queued_deletes(&f),
+        0,
+        "a row that was never marked sent nothing"
+    );
+    delete_row(&f, sent);
+    assert_eq!(
+        queued_deletes(&f),
+        1,
+        "the marked row's copy is queued for removal"
+    );
+    assert_eq!(put_marks(&f), 0, "the mark leaves with the row");
+}
+
+#[test]
+fn a_recorded_copy_leaves_no_mark_behind() {
+    let f = fixture();
+    let digest = f.put(b"copied once");
+    let r = f.replicator(SETTINGS);
+    r.pass().unwrap();
+    assert!(remote_ms(&f, digest).is_some());
+    assert_eq!(put_marks(&f), 0, "replicated() spends the mark");
 }

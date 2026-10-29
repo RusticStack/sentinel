@@ -3,18 +3,19 @@ import { api } from "../../lib/api.ts";
 import { act } from "../../lib/act.tsx";
 import { useSession } from "../../lib/session.ts";
 import { useOverride } from "../../lib/override.ts";
-import { useLoaded } from "../../lib/hooks.ts";
+import { attempt, useLoad, type Load } from "../../lib/loaded.ts";
 import { loadRepos, type RepoList } from "../../lib/repos.ts";
+import { LoadFailed } from "../LoadFailed.tsx";
 import { Button, Card, Field, Icon, Input } from "../ui.tsx";
 import { CheckboxGroup } from "./CheckboxGroup.tsx";
 
 interface Source { bound: boolean; remote?: string; allowed_refs?: string[]; pipeline_path?: string; trust_pinned?: boolean; version?: number; revoked?: boolean }
 const ACCESS = [{ label: "Read", value: "read" }, { label: "Run", value: "run" }, { label: "Secrets", value: "secrets" }];
-export const loadRepoList = (slug: string) => loadRepos(slug).catch(() => null);
+export const loadRepoList = (slug: string) => attempt(() => loadRepos(slug));
 
-export function Repos({ slug, initial }: { slug: string; initial: RepoList | null }) {
+export function Repos({ slug, initial }: { slug: string; initial: Load<RepoList> }) {
   const { me } = useSession();
-  const [data, setData] = useLoaded(initial);
+  const { data, setData, failure } = useLoad(initial);
   const refresh = () => loadRepos(slug).then(setData, () => {});
   const [name, setName] = useState("");
   const base = `/api/v1/tenants/${encodeURIComponent(slug)}/repos`;
@@ -32,9 +33,11 @@ export function Repos({ slug, initial }: { slug: string; initial: RepoList | nul
       <section aria-labelledby="repos-h" className="space-y-3">
         <h2 id="repos-h" className="text-base font-semibold text-strong">Repositories</h2>
         <p className="text-sm text-muted">Source bindings, deploy credentials and hook secrets are set on the controller host (<code>sentinel admin source …</code>); credentials never cross the API.</p>
-        <div className="grid gap-3 md:grid-cols-2">
-          {(data?.repos ?? []).map((repo) => <RepoCard key={repo.id} slug={slug} repo={repo} />)}
-        </div>
+        {failure ? <LoadFailed what="the repositories" words={failure} /> : (
+          <div className="grid gap-3 md:grid-cols-2">
+            {(data?.repos ?? []).map((repo) => <RepoCard key={repo.id} slug={slug} repo={repo} />)}
+          </div>
+        )}
       </section>
       <section aria-labelledby="new-repo-h" className="space-y-3">
         <h2 id="new-repo-h" className="text-base font-semibold text-strong">Add a repository</h2>
@@ -59,7 +62,7 @@ function RepoCard({ slug, repo }: { slug: string; repo: { id: string; name: stri
 
   async function toggleSource() {
     if (source) { setSource(null); return; }
-    const s = await act(me, `Source of ${repo.name}`, () => api<Source>(`${base}/source`));
+    const s = await act(me, `Source of ${repo.name}`, () => api<Source>(`${base}/source`), false);
     if (s) setSource(s);
   }
   async function grant(e: React.FormEvent) {

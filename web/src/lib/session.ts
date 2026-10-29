@@ -53,9 +53,16 @@ export function markSteppedUp() { if (state?.me) set({ ...state, me: { ...state.
 let go: ((to: string, replace?: boolean) => Promise<void> | void) | null = null;
 export function setNavigator(fn: typeof go) { go = fn; }
 
+// A password change ends the session on the server before its answer reaches the page, so a request in flight at that
+// moment is refused with 401 first. The change says what happened ("Password changed"), so that refusal must not
+// navigate to sign-in with "Your session ended" first.
+let endingByChoice = false;
+export function expectSessionEnd(on: boolean) { endingByChoice = on; }
+
 /** The session ended under an open page: forget the person once, however many requests were refused together. */
 export async function ended(reason: EndReason = "expired") {
-  if (reason === "expired" && !state?.me) return;
+  if (reason === "expired" && (!state?.me || endingByChoice)) return;
+  endingByChoice = false;
   set(EMPTY);
   // After an expiry another tab may already hold a fresh CSRF secret; keep it.
   if (reason !== "expired") setCsrfToken(null);

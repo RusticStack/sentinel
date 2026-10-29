@@ -13,9 +13,13 @@ User=sentinel
 Environment=NODE_ENV=production
 Environment=HOST=127.0.0.1
 Environment=PORT=3000
-# The controller's api_listen, as reached from this host (NUXT_SENTINEL_API, the
-# Nuxt release's name, is still read for one release when this is unset).
+# The controller's api_listen, as reached from this host (the Nuxt release's
+# NUXT_SENTINEL_API is still read for one release when this is unset).
 Environment=SENTINEL_API=http://127.0.0.1:7080
+# Behind the reverse proxy in examples/sentinel.nginx.conf or Caddyfile, which
+# overwrite X-Forwarded-For, so the controller can limit each client on its own
+# (docs/web-ui.md#client-addresses). Safe only while HOST is loopback:
+# Environment=SENTINEL_CLIENT_IP_HEADER=x-forwarded-for
 ExecStart=/usr/bin/node /opt/sentinel/web/.output/server/index.mjs
 Restart=on-failure
 NoNewPrivileges=true

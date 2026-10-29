@@ -1,6 +1,6 @@
 # Legacy Go pilot CI baseline
 
-Measured 2026-09-13. This records what Legacy Go pilot's GitHub Actions setup did on the hardware Sentinel must beat. Numbers are from the raw records committed under [`bench/`](../bench/); nothing here is a Sentinel result.
+Measured 2026-09-13. This records what Legacy Go pilot's GitHub Actions setup did on the hardware Sentinel must beat. Numbers are from the raw records committed under [`bench/`](../bench/), except where a row says it has no committed record; nothing here is a Sentinel result.
 
 **History.** Legacy Go pilot left the measurement set on 2026-10-22. This baseline stays as the record of the reference host's topology and measurement method and is not repeated. Current pilot baselines are taken by B01a ([pilot workloads](pilot-repositories.md#check-contracts-and-benchmarks)). Public source and host labels are anonymized; live repository and account details remain private.
 
@@ -11,10 +11,10 @@ The historical self-hosted runners shared one virtualized x86_64 host:
 | Item | Value |
 |---|---|
 | Host | `reference-host`, AMD EPYC 9645, 12 vCPUs (1 thread/core), 31 GiB RAM, virtio disk, ext4 |
-| Kernel / runtime | Linux `7.0.0-31-generic`, rootless Docker 29.8.0 (overlayfs, systemd cgroup driver), Go 1.27.0 |
-| Runner listeners | 16 across the measured workload and its related jobs; runner and account names are omitted from the public snapshot |
+| Kernel / runtime | Linux `7.0.0-31-generic`, rootless Docker 29.8.0 (read from the host on 2026-09-13, no committed record; overlayfs, systemd cgroup driver), Go 1.27.0 |
+| Runner listeners | 16 across the measured workload and its related jobs (counted on the host on 2026-09-13; no committed record); runner and account names are omitted from the public snapshot |
 | cgroup caps | Primary slice: `cpu.max` 10 CPUs, `memory.max` 26 GiB. Secondary slice: 8 CPUs, 16 GiB. Sum of caps (18 CPUs) exceeds the 12 vCPUs |
-| Throttling since boot (3.3 days) | Primary slice: 72,360 of 1,333,015 CFS periods throttled (5.4%), 6,628 s throttled, 200,458 CPU-s used. Secondary slice: 15,365 periods, 2,953 s throttled |
+| Throttling since boot (3.3 days) | Primary slice: 72,360 periods throttled and 6,628 s throttled, about 200,481 CPU-s used at the first probe phase ([`bench/f06-vps-probe.log`](../bench/f06-vps-probe.log)). Read from the cgroup counters on 2026-09-13 with no committed record: 1,333,015 CFS periods in all (5.4% throttled), and for the secondary slice 15,365 periods and 2,953 s throttled |
 | Other runners | A separate arm64 host was not used by `ci.yml` |
 
 Consequence: up to 14 jobs of one workload competed for 10 CPUs with no per-job limit. Concurrency across runs, not just within a run, set the tail.

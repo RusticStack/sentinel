@@ -20,6 +20,7 @@ use sentinel_store::{
 
 const NOW: UnixMillis = UnixMillis(1_000_000);
 const REF: &str = "refs/heads/main";
+const RELEASE: &str = "refs/heads/release";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const GITHUB_REPO_ID: u64 = 91;
 const INSTALLATION: u64 = 42;
@@ -82,7 +83,7 @@ fn fixture() -> Fixture {
             expected: 0,
             binding: &Binding {
                 remote: REMOTE.into(),
-                allowed_refs: vec![REF.into()],
+                allowed_refs: vec![REF.into(), RELEASE.into()],
                 pipeline_path: ".sentinel.yml".into(),
                 trust: String::new(),
             },
@@ -105,21 +106,25 @@ fn fixture() -> Fixture {
     }
 }
 
-fn spec() -> RunSpec {
+fn spec_at(reference: &str) -> RunSpec {
     let yaml = format!(
         "schema: 1\non: [push]\njobs:\n  build:\n    image: {IMAGE}\n    steps: [{{ id: s, run: 'true' }}]\n  test:\n    image: {IMAGE}\n    needs: [build]\n    steps: [{{ id: s, run: 'true' }}]\n"
     );
     RunSpec::new(
-        PinnedSource::new(REMOTE, SHA_B, Some(REF)).unwrap(),
+        PinnedSource::new(REMOTE, SHA_B, Some(reference)).unwrap(),
         compile_str(&yaml).unwrap(),
     )
     .unwrap()
 }
 
 fn create_run(f: &mut Fixture, at: UnixMillis) -> (RunId, Vec<JobId>) {
+    create_run_on(f, at, REF)
+}
+
+fn create_run_on(f: &mut Fixture, at: UnixMillis, reference: &str) -> (RunId, Vec<JobId>) {
     let (tenant, repo) = (f.tenant, f.repo);
     let run = RunId::new();
-    let spec = spec();
+    let spec = spec_at(reference);
     let tx = f.conn.transaction().unwrap();
     let jobs = runs::create_run(&tx, tenant, repo, run, &spec, at).unwrap();
     provenance::insert(
@@ -130,7 +135,7 @@ fn create_run(f: &mut Fixture, at: UnixMillis) -> (RunId, Vec<JobId>) {
             trigger: "push".into(),
             delivery: None,
             provider: None,
-            ref_name: Some(REF.into()),
+            ref_name: Some(reference.into()),
             old_sha: None,
             new_sha: Some(SHA_B.into()),
             head_sha: None,
@@ -191,6 +196,24 @@ fn accept(f: &mut Fixture, delivery: &str, digest: u8, event: &Event) -> (String
             panic!("accept failed: {error:?}");
         }
     }
+}
+
+/// The operator narrows the binding: only `main` is allowed from now on.
+fn narrow_to_main(f: &Fixture) {
+    let narrowed = Binding {
+        remote: REMOTE.into(),
+        allowed_refs: vec![REF.into()],
+        pipeline_path: ".sentinel.yml".into(),
+        trust: String::new(),
+    };
+    let changed = f
+        .conn
+        .execute(
+            "UPDATE source_bindings SET binding = ?2 WHERE repo_id = ?1",
+            rusqlite::params![f.repo.as_bytes(), serde_json::to_vec(&narrowed).unwrap()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
 }
 
 fn binding_state(f: &Fixture, repo: RepoId) -> (bool, Vec<u8>, i64) {
@@ -556,6 +579,70 @@ fn a_rerequest_never_touches_a_superseded_run() {
         "the superseded run stayed terminal"
     );
     let _ = old;
+}
+
+#[test]
+fn a_rerequest_skips_a_candidate_the_binding_no_longer_allows_and_reruns_the_rest() {
+    let mut f = fixture();
+    let (allowed, allowed_jobs) = create_run(&mut f, NOW);
+    // The operator narrows the binding to `main`: the run of the other ref is no longer allowed.
+    let (barred, barred_jobs) = create_run_on(&mut f, NOW, RELEASE);
+    finish(&mut f, &allowed_jobs);
+    finish(&mut f, &barred_jobs);
+    narrow_to_main(&f);
+    let event = Event::Rerequest {
+        installation: INSTALLATION,
+        repository: GITHUB_REPO_ID,
+        head: SHA_B.into(),
+        check: None,
+        suite: 3,
+    };
+    let (outcome, duplicate) = accept(&mut f, "d-narrowed", 6, &event);
+    assert_eq!(outcome, "rerequested");
+    assert!(!duplicate);
+    assert_eq!(
+        states(&f, allowed, &allowed_jobs),
+        vec![JobState::Queued, JobState::Blocked],
+        "the allowed run reran"
+    );
+    assert!(
+        states(&f, barred, &barred_jobs)
+            .iter()
+            .all(|state| matches!(state, JobState::Terminal(_))),
+        "the disallowed run was left alone"
+    );
+    // The receipt was committed with the rerun, so a redelivery replays it.
+    assert_eq!(
+        accept(&mut f, "d-narrowed", 6, &event),
+        ("rerequested".to_owned(), true)
+    );
+}
+
+#[test]
+fn a_rerequest_that_only_finds_forbidden_candidates_is_receipted_not_failed() {
+    let mut f = fixture();
+    let (barred, barred_jobs) = create_run_on(&mut f, NOW, RELEASE);
+    finish(&mut f, &barred_jobs);
+    narrow_to_main(&f);
+    let event = Event::Rerequest {
+        installation: INSTALLATION,
+        repository: GITHUB_REPO_ID,
+        head: SHA_B.into(),
+        check: None,
+        suite: 4,
+    };
+    let (outcome, duplicate) = accept(&mut f, "d-forbidden", 8, &event);
+    assert_eq!(outcome, "source_not_allowed");
+    assert!(!duplicate);
+    assert!(
+        states(&f, barred, &barred_jobs)
+            .iter()
+            .all(|state| matches!(state, JobState::Terminal(_)))
+    );
+    assert_eq!(
+        accept(&mut f, "d-forbidden", 8, &event),
+        ("source_not_allowed".to_owned(), true)
+    );
 }
 
 #[test]
@@ -977,4 +1064,53 @@ fn the_candidate_limit_bounds_a_rerequest() {
         },
     );
     assert_eq!(outcome, "rerequest_limit");
+}
+
+#[test]
+fn the_rerequest_lookups_are_index_ranges() {
+    let f = fixture();
+    let plan_of = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> String {
+        let mut stmt = f
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map(params, |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        rows.join(" | ")
+    };
+    let id = [0u8; 16];
+    let candidates = plan_of(
+        github_events::RERUN_CANDIDATES_SQL,
+        &[&id.as_slice(), &SHA_B, &Some(1i64), &"x", &1i64],
+    );
+    assert!(
+        candidates.contains("check_publications_head"),
+        "a rerequest finds a head's runs on its index: {candidates}"
+    );
+    assert!(
+        !candidates.contains("SCAN check_publications"),
+        "{candidates}"
+    );
+    let stale = plan_of(github_events::RERUN_STALE_SQL, &[&id.as_slice()]);
+    assert!(
+        stale.contains("provenance_by_repo"),
+        "the newer-run check is a range of the repository's runs: {stale}"
+    );
+    assert!(!stale.contains("SCAN newer"), "{stale}");
+}
+
+#[test]
+fn a_runs_recorded_actor_cannot_be_rewritten() {
+    let mut f = fixture();
+    let (run, _) = create_run(&mut f, NOW);
+    let alice = [7u8; 16];
+    f.conn
+        .execute(
+            "UPDATE run_provenance SET actor_user_id = ?2 WHERE run_id = ?1",
+            rusqlite::params![run.as_bytes().as_slice(), alice.as_slice()],
+        )
+        .expect_err("provenance is written once");
 }

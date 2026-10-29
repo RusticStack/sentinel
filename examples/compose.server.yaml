@@ -4,6 +4,11 @@
 #
 #   podman compose -f compose.server.yaml run --rm --no-deps server admin key create --data-dir /var/lib/sentinel
 #
+# The web interface is the `web` profile: build localhost/sentinel-web first
+# (Containerfile.web), then `podman compose -f compose.server.yaml --profile web up -d`.
+# It starts after the controller is healthy, and the controller trusts it as a
+# proxy by its fixed address below (`trusted_proxies` in server-container.toml).
+#
 # Read docs/deployment.md#container-examples before exposing a port.
 name: sentinel
 services:
@@ -14,7 +19,7 @@ services:
     restart: on-failure
     stop_grace_period: 30s
     ports:
-      # API: reached by the reverse proxy / sentinel-web on this host.
+      # API: reached by the reverse proxy on this host, and by `web` over the compose network.
       - "127.0.0.1:7080:7080"
       # Worker link: use a private address of this host to serve workers on other machines.
       - "127.0.0.1:7443:7443"
@@ -28,5 +33,46 @@ services:
     security_opt: ["no-new-privileges:true"]
     pids_limit: 4096
     mem_limit: 4g
+  web:
+    # Runs as uid 10003 (the image's sentinel-web user). Holds no credential: it
+    # forwards the browser's own session to the controller.
+    image: localhost/sentinel-web:${SENTINEL_VERSION:-0.1.0-dev}
+    profiles: [web]
+    init: true
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      SENTINEL_API: http://server:7080
+      # The reverse proxy on the host overwrites X-Forwarded-For (examples/sentinel.nginx.conf,
+      # Caddyfile); safe only while 3000 is published on loopback, as below.
+      SENTINEL_CLIENT_IP_HEADER: x-forwarded-for
+      # GitHub Enterprise Server only: its web address (docs/web-ui.md).
+      # SENTINEL_GITHUB_WEB_URL: https://github.example.com
+    restart: on-failure
+    stop_grace_period: 10s
+    ports:
+      # The reverse proxy on this host terminates TLS and forwards here.
+      - "127.0.0.1:3000:3000"
+    networks:
+      default:
+        # trusted_proxies in server-container.toml names this address.
+        ipv4_address: 10.89.77.10
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    # The size of the unit's MemoryMax (sentinel-web.service): a starting point, not a measurement.
+    mem_limit: 512m
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.89.77.0/24
 volumes:
   data:

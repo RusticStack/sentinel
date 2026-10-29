@@ -414,7 +414,7 @@ fn a_queued_message_is_sealed_delivered_once_and_its_body_deleted() {
     let message = due[0].open(&key).expect("the lane holds the key");
     assert!(
         message
-            .body
+            .body()
             .contains("https://ci.example.com/verify-email#token=")
     );
 
@@ -433,7 +433,7 @@ fn a_queued_message_is_sealed_delivered_once_and_its_body_deleted() {
     assert!(due[0].open(&Key::load(&other_path).unwrap()).is_none());
 
     let token = message
-        .body
+        .body()
         .split("#token=")
         .nth(1)
         .unwrap()
@@ -602,7 +602,8 @@ fn a_mailbox_cannot_be_buried_in_messages() {
 }
 
 fn link_in(message: &email::Pending, key: &Key) -> Secret {
-    let body = message.open(key).unwrap().body;
+    let message = message.open(key).unwrap();
+    let body = message.body();
     let token = body
         .split("#token=")
         .nth(1)

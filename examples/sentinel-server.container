@@ -8,6 +8,7 @@
 #
 # (a system-wide install uses /etc/containers/systemd/ and systemctl without
 # --user). Create the master key once, as in docs/deployment.md#container-examples.
+# The web interface joins it with sentinel-web.container and sentinel.network.
 # loginctl enable-linger <account> keeps a rootless service running after logout.
 [Unit]
 Description=Sentinel controller (container)
@@ -17,6 +18,8 @@ Wants=network-online.target
 [Container]
 Image=localhost/sentinel-server:0.1.0-dev
 ContainerName=sentinel-server
+# The network web reaches the controller on (sentinel.network).
+Network=sentinel.network
 Exec=server --config /etc/sentinel/server.toml --data-dir /var/lib/sentinel
 # The named volume holds the database and master.key; :U gives it to uid 10001.
 Volume=sentinel-data.volume:/var/lib/sentinel:U

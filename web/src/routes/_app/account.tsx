@@ -6,7 +6,7 @@ import { refusal, retryAfter, StepUpDeclined, useRetryWait, withStepUp } from ".
 import { byteLength, looksLikeEmail } from "../../lib/onboarding.ts";
 import { toast } from "../../lib/overlay.tsx";
 import { rememberReturn } from "../../lib/redirect.ts";
-import { ended, loadSession, useSession } from "../../lib/session.ts";
+import { ended, expectSessionEnd, loadSession, useSession } from "../../lib/session.ts";
 import type { Security } from "../../lib/types";
 import { Page } from "../../components/Page.tsx";
 import { showOnce } from "../../components/ShowOnceDialog.tsx";
@@ -88,13 +88,16 @@ function Account() {
     setChanging(true);
     const body = { current, new: fresh };
     try {
-      await withStepUp(() => api("/api/v1/password", { method: "POST", body }), me);
+      await withStepUp(async () => {
+        expectSessionEnd(true); // kept on success: `ended` below clears it
+        try { return await api("/api/v1/password", { method: "POST", body }); } catch (e) { expectSessionEnd(false); throw e; }
+      }, me);
       clearPasswords();
       await ended("password-changed");
     } catch (x) {
       if (x instanceof StepUpDeclined) return;
       const err = x as ApiError;
-      if (err.code === "unauthenticated") return clearPasswords();
+      if (err.code === "unauthenticated") { clearPasswords(); return ended("expired"); }
       setCurrent("");
       setPasswordError(err.code === "forbidden" ? "The current password was not accepted. Five wrong attempts end this session."
         : err.code === "invalid_request" ? "The new password must be 12 to 256 bytes long."
@@ -182,6 +185,7 @@ function Account() {
   return (
     <Page id="account" title="Account security">
       <div className="max-w-3xl space-y-6">
+        {me ? <p className="text-sm text-muted">Your user id is <code id="my-user-id" className="select-all font-mono text-strong">{me.user}</code>. An organization&apos;s administrator needs it to add you.</p> : null}
         {loadError || !security ? (
           <Alert color="error" icon="circle-alert" title="Could not load your account's security settings." description={loadError} role="alert">
             <Button size="sm" color="neutral" variant="outline" label="Try again" className="mt-1" onClick={() => { void refresh(); }} />

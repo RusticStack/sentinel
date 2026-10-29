@@ -72,7 +72,11 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$src/target}
 export TMPDIR=$out/scratch
 polite=; command -v nice >/dev/null && polite="nice -n 19"; command -v ionice >/dev/null && polite="$polite ionice -c3"
 lock=${SENTINEL_VERIFY_LOCK:-/var/tmp/sentinel-verify.lock}
-locked=; command -v flock >/dev/null && locked="flock -x $lock"
+# -o: the stage's own children (a VMM, a setsid'd worker, podman conmon) must not inherit the lock descriptor and keep
+# the host locked after the stage returns.
+locked=
+if command -v flock >/dev/null; then locked="flock -x -o $lock"
+else echo "WARNING: this host has no flock; this run is not serialized with other verification work" >&2; fi
 
 # Rootless Podman available to this account (not root, answers `podman info`)?
 podman_ok=0; podman_why=

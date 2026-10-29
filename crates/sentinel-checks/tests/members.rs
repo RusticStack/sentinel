@@ -790,3 +790,113 @@ fn a_renamed_organization_answering_404_for_every_repository_withdraws_nothing()
     assert_eq!(f.role(), Some(2));
     assert_eq!(f.grant(), Some(3));
 }
+
+#[test]
+fn a_check_whose_stored_target_cannot_be_read_waits_and_starves_nobody() {
+    let f = fixture();
+    let _lane = f.start();
+    assert_eq!(f.pass(), "joined");
+    let (tenant, tenant_b, other_admin, alice) =
+        (f.tenant, TenantId::new(), UserId::new(), f.alice);
+    let now = UnixMillis::now();
+    let before = f.passes();
+    f.store
+        .writer()
+        .write(move |tx| {
+            provisioning::insert_human(tx, other_admin, "beta-root", true, now)?;
+            auth::create_namespace(
+                tx,
+                Principal::new(other_admin, Permissions::ALL, None, None),
+                tenant_b,
+                Namespace::parse("beta").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )?;
+            // The binding the first tenant's check must read is no longer valid JSON.
+            tx.execute(
+                "UPDATE source_bindings SET binding = x'00' WHERE tenant_id = ?1",
+                [tenant.as_bytes()],
+            )?;
+            // That check is first in line; the second tenant's, which is not GitHub-backed, right behind it.
+            tx.execute(
+                "INSERT OR REPLACE INTO github_member_checks(tenant_id, user_id, next_ms)
+                 VALUES (?1, ?3, 1), (?2, ?3, 2)",
+                rusqlite::params![tenant.as_bytes(), tenant_b.as_bytes(), alice.as_bytes()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    until("both checks", || f.passes() >= before + 2);
+    let seen: Vec<String> = f.notices.lock().unwrap()[before..].to_vec();
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("parked: corrupt target"),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter().any(|o| o == "target gone"),
+        "the check behind the unreadable one was processed: {seen:?}"
+    );
+    assert!(!seen.iter().any(|o| o == "store"), "{seen:?}");
+
+    let (next_ms, attempts): (i64, i64) = f
+        .store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT next_ms, attempts FROM github_member_checks
+                 WHERE tenant_id = ?1 AND user_id = ?2",
+                [tenant.as_bytes(), alice.as_bytes()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert!(next_ms > UnixMillis::now().0, "the row waits: {next_ms}");
+    assert_eq!(attempts, 1);
+    assert_eq!(
+        f.role(),
+        Some(2),
+        "a damaged binding neither removes nor grants access"
+    );
+}
+
+impl Fixture {
+    /// A lane that only wakes for a commit or a row falling due: its idle ceiling is far beyond the test.
+    fn start_unpolled(&self) -> Members {
+        let notices = Arc::clone(&self.notices);
+        Members::start(
+            Arc::clone(&self.store),
+            Arc::clone(&self.app),
+            Config {
+                idle: Duration::from_secs(120),
+                ..Config::default()
+            },
+            move |notice: &Notice| notices.lock().unwrap().push(notice.outcome.clone()),
+        )
+    }
+}
+
+#[test]
+fn a_check_queued_for_an_idle_lane_is_taken_up_without_polling() {
+    let f = fixture();
+    let _lane = f.start_unpolled();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(f.pass(), "joined");
+}
+
+#[test]
+fn a_check_that_falls_due_later_is_taken_up_at_its_time_not_at_the_next_poll() {
+    let f = fixture();
+    f.ask();
+    let due = UnixMillis::now().0 + 600;
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute("UPDATE github_member_checks SET next_ms = ?1", [due])?;
+            Ok(())
+        })
+        .unwrap();
+    let _lane = f.start_unpolled();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(f.passes(), 0, "not due yet");
+    until("the check falling due", || f.passes() >= 1);
+}

@@ -56,6 +56,8 @@ def load(path):
                 raise GateError(f"{path}:{n}: not JSON")
             if not isinstance(rec, dict) or rec.get("schema") != SCHEMA:
                 raise GateError(f"{path}:{n}: schema is not {SCHEMA}")
+            if rec.get("simulated") or rec.get("rehearsal"):
+                raise GateError(f"{path}:{n}: a simulated rehearsal record is not evidence (bench/fake/b09)")
             if rec.get("kind") != "perf":
                 continue
             sc = rec.get("scenario") or {}

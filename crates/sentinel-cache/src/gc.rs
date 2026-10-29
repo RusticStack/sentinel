@@ -8,7 +8,13 @@ use std::{
 
 use crate::{lease, manifest, scope};
 
-pub const DEFAULT_BUDGET_BYTES: u64 = 50 << 30;
+/// The least a configured storage budget may be, for the worker cache and the controller's remote store alike.
+pub const MIN_BUDGET_BYTES: u64 = 64 << 20;
+
+/// The most a derived storage budget reaches, however large the disk.
+pub const MAX_BUDGET_BYTES: u64 = 50 << 30;
+
+pub const DEFAULT_BUDGET_BYTES: u64 = MAX_BUDGET_BYTES;
 
 pub const DEFAULT_PASS_WORK: u64 = 100_000;
 
@@ -235,8 +241,9 @@ impl Gc {
         }
         let (current, used_ms, mut gens) = self.generations(entry);
         self.stats.generations_seen += gens.len() as u64;
-        let seen: u64 = gens.iter().map(|g| g.bytes).sum();
-        self.stats.payload_bytes += seen;
+        // Manifest bytes are read from disk: sums saturate rather than wrap or panic on a lying value.
+        let seen = gens.iter().fold(0u64, |sum, g| sum.saturating_add(g.bytes));
+        self.stats.payload_bytes = self.stats.payload_bytes.saturating_add(seen);
         if pinned {
             return;
         }
@@ -276,12 +283,12 @@ impl Gc {
                 return;
             }
             if keep(&cand) {
-                kept_bytes += cand.bytes;
+                kept_bytes = kept_bytes.saturating_add(cand.bytes);
                 kept += 1;
                 continue;
             }
             if Some(&cand.name) == spare.as_ref() {
-                kept_bytes += cand.bytes;
+                kept_bytes = kept_bytes.saturating_add(cand.bytes);
                 kept += 1;
                 self.evictable.push(cand);
                 continue;
@@ -378,12 +385,12 @@ impl Gc {
         let pointer = fs::symlink_metadata(entry.join(scope::CURRENT_NAME))
             .ok()
             .filter(|m| m.is_file());
-        let used_ms = pointer.as_ref().and_then(|m| {
-            m.modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-        });
+        // Without a pointer (a crash between a first publish's rename and its pointer swap) the entry ages by
+        // its newest generation, so idleness and the budget reach it like any other entry.
+        let used_ms = pointer
+            .as_ref()
+            .and_then(modified_ms)
+            .or_else(|| newest_generation_ms(&gens));
         let current = read_current(entry);
         let usable = current
             .as_ref()
@@ -401,7 +408,7 @@ impl Gc {
         match fs::remove_dir_all(&cand.path) {
             Ok(()) => {
                 self.stats.generations_removed += 1;
-                self.stats.bytes_freed += cand.bytes;
+                self.stats.bytes_freed = self.stats.bytes_freed.saturating_add(cand.bytes);
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(_) => self.stats.errors += 1,
@@ -447,7 +454,7 @@ impl Gc {
             Ok(()) => {
                 self.stats.entries_removed += 1;
                 self.stats.generations_removed += stale.generations;
-                self.stats.bytes_freed += stale.bytes;
+                self.stats.bytes_freed = self.stats.bytes_freed.saturating_add(stale.bytes);
                 let mut dir = stale.entry.parent();
                 while let Some(d) = dir {
                     if d == self.root || fs::remove_dir(d).is_err() {
@@ -503,6 +510,32 @@ impl Gc {
         self.stats.truncated |= walked_out;
         total
     }
+}
+
+fn modified_ms(meta: &fs::Metadata) -> Option<i64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+}
+
+/// The time embedded in a `gen-<unix_ms>-<rand>` name; no syscall, and it survives a copy that resets mtimes.
+fn generation_ms(name: &str) -> Option<i64> {
+    let (ms, _) = name.strip_prefix("gen-")?.split_once('-')?;
+    ms.parse().ok()
+}
+
+/// A name that does not parse falls back to its directory's mtime.
+fn newest_generation_ms(gens: &[Candidate]) -> Option<i64> {
+    gens.iter()
+        .filter_map(|g| {
+            generation_ms(&g.name).or_else(|| {
+                fs::symlink_metadata(&g.path)
+                    .ok()
+                    .and_then(|m| modified_ms(&m))
+            })
+        })
+        .max()
 }
 
 fn read_current(entry: &Path) -> Option<String> {

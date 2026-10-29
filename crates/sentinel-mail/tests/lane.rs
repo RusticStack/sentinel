@@ -6,10 +6,11 @@ use std::{
 
 use sentinel_auth::sealed::Key;
 use sentinel_core::{UnixMillis, UserId};
-use sentinel_mail::{Failure, Lane, LaneConfig, Mail, Transport};
+use sentinel_mail::{Cause, Failure, Health, Lane, LaneConfig, Mail, Transport};
 use sentinel_store::{Durability, Store, email, local_auth};
 
 type Sent = Arc<Mutex<Vec<(String, String)>>>;
+type Healths = Arc<Mutex<Vec<Health>>>;
 
 struct Scripted {
     outcomes: VecDeque<Result<(), Failure>>,
@@ -73,15 +74,9 @@ impl World {
     }
 
     fn start(&self, key: Arc<Key>, outcomes: Vec<Result<(), Failure>>) -> (Lane, Sent) {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let transport = Scripted {
-            outcomes: outcomes.into(),
-            sent: Arc::clone(&sent),
-        };
-        let lane = Lane::start(
-            Arc::clone(&self.store),
+        let (lane, sent, _) = self.start_with(
             key,
-            Box::new(transport),
+            outcomes,
             LaneConfig {
                 batch: 8,
                 idle: Duration::from_millis(100),
@@ -89,9 +84,35 @@ impl World {
                 max_backoff: Duration::from_millis(50),
                 maintenance: Duration::from_secs(3600),
             },
-            |_| {},
         );
         (lane, sent)
+    }
+
+    fn start_with(
+        &self,
+        key: Arc<Key>,
+        outcomes: Vec<Result<(), Failure>>,
+        config: LaneConfig,
+    ) -> (Lane, Sent, Healths) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let healths: Healths = Arc::default();
+        let transport = Scripted {
+            outcomes: outcomes.into(),
+            sent: Arc::clone(&sent),
+        };
+        let seen = Arc::clone(&healths);
+        let lane = Lane::start(
+            Arc::clone(&self.store),
+            key,
+            Box::new(transport),
+            config,
+            move |batch| {
+                if let Some(health) = batch.health {
+                    seen.lock().unwrap().push(health);
+                }
+            },
+        );
+        (lane, sent, healths)
     }
 }
 
@@ -238,4 +259,104 @@ fn a_delivered_message_still_counts_against_its_mailbox_allowance() {
         "delivery does not reset the cooldown"
     );
     assert_eq!(w.counts(), (0, 1, 0), "nothing new was queued");
+}
+
+fn slow_pause() -> LaneConfig {
+    LaneConfig {
+        batch: 8,
+        idle: Duration::from_millis(100),
+        min_backoff: Duration::from_millis(600),
+        max_backoff: Duration::from_millis(600),
+        maintenance: Duration::from_secs(3600),
+    }
+}
+
+#[test]
+fn a_refusal_that_belongs_to_the_service_holds_every_message_until_it_is_fixed() {
+    let w = world();
+    for address in [
+        "a@example.com",
+        "b@example.com",
+        "c@example.com",
+        "d@example.com",
+        "e@example.com",
+    ] {
+        w.queue(address);
+    }
+    let (lane, sent, healths) = w.start_with(
+        Arc::clone(&w.key),
+        vec![Err(Failure::Service(
+            "resend refused the API key (401 invalid_api_key)".into(),
+        ))],
+        slow_pause(),
+    );
+    eventually("the first attempt", || !sent.lock().unwrap().is_empty());
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        1,
+        "one request tells the lane the key is refused; it does not try the other four"
+    );
+    assert_eq!(
+        w.counts(),
+        (5, 0, 0),
+        "nothing is given up on account of the key"
+    );
+    assert_eq!(
+        *healths.lock().unwrap(),
+        vec![Health::Degraded(Cause::Service)]
+    );
+    // The key is fixed: the next attempt succeeds and everything queued goes out.
+    eventually("all five to be delivered", || w.counts() == (0, 5, 0));
+    assert_eq!(sent.lock().unwrap().len(), 6, "the held one was sent again");
+    eventually("the recovery to be reported", || {
+        healths.lock().unwrap().last() == Some(&Health::Recovered)
+    });
+    assert_eq!(healths.lock().unwrap().len(), 2, "reported once each way");
+    drop(lane);
+}
+
+#[test]
+fn an_unreadable_outbox_is_reported_once_and_so_is_the_recovery() {
+    let w = world();
+    let (lane, _sent, healths) = w.start_with(
+        Arc::clone(&w.key),
+        vec![],
+        LaneConfig {
+            batch: 8,
+            idle: Duration::from_millis(50),
+            min_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(20),
+            maintenance: Duration::from_secs(3600),
+        },
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    w.store
+        .writer()
+        .write(|tx| {
+            tx.execute_batch("ALTER TABLE mail_outbox RENAME TO mail_outbox_away")?;
+            Ok(())
+        })
+        .unwrap();
+    eventually("the fault to be reported", || {
+        healths.lock().unwrap().as_slice() == [Health::Degraded(Cause::StoreRead)]
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        healths.lock().unwrap().len(),
+        1,
+        "not repeated on every failed read"
+    );
+    w.store
+        .writer()
+        .write(|tx| {
+            tx.execute_batch("ALTER TABLE mail_outbox_away RENAME TO mail_outbox")?;
+            Ok(())
+        })
+        .unwrap();
+    eventually("the recovery to be reported", || {
+        healths.lock().unwrap().last() == Some(&Health::Recovered)
+    });
+    assert_eq!(healths.lock().unwrap().len(), 2);
+    drop(lane);
 }

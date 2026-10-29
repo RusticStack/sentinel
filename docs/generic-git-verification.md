@@ -40,6 +40,8 @@ the hook itself is unmodified.
 
 ## Timings (pilot host, wall-clock deltas from the store and API)
 
+No record: observed once on 2026-09-15 on a pilot host; no raw timings or fixture scripts are committed. These figures are not a baseline for G08 re-verification.
+
 - **Trigger detection** — hook deliveries reach intake inside the push's own
   `post-receive` window (the push returns after the `202`). Poll detection is
   bounded by the configured interval plus jitter: 18.4 s and 27 s observed

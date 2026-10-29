@@ -61,19 +61,34 @@ try {
   await waitHeading("Namespaces");
   await noSecretStored("at the namespaces step");
 
-  // A refresh: back to the token step, which says it picks up, then the password, then this step.
-  await page.goto(cfg.base + "/setup");
-  await page.waitFor("!!document.querySelector('#setup-token') && document.body.textContent.includes('Picking up where you left off')", 10000, "resume notice");
-  check("after a refresh the wizard picks up where it left off, asking for the token again", true);
+  // Refreshes: each lands on the token step, which says it picks up; the person walks token and password back to
+  // the step they were on. The stored step must stay that step through every refresh on the way, or a second
+  // refresh would resume at the Administrator step and the person would walk Who can join, Instance and Email again.
+  const storedStep = async () => { try { return JSON.parse(await stored()).step; } catch { return null; } };
+  const refresh = async (where) => {
+    await page.goto(cfg.base + "/setup");
+    await page.waitFor("!!document.querySelector('#setup-token') && document.body.textContent.includes('Picking up where you left off')", 10000, "resume notice");
+    check(`${where}: the wizard picks up where it left off, asking for the token again`, true);
+    check(`${where}: restoring writes nothing over the stored step`, (await storedStep()) === 5, await stored());
+  };
+  await refresh("first refresh");
+  await refresh("second refresh on the token step");
   await page.fill("#setup-token", cfg.token);
   await next();
   await waitHeading("Administrator");
   check("then it asks for the password again", (await page.eval("document.querySelector('#admin-email').value")) === "ada@example.com" && (await page.eval("document.querySelector('#admin-password').value")) === "");
+  check("on the way back the stored step is still the one the person left", (await storedStep()) === 5, await stored());
+  await refresh("refresh on the administrator step");
+  await page.fill("#setup-token", cfg.token);
+  await next();
+  await waitHeading("Administrator");
   await page.fill("#admin-password", PASSWORD);
   await page.fill("#admin-again", PASSWORD);
   await next();
   await waitHeading("Namespaces");
   check("and returns to the step the person was on", true);
+  check("back on that step the stored step is that step", (await storedStep()) === 5, await stored());
+  await noSecretStored("after the refreshes");
 
   await page.fill("#ns-org", "acme");
   await next();

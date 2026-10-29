@@ -6,7 +6,7 @@ How a Sentinel release is built, what it contains, and how anyone holding the ar
 
 | Archive | Contents | Built as |
 |---|---|---|
-| `sentinel-<version>-<arch>-linux-server.tar.gz` | `bin/sentinel`, the server unit, the web unit, `server.toml` | `-p sentinel --features server` |
+| `sentinel-<version>-<arch>-linux-server.tar.gz` | `bin/sentinel`, the server unit, the web unit, `server.toml`, the container examples (the web image example, `Containerfile.web`, builds from the `web/` directory of the source tag, not from the package: [deployment](deployment.md#the-web-interface)) | `-p sentinel --features server` |
 | `sentinel-<version>-<arch>-linux-worker.tar.gz` | `bin/sentinel`, the worker unit, `worker.toml`; on x86_64 also `microvm/` (Firecracker, the guest kernel, the agent: [below](#microvm-assets)) | `-p sentinel --features worker` |
 | `sentinel-<version>-<arch>-linux-cli.tar.gz` | `bin/sentinel` (`pipeline`, `api`, `auth`, `mcp`; no role) | `-p sentinel`, default features |
 | `sentinel-agent-<version>-<arch>-linux-musl.tar.gz` | `bin/sentinel-agent`, the static guest `/init` of microVM jobs | `-p sentinel-agent --target <arch>-unknown-linux-musl` |
@@ -46,7 +46,7 @@ scripts/release/package.sh verify --out dist
 
 ## Verification record
 
-`package.sh build` and `verify` ran clean from a clean checkout of the same commit on both Linux hosts: x86_64 (12 cores, with the pinned microVM inputs; the worker package carries `microvm/`) and aarch64 (2 vCPU, about 11 minutes of release builds). On aarch64 the worker package holds a `AArch64` binary, no `microvm/` and no Firecracker or kernel file, `worker --check` accepts a configuration, and the manifest lists `tailcat` for both architectures. `worker --check` on the x86_64 host reports `microvm=unavailable: no usable /dev/kvm` because that host has no KVM; a microVM run needs a KVM host. Digests of that build (the digests change with every commit, so re-run it for a release):
+`package.sh build` and `verify` ran clean from a clean checkout of the same commit on both Linux hosts: x86_64 (12 cores, with the pinned microVM inputs; the worker package carries `microvm/`) and aarch64 (2 vCPU). On aarch64 the worker package holds a `AArch64` binary, no `microvm/` and no Firecracker or kernel file, `worker --check` accepts a configuration, and the manifest lists `tailcat` for both architectures. `worker --check` on the x86_64 host reports `microvm=unavailable: no usable /dev/kvm` because that host has no KVM; a microVM run needs a KVM host. Digests of that build (the digests change with every commit, so re-run it for a release):
 
 ```
 x86_64  cli     a6ba30e0f7fe4579590257d89347b4bc77cf6933fc231a75f04b3f5ee54f5241

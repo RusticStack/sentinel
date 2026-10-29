@@ -42,6 +42,12 @@ const HOLES_MAGIC: &[u8; 4] = b"SNLH";
 const HOLES_FORMAT: u16 = 1;
 pub const MAX_HOLES: usize = 4096;
 
+/// The `jump` sidecar: the lowest sequence the log ever lacked when a later one arrived. A filled hole leaves no
+/// other trace, and a line number from stored order is only exact below it.
+const JUMP_MAGIC: &[u8; 4] = b"SNLJ";
+const JUMP_FORMAT: u16 = 1;
+const JUMP_BYTES: usize = 14;
+
 pub const MAX_OPEN_WRITERS: usize = 1024;
 pub const WRITER_IDLE: Duration = Duration::from_secs(600);
 const SWEEP_BUDGET: u32 = 4096;
@@ -100,6 +106,7 @@ struct Open {
     last_seq: u64,
     holes: Vec<(u64, u64)>,
     holes_dirty: bool,
+    first_hole: Option<u64>,
     len: u64,
     lines: u64,
     step: u32,
@@ -542,6 +549,7 @@ impl LogStore {
             last_seq: 0,
             holes: Vec::new(),
             holes_dirty: false,
+            first_hole: None,
             len: 0,
             lines: 0,
             step: 0,
@@ -561,6 +569,14 @@ impl LogStore {
         }
         let persisted = read_holes(&w.dir);
         w.holes.clone_from(&persisted);
+        // A live log from before the sidecar still names its open holes: the lowest one is a sound first hole.
+        let recorded = read_first_hole(&w.dir);
+        w.first_hole = match (recorded, persisted.first()) {
+            (Some(at), Some(&(from, _))) => Some(at.min(from)),
+            (Some(at), None) => Some(at),
+            (None, Some(&(from, _))) => Some(from),
+            (None, None) => None,
+        };
         let index_bytes = fs::read(&index_path).unwrap_or_default();
         let valid = index_bytes.len() >= 6
             && index_bytes[..4] == *INDEX_MAGIC
@@ -666,6 +682,12 @@ impl LogStore {
         } else if w.file.is_none() {
             w.seg = top.map_or(0, |n| n + 1);
         }
+        // Durable before a seal entry covers the segment that held the jump, or the evidence is lost with it.
+        if w.first_hole != recorded
+            && let Some(at) = w.first_hole
+        {
+            write_first_hole(&w.dir, at)?;
+        }
         if !pending.is_empty() {
             index_write(&mut w, &pending)?;
             w.index.sync_data()?;
@@ -757,6 +779,12 @@ impl LogStore {
         }
         if w.seg_len > 0 && w.seg_len + record_len > SEGMENT_BYTES {
             self.seal(w)?;
+        }
+        if frame.seq > w.last_seq + 1 && w.first_hole.is_none() {
+            // Once per log, before the jump is written: a filled hole leaves no other trace, so a reader that sees
+            // the frames behind it must already find the record. A refused jump leaves it conservative, never wrong.
+            write_first_hole(&w.dir, w.last_seq + 1)?;
+            w.first_hole = Some(w.last_seq + 1);
         }
         let first_of_seg = w.file.is_none();
         if first_of_seg {
@@ -1626,6 +1654,40 @@ fn read_holes(dir: &Path) -> Vec<(u64, u64)> {
     holes
 }
 
+fn write_first_hole(dir: &Path, seq: u64) -> Result<()> {
+    let mut bytes = [0u8; JUMP_BYTES];
+    bytes[..4].copy_from_slice(JUMP_MAGIC);
+    bytes[4..6].copy_from_slice(&JUMP_FORMAT.to_le_bytes());
+    bytes[6..].copy_from_slice(&seq.to_le_bytes());
+    let tmp = dir.join("jump.tmp");
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_data()?;
+    }
+    fs::rename(&tmp, dir.join("jump"))?;
+    sync_dir(dir)
+}
+
+/// The lowest sequence the log ever lacked, `None` when it never did. A sidecar that exists but cannot be read
+/// or decoded says `0`: the log may have healed a hole, so no line past the first is exact.
+fn read_first_hole(dir: &Path) -> Option<u64> {
+    let bytes = match fs::read(dir.join("jump")) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(0),
+    };
+    if bytes.len() == JUMP_BYTES
+        && bytes[..4] == *JUMP_MAGIC
+        && u16::from_le_bytes([bytes[4], bytes[5]]) == JUMP_FORMAT
+        && let Ok(seq) = <[u8; 8]>::try_from(&bytes[6..])
+    {
+        Some(u64::from_le_bytes(seq))
+    } else {
+        Some(0)
+    }
+}
+
 fn read_index(bytes: &[u8]) -> Result<Vec<Entry>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
@@ -1694,6 +1756,10 @@ fn seal_entry(w: &Open, seg: u32, out: &mut Vec<u8>) {
 fn fold_frame(w: &mut Open, seg: u32, frame: &Frame, first: bool, pending: &mut Vec<u8>) -> bool {
     if frame.seq > w.last_seq + 1 {
         add_hole(&mut w.holes, w.last_seq + 1, frame.seq - 1);
+        let missing = w.last_seq + 1;
+        if w.first_hole.is_none_or(|at| missing < at) {
+            w.first_hole = Some(missing);
+        }
     }
     let step_changed = frame.step != w.step;
     w.len += (FRAME_HEADER_BYTES + frame.bytes.len()) as u64;
@@ -2136,8 +2202,10 @@ pub struct LineSeek {
     /// stored sequence (a live log is asked again once more arrived).
     pub found: bool,
     /// Line numbers are exact only while stored order is sequence order up to the line: no gap (a hole or a
-    /// declared or never-stored range) at or before it and no late fill in the decoded span. Otherwise the line
-    /// counts the stored frames only.
+    /// declared or never-stored range) at or before it, no late fill in the decoded span, and the line starts
+    /// below the lowest sequence the log ever lacked (the `jump` sidecar, which outlives the fill that closed the
+    /// hole). Otherwise the line counts the stored frames only. Logs written before the sidecar existed promise
+    /// this only while they never healed a hole; nothing records that for them.
     pub exact: bool,
     /// The log has its end marker.
     pub complete: bool,
@@ -2198,10 +2266,12 @@ pub fn seek_line(dir: &Path, line: u64) -> Result<LineSeek> {
         Some((_, gaps)) => (gaps, true),
         None => (read_holes(dir), scan.ended),
     };
+    // Read after the scan, so a jump the scan saw is already recorded (the writer records it before the frame).
+    let healed = read_first_hole(dir).is_some_and(|first| at >= first);
     Ok(LineSeek {
         after,
         found,
-        exact: scan.ordered && !gaps.iter().any(|(from, _)| *from <= at),
+        exact: scan.ordered && !healed && !gaps.iter().any(|(from, _)| *from <= at),
         complete,
     })
 }

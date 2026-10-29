@@ -88,6 +88,10 @@ export class Page {
     this.cdp = cdp; this.sessionId = sessionId; this.targetId = targetId; this.contextId = contextId;
     this.errors = [];
     this.console = [];
+    this.navigations = [];
+    this.downloads = [];
+    this.bodies = [];
+    this.bodyJobs = [];
   }
   send(method, params) { return this.cdp.send(method, params, this.sessionId); }
   async init(width, height) {
@@ -99,7 +103,39 @@ export class Page {
     this.cdp.on("Runtime.exceptionThrown", (p, s) => { if (s === this.sessionId) this.errors.push(p.exceptionDetails.exception?.description || p.exceptionDetails.text); });
     this.cdp.on("Runtime.consoleAPICalled", (p, s) => { if (s === this.sessionId) this.console.push(`${p.type}: ${p.args.map((a) => a.value ?? a.description).join(" ")}`); });
     this.cdp.on("Log.entryAdded", (p, s) => { if (s === this.sessionId && p.entry.level === "error") this.errors.push(`${p.entry.source}: ${p.entry.text}`); });
+    // Every address the main frame took, loads and history changes alike, so a test can say which pages were never visited.
+    this.cdp.on("Page.frameNavigated", (p, s) => { if (s === this.sessionId && !p.frame.parentId) this.navigations.push(p.frame.url + (p.frame.urlFragment ?? "")); });
+    this.cdp.on("Page.navigatedWithinDocument", (p, s) => { if (s === this.sessionId) this.navigations.push(p.url); });
     await this.send("Log.enable");
+  }
+  /**
+   * Keeps the text of every response whose URL starts with `prefix` (pages, scripts, API answers), so a test can scan
+   * what the browser was sent. Read them with `capturedBodies()`, which waits for the ones still arriving.
+   */
+  captureBodies(prefix) {
+    const known = new Map();
+    this.cdp.on("Network.responseReceived", (p, s) => {
+      if (s === this.sessionId && p.response.url.startsWith(prefix)) known.set(p.requestId, { url: p.response.url, status: p.response.status });
+    });
+    this.cdp.on("Network.loadingFinished", (p, s) => {
+      const meta = s === this.sessionId ? known.get(p.requestId) : null;
+      if (!meta) return;
+      known.delete(p.requestId);
+      this.bodyJobs.push(this.send("Network.getResponseBody", { requestId: p.requestId }).then(
+        (r) => { this.bodies.push({ ...meta, text: r.base64Encoded ? Buffer.from(r.body, "base64").toString("utf8") : r.body }); },
+        () => { /* a body the browser no longer holds (a redirect, a cancelled load) */ },
+      ));
+    });
+  }
+  async capturedBodies() {
+    await Promise.all(this.bodyJobs);
+    return this.bodies;
+  }
+  /** Saves downloads started by this page's browser context into `dir` instead of asking. */
+  async allowDownloads(dir) {
+    this.cdp.on("Browser.downloadWillBegin", (p) => this.downloads.push(`begin ${p.suggestedFilename}`));
+    this.cdp.on("Browser.downloadProgress", (p) => this.downloads.push(`${p.state} ${p.receivedBytes}/${p.totalBytes}`));
+    await this.cdp.send("Browser.setDownloadBehavior", { behavior: "allow", browserContextId: this.contextId, downloadPath: dir, eventsEnabled: true });
   }
   async viewport(width, height) {
     this.width = width; this.height = height;

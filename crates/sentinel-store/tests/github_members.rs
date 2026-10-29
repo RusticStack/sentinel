@@ -1326,6 +1326,152 @@ fn a_walk_over_many_repositories_resumes_where_it_stopped() {
     assert_eq!(target.github_id, Some(1515));
 }
 
+fn next_ms_of(f: &Fixture, user: UserId) -> (i64, i64) {
+    let tenant = f.tenant;
+    f.store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT next_ms, attempts FROM github_member_checks
+                 WHERE tenant_id = ?1 AND user_id = ?2",
+                params![tenant.as_bytes(), user.as_bytes()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_row_whose_target_cannot_be_read_waits_longer_each_time_and_changes_no_access() {
+    let f = fixture();
+    f.back();
+    let ola = f.person("ola", Some("5005"));
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(5005), at(20)))
+        .unwrap();
+    f.apply(
+        ola,
+        observed(5005, Membership::Active(OrgRole::Member), vec![]),
+        false,
+        100,
+    )
+    .unwrap();
+    // Her next check is due; the stored binding it must read is damaged.
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE github_member_checks SET next_ms = 0 WHERE tenant_id = ?1",
+                [tenant.as_bytes()],
+            )?;
+            tx.execute(
+                "UPDATE source_bindings SET binding = x'00' WHERE tenant_id = ?1",
+                [tenant.as_bytes()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let park = |now: i64| {
+        let check = f.check(ola).expect("the row is still queued");
+        f.store
+            .read(move |c| {
+                let error = github_members::target(c, &check).unwrap_err();
+                assert!(error.is_row_specific(), "{error:?}");
+                Ok(())
+            })
+            .unwrap();
+        f.store
+            .writer()
+            .write(move |tx| github_members::park(tx, &check, at(now)))
+            .unwrap()
+    };
+
+    let mut now = 1_000_000;
+    assert_eq!(park(now), "parked: corrupt target");
+    assert_eq!(next_ms_of(&f, ola), (now + 2_000, 1));
+    let mut waits = Vec::new();
+    for _ in 0..16 {
+        now = next_ms_of(&f, ola).0;
+        assert_eq!(park(now), "parked: corrupt target");
+        waits.push(next_ms_of(&f, ola).0 - now);
+    }
+    assert!(
+        waits.windows(2).all(|w| w[0] <= w[1]),
+        "the wait never shrinks: {waits:?}"
+    );
+    assert_eq!(
+        waits.last(),
+        Some(&github_members::PARK_MAX_MS),
+        "and stops at the ceiling: {waits:?}"
+    );
+    assert_eq!(next_ms_of(&f, ola).1, 17);
+    assert_eq!(
+        f.membership(ola).unwrap().1,
+        Some(100),
+        "parking is not a confirmation, and not a removal either"
+    );
+    // Far beyond the grace period, an unreadable row still removes nobody: only an answer can.
+    assert!(f.membership(ola).is_some());
+    assert!(f.can_see_tenant(ola));
+
+    // A pass superseded by a signed event writes nothing.
+    let stale = f.check(ola).unwrap();
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(5005), at(now + 1)))
+        .unwrap();
+    f.store
+        .writer()
+        .write(move |tx| github_members::park(tx, &stale, at(now + 2)))
+        .unwrap();
+    assert_eq!(
+        next_ms_of(&f, ola).0,
+        now + 1,
+        "the newer request keeps its schedule"
+    );
+}
+
+#[test]
+fn the_earliest_queued_check_is_known_and_a_parked_row_is_not_one() {
+    let f = fixture();
+    f.back();
+    let pia = f.person("pia", Some("6006"));
+    let tenant = f.tenant;
+    let next = || f.store.read(github_members::next_due_ms).unwrap();
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(6006), at(5)))
+        .unwrap();
+    assert_eq!(next(), Some(5), "the earliest row falls due first");
+    f.apply(pia, observed(6006, Membership::Absent, vec![]), false, 600)
+        .unwrap();
+    assert_ne!(next(), Some(5), "her finished check is parked, not queued");
+
+    f.store
+        .writer()
+        .write(|tx| {
+            tx.execute(
+                "UPDATE github_member_checks SET next_ms = ?1",
+                [github_members::PARKED_MS],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(next(), None, "parked rows owe nothing");
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE github_member_checks SET next_ms = 700 WHERE user_id = ?1",
+                [pia.as_bytes()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(next(), Some(700));
+}
+
 #[test]
 fn a_finished_pass_keeps_the_on_demand_gap_instead_of_forgetting_the_check() {
     let f = fixture();
@@ -1490,4 +1636,51 @@ fn a_repository_that_cannot_be_read_keeps_its_grant_and_does_not_stop_the_walk()
     )
     .unwrap();
     assert_eq!(f.grants(rae), vec![(*second.as_bytes(), 3)]);
+}
+
+// GitHub is the independent authority for a backed tenant, so a platform administrator whose
+// linked GitHub account GitHub confirms becomes a member like anyone else (documented in
+// step-up.md and admission.md); nothing else makes one a member.
+#[test]
+fn a_platform_administrator_is_derived_as_a_member_only_when_github_confirms_the_linked_account() {
+    let f = fixture();
+    f.back();
+    let root = f.admin.user;
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| {
+            provisioning::link_verified_identity(tx, root, "github", "9009", at(1))?;
+            github_members::hint(tx, tenant, Some(9009), at(20))
+        })
+        .unwrap();
+    assert!(f.check(root).is_some(), "the hint queued the administrator");
+    assert_eq!(f.membership(root), None, "a hint grants nothing");
+
+    let outcome = f
+        .apply(root, observed(9009, Membership::Absent, vec![]), false, 30)
+        .unwrap();
+    assert_eq!(outcome, "not a member");
+    assert_eq!(
+        f.membership(root),
+        None,
+        "GitHub did not confirm: no access"
+    );
+    assert_eq!(f.audit("joined"), 0);
+
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(9009), at(40)))
+        .unwrap();
+    let outcome = f
+        .apply(
+            root,
+            observed(9009, Membership::Active(OrgRole::Owner), vec![]),
+            false,
+            50,
+        )
+        .unwrap();
+    assert_eq!(outcome, "joined");
+    assert_eq!(role_of(f.membership(root)), Some(3));
+    assert_eq!(f.audit("joined"), 1);
 }

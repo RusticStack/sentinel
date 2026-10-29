@@ -880,6 +880,200 @@ fn gaps_and_late_fills_make_a_line_inexact_but_not_the_lines_before_them() {
     );
 }
 
+fn jump_sidecar(dir: &std::path::Path) -> Option<u64> {
+    let bytes = std::fs::read(dir.join("jump")).ok()?;
+    assert_eq!(bytes.len(), 14);
+    assert_eq!(&bytes[..4], b"SNLJ");
+    Some(u64::from_le_bytes(bytes[6..14].try_into().unwrap()))
+}
+
+/// A hole whose sequence lies before a line's starting checkpoint, filled after the line's frame: the fill leaves
+/// no hole, no marker gap and nothing in the decoded span, so only the recorded first hole can say the line
+/// counts stored order. Fails without the `jump` sidecar: line 5 and line 3 answer `exact`.
+#[test]
+fn a_hole_healed_behind_the_starting_checkpoint_keeps_later_lines_inexact() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("logs");
+    let attempt = AttemptId::new();
+    let dir;
+    {
+        let logs = LogStore::open(&root).unwrap();
+        // Stored order 1, 2, 4, 5, 6, then the fill 3. Seq 4 changes the step, so it is a checkpoint at line 3.
+        for f in [
+            at_step(1, 0, "a\n"),
+            at_step(2, 0, "b\n"),
+            at_step(4, 1, "d\n"),
+            at_step(5, 1, "e\n"),
+            at_step(6, 1, "f\n"),
+            at_step(3, 0, "c\n"),
+        ] {
+            logs.append(run(), job(), attempt, &f).unwrap();
+        }
+        dir = logs.attempt_dir(run(), job(), attempt);
+        assert_eq!(jump_sidecar(&dir), Some(3));
+        let check = |logs: &LogStore| {
+            let at = |line| logs.seek_line(run(), job(), attempt, line).unwrap();
+            assert!(found(0)(at(1)) && at(1).exact);
+            assert!(found(1)(at(2)) && at(2).exact);
+            // Stored order a b d e f (c is the late fill): line 5 is "f" in frame 6, not sequence order's "e".
+            assert!(found(3)(at(3)) && !at(3).exact);
+            assert!(found(4)(at(4)) && !at(4).exact);
+            assert!(found(5)(at(5)) && !at(5).exact);
+            assert!(!at(9).found && !at(9).exact);
+        };
+        check(&logs);
+        logs.finish(run(), job(), attempt, 6, &[]).unwrap();
+        check(&logs);
+    }
+    // Reopened: a finished log answers the same from its files alone.
+    let logs = LogStore::open(&root).unwrap();
+    let at = |line| logs.seek_line(run(), job(), attempt, line).unwrap();
+    assert!(found(1)(at(2)) && at(2).exact && at(2).complete);
+    assert!(!at(4).exact && !at(5).exact);
+    assert_eq!(jump_sidecar(&dir), Some(3));
+}
+
+/// The fill is stored before the later checkpoint, so that checkpoint's cumulative line count already holds it and
+/// the decoded span is in order: lines past the hole are still not sequence-order lines.
+#[test]
+fn a_hole_healed_before_a_later_checkpoint_keeps_later_lines_inexact() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let attempt = AttemptId::new();
+    for seq in [1, 2, 4, 3] {
+        logs.append(run(), job(), attempt, &frame(seq, "x\n"))
+            .unwrap();
+    }
+    for seq in 5..=200u64 {
+        logs.append(run(), job(), attempt, &frame(seq, "x\n"))
+            .unwrap();
+    }
+    let at = |line| logs.seek_line(run(), job(), attempt, line).unwrap();
+    assert!(found(0)(at(1)) && at(1).exact);
+    assert!(found(1)(at(2)) && at(2).exact);
+    for line in [3, 4, 100, 150, 200] {
+        assert!(!at(line).exact, "line {line}");
+    }
+}
+
+/// The jump is in a segment that seals before the fill and a restart: reopen decodes only uncovered segments, so
+/// the record must be on disk from the jump itself.
+#[test]
+fn the_first_hole_survives_a_seal_and_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("logs");
+    let attempt = AttemptId::new();
+    let text = format!("{}\n", "x".repeat(32 * 1024 - 19));
+    let dir;
+    {
+        let logs = LogStore::open(&root).unwrap();
+        for seq in (1..=2).chain(4..=99).chain([3]).chain(100..=140) {
+            logs.append(run(), job(), attempt, &frame(seq, &text))
+                .unwrap();
+        }
+        dir = logs.attempt_dir(run(), job(), attempt);
+        wait_compressed(&dir, 0);
+        assert!(!logs.seek_line(run(), job(), attempt, 135).unwrap().exact);
+    }
+    let logs = LogStore::open(&root).unwrap();
+    let at = |line| logs.seek_line(run(), job(), attempt, line).unwrap();
+    assert!(found(0)(at(1)) && at(1).exact);
+    assert!(found(1)(at(2)) && at(2).exact);
+    assert!(found(134)(at(135)) && !at(135).exact);
+    // The writer reopens too and keeps the record.
+    logs.append(run(), job(), attempt, &frame(141, &text))
+        .unwrap();
+    assert!(!at(141).exact);
+    assert_eq!(jump_sidecar(&dir), Some(3));
+}
+
+/// A lost sidecar of a log whose segment is still uncovered is re-derived by decoding on reopen and written back.
+#[test]
+fn a_lost_first_hole_is_rederived_from_the_active_segment() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("logs");
+    let attempt = AttemptId::new();
+    let dir;
+    {
+        let logs = LogStore::open(&root).unwrap();
+        for f in [
+            at_step(1, 0, "a\n"),
+            at_step(2, 0, "b\n"),
+            at_step(4, 1, "d\n"),
+            at_step(5, 1, "e\n"),
+            at_step(3, 0, "c\n"),
+        ] {
+            logs.append(run(), job(), attempt, &f).unwrap();
+        }
+        dir = logs.attempt_dir(run(), job(), attempt);
+        assert!(!logs.seek_line(run(), job(), attempt, 4).unwrap().exact);
+    }
+    std::fs::remove_file(dir.join("jump")).unwrap();
+    let logs = LogStore::open(&root).unwrap();
+    logs.append(run(), job(), attempt, &at_step(6, 1, "f\n"))
+        .unwrap();
+    assert_eq!(jump_sidecar(&dir), Some(3));
+    let at = |line| logs.seek_line(run(), job(), attempt, line).unwrap();
+    assert!(at(2).exact && !at(4).exact && !at(6).exact);
+}
+
+/// A sidecar that exists but cannot be decoded cannot rule a hole out: no line is exact, and a log that never had
+/// a jump writes none.
+#[test]
+fn an_unreadable_first_hole_makes_lines_inexact_and_an_in_order_log_writes_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let attempt = AttemptId::new();
+    for seq in 1..=200u64 {
+        logs.append(run(), job(), attempt, &frame(seq, "x\n"))
+            .unwrap();
+    }
+    let dir = logs.attempt_dir(run(), job(), attempt);
+    assert!(!dir.join("jump").exists() && !dir.join("jump.tmp").exists());
+    logs.finish(run(), job(), attempt, 200, &[]).unwrap();
+    assert!(!dir.join("jump").exists());
+    assert!(seek_line(&dir, 150).unwrap().exact);
+    let junks: [&[u8]; 4] = [
+        b"junk",
+        b"",
+        b"SNLJ\x01\x00\x03\x00\x00\x00\x00\x00\x00",
+        b"SNLJ\x09\x00\x03\x00\x00\x00\x00\x00\x00\x00",
+    ];
+    for junk in junks {
+        std::fs::write(dir.join("jump"), junk).unwrap();
+        for line in [1, 2, 150] {
+            assert!(
+                !seek_line(&dir, line).unwrap().exact,
+                "{junk:?} line {line}"
+            );
+        }
+    }
+}
+
+/// A log written before the sidecar existed cannot say it healed a hole; it answers from what is stored. This pins
+/// the documented limit (docs/logs.md), so a change to it is deliberate.
+#[test]
+fn a_log_without_a_first_hole_record_answers_from_what_is_stored() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let attempt = AttemptId::new();
+    for f in [
+        at_step(1, 0, "a\n"),
+        at_step(2, 0, "b\n"),
+        at_step(4, 1, "d\n"),
+        at_step(5, 1, "e\n"),
+        at_step(6, 1, "f\n"),
+        at_step(3, 0, "c\n"),
+    ] {
+        logs.append(run(), job(), attempt, &f).unwrap();
+    }
+    logs.finish(run(), job(), attempt, 6, &[]).unwrap();
+    let dir = logs.attempt_dir(run(), job(), attempt);
+    std::fs::remove_file(dir.join("jump")).unwrap();
+    let seek = seek_line(&dir, 5).unwrap();
+    assert!(found(5)(seek) && seek.exact);
+}
+
 #[test]
 fn torn_and_zeroed_tails_end_the_lookup_at_the_last_whole_frame() {
     use std::io::Write;

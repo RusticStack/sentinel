@@ -1,0 +1,26 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "backup-rehash",
+  "revision": 1,
+  "harness": {
+    "example": "backup-rehash-bench",
+    "build": "cargo build --release --locked -p sentinel-store --example backup-rehash-bench"
+  },
+  "run": {
+    "args": ["--counts", "100,1000", "--object-bytes", "1048576", "--rounds", "5", "--max-gib", "8"],
+    "smoke_args": ["--counts", "4,16", "--object-bytes", "65536", "--rounds", "2", "--max-gib", "1"],
+    "dir": true
+  },
+  "ordering": {
+    "scheme": "abba",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/backup-rehash/1",
+    "out": "bench/backup-rehash.jsonl"
+  },
+  "notes": "Object counts reverse every round (ABBA); the bench refuses a combination above --max-gib before writing anything."
+}

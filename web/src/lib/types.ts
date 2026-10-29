@@ -120,12 +120,10 @@ export interface Explanation {
 
 export interface StepRecord { index: number; id: string; outcome: string; exit_code?: number; signal?: number; duration_ns?: number }
 
-export interface Steps {
-  attempt: string;
-  present: boolean;
-  timings_ns?: Record<string, number>;
-  steps?: StepRecord[];
-}
+/** A summary exists once the attempt has settled; before that only `present: false` comes back. */
+export type Steps =
+  | { attempt: string; present: false }
+  | { attempt: string; present: true; timings_ns: Record<string, number>; steps: StepRecord[] };
 
 export interface Frame { seq: number; step: number; stream: "stdout" | "stderr"; text: string }
 
@@ -135,7 +133,8 @@ export interface LogPage {
   complete: boolean;
   gaps: [number, number][];
   next_after: number | null;
-  next: string;
+  /** Absent in the reply for a log past its retention (`expired_ms` is set instead). */
+  next?: string;
   step_done: boolean;
   expired_ms?: number;
 }

@@ -1,7 +1,7 @@
 # Caddy in front of Sentinel (docs/deployment.md#tls-and-a-reverse-proxy).
 # Caddy obtains and renews the certificate for the name itself (ports 80 and
 # 443 must reach it). The controller's public_url is https://ci.example.com;
-# sentinel-web runs with NUXT_CLIENT_IP_HEADER=x-forwarded-for.
+# sentinel-web runs with SENTINEL_CLIENT_IP_HEADER=x-forwarded-for.
 #
 # Without the web interface, point reverse_proxy at the controller's
 # api_listen (127.0.0.1:7080) and send only the routes listed in the guide.

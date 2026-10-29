@@ -112,12 +112,20 @@ impl Scope {
     }
 }
 
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// Lower-case hex of `bytes` appended to `out`; a table lookup, so no per-digit conversion can fail.
+pub(crate) fn push_hex(out: &mut String, bytes: &[u8]) {
+    out.reserve(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0F)]));
+    }
+}
+
 pub fn toolchain16(digest: &[u8; 32]) -> String {
     let mut s = String::with_capacity(16);
-    for b in &digest[..8] {
-        s.push(char::from_digit((b >> 4) as u32, 16).expect("nibble"));
-        s.push(char::from_digit((b & 0x0F) as u32, 16).expect("nibble"));
-    }
+    push_hex(&mut s, &digest[..8]);
     s
 }
 
@@ -315,5 +323,12 @@ mod tests {
         assert_eq!(gen_name(1_700_000_000_000, 1), "gen-1700000000000-00000001");
         assert_ne!(gen_name(1, 1), gen_name(1, 2));
         assert!(gen_name(1_700_000_000_000, 9) < gen_name(1_700_000_000_001, 0));
+    }
+
+    #[test]
+    fn toolchain16_is_the_lower_case_hex_of_the_first_eight_bytes() {
+        let mut digest = [0xEEu8; 32];
+        digest[..8].copy_from_slice(&[0x01, 0x23, 0xab, 0xcd, 0xef, 0x00, 0xff, 0x10]);
+        assert_eq!(toolchain16(&digest), "0123abcdef00ff10");
     }
 }

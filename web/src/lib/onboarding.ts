@@ -132,6 +132,14 @@ const REGISTRATIONS: readonly string[] = ["closed", "invite-only", "approval-req
 const CREATIONS: readonly string[] = ["super-admin-only", "approved-users"];
 const str = (v: unknown, max: number) => (typeof v === "string" ? v.slice(0, max) : "");
 
+/**
+ * The step to store. While a resumed wizard is still walking back through the token and the password, the person is
+ * at an earlier step than the one they left (`resumeAt`), and storing that would lose the place on the next refresh.
+ */
+export function persistedStep(step: number, resumeAt: number, last: number): number {
+  return Math.min(Math.max(step, resumeAt), last);
+}
+
 export function serializeDraft(draft: WizardDraft): string {
   const keep: WizardDraft = {
     step: draft.step,

@@ -902,3 +902,69 @@ fn maintenance_reads_are_served_by_their_partial_indexes() {
         })
         .unwrap();
 }
+
+/// Outside damage to a row's id, as a disk fault or a hand-edit would leave it: still 16 bytes, so the schema's check accepts it,
+/// but no UUID version 4. The immutability trigger is dropped on this separate connection only to let the test write it.
+fn damage_attempt_id(f: &Fixture, attempt: AttemptId) {
+    let db = rusqlite::Connection::open(f.dir.path().join("metadata.sqlite")).unwrap();
+    db.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+    db.execute_batch("PRAGMA foreign_keys = OFF; DROP TRIGGER attempt_update;")
+        .unwrap();
+    let changed = db
+        .execute(
+            "UPDATE attempts SET id = ?2 WHERE id = ?1",
+            rusqlite::params![attempt.as_bytes().as_slice(), [0u8; 16].as_slice()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+/// A row that cannot be decoded sits at the head of both queries for good: failing the batch on it would stop every log behind it,
+/// at every pass, and say nothing.
+#[test]
+fn a_malformed_attempt_row_does_not_stop_stamping_or_expiry() {
+    let f = fixture();
+    let (_, _, bad) = f.released_attempt(UnixMillis(100));
+    let (_, _, first) = f.released_attempt(UnixMillis(200));
+    let (_, _, second) = f.released_attempt(UnixMillis(300));
+    damage_attempt_id(&f, bad);
+
+    let skipped_before = sentinel_store::skipped::total();
+    assert_eq!(f.stamp(Deployment::default(), 10), 2);
+    assert!(f.expires(first).is_some() && f.expires(second).is_some());
+    assert!(
+        sentinel_store::skipped::total() > skipped_before,
+        "the passed-over row is counted"
+    );
+    let row = sentinel_store::skipped::last().unwrap();
+    assert_eq!(row.table, "attempts");
+    assert_eq!(
+        row.key,
+        "00".repeat(16),
+        "named by its key, nothing else of it"
+    );
+
+    // The damaged row is due as well, and still first in line.
+    f.store
+        .writer()
+        .write(|tx| {
+            tx.execute("UPDATE attempts SET log_expires_ms = 1", [])?;
+            Ok(())
+        })
+        .unwrap();
+    let skipped_before = sentinel_store::skipped::total();
+    let due = f.store.read(|c| retention::expiring(c, NOW, 256)).unwrap();
+    assert_eq!(
+        due.iter()
+            .map(|d| d.attempt)
+            .collect::<std::collections::HashSet<_>>(),
+        [first, second].into_iter().collect()
+    );
+    assert!(sentinel_store::skipped::total() > skipped_before);
+    let expired = f
+        .store
+        .writer()
+        .write(move |tx| retention::expire(tx, &due, NOW))
+        .unwrap();
+    assert_eq!(expired.len(), 2);
+}

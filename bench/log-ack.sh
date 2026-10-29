@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
 # Log-ack batching: cost of one fdatasync per burst of frames against one per frame, through the real LogStore.
-#   SENTINEL_SRC=/checkout SENTINEL_BIN=target/release/examples/log-ack-bench DIR=/srv/bench/log-ack bench/log-ack.sh [bench args]
-# DIR must sit on the file system under test. Appends one stamped record to OUT (default bench/log-ack.jsonl).
-# The measured binary is the example built from SENTINEL_SRC: cargo build --release -p sentinel-store --example log-ack-bench
+#   SENTINEL_SRC=/checkout SENTINEL_BIN=target/release/examples/log-ack-bench SENTINEL_BENCH_HOST_LABEL=<label> DIR=/var/tmp/log-ack bench/log-ack.sh [extra bench args]
+# Runs through bench/micro-run.sh and bench/contracts/micro/log-ack.json: the contract fixes the arguments, the case
+# order and the record; the runner takes the shared verification lock, refuses a host that is not quiet, stamps the
+# build and host and appends the record to bench/log-ack.jsonl (OUT overrides). `bench/micro-run.sh <contract> --smoke`
+# is the tiny-parameter harness check. The measured binary is built from SENTINEL_SRC:
+#   cargo build --release --locked -p sentinel-store --example log-ack-bench
 set -euo pipefail
-. "$(dirname "${BASH_SOURCE[0]}")/stamp.sh"
-stamp_init
-BIN="${SENTINEL_BIN:?set SENTINEL_BIN to the log-ack-bench binary built from SENTINEL_SRC}"
-DIR="${DIR:?set DIR to a directory on the file system under test}"
-OUT="${OUT:-$(dirname "${BASH_SOURCE[0]}")/log-ack.jsonl}"
-STAMP_SED="$(stamp_sed)"
-"$BIN" --dir "$DIR" "$@" | sed "s/^{/{$STAMP_SED,/" >> "$OUT"
-echo "record appended to $OUT" >&2
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec bash "$here/micro-run.sh" "$here/contracts/micro/log-ack.json" -- "$@"
