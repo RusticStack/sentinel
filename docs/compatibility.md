@@ -11,7 +11,7 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | Cache manifest | `sentinel.cache` magic + format `u8` (currently 1) | `sentinel-cache::manifest` | workers |
 | Cache file listing | `sentinel.files` magic + format `u8` (currently 1) | `sentinel-cache::manifest` | workers |
 | Cache miss reasons | `Miss::as_str` vocabulary | `sentinel-cache::outcome` | workers, reports |
-| Metadata database | `schema_migrations.version` (currently 58) | `sentinel-store` | controller |
+| Metadata database | `schema_migrations.version` (currently 59) | `sentinel-store` | controller |
 | Sealed ciphertext | leading format byte (writes 2; reads 1–2) | `sentinel-auth::sealed` | controller, host-local admin |
 | Master key file | `SNTLKEY2` magic (also reads legacy raw 32-byte file) | `sentinel-auth::sealed` | controller, host-local admin |
 | Manifest file | `SNMF` magic + format `u16` (currently 1) | `sentinel-store::objects` | controller |
