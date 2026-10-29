@@ -1555,6 +1555,54 @@ struct GithubLanes {
     _checks: Box<sentinel_checks::Lane>,
 }
 
+/// What runs when one-click setup puts a GitHub App in force: source resolution takes the App, the check lanes start
+/// if no App had started them, and one line says so. It names the App's id and slug and nothing it was handed.
+#[cfg(feature = "server")]
+fn github_activation_hook(
+    store: &Arc<sentinel_store::Store>,
+    lanes: &Arc<std::sync::Mutex<Option<GithubLanes>>>,
+    link: sentinel_link::controller::Handle,
+    details_url: Option<String>,
+) -> sentinel_api::OnActivate {
+    let (store, lanes) = (Arc::clone(store), Arc::clone(lanes));
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    Arc::new(move |activation: &sentinel_api::Activation| {
+        tracing::dispatcher::with_default(&dispatch, || {
+            link.set_source_app(Arc::clone(&activation.app));
+            let mut slot = lanes.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.is_none() {
+                *slot = Some(GithubLanes::start(
+                    &store,
+                    Arc::clone(&activation.app),
+                    details_url.clone(),
+                    sentinel_checks::members::Config::default(),
+                ));
+            }
+            tracing::info!(
+                event = "github_app_activated",
+                app_id = activation.app_id,
+                slug = %activation.slug,
+                "the GitHub App made with one-click setup is in force; no restart needed"
+            );
+        });
+    })
+}
+
+/// The API's GitHub App setup for the controller: GitHub's real origins. Only a test supplies others.
+#[cfg(feature = "server")]
+fn github_app_setup(
+    current: sentinel_github::app::Current,
+    source: Option<sentinel_api::AppSource>,
+    on_activate: sentinel_api::OnActivate,
+) -> sentinel_api::GithubAppSetup {
+    sentinel_api::GithubAppSetup {
+        current,
+        source,
+        on_activate: Some(on_activate),
+        ..sentinel_api::GithubAppSetup::default()
+    }
+}
+
 #[cfg(feature = "server")]
 impl GithubLanes {
     fn start(
@@ -2246,35 +2294,12 @@ fn start_server(
         }
         None => tracing::info!(event = "checks_disabled", "no GitHub App"),
     }
-    let on_activate: sentinel_api::OnActivate = {
-        let (store, lanes, link) = (
-            Arc::clone(&store),
-            Arc::clone(&github_lanes),
-            controller.handle(),
-        );
-        let details_url = public_url.clone();
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        Arc::new(move |activation: &sentinel_api::Activation| {
-            tracing::dispatcher::with_default(&dispatch, || {
-                link.set_source_app(Arc::clone(&activation.app));
-                let mut slot = lanes.lock().unwrap_or_else(|p| p.into_inner());
-                if slot.is_none() {
-                    *slot = Some(GithubLanes::start(
-                        &store,
-                        Arc::clone(&activation.app),
-                        details_url.clone(),
-                        sentinel_checks::members::Config::default(),
-                    ));
-                }
-                tracing::info!(
-                    event = "github_app_activated",
-                    app_id = activation.app_id,
-                    slug = %activation.slug,
-                    "the GitHub App made with one-click setup is in force; no restart needed"
-                );
-            });
-        })
-    };
+    let on_activate = github_activation_hook(
+        &store,
+        &github_lanes,
+        controller.handle(),
+        public_url.clone(),
+    );
     tracing::info!(
         event = "link_listening",
         addr = %controller.local_addr(),
@@ -2340,12 +2365,7 @@ fn start_server(
                 organization: rule.slug.clone(),
             })
             .collect(),
-        github_app: sentinel_api::GithubAppSetup {
-            current: github.current.clone(),
-            source: github.source,
-            on_activate: Some(on_activate),
-            ..sentinel_api::GithubAppSetup::default()
-        },
+        github_app: github_app_setup(github.current.clone(), github.source, on_activate),
     };
     let api = sentinel_api::Server::start_with(
         sentinel_api::Config {
@@ -3964,5 +3984,267 @@ credentials_file = '/etc/sentinel/s3'
         }
         assert!(toml::from_str::<MailFile>("hots = 'x'").is_err());
         assert!(toml::from_str::<MailFile>("host = 'x'").is_err());
+    }
+
+    /// What a test subscriber writes, kept to be read back.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+
+        fn make_writer(&'a self) -> Capture {
+            self.clone()
+        }
+    }
+
+    /// The activation line is written when one-click setup puts an App in force, which the real binary cannot be made
+    /// to do against a test double (GitHub's origins are fixed), so the hook the controller installs is run here against
+    /// a real conversion over HTTP, with the log it writes captured: one line, naming the App, and no secret it was handed.
+    #[test]
+    fn the_activation_hook_logs_one_line_and_no_secret() {
+        use sentinel_core::UnixMillis;
+        use sentinel_github::fake::{Blueprint, FakeGithub};
+        use sentinel_link::{controller::Controller, identity::Identity};
+        use sentinel_store::{Durability, Store, local_auth, logs::LogStore, objects::Objects};
+        use serde_json::{Value, json};
+
+        const PASSWORD: &str = "correct horse battery staple";
+        const CLIENT_SECRET: &str = "client-secret-canary-6f1d2a9e0b7c4d3e8f5a";
+        const WEBHOOK_SECRET: &str = "webhook-secret-canary-3e9f0a1b2c7d4e5f6a8b";
+        const PEM_MARKER: &str = "-----BEGIN PRIVATE KEY-----";
+        // A test-only RSA key generated for this run with the `openssl` CLI; it authenticates nothing.
+        let out = std::process::Command::new("openssl")
+            .args([
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+            ])
+            .output()
+            .expect("the openssl CLI must be installed to generate the test-only App key");
+        assert!(out.status.success(), "openssl genpkey failed");
+        let pem = String::from_utf8(out.stdout).unwrap();
+        // A run of random key material (the first body lines of a PKCS#8 key are the same in every key).
+        let key_canary: String = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .nth(7)
+            .unwrap()[..40]
+            .to_owned();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
+        let logs = Arc::new(LogStore::open(dir.path().join("logs")).unwrap());
+        let objects = Arc::new(Objects::open(dir.path()).unwrap());
+        let key_path = dir.path().join("master.key");
+        sentinel_auth::sealed::Key::create(&key_path).unwrap();
+        let key = Arc::new(sentinel_auth::sealed::Key::load(&key_path).unwrap());
+        local_auth::bootstrap(
+            &store,
+            "root",
+            "Root",
+            PASSWORD.as_bytes(),
+            UnixMillis::now(),
+        )
+        .unwrap();
+        let controller = Controller::start(
+            Arc::clone(&store),
+            Arc::clone(&logs),
+            Arc::clone(&objects),
+            Identity::generate("controller").unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let fake = FakeGithub::start("unused-oauth-secret");
+        fake.set_blueprint(Blueprint {
+            id: 4242,
+            slug: "acme-ci".into(),
+            name: "Acme CI".into(),
+            owner_login: "acme-gh".into(),
+            owner_id: 9000,
+            owner_kind: "Organization".into(),
+            client_id: "Iv23.acmeclient".into(),
+            client_secret: CLIENT_SECRET.into(),
+            webhook_secret: WEBHOOK_SECRET.into(),
+            pem: pem.clone(),
+        });
+        // The positive control: every canary is in what the fake hands back, so a clean capture means something.
+        for canary in [
+            key_canary.as_str(),
+            CLIENT_SECRET,
+            WEBHOOK_SECRET,
+            PEM_MARKER,
+        ] {
+            assert!(
+                [pem.as_str(), CLIENT_SECRET, WEBHOOK_SECRET]
+                    .iter()
+                    .any(|s| s.contains(canary)),
+                "{canary}"
+            );
+        }
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .json()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(capture.clone())
+                .finish(),
+        );
+        let lanes: Arc<std::sync::Mutex<Option<GithubLanes>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        // The hook keeps the subscriber that is the default when it is built.
+        let hook = tracing::dispatcher::with_default(&dispatch, || {
+            github_activation_hook(
+                &store,
+                &lanes,
+                controller.handle(),
+                Some("https://ci.example.com".into()),
+            )
+        });
+        let setup = sentinel_api::GithubAppSetup {
+            web_url: fake.base(),
+            api_url: fake.base(),
+            sign_in_endpoints: fake.endpoints(),
+            ..github_app_setup(sentinel_github::app::Current::default(), None, hook)
+        };
+        let server = sentinel_api::Server::start_with(
+            sentinel_api::Config {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                store: Arc::clone(&store),
+                logs,
+                objects,
+                controller: controller.handle(),
+                secret_key: Some(key),
+                sessions: local_auth::Policy::default(),
+                github_webhook_secret: None,
+                intake: None,
+                public_url: Some("https://ci.example.com".into()),
+                github_sign_in: None,
+                trusted_proxies: sentinel_api::TrustedProxy::loopback(),
+            },
+            sentinel_api::Options {
+                github_app: setup,
+                ..sentinel_api::Options::default()
+            },
+        )
+        .unwrap();
+        let base = format!("http://{}", server.local_addr());
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .max_redirects(0)
+                .build(),
+        );
+        let post = |path: &str, body: &Value, session: Option<&(String, String)>| {
+            let mut request = agent
+                .post(format!("{base}{path}"))
+                .header("content-type", "application/json");
+            if let Some((cookie, csrf)) = session {
+                request = request
+                    .header("cookie", cookie)
+                    .header("x-sentinel-csrf", csrf);
+            }
+            let mut response = request.send(body.to_string().as_bytes()).unwrap();
+            let cookie = response
+                .headers()
+                .get("set-cookie")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.split(';').next().unwrap_or_default().to_owned());
+            let status = response.status().as_u16();
+            let text = response.body_mut().read_to_string().unwrap_or_default();
+            (
+                status,
+                cookie,
+                serde_json::from_str::<Value>(&text).unwrap_or(Value::Null),
+            )
+        };
+        let (status, cookie, login) = post(
+            "/api/v1/login",
+            &json!({ "username": "root", "password": PASSWORD }),
+            None,
+        );
+        assert_eq!(status, 200, "{login}");
+        let session = (cookie.unwrap(), login["csrf"].as_str().unwrap().to_owned());
+        let (status, _, body) = post(
+            "/api/v1/step-up",
+            &json!({ "method": "password", "code": PASSWORD }),
+            Some(&session),
+        );
+        assert_eq!(status, 200, "{body}");
+        let (status, _, manifest) = post(
+            "/api/v1/github/app/manifest",
+            &json!({ "owner": { "kind": "user" } }),
+            Some(&session),
+        );
+        assert_eq!(status, 200, "{manifest}");
+        fake.add_manifest(
+            "code0123",
+            &json!({
+                "id": 4242,
+                "slug": "acme-ci",
+                "name": "Acme CI",
+                "owner": { "login": "acme-gh", "id": 9000, "type": "Organization" },
+                "html_url": format!("{}/apps/acme-ci", fake.base()),
+                "client_id": "Iv23.acmeclient",
+                "client_secret": CLIENT_SECRET,
+                "webhook_secret": WEBHOOK_SECRET,
+                "pem": pem,
+            })
+            .to_string(),
+        );
+        let (status, _, converted) = post(
+            "/api/v1/github/app/conversion",
+            &json!({ "code": "code0123", "state": manifest["state"] }),
+            Some(&session),
+        );
+        assert_eq!(status, 200, "{converted}");
+
+        // The lane threads join when their slot is dropped; then the log is complete.
+        lanes.lock().unwrap_or_else(|p| p.into_inner()).take();
+        server.shutdown();
+        drop(controller);
+        let written = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(!written.is_empty(), "the subscriber saw nothing");
+        let records: Vec<Value> = written
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let activations: Vec<&Value> = records
+            .iter()
+            .filter(|r| r["fields"]["event"] == "github_app_activated")
+            .collect();
+        assert_eq!(activations.len(), 1, "{written}");
+        let fields = activations[0]["fields"].as_object().unwrap();
+        assert_eq!(fields["app_id"], 4242);
+        assert_eq!(fields["slug"], "acme-ci");
+        let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["app_id", "event", "message", "slug"]);
+        for canary in [
+            key_canary.as_str(),
+            CLIENT_SECRET,
+            WEBHOOK_SECRET,
+            PEM_MARKER,
+        ] {
+            assert!(!written.contains(canary), "{canary} in the log");
+        }
     }
 }
