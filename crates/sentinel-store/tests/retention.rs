@@ -873,3 +873,31 @@ fn a_reapply_batch_scans_rows_in_proportion_to_the_batch_not_to_the_table() {
         );
     }
 }
+
+/// Each maintenance read names a partial index with `INDEXED BY`; SQLite refuses to prepare the statement when
+/// that index cannot answer the query, so running them against the migrated schema proves the index still serves
+/// its predicate.
+#[test]
+fn maintenance_reads_are_served_by_their_partial_indexes() {
+    let f = fixture();
+    f.store
+        .read(|c| {
+            assert!(retention::unstamped(c, 256).unwrap().is_empty());
+            assert!(
+                retention::expiring(c, UnixMillis(i64::MAX), 256)
+                    .unwrap()
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .unwrap();
+    f.store
+        .write(|tx| {
+            assert_eq!(
+                retention::purge_aborted_uploads(tx, UnixMillis(i64::MAX), 256).unwrap(),
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
+}

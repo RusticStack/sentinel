@@ -1,6 +1,7 @@
 //! A publisher that read generation N can never overwrite generation N+1: the
 //! store's guarded write names the sequence it read.
 
+pub mod details;
 pub mod github;
 pub mod lane;
 pub mod members;

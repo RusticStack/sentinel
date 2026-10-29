@@ -367,6 +367,9 @@ impl WorkerBootstrapFile {
     }
 }
 
+/// The recovery point is the interval plus how long a backup takes, so the default leaves ten minutes of the one-hour objective for the backup itself.
+const DEFAULT_BACKUP_INTERVAL_SECS: u64 = 3_000;
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BackupFile {
@@ -2184,12 +2187,12 @@ fn start_server(
             tracing::info!(
                 event = "checks_enabled",
                 endpoint = %app.endpoint(),
-                details_url = github.details_url.is_some()
+                details_url = github.details_url.is_some() || public_url.is_some()
             );
             *github_lanes.lock().unwrap_or_else(|p| p.into_inner()) = Some(GithubLanes::start(
                 &store,
                 Arc::clone(app),
-                github.details_url.clone(),
+                github.details_url.clone().or_else(|| public_url.clone()),
                 github.members,
             ));
         }
@@ -2248,7 +2251,7 @@ fn start_server(
                 Arc::clone(&objects),
                 config.data_dir.clone(),
                 backup.dir.clone(),
-                Duration::from_secs(backup.interval_secs.unwrap_or(3_600)),
+                Duration::from_secs(backup.interval_secs.unwrap_or(DEFAULT_BACKUP_INTERVAL_SECS)),
                 backup.keep.unwrap_or(24),
                 env!("CARGO_PKG_VERSION").to_owned(),
             );
@@ -2256,7 +2259,7 @@ fn start_server(
             let thread = scheduler
                 .start()
                 .map_err(|error| Error::runtime(format!("cannot start backups: {error}")))?;
-            tracing::info!(event = "backups_scheduled", dir = %backup.dir.display(), interval_secs = backup.interval_secs.unwrap_or(3_600), keep = backup.keep.unwrap_or(24));
+            tracing::info!(event = "backups_scheduled", dir = %backup.dir.display(), interval_secs = backup.interval_secs.unwrap_or(DEFAULT_BACKUP_INTERVAL_SECS), keep = backup.keep.unwrap_or(24));
             Some((scheduler, thread))
         }
         None => None,
