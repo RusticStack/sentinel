@@ -2,11 +2,11 @@
 # Align a verification host's Sentinel toolchain with the reference host (reference-host) without touching the OS:
 # Podman 5.7.0 and conmon 2.1.13 from the signed podman-static bundle under /opt, the host's runc (Docker CE's 1.5.1 where present),
 # passt 2026_01_20.386b5f5 built from source under /opt, all wired through the account's containers.conf;
-# Rust 1.97.0 and one cargo-nextest version in the account; Node 22.22.1 and pnpm 12.3.4 under the account.
+# Rust 1.97.0 and one cargo-nextest version in the account; Node 22.22.1 and pnpm 12.15.0 under the account.
 #   sudo bash align-toolchain.sh ACCOUNT        (run as root; idempotent)
 set -euo pipefail
 ACCOUNT=$1
-PODMAN=v5.7.0 RUNC=v1.5.1 PASST=2026_01_20.386b5f5 RUST=1.97.0 NEXTEST=0.9.149 NODE=22.22.1 PNPM=12.3.4
+PODMAN=v5.7.0 RUNC=v1.5.1 PASST=2026_01_20.386b5f5 RUST=1.97.0 NEXTEST=0.9.149 NODE=22.22.1 PNPM=12.15.0
 SIGNER=0CCF102C4F95D89E583FF1D4F8B5AF50344BB503
 ARCH=$(dpkg --print-architecture)
 OPT=/opt/sentinel/toolchain

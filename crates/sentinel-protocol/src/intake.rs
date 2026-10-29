@@ -7,7 +7,6 @@ pub const MAX_HOOK_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_WEBHOOK_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_DELIVERY_ID_BYTES: usize = 128;
 pub const MAX_REF_BYTES: usize = 1024;
-pub const MAX_SHA_BYTES: usize = 64;
 pub const HOOK_TOKEN_PREFIX: &str = "sentinel_hook_";
 
 pub fn valid_delivery_id(value: &str) -> bool {

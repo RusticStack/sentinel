@@ -3,8 +3,6 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub const METADATA_PATH: &str = "/.well-known/oauth-authorization-server";
-pub const PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource/api/v1";
-pub const MCP_PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource/mcp";
 pub const AUTHORIZE_PATH: &str = "/oauth/authorize";
 pub const TOKEN_PATH: &str = "/oauth/token";
 pub const REVOKE_PATH: &str = "/oauth/revoke";

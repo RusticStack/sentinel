@@ -1676,6 +1676,23 @@ fn dynamic_registration_is_off_by_default_and_not_advertised() {
 }
 
 #[test]
+fn an_open_registration_cuts_an_oversized_body_off_at_16_kib() {
+    let d = deployment();
+    open_registration(&d);
+    let uri = format!("https://client.example.org/{}", "a".repeat(16 << 10));
+    let refused = send(
+        &d,
+        "POST",
+        "/oauth/register",
+        Body::Json(&json!({"redirect_uris":[uri]})),
+        &[],
+    );
+    assert_eq!(refused.status, 413, "{:?}", refused.body);
+    assert_eq!(refused.body["error"], "invalid_client_metadata");
+    assert_eq!(registered_clients(&d), 0);
+}
+
+#[test]
 fn standard_native_registrations_are_accepted_and_match_any_loopback_port() {
     let d = deployment();
     open_registration(&d);

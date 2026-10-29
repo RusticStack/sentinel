@@ -46,7 +46,7 @@ fn mib(bytes: u64) -> f64 {
 }
 
 #[test]
-#[ignore = "the R04 drill: minutes and gigabytes; run on the verification VPS"]
+#[ignore = "the backup restore drill: minutes and gigabytes; run on the verification VPS"]
 fn drill() {
     let big: u32 = std::env::var("SENTINEL_DRILL_BIG")
         .ok()

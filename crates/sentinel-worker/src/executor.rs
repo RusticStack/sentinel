@@ -137,7 +137,7 @@ impl CacheTotals {
 #[derive(Clone, Debug)]
 pub struct Availability {
     /// The measured restore and rebuild cost per cache class, settled estimates only (docs/cache.md).
-    pub cache_costs: [sentinel_cache::ClassFigures; 3],
+    pub cache_costs: [sentinel_cache::ClassFigures; sentinel_protocol::cache::Class::ALL.len()],
     pub images_held: Vec<String>,
     pub images_in_flight: usize,
     pub cache_entries: u64,
