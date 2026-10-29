@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use sentinel_s3::{Client, Error as S3Error};
+use sentinel_s3::{Client, Error as S3Error, client::READ_CHUNK_BYTES};
 use sentinel_store::{
     objects::Remote,
     replicate::{Bucket, BucketError, BucketResult, Replicator},
@@ -134,23 +134,10 @@ impl Bucket for S3Bucket {
             .map_err(map)
     }
     fn get(&self, key: &str, out: &mut dyn Write) -> BucketResult<u64> {
-        let (len, mut reader) = self
-            .client
-            .get_object(&self.client.key(key), None)
-            .map_err(map)?;
-        let copied = std::io::copy(&mut reader, out).map_err(|e| BucketError {
-            transient: true,
-            not_found: false,
-            message: format!("S3 read: {}", e.kind()),
-        })?;
-        if copied != len {
-            return Err(BucketError {
-                transient: true,
-                not_found: false,
-                message: "S3 read ended short".into(),
-            });
-        }
-        Ok(copied)
+        // Ranged reads: each has its own timeout budget, so a large object is not limited by one total.
+        self.client
+            .read_object(&self.client.key(key), out, READ_CHUNK_BYTES)
+            .map_err(map)
     }
     fn delete(&self, key: &str) -> BucketResult<()> {
         self.client
@@ -255,6 +242,7 @@ fn run(replicator: &Replicator, stop: &AtomicBool) {
     let status = replicator.status();
     let mut backoff = Duration::from_secs(1);
     let mut degraded = false;
+    let mut faults_seen = 0u64;
     while !stop.load(Ordering::Acquire) {
         match replicator.pass() {
             Ok(pass) => {
@@ -264,6 +252,18 @@ fn run(replicator: &Replicator, stop: &AtomicBool) {
                     tracing::info!(
                         event = "s3_recovered",
                         backlog_bytes = status.backlog_bytes.load(Ordering::Relaxed)
+                    );
+                }
+                let faults = status.local_faults.load(Ordering::Relaxed);
+                if faults != faults_seen || pass.parked > 0 {
+                    faults_seen = faults;
+                    // Counts only: which object or log is in `last_local_fault` and `last_refusal` of the admin status.
+                    tracing::warn!(
+                        event = "s3_items_parked",
+                        local_faults = faults,
+                        parked_items = status.parked_items.load(Ordering::Relaxed),
+                        parked_bytes = status.parked_bytes.load(Ordering::Relaxed),
+                        "some objects or logs are skipped and retried later; the rest of the queue goes on"
                     );
                 }
                 if !pass.more {

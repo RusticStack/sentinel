@@ -2075,11 +2075,16 @@ fn start_server(
         .read(|conn| objects.recover(conn))
         .map_err(|error| Error::runtime(format!("cannot recover the object store: {error}")))?;
     if recovery.orphans.is_empty() && recovery.corrupt.is_empty() && recovery.missing.is_empty() {
-        tracing::info!(event = "objects_recovered", staged = recovery.staged);
+        tracing::info!(
+            event = "objects_recovered",
+            staged = recovery.staged,
+            evicted_leftovers = recovery.evicted_leftovers
+        );
     } else {
         tracing::warn!(
             event = "objects_recovered",
             staged = recovery.staged,
+            evicted_leftovers = recovery.evicted_leftovers,
             orphans = recovery.orphans.len(),
             corrupt = recovery.corrupt.len(),
             missing = recovery.missing.len(),
@@ -2541,6 +2546,18 @@ fn start_mail(
         sentinel_mail::LaneConfig::default(),
         move |batch| {
             tracing::dispatcher::with_default(&dispatch, || {
+                // Once per change of state, with the class of the fault only, never a row or an address.
+                match batch.health {
+                    Some(sentinel_mail::Health::Degraded(cause)) => tracing::warn!(
+                        event = "mail_degraded",
+                        cause = cause.name(),
+                        "queued mail is not moving; it waits until the fault is fixed or it expires"
+                    ),
+                    Some(sentinel_mail::Health::Recovered) => {
+                        tracing::info!(event = "mail_recovered")
+                    }
+                    None => {}
+                }
                 if batch.abandoned > 0 {
                     tracing::warn!(
                         event = "mail_abandoned",

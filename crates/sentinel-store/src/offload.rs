@@ -157,6 +157,8 @@ pub struct LogRef {
     pub run: RunId,
     pub job: JobId,
     pub released_ms: i64,
+    /// The attempt's `log_state` when the row was read: the copy counts only if it is unchanged when the copy ends.
+    pub state: i64,
 }
 
 pub fn unreplicated_logs(
@@ -165,7 +167,7 @@ pub fn unreplicated_logs(
     limit: u32,
 ) -> Result<Vec<LogRef>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT a.id, j.run_id, a.job_id, a.released_ms
+        "SELECT a.id, j.run_id, a.job_id, a.released_ms, a.log_state
          FROM attempts a INDEXED BY attempts_log_unreplicated JOIN jobs j ON j.id = a.job_id
          WHERE a.log_expires_ms IS NOT NULL AND a.log_expired_ms IS NULL
            AND a.log_remote_ms IS NULL AND a.released_ms <= ?1
@@ -177,29 +179,68 @@ pub fn unreplicated_logs(
             r.get::<_, Vec<u8>>(1)?,
             r.get::<_, Vec<u8>>(2)?,
             r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (a, r, j, released_ms) = row?;
+        let (a, r, j, released_ms, state) = row?;
         out.push(LogRef {
             attempt: id16(a, AttemptId::from_bytes, "attempt_id")?,
             run: id16(r, RunId::from_bytes, "run_id")?,
             job: id16(j, JobId::from_bytes, "job_id")?,
             released_ms,
+            state,
         });
     }
     Ok(out)
 }
 
-pub fn log_replicated(tx: &Transaction<'_>, attempt: AttemptId, now: UnixMillis) -> Result<bool> {
-    Ok(tx
+/// What became of a log's copy when it ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogCopy {
+    /// Recorded: the copy matches the log as it was read.
+    Recorded,
+    /// A late end changed the log during the copy; it stays unreplicated and is copied again.
+    Changed,
+    /// Retention expired the log during the copy. Its trigger saw no copy yet, so the delete is queued here.
+    Expired,
+}
+
+pub fn log_replicated(tx: &Transaction<'_>, log: &LogRef, now: UnixMillis) -> Result<LogCopy> {
+    let recorded = tx
         .prepare_cached(
             "UPDATE attempts SET log_remote_ms = ?2
-             WHERE id = ?1 AND log_remote_ms IS NULL AND log_expired_ms IS NULL",
+             WHERE id = ?1 AND log_remote_ms IS NULL AND log_expired_ms IS NULL AND log_state = ?3",
         )?
-        .execute(params![attempt.as_bytes().as_slice(), now.0])?
-        == 1)
+        .execute(params![log.attempt.as_bytes().as_slice(), now.0, log.state])?
+        == 1;
+    if recorded {
+        return Ok(LogCopy::Recorded);
+    }
+    let expired: bool = tx
+        .prepare_cached("SELECT log_expired_ms IS NOT NULL FROM attempts WHERE id = ?1")?
+        .query_row([log.attempt.as_bytes().as_slice()], |r| r.get(0))
+        .optional()?
+        .unwrap_or(false);
+    if !expired {
+        return Ok(LogCopy::Changed);
+    }
+    queue_log_delete(tx, log, now)?;
+    Ok(LogCopy::Expired)
+}
+
+fn queue_log_delete(tx: &Transaction<'_>, log: &LogRef, now: UnixMillis) -> Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO s3_deletes(kind, run_id, job_id, attempt_id, queued_ms) VALUES (1, ?1, ?2, ?3, ?4)",
+    )?
+    .execute(params![
+        log.run.as_bytes().as_slice(),
+        log.job.as_bytes().as_slice(),
+        log.attempt.as_bytes().as_slice(),
+        now.0
+    ])?;
+    Ok(())
 }
 
 pub fn log_prefix(run: RunId, job: JobId, attempt: AttemptId) -> String {

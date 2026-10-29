@@ -356,6 +356,9 @@ pub struct Manifest {
 #[derive(Debug, Default)]
 pub struct Recovery {
     pub staged: u32,
+    /// Local files of objects marked evicted, left by an eviction that stopped between its mark and its unlink.
+    /// The external copy is verified, so they were removed.
+    pub evicted_leftovers: u32,
     pub orphans: Vec<PathBuf>,
     pub corrupt: Vec<PathBuf>,
     pub missing: Vec<PathBuf>,
@@ -1386,7 +1389,13 @@ impl Objects {
                 let digest = Digest::parse(&name.to_string_lossy());
                 match (valid_name, digest) {
                     (true, Ok(digest)) => match committed.remove(&(tenant, digest)) {
-                        Some((len, _)) if entry.metadata()?.len() == len => {
+                        Some((_, true)) => {
+                            // Evicted rows are committed only after the external copy is verified, and nothing reads the file
+                            // while the row says so; at startup no fetch is placing one either.
+                            fs::remove_file(&path)?;
+                            report.evicted_leftovers += 1;
+                        }
+                        Some((len, false)) if entry.metadata()?.len() == len => {
                             if !content_matches(&path, len, digest, buf) {
                                 report.corrupt.push(path);
                             }
