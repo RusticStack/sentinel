@@ -126,6 +126,7 @@ fn policy<'a>(source: &'a dyn Remote) -> remote::Policy<'a> {
         source,
         attempt: *AttemptId::new().as_bytes(),
         deadline: Instant::now() + Duration::from_secs(24 * 3600),
+        budget_bytes: remote::STORE_BUDGET_BYTES,
     }
 }
 
@@ -688,6 +689,7 @@ fn a_transfer_past_its_deadline_keeps_its_partial_for_the_next_attempt() {
         source: &fake,
         attempt: *AttemptId::new().as_bytes(),
         deadline: Instant::now() + Duration::from_millis(200),
+        budget_bytes: remote::STORE_BUDGET_BYTES,
     };
     let late = restore::restore_remote(
         &env(&root_b, &ws),
@@ -718,6 +720,7 @@ fn a_spent_job_deadline_never_networks() {
         source: &NeverCalled,
         attempt: *AttemptId::new().as_bytes(),
         deadline: Instant::now(),
+        budget_bytes: remote::STORE_BUDGET_BYTES,
     };
     let missed = restore::restore_remote(
         &env(&temp.path().join("cache"), &ws),
@@ -750,7 +753,7 @@ fn upload_for(scope: &Scope, stream: &[u8]) -> Upload {
 
 fn receive(store: &Path, scope: &Scope, stream: &[u8]) {
     let upload = upload_for(scope, stream);
-    let mut receiving = remote::Receiving::begin(store, &upload)
+    let mut receiving = remote::Receiving::begin(store, &upload, remote::STORE_BUDGET_BYTES)
         .unwrap()
         .expect("not stored yet");
     for (i, piece) in stream.chunks(1000).enumerate() {
@@ -813,7 +816,9 @@ fn an_abandoned_upload_leaves_nothing_behind() {
     let scope = test_scope(Trust::Protected);
     let stream = vec![4u8; 4000];
     let upload = upload_for(&scope, &stream);
-    let mut receiving = remote::Receiving::begin(&store, &upload).unwrap().unwrap();
+    let mut receiving = remote::Receiving::begin(&store, &upload, remote::STORE_BUDGET_BYTES)
+        .unwrap()
+        .unwrap();
     receiving.push(0, &stream[..1000]).unwrap();
     let writing = entry_of(&store, &scope).join(scope::WRITING_NAME);
     assert!(fs::read_dir(&writing).unwrap().count() > 0);
@@ -835,7 +840,9 @@ fn uploads_verify_as_they_land_and_serves_resume_only_proven_prefixes() {
     let scope = test_scope(Trust::Protected);
     let stream: Vec<u8> = (0..200_000u32).map(|i| (i % 253) as u8).collect();
     let upload = upload_for(&scope, &stream);
-    let mut lying = remote::Receiving::begin(&store, &upload).unwrap().unwrap();
+    let mut lying = remote::Receiving::begin(&store, &upload, remote::STORE_BUDGET_BYTES)
+        .unwrap()
+        .unwrap();
     let mut forged = stream.clone();
     forged[100] ^= 1;
     lying.push(0, &forged[..100_000]).unwrap();
@@ -910,13 +917,17 @@ fn the_store_takes_a_digest_at_the_end_only_when_the_bytes_prove_it() {
         remote::DIGEST_AT_END,
     );
     for wrong in [remote::DIGEST_AT_END, *blake3::hash(b"other").as_bytes()] {
-        let mut receiving = remote::Receiving::begin(&store, &late).unwrap().unwrap();
+        let mut receiving = remote::Receiving::begin(&store, &late, remote::STORE_BUDGET_BYTES)
+            .unwrap()
+            .unwrap();
         receiving.push(0, &stream).unwrap();
         assert_eq!(receiving.end(wrong), Err(Refusal::Store));
         drop(receiving);
         assert!(bundles(&entry_of(&store, &scope)).is_empty());
     }
-    let mut receiving = remote::Receiving::begin(&store, &late).unwrap().unwrap();
+    let mut receiving = remote::Receiving::begin(&store, &late, remote::STORE_BUDGET_BYTES)
+        .unwrap()
+        .unwrap();
     for (i, piece) in stream.chunks(40_000).enumerate() {
         receiving.push((i * 40_000) as u64, piece).unwrap();
     }
@@ -926,4 +937,245 @@ fn the_store_takes_a_digest_at_the_end_only_when_the_bytes_prove_it() {
         .plan();
     assert_eq!(served.digest, digest);
     assert_eq!(bundles(&entry_of(&store, &scope)).len(), 1);
+}
+
+/// Grants a total and moves no byte, so only the size gate in front of the transfer is under test.
+struct Granting(u64);
+
+impl Remote for Granting {
+    fn fetch(&self, need: &Need, _: Instant, sink: &mut dyn Sink) -> Result<(), Refusal> {
+        sink.plan(&Grant {
+            attempt: need.attempt,
+            total: self.0,
+            offset: 0,
+            prefix: [0; 32],
+            digest: [1; 32],
+        })
+    }
+    fn offer(&self, _: &Upload, _: Instant, _: &mut dyn Read) -> Result<[u8; 32], Refusal> {
+        Err(Refusal::Store)
+    }
+}
+
+fn hydrate_with_budget(
+    root: &Path,
+    ws: &Path,
+    scope: &Scope,
+    source: &dyn Remote,
+    budget_bytes: u64,
+) -> Attached {
+    fs::create_dir_all(ws).unwrap();
+    restore::restore_remote(
+        &env(root, ws),
+        &decl(&["vendor"]),
+        Some(KEY.to_owned()),
+        scope.clone(),
+        "attempt-1",
+        Some(remote::Policy {
+            budget_bytes,
+            ..policy(source)
+        }),
+    )
+}
+
+fn nothing_staged_or_promoted(root: &Path, scope: &Scope) {
+    let entry = entry_of(root, scope);
+    assert!(
+        !entry
+            .join(scope::WRITING_NAME)
+            .join("remote.stage")
+            .exists(),
+        "a refused bundle leaves no staging"
+    );
+    assert!(!entry.join(scope::CURRENT_NAME).exists());
+    let promoted = fs::read_dir(&entry)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("gen-"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(promoted, 0, "a refused bundle installs no generation");
+}
+
+#[test]
+fn a_grant_past_the_workers_bundle_cap_is_refused_before_anything_is_staged() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("cache");
+    let scope = test_scope(Trust::Protected);
+    fs::create_dir_all(&root).unwrap();
+    let budget = 64 << 20;
+    let cap = remote::max_bundle_bytes(budget);
+    assert!(
+        cap < remote::MAX_BUNDLE_BYTES,
+        "a small budget caps below the wire bound"
+    );
+
+    let over = hydrate_with_budget(
+        &root,
+        &temp.path().join("ws"),
+        &scope,
+        &Granting(cap + 1),
+        budget,
+    );
+    assert_eq!(over.outcome, Outcome::Miss(Miss::Invalid));
+    nothing_staged_or_promoted(&root, &scope);
+
+    // At the cap the size gate lets the grant through; this fake then moves nothing, so the bundle never
+    // verifies, which is a different miss from a size refusal.
+    let at = hydrate_with_budget(
+        &root,
+        &temp.path().join("ws"),
+        &scope,
+        &Granting(cap),
+        budget,
+    );
+    assert_eq!(at.outcome, Outcome::Miss(Miss::Corrupt));
+
+    // The same grant is within a worker whose budget is large enough: the cap follows the budget.
+    let roomy = hydrate_with_budget(
+        &root,
+        &temp.path().join("ws"),
+        &scope,
+        &Granting(cap + 1),
+        remote::STORE_BUDGET_BYTES,
+    );
+    assert_eq!(roomy.outcome, Outcome::Miss(Miss::Corrupt));
+}
+
+#[test]
+fn the_payload_cap_is_a_quarter_of_the_budget_and_inclusive() {
+    let temp = tempfile::tempdir().unwrap();
+    let (root_a, root_b) = (temp.path().join("a"), temp.path().join("b"));
+    fs::create_dir_all(&root_b).unwrap();
+    let scope = test_scope(Trust::Protected);
+    let fake = Fake::default();
+    let generation = seal_generation(
+        &root_a,
+        &scope,
+        &[("lib", b"payload-one"), ("sub/tool", b"tool-bytes!")],
+        "gen-1500000-0000abe0",
+    );
+    offer(&fake, &root_a, &scope, &generation);
+    // 22 payload bytes: a budget of 88 allows exactly 22, a budget of 87 allows 21.
+    let refused = hydrate_with_budget(&root_b, &temp.path().join("ws1"), &scope, &fake, 87);
+    assert_eq!(refused.outcome, Outcome::Miss(Miss::Invalid));
+    nothing_staged_or_promoted(&root_b, &scope);
+    let taken = hydrate_with_budget(&root_b, &temp.path().join("ws2"), &scope, &fake, 88);
+    assert!(taken.outcome.is_hit(), "{:?}", taken.outcome);
+}
+
+fn tamper_manifest(root: &Path, scope: &Scope, generation: &str, edit: impl FnOnce(&mut Manifest)) {
+    let path = entry_of(root, scope)
+        .join(generation)
+        .join(scope::MANIFEST_NAME);
+    let mut manifest = Manifest::decode(&fs::read(&path).unwrap()).unwrap();
+    edit(&mut manifest);
+    fs::write(&path, manifest.encode()).unwrap();
+}
+
+#[test]
+fn a_manifest_that_misstates_its_bytes_or_seal_time_never_hydrates() {
+    type Edit = fn(&mut Manifest);
+    let lies: [(&str, Edit, Miss); 4] = [
+        ("huge bytes", |m| m.bytes = u64::MAX, Miss::Corrupt),
+        ("zero bytes", |m| m.bytes = 0, Miss::Corrupt),
+        ("one byte over", |m| m.bytes += 1, Miss::Corrupt),
+        (
+            "a seal time past i64",
+            |m| m.sealed_ms = u64::MAX,
+            Miss::Invalid,
+        ),
+    ];
+    for (what, lie, miss) in lies {
+        let temp = tempfile::tempdir().unwrap();
+        let (root_a, root_b) = (temp.path().join("a"), temp.path().join("b"));
+        fs::create_dir_all(&root_b).unwrap();
+        let scope = test_scope(Trust::Protected);
+        let generation = seal_generation(
+            &root_a,
+            &scope,
+            &[("lib", b"payload-one"), ("sub/tool", b"tool-bytes")],
+            "gen-1500000-0000abe1",
+        );
+        tamper_manifest(&root_a, &scope, &generation, lie);
+        let fake = Fake::default();
+        offer(&fake, &root_a, &scope, &generation);
+        let served = hydrate(&root_b, &temp.path().join("ws"), &scope, &fake);
+        assert_eq!(served.outcome, Outcome::Miss(miss), "{what}");
+        nothing_staged_or_promoted(&root_b, &scope);
+    }
+}
+
+#[test]
+fn the_store_refuses_a_bundle_past_its_budget_cap_and_sweeps_an_oversize_one_first() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("remote-cache");
+    let scope = test_scope(Trust::Protected);
+    let budget = 64 << 20;
+    let cap = remote::max_bundle_bytes(budget);
+
+    let too_big = Upload::of(
+        *AttemptId::new().as_bytes(),
+        &scope,
+        KEY,
+        cap + 1,
+        *blake3::hash(b"never sent").as_bytes(),
+    );
+    assert_eq!(
+        remote::Receiving::begin(&store, &too_big, budget).err(),
+        Some(Refusal::TooLarge)
+    );
+    let at_end = Upload::of(
+        *AttemptId::new().as_bytes(),
+        &scope,
+        KEY,
+        cap + 1,
+        remote::DIGEST_AT_END,
+    );
+    assert_eq!(
+        remote::Receiving::begin(&store, &at_end, budget).err(),
+        Some(Refusal::TooLarge),
+        "a digest stated at the end changes nothing about the size bound"
+    );
+    let at_cap = Upload::of(
+        *AttemptId::new().as_bytes(),
+        &scope,
+        KEY,
+        cap,
+        *blake3::hash(b"never sent").as_bytes(),
+    );
+    assert!(
+        remote::Receiving::begin(&store, &at_cap, budget)
+            .unwrap()
+            .is_some(),
+        "the cap itself is allowed"
+    );
+    assert!(
+        remote::Receiving::begin(&store, &too_big, remote::STORE_BUDGET_BYTES).is_ok(),
+        "the bound follows the store's budget"
+    );
+
+    // A bundle bigger than the whole budget is dropped before the entries that fit, whoever was served last.
+    let small_a = test_scope(Trust::Protected);
+    let small_b = test_scope(Trust::Protected);
+    let big = test_scope(Trust::Protected);
+    receive(&store, &small_a, &[1u8; 3000]);
+    receive(&store, &small_b, &[2u8; 3000]);
+    receive(&store, &big, &[3u8; 9000]);
+    let past = std::time::SystemTime::now() - Duration::from_secs(3600);
+    for older in [&small_a, &small_b] {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(entry_of(&store, older).join(scope::CURRENT_NAME))
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+    let swept = remote::sweep_store(&store, 7000, 1000, UnixMillis::now().0);
+    assert_eq!(swept.entries_evicted, 1, "{swept:?}");
+    assert!(!entry_of(&store, &big).exists());
+    assert!(entry_of(&store, &small_a).exists());
+    assert!(entry_of(&store, &small_b).exists());
+    assert_eq!(swept.bytes, 6000);
 }

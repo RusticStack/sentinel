@@ -743,6 +743,71 @@ fn default_budget_refuses_a_generation_over_the_byte_cap() {
 }
 
 #[cfg(target_os = "linux")]
+fn publish_one_sparse(budget: u64, logical: u64) -> Result<Published, PublishError> {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cache");
+    let view = tmp.path().join("view");
+    fs::create_dir_all(&view).unwrap();
+    fs::File::create(view.join("blob"))
+        .unwrap()
+        .set_len(logical)
+        .unwrap();
+    let a = attached(test_scope(Trust::Protected), vec![target(view)]);
+    sentinel_cache::publish::commit_with_budget(
+        &root,
+        budget,
+        &a,
+        Trust::Protected,
+        UnixMillis(1_000),
+        deadline(),
+        &never(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_generation_cap_is_inclusive_at_the_minimum_budget() {
+    const FLOOR: u64 = 64 << 20;
+    let at_cap = publish_one_sparse(FLOOR, FLOOR / 4);
+    assert!(
+        matches!(at_cap, Ok(Published::Sealed { .. })),
+        "a generation of exactly a quarter of the budget is published, got {at_cap:?}"
+    );
+    let over = publish_one_sparse(FLOOR, FLOOR / 4 + 1);
+    assert!(
+        matches!(over, Err(PublishError::TooLarge)),
+        "one byte over is refused, got {over:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_budget_under_four_bytes_caps_a_generation_at_nothing_without_failing_oddly() {
+    for budget in 0..4 {
+        let out = publish_one_sparse(budget, 1);
+        assert!(
+            matches!(out, Err(PublishError::TooLarge)),
+            "budget {budget}: a one-byte generation is over a zero cap, got {out:?}"
+        );
+    }
+    let out = publish_one_sparse(0, 0);
+    assert!(
+        matches!(out, Ok(Published::Sealed { .. })),
+        "an empty file costs no bytes, so a zero cap still holds it, got {out:?}"
+    );
+    let out = publish_one_sparse(4, 1);
+    assert!(matches!(out, Ok(Published::Sealed { .. })), "got {out:?}");
+}
+
+#[test]
+fn a_refused_generation_says_which_bound_it_hit() {
+    let text = PublishError::TooLarge.to_string();
+    assert!(text.contains("quarter of the cache budget"), "{text}");
+    assert_ne!(text, PublishError::TooManyFiles.to_string());
+    assert_ne!(text, PublishError::FileListTooLarge.to_string());
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn sparse_file_does_not_amplify() {
     use std::io::{Seek, SeekFrom, Write};

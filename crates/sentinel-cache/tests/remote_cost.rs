@@ -29,7 +29,7 @@ use sentinel_protocol::{
 };
 
 const KEY: &str = "deps-cost";
-const CHUNK: usize = 48 << 10;
+const CHUNK: usize = sentinel_protocol::limits::MAX_CACHE_CHUNK_BYTES;
 
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -260,6 +260,7 @@ fn transfer_cost() {
                 source: &store,
                 attempt: *AttemptId::new().as_bytes(),
                 deadline: Instant::now() + Duration::from_secs(600),
+                budget_bytes: remote::STORE_BUDGET_BYTES,
             }),
         );
         let hydrate_ns = started.elapsed().as_nanos();

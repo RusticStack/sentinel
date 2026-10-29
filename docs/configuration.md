@@ -66,7 +66,7 @@ isolation = "auto"                 # default executor for jobs that state none: 
 disk_bytes = 1073741824            # scratch disk offered to jobs; default: the data directory's free space less an eighth (clamped to 512 MiB-2 GiB), re-measured while the worker runs; a stated value is fixed; a platform that cannot measure it offers none, and no job is placed there
 spool_reserve_bytes = 1073741824   # free space the log spools never write the data directory below (default 1 GiB; 0 = none)
 spool_quota_bytes = 4294967296     # bytes every attempt's log spool may hold together (> 0, default 4 GiB); output past either is declared as log gaps ([logs](logs.md))
-cache_budget_bytes = 53687091200   # what the local cache may hold (≥ 64 MiB); default a fifth of the data file system, 1-50 GiB ([retention](retention.md))
+cache_budget_bytes = 53687091200   # what the local cache may hold (≥ 64 MiB); a published generation is capped at a quarter of it, see [cache](cache.md); default a fifth of the data file system, 1-50 GiB ([retention](retention.md))
 mirror_budget_bytes = 53687091200  # what the Git mirrors may hold (≥ 64 MiB); default a tenth, 1-50 GiB
 image_budget_bytes = 53687091200   # what each image store may hold (≥ 64 MiB); default a fifth, 2-50 GiB; least recently used images no container holds go first
 metrics_listen = "127.0.0.1:9464"  # loopback address answering `GET /metrics` for a local scraper (default off; [monitoring](monitoring.md))
@@ -91,7 +91,7 @@ listen_port = 7443                 # server: must match `listen`; worker: the lo
 # either role: remote cache hydration; absent or `enabled = false` keeps every lookup local
 [remote_cache]
 enabled = true                     # default; the controller holds offered objects, the worker fetches/offers them
-budget_bytes = 53687091200         # server only: what the controller's store may hold (≥ 64 MiB); default a tenth of the data file system, 1-50 GiB
+budget_bytes = 53687091200         # server only: what the controller's store may hold (≥ 64 MiB); one bundle may be at most a quarter of it plus its listing, see [cache](cache.md); default a tenth of the data file system, 1-50 GiB
 
 # server only: the optional external S3 copy of objects and finished logs ([s3](s3.md)); absent keeps everything on the local disk only
 [s3]

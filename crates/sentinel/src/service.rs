@@ -63,6 +63,10 @@ impl Error {
     }
 }
 
+/// The least a configured cache, mirror, image or remote-store budget may be (`sentinel_cache::gc::MIN_BUDGET_BYTES`
+/// is the same figure; this crate links no cache code in every build, so the two validations here share this copy).
+const MIN_BUDGET_BYTES: u64 = 64 << 20;
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -826,7 +830,7 @@ impl Config {
                     .map(RemoteCacheFile::on)
                     .unwrap_or(true),
                 remote_cache_budget: match file.remote_cache.as_ref().and_then(|r| r.budget_bytes) {
-                    Some(bytes) if bytes < (64 << 20) => {
+                    Some(bytes) if bytes < MIN_BUDGET_BYTES => {
                         return Err(Error::config(
                             "[remote_cache] budget_bytes must be at least 64 MiB when set",
                         ));
@@ -966,7 +970,7 @@ impl Config {
                     ]
                     .into_iter()
                     .flatten()
-                    .any(|b| b < (64 << 20))
+                    .any(|b| b < MIN_BUDGET_BYTES)
                     {
                         return Err(Error::config(
                             "cache_budget_bytes, mirror_budget_bytes and image_budget_bytes must be at least 64 MiB when set",
@@ -2121,7 +2125,8 @@ fn start_server(
                 root.display()
             ))
         })?;
-        let budget = remote_cache_budget.unwrap_or_else(|| (total / 10).clamp(1 << 30, 50 << 30));
+        let budget = remote_cache_budget
+            .unwrap_or_else(|| sentinel_link::controller::default_remote_cache_budget(total));
         controller.set_remote_cache_budget(budget);
         controller.set_remote_cache(root);
     }

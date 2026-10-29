@@ -32,7 +32,7 @@ const COPY_BYTES: usize = 1 << 20;
 const SYNC_FDS: usize = 64;
 pub(crate) const CURRENT_TMP: &str = "current.tmp";
 
-const fn max_generation_bytes(budget_bytes: u64) -> u64 {
+pub(crate) const fn max_generation_bytes(budget_bytes: u64) -> u64 {
     budget_bytes / 4
 }
 
@@ -73,7 +73,12 @@ impl SkipReason {
 pub enum PublishError {
     TrustMismatch,
     TimedOut,
+    /// Logical payload over the byte cap, one quarter of the cache budget.
     TooLarge,
+    /// More file entries than `MAX_FILE_ENTRIES`.
+    TooManyFiles,
+    /// The encoded listing is over `MAX_FILES_BLOB_BYTES`.
+    FileListTooLarge,
     NoSpace,
     Lock(LeaseError),
     Io(std::io::Error),
@@ -84,7 +89,11 @@ impl std::fmt::Display for PublishError {
         match self {
             Self::TrustMismatch => f.write_str("scope trust is not the job's"),
             Self::TimedOut => f.write_str("publish exceeded its deadline"),
-            Self::TooLarge => f.write_str("generation exceeds the publish bounds"),
+            Self::TooLarge => {
+                f.write_str("generation exceeds the byte cap (one quarter of the cache budget)")
+            }
+            Self::TooManyFiles => f.write_str("generation exceeds the file entry cap"),
+            Self::FileListTooLarge => f.write_str("generation file listing exceeds its size cap"),
             Self::NoSpace => f.write_str("not enough free space for the generation"),
             Self::Lock(e) => write!(f, "write lock: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
@@ -377,9 +386,7 @@ fn stage(
         return Ok(Published::Skipped(SkipReason::Unchanged));
     }
     plan.check(deadline, cancel)?;
-    if let Some((free, total)) = free_bytes(entry)
-        && free < plan.copy_bytes().saturating_add(reserve(total))
-    {
+    if short_of_space(free_bytes(entry), plan.copy_bytes()) {
         return Err(PublishError::NoSpace.into());
     }
     phases.plan_ns = ns_since(planning);
@@ -400,7 +407,7 @@ fn stage(
     blob.entries.sort_by(|a, b| a.path.cmp(&b.path));
     let encoded = blob.encode();
     if encoded.len() as u64 > MAX_FILES_BLOB_BYTES {
-        return Err(PublishError::TooLarge.into());
+        return Err(PublishError::FileListTooLarge.into());
     }
     write_synced(&staging.join(scope::FILES_NAME), &encoded)?;
     let mut manifest = Manifest::writing(&attached.scope, &attached.key, attached.compat.clone());
@@ -568,7 +575,7 @@ impl Plan<'_> {
         cancel: &dyn Fn() -> bool,
     ) -> Result<(), Stop> {
         if self.planned.len() as u32 >= MAX_FILE_ENTRIES {
-            return Err(PublishError::TooLarge.into());
+            return Err(PublishError::TooManyFiles.into());
         }
         if !valid_relative_path(&entry) {
             self.skipped += 1;
@@ -781,11 +788,17 @@ fn copy_hashed(
     Ok((*hasher.finalize().as_bytes(), written, output))
 }
 
-fn reserve(total: u64) -> u64 {
+pub(crate) fn reserve(total: u64) -> u64 {
     (total / 20).min(FREE_SPACE_RESERVE)
 }
 
-fn free_bytes(path: &Path) -> Option<(u64, u64)> {
+/// Whether a file system, measured as `(free, total)` by [`free_bytes`], lacks room for `need` bytes
+/// and its reserve. An unmeasurable file system never refuses.
+pub(crate) fn short_of_space(space: Option<(u64, u64)>, need: u64) -> bool {
+    space.is_some_and(|(free, total)| free < need.saturating_add(reserve(total)))
+}
+
+pub(crate) fn free_bytes(path: &Path) -> Option<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {
         let st = rustix::fs::statvfs(path).ok()?;
@@ -860,5 +873,52 @@ pub(crate) fn file_mode(meta: &fs::Metadata) -> u32 {
 }
 
 fn entries_len(blob: &FilesBlob) -> Result<u32, PublishError> {
-    u32::try_from(blob.entries.len()).map_err(|_| PublishError::TooLarge)
+    u32::try_from(blob.entries.len()).map_err(|_| PublishError::TooManyFiles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn room_is_the_need_plus_a_twentieth_of_the_file_system_capped_at_the_reserve() {
+        assert!(
+            !short_of_space(None, u64::MAX),
+            "an unmeasured file system never refuses"
+        );
+        // 1000-byte file system: reserve 50.
+        assert!(!short_of_space(Some((100, 1000)), 50));
+        assert!(short_of_space(Some((100, 1000)), 51));
+        // A huge file system caps the reserve at FREE_SPACE_RESERVE.
+        let total = 100 * FREE_SPACE_RESERVE;
+        assert_eq!(reserve(total), FREE_SPACE_RESERVE);
+        assert!(!short_of_space(Some((FREE_SPACE_RESERVE + 7, total)), 7));
+        assert!(short_of_space(Some((FREE_SPACE_RESERVE + 6, total)), 7));
+        // A need that overflows is short, never wrapped into room.
+        assert!(short_of_space(Some((u64::MAX - 1, total)), u64::MAX));
+    }
+
+    #[test]
+    fn the_byte_cap_is_a_quarter_of_the_budget() {
+        assert_eq!(max_generation_bytes(0), 0);
+        assert_eq!(max_generation_bytes(3), 0);
+        assert_eq!(max_generation_bytes(4), 1);
+        assert_eq!(max_generation_bytes(64 << 20), 16 << 20);
+        assert_eq!(MAX_GENERATION_BYTES, (50u64 << 30) / 4);
+    }
+
+    #[test]
+    fn each_bound_names_itself() {
+        let named: Vec<String> = [
+            PublishError::TooLarge,
+            PublishError::TooManyFiles,
+            PublishError::FileListTooLarge,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert!(named[0].contains("byte cap") && named[0].contains("quarter"));
+        assert!(named[1].contains("file entry"));
+        assert!(named[2].contains("listing"));
+    }
 }

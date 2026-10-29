@@ -53,7 +53,9 @@ const TLS_READ_BYTES: usize = 16 * 1024 + 512;
 pub const SPEC_CHUNK_BYTES: usize = 48 * 1024;
 pub const MAX_SPEC_BYTES: usize = MAX_API_BODY_BYTES;
 const MAX_IN_FLIGHT_SECRET_BYTES: usize = 8 * sentinel_protocol::secrets::MAX_DELIVERY_BYTES;
-pub const MAX_CACHE_CHUNK_BYTES: usize = 48 * 1024;
+pub const MAX_CACHE_CHUNK_BYTES: usize = sentinel_protocol::limits::MAX_CACHE_CHUNK_BYTES;
+const _: () =
+    assert!(SPEC_CHUNK_BYTES + 128 <= sentinel_protocol::limits::MAX_CONTROL_MESSAGE_BYTES);
 const MAX_CACHE_TRANSFERS: usize = 4;
 const UPLOAD_IDLE: Duration = Duration::from_secs(60);
 const TRANSPORT_BEATS: u64 = 12;
@@ -905,6 +907,10 @@ pub trait SessionHandler: Send + Sync {
     }
     fn cache_offer(&self, _worker: WorkerId, _upload: &Upload) -> Option<PathBuf> {
         None
+    }
+    /// The store's byte budget: an offer past `remote::max_bundle_bytes` of it is refused before it is staged.
+    fn cache_budget(&self) -> u64 {
+        sentinel_cache::remote::STORE_BUDGET_BYTES
     }
 }
 
@@ -2416,7 +2422,11 @@ fn serve_connection(
                 }
                 match handler.cache_offer(worker, &upload) {
                     None => send_cache_refused(tx, attempt, Refusal::Denied)?,
-                    Some(root) => match sentinel_cache::remote::Receiving::begin(&root, &upload) {
+                    Some(root) => match sentinel_cache::remote::Receiving::begin(
+                        &root,
+                        &upload,
+                        handler.cache_budget(),
+                    ) {
                         Ok(None) => {
                             tx.send(&ServerMessage::CacheEnd(End {
                                 attempt,
