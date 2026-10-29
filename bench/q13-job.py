@@ -13,7 +13,9 @@ the intake delivery, and answers where the run was placed. It prints one JSON li
 reason (`GET /queue`) the probe waits with when nothing takes it within `wait_s`. Every API or Git failure exits 2
 with one line on stderr and prints nothing: an unreachable controller is never reported as "no worker". A probe that
 was placed is cancelled again unless `--keep` (the harness's drain scenario keeps one running); `--release` cancels
-every kept probe.
+every kept probe. A probe whose placement cannot be told, or whose `--keep` cannot be recorded, is cancelled before the
+failure is reported, so a `sleep` job never starts later and holds a worker in the next scenario. Git's own messages
+are printed with any `user:secret@` part of a URL removed.
 
 JOB.json: {"api": "https://controller.example/api/v1", "token_file": "...", "hook_token_file": "...",
            "tenant": "slug", "repo_id": "repo_...", "repo_name": "probe", "git_work": "/path/to/clone",
@@ -24,6 +26,7 @@ The tokens are read from files and never printed. The Git clone must have the re
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -38,6 +41,14 @@ MIB = 1 << 20
 
 class Failure(Exception):
     pass
+
+
+CREDENTIAL_URL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]*@")
+
+
+def redact(text):
+    """Git echoes the remote it failed on, and a remote may carry `user:secret@`: drop everything before the `@`."""
+    return CREDENTIAL_URL.sub(lambda m: m.group(1) + "***@", text)
 
 
 def need(cfg, *keys):
@@ -83,7 +94,7 @@ def pipeline(cfg, arch, os_, isolation, cpu, mem, disk):
 def git(cfg, *args, stdin=None):
     r = subprocess.run(["git", *IDENT, "-C", cfg["git_work"], *args], input=stdin, capture_output=True, text=True)
     if r.returncode != 0:
-        raise Failure(f"git {args[0]} failed: {r.stderr.strip()[:200]}")
+        raise Failure(f"git {args[0]} failed: {redact(r.stderr.strip())[:200]}")
     return r.stdout.strip()
 
 
@@ -96,7 +107,7 @@ def push_probe(cfg, yml):
         def plumb(*a, stdin=None):
             r = subprocess.run(["git", *IDENT, "-C", work, *a], input=stdin, capture_output=True, text=True, env=env)
             if r.returncode != 0:
-                raise Failure(f"git {a[0]} failed: {r.stderr.strip()[:200]}")
+                raise Failure(f"git {a[0]} failed: {redact(r.stderr.strip())[:200]}")
             return r.stdout.strip()
         plumb("read-tree", "HEAD")
         blob = plumb("hash-object", "-w", "--stdin", stdin=yml)
@@ -121,13 +132,26 @@ def held(cfg):
     return {w["id"]: int(w.get("held_attempts") or 0) for w in body.get("workers", []) if "id" in w}
 
 
+def lookup_run(cfg, sha):
+    _s, body = call(cfg, "GET", f"/tenants/{cfg['tenant']}/repos/{cfg['repo_name']}/runs?sha={sha}&limit=1")
+    runs = body.get("runs") or []
+    return runs[0]["id"] if runs else None
+
+
+def cancel_quietly(cfg, run):
+    """Best effort on a failure path: the original failure is what gets reported, not a failed clean-up."""
+    try:
+        call(cfg, "POST", f"/runs/{run}/cancel", {})
+    except Failure:
+        pass
+
+
 def find_run(cfg, sha, wait_s):
     deadline = time.monotonic() + wait_s
     while True:
-        _s, body = call(cfg, "GET", f"/tenants/{cfg['tenant']}/repos/{cfg['repo_name']}/runs?sha={sha}&limit=1")
-        runs = body.get("runs") or []
-        if runs:
-            return runs[0]["id"]
+        run = lookup_run(cfg, sha)
+        if run:
+            return run
         if time.monotonic() > deadline:
             raise Failure("the intake delivery produced no run within the wait")
         time.sleep(0.25)
@@ -140,7 +164,32 @@ def place(cfg, arch, os_, isolation, cpu, mem, disk, keep=False):
     ref, sha = push_probe(cfg, pipeline(cfg, arch, os_, isolation, cpu, mem, disk))
     call(cfg, "POST", f"/intake/{cfg['repo_id']}", {"delivery_id": f"q13-{uuid.uuid4().hex}", "ref": ref,
                                                      "old_sha": "0" * 40, "new_sha": sha}, token_key="hook_token_file")
-    run = find_run(cfg, sha, wait_s)
+    try:
+        run = find_run(cfg, sha, wait_s)
+    except Failure:
+        # The delivery may still produce the run after the wait: one last look, so a late probe does not hold a worker.
+        try:
+            late = lookup_run(cfg, sha)
+        except Failure:
+            late = None
+        if late:
+            cancel_quietly(cfg, late)
+        raise
+    settled = False  # the probe is kept (recorded for --release) or cancelled; anything else cancels it below
+    try:
+        out = placement(cfg, run, before, wait_s)
+        if keep:
+            record_kept(cfg, run)
+        else:
+            call(cfg, "POST", f"/runs/{run}/cancel", {})
+        settled = True
+        return out
+    finally:
+        if not settled:
+            cancel_quietly(cfg, run)
+
+
+def placement(cfg, run, before, wait_s):
     deadline = time.monotonic() + wait_s
     worker = reason = None
     while time.monotonic() < deadline:
@@ -157,21 +206,24 @@ def place(cfg, arch, os_, isolation, cpu, mem, disk, keep=False):
             raise Failure("the probe is neither on a worker nor in the queue; its placement cannot be told")
         r = mine[0].get("reason")
         reason = r.get("code") if isinstance(r, dict) else r
-    if keep:
-        kept = []
-        path = cfg.get("state_file")
-        if not path:
-            raise Failure("--keep needs state_file in the job config, so --release can find the run")
-        try:
-            with open(path) as f:
-                kept = json.load(f)
-        except (OSError, ValueError):
-            pass
+    return {"worker": worker, "reason": reason}
+
+
+def record_kept(cfg, run):
+    kept = []
+    path = cfg.get("state_file")
+    if not path:
+        raise Failure("--keep needs state_file in the job config, so --release can find the run")
+    try:
+        with open(path) as f:
+            kept = json.load(f)
+    except (OSError, ValueError):
+        pass
+    try:
         with open(path, "w") as f:
             json.dump(kept + [run], f)
-    else:
-        call(cfg, "POST", f"/runs/{run}/cancel", {})
-    return {"worker": worker, "reason": reason}
+    except OSError as e:
+        raise Failure(f"cannot record the kept run: {e.strerror}") from None
 
 
 def release(cfg):

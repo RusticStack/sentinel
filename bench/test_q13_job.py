@@ -57,7 +57,7 @@ class Fake(http.server.BaseHTTPRequestHandler):
             run = s.runs_by_sha.get(m.group(1))
             return self.reply(200, {"runs": [{"id": run}] if run else []})
         if self.path.startswith("/api/v1/queue"):
-            return self.reply(200, {"jobs": [{"run": r, "reason": {"code": s.reason}} for r in s.queued]})
+            return self.reply(200, {"jobs": [] if s.hide_queue else [{"run": r, "reason": {"code": s.reason}} for r in s.queued]})
         self.reply(404, {})
 
     def do_POST(self):
@@ -94,7 +94,15 @@ class Server(http.server.ThreadingHTTPServer):
         Fake.srv = self
         self.calls, self.held, self.runs_by_sha, self.queued, self.intakes = [], {"wrk_a": 0, "wrk_b": 0}, {}, [], []
         self.on_worker, self.cancelled = {}, []
-        self.takes, self.reason, self.fail_workers = "wrk_b", "arch_mismatch", False
+        self.takes, self.reason, self.fail_workers, self.hide_queue = "wrk_b", "arch_mismatch", False, False
+
+
+def load_job():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("q13_job", JOB)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def sh(*a, **kw):
@@ -187,6 +195,33 @@ class Job(unittest.TestCase):
         r = self.run_job("sparc", "linux", "container", "1000", str(1 << 30), str(1 << 30))
         self.assertEqual((r.returncode, r.stdout), (2, ""))
         self.assertEqual(self.srv.intakes, [])
+
+    def test_a_probe_whose_placement_cannot_be_told_is_cancelled_not_left_to_start_later(self):
+        # Without the clean-up the run stays queued (or starts) and its `sleep` job holds a worker in the next scenario.
+        self.srv.takes, self.srv.hide_queue = None, True
+        r = self.run_job("x86_64", "linux", "container", "1000", str(1 << 30), str(1 << 30))
+        self.assertEqual((r.returncode, r.stdout), (2, ""))
+        self.assertIn("neither on a worker nor in the queue", r.stderr)
+        self.assertEqual(self.srv.cancelled, ["run_1"])
+
+    def test_a_keep_that_cannot_be_recorded_cancels_the_probe(self):
+        del self.cfg["state_file"]
+        self.write_cfg()
+        r = self.run_job("x86_64", "linux", "container", "1000", str(1 << 30), str(1 << 30), extra=["--keep"])
+        self.assertEqual((r.returncode, r.stdout), (2, ""))
+        self.assertIn("state_file", r.stderr)
+        self.assertEqual(self.srv.cancelled, ["run_1"], "nothing could find the run for --release, so it must not keep running")
+
+    def test_a_failure_message_does_not_carry_a_credential_in_the_remote_url(self):
+        job = load_job()
+        msg = "fatal: unable to access 'https://deploy:s3cretpw@git.example.test/x.git/': Could not resolve host"
+        self.assertNotIn("s3cretpw", job.redact(msg))
+        self.assertIn("git.example.test", job.redact(msg))
+        self.cfg["git_remote"] = "http://deploy:s3cretpw@127.0.0.1:9/x.git"
+        self.write_cfg()
+        r = self.run_job("x86_64", "linux", "container", "1000", str(1 << 30), str(1 << 30))
+        self.assertEqual((r.returncode, r.stdout), (2, ""))
+        self.assertNotIn("s3cretpw", r.stderr)
 
     def test_keep_leaves_the_probe_running_and_release_cancels_it(self):
         r = self.run_job("x86_64", "linux", "container", "1000", str(1 << 30), str(1 << 30), extra=["--keep"])
