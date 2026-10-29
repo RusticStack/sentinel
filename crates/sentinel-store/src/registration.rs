@@ -407,6 +407,8 @@ pub(crate) struct Usable {
     pub role: Option<Role>,
     pub identity: Option<(String, String)>,
     pub email: Option<String>,
+    /// Issued by the host-local CLI, so no tenant administrator stands behind it.
+    pub host_local: bool,
 }
 
 pub(crate) enum Select {
@@ -417,7 +419,8 @@ pub(crate) enum Select {
 macro_rules! usable_sql {
     ($selector:literal) => {
         concat!(
-            "SELECT i.id, i.tenant_id, i.role, i.provider, i.subject, i.email FROM invitations i
+            "SELECT i.id, i.tenant_id, i.role, i.provider, i.subject, i.email, i.created_by IS NULL
+             FROM invitations i
              LEFT JOIN users c ON c.id = i.created_by
              LEFT JOIN memberships cm
                ON cm.tenant_id = i.tenant_id AND cm.user_id = i.created_by
@@ -457,6 +460,7 @@ pub(crate) fn usable_invitation(
         Option<String>,
         Option<String>,
         Option<String>,
+        bool,
     )> = {
         let map = |r: &rusqlite::Row<'_>| {
             Ok((
@@ -466,6 +470,7 @@ pub(crate) fn usable_invitation(
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
+                r.get(6)?,
             ))
         };
         match by {
@@ -479,7 +484,7 @@ pub(crate) fn usable_invitation(
                 .optional()?,
         }
     };
-    let Some((id, tenant, role, provider, subject, email)) = row else {
+    let Some((id, tenant, role, provider, subject, email, host_local)) = row else {
         return Ok(None);
     };
     Ok(Some(Usable {
@@ -490,6 +495,7 @@ pub(crate) fn usable_invitation(
         role: decode_role(role)?,
         identity: provider.zip(subject),
         email,
+        host_local,
     }))
 }
 
@@ -508,12 +514,29 @@ fn tenant_is_open(conn: &Connection, tenant: TenantId) -> Result<bool> {
     Ok(active && !tenant_is_github_backed(conn, tenant)?)
 }
 
+/// A platform administrator has no ambient tenant access, and joining one needs step-up and an audited
+/// reason ([`crate::auth::Authority::require_tenant_access_change`]). A host-local invitation carries
+/// neither, so it must not be a way around that: it stays unspent for the person it was meant for.
+fn barred_platform_admin(conn: &Connection, invitation: &Usable, user: UserId) -> Result<bool> {
+    if invitation.tenant.is_none() || !invitation.host_local {
+        return Ok(false);
+    }
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND kind = 0 AND super_admin = 1)",
+        )?
+        .query_row([user.as_bytes()], |r| r.get(0))?)
+}
+
 pub(crate) fn redeem(
     tx: &Transaction<'_>,
     invitation: &Usable,
     user: UserId,
     now: UnixMillis,
 ) -> Result<Option<TenantId>> {
+    if barred_platform_admin(tx, invitation, user)? {
+        return Ok(None);
+    }
     let spent = tx.execute(
         "UPDATE invitations SET redeemed_ms = ?2, redeemed_by = ?3
          WHERE id = ?1 AND redeemed_ms IS NULL AND revoked_ms IS NULL",
@@ -608,7 +631,7 @@ pub fn accept_invitation(
                 "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND kind = 0 AND active = 1)",
             )?
             .query_row([user.as_bytes()], |r| r.get(0))?;
-        if !active {
+        if !active || barred_platform_admin(tx, &invitation, user)? {
             return Ok(Accepted::Unusable);
         }
         if let Some((provider, subject)) = &invitation.identity {

@@ -2,6 +2,8 @@
 
 Contract for Sentinel's integrated authorization server, the CLI profiles, secret management and the MCP transports ([OAuth](oauth.md), [CLI](cli.md), [MCP](mcp.md), [secrets](secrets.md)). Remote MCP supports bounded DCR/CIMD client registration. The conformance fixtures are hand-written callback profiles, not real MCP client applications. Consent and device pages sign in with a local password or, when configured, through GitHub. Humans and coding agents use the same scoped operations with little repeated setup; the multi-tenant roles and registration policy are in [plan.md](../plan.md).
 
+Status of this contract: every item below is implemented unless it is marked **Planned**. The planned items are collected in section 7 so a reader can tell the contract from what exists. Checked against the code on 2026-10-29.
+
 ## 1. Identities and tokens
 
 Keep three relationships separate:
@@ -10,7 +12,7 @@ Keep three relationships separate:
 2. **Sentinel authorization:** a CLI/MCP client receives a token for Sentinel, limited to approved tenants/repos/actions.
 3. **Forge/workload credentials:** GitHub App installation tokens, registry tokens, deployment keys, and other job secrets are separately managed. A GitHub login token is not a Sentinel access token, and a Sentinel token is not passed through to GitHub.
 
-Sentinel exposes its own OAuth authorization service as an integrated server module, built using maintained protocol/crypto libraries. There is no external authorization server. Admission/invite policy still applies after OAuth sign-in; authenticating must not bypass super-admin registration controls.
+Sentinel exposes its own OAuth authorization service as an integrated server module, built using maintained protocol/crypto libraries. There is no external authorization server and no provider boundary for one: the issuer, the clients, grants and tokens are all in the controller's own database, and the protected-resource metadata advertises only this deployment as authorization server. **Planned:** delegating authorization to an external authorization server is not implemented and is not on the tracker. Admission/invite policy still applies after OAuth sign-in; authenticating must not bypass super-admin registration controls.
 
 Scopes include `runs:read`, `runs:write`, `logs:read`, `artifacts:read`, `cache:read`, `cache:write`, `secrets:metadata`, `secrets:write`, and administrative scopes. Effective authority is scope intersected with current membership, tenant/repo grants, client policy, and resource ownership. Holding `secrets:write` for one repo grants no authority in another.
 
@@ -33,7 +35,7 @@ sentinel context use alpha
 - Store refresh credentials in OS credential storage when available (Windows Credential Manager; Linux has no OS store yet); otherwise an owner-only credentials file outside repositories, with an explicit deployment/profile namespace. Access tokens and secret values never appear in `auth status`, shell completion, debug logs, or errors.
 - Noninteractive agents use a previously authorized local profile or an explicitly provisioned expiring service-account grant. OAuth cannot create unattended authority without an initial authorization or service identity. The agent need not read the credential material to invoke authorized CLI operations.
 
-Support authorization-server metadata, token/revocation endpoints, PKCE, and device authorization with release conformance fixtures. Use opaque high-entropy access/refresh tokens hashed at rest initially for simple server-side revocation. Fast indexed validation/short bounded auth caching must still honor revocation versions; do not call GitHub membership APIs for every log frame.
+Support authorization-server metadata, token/revocation endpoints, PKCE, and device authorization with release conformance fixtures. Use opaque high-entropy access/refresh tokens hashed at rest initially for simple server-side revocation. Validation is an indexed lookup on every request; there is no authentication cache, so revocation takes effect on the next request (**Planned:** a short bounded cache that honors revocation versions, only if a measurement shows validation cost matters); do not call GitHub membership APIs for every log frame.
 
 ## 3. Remote MCP OAuth
 
@@ -78,16 +80,26 @@ Encryption, key format, rotation and restore are in [sealed storage](sealed-stor
 - Authenticated encryption with a maintained AEAD implementation; versioned ciphertext, unique nonces, and authenticated tenant/repo/name/version context. Master key outside SQLite under operator-controlled permissions; document rotation, backup, and restore. Never build our own cryptography.
 - Resolve allowed bindings at job preparation and record version IDs, not values. Every new attempt, including a rerun, uses the current active version ([scoped secrets](secrets.md)); an unavailable or revoked version fails the attempt explicitly, naming the secret and why, rather than silently changing provenance.
 - Prefer job-local read-only mounted files for multiline/large secrets; allow explicit step environment bindings when a tool requires them. Short-lived delivery over authenticated worker sessions, scoped to attempt and worker identity. Prevent later unrelated steps from inheriting undeclared secrets: all steps share one container, so before a secret-bearing step starts and again when it ends the worker kills every process in the container but its keepalive — nothing an earlier step left running can watch it, and nothing it started runs on into a later one. Environment values reach the step through a private file its wrapper shell sources, never through the runtime's own (on-disk) exec spec.
-- Register dynamic redaction before execution/output, including per-run generated credentials where scripts request it. Handle boundary-spanning values, and redact before all persistence. Arbitrary encodings/exfiltration cannot be solved by a log filter; repository code allowed to use a secret is within that secret's trust policy.
+- Register dynamic redaction before execution/output: every delivered secret value is registered with the attempt's redactor before the log pipe opens ([logs](logs.md)). **Planned:** registering a credential a script generates at run time (a mask command) is not implemented; only delivered values are redacted. Handle boundary-spanning values, and redact before all persistence. Arbitrary encodings/exfiltration cannot be solved by a log filter; repository code allowed to use a secret is within that secret's trust policy.
 - Exclude secret files/configs from workspace caches/artifacts by default; output allowlists and validations protect common mistakes. No secrets in image layers, build arguments, shared compiler caches, or public cache-key hashes. Tools requiring build secrets use their secret-mount mechanisms.
 - Remove injection files/processes during finalization/cancel/restart recovery. Minimize lifetime/copies and best-effort clear owned buffers; do not promise perfect RAM erasure across child processes or the OS — core dumps are disabled for the controller, the worker and job containers instead.
 - Audit who created/rotated/deleted/bound/used each version, tenant/repo/attempt, and result; no values or value-derived public fingerprints. Permission tests cover cross-tenant writes, path/body/log leakage, revoked grants, bulk retry, scope confusion, and cancellation cleanup.
 
 ## 6. Developer and agent experience
 
-`pipeline validate` explains missing bindings by name and scope. `secret set --stdin --json` returns compact metadata suitable for agent verification. `auth status` explains deployment/identity/scopes/expiry and the exact login command when renewal is needed. `doctor` diagnoses auth/connectivity without dumping credentials. Existing grants make routine status/log/secret commands fast; step-up is limited to genuinely privileged auth/platform policy changes.
+`pipeline explain` lists the secret names a pipeline needs (the **requires** section) and a missing or revoked binding fails the attempt at preparation with `secret NAME: reason`. **Planned:** `pipeline validate` stays offline and cannot say which bindings are missing; checking a file against a repository's bindings on the server is not implemented. `secret set --stdin --json` returns compact metadata suitable for agent verification. `auth status` explains deployment/identity/scopes/expiry and the exact login command when renewal is needed. `doctor` diagnoses auth/connectivity without dumping credentials. Existing grants make routine status/log/secret commands fast; step-up is limited to genuinely privileged auth/platform policy changes.
 
 Examples/cookbooks must show credential files/handles and stdin, never real values in shell history. All surfaces use the same authorization rules; a browser role restriction cannot be bypassed through CLI/MCP.
+
+## 7. Planned items
+
+Not implemented; each is also marked where it appears above.
+
+- Delegating authorization to an external authorization server (section 1).
+- A bounded authentication cache honoring revocation versions (section 2); validation is an indexed lookup per request today.
+- Run-time registration of script-generated credentials with the redactor (section 5).
+- Server-side checking of a pipeline's secret names against a repository's bindings in `pipeline validate` (section 6).
+- A Linux OS credential store for refresh tokens: Linux uses the owner-only credentials file ([CLI](cli.md)).
 
 ## Sources
 

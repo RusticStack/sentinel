@@ -127,6 +127,11 @@ pub fn create_self_service(
     if taken {
         return Err(Error::Conflict);
     }
+    // A platform administrator is trusted to name an organization before binding its installation;
+    // anyone else may not take the name of a GitHub account the App is installed on.
+    if !platform && github_login_reserved(tx, name.as_str())? {
+        return Err(Error::Conflict);
+    }
     crate::auth::insert_namespace(
         tx,
         tenant,
@@ -160,6 +165,18 @@ pub fn create_self_service(
     )
 }
 
+/// Whether `slug` equals the login of an account the GitHub App is installed on, bound or not, so
+/// a self-service organization cannot squat the name of a GitHub organization before its owner
+/// installs the App. Logins compare lowercase; `installations_by_github_login` answers it.
+fn github_login_reserved(tx: &Transaction<'_>, slug: &str) -> Result<bool> {
+    Ok(tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM installations
+             WHERE provider = 'github' AND lower(account_login) = ?1)",
+        )?
+        .query_row([slug], |r| r.get(0))?)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub tenant: TenantId,
@@ -182,7 +199,7 @@ pub fn settings(conn: &Connection, principal: Principal, slug: &str) -> Result<S
             "SELECT t.slug, t.kind, t.membership_source, t.created_ms, m.role,
                     EXISTS(SELECT 1 FROM installations i
                            WHERE i.tenant_id = t.id AND i.provider = 'github'),
-                    m.synced_ms, c.attempts, c.next_ms
+                    m.synced_ms, c.attempts, NULLIF(c.next_ms, 9223372036854775807)
              FROM tenants t
              LEFT JOIN memberships m ON m.tenant_id = t.id AND m.user_id = ?2
              LEFT JOIN github_member_checks c ON c.tenant_id = t.id AND c.user_id = ?2

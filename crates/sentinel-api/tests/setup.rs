@@ -123,6 +123,8 @@ fn status_says_only_whether_setup_is_open() {
         UnixMillis::now(),
     )
     .unwrap();
+    // The open answer is cached for a second (see the cache test below).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     let (_, _, closed) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
     assert_eq!(closed, json!({ "open": false, "mail_configured": false }));
 }
@@ -210,6 +212,79 @@ fn guessing_is_throttled_and_a_locked_setup_refuses_the_right_token() {
     let (status, _, _) = post(&f, "/api/v1/setup", &body(&token_text(&token)));
     assert!(status == 403 || status == 429, "{status}");
     assert!(f.store.read(setup::is_open).unwrap());
+}
+
+#[test]
+fn an_open_answer_is_cached_briefly_and_a_closure_shows_after_it() {
+    let f = fresh();
+    let (_, _, open) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
+    assert_eq!(open["open"], true);
+    local_auth::bootstrap(
+        &f.store,
+        "root",
+        "Root",
+        b"an operator password",
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let (_, _, cached) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
+    assert_eq!(
+        cached["open"], true,
+        "answered from the cache, not the store"
+    );
+    // `admin bootstrap` runs in another process and cannot tell this one: the cached answer may lag
+    // the closure by its lifetime, never longer.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (_, _, closed) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
+    assert_eq!(closed["open"], false);
+}
+
+#[test]
+fn the_status_route_has_an_admission_budget_while_setup_is_open() {
+    let f = fresh();
+    let client = [("x-forwarded-for", "198.51.100.7")];
+    let statuses: Vec<u16> = (0..14)
+        .map(|_| call(&f.base, "GET", "/api/v1/setup", None, &client).0)
+        .collect();
+    assert_eq!(statuses[..10], [200; 10], "{statuses:?}");
+    assert!(statuses[10..].contains(&429), "{statuses:?}");
+    // Another client is unaffected by the first one's spent allowance.
+    let other = [("x-forwarded-for", "198.51.100.8")];
+    assert_eq!(call(&f.base, "GET", "/api/v1/setup", None, &other).0, 200);
+}
+
+#[test]
+fn a_locked_setup_is_escaped_by_the_host_local_bootstrap() {
+    let f = fresh();
+    let token = setup::issue(&f.store, UnixMillis::now()).unwrap().unwrap();
+    for _ in 0..5 {
+        let guess = token_text(&Secret::generate());
+        let _ = call(
+            &f.base,
+            "POST",
+            "/api/v1/setup",
+            Some(&body(&guess)),
+            &[("x-forwarded-for", "198.51.100.9")],
+        );
+    }
+    let (status, _, _) = call(
+        &f.base,
+        "POST",
+        "/api/v1/setup",
+        Some(&body(&token_text(&token))),
+        &[("x-forwarded-for", "198.51.100.10")],
+    );
+    assert!(status == 403 || status == 429, "{status}");
+    // The lock stops the web wizard only; the operator's shell still completes setup.
+    local_auth::bootstrap(
+        &f.store,
+        "root",
+        "Root",
+        b"an operator password",
+        UnixMillis::now(),
+    )
+    .unwrap();
+    assert!(!f.store.read(setup::is_open).unwrap());
 }
 
 #[test]
@@ -471,6 +546,26 @@ fn an_approved_user_creates_an_organization_when_policy_allows() {
         &dana,
     );
     assert_eq!(status, 409);
+    // The name of a GitHub account the App is installed on is held: the same 409 as a taken name.
+    f.store
+        .writer()
+        .write(|tx| {
+            registration::record_installation(tx, "github", "9001", "Initech", UnixMillis::now())
+                .map(|_| ())
+        })
+        .unwrap();
+    let (status, answer) = send(
+        &f,
+        "POST",
+        "/api/v1/orgs",
+        Some(json!({ "slug": "initech" })),
+        &dana,
+    );
+    assert_eq!(
+        (status, &answer["code"]),
+        (409, &json!("conflict")),
+        "{answer}"
+    );
     let (status, _) = send(
         &f,
         "POST",
@@ -479,6 +574,76 @@ fn an_approved_user_creates_an_organization_when_policy_allows() {
         &dana,
     );
     assert_eq!(status, 400);
+}
+
+#[test]
+fn settings_report_github_sync_only_on_a_github_backed_organization() {
+    let f = Fixture::new(1);
+    allow_creation(&f, TenantCreation::ApprovedUsers);
+    let dana = session(&f, "dana");
+    let (status, _) = send(
+        &f,
+        "POST",
+        "/api/v1/orgs",
+        Some(json!({ "slug": "dana-gh" })),
+        &dana,
+    );
+    assert_eq!(status, 201);
+    let settings = |f: &Fixture| {
+        let (status, value) = send(f, "GET", "/api/v1/tenants/dana-gh/settings", None, &dana);
+        assert_eq!(status, 200, "{value}");
+        value
+    };
+    assert!(settings(&f).get("github_sync").is_none());
+
+    // Hand the organization to GitHub: membership now follows GitHub, confirmed at a known time, with one
+    // unanswered check that is already due.
+    let confirmed = UnixMillis::now().0 - 60_000;
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE tenants SET membership_source = 1 WHERE slug = 'dana-gh'",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE memberships SET synced_ms = ?1
+                 WHERE tenant_id = (SELECT id FROM tenants WHERE slug = 'dana-gh')",
+                [confirmed],
+            )?;
+            tx.execute(
+                "INSERT INTO github_member_checks(tenant_id, user_id, next_ms, attempts)
+                 SELECT tenant_id, user_id, 1, 2 FROM memberships
+                 WHERE tenant_id = (SELECT id FROM tenants WHERE slug = 'dana-gh')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let value = settings(&f);
+    assert_eq!(value["membership"], "github", "{value}");
+    assert_eq!(
+        value["github_sync"],
+        json!({ "confirmed_ms": confirmed, "check_due": true, "unanswered": 2 }),
+        "{value}"
+    );
+    // Only the numbers a member needs: no check cursor, sequence or login leaks into the answer.
+    assert_eq!(value["github_sync"].as_object().unwrap().len(), 3);
+
+    // A check scheduled for later is not due.
+    f.store
+        .writer()
+        .write(|tx| {
+            tx.execute(
+                "UPDATE github_member_checks SET next_ms = ?1, attempts = 0",
+                [UnixMillis::now().0 + 3_600_000],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let value = settings(&f);
+    assert_eq!(value["github_sync"]["check_due"], false, "{value}");
+    assert_eq!(value["github_sync"]["unanswered"], 0, "{value}");
 }
 
 #[test]

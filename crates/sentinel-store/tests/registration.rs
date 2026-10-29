@@ -955,3 +955,74 @@ fn rejecting_an_approved_account_needs_step_up() {
         .write(move |tx| registration::reject(tx, Authority::credential(admin), pending, at(23)))
         .unwrap();
 }
+
+fn host_local_invitation(f: &Fixture, role: Role) -> registration::Invitation {
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| {
+            registration::invite(
+                tx,
+                Authority::HostLocal,
+                Terms {
+                    tenant: Some(tenant),
+                    role: Some(role),
+                    ..Terms::default()
+                },
+                at(3),
+            )
+        })
+        .unwrap()
+}
+
+fn memberships_of(f: &Fixture, user: UserId) -> i64 {
+    f.store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM memberships WHERE user_id = ?1",
+                [user.as_bytes()],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+// A host-local command must not be a way for a platform administrator to join a tenant without the
+// step-up and audited reason that `set_membership_as` demands.
+#[test]
+fn a_host_local_invitation_is_not_a_way_for_a_platform_administrator_to_join_a_tenant() {
+    let f = fixture();
+    let invitation = host_local_invitation(&f, Role::TenantAdmin);
+    let outcome =
+        registration::accept_invitation(&f.store, f.root, &invitation.secret, None, at(20))
+            .unwrap();
+    assert_eq!(outcome, registration::Accepted::Unusable);
+    assert_eq!(memberships_of(&f, f.root), 0);
+    assert!(
+        !f.events().contains(&Event::InvitationRedeemed),
+        "a refused acceptance spends nothing"
+    );
+
+    // The invitation is still there for the person it was issued for.
+    let dev = admitted(f.apply_local("dev", Some(&f.invite(Terms::default()).secret)));
+    let outcome =
+        registration::accept_invitation(&f.store, dev, &invitation.secret, None, at(21)).unwrap();
+    assert_eq!(outcome, registration::Accepted::Joined(f.tenant));
+    assert_eq!(memberships_of(&f, dev), 1);
+}
+
+// The audited route stays open: an invitation issued under a credential (the API applies the override rules
+// a tenant administrator's, is delegated authority and is honoured for any account.
+#[test]
+fn an_invitation_issued_through_a_credential_still_admits_a_platform_administrator() {
+    let f = fixture();
+    let invitation = f.invite(Terms {
+        tenant: Some(f.tenant),
+        role: Some(Role::Reader),
+        ..Terms::default()
+    });
+    let outcome =
+        registration::accept_invitation(&f.store, f.root, &invitation.secret, None, at(20))
+            .unwrap();
+    assert_eq!(outcome, registration::Accepted::Joined(f.tenant));
+}

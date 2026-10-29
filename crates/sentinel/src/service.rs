@@ -499,6 +499,21 @@ fn hex32(bytes: &[u8; 32]) -> String {
     out
 }
 
+/// Reads the auto-join variable's value: unset is no rules, a non-Unicode value is a startup
+/// error (it must not silently turn the rules off), and the message never echoes the value.
+#[cfg(feature = "server")]
+fn auto_join_from_env(
+    value: Result<String, std::env::VarError>,
+) -> Result<sentinel_store::auto_join::Parsed, Error> {
+    match value {
+        Ok(text) => Ok(sentinel_store::auto_join::parse(&text)),
+        Err(std::env::VarError::NotPresent) => Ok(sentinel_store::auto_join::Parsed::default()),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::config(
+            "SENTINEL_AUTO_JOIN_DOMAINS is not valid Unicode; fix or unset it",
+        )),
+    }
+}
+
 impl Config {
     fn load(role: &str, args: &ServiceArgs, io: &Executor, cpu: &Executor) -> Result<Self, Error> {
         let file = match &args.config {
@@ -894,9 +909,7 @@ impl Config {
         let _ = mail;
         #[cfg(feature = "server")]
         let auto_join = match &role {
-            Role::Server { .. } => std::env::var("SENTINEL_AUTO_JOIN_DOMAINS")
-                .map(|text| sentinel_store::auto_join::parse(&text))
-                .unwrap_or_default(),
+            Role::Server { .. } => auto_join_from_env(std::env::var("SENTINEL_AUTO_JOIN_DOMAINS"))?,
             Role::Worker(_) => sentinel_store::auto_join::Parsed::default(),
         };
         Ok(Self {
@@ -1568,6 +1581,11 @@ fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
         ("sessions", sentinel_store::local_auth::purge_expired, wall),
         ("sign_in", sentinel_store::sign_in::purge_expired, wall),
         ("email", sentinel_store::email::purge, wall),
+        (
+            "unverified_accounts",
+            sentinel_store::email::purge_unverified,
+            wall,
+        ),
         (
             "idempotency",
             sentinel_store::idempotency::purge_expired,
@@ -3066,6 +3084,21 @@ mod tests {
             Ok(marks) => marks,
             Err(_) => panic!("watermarks must resolve for {total}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_auto_join_value_stops_startup_without_echoing_it() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = std::ffi::OsString::from_vec(b"secret-\xff.example=org".to_vec());
+        let Err(error) = auto_join_from_env(Err(std::env::VarError::NotUnicode(raw))) else {
+            panic!("a non-Unicode value must be an error");
+        };
+        let text = error.message;
+        assert!(text.contains("SENTINEL_AUTO_JOIN_DOMAINS"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+        assert!(auto_join_from_env(Err(std::env::VarError::NotPresent)).is_ok());
+        assert!(auto_join_from_env(Ok("example.com=eng".into())).is_ok());
     }
 
     fn resolve_ok(file: StorageFile) -> Storage {

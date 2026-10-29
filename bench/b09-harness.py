@@ -345,17 +345,6 @@ def bench_env():
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
 
 
-MEMBERSHIPS = """
-import sqlite3, sys
-c = sqlite3.connect(sys.argv[1], timeout=20)
-user = c.execute("SELECT id FROM users WHERE super_admin = 1").fetchone()[0]
-for slug in sys.argv[2:]:
-    tenant = c.execute("SELECT id FROM tenants WHERE slug = ?", (slug,)).fetchone()[0]
-    c.execute("INSERT OR REPLACE INTO memberships(tenant_id, user_id, role) VALUES (?, ?, 3)", (tenant, user))
-c.commit()
-"""
-
-
 _RETRIES = threading.local()
 
 
@@ -627,9 +616,14 @@ class Deploy:
             self.hooks[t] = self.source_admin("hook-token", "--repo", rid).strip()
 
     def memberships(self):
-        """The host-local CLI has no membership command and a platform admin cannot add itself over the API.
-        Written as the bench user, before the controller starts, so the database files keep their owner."""
-        sh(as_bench(["python3", "-c", MEMBERSHIPS, os.path.join(self.ctl, "metadata.sqlite"), *self.tenants]))
+        """A platform admin has no ambient tenant access and no host-local command adds it to one. The audited
+        override (session, step-up, reason) is the supported path, so it runs against the started controller;
+        KIT/seed-membership.py (bench/seed-membership.py) walks it."""
+        cmd = ["python3", os.path.join(self.a.kit, "seed-membership.py"), "--api", self.api,
+               "--username", "root", "--reason", "b09 seed"]
+        for t in self.tenants:
+            cmd += ["--tenant", t]
+        sh(cmd, input="correct horse battery staple")
 
     def enroll_workers(self):
         """Host-local admin needs the database to itself, so every enrollment is issued before the controller starts."""
@@ -677,8 +671,8 @@ class Deploy:
         self.start_git()
         self.bind_repos()
         self.enroll_workers()
-        self.memberships()
         self.start_controller()
+        self.memberships()
         self.start_workers()
         on_exit(self.remove_containers)
 

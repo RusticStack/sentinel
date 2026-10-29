@@ -161,6 +161,8 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("migrations/058_delivery_authentication.sql"),
     ),
     (59, include_str!("migrations/059_link_admission.sql")),
+    (60, include_str!("migrations/060_removal_tombstones.sql")),
+    (61, include_str!("migrations/061_auto_join_generation.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -233,6 +235,14 @@ mod tests {
         (
             59,
             "an older binary is not offered to keep running on the link-admission tables: it neither maintains the known-source set nor counts refused enrollments, so its admission and audit bounds would not hold",
+        ),
+        (
+            60,
+            "an older controller removes members without writing a tombstone, so it would silently reopen the rejoin through domain auto-join, and it does not hold GitHub organization names",
+        ),
+        (
+            61,
+            "an older controller rewrites the auto-join rules without raising the generation, so a person it never re-checked would stay behind the rule change",
         ),
     ];
 

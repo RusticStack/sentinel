@@ -103,6 +103,7 @@ pub enum Event {
     EmailVerificationRequested = 59,
     EmailVerified = 60,
     MailAbandoned = 61,
+    UnverifiedAccountPurged = 62,
     GithubMemberJoined = 70,
     GithubMemberRoleChanged = 71,
     GithubMemberRemoved = 72,
@@ -177,6 +178,7 @@ impl Event {
             Event::EmailVerificationRequested => "email-verification-requested",
             Event::EmailVerified => "email-verified",
             Event::MailAbandoned => "mail-abandoned",
+            Event::UnverifiedAccountPurged => "unverified-account-purged",
             Event::GithubMemberJoined => "github-member-joined",
             Event::GithubMemberRoleChanged => "github-member-role-changed",
             Event::GithubMemberRemoved => "github-member-removed",
@@ -251,6 +253,7 @@ impl Event {
             59 => Event::EmailVerificationRequested,
             60 => Event::EmailVerified,
             61 => Event::MailAbandoned,
+            62 => Event::UnverifiedAccountPurged,
             70 => Event::GithubMemberJoined,
             71 => Event::GithubMemberRoleChanged,
             72 => Event::GithubMemberRemoved,
@@ -689,7 +692,7 @@ pub fn issue_session(
         ],
     )?;
     crate::github_members::enqueue_user(tx, user, now)?;
-    crate::auto_join::apply(tx, user, now)?;
+    crate::auto_join::apply_if_due(tx, user, now)?;
     Ok(Issued {
         user,
         session,

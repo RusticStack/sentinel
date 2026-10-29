@@ -442,7 +442,7 @@ fn busy(message: &str) -> Reply {
 }
 
 fn registrant(state: &State, request: &Request) -> [u8; 16] {
-    grants::registrant_digest(super::client_of(state, request))
+    grants::registrant_digest(super::client_of_address(state, request))
 }
 
 pub(crate) fn resolve(

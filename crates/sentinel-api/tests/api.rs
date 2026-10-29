@@ -3001,6 +3001,95 @@ fn login_refuses_a_foreign_origin() {
     assert_eq!(status, 200);
 }
 
+const LOGIN_JSON: &[(&str, &str)] = &[("content-type", "application/json")];
+const WRONG_PASSWORD: &str = r#"{"username":"root","password":"not the password at all"}"#;
+const RIGHT_PASSWORD: &str = r#"{"username":"root","password":"correct horse battery staple"}"#;
+
+fn login_as(d: &Deployment, body: &str, client: Option<&str>) -> u16 {
+    let mut headers = LOGIN_JSON.to_vec();
+    if let Some(client) = client {
+        headers.push(("x-forwarded-for", client));
+    }
+    raw_login(d, body, &headers).0
+}
+
+// The loopback proxy here sends no client address, as an unconfigured reverse proxy does. Every attempt
+// is its own connection, so the guesser's failures must not lock the owner out of the account.
+#[test]
+fn guessing_through_an_unforwarding_proxy_does_not_lock_the_owner_out() {
+    let policy = local_auth::Policy {
+        max_failures: 3,
+        ..local_auth::Policy::default()
+    };
+    let d = deployment_with(policy);
+    for _ in 0..4 {
+        assert_eq!(login_as(&d, WRONG_PASSWORD, None), 401);
+    }
+    assert_eq!(login_as(&d, RIGHT_PASSWORD, None), 200);
+}
+
+// A proxy that names the client gets the per-client lockout: the guesser's address is refused, even with
+// the right password, and the owner's address still signs in.
+#[test]
+fn the_login_lockout_follows_the_client_a_proxy_names() {
+    let policy = local_auth::Policy {
+        max_failures: 3,
+        ..local_auth::Policy::default()
+    };
+    let d = deployment_with(policy);
+    let guesser = Some("198.51.100.7");
+    for _ in 0..3 {
+        assert_eq!(login_as(&d, WRONG_PASSWORD, guesser), 401);
+    }
+    assert_eq!(login_as(&d, RIGHT_PASSWORD, guesser), 401, "locked out");
+    assert_eq!(login_as(&d, RIGHT_PASSWORD, Some("198.51.100.8")), 200);
+    // The same address on another connection is the same client; a spoofed first entry changes nothing.
+    assert_eq!(
+        login_as(&d, RIGHT_PASSWORD, Some("203.0.113.1, 198.51.100.7")),
+        401
+    );
+}
+
+// The request-level budget stands apart from the failure lockout (raised out of reach here): a client
+// past its burst is answered 429 with a retry hint before its password is judged, so even the right
+// password teaches it nothing, while another client is untouched.
+#[test]
+fn a_client_past_its_login_budget_is_refused_before_its_password_is_judged() {
+    let policy = local_auth::Policy {
+        max_failures: 1000,
+        ..local_auth::Policy::default()
+    };
+    let d = deployment_with(policy);
+    let noisy = "198.51.100.7";
+    let mut headers = LOGIN_JSON.to_vec();
+    headers.push(("x-forwarded-for", noisy));
+    let mut first_refusal = None;
+    for attempt in 0..30 {
+        let (status, cookie, body) = raw_login(&d, WRONG_PASSWORD, &headers);
+        assert!(cookie.is_none());
+        match status {
+            401 => {}
+            429 => {
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(body["code"], "rate_limited");
+                assert!(body["details"]["retry_after_ms"].as_u64().unwrap() > 0);
+                first_refusal = Some(attempt);
+                break;
+            }
+            other => panic!("unexpected {other}: {body}"),
+        }
+    }
+    let first_refusal = first_refusal.expect("the budget refused a client that kept going");
+    assert!(
+        first_refusal >= 10,
+        "a burst of 10 is admitted: {first_refusal}"
+    );
+    let (status, cookie, _) = raw_login(&d, RIGHT_PASSWORD, &headers);
+    assert_eq!(status, 429);
+    assert!(cookie.is_none(), "no session for a refused attempt");
+    assert_eq!(login_as(&d, RIGHT_PASSWORD, Some("198.51.100.8")), 200);
+}
+
 #[test]
 fn a_foreign_tenant_slug_lists_as_not_found() {
     let d = deployment();
@@ -3065,6 +3154,126 @@ fn a_foreign_tenant_slug_lists_as_not_found() {
     );
     assert_eq!(foreign.0, 404, "{}", foreign.1);
     assert_eq!(foreign, missing);
+}
+
+#[test]
+fn listing_repositories_as_a_stale_github_member_takes_no_writer_and_files_one_refresh() {
+    let d = deployment();
+    let (member, auth) = person(
+        &d,
+        "stale",
+        Some(sentinel_core::auth::Role::Reader),
+        P::REPOSITORY,
+    );
+    let tenant = d.tenant;
+    // The first use of a credential is recorded through the writer (throttled afterwards); spend it here,
+    // while the tenant is not yet GitHub-backed and the member is not stale.
+    assert_eq!(
+        call(
+            &d,
+            "GET",
+            "/api/v1/tenants/acme/repos",
+            None,
+            Some(&auth),
+            &[]
+        )
+        .0,
+        200
+    );
+    d.store
+        .writer()
+        .write(move |tx| {
+            provisioning::link_verified_identity(tx, member, "github", "3030", UnixMillis(1))?;
+            tx.execute(
+                "UPDATE tenants SET membership_source = 1 WHERE id = ?1",
+                [tenant.as_bytes()],
+            )?;
+            tx.execute(
+                "UPDATE memberships SET synced_ms = 1 WHERE tenant_id = ?1 AND user_id = ?2",
+                [tenant.as_bytes().as_slice(), member.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let queued = |d: &Deployment| -> Option<i64> {
+        d.store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT seq FROM github_member_checks WHERE tenant_id = ?1 AND user_id = ?2",
+                    [tenant.as_bytes().as_slice(), member.as_bytes().as_slice()],
+                    |r| r.get(0),
+                )
+                .ok())
+            })
+            .unwrap()
+    };
+    assert_eq!(queued(&d), None);
+
+    // Wedge the writer: a request that waited for it would sit out the whole write wait.
+    let (started_tx, started) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let store = Arc::clone(&d.store);
+    let wedge = std::thread::spawn(move || {
+        let _ = store.writer().raw(move |_| {
+            started_tx.send(()).unwrap();
+            let _ = released.recv();
+            Ok(())
+        });
+    });
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    let began = std::time::Instant::now();
+    for _ in 0..3 {
+        let (status, _) = call(
+            &d,
+            "GET",
+            "/api/v1/tenants/acme/repos",
+            None,
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(status, 200);
+    }
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "the list waited for the writer: {:?}",
+        began.elapsed()
+    );
+    assert_eq!(
+        queued(&d),
+        None,
+        "nothing was written while the writer was held"
+    );
+    release.send(()).unwrap();
+    wedge.join().unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let seq = loop {
+        if let Some(seq) = queued(&d) {
+            break seq;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the refresh was never filed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // The same member opening the tenant again inside the gap files nothing more.
+    for _ in 0..3 {
+        assert_eq!(
+            call(
+                &d,
+                "GET",
+                "/api/v1/tenants/acme/repos",
+                None,
+                Some(&auth),
+                &[]
+            )
+            .0,
+            200
+        );
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(queued(&d), Some(seq));
 }
 
 #[test]
@@ -3843,4 +4052,309 @@ fn mcp_lists_a_slash_named_repositorys_secret_bindings_as_metadata_only() {
         .map(|(_, value)| value.as_str())
         .unwrap_or_default();
     assert!(challenge.contains("insufficient_scope"), "{challenge}");
+}
+
+/// How a raw request frames its body.
+enum Framing {
+    /// `Content-Length: n`; the body bytes that follow may be fewer than declared.
+    Length(usize),
+    /// `Transfer-Encoding: chunked`, with no length known up front.
+    Chunked,
+}
+
+/// One request over a plain socket, so a test can declare a length without sending the body and
+/// read the answer the server gives to the head alone. Returns the status and the response body.
+fn raw_request(
+    d: &Deployment,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    framing: Framing,
+    body: &[u8],
+) -> (u16, String) {
+    use std::io::{Read, Write};
+    let address = d.base.trim_start_matches("http://");
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut head = format!("{method} {path} HTTP/1.1\r\nhost: {address}\r\nconnection: close\r\n");
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    match framing {
+        Framing::Length(n) => head.push_str(&format!("content-length: {n}\r\n")),
+        Framing::Chunked => head.push_str("transfer-encoding: chunked\r\n"),
+    }
+    head.push_str("\r\n");
+    // The server may answer and close before it reads everything; a failed write is then expected.
+    let _ = stream.write_all(head.as_bytes());
+    match framing {
+        Framing::Length(_) => {
+            let _ = stream.write_all(body);
+        }
+        Framing::Chunked => {
+            let mut wire = format!("{:x}\r\n", body.len()).into_bytes();
+            wire.extend_from_slice(body);
+            wire.extend_from_slice(b"\r\n0\r\n\r\n");
+            let _ = stream.write_all(&wire);
+        }
+    }
+    let mut answer = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => answer.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&answer).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no HTTP status from {method} {path}: {text:?}"));
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
+#[test]
+fn every_route_class_enforces_its_own_body_limit() {
+    use sentinel_core::auth::Scopes;
+    use sentinel_protocol::{
+        intake::{MAX_HOOK_BODY_BYTES, MAX_WEBHOOK_BODY_BYTES},
+        limits::{MAX_API_BODY_BYTES, MAX_OAUTH_FORM_BYTES},
+        mcp::MAX_MESSAGE_BYTES,
+    };
+    let d = deployment();
+    let auth = bearer(&d);
+    let hook = hook_bearer(&d);
+    let (mcp_auth, _) = mcp_session(&d, "body-limit-reader", Scopes::MCP);
+
+    let content = vec![7u8; 40_000];
+    let digest = blake3::hash(&content).to_hex().to_string();
+    let (status, begin) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": content.len(), "digest": digest })),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201, "{begin}");
+    let upload_path = format!(
+        "/api/v1/uploads/{}?offset=0",
+        begin["upload"].as_str().unwrap()
+    );
+    let intake_path = format!("/api/v1/intake/{}", d.intake_repo);
+
+    struct Class<'a> {
+        name: &'static str,
+        method: &'static str,
+        path: &'a str,
+        headers: Vec<(&'static str, &'a str)>,
+        limit: usize,
+        /// What the over-limit refusal looks like: an `sentinel.error/1` code or an OAuth error.
+        error: &'static str,
+    }
+    let json = ("content-type", "application/json");
+    let class = |name, method, path, headers, limit, error| Class {
+        name,
+        method,
+        path,
+        headers,
+        limit,
+        error,
+    };
+    let classes = vec![
+        class(
+            "authenticated JSON route (MAX_API_BODY_BYTES)",
+            "POST",
+            "/api/v1/tenants/acme/repos/app/runs",
+            vec![json, ("authorization", auth.as_str())],
+            MAX_API_BODY_BYTES,
+            "payload_too_large",
+        ),
+        class(
+            "upload chunk (MAX_UPLOAD_CHUNK)",
+            "PUT",
+            upload_path.as_str(),
+            vec![
+                ("content-type", "application/octet-stream"),
+                ("authorization", auth.as_str()),
+            ],
+            sentinel_api::MAX_UPLOAD_CHUNK,
+            "payload_too_large",
+        ),
+        class(
+            "password login (16 KiB)",
+            "POST",
+            "/api/v1/login",
+            vec![json],
+            16 << 10,
+            "payload_too_large",
+        ),
+        class(
+            "first-run setup (8 KiB)",
+            "POST",
+            "/api/v1/setup",
+            vec![json],
+            8 << 10,
+            "payload_too_large",
+        ),
+        class(
+            "GitHub webhook (MAX_WEBHOOK_BODY_BYTES)",
+            "POST",
+            "/api/v1/hooks/github",
+            vec![json],
+            MAX_WEBHOOK_BODY_BYTES,
+            "payload_too_large",
+        ),
+        class(
+            "generic intake hook (MAX_HOOK_BODY_BYTES)",
+            "POST",
+            intake_path.as_str(),
+            vec![json, ("authorization", hook.as_str())],
+            MAX_HOOK_BODY_BYTES,
+            "payload_too_large",
+        ),
+        class(
+            "MCP message (mcp::MAX_MESSAGE_BYTES)",
+            "POST",
+            "/mcp",
+            vec![
+                json,
+                ("accept", "application/json, text/event-stream"),
+                ("authorization", mcp_auth.as_str()),
+            ],
+            MAX_MESSAGE_BYTES,
+            "payload_too_large",
+        ),
+        class(
+            "OAuth form (MAX_OAUTH_FORM_BYTES)",
+            "POST",
+            "/oauth/token",
+            vec![("content-type", "application/x-www-form-urlencoded")],
+            MAX_OAUTH_FORM_BYTES,
+            "invalid_request",
+        ),
+    ];
+
+    for class in &classes {
+        let (status, answer) = raw_request(
+            &d,
+            class.method,
+            class.path,
+            &class.headers,
+            Framing::Length(class.limit + 1),
+            b"",
+        );
+        assert_eq!(
+            status, 413,
+            "{}: one byte over the limit: {answer}",
+            class.name
+        );
+        assert!(
+            answer.contains(class.error),
+            "{}: refusal names {}: {answer}",
+            class.name,
+            class.error
+        );
+        let padding = vec![b' '; class.limit];
+        let (status, answer) = raw_request(
+            &d,
+            class.method,
+            class.path,
+            &class.headers,
+            Framing::Length(class.limit),
+            &padding,
+        );
+        assert_ne!(
+            status, 413,
+            "{}: a body of exactly the limit: {answer}",
+            class.name
+        );
+    }
+
+    // A body that declares no length is cut off at the same limit while it is read.
+    let padding = vec![b' '; (16 << 10) + 1];
+    let (status, answer) = raw_request(
+        &d,
+        "POST",
+        "/api/v1/login",
+        &[json],
+        Framing::Chunked,
+        &padding,
+    );
+    assert_eq!(status, 413, "chunked login body over the limit: {answer}");
+}
+
+#[test]
+fn the_serializers_always_emit_the_fields_the_web_types_mark_optional() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let _ = member_bearer(&d, "ada");
+
+    // Me.email and Me.email_verified: present even for an account with no address.
+    let (status, me) = call(&d, "GET", "/api/v1/me", None, Some(&auth), &[]);
+    assert_eq!(status, 200, "{me}");
+    let me = me.as_object().unwrap();
+    assert!(
+        me.contains_key("email"),
+        "Me.email is emitted (null without an address)"
+    );
+    assert!(me["email"].is_null() || me["email"].is_string());
+    assert!(
+        me["email_verified"].is_boolean(),
+        "Me.email_verified is a boolean"
+    );
+
+    // TenantChoice.kind and membership on every entry.
+    let (status, tenants) = call(&d, "GET", "/api/v1/tenants", None, Some(&auth), &[]);
+    assert_eq!(status, 200, "{tenants}");
+    let tenants = tenants["tenants"].as_array().unwrap();
+    for choice in tenants {
+        assert!(
+            matches!(choice["kind"].as_str(), Some("personal" | "organization")),
+            "TenantChoice.kind: {choice}"
+        );
+        assert!(
+            matches!(choice["membership"].as_str(), Some("app" | "github")),
+            "TenantChoice.membership: {choice}"
+        );
+        assert!(choice["role"].is_string() && choice["slug"].is_string());
+    }
+
+    // Member.source and Member.synced_ms on every row (null while not derived from GitHub).
+    let (status, members) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/members",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200, "{members}");
+    let rows = members["members"].as_array().unwrap();
+    assert!(!rows.is_empty(), "{members}");
+    for row in rows {
+        let row = row.as_object().unwrap();
+        assert!(
+            matches!(row["source"].as_str(), Some("app" | "github")),
+            "Member.source: {row:?}"
+        );
+        assert!(
+            row.contains_key("synced_ms"),
+            "Member.synced_ms is emitted: {row:?}"
+        );
+        assert_eq!(
+            row["source"] == "github",
+            row["synced_ms"].is_number(),
+            "a GitHub-derived member has a sync time and no other has: {row:?}"
+        );
+    }
 }

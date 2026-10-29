@@ -1341,8 +1341,13 @@ fn the_start_route_is_limited_per_client() {
     let (d, _) = deployment(true);
     let url = format!("{}/auth/github/start?return_to=%2Fdevice", d.base);
     let mut statuses = Vec::new();
+    // The loopback proxy names one client; without the header every request would be a connection of its own.
     for _ in 0..16 {
-        statuses.push(Browser::new(&d).get(&url).status);
+        statuses.push(
+            Browser::new(&d)
+                .request("GET", &url, None, &[("x-forwarded-for", "198.51.100.9")])
+                .status,
+        );
     }
     assert!(statuses[..10].iter().all(|s| *s == 303), "{statuses:?}");
     assert!(statuses.contains(&429), "{statuses:?}");

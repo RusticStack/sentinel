@@ -496,6 +496,12 @@ impl App {
             Ok(reply) => reply,
             Err(_) => return Answer::unknown(None),
         };
+        // The person's account was just resolved by id, so a 404 here means this token cannot see the
+        // repository (removed, transferred, renamed or no longer installed); the caller confirms the
+        // organization is unchanged before it believes that.
+        if reply.status == 404 {
+            return Answer::Absent;
+        }
         if reply.status != 200 {
             return Answer::from_failure(&reply);
         }
