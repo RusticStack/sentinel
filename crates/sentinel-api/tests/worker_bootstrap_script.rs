@@ -157,12 +157,46 @@ fn stub_sentinel(version: &str, fail_on_start: bool) -> String {
         r##"#!/bin/sh
 STUB_VERSION={version}
 FAIL_ON_START={fail}
+# Readable by whoever runs the tests: a rootless container maps this account to an unprivileged host id.
+umask 022
 cmd=${{1:-}}
 [ $# -eq 0 ] || shift
 case $cmd in
     --version) echo "sentinel stub $STUB_VERSION"; exit 0 ;;
     worker) ;;
     *) exit 64 ;;
+esac
+case ${{1:-}} in
+    uninstall | rollback)
+        echo "stub: no $1 command" >&2
+        exit 127
+        ;;
+    enroll)
+        shift
+        printf '%s\n' "$@" >>/out/enroll.args
+        data=''
+        out=''
+        tailcat=0
+        while [ $# -gt 0 ]; do
+            case $1 in
+                --data-dir) data=$2; shift 2 ;;
+                --config) out=$2; shift 2 ;;
+                --tailcat-binary) tailcat=1; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        IFS= read -r secret || exit 1
+        printf '%s\n' "$secret" >>/out/seen-stdin
+        [ ! -e /work/enroll-fails ] || {{ echo "stub: the controller refused the secret" >&2; exit 1; }}
+        echo wrk_00000000-0000-4000-8000-000000000001 >"$data/worker.id"
+        echo certificate >"$data/worker.crt"
+        {{
+            printf 'data_dir = "%s"\n' "$data"
+            echo 'controller = "10.0.0.5:7443"'
+            [ "$tailcat" = 0 ] || printf '[tailcat]\nenabled = true\n'
+        }} >"$out"
+        exit 0
+        ;;
 esac
 config=''
 check=0
@@ -193,6 +227,7 @@ if [ -f "$enrollment" ]; then
     rm -f "$enrollment"
 fi
 cp "$config" /out/worker.toml.seen
+chmod 0644 /out/worker.toml.seen
 exec sleep 3600
 "##,
         fail = u8::from(fail_on_start)
@@ -286,6 +321,18 @@ fn tailcat_pin(fake: &Fake) -> Pin {
 
 /// Serve `release` and render the script that pins it. `sums_arch` is the architecture the pins are for.
 fn script(fake: &Fake, version: &str, release: &Release, tailcat: bool, sums_arch: &str) -> String {
+    script_with(fake, version, release, tailcat, sums_arch, None)
+}
+
+/// Like [`script`], pinned to a controller that takes enrollments over HTTPS at `api_url`.
+fn script_with(
+    fake: &Fake,
+    version: &str,
+    release: &Release,
+    tailcat: bool,
+    sums_arch: &str,
+    api_url: Option<&str>,
+) -> String {
     let name = format!("sentinel-{version}-{sums_arch}-linux-worker.tar.gz");
     fake.serve(&format!("/rel/{name}"), release.archive.clone());
     fake.serve("/tailcat/tailcat-0.6.0", TAILCAT_STUB.to_vec());
@@ -303,6 +350,7 @@ fn script(fake: &Fake, version: &str, release: &Release, tailcat: bool, sums_arc
             region: None,
         }),
         tailcat_address_file: None,
+        api_url: api_url.map(str::to_owned),
     })
     .unwrap()
     .render(tailcat)
@@ -464,6 +512,7 @@ fn a_tailcat_install_verifies_places_and_hands_the_secret_to_the_worker_alone() 
         &format!(
             "{INSTALL_WITH_FILE}
 fact current \"$(readlink /opt/sentinel-worker/current)\"
+fact outls \"$(ls -ln /out /var/lib/sentinel-worker | tr '\n' '|')\"
 fact tailcat_stat \"$(stat -c '%U:%G %a' /opt/sentinel-worker/tailcat/tailcat)\"
 fact binary_stat \"$(stat -c '%U:%G %a' /opt/sentinel-worker/current/sentinel)\"
 fact conf_stat \"$(stat -c '%U:%G %a' /etc/sentinel-worker/worker.toml)\"
@@ -524,7 +573,14 @@ fact addr_leaked \"$(grep -rIlF --exclude-dir=sentinel-worker -f /work/address-o
         &format!("sha256 = \"{}\"", sha256(TAILCAT_STUB)),
         "listen_port = 7443",
     ] {
-        assert!(config.contains(line), "worker.toml lacks {line}:\n{config}");
+        assert!(
+            config.contains(line),
+            "worker.toml lacks {line}:\n{config}\nout: {}\nworker log:\n{}\nsystemctl:\n{}\ninstall output:\n{}",
+            fact("outls"),
+            s.out_file("worker.log"),
+            s.out_file("systemctl.log"),
+            s.out_file("install.out")
+        );
     }
     assert!(!config.contains(SECRET_HEX));
 
@@ -634,6 +690,126 @@ fact account \"$(getent passwd sentinel-worker >/dev/null && echo yes || echo no
         ("no", "no")
     );
     assert!(fake.paths().is_empty(), "nothing was downloaded");
+}
+
+#[test]
+#[ignore = "needs podman, tar and pre-pulled base images; run on a verification host"]
+fn an_https_enrollment_hands_the_secret_to_the_worker_on_stdin_and_installs_its_config() {
+    for tailcat in [false, true] {
+        let fake = Fake::start();
+        let s = Scenario::new();
+        let rel = release(s.dir.path(), "0.1.0", false);
+        s.write(
+            "boot.sh",
+            &script_with(
+                &fake,
+                "0.1.0",
+                &rel,
+                tailcat,
+                arch(),
+                Some("https://sentinel.example.test"),
+            ),
+            0o644,
+        );
+        s.write("input", &format!("sntl_{SECRET_HEX}\n"), 0o600);
+        s.write("secret-only", &format!("sntl_{SECRET_HEX}\n"), 0o600);
+        let run = s.run(
+            &image("SENTINEL_BOOTSTRAP_IMAGE", IMAGE),
+            "sh /work/boot.sh install --name https-1 --secret-stdin </work/input >/out/install.out 2>&1
+fact rc $?
+fact conf_stat \"$(stat -c '%U:%G %a' /etc/sentinel-worker/worker.toml)\"
+fact outls \"$(ls -ln /out | tr '\\n' '|')\"
+fact staged_left \"$([ -e /var/lib/sentinel-worker/worker.toml.staged ] && echo yes || echo no)\"
+fact enrollment_left \"$([ -e /var/lib/sentinel-worker/enrollment ] && echo yes || echo no)\"
+fact leaked \"$(grep -rIlF -f /work/secret-only /etc /opt /var /usr/local /root /home /srv /run /tmp 2>/dev/null | tr '\n' ' ')\"
+",
+        );
+        let facts = s.facts();
+        let fact = |k: &str| facts.get(k).map(String::as_str).unwrap_or("<missing>");
+        assert_eq!(
+            fact("rc"),
+            "0",
+            "tailcat={tailcat}\n{}\n{}",
+            describe(&run),
+            s.out_file("install.out")
+        );
+        assert_eq!(fact("conf_stat"), "root:sentinel-worker 640");
+        assert_eq!(fact("staged_left"), "no", "the staged config was removed");
+        assert_eq!(
+            fact("enrollment_left"),
+            "no",
+            "no enrollment file is written"
+        );
+        assert_eq!(
+            fact("leaked").trim(),
+            "",
+            "a copy of the secret stayed on disk"
+        );
+        // The worker received the secret once, on standard input, and never on its command line.
+        assert_eq!(
+            s.out_file("seen-stdin").trim(),
+            format!("sntl_{SECRET_HEX}"),
+            "out: {}\ninstall output:\n{}",
+            fact("outls"),
+            s.out_file("install.out")
+        );
+        let args = s.out_file("enroll.args");
+        assert!(args.contains("--secret-stdin"), "{args}");
+        assert!(args.contains("https://sentinel.example.test"), "{args}");
+        assert!(!args.contains(SECRET_HEX), "{args}");
+        assert_eq!(args.contains("--tailcat-binary"), tailcat, "{args}");
+        let config = s.out_file("worker.toml.seen");
+        assert!(config.contains("controller = "), "{config}");
+        assert_eq!(config.contains("[tailcat]"), tailcat, "{config}");
+        assert!(!config.contains(SECRET_HEX));
+        s.assert_secret_never_leaked(&run, &fake);
+    }
+}
+
+#[test]
+#[ignore = "needs podman, tar and pre-pulled base images; run on a verification host"]
+fn a_refused_https_enrollment_installs_nothing_and_leaves_no_account_or_files() {
+    let fake = Fake::start();
+    let s = Scenario::new();
+    let rel = release(s.dir.path(), "0.1.0", false);
+    s.write(
+        "boot.sh",
+        &script_with(
+            &fake,
+            "0.1.0",
+            &rel,
+            false,
+            arch(),
+            Some("https://sentinel.example.test"),
+        ),
+        0o644,
+    );
+    s.write("input", &format!("sntl_{SECRET_HEX}\n"), 0o600);
+    s.write("enroll-fails", "1\n", 0o644);
+    let run = s.run(
+        &image("SENTINEL_BOOTSTRAP_IMAGE", IMAGE),
+        "sh /work/boot.sh install --name https-2 --secret-stdin </work/input >/out/install.out 2>&1
+fact rc $?
+fact opt \"$([ -e /opt/sentinel-worker ] && echo yes || echo no)\"
+fact conf \"$([ -e /etc/sentinel-worker ] && echo yes || echo no)\"
+fact data \"$([ -e /var/lib/sentinel-worker ] && echo yes || echo no)\"
+fact unit \"$([ -e /etc/systemd/system/sentinel-worker.service ] && echo yes || echo no)\"
+fact account \"$(getent passwd sentinel-worker >/dev/null && echo yes || echo no)\"
+fact linger \"$([ -e /var/lib/systemd/linger/sentinel-worker ] && echo yes || echo no)\"
+",
+    );
+    let facts = s.facts();
+    let fact = |k: &str| facts.get(k).map(String::as_str).unwrap_or("<missing>");
+    assert_eq!(fact("rc"), "1", "{}", describe(&run));
+    let out = s.out_file("install.out");
+    assert!(
+        out.contains("enrolling with the controller failed"),
+        "{out}"
+    );
+    for what in ["opt", "conf", "data", "unit", "account", "linger"] {
+        assert_eq!(fact(what), "no", "{what} was left behind\n{out}");
+    }
+    s.assert_secret_never_leaked(&run, &fake);
 }
 
 #[test]

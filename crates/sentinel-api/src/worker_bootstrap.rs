@@ -53,6 +53,10 @@ pub struct Settings {
     pub tailcat: Option<TailcatRelease>,
     /// The controller's `<data_dir>/tailcat/address` file; absent means no Tailcat enrollments.
     pub tailcat_address_file: Option<PathBuf>,
+    /// The HTTPS base URL a worker redeems its enrollment at (`POST /api/v1/worker-enrollments/redeem`).
+    /// Absent means the generated script keeps the older flow: the secret is presented with the worker's
+    /// first link hello and, for Tailcat, authorized for the node key by an administrator.
+    pub api_url: Option<String>,
 }
 
 /// Why a script cannot be rendered for an enrollment.
@@ -70,6 +74,7 @@ pub struct WorkerBootstrap {
     workers: [Option<Pin>; 2],
     tailcat: Option<TailcatRelease>,
     tailcat_address_file: Option<PathBuf>,
+    api_url: Option<String>,
 }
 
 impl WorkerBootstrap {
@@ -81,11 +86,15 @@ impl WorkerBootstrap {
             release_sums,
             tailcat,
             tailcat_address_file,
+            api_url,
         } = settings;
         if !is_hex64(&fingerprint) {
             return Err("fingerprint must be 64 lower-case hex characters".into());
         }
         let base = checked_url(&release_url, "release_url")?;
+        let api_url = api_url
+            .map(|url| checked_url(&url, "api_url").map(|url| url.trim_end_matches('/').to_owned()))
+            .transpose()?;
         let base = base.trim_end_matches('/');
         let (version, sums) = release(&release_sums)?;
         let mut workers = [None, None];
@@ -141,6 +150,7 @@ impl WorkerBootstrap {
             workers,
             tailcat,
             tailcat_address_file,
+            api_url,
         })
     }
 
@@ -159,6 +169,21 @@ impl WorkerBootstrap {
 
     pub fn release_version(&self) -> &str {
         &self.version
+    }
+
+    /// Whether workers redeem at the HTTPS endpoint (an `api_url` is configured).
+    pub fn redeems_over_https(&self) -> bool {
+        self.api_url.is_some()
+    }
+
+    /// Where a direct TLS worker dials the link listener.
+    pub fn controller(&self) -> SocketAddr {
+        self.controller
+    }
+
+    /// The controller's public link certificate fingerprint, 64 lower-case hex characters.
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 
     /// The script for one transport: identical for every enrollment of that transport, and free of secrets.
@@ -184,6 +209,7 @@ impl WorkerBootstrap {
         put("TRANSPORT", if tailcat { "tailcat" } else { "direct" });
         put("CONTROLLER_ADDR", &self.controller.to_string());
         put("CONTROLLER_FINGERPRINT", &self.fingerprint);
+        put("API_URL", self.api_url.as_deref().unwrap_or(""));
         put("RELEASE_VERSION", &self.version);
         put("WORKER_URL_X86_64", url(x86));
         put("WORKER_SHA256_X86_64", sum(x86));
@@ -363,6 +389,7 @@ mod tests {
                 region: Some("derp.example.test".into()),
             }),
             tailcat_address_file: None,
+            api_url: Some("https://ci.example.test/".into()),
         }
     }
 
@@ -504,6 +531,34 @@ mod tests {
         let script = bootstrap.render(false).unwrap();
         assert_eq!(value(&script, "WORKER_URL_AARCH64"), "");
         assert_eq!(value(&script, "WORKER_SHA256_X86_64"), X86);
+    }
+
+    #[test]
+    fn the_api_url_is_pinned_without_credentials_and_may_be_left_out() {
+        let script = WorkerBootstrap::new(settings())
+            .unwrap()
+            .render(true)
+            .unwrap();
+        assert_eq!(value(&script, "API_URL"), "https://ci.example.test");
+        let mut older = settings();
+        older.api_url = None;
+        let older = WorkerBootstrap::new(older).unwrap();
+        assert!(!older.redeems_over_https());
+        assert_eq!(value(&older.render(true).unwrap(), "API_URL"), "");
+        for bad in [
+            "http://ci.example.test",
+            "https://user:pw@ci.example.test",
+            "https://ci.example.test/?token=x",
+            "https://ci.example.test/#frag",
+            "ci.example.test",
+        ] {
+            let mut s = settings();
+            s.api_url = Some(bad.into());
+            assert!(WorkerBootstrap::new(s).is_err(), "{bad}");
+        }
+        let mut loopback = settings();
+        loopback.api_url = Some("http://127.0.0.1:8080".into());
+        assert!(WorkerBootstrap::new(loopback).is_ok());
     }
 
     #[test]

@@ -14,8 +14,9 @@ pub struct Cli {
 pub enum Command {
     /// Start the Linux controller: metadata store, worker link and dispatcher
     Server(ServiceArgs),
-    /// Start the separate Linux worker: connects to its controller and executes assigned jobs
-    Worker(ServiceArgs),
+    /// Start the separate Linux worker (connects to its controller and executes assigned jobs), or enroll,
+    /// uninstall or roll back the worker this host runs
+    Worker(WorkerRoleArgs),
     /// Validate or explain a `.sentinel.yml` offline, on any platform
     Pipeline(PipelineArgs),
     /// Host-local administration of local login, on the controller's own host
@@ -1238,4 +1239,113 @@ pub struct ServiceArgs {
     /// Internal diagnostic verbosity; defaults to info
     #[arg(long, value_enum)]
     pub log_level: Option<LogLevel>,
+}
+
+/// `sentinel worker`: the service itself, or one of the host-management subcommands the generated
+/// bootstrap script calls.
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct WorkerRoleArgs {
+    #[command(flatten)]
+    pub service: ServiceArgs,
+
+    #[command(subcommand)]
+    pub command: Option<WorkerHostCommand>,
+}
+
+#[derive(Subcommand)]
+pub enum WorkerHostCommand {
+    /// Generate this host's identities and redeem an enrollment with the controller over HTTPS
+    Enroll(EnrollArgs),
+    /// Remove the worker service, its files and, unless kept, its data and account
+    Uninstall(UninstallArgs),
+    /// Switch back to the previous release and restart the service
+    Rollback(RollbackArgs),
+}
+
+#[derive(Args)]
+pub struct EnrollArgs {
+    /// The controller's API base URL (https://, or http:// for a loopback host)
+    #[arg(long, value_name = "URL")]
+    pub api_url: String,
+
+    /// Where to write the worker configuration
+    #[arg(long, value_name = "FILE")]
+    pub config: PathBuf,
+
+    /// Absolute worker data directory that will hold the identities
+    #[arg(long, value_name = "PATH")]
+    pub data_dir: PathBuf,
+
+    /// Name the controller lists this worker under; defaults to the host name
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Read the enrollment secret from the first line of this owner-only file
+    #[arg(long, value_name = "FILE", conflicts_with = "secret_stdin")]
+    pub secret_file: Option<PathBuf>,
+
+    /// Read the enrollment secret from the first line of standard input (never a terminal)
+    #[arg(long)]
+    pub secret_stdin: bool,
+
+    /// Enroll over Tailcat: the helper binary that generates this host's node key
+    #[arg(long, value_name = "FILE", requires = "tailcat_sha256")]
+    pub tailcat_binary: Option<PathBuf>,
+
+    /// SHA-256 of the Tailcat helper, 64 lower-case hex characters
+    #[arg(long, value_name = "HEX", requires = "tailcat_binary")]
+    pub tailcat_sha256: Option<String>,
+
+    /// Operator-owned DERP map URL for the helper
+    #[arg(long, value_name = "URL", requires = "tailcat_binary")]
+    pub derpmap_url: Option<String>,
+
+    /// DERP region for the helper
+    #[arg(long, value_name = "NAME", requires = "tailcat_binary")]
+    pub region: Option<String>,
+
+    /// Link port on the controller's tailnet address
+    #[arg(long, value_name = "PORT", requires = "tailcat_binary")]
+    pub tailcat_port: Option<u16>,
+}
+
+/// The install layout the generated bootstrap script creates; the defaults are the script's.
+#[derive(Args)]
+pub struct InstallLayoutArgs {
+    /// Root of the installed releases
+    #[arg(long, value_name = "PATH", default_value = "/opt/sentinel-worker")]
+    pub prefix: PathBuf,
+
+    /// Directory holding worker.toml
+    #[arg(long, value_name = "PATH", default_value = "/etc/sentinel-worker")]
+    pub conf_dir: PathBuf,
+
+    /// The worker's data directory
+    #[arg(long, value_name = "PATH", default_value = "/var/lib/sentinel-worker")]
+    pub data_dir: PathBuf,
+
+    /// The systemd unit file
+    #[arg(
+        long,
+        value_name = "FILE",
+        default_value = "/etc/systemd/system/sentinel-worker.service"
+    )]
+    pub unit_file: PathBuf,
+}
+
+#[derive(Args)]
+pub struct UninstallArgs {
+    #[command(flatten)]
+    pub layout: InstallLayoutArgs,
+
+    /// Keep the data directory (the worker's identity and caches)
+    #[arg(long)]
+    pub keep_data: bool,
+}
+
+#[derive(Args)]
+pub struct RollbackArgs {
+    #[command(flatten)]
+    pub layout: InstallLayoutArgs,
 }

@@ -378,6 +378,33 @@ pub(crate) fn audit(
     Ok(())
 }
 
+/// Append an audit row only while fewer than `rows` rows of the same event exist in the last
+/// `window_ms`; true when the row was written. The log is append-only, so an event an unauthenticated
+/// caller can trigger is bounded here, at the write, instead of by deleting rows later.
+pub(crate) fn audit_capped(
+    tx: &Transaction<'_>,
+    event: Event,
+    detail: Option<&str>,
+    window_ms: i64,
+    rows: i64,
+) -> Result<bool> {
+    let now = UnixMillis::now().0;
+    let written = tx
+        .prepare_cached(
+            "INSERT INTO auth_audit(at_ms, event, actor_user_id, subject_user_id, host_local, detail)
+             SELECT ?1, ?2, NULL, NULL, 0, ?3
+             WHERE (SELECT COUNT(*) FROM auth_audit WHERE at_ms > ?4 AND event = ?2) < ?5",
+        )?
+        .execute(params![
+            now,
+            event as u8,
+            detail.map(bounded_detail),
+            now.saturating_sub(window_ms),
+            rows
+        ])?;
+    Ok(written > 0)
+}
+
 const FLOOD_ROWS: i64 = 5;
 const FLOOD_WINDOW_MS: i64 = 10_000;
 

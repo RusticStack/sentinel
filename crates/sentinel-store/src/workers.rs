@@ -6,13 +6,24 @@ use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersi
 use crate::{
     Error, Result,
     auth::Authority,
-    local_auth::{Event, audit},
+    local_auth::{Event, audit, audit_capped},
 };
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 pub const DEFAULT_ENROLLMENT_MS: i64 = 60 * 60 * 1000;
 pub const MAX_ENROLLMENT_MS: i64 = DAY_MS;
 pub const SEEN_RECORD_INTERVAL_MS: i64 = 60 * 1000;
+
+/// A refused secret writes at most `REFUSED_AUDIT_ROWS` audit rows per `REFUSED_AUDIT_WINDOW_MS`,
+/// however many guesses arrive: the audit log is append-only and anyone who can reach the enrollment
+/// endpoints can present a wrong secret.
+pub const REFUSED_AUDIT_ROWS: i64 = 20;
+pub const REFUSED_AUDIT_WINDOW_MS: i64 = 60 * 60 * 1000;
+
+/// How long after a redemption the same machine may present the same secret again and be told the
+/// same answer: the response to the first call can be lost on the way back, and the machine retries
+/// with the identity it already holds. Any other presentation of a spent secret is refused.
+pub const REPLAY_WINDOW_MS: i64 = 10 * 60 * 1000;
 
 /// Operator priority bounds: higher is preferred, zero is neutral.
 pub const PRIORITY_MIN: i32 = -100;
@@ -431,7 +442,7 @@ pub fn redeem_bound(
         .optional()?;
     let Some((pool, policy, _)) = terms.filter(|(_, _, tailcat)| *tailcat == node_key.is_some())
     else {
-        audit(tx, Event::WorkerEnrollmentRefused, None, None, false, None)?;
+        refused(tx)?;
         return Ok(None);
     };
     let pool = PoolId::from_bytes(pool).map_err(|_| Error::Corrupt("pool id"))?;
@@ -487,6 +498,97 @@ pub fn redeem_bound(
         node_key,
         uninstall_requested: None,
     }))
+}
+
+fn refused(tx: &Transaction<'_>) -> Result<()> {
+    audit_capped(
+        tx,
+        Event::WorkerEnrollmentRefused,
+        None,
+        REFUSED_AUDIT_WINDOW_MS,
+        REFUSED_AUDIT_ROWS,
+    )
+    .map(drop)
+}
+
+/// Redeem an enrollment for a machine that states its own identity over HTTPS (Q11): the secret
+/// authorizes the TLS fingerprint and, for a Tailcat enrollment, the node key the machine presents,
+/// and both are bound to the pool in the one transaction that spends the enrollment. The machine has
+/// no tunnel yet, so nothing else can vouch for its key.
+///
+/// - An enrollment an administrator already authorized a key for (`authorize_node_key`) is redeemed
+///   only by that exact worker identifier and key.
+/// - A key reserved for a different pending enrollment is `Conflict`, like one already bound.
+/// - A spent secret presented again within `REPLAY_WINDOW_MS` by the same worker identifier, TLS
+///   fingerprint and node key is answered with the worker it already created and changes nothing; any
+///   other presentation of it is refused as a value.
+///
+/// Refusal is `Ok(None)` and leaves the enrollment unspent; the audit row it writes is bounded.
+pub fn redeem_presented(
+    tx: &Transaction<'_>,
+    presented: &Secret,
+    presentation: Presentation<'_>,
+    node_key: Option<NodeKey>,
+    now: UnixMillis,
+) -> Result<Option<Worker>> {
+    let digest = presented.digest();
+    let known: Option<(AuthorizedPair, Option<i64>)> = tx
+        .prepare_cached(
+            "SELECT authorized_worker, authorized_node_key, redeemed_ms FROM worker_enrollments
+             WHERE token_digest = ?1 AND revoked_ms IS NULL",
+        )?
+        .query_row([digest.0], |r| Ok(((r.get(0)?, r.get(1)?), r.get(2)?)))
+        .optional()?;
+    match known {
+        Some((_, Some(redeemed))) => {
+            return replay(
+                tx,
+                presentation,
+                node_key,
+                now.0.saturating_sub(redeemed) <= REPLAY_WINDOW_MS,
+            );
+        }
+        Some(((Some(worker), Some(key)), None))
+            if worker.as_slice() != presentation.worker.as_bytes()
+                || Some(key.as_slice()) != node_key.as_ref().map(<[u8; 32]>::as_slice) =>
+        {
+            refused(tx)?;
+            return Ok(None);
+        }
+        _ => {}
+    }
+    if let Some(key) = &node_key {
+        let reserved: bool = tx
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM worker_enrollments
+                 WHERE authorized_node_key = ?1 AND redeemed_ms IS NULL AND revoked_ms IS NULL
+                   AND token_digest != ?2)",
+            )?
+            .query_row(params![key.as_slice(), digest.0], |r| r.get(0))?;
+        if reserved {
+            return Err(Error::Conflict);
+        }
+    }
+    redeem_bound(tx, presented, presentation, node_key, now)
+}
+
+/// The answer to a spent secret presented again by the machine it created (see `redeem_presented`).
+fn replay(
+    tx: &Transaction<'_>,
+    presentation: Presentation<'_>,
+    node_key: Option<NodeKey>,
+    within_window: bool,
+) -> Result<Option<Worker>> {
+    if within_window
+        && let Ok(worker) = authenticate(tx, &presentation.fingerprint)
+        && worker.id == presentation.worker
+        && worker.node_key == node_key
+        && worker.uninstall_requested.is_none()
+    {
+        return Ok(Some(worker));
+    }
+    refused(tx)?;
+    Ok(None)
 }
 
 /// State a pending Tailcat enrollment needs before its worker can reach the controller: which

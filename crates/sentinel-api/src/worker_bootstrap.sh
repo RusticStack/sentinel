@@ -23,6 +23,7 @@ BOOTSTRAP_FORMAT=''
 TRANSPORT=''
 CONTROLLER_ADDR=''
 CONTROLLER_FINGERPRINT=''
+API_URL=''
 RELEASE_VERSION=''
 WORKER_URL_X86_64=''
 WORKER_SHA256_X86_64=''
@@ -68,6 +69,7 @@ TAILCAT_URL=''
 TAILCAT_SHA256=''
 SECRET=''
 TC_ADDRESS=''
+ENROLLED_ID=''
 
 say() { printf '%s\n' "sentinel-worker: $*" >&2; }
 die() {
@@ -182,7 +184,7 @@ check_host() {
         refuse "run it as root, for example: sudo sh $0 $CMD ..."
     fi
     [ -d /run/systemd/system ] || refuse "systemd is not this host's init system (/run/systemd/system is missing); the worker is installed as a systemd service"
-    for tool in systemctl loginctl tar gzip sha256sum awk sed grep head install mktemp useradd usermod userdel getent runuser stat df wc tr; do
+    for tool in systemctl loginctl tar gzip sha256sum awk sed grep head install mktemp useradd usermod userdel getent runuser stat df wc tr env; do
         need "$tool" ""
     done
     if command -v curl >/dev/null 2>&1; then
@@ -214,6 +216,9 @@ on_exit() {
     trap - EXIT
     if [ "$rc" -ne 0 ] && [ "$TOUCHED" = 1 ]; then
         say "the install failed (exit $rc); undoing what this run changed"
+        if [ -n "$ENROLLED_ID" ]; then
+            say "the controller had already enrolled worker $ENROLLED_ID; ask a platform administrator to uninstall it there (the enrollment cannot be reused)"
+        fi
         undo_install || say "could not undo everything; run 'sh $0 uninstall' to finish"
     fi
     if [ -n "$STAGE" ]; then
@@ -298,7 +303,7 @@ read_input() {
                 say "enrollment secret (input is hidden):"
                 stty -echo 2>/dev/null || true
                 IFS= read -r l1 || l1=''
-                if [ "$TRANSPORT" = tailcat ]; then
+                if [ "$TRANSPORT" = tailcat ] && [ -z "$API_URL" ]; then
                     say "controller Tailcat address (input is hidden):"
                     IFS= read -r l2 || l2=''
                 else
@@ -323,7 +328,10 @@ read_input() {
     esac
     printf '%s\n' "${SECRET#sntl_}" | grep -Eq '^[0-9a-f]{64}$' ||
         die "the enrollment secret is malformed (sntl_ followed by 64 hex characters)"
-    if [ "$TRANSPORT" = tailcat ]; then
+    if [ -n "$API_URL" ]; then
+        # The controller answers the redemption with its Tailcat address: nothing more to read.
+        TC_ADDRESS=''
+    elif [ "$TRANSPORT" = tailcat ]; then
         printf '%s\n' "$TC_ADDRESS" | grep -Eq '^tc[A-Za-z0-9_-]{20,254}$' ||
             die "a Tailcat enrollment needs the controller's Tailcat address (tc...) on the second line of the input"
     else
@@ -377,6 +385,34 @@ enable_linger() {
 }
 
 # ---- files ---------------------------------------------------------------
+
+# Redeem the enrollment over HTTPS with the installed worker: it generates this host's identities as the
+# service account, binds them at the controller in one step and writes the configuration, which is then
+# installed root-owned. The secret travels on a pipe into the worker's standard input.
+enroll_over_https() {
+    bin=$1
+    uid=$2
+    staged="$DATA_DIR/worker.toml.staged"
+    rm -f -- "$staged"
+    set -- --api-url "$API_URL" --data-dir "$DATA_DIR" --config "$staged" --name "$WORKER_NAME" --secret-stdin
+    if [ "$TRANSPORT" = tailcat ]; then
+        set -- "$@" --tailcat-binary "$PREFIX/tailcat/tailcat" --tailcat-sha256 "$TAILCAT_SHA256" --tailcat-port "$LINK_PORT"
+        if [ -n "$TAILCAT_DERPMAP_URL" ]; then
+            set -- "$@" --derpmap-url "$TAILCAT_DERPMAP_URL"
+        fi
+        if [ -n "$TAILCAT_REGION" ]; then
+            set -- "$@" --region "$TAILCAT_REGION"
+        fi
+    fi
+    printf '%s\n' "$SECRET" | runuser -u "$ACCOUNT" -- env HOME="$DATA_DIR" XDG_RUNTIME_DIR="/run/user/$uid" "$bin" worker enroll "$@" ||
+        die "enrolling with the controller failed (see the message above); nothing was installed"
+    SECRET=''
+    if [ -s "$DATA_DIR/worker.id" ]; then
+        ENROLLED_ID=$(head -n 1 "$DATA_DIR/worker.id")
+    fi
+    install -m 0640 -o root -g "$ACCOUNT" "$staged" "$CONF_FILE"
+    rm -f -- "$staged"
+}
 
 write_config() {
     tmp="$CONF_FILE.new"
@@ -568,14 +604,18 @@ cmd_install() {
         install -d -m 0755 -o root -g root "$PREFIX/tailcat"
         install -m 0755 -o root -g root "$STAGE/tailcat" "$PREFIX/tailcat/tailcat"
     fi
-    if [ -n "$SECRET" ]; then
+    if [ -n "$SECRET" ] && [ -n "$API_URL" ]; then
+        enroll_over_https "$PREFIX/releases/$NEW_REL/sentinel" "$uid"
+    elif [ -n "$SECRET" ]; then
         enrollment="$DATA_DIR/enrollment"
         rm -f -- "$enrollment"
         install -m 0600 -o "$ACCOUNT" -g "$ACCOUNT" /dev/null "$enrollment"
         printf '%s\n' "$SECRET" >"$enrollment"
         SECRET=''
     fi
-    if [ "$FRESH" = 1 ] || [ ! -f "$CONF_FILE" ]; then
+    if [ ! -f "$CONF_FILE" ] && [ -n "$API_URL" ]; then
+        die "$CONF_FILE is missing and there is no enrollment secret to rebuild it; uninstall and install again"
+    elif [ "$FRESH" = 1 ] || [ ! -f "$CONF_FILE" ]; then
         write_config
     else
         say "kept the existing $CONF_FILE; local settings in it survive an upgrade"
@@ -610,7 +650,7 @@ cmd_install() {
     if [ -f "$DATA_DIR/worker.id" ]; then
         say "worker id: $(head -n 1 "$DATA_DIR/worker.id")"
     fi
-    if [ "$TRANSPORT" = tailcat ]; then
+    if [ "$TRANSPORT" = tailcat ] && [ -z "$API_URL" ]; then
         say "the controller admits this worker's Tailcat key once you authorize it for the enrollment it was issued from: sh $0 identity | sentinel admin tailcat authorize --enrollment <tok_ id> --data-dir <controller data dir>"
     fi
 }
@@ -648,6 +688,18 @@ cmd_rollback() {
     if [ ! -L "$PREFIX/previous" ] || [ ! -d "$PREFIX/$(readlink "$PREFIX/previous")" ]; then
         die "there is no previous release to roll back to"
     fi
+    bin="$PREFIX/current/sentinel"
+    if [ -x "$bin" ]; then
+        if "$bin" worker rollback; then
+            return 0
+        else
+            rc=$?
+        fi
+        # 1 is the worker's own report that the switch failed or the old release did not stay up (it restored
+        # the running one); anything else means it cannot do the switch at all.
+        [ "$rc" -ne 1 ] || die "the rollback failed (see above)"
+        say "the installed worker cannot roll itself back (exit $rc); using this script's own rollback"
+    fi
     current=$(readlink "$PREFIX/current")
     previous=$(readlink "$PREFIX/previous")
     ln -sfn "$previous" "$PREFIX/current"
@@ -672,6 +724,19 @@ check_root_only() {
 
 remove_installation() {
     # argument: 1 to remove the data directory too
+    created=$(state_get created_account)
+    linger=$(state_get enabled_linger)
+    # The installed worker removes what the install made; this function finishes the job when it cannot run
+    # (a release that predates the command, a broken binary) or stops partway.
+    bin="$PREFIX/current/sentinel"
+    if [ -x "$bin" ]; then
+        if [ "$1" = 1 ]; then
+            "$bin" worker uninstall && return 0
+        else
+            "$bin" worker uninstall --keep-data && return 0
+        fi
+        say "the installed worker could not finish the removal; finishing it with this script"
+    fi
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         systemctl stop "$UNIT" 2>/dev/null || true
         systemctl disable "$UNIT" >/dev/null 2>&1 || true
@@ -680,8 +745,6 @@ remove_installation() {
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         systemctl daemon-reload 2>/dev/null || true
     fi
-    created=$(state_get created_account)
-    linger=$(state_get enabled_linger)
     rm -rf -- "$PREFIX" "$CONF_DIR"
     if [ "$1" = 1 ]; then
         rm -rf -- "$DATA_DIR"

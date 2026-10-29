@@ -245,6 +245,10 @@ struct WorkerBootstrapFile {
     release_url: String,
     /// The release's `SHA256SUMS` file.
     release_sums: PathBuf,
+    /// HTTPS base URL workers redeem their enrollment at (`https://`, or `http://` on a loopback host).
+    /// Without it the generated script keeps the older flow, in which the secret rides the worker's
+    /// first link hello and a Tailcat key is authorized by an administrator.
+    api_url: Option<String>,
     tailcat: Option<BootstrapTailcatFile>,
 }
 
@@ -270,6 +274,13 @@ impl WorkerBootstrapFile {
         if !self.release_sums.is_absolute() {
             return Err(Error::config(
                 "[worker_bootstrap] release_sums must be an absolute path",
+            ));
+        }
+        if let Some(url) = &self.api_url
+            && !(url.starts_with("https://") || url.starts_with("http://"))
+        {
+            return Err(Error::config(
+                "[worker_bootstrap] api_url must be an https:// URL (http:// only for a loopback host)",
             ));
         }
         if let Some(tailcat) = &self.tailcat {
@@ -349,6 +360,7 @@ impl WorkerBootstrapFile {
                     .join(sentinel_link::tailcat::ADDRESS_FILE)
             }),
             tailcat,
+            api_url: self.api_url.clone(),
         })
         .map_err(|error| Error::config(format!("[worker_bootstrap] {error}")))
     }
@@ -1302,6 +1314,33 @@ pub(crate) fn tailcat_setup(
     })
 }
 
+/// The checks `sentinel worker --check` runs, plus the host's runtime: the configuration must load and the
+/// isolation it names must be possible here. Enrollment runs it before it spends the enrollment secret.
+#[cfg(feature = "worker")]
+pub(crate) fn check_worker(config: PathBuf, data_dir: PathBuf) -> Result<(), Error> {
+    let args = ServiceArgs {
+        config: Some(config),
+        data_dir: Some(data_dir),
+        check: true,
+        log_format: None,
+        log_level: None,
+    };
+    let mut io = Executor::new(WorkClass::BlockingIo, 1)
+        .map_err(|error| Error::runtime(format!("cannot start I/O lane: {error}")))?;
+    let mut cpu = Executor::new(WorkClass::Cpu, 1)
+        .map_err(|error| Error::runtime(format!("cannot start CPU lane: {error}")))?;
+    let loaded = Config::load("worker", &args, &io, &cpu);
+    io.shutdown(Duration::from_secs(1));
+    cpu.shutdown(Duration::from_secs(1));
+    let loaded = loaded?;
+    let Role::Worker(Some(link)) = &loaded.role else {
+        return Err(Error::config(
+            "the worker configuration names no controller",
+        ));
+    };
+    worker_role::check_runtime(link)
+}
+
 fn bootstrap_work<T: Send + 'static>(
     executor: &Executor,
     work: impl FnOnce() -> T + Send + 'static,
@@ -1427,17 +1466,33 @@ enum Running {
     },
 }
 
+/// What wakes the node-key pass: the periodic tick still catches edits to the operator's allow-list file, but a
+/// machine that redeems an enrollment is admitted at once.
+#[cfg(feature = "server")]
+enum Wake {
+    Refresh,
+    Stop,
+}
+
 #[cfg(feature = "server")]
 struct TailcatServer {
     server: Arc<sentinel_link::tailcat::Server>,
-    stop: mpsc::SyncSender<()>,
+    wake: mpsc::SyncSender<Wake>,
     refresher: std::thread::JoinHandle<()>,
 }
 
 #[cfg(feature = "server")]
 impl TailcatServer {
+    /// Run the node-key pass now. A pass already queued covers this request too.
+    fn refresh_now(&self) -> sentinel_api::Notify {
+        let wake = self.wake.clone();
+        sentinel_api::Notify(Arc::new(move || {
+            let _ = wake.try_send(Wake::Refresh);
+        }))
+    }
+
     fn shutdown(self) {
-        drop(self.stop);
+        let _ = self.wake.send(Wake::Stop);
         let _ = self.refresher.join();
         self.server.shutdown();
     }
@@ -1553,7 +1608,7 @@ fn start_tailcat(
         ),
     }
     let server = Arc::new(server);
-    let (stop, wake) = mpsc::sync_channel::<()>(0);
+    let (wake_tx, wake) = mpsc::sync_channel::<Wake>(1);
     let refresher = {
         let server = Arc::clone(&server);
         let store = Arc::clone(store);
@@ -1565,9 +1620,10 @@ fn start_tailcat(
                 tracing::dispatcher::with_default(&dispatch, || {
                     let (mut file_warned, mut store_warned) = (false, false);
                     let mut rotation_warned = false;
-                    while let Err(mpsc::RecvTimeoutError::Timeout) =
-                        wake.recv_timeout(TAILCAT_ALLOW_REFRESH)
-                    {
+                    while !matches!(
+                        wake.recv_timeout(TAILCAT_ALLOW_REFRESH),
+                        Ok(Wake::Stop) | Err(mpsc::RecvTimeoutError::Disconnected)
+                    ) {
                         match server.reload_keys() {
                             Ok(()) => rotation_warned = false,
                             Err(_) if !rotation_warned => {
@@ -1637,7 +1693,7 @@ fn start_tailcat(
     };
     Ok(Some(TailcatServer {
         server,
-        stop,
+        wake: wake_tx,
         refresher,
     }))
 }
@@ -2082,6 +2138,7 @@ fn start_server(
     };
     let options = sentinel_api::Options {
         worker_bootstrap,
+        on_worker_enrolled: tailcat.as_ref().map(TailcatServer::refresh_now),
         mail: mail_sender,
         auto_join: config
             .auto_join
@@ -2529,6 +2586,24 @@ mod worker_role {
                 Box::new(NoExecutor)
             }
         }
+    }
+
+    /// Whether the isolation the configuration asks for can run on this host.
+    pub(super) fn check_runtime(link: &WorkerLink) -> Result<(), Error> {
+        let setup = link
+            .microvm
+            .as_ref()
+            .map(|m| sentinel_worker::microvm::Setup {
+                firecracker: m.firecracker.clone(),
+                kernel: m.kernel.clone(),
+                agent: m.agent.clone(),
+            });
+        let preference = match link.isolation {
+            IsolationSetting::Auto => sentinel_worker::host::Preference::Auto,
+            IsolationSetting::Container => sentinel_worker::host::Preference::Container,
+            IsolationSetting::Microvm => sentinel_worker::host::Preference::Microvm,
+        };
+        runtime_selection(preference, setup.as_ref()).map(drop)
     }
 
     /// Detects the host's virtualization and picks the default executor (plan 16.8, runtime selection).

@@ -118,12 +118,26 @@ pub struct Options {
     pub mail: Option<Arc<sentinel_mail::Resend>>,
     /// Lets platform administrators issue worker enrollments and download their bootstrap script (Q11).
     pub worker_bootstrap: Option<Arc<WorkerBootstrap>>,
+    /// Called after a machine redeems an enrollment, so the controller admits its Tailcat node key
+    /// at once instead of at its next periodic pass.
+    pub on_worker_enrolled: Option<Notify>,
+}
+
+/// A callback the embedding controller hands the API.
+#[derive(Clone)]
+pub struct Notify(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Notify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Notify")
+    }
 }
 
 pub(crate) struct State {
     pub auto_join: Vec<AutoJoinRule>,
     pub mail: Option<Arc<sentinel_mail::Resend>>,
     pub worker_bootstrap: Option<Arc<WorkerBootstrap>>,
+    pub on_worker_enrolled: Option<Notify>,
     pub setup_mail: Outbound,
     pub setup_closed: AtomicBool,
     pub store: Arc<Store>,
@@ -246,6 +260,7 @@ impl Server {
             auto_join: options.auto_join,
             mail: options.mail,
             worker_bootstrap: options.worker_bootstrap,
+            on_worker_enrolled: options.on_worker_enrolled,
             setup_mail: Outbound::default(),
             setup_closed: AtomicBool::new(false),
             store: config.store,

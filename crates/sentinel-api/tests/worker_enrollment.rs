@@ -1,10 +1,13 @@
 //! Q11: platform administrators issue worker enrollments and download the worker-only bootstrap script.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use sentinel_api::{Pin, TailcatRelease, WorkerBootstrap, WorkerBootstrapSettings};
 use sentinel_core::{
-    PoolId, TenantId, UnixMillis, UserId,
+    PoolId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Namespace, Permissions, Principal},
 };
 use sentinel_link::{controller::Controller, identity::Identity};
@@ -37,6 +40,7 @@ struct Deployment {
     base: String,
     pool: PoolId,
     root: UserId,
+    enrolled_calls: Arc<AtomicUsize>,
 }
 
 impl Drop for Deployment {
@@ -70,6 +74,7 @@ fn bootstrap(dir: &std::path::Path, with_tailcat: bool) -> Arc<WorkerBootstrap> 
                 region: None,
             }),
             tailcat_address_file: with_tailcat.then_some(address_file),
+            api_url: Some("http://127.0.0.1:8080".into()),
         })
         .unwrap(),
     )
@@ -114,6 +119,8 @@ fn deployment(configured: Option<bool>) -> Deployment {
         "127.0.0.1:0".parse().unwrap(),
     )
     .unwrap();
+    let enrolled_calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&enrolled_calls);
     let server = sentinel_api::Server::start_with(
         sentinel_api::Config {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -131,6 +138,9 @@ fn deployment(configured: Option<bool>) -> Deployment {
         },
         sentinel_api::Options {
             worker_bootstrap: configured.map(|tailcat| bootstrap(dir.path(), tailcat)),
+            on_worker_enrolled: Some(sentinel_api::Notify(Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }))),
             ..sentinel_api::Options::default()
         },
     )
@@ -144,6 +154,7 @@ fn deployment(configured: Option<bool>) -> Deployment {
         base,
         pool,
         root,
+        enrolled_calls,
     }
 }
 
@@ -1083,5 +1094,268 @@ fn listings_show_terms_and_host_policy_and_never_a_secret() {
     );
     assert_eq!(uninstall.status, 202, "{}", uninstall.text);
     let marked = send(&d, "GET", "/api/v1/admin/workers", None, &admin.headers()).json();
-    assert!(marked["workers"][0]["uninstall_requested_ms"].is_number());
+    // The deployment runs a real link controller, whose uninstall pass revokes a worker that holds no work
+    // as soon as it ticks, and the listing shows live workers only: either the request is visible or it
+    // has already settled and the worker is gone.
+    match marked["workers"].as_array().and_then(|hosts| hosts.first()) {
+        Some(host) => assert!(host["uninstall_requested_ms"].is_number(), "{marked}"),
+        None => assert_eq!(marked["workers"], json!([]), "{marked}"),
+    }
+}
+
+fn node_key_text(byte: u8) -> String {
+    format!("nodekey:{}", format!("{byte:02x}").repeat(32))
+}
+
+fn redeem_body(secret: &str, worker: WorkerId, fingerprint: &str, node_key: Option<u8>) -> Value {
+    let mut body = json!({
+        "secret": secret,
+        "worker": worker.to_string(),
+        "name": "build-1",
+        "fingerprint": fingerprint,
+        "arch": "x86_64",
+    });
+    if let Some(byte) = node_key {
+        body["node_key"] = json!(node_key_text(byte));
+    }
+    body
+}
+
+fn post_redeem(d: &Deployment, body: &Value) -> Reply {
+    send(
+        d,
+        "POST",
+        "/api/v1/worker-enrollments/redeem",
+        Some(body),
+        &[],
+    )
+}
+
+fn issue_secret(d: &Deployment, admin: &Session, transport: &str) -> (String, String) {
+    let issued = issue(
+        d,
+        admin,
+        json!({
+            "pool": d.pool.to_string(),
+            "transport": transport,
+            "cpu_millis": 2000,
+            "priority": 3,
+        }),
+    );
+    assert_eq!(issued.status, 201, "{}", issued.text);
+    let body = issued.json();
+    (
+        body["secret"].as_str().unwrap().to_owned(),
+        body["id"].as_str().unwrap().to_owned(),
+    )
+}
+
+fn enrollment_state(d: &Deployment, admin: &Session, id: &str) -> String {
+    let shown = send(
+        d,
+        "GET",
+        &format!("/api/v1/admin/worker-enrollments/{id}"),
+        None,
+        &admin.headers(),
+    );
+    shown.json()["state"].as_str().unwrap().to_owned()
+}
+
+const PRINT_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const PRINT_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+#[test]
+fn a_tailcat_machine_redeems_over_https_and_gets_the_controllers_trust_data() {
+    let d = deployment(Some(true));
+    let admin = administrator(&d);
+    let (secret, id) = issue_secret(&d, &admin, "tailcat");
+    let worker = WorkerId::new();
+
+    let reply = post_redeem(&d, &redeem_body(&secret, worker, PRINT_A, Some(7)));
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    assert_eq!(reply.header("cache-control"), Some("no-store"));
+    let body = reply.json();
+    assert_eq!(body["worker"], worker.to_string());
+    assert_eq!(body["pool"], d.pool.to_string());
+    assert_eq!(body["transport"], "tailcat");
+    assert_eq!(body["controller"], "10.0.0.5:7443");
+    assert_eq!(body["controller_fingerprint"], FINGERPRINT);
+    assert_eq!(body["tailcat_address"], TAILCAT_ADDRESS);
+    assert_eq!(body["host"]["cpu_millis"], 2000);
+    assert_eq!(body["host"]["priority"], 3);
+    assert_eq!(d.enrolled_calls.load(Ordering::SeqCst), 1);
+
+    // One transaction bound both identities, and the secret is spent.
+    let print = sentinel_auth::secret::Digest([0x11; 32]);
+    let bound = d
+        .store
+        .read(|c| workers::authenticate_bound(c, &print, &[7u8; 32]))
+        .unwrap();
+    assert_eq!((bound.id, bound.pool), (worker, d.pool));
+    assert!(
+        d.store
+            .read(|c| workers::pending_node_keys(c, UnixMillis::now()))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(enrollment_state(&d, &admin, &id), "redeemed");
+    let hosts = send(&d, "GET", "/api/v1/admin/workers", None, &admin.headers()).json();
+    assert_eq!(hosts["workers"][0]["id"], worker.to_string());
+    assert!(!hosts.to_string().contains(&secret[5..]));
+
+    // The same machine repeating the call (its answer was lost) gets the same answer and no second worker.
+    let again = post_redeem(&d, &redeem_body(&secret, worker, PRINT_A, Some(7)));
+    assert_eq!(again.status, 200, "{}", again.text);
+    assert_eq!(again.json()["worker"], worker.to_string());
+    let hosts = send(&d, "GET", "/api/v1/admin/workers", None, &admin.headers()).json();
+    assert_eq!(hosts["workers"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_direct_machine_gets_no_tailcat_address_and_the_transports_do_not_mix() {
+    let d = deployment(Some(true));
+    let admin = administrator(&d);
+    let (direct, _) = issue_secret(&d, &admin, "direct");
+    let refused = post_redeem(&d, &redeem_body(&direct, WorkerId::new(), PRINT_A, Some(7)));
+    assert_eq!(refused.status, 403, "{}", refused.text);
+    let reply = post_redeem(&d, &redeem_body(&direct, WorkerId::new(), PRINT_A, None));
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    assert_eq!(reply.json()["transport"], "direct");
+    assert_eq!(reply.json()["tailcat_address"], Value::Null);
+    assert_eq!(reply.json()["controller_fingerprint"], FINGERPRINT);
+
+    let (tailcat, _) = issue_secret(&d, &admin, "tailcat");
+    let missing = post_redeem(&d, &redeem_body(&tailcat, WorkerId::new(), PRINT_B, None));
+    assert_eq!(missing.status, 403, "{}", missing.text);
+}
+
+#[test]
+fn every_way_a_secret_can_fail_is_one_answer_that_names_no_case() {
+    let d = deployment(Some(true));
+    let admin = administrator(&d);
+    let (spent, _) = issue_secret(&d, &admin, "direct");
+    let first = post_redeem(&d, &redeem_body(&spent, WorkerId::new(), PRINT_A, None));
+    assert_eq!(first.status, 200);
+    let (withdrawn, id) = issue_secret(&d, &admin, "direct");
+    let gone = send(
+        &d,
+        "DELETE",
+        &format!("/api/v1/admin/worker-enrollments/{id}"),
+        None,
+        &admin.headers(),
+    );
+    assert_eq!(gone.status, 204);
+
+    // Spent (by another machine), withdrawn and never issued: indistinguishable.
+    let wrong = format!("sntl_{}", "ab".repeat(32));
+    let answers: Vec<Reply> = [spent.as_str(), withdrawn.as_str(), wrong.as_str()]
+        .into_iter()
+        .map(|secret| post_redeem(&d, &redeem_body(secret, WorkerId::new(), PRINT_B, None)))
+        .collect();
+    for answer in &answers {
+        assert_eq!(answer.status, 403, "{}", answer.text);
+    }
+    let messages: Vec<String> = answers
+        .iter()
+        .map(|a| a.json()["message"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        messages.windows(2).all(|pair| pair[0] == pair[1]),
+        "{messages:?}"
+    );
+    assert_eq!(
+        d.enrolled_calls.load(Ordering::SeqCst),
+        1,
+        "only the real redemption notified"
+    );
+}
+
+#[test]
+fn a_taken_identity_is_a_conflict_that_leaves_the_secret_for_the_real_machine() {
+    let d = deployment(Some(true));
+    let admin = administrator(&d);
+    let (first, _) = issue_secret(&d, &admin, "direct");
+    assert_eq!(
+        post_redeem(&d, &redeem_body(&first, WorkerId::new(), PRINT_A, None)).status,
+        200
+    );
+    let (second, id) = issue_secret(&d, &admin, "direct");
+    let clash = post_redeem(&d, &redeem_body(&second, WorkerId::new(), PRINT_A, None));
+    assert_eq!(clash.status, 409, "{}", clash.text);
+    assert_eq!(enrollment_state(&d, &admin, &id), "pending");
+    let real = post_redeem(&d, &redeem_body(&second, WorkerId::new(), PRINT_B, None));
+    assert_eq!(real.status, 200, "{}", real.text);
+}
+
+#[test]
+fn a_tailcat_redemption_waits_for_the_controllers_address_and_spends_nothing() {
+    let d = deployment(Some(true));
+    let admin = administrator(&d);
+    let (secret, id) = issue_secret(&d, &admin, "tailcat");
+    let address = d._dir.path().join("address");
+    let saved = std::fs::read(&address).unwrap();
+    std::fs::remove_file(&address).unwrap();
+    let early = post_redeem(&d, &redeem_body(&secret, WorkerId::new(), PRINT_A, Some(7)));
+    assert_eq!(early.status, 429, "{}", early.text);
+    assert_eq!(enrollment_state(&d, &admin, &id), "pending");
+    std::fs::write(&address, saved).unwrap();
+    let ready = post_redeem(&d, &redeem_body(&secret, WorkerId::new(), PRINT_A, Some(7)));
+    assert_eq!(ready.status, 200, "{}", ready.text);
+}
+
+#[test]
+fn the_endpoint_is_off_without_an_api_url_and_takes_no_browser_or_oversized_requests() {
+    let off = deployment(None);
+    let reply = post_redeem(&off, &redeem_body("sntl_x", WorkerId::new(), PRINT_A, None));
+    assert_eq!(reply.status, 404);
+
+    let d = deployment(Some(false));
+    let valid = redeem_body(
+        &format!("sntl_{}", "cd".repeat(32)),
+        WorkerId::new(),
+        PRINT_A,
+        None,
+    );
+    let browser = send(
+        &d,
+        "POST",
+        "/api/v1/worker-enrollments/redeem",
+        Some(&valid),
+        &[("origin", "https://evil.example")],
+    );
+    assert_eq!(browser.status, 403, "{}", browser.text);
+    let huge = json!({ "secret": "x".repeat(4096) });
+    let oversized = post_redeem(&d, &huge);
+    assert_eq!(oversized.status, 413, "{}", oversized.text);
+    // A secret in the URL is never read: the body is the only place for it.
+    let in_url = send(
+        &d,
+        "POST",
+        &format!(
+            "/api/v1/worker-enrollments/redeem?secret=sntl_{}",
+            "ab".repeat(32)
+        ),
+        Some(&json!({ "worker": WorkerId::new().to_string() })),
+        &[],
+    );
+    assert_eq!(in_url.status, 400, "{}", in_url.text);
+}
+
+#[test]
+fn guessing_is_rate_limited_per_address_and_the_audit_trail_stays_small() {
+    let d = deployment(Some(true));
+    let admin = administrator(&d);
+    let mut statuses = Vec::new();
+    for _ in 0..8 {
+        let secret = format!("sntl_{}", "ef".repeat(32));
+        statuses
+            .push(post_redeem(&d, &redeem_body(&secret, WorkerId::new(), PRINT_A, None)).status);
+    }
+    assert!(statuses.iter().take(5).all(|s| *s == 403), "{statuses:?}");
+    assert!(statuses.iter().skip(5).all(|s| *s == 429), "{statuses:?}");
+    let refused = audit_events(&d, &admin)
+        .iter()
+        .filter(|e| *e == "worker-enrollment-refused")
+        .count();
+    assert_eq!(refused, 5);
 }

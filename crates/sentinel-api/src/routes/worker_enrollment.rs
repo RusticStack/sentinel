@@ -7,15 +7,20 @@
 //! ceilings and priority approved for one worker, and request its uninstall. A worker's own report can
 //! never raise either.
 
+use sentinel_auth::secret::Digest;
 use sentinel_core::{PoolId, TokenId, UnixMillis, WorkerId};
 use sentinel_protocol::error::{ApiError, ErrorCode};
+use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
 use sentinel_store::workers::{
     self, DEFAULT_ENROLLMENT_MS, EnrollmentState, EnrollmentStatus, EnrollmentTerms, HostPolicy,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Reply, Route, body, err, id, ok, parse, query_param, store_error};
+use super::{
+    JSON, Reply, Route, body, err, header, header_value, id, ok, parse, public_body_limit,
+    query_param, store_error,
+};
 use crate::{
     State,
     auth::Identity,
@@ -32,6 +37,7 @@ pub(super) fn route(
     query: &str,
 ) -> Option<Route> {
     Some(match (method, parts) {
+        ("POST", ["api", "v1", "worker-enrollments", "redeem"]) => redeem(state, request),
         ("POST", ["api", "v1", "admin", "worker-enrollments"]) => issue(state, request),
         ("GET", ["api", "v1", "admin", "worker-enrollments"]) => {
             list_enrollments(state, request, query)
@@ -472,4 +478,176 @@ fn list_hosts(state: &State, request: &Request, query: &str) -> Route {
             host
         }).collect::<Vec<_>>(),
     }))
+}
+
+/// The most a redemption body can be: a secret, an identifier, a name, a fingerprint and a node key.
+const MAX_REDEEM_BODY_BYTES: usize = 2 << 10;
+/// One answer for every way a secret can fail, so the response never says which case applied.
+const REDEEM_REFUSED: &str = "the enrollment secret is not valid, was already used or has expired";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RedeemBody {
+    secret: String,
+    worker: String,
+    name: String,
+    /// BLAKE3 of the worker's link certificate, 64 lower-case hex characters.
+    fingerprint: String,
+    arch: String,
+    /// `nodekey:<64 hex>`; present for a Tailcat enrollment and absent for a direct one.
+    #[serde(default)]
+    node_key: Option<String>,
+}
+
+fn digest_of(text: &str) -> Option<Digest> {
+    if text.len() != 64 {
+        return None;
+    }
+    let nibble = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let mut out = [0u8; 32];
+    for (byte, pair) in out.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+        *byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Some(Digest(out))
+}
+
+/// A machine redeems its enrollment: the secret, in the body and never in a URL, authorizes the TLS
+/// fingerprint and the Tailcat node key it presents, and one store transaction binds both to the pool
+/// and spends the secret. The answer is the controller's trust data, so the worker can pin it and
+/// connect. Unauthenticated by design (the secret is the credential), so it is bounded: a small body,
+/// per-address and overall budgets, one uniform refusal and a capped audit trail.
+fn redeem(state: &State, request: &mut Request) -> Route {
+    let Some(bootstrap) = state
+        .worker_bootstrap
+        .as_deref()
+        .filter(|b| b.redeems_over_https())
+    else {
+        return Err(err(ErrorCode::NotFound, "not found"));
+    };
+    let json_body = header_value(request, "content-type").is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case(JSON))
+    });
+    if !json_body {
+        return Err(err(
+            ErrorCode::InvalidRequest,
+            "this route takes an application/json body",
+        ));
+    }
+    if header_value(request, "origin").is_some() {
+        return Err(err(
+            ErrorCode::Forbidden,
+            "requests from a browser page are refused",
+        ));
+    }
+    if !oauth::admitted(state, request, Budget::Redeem) {
+        return Err(
+            err(ErrorCode::RateLimited, "too many requests; retry later")
+                .with_detail("retry_after_ms", 12_000),
+        );
+    }
+    let body: RedeemBody = parse(&public_body_limit(request, MAX_REDEEM_BODY_BYTES)?)?;
+    // A malformed secret is refused before the store: only well-formed guesses reach the audit trail.
+    let Some(secret) = sentinel_auth::token::parse(&body.secret) else {
+        return Err(err(ErrorCode::Forbidden, REDEEM_REFUSED));
+    };
+    let worker: WorkerId = id(&body.worker, "worker")?;
+    let fingerprint = digest_of(&body.fingerprint).ok_or_else(|| {
+        err(
+            ErrorCode::InvalidRequest,
+            "fingerprint must be 64 lower-case hex characters",
+        )
+    })?;
+    let arch = match body.arch.as_str() {
+        "x86_64" => Arch::X86_64,
+        "aarch64" => Arch::Aarch64,
+        _ => {
+            return Err(err(
+                ErrorCode::InvalidRequest,
+                "arch must be x86_64 or aarch64",
+            ));
+        }
+    };
+    let node_key = match body.node_key.as_deref() {
+        None => None,
+        Some(text) => Some(workers::parse_node_key(text).ok_or_else(|| {
+            err(
+                ErrorCode::InvalidRequest,
+                "node_key must be nodekey:<64 hex>",
+            )
+        })?),
+    };
+    // Checked before the write: the answer for a Tailcat machine carries the controller's address, and a
+    // secret must not be spent on a reply the controller cannot yet complete.
+    let tailcat_address = match node_key {
+        Some(_) => Some(
+            bootstrap
+                .tailcat_configured()
+                .then(|| bootstrap.tailcat_address())
+                .flatten()
+                .ok_or_else(|| {
+                    err(
+                        ErrorCode::RateLimited,
+                        "the controller is not serving Tailcat yet; retry shortly",
+                    )
+                    .with_detail("retry_after_ms", 5_000)
+                })?,
+        ),
+        None => None,
+    };
+    let name = body.name;
+    let enrolled = state
+        .store
+        .writer()
+        .write(move |tx| {
+            workers::redeem_presented(
+                tx,
+                &secret,
+                workers::Presentation {
+                    worker,
+                    fingerprint,
+                    name: &name,
+                    negotiated: Negotiated {
+                        protocol: ProtocolVersion(1),
+                        capabilities: Capabilities::REQUIRED,
+                        arch,
+                    },
+                },
+                node_key,
+                UnixMillis::now(),
+            )
+        })
+        .map_err(|e| match e {
+            sentinel_store::Error::Conflict => err(
+                ErrorCode::Conflict,
+                "this worker identity or node key is already enrolled",
+            ),
+            e => store_error(e),
+        })?;
+    let Some(enrolled) = enrolled else {
+        return Err(err(ErrorCode::Forbidden, REDEEM_REFUSED));
+    };
+    if let Some(notify) = &state.on_worker_enrolled {
+        (notify.0)();
+    }
+    Ok(Reply::Json(
+        200,
+        json!({
+            "worker": enrolled.id.to_string(),
+            "pool": enrolled.pool.to_string(),
+            "transport": transport_name(node_key.is_some()),
+            "host": policy_json(&enrolled.policy),
+            "controller": bootstrap.controller().to_string(),
+            "controller_fingerprint": bootstrap.fingerprint(),
+            // A credential: shown to the holder of the secret only, and never logged.
+            "tailcat_address": tailcat_address.as_ref().map(|a| a.expose()),
+        }),
+        vec![header("cache-control", "no-store")],
+    ))
 }

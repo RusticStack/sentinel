@@ -47,6 +47,7 @@ pub(crate) enum Budget {
     Enrollment,
     Bootstrap,
     HostPolicy,
+    Redeem,
 }
 
 const TOKEN_CLIENT: Rate = Rate::per_sec(10, 20);
@@ -75,6 +76,10 @@ const BOOTSTRAP_CEILING: Rate = Rate::per_sec(2, 10);
 // Host policy and uninstall requests, per platform administrator: 10 in a burst, then one a second.
 const HOST_POLICY_ACTOR: Rate = Rate::new(std::time::Duration::from_secs(1), 10);
 const HOST_POLICY_CEILING: Rate = Rate::per_sec(2, 10);
+// An unauthenticated enrollment redemption: 5 attempts per address then one every 12 s, and 20 then one every 3 s
+// overall, the same bounds as the link's own enrollment attempts. Each wrong secret may write an audit row.
+const REDEEM_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(12), 5);
+const REDEEM_CEILING: Rate = Rate::new(std::time::Duration::from_secs(3), 20);
 
 pub(crate) struct OAuthState {
     pub issuer: String,
@@ -100,6 +105,7 @@ pub(crate) struct OAuthState {
     pub enrollment_budget: Mutex<Limiter>,
     pub bootstrap_budget: Mutex<Limiter>,
     pub host_policy_budget: Mutex<Limiter>,
+    pub redeem_budget: Mutex<Limiter>,
     pub client_metadata: client::MetadataCache,
     pub device_polls: Mutex<HashMap<[u8; 32], (Instant, u32)>>,
     pub user_code_failures: Mutex<device::WrongCodes>,
@@ -164,6 +170,7 @@ impl OAuthState {
                 Some(HOST_POLICY_CEILING),
                 now,
             )),
+            redeem_budget: Mutex::new(Limiter::new(REDEEM_CLIENT, Some(REDEEM_CEILING), now)),
             client_metadata: client::MetadataCache::default(),
             device_polls: Mutex::new(HashMap::new()),
             user_code_failures: Mutex::new(device::WrongCodes::new()),
@@ -359,6 +366,7 @@ pub(crate) fn admitted_as(state: &State, client: u128, budget: Budget) -> bool {
         Budget::Enrollment => take(&oauth.enrollment_budget),
         Budget::Bootstrap => take(&oauth.bootstrap_budget),
         Budget::HostPolicy => take(&oauth.host_policy_budget),
+        Budget::Redeem => take(&oauth.redeem_budget),
     }
 }
 
