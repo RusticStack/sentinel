@@ -116,6 +116,7 @@ fn accept_with(
         &tx,
         f.repo,
         &NewDelivery {
+            authentication: sentinel_store::intake::Authentication::HookToken,
             provider: "generic",
             external_id,
             event: "ref_update",
@@ -692,6 +693,7 @@ fn accept_pr(f: &mut Fixture, id: &str, terms: &intake::PrTerms<'_>) -> Result<A
         &tx,
         f.repo,
         &NewDelivery {
+            authentication: sentinel_store::intake::Authentication::SignedWebhook,
             provider: "github",
             external_id: id,
             event: "pull_request",
@@ -1147,4 +1149,57 @@ fn a_constraint_failure_in_one_delivery_does_not_abort_the_batch() {
     let row = fetch(&f, poison);
     assert_eq!(row.state, State::Pending, "{row:?}");
     assert_eq!(row.attempts, 1, "the row is on its own retry schedule");
+}
+
+#[test]
+fn the_controller_records_event_fact_provenance_in_the_transaction_that_creates_the_run() {
+    let mut f = fixture();
+    let accepted = accept(&mut f, "atomic", REF, SHA_B, SHA_C).id();
+    let tx = f.conn.transaction().unwrap();
+    intake::resolve_due(&tx, NOW, 10).unwrap();
+    tx.commit().unwrap();
+    let delivery = fetch(&f, accepted);
+    let run_spec = spec(true);
+    let images = runs::pinned_images(&run_spec).unwrap();
+    let provenance = provenance::Provenance {
+        tenant: f.tenant,
+        repo: f.repo,
+        trigger: "push".into(),
+        delivery: Some(accepted),
+        provider: Some("generic".into()),
+        ref_name: Some(REF.into()),
+        old_sha: Some(SHA_B.into()),
+        new_sha: Some(SHA_C.into()),
+        head_sha: None,
+        base_sha: None,
+        merge_sha: None,
+        pipeline_sha: SHA_C.into(),
+        pipeline_path: Some(".sentinel.yml".into()),
+        pipeline_digest: run_spec.pipeline.digest.to_le_bytes(),
+        pr_number: None,
+    };
+    let count = |f: &Fixture| -> (i64, i64) {
+        (
+            f.conn
+                .query_row("SELECT count(*) FROM runs", [], |r| r.get(0))
+                .unwrap(),
+            f.conn
+                .query_row("SELECT count(*) FROM run_provenance", [], |r| r.get(0))
+                .unwrap(),
+        )
+    };
+    let before = count(&f);
+    let tx = f.conn.transaction().unwrap();
+    intake::dispatch(&tx, &delivery, &run_spec, &images, &provenance, NOW).unwrap();
+    tx.rollback().unwrap();
+    assert_eq!(count(&f), before, "a rolled-back dispatch leaves neither");
+
+    let tx = f.conn.transaction().unwrap();
+    intake::dispatch(&tx, &delivery, &run_spec, &images, &provenance, NOW).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(count(&f), (before.0 + 1, before.1 + 1));
+    let run = fetch(&f, accepted).run.unwrap();
+    let facts = provenance::event_facts(&f.conn, run).unwrap();
+    assert_eq!((facts.name.as_str(), facts.key.as_str()), ("push", "main"));
+    assert_eq!(facts.ref_name, REF);
 }

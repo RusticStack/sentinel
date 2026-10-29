@@ -788,7 +788,7 @@ impl LogStore {
         let step_changed = frame.step != w.step;
         w.seg_len += record_len;
         w.len += record_len;
-        w.lines += frame.bytes.iter().filter(|b| **b == b'\n').count() as u64;
+        w.lines += memchr::memchr_iter(b'\n', &frame.bytes).count() as u64;
         if frame.seq <= w.last_seq {
             fill_hole(&mut w.holes, frame.seq);
             w.holes_dirty = true;
@@ -919,6 +919,28 @@ impl LogStore {
         step: Option<u32>,
     ) -> Result<Tail> {
         read_newest(&self.attempt_dir(run, job, attempt), page, step)
+    }
+
+    /// The cursor that starts a read at 1-based `line` of one attempt's log; see [`seek_line`].
+    pub fn seek_line(
+        &self,
+        run: RunId,
+        job: JobId,
+        attempt: AttemptId,
+        line: u64,
+    ) -> Result<LineSeek> {
+        seek_line(&self.attempt_dir(run, job, attempt), line)
+    }
+
+    /// The checkpoints around a wall-clock instant of one attempt's log; see [`seek_time`].
+    pub fn seek_time(
+        &self,
+        run: RunId,
+        job: JobId,
+        attempt: AttemptId,
+        at: UnixMillis,
+    ) -> Result<TimeSeek> {
+        seek_time(&self.attempt_dir(run, job, attempt), at)
     }
 
     pub fn frontier(&self, attempt: AttemptId) -> Option<(u64, bool)> {
@@ -1675,7 +1697,7 @@ fn fold_frame(w: &mut Open, seg: u32, frame: &Frame, first: bool, pending: &mut 
     }
     let step_changed = frame.step != w.step;
     w.len += (FRAME_HEADER_BYTES + frame.bytes.len()) as u64;
-    w.lines += frame.bytes.iter().filter(|b| **b == b'\n').count() as u64;
+    w.lines += memchr::memchr_iter(b'\n', &frame.bytes).count() as u64;
     if frame.seq <= w.last_seq {
         fill_hole(&mut w.holes, frame.seq);
         return false;
@@ -2102,6 +2124,186 @@ fn step_moved_on(entries: &[Entry], want: u32) -> bool {
         .max()
         .unwrap_or(0);
     entries.iter().any(|e| e.step > want && e.seq > last_want)
+}
+
+/// Where a lookup by line landed. Every field is derived from stored data; the cursor is a plain sequence number,
+/// so `read_page(dir, after, ..)` continues from it and no cursor format changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineSeek {
+    /// Frames with `seq > after` start at, or just before, the first byte of the line; `0` for line 1.
+    pub after: u64,
+    /// The line's first byte is stored. `false`: the log holds fewer lines than asked for, and `after` is the newest
+    /// stored sequence (a live log is asked again once more arrived).
+    pub found: bool,
+    /// Line numbers are exact only while stored order is sequence order up to the line: no gap (a hole or a
+    /// declared or never-stored range) at or before it and no late fill in the decoded span. Otherwise the line
+    /// counts the stored frames only.
+    pub exact: bool,
+    /// The log has its end marker.
+    pub complete: bool,
+}
+
+/// Where a lookup by wall time landed, at checkpoint granularity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeSeek {
+    /// Every frame with `seq <= after` was stored before the instant (the newest checkpoint stamped earlier).
+    pub after: u64,
+    /// Every frame with `seq > until` was stored at or after the instant (the first checkpoint stamped at or
+    /// after it). The first frame stored at or after the instant lies in `(after, until]`. `None`: no checkpoint is
+    /// stamped at or after the instant, so frames past `after` may be older or newer than it.
+    pub until: Option<u64>,
+    /// The log has its end marker.
+    pub complete: bool,
+}
+
+struct LineScan {
+    start: Option<u64>,
+    last: u64,
+    ended: bool,
+    ordered: bool,
+}
+
+/// Finds the frame holding the first byte of 1-based `line`, counting newlines over the merged stream in stored
+/// order as the writer counts them. The index's line checkpoints bound the decode to the frames between the
+/// newest checkpoint before the line and the line itself; without a usable index the scan starts at the first
+/// segment.
+pub fn seek_line(dir: &Path, line: u64) -> Result<LineSeek> {
+    if line == 0 {
+        return Err(Error::InvalidInput("log line"));
+    }
+    let segs = segs(dir)?;
+    let marker = end_marker(dir);
+    if segs.is_empty() && marker.is_none() {
+        return Err(Error::NotFound);
+    }
+    let want = line - 1;
+    let entries = usable_index(dir);
+    let from = entries
+        .partition_point(|e| e.line < want)
+        .checked_sub(1)
+        .map(|i| entries[i]);
+    let scan = match scan_line(dir, &segs, from, want)? {
+        Some(scan) => scan,
+        // The checkpoint names a frame the segment does not hold: the index is stale, the segments are the truth.
+        None => {
+            scan_line(dir, &segs, None, want)?.expect("a scan from the start has nothing to skip")
+        }
+    };
+    let (after, found, at) = match scan.start {
+        Some(start) if want == 0 => (0, true, start),
+        Some(start) => (start - 1, true, start),
+        None => (scan.last, false, scan.last),
+    };
+    let (gaps, complete) = match marker {
+        Some((_, gaps)) => (gaps, true),
+        None => (read_holes(dir), scan.ended),
+    };
+    Ok(LineSeek {
+        after,
+        found,
+        exact: scan.ordered && !gaps.iter().any(|(from, _)| *from <= at),
+        complete,
+    })
+}
+
+fn scan_line(
+    dir: &Path,
+    segs: &BTreeMap<u32, bool>,
+    from: Option<Entry>,
+    want: u64,
+) -> Result<Option<LineScan>> {
+    let (first, mut cum, mut prev) = from.map_or((0, 0, 0), |e| {
+        let first = if e.kind == KIND_SEAL {
+            e.seg.saturating_add(1)
+        } else {
+            e.seg
+        };
+        (first, e.line, e.seq)
+    });
+    // A checkpoint names a frame inside its segment: skip to it, count after it. A seal names the segment's end.
+    let mut skipping = from.filter(|e| e.kind == KIND_CHECKPOINT).map(|e| e.seq);
+    let mut out = LineScan {
+        start: None,
+        last: prev,
+        ended: false,
+        ordered: true,
+    };
+    let mut closed = false;
+    'decode: for (n, compressed) in segs.range(first..) {
+        let Some(mut decoder) = listed_seg_decoder(dir, *n, *compressed)? else {
+            break;
+        };
+        while let Some(record) = decoder.next()? {
+            let Record::Frame(frame) = record else {
+                out.ended = true;
+                break 'decode;
+            };
+            if let Some(seq) = skipping {
+                if frame.seq == seq {
+                    skipping = None;
+                }
+                continue;
+            }
+            out.ordered &= frame.seq == prev + 1;
+            prev = prev.max(frame.seq);
+            out.last = prev;
+            if want == 0 || closed {
+                out.start = Some(frame.seq);
+                break 'decode;
+            }
+            let bytes = &frame.bytes[..];
+            let here = memchr::memchr_iter(b'\n', bytes).count() as u64;
+            if cum + here >= want {
+                // The `want`th newline is in this frame: the line starts after it, here unless it ends the frame.
+                let at = memchr::memchr_iter(b'\n', bytes)
+                    .nth((want - cum - 1) as usize)
+                    .expect("counted above");
+                if at + 1 < bytes.len() {
+                    out.start = Some(frame.seq);
+                    break 'decode;
+                }
+                closed = true;
+            }
+            cum += here;
+        }
+    }
+    Ok(skipping.is_none().then_some(out))
+}
+
+/// Finds the checkpoints around a wall-clock instant: the stamp is taken after the frame it names is written and
+/// before the next frame, so frames at or below the last checkpoint stamped before `at` were stored before it
+/// and frames above the first checkpoint stamped at or after it were stored at or after it. The wall clock is
+/// provenance only: a clock stepped backwards moves the answer to the first checkpoint stamped at or after the
+/// instant, and nothing else is promised.
+pub fn seek_time(dir: &Path, at: UnixMillis) -> Result<TimeSeek> {
+    let segs = segs(dir)?;
+    let marker = end_marker(dir);
+    if segs.is_empty() && marker.is_none() {
+        return Err(Error::NotFound);
+    }
+    let entries = usable_index(dir);
+    let first = entries.iter().position(|e| e.ms >= at.0);
+    let before = first.unwrap_or(entries.len());
+    Ok(TimeSeek {
+        after: before.checked_sub(1).map_or(0, |i| entries[i].seq),
+        until: first.map(|i| entries[i].seq),
+        complete: marker.is_some(),
+    })
+}
+
+/// The index entries when they are in the order every seek relies on (lines, sequences and segments never
+/// decrease); an absent, torn or reordered index reads as empty and the seek falls back to the segments.
+fn usable_index(dir: &Path) -> Vec<Entry> {
+    let bytes = fs::read(dir.join("index")).unwrap_or_default();
+    let entries = read_index(&bytes).unwrap_or_default();
+    if entries
+        .windows(2)
+        .all(|w| w[0].line <= w[1].line && w[0].seq <= w[1].seq && w[0].seg <= w[1].seg)
+    {
+        entries
+    } else {
+        Vec::new()
+    }
 }
 
 pub fn read_tail(path: &Path, after: u64, limit: usize, step: Option<u32>) -> Result<Tail> {

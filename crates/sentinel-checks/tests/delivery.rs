@@ -1110,6 +1110,7 @@ fn a_settled_delivery_publishes_a_completed_check() {
                 tx,
                 repo,
                 &NewDelivery {
+                    authentication: sentinel_store::intake::Authentication::HookToken,
                     provider: "generic",
                     external_id: "no-pipeline",
                     event: "ref_update",
@@ -1172,6 +1173,7 @@ fn a_lost_answer_to_a_completed_create_is_adopted_not_duplicated() {
                 tx,
                 repo,
                 &NewDelivery {
+                    authentication: sentinel_store::intake::Authentication::HookToken,
                     provider: "generic",
                     external_id: "lost-completed",
                     event: "ref_update",

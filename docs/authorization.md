@@ -34,7 +34,7 @@ Repository permission bits are `READ` (1), `RUN` (2), `WRITE_SECRETS` (4). Admin
 
 Secret-write delegation is independent: an operator's run grant never grants it implicitly. An explicit secret-write grant may be given to a reader or operator; no role has a plaintext secret read-back operation.
 
-A `run` grant (or an MCP `runs:write` token) can submit a pipeline of its own, so it never reaches secrets: a manually dispatched run is refused every secret and the API refuses a manual pipeline that declares one ([secrets](secrets.md#who-may-cause-a-delivery)). Only runs built from the repository's own pipeline at a bound revision receive them.
+A `run` grant (or an MCP `runs:write` token) can submit a pipeline of its own, so it never reaches secrets: a manually dispatched run is refused every secret and the API refuses a manual pipeline that declares one ([secrets](secrets.md#who-may-cause-a-delivery)). Only runs built from the repository's own pipeline at a bound revision, from a delivery authenticated at intake (a verified webhook signature or the hook secret; never a polled event), receive them.
 
 ## Queries and mutations
 
@@ -76,6 +76,7 @@ Earlier parent foreign keys did not enforce equal tenant IDs (Parts 01–02 audi
 - Repository access uses cached static statements and primary-key joins. `require_repo` returns a 16-byte tenant ID without allocating repository metadata. Spec reads use one statement/snapshot.
 - Listing uses the `(tenant_id, id)` repository index and keyset range. A query-plan test verifies point and page lookups use index searches and avoid table scans and temporary sort trees. Returned strings/vectors are allocated only for actual results.
 - Administrative changes use short existing single-writer transactions; there is no separate authorization service/cache, lock hierarchy or new crate/dependency.
+- Present and absent repositories take the same path: `require_repo` runs one cached statement keyed on the repository ID and returns `NotFound` for a missing row and a forbidden one alike, with the same status and body. It is not constant-work: `repo_authorization_runs_the_same_keyed_probe_for_present_and_absent_objects` counts SQLite VM instructions and measures that two absent IDs cost exactly the same, while an existing repository the caller may not see costs about a dozen instructions more (41 against 28 on the verification host; a permitted hit costs 58 because it also returns the tenant) because the keyed row is found and then filtered by membership. The difference is bounded (the test allows 32, and 64 for a hit), involves no scan or sort, and is nanoseconds; no timing-equality claim is made, and isolation rests on identical answers, not on equal time.
 - No authorization latency claim is made from unit tests.
 
 ## Verification

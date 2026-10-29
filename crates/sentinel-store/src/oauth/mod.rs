@@ -1299,6 +1299,30 @@ pub fn own_grant(conn: &Connection, user: UserId, grant: GrantId) -> Result<Gran
     grant_record(row)
 }
 
+/// Revokes the live service grants one browser session minted, by the session's retained public ID.
+/// Served by `oauth_grants_by_created_session`; the plan is asserted in `tests/oauth_service.rs`.
+#[doc(hidden)]
+pub const REVOKE_MINTED_BY_SESSION: &str =
+    "UPDATE oauth_grants SET revoked_ms = ?3, revoked_reason = ?4
+             WHERE revoked_ms IS NULL AND kind = 3
+             AND created_by = ?1 AND created_session = ?2";
+
+/// Revokes every live service grant a user minted from any session (logout-all).
+#[doc(hidden)]
+pub const REVOKE_MINTED_BY_USER: &str =
+    "UPDATE oauth_grants SET revoked_ms = ?2, revoked_reason = ?3
+             WHERE revoked_ms IS NULL AND kind = 3
+             AND created_by = ?1 AND created_session IS NOT NULL";
+
+/// Revokes the service grants a user minted without a session (`created_session IS NULL`: grants
+/// from before migration 55, and grants minted by a non-session credential) inside a time window.
+#[doc(hidden)]
+pub const REVOKE_MINTED_LEGACY: &str =
+    "UPDATE oauth_grants SET revoked_ms = ?3, revoked_reason = ?4
+             WHERE expires_ms > ?3 AND revoked_ms IS NULL AND kind = 3
+             AND created_by = ?1 AND created_session IS NULL
+             AND created_ms >= ?2 AND created_ms <= ?3";
+
 pub(crate) fn revoke_minted_for_session(
     tx: &Transaction<'_>,
     minter: UserId,
@@ -1307,11 +1331,7 @@ pub(crate) fn revoke_minted_for_session(
     now: UnixMillis,
 ) -> Result<usize> {
     let mut revoked = tx
-        .prepare_cached(
-            "UPDATE oauth_grants SET revoked_ms = ?3, revoked_reason = ?4
-             WHERE revoked_ms IS NULL AND kind = 3
-             AND created_by = ?1 AND created_session = ?2",
-        )?
+        .prepare_cached(REVOKE_MINTED_BY_SESSION)?
         .execute(params![
             minter.as_bytes(),
             session.as_bytes(),
@@ -1329,13 +1349,11 @@ pub(crate) fn revoke_all_minted(
     legacy_since: Option<UnixMillis>,
     now: UnixMillis,
 ) -> Result<usize> {
-    let mut revoked = tx
-        .prepare_cached(
-            "UPDATE oauth_grants SET revoked_ms = ?2, revoked_reason = ?3
-             WHERE revoked_ms IS NULL AND kind = 3
-             AND created_by = ?1 AND created_session IS NOT NULL",
-        )?
-        .execute(params![minter.as_bytes(), now.0, reason::ACCOUNT])?;
+    let mut revoked = tx.prepare_cached(REVOKE_MINTED_BY_USER)?.execute(params![
+        minter.as_bytes(),
+        now.0,
+        reason::ACCOUNT
+    ])?;
     if let Some(since) = legacy_since {
         revoked += revoke_legacy_minted_since(tx, minter, since, now)?;
     }
@@ -1349,14 +1367,12 @@ fn revoke_legacy_minted_since(
     since: UnixMillis,
     now: UnixMillis,
 ) -> Result<usize> {
-    Ok(tx
-        .prepare_cached(
-            "UPDATE oauth_grants SET revoked_ms = ?3, revoked_reason = ?4
-             WHERE expires_ms > ?3 AND revoked_ms IS NULL AND kind = 3
-             AND created_by = ?1 AND created_session IS NULL
-             AND created_ms >= ?2 AND created_ms <= ?3",
-        )?
-        .execute(params![minter.as_bytes(), since.0, now.0, reason::ACCOUNT])?)
+    Ok(tx.prepare_cached(REVOKE_MINTED_LEGACY)?.execute(params![
+        minter.as_bytes(),
+        since.0,
+        now.0,
+        reason::ACCOUNT
+    ])?)
 }
 
 fn audit_minted_revocation(tx: &Transaction<'_>, minter: UserId, revoked: usize) -> Result<()> {
@@ -1531,12 +1547,8 @@ mod tests {
              UNION ALL SELECT id FROM oauth_grants WHERE revoked_ms IS NOT NULL LIMIT ?2",
             "UPDATE oauth_grants SET revoked_ms = ?2, revoked_reason = ?3
              WHERE client_id = ?1 AND revoked_ms IS NULL",
-            "UPDATE oauth_grants SET revoked_ms = ?3, revoked_reason = ?4
-             WHERE revoked_ms IS NULL AND kind = 3
-             AND created_by = ?1 AND created_session = ?2",
-            "UPDATE oauth_grants SET revoked_ms = ?2, revoked_reason = ?3
-             WHERE revoked_ms IS NULL AND kind = 3
-             AND created_by = ?1 AND created_session IS NOT NULL",
+            super::REVOKE_MINTED_BY_SESSION,
+            super::REVOKE_MINTED_BY_USER,
         ] {
             let plans = plans(&conn, sql);
             assert!(

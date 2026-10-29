@@ -406,6 +406,7 @@ fn a_full_delivery_queue_defers_without_advancing_the_cursor() {
             &tx,
             f.repo,
             &intake::NewDelivery {
+                authentication: sentinel_store::intake::Authentication::HookToken,
                 provider: "generic",
                 external_id: &format!("hook-{i}"),
                 event: "ref_update",

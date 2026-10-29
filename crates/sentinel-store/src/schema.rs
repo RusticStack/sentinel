@@ -152,12 +152,28 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("migrations/055_session_grant_provenance.sql"),
     ),
     (56, include_str!("migrations/056_github_app.sql")),
+    (
+        57,
+        include_str!("migrations/057_minted_grants_unattributed.sql"),
+    ),
+    (
+        58,
+        include_str!("migrations/058_delivery_authentication.sql"),
+    ),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 
 // List a migration only when an older binary can neither break it nor be broken by it.
-pub const READABLE_BY: &[(u32, u32)] = &[(45, 44), (48, 47), (49, 48), (52, 51), (53, 51)];
+pub const READABLE_BY: &[(u32, u32)] = &[
+    (45, 44),
+    (48, 47),
+    (49, 48),
+    (52, 51),
+    (53, 51),
+    (57, 56),
+    (58, 57),
+];
 
 pub fn readable_by(version: u32) -> u32 {
     READABLE_BY
@@ -188,6 +204,81 @@ const _: () = assert!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Migrations from `READABLE_BY_SINCE` on that are deliberately absent from `READABLE_BY`, each with
+    /// why an older binary cannot run on the result (docs/compatibility.md has the full entry). A new
+    /// migration must be listed in one place or the other.
+    const NOT_READABLE: &[(u32, &str)] = &[
+        (
+            50,
+            "older binaries insert users and invitations without the new columns and do not maintain the new tables",
+        ),
+        (
+            51,
+            "an older controller would write manual memberships into a GitHub-backed tenant",
+        ),
+        (
+            54,
+            "an older binary would place a microVM or Windows job on any worker; it cannot see jobs.runtime",
+        ),
+        (
+            55,
+            "older issuance statements do not populate the session provenance the new revocation rules need",
+        ),
+        (
+            56,
+            "an older controller does not know the sealed GitHub App credentials, so it could not use or reseal the App registered through the manifest flow",
+        ),
+    ];
+
+    #[test]
+    fn every_migration_from_the_readable_by_cutover_is_declared_readable_or_exempt_with_a_reason() {
+        let latest = MIGRATIONS.len() as u32;
+        let mut seen = std::collections::HashSet::new();
+        for &(version, reader) in READABLE_BY {
+            assert!(seen.insert(version), "READABLE_BY lists {version} twice");
+            assert!(
+                version <= latest,
+                "READABLE_BY lists unknown migration {version}"
+            );
+            assert!(
+                reader < version,
+                "{version} is declared readable by {reader}"
+            );
+            assert!(reader >= 1, "{version} readable by a nonexistent version");
+        }
+        for pair in READABLE_BY.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0,
+                "READABLE_BY must ascend by migration"
+            );
+        }
+        for &(version, reason) in NOT_READABLE {
+            assert!(
+                !reason.trim().is_empty(),
+                "exemption for {version} needs a reason"
+            );
+            assert!(
+                !seen.contains(&version),
+                "{version} is both declared readable and exempt"
+            );
+        }
+        for version in READABLE_BY_SINCE..=latest {
+            let declared = seen.contains(&version);
+            let exempt = NOT_READABLE.iter().any(|&(v, _)| v == version);
+            assert!(
+                declared ^ exempt,
+                "migration {version} must be in READABLE_BY or NOT_READABLE (declared {declared}, exempt {exempt})"
+            );
+        }
+        for &(version, _) in NOT_READABLE {
+            assert!(
+                (READABLE_BY_SINCE..=latest).contains(&version),
+                "exemption {version} is outside the range that needs one"
+            );
+        }
+        assert_eq!(readable_by(latest + 1), latest + 1);
+    }
 
     #[test]
     fn migration_versions_are_strictly_ascending_and_contiguous_from_one() {

@@ -1140,6 +1140,24 @@ pub fn audit_page(conn: &Connection, before: Option<i64>, limit: u16) -> Result<
 mod tests {
     use rusqlite::Connection;
 
+    use super::Event;
+
+    #[test]
+    fn audit_event_codes_and_names_are_unique_and_round_trip() {
+        let mut names = std::collections::HashSet::new();
+        let mut known = 0;
+        for code in 0..=255i64 {
+            if let Some(event) = Event::from_code(code) {
+                known += 1;
+                assert_eq!(event as i64, code, "{event:?} decodes from another code");
+                assert!(names.insert(event.name()), "name {} reused", event.name());
+            }
+        }
+        // 61 contiguous codes plus the 70.. block; a new event must be added to `from_code` too.
+        assert_eq!(known, 61 + 6, "an event is missing from from_code");
+        assert!(Event::from_code(0).is_none() && Event::from_code(62).is_none());
+    }
+
     #[test]
     fn session_validation_and_credential_lookup_are_index_searches() {
         let mut conn = Connection::open_in_memory().unwrap();

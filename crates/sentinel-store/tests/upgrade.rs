@@ -78,6 +78,7 @@ fn an_upgrade_keeps_a_copy_of_the_database_from_before_it() {
     assert!(readable.contains(&(50, 50)), "{readable:?}");
     assert!(readable.contains(&(52, 51)), "{readable:?}");
     assert!(readable.contains(&(53, 51)), "{readable:?}");
+    assert!(readable.contains(&(57, 56)), "{readable:?}");
     let (_, again) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
     assert!(again.is_none());
     let other = dir.path().join("other");

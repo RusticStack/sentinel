@@ -843,3 +843,66 @@ fn the_last_tenant_administrator_keeps_the_role() {
         Err(Error::Conflict)
     ));
 }
+
+/// Counts the SQLite virtual-machine instructions one authorization call executes.
+fn vm_steps<T>(c: &Connection, f: impl FnOnce() -> T) -> (u64, T) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    let steps = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&steps);
+    c.progress_handler(
+        1,
+        Some(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            false
+        }),
+    )
+    .unwrap();
+    let out = f();
+    c.progress_handler(1, None::<fn() -> bool>).unwrap();
+    (steps.load(Ordering::Relaxed), out)
+}
+
+#[test]
+fn repo_authorization_runs_the_same_keyed_probe_for_present_and_absent_objects() {
+    let (_dir, store, i) = fixture();
+    store
+        .read(|c| {
+            let who = principal(i.alice);
+            // Warm the statement cache so the first call's compile cost is not counted.
+            let _ = auth::require_repo(c, who, i.ar, P::READ);
+            let (present, found) = vm_steps(c, || auth::require_repo(c, who, i.ar, P::READ));
+            assert_eq!(found.unwrap(), i.a);
+            // A repository of another tenant, one that never existed and a random id are
+            // refused with NotFound by one keyed probe; two absent ids cost exactly the same.
+            let outsider = principal(i.outsider);
+            let (foreign, r1) = vm_steps(c, || auth::require_repo(c, outsider, i.ar, P::READ));
+            let (never_o, r0) = vm_steps(c, || {
+                auth::require_repo(c, outsider, RepoId::new(), P::READ)
+            });
+            missing(r0);
+            // Measured: an existing-but-forbidden repository joins a few more rows than an
+            // absent id (the keyed probe finds the row, then membership filters it), so the
+            // work is not identical. It stays a small constant, with no scan or sort.
+            assert!(
+                foreign.abs_diff(never_o) <= 32,
+                "foreign {foreign} vs absent {never_o}"
+            );
+            let (never, r2) = vm_steps(c, || auth::require_repo(c, who, RepoId::new(), P::READ));
+            let (guess, r3) = vm_steps(c, || auth::require_repo(c, who, RepoId::new(), P::READ));
+            missing(r1);
+            missing(r2);
+            missing(r3);
+            assert_eq!(never, guess, "two absent ids differ in work");
+            // A hit runs the same one keyed probe, then reads and returns the tenant id
+            // (58 against 28 on the verification host): a small constant, no scan or sort.
+            assert!(
+                present.abs_diff(never) <= 64,
+                "present {present} vs absent {never}: the probe is not the same shape"
+            );
+            Ok(())
+        })
+        .unwrap();
+}

@@ -152,15 +152,30 @@ fn credential_free_floods_cannot_grow_the_audit_trail_without_bound() {
             Login::Rejected
         ));
     }
-    let rejected = events(&store)
-        .iter()
-        .filter(|e| **e == Event::LoginRejected)
-        .count();
+    // The bound is "at most five rows in any ten-second window of the audit clock", not "five rows in
+    // total": a loaded host spreads the twelve hashed attempts over more than ten seconds, and then
+    // more rows are legitimate. Assert the window bound on the recorded timestamps, which holds at
+    // any speed and fails if the cap is removed or the window is widened.
+    let rows: Vec<i64> = store
+        .read(|conn| local_auth::recent_audit(conn, 100))
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.event == Event::LoginRejected)
+        .map(|r| r.at.0)
+        .collect();
     assert!(
-        (1..=5).contains(&rejected),
-        "{rejected} rejections recorded"
+        (1..=12).contains(&rows.len()),
+        "{} rejections recorded",
+        rows.len()
     );
-    assert!(events(&store).len() - before <= 5);
+    for &end in &rows {
+        let in_window = rows
+            .iter()
+            .filter(|&&t| t <= end && t > end - 10_000)
+            .count();
+        assert!(in_window <= 5, "{in_window} rejections within ten seconds");
+    }
+    assert!(events(&store).len() - before <= 12);
     assert!(matches!(
         local_auth::login(&store, "root", PASSWORD, Policy::default(), at(6_000)).unwrap(),
         Login::Accepted(_)
