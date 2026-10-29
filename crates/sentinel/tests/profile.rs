@@ -1888,3 +1888,73 @@ fn an_unwritable_credential_target_revokes_the_new_grant_and_leaves_no_staging_f
         .collect();
     assert_eq!(names, vec!["default.json".to_owned()], "{names:?}");
 }
+
+/// The new credential is stored (a file store replaced the old one in place) but profiles.json cannot be updated:
+/// the previous grant has no credential left to revoke it later, so it is revoked on the way out.
+#[test]
+fn a_failed_profile_update_still_revokes_the_previous_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("cfg");
+    let profiles = cfg.join("profiles.json");
+    let blocker = profiles.clone();
+    // Once the token request is served the sign-in has already read the profiles, so the update is what fails.
+    let server = oauth_server(move |_| {
+        if blocker.is_file() {
+            std::fs::remove_file(&blocker).unwrap();
+            std::fs::create_dir(&blocker).unwrap();
+            std::fs::write(blocker.join("occupied"), b"x").unwrap();
+        }
+        (200, tokens_json(71, "grt_new"))
+    });
+    let config = Config::at(&cfg).unwrap();
+    seed(&config, "default", &server.url, &credentials(1, 600_000));
+
+    let file = grant_file(&dir, 70);
+    let output = run(
+        &cfg,
+        &[
+            "auth",
+            "login",
+            "--grant-file",
+            &file,
+            "--server",
+            &server.url,
+        ],
+    );
+    assert_ne!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(profiles.is_dir(), "the update really was blocked");
+    let revokes = server.requests("/oauth/revoke");
+    assert_eq!(revokes.len(), 1, "{revokes:?}");
+    assert_eq!(
+        revokes[0].param("token"),
+        Some(token("sntl_rt_", 1)),
+        "the previous grant is revoked, the new one stays"
+    );
+    assert!(stderr(&output).contains("could not be updated"));
+}
+
+/// `--forget` must not drop the entry that points at a credential logout left in place.
+#[cfg(not(windows))]
+#[test]
+fn logout_forget_keeps_the_profile_whose_os_store_credential_could_not_be_read() {
+    let server = oauth_server(|_| oauth_error("invalid_grant"));
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = dir.path().join("cfg");
+    let config = Config::at(&cfg_dir).unwrap();
+    let mut entry = seed(&config, "default", &server.url, &credentials(1, 600_000));
+    entry.store = Backend::Os;
+    entry.key = Some(keystore::scoped_key(config.dir(), &server.url, "default"));
+    let stored = entry.clone();
+    config
+        .update(|p| {
+            p.profiles.insert("default".to_owned(), stored);
+            Ok(())
+        })
+        .unwrap();
+
+    let output = run(&cfg_dir, &["auth", "logout", "--forget"]);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    let profiles = config.load().unwrap();
+    assert!(profiles.profiles.contains_key("default"));
+    assert_eq!(profiles.current.as_deref(), Some("default"));
+}

@@ -519,11 +519,23 @@ fn save_login(
         key: key.clone(),
         created_ms: sent,
     };
-    config.update(|profiles| {
+    let updated = config.update(|profiles| {
         profiles.profiles.insert(name.to_owned(), entry);
         profiles.current = Some(name.to_owned());
         Ok(())
-    })?;
+    });
+    if let Err(error) = updated {
+        // The write above already replaced the previous credential in a file store: this is the last chance to revoke its grant.
+        if let Some((old, (Some(stored), _))) = &superseded
+            && old.grant != response.sentinel_grant
+        {
+            let _ = revoke(&quick_agent(), &old.issuer, &stored.refresh);
+        }
+        eprintln!(
+            "notice: the new sign-in is stored but the profile could not be updated; run sentinel auth login again"
+        );
+        return Err(error);
+    }
     if let Some((old, (stored, ours))) = superseded {
         if let Some(stored) = stored
             && old.grant != response.sentinel_grant
@@ -768,6 +780,31 @@ pub(crate) fn verify(config: &Config, name: &str, agent: &ureq::Agent) -> Result
     ))
 }
 
+enum LogoutRead {
+    Stored(Option<Credentials>),
+    /// The store did not answer and may later: nothing is deleted.
+    Undecided(Error),
+    /// No retry can read it: the credential is deleted so that logout can finish.
+    Unreadable(Error),
+}
+
+// The OS store may only be busy or locked, and deleting would destroy the only copy of the refresh token.
+// A refused file (loose mode, foreign owner) or a damaged blob, in either store, reads the same on every retry.
+fn logout_read(
+    store: keystore::Backend,
+    read: Result<Option<Credentials>, profile::ReadFailure>,
+) -> LogoutRead {
+    match read {
+        Ok(stored) => LogoutRead::Stored(stored),
+        Err(profile::ReadFailure::Store(e)) if store == keystore::Backend::Os => {
+            LogoutRead::Undecided(e)
+        }
+        Err(profile::ReadFailure::Store(e) | profile::ReadFailure::Damaged(e)) => {
+            LogoutRead::Unreadable(e)
+        }
+    }
+}
+
 fn run_logout(args: &LogoutArgs) -> Result<(), Error> {
     let config = Config::from_env()?;
     let profiles = config.load()?;
@@ -806,10 +843,12 @@ fn run_logout(args: &LogoutArgs) -> Result<(), Error> {
                 }
             }
         } else {
-            match config.read_credentials(name, &entry) {
-                Ok(stored) => stored,
-                // The OS store may only be busy or locked, and deleting would destroy the only copy of the refresh token.
-                Err(e) if entry.store == keystore::Backend::Os => {
+            match logout_read(
+                entry.store,
+                config.read_credentials_classified(name, &entry),
+            ) {
+                LogoutRead::Stored(stored) => stored,
+                LogoutRead::Undecided(e) => {
                     eprintln!(
                         "warning: {}; nothing was deleted (profile {name})",
                         e.message
@@ -817,10 +856,9 @@ fn run_logout(args: &LogoutArgs) -> Result<(), Error> {
                     undecided.push(name.clone());
                     continue;
                 }
-                // A refused file (loose mode, foreign owner) or a damaged blob stays that way: no retry can read it.
-                Err(e) => {
+                LogoutRead::Unreadable(e) => {
                     eprintln!(
-                        "warning: {}; its grant cannot be revoked from this credential, and the unusable file is deleted",
+                        "warning: {}; its grant cannot be revoked from this credential, and the unusable credential is deleted",
                         e.message
                     );
                     unreadable.push(name.clone());
@@ -840,12 +878,18 @@ fn run_logout(args: &LogoutArgs) -> Result<(), Error> {
         config.delete_credentials(name, &entry)?;
         eprintln!("Signed out of {} (profile {name})", entry.server);
     }
-    if args.forget && !names.is_empty() {
+    // A profile whose credential was left in place keeps its entry: without it the next logout could not find the credential.
+    let forgotten: Vec<&String> = names.iter().filter(|n| !undecided.contains(n)).collect();
+    if args.forget && !forgotten.is_empty() {
         config.update(|profiles| {
-            for name in &names {
-                profiles.profiles.remove(name);
+            for name in &forgotten {
+                profiles.profiles.remove(*name);
             }
-            if profiles.current.as_ref().is_some_and(|c| names.contains(c)) {
+            if profiles
+                .current
+                .as_ref()
+                .is_some_and(|c| forgotten.contains(&c))
+            {
                 profiles.current = None;
             }
             Ok(())
@@ -919,4 +963,56 @@ fn context_show(client: &ClientArgs) -> Result<(), Error> {
         None => "(no default tenant; set one with: sentinel context use TENANT)\n".to_owned(),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use profile::{ReadFailure, parse_stored};
+
+    fn damaged() -> Result<Option<Credentials>, ReadFailure> {
+        parse_stored(Some(b"{ not a credential".to_vec()))
+    }
+
+    fn busy() -> Result<Option<Credentials>, ReadFailure> {
+        Err(ReadFailure::Store(Error::new(
+            Exit::Busy,
+            "the credential store is busy",
+        )))
+    }
+
+    #[test]
+    fn a_damaged_blob_is_unreadable_in_both_stores() {
+        for store in [keystore::Backend::Os, keystore::Backend::File] {
+            assert!(
+                matches!(logout_read(store, damaged()), LogoutRead::Unreadable(_)),
+                "{store:?}: no retry can parse the same bytes, so logout must be able to delete it"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_store_that_did_not_answer_is_undecided_and_only_for_the_os_store() {
+        assert!(matches!(
+            logout_read(keystore::Backend::Os, busy()),
+            LogoutRead::Undecided(_)
+        ));
+        assert!(matches!(
+            logout_read(keystore::Backend::File, busy()),
+            LogoutRead::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn a_readable_or_absent_credential_is_used_as_read() {
+        assert!(matches!(
+            logout_read(keystore::Backend::Os, parse_stored(None)),
+            LogoutRead::Stored(None)
+        ));
+        let blob = br#"{"refresh":"r","access":"a","access_expires_ms":1,"refresh_expires_ms":2}"#;
+        assert!(matches!(
+            logout_read(keystore::Backend::Os, parse_stored(Some(blob.to_vec()))),
+            LogoutRead::Stored(Some(_))
+        ));
+    }
 }
