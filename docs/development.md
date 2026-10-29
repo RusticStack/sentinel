@@ -74,6 +74,8 @@ pnpm -C web install --frozen-lockfile
 pnpm -C web typecheck
 pnpm -C web build
 cargo test -p sentinel-api --test web_browser -- --ignored --nocapture the_web_interface
+cargo test -p sentinel-api --test web_browser -- --ignored --nocapture the_github_app_setup
+cargo test -p sentinel-github --features fake --test fake_web
 ```
 
 The browser test starts a seeded controller and the built interface; `serve_the_fixture` (same test binary) serves them for a person to look at (`SENTINEL_SERVE_SECS`, default 600). For live editing, run `pnpm -C web dev` with `SENTINEL_API` pointing at a controller (or at a running `sentinel-web`, which proxies the API); sign in on the origin the controller names as `public_url`, whose session cookie the dev server shares (cookies ignore the port).
