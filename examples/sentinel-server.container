@@ -1,0 +1,41 @@
+# The controller as a Podman Quadlet (Podman 4.4+; this file needs 5.x for the
+# keys below). Build localhost/sentinel-server:<version> from
+# Containerfile.server first, then, for a rootless account:
+#
+#   install -D -m 0644 sentinel-server.container ~/.config/containers/systemd/sentinel-server.container
+#   install -D -m 0644 server-container.toml ~/.config/sentinel/server-container.toml
+#   systemctl --user daemon-reload && systemctl --user start sentinel-server.service
+#
+# (a system-wide install uses /etc/containers/systemd/ and systemctl without
+# --user). Create the master key once, as in docs/deployment.md#container-examples.
+# loginctl enable-linger <account> keeps a rootless service running after logout.
+[Unit]
+Description=Sentinel controller (container)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/sentinel-server:0.1.0-dev
+ContainerName=sentinel-server
+Exec=server --config /etc/sentinel/server.toml --data-dir /var/lib/sentinel
+# The named volume holds the database and master.key; :U gives it to uid 10001.
+Volume=sentinel-data.volume:/var/lib/sentinel:U
+Volume=%h/.config/sentinel/server-container.toml:/etc/sentinel/server.toml:ro
+# Host loopback only; see docs/deployment.md before publishing 7443 on a private address.
+PublishPort=127.0.0.1:7080:7080
+PublishPort=127.0.0.1:7443:7443
+ReadOnly=true
+Tmpfs=/tmp:size=64m,mode=1777
+DropCapability=ALL
+NoNewPrivileges=true
+PidsLimit=4096
+Memory=4g
+StopSignal=SIGTERM
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=120
+TimeoutStopSec=40
+
+[Install]
+WantedBy=default.target

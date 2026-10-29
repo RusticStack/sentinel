@@ -4,6 +4,9 @@ lint = "clippy --locked --workspace --all-targets -- -D warnings"
 # Tests use cargo-nextest, which runs test binaries in parallel (cargo test does not).
 test-cli = "nextest run --locked --workspace --no-fail-fast"
 release-cli = "build --locked --workspace --release"
+# Dependency policy for the release artifacts (deny.toml); needs cargo-deny. The inventory
+# freshness check is scripts/release/check-inventory.sh.
+licenses = "deny --locked check bans licenses sources"
 
 # Linux-only role commands; portable checks above intentionally omit role features.
 lint-linux = "clippy --locked --workspace --all-targets --all-features -- -D warnings"

@@ -223,7 +223,7 @@ exception: a fresh event for it re-arms it.
 A late completion from a superseded attempt cannot reach GitHub at all: the
 store's job fence refuses the report before any check row moves.
 
-## Rerequests and lifecycle reconciliation (G05)
+## Rerequests and lifecycle reconciliation
 
 GitHub sends control events on the same signed webhook: `check_run` and
 `check_suite` `rerequested`, `installation` lifecycle, `installation_repositories`

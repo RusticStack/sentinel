@@ -1,0 +1,89 @@
+# The controller (`sentinel server`, docs/deployment.md). Installed as
+# /etc/systemd/system/sentinel-server.service beside examples/sentinel-web.service,
+# which orders itself after this unit.
+#
+#   useradd --system --home-dir /var/lib/sentinel --shell /usr/sbin/nologin sentinel
+#   install -d -o sentinel -g sentinel -m 0700 /var/lib/sentinel
+#   install -d -o root -g sentinel -m 0750 /etc/sentinel
+#   install -o root -g sentinel -m 0640 server.toml /etc/sentinel/server.toml
+#   # the binary comes from the release package: /opt/sentinel/bin/sentinel
+#
+# Files the controller reads as secrets (the GitHub App key, the sign-in client
+# secret, S3 and mail credentials) must be owned by `sentinel` with no group or
+# other access (mode 0600): the controller refuses anything else. Keep them in
+# a directory the service can read but, under ProtectSystem=strict, not change,
+# for example /etc/sentinel/credentials (owner sentinel, mode 0700). The master
+# key is created by `sentinel admin key create --data-dir /var/lib/sentinel`
+# (run as the sentinel user, with the service stopped); it lives at
+# /var/lib/sentinel/master.key because the controller reads it from there only.
+#
+# The worker is a separate unit and a separate account; its data directory
+# (/var/lib/sentinel-worker) is never this one.
+[Unit]
+Description=Sentinel controller
+Documentation=https://github.com/RusticStack/sentinel/blob/main/docs/deployment.md
+After=network-online.target
+Wants=network-online.target
+# An invalid configuration (exit status 2) is not retried; a crash loop stops
+# after five starts in five minutes instead of hammering the data directory.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=sentinel
+Group=sentinel
+ExecStart=/opt/sentinel/bin/sentinel server --config /etc/sentinel/server.toml --data-dir /var/lib/sentinel
+Restart=on-failure
+RestartSec=2s
+RestartPreventExitStatus=2
+# SIGTERM is a clean shutdown: sessions close in 2 s and the store drains in 5 s.
+TimeoutStopSec=30s
+
+# The controller's data directory: database, master key, logs, objects, TLS
+# identity. Created owner-only by systemd and survives a service removal.
+StateDirectory=sentinel
+StateDirectoryMode=0700
+UMask=0077
+
+# Resource limits: starting points for a single-host deployment, not measured
+# ceilings. Raise them with `systemctl edit sentinel-server` rather than here.
+MemoryMax=4G
+TasksMax=4096
+LimitNOFILE=65536
+LimitCORE=0
+
+# Sandbox. The controller needs the network and its own data directory, git on
+# the PATH for source resolution, and nothing else on the host.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateMounts=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+# AF_NETLINK is for the optional Tailcat helper's interface lookup.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# A [backup] dir or other writable location outside the data directory:
+#ReadWritePaths=/var/backups/sentinel
+
+[Install]
+WantedBy=multi-user.target

@@ -1,12 +1,12 @@
 # Retention and quotas
 
-Every byte Sentinel stores is bounded twice: by **size** (a quota, a budget or a watermark) and, for evidence, by **age** (a retention). This page is the whole map. Planned on top of it: a default tenant limit instead of unlimited, cache classes in tenant usage, soft/hard thresholds and notifications ([plan 16.3](../plan.md#163-default-tenant-storage-limits)), and artifact retention classes and pins ([plan 16.2](../plan.md#162-artifact-storage)). The disk admission gate, object reclamation and the orphan sweep it builds on are in [storage](storage.md#disk-admission-quotas-and-reclamation-d06).
+Every byte Sentinel stores is bounded twice: by **size** (a quota, a budget or a watermark) and, for evidence, by **age** (a retention). This page is the whole map. Planned on top of it: a default tenant limit instead of unlimited, cache classes in tenant usage, soft/hard thresholds and notifications ([plan 16.3](../plan.md#163-default-tenant-storage-limits)), and artifact retention classes and pins ([plan 16.2](../plan.md#162-artifact-storage)). The disk admission gate, object reclamation and the orphan sweep it builds on are in [storage](storage.md#disk-admission-quotas-and-reclamation).
 
 ## What is bounded, and by what
 
 | Kind | Where | Size bound | Age bound | Collected by |
 |---|---|---|---|---|
-| Artifacts | controller objects | run budget, repository quota, tenant quota, deployment cap | the pipeline's `retain`, shortened to the effective artifact retention | artifact sweep, then reference-safe reclaim ([storage](storage.md#disk-admission-quotas-and-reclamation-d06)) |
+| Artifacts | controller objects | run budget, repository quota, tenant quota, deployment cap | the pipeline's `retain`, shortened to the effective artifact retention | artifact sweep, then reference-safe reclaim ([storage](storage.md#disk-admission-quotas-and-reclamation)) |
 | Uploads | controller objects | tenant quota, deployment cap; 4 GiB per session | session TTL ≤ 24 h; aborted rows kept 7 days | upload sweep; aborted-row purge |
 | Attempt logs | controller `logs/` | `attempt_log_bytes` per attempt; counted in repository, tenant and deployment usage | the effective log retention | database-driven expiry, then the directory sweep |
 | External S3 copy ([s3](s3.md)) | the bucket | the backlog budget closes admission; `local_bytes` bounds local copies of replicated objects | follows the local record: deleted after reclamation or log expiry | the replicator |
@@ -15,7 +15,7 @@ Every byte Sentinel stores is bounded twice: by **size** (a quota, a budget or a
 | Git mirrors | worker `mirrors/` | `mirror_budget_bytes`, least recently written, leased mirrors skipped | 14 days idle | the mirror sweep, same cadence ([mirrors](mirrors.md)) |
 | Container images | worker image stores | `image_budget_bytes` per store, least recently pulled | — | the image sweep, at most every minute (below) |
 | Log spools | worker `spool/` | `spool_quota_bytes`, `spool_reserve_bytes` | until acknowledged | spool delivery ([logs](logs.md)) |
-| Everything on the controller disk | data file system | reserve, low/high watermarks, log floor | — | admission closes before the disk fills ([storage](storage.md#disk-admission-quotas-and-reclamation-d06)) |
+| Everything on the controller disk | data file system | reserve, low/high watermarks, log floor | — | admission closes before the disk fills ([storage](storage.md#disk-admission-quotas-and-reclamation)) |
 
 ## Policy at each level
 
@@ -32,7 +32,7 @@ Retention only narrows going down: a repository's effective retention is the sma
 
 **What counts.** A tenant's usage is its committed objects, the declared length of its open uploads, and its stamped log bytes. A repository's is the logical bytes of its captured artifacts (before the tenant-wide deduplication, which is the tenant's saving, not the repository's) and its logs. The deployment's is every tenant's.
 
-**What is refused.** An object or upload that would take a tenant past its quota, or the deployment past its cap, is `quota_exceeded` (403). An artifact whose repository is at its quota, or whose run is at `run_artifact_bytes`, is refused to the worker (`TooLarge`) when it begins, as the disk watermarks already did. The run budget is also charged file by file while the artifact streams (what other artifacts of the run hold counts, and a refused one gives its share back), and the repository quota is checked again in the commit transaction with the artifact's real size, so an artifact whose size the begin check could not know never takes a repository past its quota: it is refused `TooLarge`, its staged objects are discarded and a failed row records it. A failed artifact holds no bytes against the repository: its row carries zero bytes whatever it had staged before the refusal. **Logs are counted, never refused for quota**: a log is the evidence of what ran, and refusing it would hide a failure. They are bounded instead by `attempt_log_bytes` and their retention, and a disk below the log floor still refuses them ([storage](storage.md#disk-admission-quotas-and-reclamation-d06)).
+**What is refused.** An object or upload that would take a tenant past its quota, or the deployment past its cap, is `quota_exceeded` (403). An artifact whose repository is at its quota, or whose run is at `run_artifact_bytes`, is refused to the worker (`TooLarge`) when it begins, as the disk watermarks already did. The run budget is also charged file by file while the artifact streams (what other artifacts of the run hold counts, and a refused one gives its share back), and the repository quota is checked again in the commit transaction with the artifact's real size, so an artifact whose size the begin check could not know never takes a repository past its quota: it is refused `TooLarge`, its staged objects are discarded and a failed row records it. A failed artifact holds no bytes against the repository: its row carries zero bytes whatever it had staged before the refusal. **Logs are counted, never refused for quota**: a log is the evidence of what ran, and refusing it would hide a failure. They are bounded instead by `attempt_log_bytes` and their retention, and a disk below the log floor still refuses them ([storage](storage.md#disk-admission-quotas-and-reclamation)).
 
 ## Log expiry is decided in the database
 
@@ -85,7 +85,7 @@ The size is podman's per-image figure; layers shared between images count for ea
 
 ## Metadata housekeeping
 
-- Aborted upload sessions are deleted a week after they expired; committed ones stay, because they authorize reads of the object they produced ([storage](storage.md#resumable-uploads-reads-and-materialization-d02)).
+- Aborted upload sessions are deleted a week after they expired; committed ones stay, because they authorize reads of the object they produced ([storage](storage.md#resumable-uploads-reads-and-materialization)).
 - Run, job and attempt rows and the audit trails are kept: they are the record of what ran and who did what, the audit tables refuse deletes by trigger, and a run's rows are small beside its logs. Their growth is what the metadata reserve tracks.
 
 ## Operating it

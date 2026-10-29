@@ -1,0 +1,25 @@
+# A worker as a container: `podman compose -f compose.worker.yaml up -d`.
+# Build the image first (Containerfile.worker) and copy worker.toml next to
+# this file with `controller`, `controller_fingerprint` and the enrollment
+# settings filled in. Rootless Podman only: the worker runs jobs in containers
+# started by the Podman inside this one.
+#
+# `privileged` is the least that works in a rootless nested setup, and what it
+# means is spelled out in docs/deployment.md#container-examples: on rootless
+# Podman it grants capabilities inside the user namespace and the host
+# devices the invoking account can open, not root on the host. Where that is
+# not acceptable, run the worker from examples/sentinel-worker.service.
+name: sentinel-worker
+services:
+  worker:
+    image: localhost/sentinel-worker:${SENTINEL_VERSION:-0.1.0-dev}
+    command: ["worker", "--config", "/etc/sentinel/worker.toml", "--data-dir", "/var/lib/sentinel-worker"]
+    privileged: true
+    restart: on-failure
+    stop_grace_period: 60s
+    volumes:
+      # Podman's images and containers live below this, with the worker's state.
+      - data:/var/lib/sentinel-worker
+      - ./worker.toml:/etc/sentinel/worker.toml:ro
+volumes:
+  data:

@@ -12,3 +12,12 @@ publish = false
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+
+# Chosen by measurement on the reference host: docs/deployment.md#release-profile,
+# bench/v01-release-profile.jsonl. `panic` stays "unwind": the API acceptor, the
+# worker executor and the work lanes contain a panic with `catch_unwind`.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "debuginfo"

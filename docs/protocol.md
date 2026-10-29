@@ -21,7 +21,7 @@ Every error response is one JSON object with `schema: "sentinel.error/1"`, a sta
 | `internal` | 500 | yes | Server fault; `request_id` locates the log record |
 | `outcome_unknown` | 503 | no | The controller stopped waiting for a write that is still queued or running and **may yet commit** (the store's `WriteAmbiguous`). Repeating an unkeyed mutation can apply it twice: re-read first, or repeat with the same `Idempotency-Key` (`details.retry_with_idempotency_key: true`), which replays instead of executing again |
 | `upstream_failed` | 502 | no | A third party (GitHub) refused or failed a call the controller made for this request; its body is never echoed. A state or code spent before the call stays spent: start the flow again ([GitHub App](github-app.md#failure-modes-and-recovery)) |
-| `storage_full` | 507 | yes | Write refused below the disk watermarks ([storage](storage.md#disk-admission-quotas-and-reclamation-d06)); retry once the controller has headroom |
+| `storage_full` | 507 | yes | Write refused below the disk watermarks ([storage](storage.md#disk-admission-quotas-and-reclamation)); retry once the controller has headroom |
 | `quota_exceeded` | 403 | no | The tenant reached its storage quota; reclaim space or raise it |
 
 `message` and `details` never echo request payloads, secrets or parser fragments.

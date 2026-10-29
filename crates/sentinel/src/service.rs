@@ -528,6 +528,33 @@ struct MicrovmSetup {
     agent: PathBuf,
 }
 
+impl MicrovmSetup {
+    /// `ready`, or `unavailable: <every missing piece>`, for `--check`.
+    fn status(&self) -> String {
+        #[cfg(all(feature = "worker", target_os = "linux"))]
+        {
+            let setup = sentinel_worker::microvm::Setup {
+                firecracker: self.firecracker.clone(),
+                kernel: self.kernel.clone(),
+                agent: self.agent.clone(),
+            };
+            let (virtualization, absent) = sentinel_worker::host::detect();
+            match (setup.check(), virtualization.kvm) {
+                (Ok(()), true) => "ready".to_owned(),
+                (Ok(()), false) => format!(
+                    "unavailable: no usable /dev/kvm ({})",
+                    absent.map_or_else(|| "reason unknown".to_owned(), |a| a.0)
+                ),
+                (Err(why), _) => format!("unavailable: {why}"),
+            }
+        }
+        #[cfg(not(all(feature = "worker", target_os = "linux")))]
+        {
+            "unavailable: microVMs need a Linux worker".to_owned()
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum NetworkSetting {
     None,
@@ -1124,12 +1151,19 @@ impl Config {
                 text
             }
             Role::Worker(None) => "controller=none (idle)".to_owned(),
-            Role::Worker(Some(link)) => format!(
-                "controller={} controller_fingerprint={} worker_name={}",
-                link.controller,
-                hex32(&link.fingerprint),
-                link.name
-            ),
+            Role::Worker(Some(link)) => {
+                let mut text = format!(
+                    "controller={} controller_fingerprint={} worker_name={}",
+                    link.controller,
+                    hex32(&link.fingerprint),
+                    link.name
+                );
+                if let Some(microvm) = &link.microvm {
+                    text.push_str(" microvm=");
+                    text.push_str(&microvm.status());
+                }
+                text
+            }
         }
     }
 }

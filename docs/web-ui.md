@@ -129,7 +129,7 @@ Three hops each see a different peer: the browser reaches the reverse proxy, the
 - **Behind a proxy you control:** set `SENTINEL_CLIENT_IP_HEADER` to the header that proxy sets, with the proxy overwriting or appending to it so its own entry is last (`x-forwarded-for`, or a single-valued `x-real-ip`). Only the last entry is used, and only when it is a valid address; otherwise the peer is used. Bind `sentinel-web` to loopback or a private interface that only the proxy reaches, because a client that reached it directly could set the header itself.
 - A client's own `X-Forwarded-For`, `X-Real-IP`, `Forwarded` and `X-Forwarded-Host/Proto` never reach the controller.
 
-The reverse proxy terminates TLS and sends everything for the public origin to `sentinel-web`; the controller's `public_url` is that origin ([configuration](configuration.md)). [`examples/sentinel-web.service`](../examples/sentinel-web.service) is a systemd unit.
+The reverse proxy terminates TLS and sends everything for the public origin to `sentinel-web`; the controller's `public_url` is that origin ([configuration](configuration.md)). [`examples/sentinel-web.service`](../examples/sentinel-web.service) is a systemd unit, ordered after the controller's [`sentinel-server.service`](../examples/sentinel-server.service) ([deployment](deployment.md#the-controller-as-a-systemd-service)). Verified nginx and Caddy configurations for this layout, with `trusted_proxies`, are in [deployment](deployment.md#tls-and-a-reverse-proxy).
 
 ## Stack choice
 

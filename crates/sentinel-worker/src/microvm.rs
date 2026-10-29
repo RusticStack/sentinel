@@ -59,24 +59,36 @@ pub struct Setup {
 }
 
 impl Setup {
-    /// Whether this setup can run a VM, as text for `runtime_selected`.
+    /// Whether this setup can run a VM, as text for `runtime_selected` and `worker --check`.
+    /// Names every missing piece at once, so one look at the message finishes the install.
     pub fn check(&self) -> std::result::Result<(), String> {
         let executable = |p: &Path| {
             fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         };
+        let mut missing = Vec::new();
         if !executable(&self.firecracker) {
-            return Err(format!(
-                "{}: not an executable file",
+            missing.push(format!(
+                "firecracker {}: not an executable file",
                 self.firecracker.display()
             ));
         }
         if !fs::metadata(&self.kernel).is_ok_and(|m| m.is_file()) {
-            return Err(format!("{}: no guest kernel", self.kernel.display()));
+            missing.push(format!("{}: no guest kernel", self.kernel.display()));
         }
         if !executable(&self.agent) {
-            return Err(format!("{}: not an executable file", self.agent.display()));
+            missing.push(format!(
+                "agent {}: not an executable file",
+                self.agent.display()
+            ));
         }
-        Ok(())
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} (the x86_64 worker package installs all three: docs/releasing.md#microvm-assets)",
+                missing.join("; ")
+            ))
+        }
     }
 }
 
@@ -909,6 +921,34 @@ pub fn owned(root: &Path) -> Vec<AttemptId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_names_every_missing_piece_and_passes_when_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let put = |name: &str, mode: u32| {
+            let path = dir.path().join(name);
+            fs::write(&path, b"x").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let setup = Setup {
+            firecracker: dir.path().join("firecracker"),
+            kernel: dir.path().join("vmlinux"),
+            agent: dir.path().join("sentinel-agent"),
+        };
+        let error = setup.check().unwrap_err();
+        assert!(error.contains("firecracker "), "{error}");
+        assert!(error.contains("no guest kernel"), "{error}");
+        assert!(error.contains("agent "), "{error}");
+        put("firecracker", 0o755);
+        put("vmlinux", 0o644);
+        put("sentinel-agent", 0o644);
+        let error = setup.check().unwrap_err();
+        assert!(!error.contains("firecracker "), "{error}");
+        assert!(!error.contains("no guest kernel"), "{error}");
+        assert!(error.contains("agent "), "{error}");
+        put("sentinel-agent", 0o755);
+        assert_eq!(setup.check(), Ok(()));
+    }
 
     #[test]
     fn cpio_records_are_newc_and_four_byte_aligned() {
