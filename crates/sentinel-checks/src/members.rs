@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sentinel_core::UnixMillis;
@@ -25,9 +25,14 @@ use sentinel_store::{
 const TOKEN_MARGIN_MS: i64 = 120_000;
 const MAX_CACHED: usize = 1024;
 const MAX_PAUSE_MS: i64 = 60 * 60 * 1000;
+/// The shortest gap between two reads of the queue: a commit wakes an idle lane, but a busy store must not
+/// turn that into a read per commit.
+const COMMIT_GAP: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
+    /// The longest an idle lane sleeps. It wakes earlier for a commit or when the next row falls due, so this
+    /// is only the net for a write the commit notifier cannot see.
     pub idle: Duration,
     pub min_backoff: Duration,
     pub max_backoff: Duration,
@@ -37,7 +42,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            idle: Duration::from_millis(250),
+            idle: Duration::from_secs(2),
             min_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
             timing: Timing {
@@ -57,6 +62,7 @@ pub struct Notice {
 }
 
 pub struct Members {
+    store: Arc<Store>,
     stop: Arc<AtomicBool>,
     settled: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     thread: Option<thread::JoinHandle<()>>,
@@ -71,6 +77,7 @@ impl Members {
     ) -> Members {
         let stop = Arc::new(AtomicBool::new(false));
         let settled = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let handle = Arc::clone(&store);
         let thread = {
             let (stop, settled) = (Arc::clone(&stop), Arc::clone(&settled));
             thread::Builder::new()
@@ -87,6 +94,7 @@ impl Members {
                 .expect("spawn github members lane")
         };
         Members {
+            store: handle,
             stop,
             settled,
             thread: Some(thread),
@@ -100,6 +108,7 @@ impl Drop for Members {
         let (lock, cv) = &*self.settled;
         *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
         cv.notify_all();
+        self.store.changes().nudge();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -141,7 +150,13 @@ fn run(
         failures = failures.saturating_add(1);
         wait(settled, backoff(config, failures));
     }
-    while !stop.load(Ordering::Acquire) {
+    loop {
+        // Read before the stop flag: a drop that lands in between has already moved the generation.
+        let seen = worker.store.changes().generation();
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let polled = Instant::now();
         let due = match worker
             .store
             .read(|c| github_members::due(c, UnixMillis::now()))
@@ -155,7 +170,7 @@ fn run(
         };
         let Some(check) = due else {
             failures = 0;
-            wait(settled, config.idle);
+            sleep_until_work(&worker.store, config, settled, seen, polled);
             continue;
         };
         let outcome = worker.pass(&check, config.timing);
@@ -182,6 +197,20 @@ impl Worker {
                     .store
                     .writer()
                     .write(move |tx| github_members::no_target(tx, &check, timing, now))
+                {
+                    Ok(outcome) => outcome.into(),
+                    Err(_) => STORE.into(),
+                };
+            }
+            // The stored target of this pair cannot be read (a damaged binding, a malformed id). That says
+            // nothing about the person, so access is left as it is and the row only waits, instead of
+            // sitting at the head of the queue and holding back every other tenant's check.
+            Err(error) if error.is_row_specific() => {
+                let (check, now) = (*check, UnixMillis::now());
+                return match self
+                    .store
+                    .writer()
+                    .write(move |tx| github_members::park(tx, &check, now))
                 {
                     Ok(outcome) => outcome.into(),
                     Err(_) => STORE.into(),
@@ -427,6 +456,28 @@ impl Worker {
             );
         }
         self.sessions.get(&target.installation).ok_or(None)
+    }
+}
+
+/// Sleeps until a commit may have queued work or the earliest row falls due, never longer than `config.idle`.
+fn sleep_until_work(
+    store: &Store,
+    config: &Config,
+    settled: &(std::sync::Mutex<bool>, std::sync::Condvar),
+    seen: u64,
+    polled: Instant,
+) {
+    let ceiling = polled + config.idle;
+    let deadline = match store.read(github_members::next_due_ms) {
+        Ok(Some(due_ms)) => {
+            let wait_ms = due_ms.saturating_sub(UnixMillis::now().0).max(0) as u64;
+            (polled + Duration::from_millis(wait_ms)).min(ceiling)
+        }
+        _ => ceiling,
+    };
+    store.changes().wait_past(seen, deadline);
+    if let Some(rest) = COMMIT_GAP.min(config.idle).checked_sub(polled.elapsed()) {
+        wait(settled, rest);
     }
 }
 

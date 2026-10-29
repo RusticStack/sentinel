@@ -14,6 +14,11 @@ use sentinel_store::{Error as StoreError, Store, checks};
 const QUARANTINE_AFTER: u32 = 3;
 const QUARANTINE_MS: i64 = checks::MAX_DEFER_MS;
 const MAX_TRACKED: usize = 1024;
+/// Rows that could not even be parked durably are left out of the batch in memory for a while, and the lane
+/// remembers at most this many. The due read asks for that many extra rows, so they cannot crowd out the
+/// healthy ones behind them.
+const SKIP_FOR: Duration = Duration::from_secs(60);
+const MAX_SKIPPED: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Publish {
@@ -50,6 +55,15 @@ pub struct Batch {
     pub retried: usize,
     pub refused: usize,
     pub paused_until_ms: Option<i64>,
+    /// Rows whose store writes kept failing and that were set aside (parked for an hour, or skipped in memory
+    /// when even parking failed).
+    pub quarantined: usize,
+    /// Rows that could not be decoded and were parked by their raw key.
+    pub corrupt_parked: usize,
+    /// The store began failing: reported once, not on every back-off round.
+    pub store_unavailable: bool,
+    /// The store answered again after a failure.
+    pub store_recovered: bool,
     pub entries: Vec<Notice>,
 }
 
@@ -128,11 +142,19 @@ enum Fault {
     Moved,
     Down,
     Quarantined,
+    /// Parking the row failed too; it is left out of the batch in memory instead.
+    Skipped,
+}
+
+#[derive(Default)]
+struct Poison {
+    strikes: HashMap<CheckId, u32>,
+    skipped: HashMap<CheckId, Instant>,
 }
 
 fn store_fault(
     store: &Store,
-    poison: &mut HashMap<CheckId, u32>,
+    poison: &mut Poison,
     id: CheckId,
     seq: i64,
     error: &StoreError,
@@ -149,22 +171,50 @@ fn store_fault(
         | StoreError::WriterPanicked => {}
         _ => return Fault::Down,
     }
-    if poison.len() >= MAX_TRACKED && !poison.contains_key(&id) {
-        poison.clear();
+    if poison.strikes.len() >= MAX_TRACKED && !poison.strikes.contains_key(&id) {
+        poison.strikes.clear();
     }
-    let count = poison.entry(id).or_insert(0);
+    let count = poison.strikes.entry(id).or_insert(0);
     *count += 1;
     if *count < QUARANTINE_AFTER {
         return Fault::Down;
     }
-    poison.remove(&id);
+    poison.strikes.remove(&id);
     let now = UnixMillis::now();
     match store
         .writer()
         .write(move |tx| checks::defer(tx, id, seq, now, now.0.saturating_add(QUARANTINE_MS)))
     {
         Ok(_) => Fault::Quarantined,
+        // The store is busy or gone, which says nothing about this row.
+        Err(error) if error.is_transient() => Fault::Down,
+        // A row that rejects even the write that parks it would stay at the head of the queue and be
+        // retried before every healthy row. Leave it out of the batch in memory instead.
+        Err(_) if poison.skipped.len() < MAX_SKIPPED || poison.skipped.contains_key(&id) => {
+            poison.skipped.insert(id, Instant::now() + SKIP_FOR);
+            Fault::Skipped
+        }
         Err(_) => Fault::Down,
+    }
+}
+
+/// The store began failing: say so once, however many back-off rounds follow.
+fn store_failed(failures: &mut u32, notice: &(dyn Fn(&Batch) + Send + Sync)) {
+    *failures = failures.saturating_add(1);
+    if *failures == 1 {
+        notice(&Batch {
+            store_unavailable: true,
+            ..Batch::default()
+        });
+    }
+}
+
+fn store_recovered(failures: &mut u32, notice: &(dyn Fn(&Batch) + Send + Sync)) {
+    if std::mem::take(failures) > 0 {
+        notice(&Batch {
+            store_recovered: true,
+            ..Batch::default()
+        });
     }
 }
 
@@ -187,7 +237,7 @@ fn run(
     let mut next_rearm = Instant::now() + config.rearm_interval;
     let mut failures: u32 = 0;
     let mut parked: HashMap<u64, i64> = HashMap::new();
-    let mut poison: HashMap<CheckId, u32> = HashMap::new();
+    let mut poison = Poison::default();
     loop {
         let seen = store.changes().generation();
         if stop.load(Ordering::Acquire) {
@@ -199,21 +249,32 @@ fn run(
             rearm(store);
             next_rearm = Instant::now() + config.rearm_interval;
         }
-        let due = match store.read(|c| checks::due(c, UnixMillis::now(), config.batch)) {
+        poison.skipped.retain(|_, until| *until > polled);
+        let limit = config
+            .batch
+            .saturating_add(u16::try_from(poison.skipped.len()).unwrap_or(u16::MAX));
+        let due = match store.read(|c| checks::due(c, UnixMillis::now(), limit)) {
             Ok(due) => due,
             Err(_) => {
-                failures = failures.saturating_add(1);
+                store_failed(&mut failures, notice);
                 wait(settled, backoff(config, failures));
                 continue;
             }
         };
         let checks::Due {
-            publications: due,
+            publications: mut due,
             corrupt,
         } = due;
+        let fetched = due.len();
+        if !poison.skipped.is_empty() {
+            due.retain(|publication| !poison.skipped.contains_key(&publication.id));
+        }
+        let hidden = due.len() != fetched;
+        let mut corrupt_parked = 0;
         if !corrupt.is_empty() {
             let now = UnixMillis::now();
             let until = now.0.saturating_add(QUARANTINE_MS);
+            let count = corrupt.len();
             if store
                 .writer()
                 .write(move |tx| {
@@ -224,14 +285,26 @@ fn run(
                 })
                 .is_err()
             {
-                failures = failures.saturating_add(1);
+                store_failed(&mut failures, notice);
                 wait(settled, backoff(config, failures));
                 continue;
             }
+            corrupt_parked = count;
         }
         if due.is_empty() {
-            failures = 0;
-            let deadline = wake_at(store, config, polled, next_rearm);
+            store_recovered(&mut failures, notice);
+            if corrupt_parked > 0 {
+                notice(&Batch {
+                    corrupt_parked,
+                    ..Batch::default()
+                });
+            }
+            // Rows held back in memory are still due in the store, so they must not shorten the sleep.
+            let deadline = if hidden {
+                (polled + config.idle).min(next_rearm)
+            } else {
+                wake_at(store, config, polled, next_rearm)
+            };
             store.changes().wait_past(seen, deadline);
             if let Some(rest) = COMMIT_GAP.min(config.idle).checked_sub(polled.elapsed()) {
                 wait(settled, rest);
@@ -240,9 +313,12 @@ fn run(
         }
         let pass_start = UnixMillis::now();
         parked.retain(|_, until| *until > pass_start.0);
-        let mut batch = Batch::default();
+        let mut batch = Batch {
+            corrupt_parked,
+            ..Batch::default()
+        };
         let mut pause_until: Option<i64> = None;
-        let mut store_failed = false;
+        let mut write_failed = false;
         let mut skipped: Vec<(CheckId, i64, i64)> = Vec::new();
         for publication in due {
             if stop.load(Ordering::Acquire) {
@@ -314,26 +390,35 @@ fn run(
             };
             match outcome {
                 Ok(outcome) => {
-                    poison.remove(&id);
+                    poison.strikes.remove(&id);
                     batch.entries.push(Notice { id, name, outcome });
                 }
                 Err(error) => match store_fault(store, &mut poison, id, seq, &error) {
                     Fault::Moved => {}
                     Fault::Quarantined => {
+                        batch.quarantined += 1;
                         batch.entries.push(Notice {
                             id,
                             name,
                             outcome: "quarantined: store writes kept failing".into(),
                         });
                     }
+                    Fault::Skipped => {
+                        batch.quarantined += 1;
+                        batch.entries.push(Notice {
+                            id,
+                            name,
+                            outcome: "quarantined: row cannot be written, skipped for now".into(),
+                        });
+                    }
                     Fault::Down => {
-                        store_failed = true;
+                        write_failed = true;
                         break;
                     }
                 },
             }
         }
-        if !skipped.is_empty() && !store_failed {
+        if !skipped.is_empty() && !write_failed {
             let now = UnixMillis::now();
             if store
                 .writer()
@@ -345,17 +430,17 @@ fn run(
                 })
                 .is_err()
             {
-                store_failed = true;
+                write_failed = true;
             }
         }
-        if store_failed {
-            failures = failures.saturating_add(1);
+        if write_failed {
+            store_failed(&mut failures, notice);
             wait(settled, backoff(config, failures));
             continue;
         }
-        failures = 0;
+        store_recovered(&mut failures, notice);
         batch.paused_until_ms = pause_until;
-        if !batch.entries.is_empty() || pause_until.is_some() {
+        if !batch.entries.is_empty() || pause_until.is_some() || batch.corrupt_parked > 0 {
             notice(&batch);
         }
     }
@@ -413,7 +498,7 @@ mod tests {
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
             None,
         ));
-        let mut poison = HashMap::new();
+        let mut poison = Poison::default();
         let id = CheckId::new();
         for _ in 0..=QUARANTINE_AFTER {
             assert!(matches!(
@@ -421,6 +506,7 @@ mod tests {
                 Fault::Down
             ));
         }
-        assert!(poison.is_empty());
+        assert!(poison.strikes.is_empty());
+        assert!(poison.skipped.is_empty());
     }
 }

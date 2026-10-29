@@ -1585,7 +1585,15 @@ impl GithubLanes {
             members,
             move |notice| {
                 tracing::dispatcher::with_default(&members_dispatch, || {
-                    tracing::info!(event = "github_members_checked", outcome = %notice.outcome);
+                    if notice.outcome.starts_with("parked") {
+                        tracing::warn!(
+                            event = "github_members_parked",
+                            outcome = %notice.outcome,
+                            "a membership check could not read its stored target"
+                        );
+                    } else {
+                        tracing::info!(event = "github_members_checked", outcome = %notice.outcome);
+                    }
                 });
             },
         ));
@@ -1607,6 +1615,29 @@ impl GithubLanes {
                     }
                     if let Some(until) = batch.paused_until_ms {
                         tracing::warn!(event = "checks_paused", until_ms = until);
+                    }
+                    if batch.quarantined > 0 {
+                        tracing::warn!(
+                            event = "checks_quarantined",
+                            rows = batch.quarantined,
+                            "rows whose store writes kept failing were set aside"
+                        );
+                    }
+                    if batch.corrupt_parked > 0 {
+                        tracing::warn!(
+                            event = "checks_corrupt_parked",
+                            rows = batch.corrupt_parked,
+                            "rows that could not be decoded were parked"
+                        );
+                    }
+                    if batch.store_unavailable {
+                        tracing::warn!(
+                            event = "checks_store_unavailable",
+                            "the checks lane cannot use the store; retrying under back-off"
+                        );
+                    }
+                    if batch.store_recovered {
+                        tracing::info!(event = "checks_store_recovered");
                     }
                     for entry in &batch.entries {
                         tracing::info!(

@@ -13,7 +13,7 @@ use sentinel_checks::{
     lane::{Batch, Config, Publish, Publisher},
 };
 use sentinel_core::{
-    RepoId, RunId, TenantId, UnixMillis, UserId,
+    CheckId, RepoId, RunId, TenantId, UnixMillis, UserId,
     auth::{Namespace, Permissions, Principal},
 };
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
@@ -343,6 +343,27 @@ fn start_with(f: &Fixture, publisher: impl Publisher + 'static) -> Lane {
     )
 }
 
+fn start_noticed(
+    f: &Fixture,
+    publisher: impl Publisher + 'static,
+) -> (Lane, mpsc::Receiver<Batch>) {
+    let (tx, rx) = mpsc::channel();
+    let lane = Lane::start(
+        Arc::clone(&f.store),
+        Box::new(publisher),
+        Config {
+            idle: Duration::from_millis(20),
+            min_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(40),
+            ..Config::default()
+        },
+        move |batch| {
+            let _ = tx.send(batch.clone());
+        },
+    );
+    (lane, rx)
+}
+
 fn wait_for(f: &Fixture, run: RunId, what: &str, done: impl Fn(&[checks::Publication]) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -459,7 +480,7 @@ fn a_row_whose_store_writes_keep_failing_cannot_block_the_lane() {
     let f = fixture();
     let run = event_run(&f);
     poison_aggregate(&f);
-    let lane = start_with(&f, Deliver);
+    let (lane, batches) = start_noticed(&f, Deliver);
     wait_for(&f, run, "the healthy rows deliver", |rows| {
         rows.iter()
             .filter(|r| !is_aggregate(r))
@@ -478,6 +499,94 @@ fn a_row_whose_store_writes_keep_failing_cannot_block_the_lane() {
     let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
     let aggregate = rows.iter().find(|r| is_aggregate(r)).unwrap();
     assert_eq!(aggregate.state, State::Pending, "the poison row waits");
+
+    // The lane says what it did: the store failing, the row set aside, the store answering again.
+    let reported: Vec<Batch> = batches.try_iter().collect();
+    assert!(
+        reported.iter().any(|b| b.store_unavailable),
+        "the first failed write is reported: {reported:?}"
+    );
+    assert_eq!(
+        reported.iter().map(|b| b.quarantined).sum::<usize>(),
+        1,
+        "{reported:?}"
+    );
+    assert!(
+        reported.iter().any(|b| b.store_recovered),
+        "recovery is reported: {reported:?}"
+    );
+}
+
+const LOCKED_SCOPE: &str = "locked";
+
+/// The oldest row in the table, with a scope of its own so a trigger can single it out.
+fn insert_oldest_row(f: &Fixture, run: RunId, id: rusqlite::types::Value, scope: &'static str) {
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO check_publications(id, tenant_id, repo_id, run_id, scope, name,
+                    head_sha, external_id, status, conclusion, title, summary, seq,
+                    published_seq, state, created_ms, updated_ms)
+                 SELECT ?1, tenant_id, repo_id, run_id, ?3, name, head_sha,
+                    'sentinel:oldest', status, conclusion, title, summary, 1, 0, 0, -1, updated_ms
+                 FROM check_publications WHERE run_id = ?2 ORDER BY id LIMIT 1",
+                rusqlite::params![id, run.as_bytes(), scope],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_row_that_rejects_even_the_write_that_parks_it_does_not_hold_back_the_healthy_rows() {
+    let f = fixture();
+    let run = event_run(&f);
+    let raw = *CheckId::new().as_bytes();
+    insert_oldest_row(
+        &f,
+        run,
+        rusqlite::types::Value::Blob(raw.to_vec()),
+        LOCKED_SCOPE,
+    );
+    f.store
+        .writer()
+        .write(|tx| {
+            // Every update of that row fails, the parking one included.
+            tx.execute_batch(
+                "CREATE TRIGGER locked BEFORE UPDATE ON check_publications
+                 WHEN OLD.scope = 'locked'
+                 BEGIN SELECT RAISE(ABORT, 'locked'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (lane, batches) = start_noticed(&f, Deliver);
+    wait_for(&f, run, "the healthy rows deliver", |rows| {
+        !rows.is_empty()
+            && rows
+                .iter()
+                .filter(|r| r.scope != LOCKED_SCOPE)
+                .all(|r| r.state == State::Published)
+    });
+    drop(lane);
+    let (state, next): (i64, Option<i64>) = f
+        .store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT state, next_attempt_ms FROM check_publications WHERE id = ?1",
+                [raw],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(state, 0, "the row is untouched");
+    assert_eq!(next, None, "nothing could be written to it");
+    let reported: Vec<Batch> = batches.try_iter().collect();
+    assert!(
+        reported.iter().any(|b| b.quarantined > 0),
+        "the row set aside is reported: {reported:?}"
+    );
 }
 
 #[test]
@@ -510,7 +619,7 @@ fn a_malformed_oldest_row_is_parked_and_later_checks_publish() {
             )?)
         })
         .unwrap();
-    let lane = start_with(&f, Deliver);
+    let (lane, batches) = start_noticed(&f, Deliver);
     let deadline = Instant::now() + Duration::from_secs(20);
     let parked = loop {
         let (published, parked) = f
@@ -543,6 +652,65 @@ fn a_malformed_oldest_row_is_parked_and_later_checks_publish() {
     };
     drop(lane);
     assert!(parked > UnixMillis::now().0 + 30 * 60 * 1000, "{parked}");
+    let reported: usize = batches.try_iter().map(|b| b.corrupt_parked).sum();
+    assert_eq!(reported, 1, "the parked row is reported");
+}
+
+#[test]
+fn a_row_whose_key_is_stored_as_text_is_parked_and_later_checks_publish() {
+    let f = fixture();
+    let run = event_run(&f);
+    // Sixteen characters satisfy `length(id) = 16`, but the key is TEXT, not the 16-byte blob every typed read
+    // expects.
+    let key = "0123456789abcdef";
+    insert_oldest_row(
+        &f,
+        run,
+        rusqlite::types::Value::Text(key.to_owned()),
+        "text-key",
+    );
+    let (lane, batches) = start_noticed(&f, Deliver);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let parked = loop {
+        let (published, total, parked) = f
+            .store
+            .read(move |c| {
+                let published = c.query_row(
+                    "SELECT COUNT(*) FROM check_publications
+                     WHERE run_id = ?1 AND scope != 'text-key' AND state = 1",
+                    [run.as_bytes()],
+                    |r| r.get::<_, i64>(0),
+                )?;
+                let total = c.query_row(
+                    "SELECT COUNT(*) FROM check_publications
+                     WHERE run_id = ?1 AND scope != 'text-key'",
+                    [run.as_bytes()],
+                    |r| r.get::<_, i64>(0),
+                )?;
+                let parked = c.query_row(
+                    "SELECT next_attempt_ms FROM check_publications WHERE id = ?1",
+                    [key],
+                    |r| r.get::<_, Option<i64>>(0),
+                )?;
+                Ok((published, total, parked))
+            })
+            .unwrap();
+        if total > 0
+            && published == total
+            && let Some(parked) = parked
+        {
+            break parked;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "healthy rows published {published}/{total}; text-key row parked at {parked:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(lane);
+    assert!(parked > UnixMillis::now().0 + 30 * 60 * 1000, "{parked}");
+    let reported: usize = batches.try_iter().map(|b| b.corrupt_parked).sum();
+    assert_eq!(reported, 1, "the parked row is reported");
 }
 
 struct Deliver;
