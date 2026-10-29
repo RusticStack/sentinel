@@ -484,9 +484,29 @@ pub fn run(
                 .iter()
                 .flat_map(|a| a.paths.iter().cloned())
                 .collect();
-            if let Err(e) = prepared.sandbox.sync_out(prepared.workspace.path(), &paths) {
-                summary.detail = format!("copying results out of the microVM: {e}");
-            }
+            // The cache views declared by a relative path live in the workspace: a VM works on a copy, so they
+            // are brought back whole before publication reads them.
+            let views: Vec<String> = job
+                .caches
+                .iter()
+                .flat_map(|attached| attached.targets.iter())
+                .filter(|target| !target.mount)
+                .filter_map(|target| target.dir.strip_prefix(&target.root).ok())
+                .filter(|rel| !rel.as_os_str().is_empty())
+                .filter_map(|rel| rel.to_str().map(str::to_owned))
+                .collect();
+            // A cache sealed from a view that could not be brought back would hold a truncated tree, so
+            // none is published then.
+            let synced = match prepared
+                .sandbox
+                .sync_out(prepared.workspace.path(), &paths, &views)
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    summary.detail = format!("copying results out of the microVM: {e}");
+                    false
+                }
+            };
             let artifact_failure = capture_artifacts(
                 job.attempt,
                 prepared.workspace.path(),
@@ -494,7 +514,7 @@ pub fn run(
                 matches!(verdict, Verdict::Passed),
                 sink,
             );
-            sealed = finalize(root, job, &verdict, report, prepared, cancel);
+            sealed = finalize(root, job, &verdict, synced, report, prepared, cancel);
             let published = output.complete();
             if published {
                 recovery::mark_ended(root, job.attempt);
@@ -993,7 +1013,22 @@ fn execute(
                 continue;
             }
             match materialize_step_secrets(directory, &job.secret_bundle, index) {
-                Ok(paths) => Some(paths),
+                // A VM has file systems of its own: the step's secrets go in now and come out after it.
+                Ok(paths) => match container.deliver_secrets(&[
+                    (&directory.files_dir, SECRET_FILES_MOUNT),
+                    (&directory.env_dir, SECRET_ENV_MOUNT),
+                ]) {
+                    Ok(()) => Some(paths),
+                    Err(_) => {
+                        let _ = container.retract_secrets();
+                        summary.steps.push(record);
+                        failure = Some((
+                            FailureClass::Preparation,
+                            format!("step {index} secret delivery failed"),
+                        ));
+                        continue;
+                    }
+                },
                 Err(_) => {
                     summary.steps.push(record);
                     failure = Some((
@@ -1022,9 +1057,15 @@ fn execute(
         } else {
             Ok(())
         };
+        // Taken out of the guest even when the step timed out; a canceled attempt's VM is going anyway.
+        let retracted = if secret_step && !cancel.load(Ordering::Acquire) {
+            container.retract_secrets()
+        } else {
+            Ok(())
+        };
         drop(step_secrets);
         output.step_done(index as u32);
-        let exit = match exec.and_then(|exit| cleared.map(|()| exit)) {
+        let exit = match exec.and_then(|exit| cleared.and(retracted).map(|()| exit)) {
             Ok(exit) => exit,
             Err(e) => {
                 record.outcome = StepOutcome::Runtime;
@@ -1263,6 +1304,7 @@ fn finalize(
     root: &Path,
     job: &mut Job,
     verdict: &Verdict,
+    synced: bool,
     report: &dyn Report,
     prepared: PreparedExecution,
     cancel: &Cancel,
@@ -1275,7 +1317,7 @@ fn finalize(
     // Stop the sandbox first: no job process may rewrite the views publication reads.
     let _ = sandbox.destroy();
     drop(secret_directory);
-    let sealed = if cache_worthy(verdict) {
+    let sealed = if synced && cache_worthy(verdict) {
         publish_caches(root, job, report, cancel)
     } else {
         Vec::new()

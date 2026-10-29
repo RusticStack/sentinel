@@ -70,6 +70,23 @@ fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
     }
 }
 
+/// As [`eventually`], with a description of what was left when the wait gives up.
+fn eventually_described(
+    what: &str,
+    mut predicate: impl FnMut() -> bool,
+    describe: impl Fn() -> String,
+) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !predicate() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}: {}",
+            describe()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 struct Api {
     base: String,
     token: String,
@@ -405,14 +422,30 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
         "{list}"
     );
 
+    // This worker negotiates a link without cancel push, so a cancel reaches it with the next heartbeat. The
+    // hold lasts until a cancel arrives, so it only has to outlast one heartbeat for the cancel to find the
+    // attempt still preparing, however long the executor takes to start a sandbox.
+    executor.set_prepare_hold(sentinel_link::session::HEARTBEAT_INTERVAL + Duration::from_secs(5));
     let held = api.dispatch(&pipeline("held", "echo never"), &repo, &sha);
     let held_id = held["id"].as_str().unwrap().to_owned();
     eventually("held preparing", || {
         api.job(&held_id, "held")["state"] == "preparing"
     });
+    executor.set_prepare_hold(Duration::from_secs(3));
     let (status, body) = api.call("POST", &format!("/api/v1/runs/{held_id}/cancel"), None);
     assert_eq!(status, 200, "{body}");
-    eventually("held canceled", || api.run(&held_id)["state"] == "canceled");
+    eventually_described(
+        "held canceled",
+        || api.run(&held_id)["state"] == "canceled",
+        || {
+            format!(
+                "run={} job={} notices={:?}",
+                api.run(&held_id),
+                api.job(&held_id, "held"),
+                notices.lock().unwrap()
+            )
+        },
+    );
     let held_job = api.job(&held_id, "held");
     assert_eq!(held_job["failure_class"], "canceled");
     let held_attempt = held_job["attempt"].as_str().unwrap();

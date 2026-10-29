@@ -112,6 +112,8 @@ struct Awaiting {
     since: Instant,
     asked: Instant,
     declining: bool,
+    /// A cancel arrived before the spec did: the attempt starts canceled.
+    canceled: bool,
     secrets: Vec<sentinel_protocol::secrets::SecretBytes>,
 }
 
@@ -325,6 +327,8 @@ struct State {
     reporter: Option<Reporter>,
     unconfirmed: HashMap<AttemptId, Unconfirmed>,
     awaiting: HashMap<AttemptId, Awaiting>,
+    /// Attempts whose spec arrived and whose live entry is not made yet, with whether a cancel came meanwhile.
+    starting: HashMap<AttemptId, bool>,
     live: HashMap<AttemptId, Live>,
     pending: Vec<(AttemptId, Fence, Event, Option<Vec<u8>>)>,
     lease_deadline: Option<Instant>,
@@ -552,6 +556,7 @@ impl Executor {
                 reporter: None,
                 unconfirmed: HashMap::new(),
                 awaiting: HashMap::new(),
+                starting: HashMap::new(),
                 live: HashMap::new(),
                 pending: Vec::new(),
                 lease_deadline: None,
@@ -713,7 +718,10 @@ impl Executor {
             if state.awaiting.get(&attempt).is_none_or(|w| w.declining) {
                 return;
             }
-            state.awaiting.remove(&attempt).expect("checked present")
+            let waiting = state.awaiting.remove(&attempt).expect("checked present");
+            // In one step with the removal, so a cancel never finds the attempt in neither place.
+            state.starting.insert(attempt, waiting.canceled);
+            waiting
         };
         let offer = waiting.offer;
         let job_index = offer.job_index as usize;
@@ -729,12 +737,15 @@ impl Executor {
                     secret_bundle,
                 );
             }
-            _ => self.send(
-                attempt,
-                offer.fence,
-                Event::Failed(sentinel_core::FailureClass::Preparation),
-                None,
-            ),
+            _ => {
+                self.state().starting.remove(&attempt);
+                self.send(
+                    attempt,
+                    offer.fence,
+                    Event::Failed(sentinel_core::FailureClass::Preparation),
+                    None,
+                )
+            }
         }
     }
 
@@ -749,7 +760,7 @@ impl Executor {
     ) {
         let cancel: Cancel = Arc::new(AtomicBool::new(false));
         let logs = {
-            let state = self.state();
+            let mut state = self.state();
             let mut redactor = Redactor::new();
             for secret in &secrets {
                 redactor.register(secret.as_slice());
@@ -760,6 +771,7 @@ impl Executor {
             match LogPipe::open_in(&self.spool, offer.attempt, redactor, state.reporter.clone()) {
                 Ok(pipe) => Arc::new(pipe),
                 Err(_) => {
+                    state.starting.remove(&offer.attempt);
                     drop(state);
                     self.send(
                         offer.attempt,
@@ -773,9 +785,11 @@ impl Executor {
         };
         {
             let mut state = self.state();
+            let canceled = state.starting.remove(&offer.attempt).unwrap_or(false);
             if state.draining {
                 return;
             }
+            cancel.store(canceled, Ordering::Release);
             state.live.insert(
                 offer.attempt,
                 Live {
@@ -1424,6 +1438,7 @@ impl LinkExecutor for Executor {
                 since: now,
                 asked: now,
                 declining: false,
+                canceled: false,
                 secrets: Vec::new(),
             },
         );
@@ -1485,7 +1500,17 @@ impl LinkExecutor for Executor {
                     live.canceling = true;
                     (Arc::clone(&live.cancel), grace, live.store.clone())
                 }
-                _ => return,
+                Some(_) => return,
+                None => {
+                    // Offered and accepted, or its spec arrived and it is starting: the cancel is kept, so the
+                    // attempt starts canceled instead of running a job the controller already gave up on.
+                    if let Some(waiting) = state.awaiting.get_mut(&attempt) {
+                        waiting.canceled = true;
+                    } else if let Some(canceled) = state.starting.get_mut(&attempt) {
+                        *canceled = true;
+                    }
+                    return;
+                }
             }
         };
         // Desired state is set first, so a step that ends by itself meanwhile is still reported as canceled.

@@ -394,7 +394,11 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
         let started = Instant::now();
         let killed = container.clear_strays().unwrap();
         timings.push(started.elapsed());
-        assert!(killed >= 3, "killed {killed}");
+        // The guest agent clears the strays without counting them (the reply carries no number), so the
+        // count is a container property; the `ps` check below is what holds for both.
+        if !isolation::microvm() {
+            assert!(killed >= 3, "killed {killed}");
+        }
         let exit = container
             .exec(&step("ps -o args | grep -c '[s]leep 0.05'; true"), &[])
             .unwrap();

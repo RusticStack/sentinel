@@ -109,6 +109,9 @@ fn a_guest_runs_steps_with_the_workspace_and_brings_back_what_the_host_reads() {
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("source.txt"), "checked out\n").unwrap();
     fs::create_dir_all(workspace.path().join("sub/dir")).unwrap();
+    // A cache view declared by a relative path: restored into the workspace before the steps run.
+    fs::create_dir_all(workspace.path().join("vendor")).unwrap();
+    fs::write(workspace.path().join("vendor/old"), "restored\n").unwrap();
     fs::write(workspace.path().join(".sentinel-cache"), "never shipped").unwrap();
     let cache = tempfile::tempdir().unwrap();
     fs::write(cache.path().join("restored"), "from the host").unwrap();
@@ -171,11 +174,23 @@ fn a_guest_runs_steps_with_the_workspace_and_brings_back_what_the_host_reads() {
     assert_eq!(text(&in_dir.stdout), "/workspace/sub/dir");
 
     let made = vm
-        .exec(&sh("mkdir -p out && echo built > out/app && echo cached > /cache/c/new && rm /cache/c/restored && echo scratch > notanartifact", 60), &[])
+        .exec(&sh("mkdir -p out && echo built > out/app && echo cached > /cache/c/new && rm /cache/c/restored && echo scratch > notanartifact && rm vendor/old && echo fresh > vendor/new", 60), &[])
         .unwrap();
     assert_eq!(made.code, Some(0));
-    vm.sync_out(workspace.path(), &["out/app".into(), "missing".into()])
-        .unwrap();
+    vm.sync_out(
+        workspace.path(),
+        &["out/app".into(), "missing".into()],
+        &["vendor".into()],
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("vendor/new")).unwrap(),
+        "fresh\n"
+    );
+    assert!(
+        !workspace.path().join("vendor/old").exists(),
+        "a replaced view mirrors the guest, so a file the job deleted is gone"
+    );
     assert_eq!(
         fs::read_to_string(workspace.path().join("out/app")).unwrap(),
         "built\n"
@@ -263,14 +278,52 @@ fn a_cancel_by_name_ends_the_running_step_and_removal_leaves_nothing() {
     let started = Instant::now();
     let outcome =
         microvm::terminate_named(root.path(), attempt, Duration::from_millis(500)).unwrap();
-    assert_eq!(outcome, Terminated::Forced);
+    assert_eq!(
+        outcome,
+        Terminated::Graceful,
+        "the step ended on SIGTERM within the grace period"
+    );
     let exit = running.join().unwrap();
     eprintln!("cancel -> step ended: {:?}", started.elapsed());
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "cancel within the B03 budget"
     );
-    assert!(exit.code == Some(3) || exit.signal.is_some(), "{exit:?}");
+    assert_eq!(exit.code, Some(3), "{exit:?}");
+    microvm::remove_named(root.path(), attempt).unwrap();
+    assert!(!microvm::exists(root.path(), attempt));
+    assert_scope_gone(root.path(), attempt);
+}
+
+#[test]
+fn a_step_that_ignores_the_polite_signal_is_killed_when_the_grace_period_ends() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (attempt, vm) = start(root.path(), &setup, workspace.path(), &[]);
+    let vm = Arc::new(vm);
+    let running = {
+        let vm = Arc::clone(&vm);
+        std::thread::spawn(move || {
+            vm.exec(
+                &sh("trap '' TERM; echo up; while :; do sleep 1; done", 600),
+                &[],
+            )
+            .unwrap()
+        })
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    let grace = Duration::from_millis(700);
+    let started = Instant::now();
+    let outcome = microvm::terminate_named(root.path(), attempt, grace).unwrap();
+    assert_eq!(outcome, Terminated::Forced);
+    let exit = running.join().unwrap();
+    assert!(
+        started.elapsed() >= grace,
+        "the step had its whole grace period"
+    );
+    assert_eq!(exit.signal, Some(libc::SIGKILL), "{exit:?}");
     microvm::remove_named(root.path(), attempt).unwrap();
     assert!(!microvm::exists(root.path(), attempt));
     assert_scope_gone(root.path(), attempt);
@@ -328,6 +381,53 @@ fn the_guest_has_no_kvm() {
         )
         .unwrap();
     assert_eq!(exit.code, Some(0), "{}", text(&exit.stderr));
+    vm.destroy().unwrap();
+}
+
+#[test]
+fn a_steps_secrets_live_in_guest_memory_and_are_gone_after_it() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (_, vm) = start(root.path(), &setup, workspace.path(), &[]);
+    let (files, env) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    fs::create_dir(files.path().join("deep")).unwrap();
+    fs::write(files.path().join("deep/token"), "file-secret").unwrap();
+    fs::write(env.path().join("step-0.sh"), "export TOKEN='env-secret'\n").unwrap();
+    vm.deliver_secrets(&[
+        (files.path(), "/run/sentinel-secrets"),
+        (env.path(), "/run/sentinel-env"),
+    ])
+    .unwrap();
+    let seen = vm
+        .exec(
+            &sh(
+                ". /run/sentinel-env/step-0.sh && echo \"$TOKEN $(cat /run/sentinel-secrets/deep/token)\"; \
+                 grep -c '^tmpfs /run/sentinel-\\(env\\|secrets\\) tmpfs' /proc/mounts",
+                60,
+            ),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        text(&seen.stdout),
+        "env-secret file-secret\n2",
+        "{}",
+        text(&seen.stderr)
+    );
+    vm.retract_secrets().unwrap();
+    let after = vm
+        .exec(
+            &sh(
+                "ls -A /run/sentinel-env /run/sentinel-secrets | grep -c . ; true",
+                60,
+            ),
+            &[],
+        )
+        .unwrap();
+    // Only the two directory headers `ls` prints remain: nothing the step was given.
+    assert_eq!(text(&after.stdout), "2", "{}", text(&after.stderr));
     vm.destroy().unwrap();
 }
 

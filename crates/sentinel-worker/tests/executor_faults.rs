@@ -398,3 +398,52 @@ fn a_repeated_offer_is_acknowledged_again_and_never_started_twice() {
     });
     live.stop();
 }
+
+/// A cancel the controller sends while the worker still waits for the spec must not be lost: the attempt
+/// starts canceled and never runs its steps.
+#[test]
+fn a_cancel_that_arrives_before_the_spec_cancels_the_attempt() {
+    if !podman_enabled() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    shim();
+    let (live, probe) = Live::start(|dir, worker| Probe::start(dir, worker, 0));
+    probe.hold_specs();
+    let (run, jobs) = live.enqueue(&one_job(
+        "      - id: work\n        run: 'echo must-not-run; sleep 5'\n",
+    ));
+    let job = jobs[0];
+    eventually("the spec held back", Duration::from_secs(60), || {
+        probe.specs_held() > 0
+    });
+    let (tenant, id) = (live.tenant, job);
+    live.store
+        .writer()
+        .write(move |tx| dispatch::cancel(tx, tenant, id, UnixMillis::now()))
+        .unwrap();
+    eventually(
+        "the cancel reached the worker",
+        Duration::from_secs(30),
+        || probe.cancels.load(Ordering::SeqCst) >= 1,
+    );
+    probe.release_specs();
+    eventually("the job canceled", Duration::from_secs(60), || {
+        matches!(live.job(job).state, JobState::Terminal(_))
+    });
+    let row = live.job(job);
+    assert_eq!(
+        (row.state, row.failure_class),
+        (
+            JobState::Terminal(Outcome::Canceled),
+            Some(sentinel_core::FailureClass::Canceled)
+        ),
+        "notices: {:?}",
+        probe.notices.lock().unwrap()
+    );
+    assert!(!live.printed(run, job, "must-not-run"));
+    eventually("nothing held", Duration::from_secs(30), || {
+        probe.inner.held().is_empty()
+    });
+    live.stop();
+}

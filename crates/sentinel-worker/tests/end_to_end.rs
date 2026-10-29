@@ -86,6 +86,19 @@ fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
     }
 }
 
+/// As [`eventually`], with the state a job was left in when the wait gives up.
+fn eventually_job(what: &str, mut predicate: impl FnMut() -> bool, detail: impl Fn() -> String) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !predicate() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}: {}",
+            detail()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn attempt_detail(store: &Store, tenant: TenantId, job: JobId) -> Option<String> {
     let attempt = store
         .read(|c| dispatch::latest_attempt(c, tenant, job))
@@ -441,6 +454,14 @@ jobs:
             .read(|c| sentinel_store::jobs::get_job(c, tenant, job))
             .unwrap()
     };
+    let describe = |job| {
+        format!(
+            "state={:?}, failure={:?}, detail={:?}",
+            state(job).state,
+            state(job).failure_class,
+            attempt_detail(&store, tenant, job)
+        )
+    };
     let compiled = spec_names(&yaml);
     let by_name = |name: &str| ids[compiled.iter().position(|n| n == name).unwrap()];
     let sealed = by_name("sealed");
@@ -630,17 +651,21 @@ jobs:
     eventually("sealed passed", || {
         state(sealed).state == JobState::Terminal(Outcome::Passed)
     });
-    eventually("oom failed", || {
-        state(oom).state == JobState::Terminal(Outcome::Failed)
-    });
+    eventually_job(
+        "oom failed",
+        || state(oom).state == JobState::Terminal(Outcome::Failed),
+        || describe(oom),
+    );
     assert_eq!(
         state(oom).failure_class,
         Some(sentinel_core::FailureClass::OutOfMemory)
     );
     assert_eq!(summary_of(oom).steps[0].outcome, StepOutcome::OutOfMemory);
-    eventually("slow timed out", || {
-        state(slow).state == JobState::Terminal(Outcome::TimedOut)
-    });
+    eventually_job(
+        "slow timed out",
+        || state(slow).state == JobState::Terminal(Outcome::TimedOut),
+        || describe(slow),
+    );
     assert_eq!(
         state(slow).failure_class,
         Some(sentinel_core::FailureClass::ExecutionTimeout)
@@ -669,12 +694,16 @@ jobs:
             dispatch::cancel(tx, tenant, stubborn, UnixMillis::now())
         })
         .unwrap();
-    eventually("polite canceled", || {
-        state(polite).state == JobState::Terminal(Outcome::Canceled)
-    });
-    eventually("stubborn canceled", || {
-        state(stubborn).state == JobState::Terminal(Outcome::Canceled)
-    });
+    eventually_job(
+        "polite canceled",
+        || state(polite).state == JobState::Terminal(Outcome::Canceled),
+        || describe(polite),
+    );
+    eventually_job(
+        "stubborn canceled",
+        || state(stubborn).state == JobState::Terminal(Outcome::Canceled),
+        || describe(stubborn),
+    );
     let took = asked.elapsed();
     assert!(took < Duration::from_secs(30), "cancellation took {took:?}");
     for job in [polite, stubborn] {

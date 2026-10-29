@@ -110,7 +110,8 @@ pub(super) fn name(
     boot_args: &str,
 ) -> io::Result<String> {
     let text = format!(
-        "{FORMAT}\0{rootfs}\0{boot_args}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        "{FORMAT}\0{rootfs}\0{boot_args}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        super::CPU_CONFIG,
         initrd.file_name().and_then(|n| n.to_str()).unwrap_or(""),
         file_identity(kernel)?,
         file_identity(firecracker)?,

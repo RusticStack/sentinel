@@ -49,11 +49,34 @@ impl Sandbox {
     }
 
     /// Makes what the host reads after the steps current on the host: a container shares the host's
-    /// directories already; a VM copies the artifact paths and its writable mounts back.
-    pub fn sync_out(&self, workspace: &Path, artifact_paths: &[String]) -> Result<()> {
+    /// directories already; a VM copies the artifact paths, the `replaced` workspace directories (cache
+    /// views) and its writable mounts back.
+    pub fn sync_out(
+        &self,
+        workspace: &Path,
+        artifact_paths: &[String],
+        replaced: &[String],
+    ) -> Result<()> {
         match self {
             Sandbox::Container(_) => Ok(()),
-            Sandbox::Vm(vm) => vm.sync_out(workspace, artifact_paths),
+            Sandbox::Vm(vm) => vm.sync_out(workspace, artifact_paths, replaced),
+        }
+    }
+
+    /// Puts directories of the host (a step's secret files and environment file) into the guest at their
+    /// container paths; a container has them bind-mounted already.
+    pub fn deliver_secrets(&self, dirs: &[(&Path, &str)]) -> Result<()> {
+        match self {
+            Sandbox::Container(_) => Ok(()),
+            Sandbox::Vm(vm) => vm.deliver_secrets(dirs),
+        }
+    }
+
+    /// Takes what [`Sandbox::deliver_secrets`] put into the guest out of it again.
+    pub fn retract_secrets(&self) -> Result<()> {
+        match self {
+            Sandbox::Container(_) => Ok(()),
+            Sandbox::Vm(vm) => vm.retract_secrets(),
         }
     }
 

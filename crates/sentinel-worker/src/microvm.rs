@@ -32,7 +32,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex, MutexGuard, TryLockError,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -63,6 +63,11 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const IMAGE_BUILD_TIMEOUT: Duration = Duration::from_secs(900);
 /// Memory the VMM process needs beyond the guest's RAM, in the scope's cap.
 const VMM_OVERHEAD: u64 = 256 << 20;
+/// Memory a guest has beyond its job's reservation: the kernel, the agent and the file system caches they
+/// need. The steps share a memory cgroup capped at the reservation itself ([`Request::MemoryLimit`]), so a job
+/// that outgrows it is OOM-killed inside the guest and the agent stays able to say so, the way a container
+/// is, instead of the whole guest running out of memory with it.
+const GUEST_OVERHEAD_MIB: u64 = 64;
 /// How long a cancel waits for the guest agent to confirm a signal before it kills the VM instead.
 const CANCEL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a cancel waits to reach the agent at all.
@@ -156,13 +161,20 @@ pub fn initramfs(root: &Path, setup: &Setup) -> Result<PathBuf> {
     }
     cpio_entry(&mut out, &mut ino, "init", 0o100755, &agent);
     cpio_entry(&mut out, &mut ino, "TRAILER!!!", 0, &[]);
+    // A name of its own per call: attempts of one worker start together, and two writers sharing a temporary
+    // would have the second rename find the file the first already moved.
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     let tmp = dir.join(format!(
-        ".initramfs-{}.{}",
+        ".initramfs-{}.{}.{}",
         &digest[..16],
-        std::process::id()
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
     ));
     fs::write(&tmp, &out)?;
-    fs::rename(&tmp, &path)?;
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(path)
 }
 
@@ -206,6 +218,8 @@ fn cpio_entry(out: &mut Vec<u8>, ino: &mut u32, name: &str, mode: u32, data: &[u
 pub struct GuestImage {
     pub rootfs: PathBuf,
     pub env: Vec<(String, String)>,
+    /// The image's configured user (`USER`): empty for root.
+    pub user: String,
     /// What the attempt's summary records: the pinned digest this root file system carries.
     pub record: GuestImageRecord,
     /// Keeps GC off the image for as long as a VM boots from it (see [`ImageLease`]).
@@ -261,9 +275,10 @@ struct ImageMeta {
     image_id: String,
     rootfs_bytes: u64,
     env: Vec<(String, String)>,
+    user: String,
 }
 
-const META_FORMAT: u64 = 1;
+const META_FORMAT: u64 = 2;
 
 impl ImageMeta {
     fn to_json(&self) -> Vec<u8> {
@@ -274,6 +289,7 @@ impl ImageMeta {
             "image_id": self.image_id,
             "rootfs_bytes": self.rootfs_bytes,
             "env": env,
+            "user": self.user,
         }))
         .expect("a JSON value serializes")
     }
@@ -296,6 +312,7 @@ impl ImageMeta {
                     Some((k.to_owned(), v.to_owned()))
                 })
                 .collect(),
+            user: value.get("user")?.as_str()?.to_owned(),
         })
     }
 }
@@ -387,6 +404,7 @@ fn ensure_image(
                 build_ns: Some(started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX)),
             },
             env: meta.env,
+            user: meta.user,
             lease: Arc::clone(&lease),
         })
     })();
@@ -448,6 +466,7 @@ fn cached_image(
             build_ns: None,
         },
         env: meta.env,
+        user: meta.user,
         lease: Arc::clone(lease),
     })
 }
@@ -481,22 +500,32 @@ struct Inspected {
     id: String,
     digest: String,
     repo_digests: Vec<String>,
+    user: String,
     env: Vec<(String, String)>,
 }
 
 const ENV_SEPARATOR: &str = "--env--";
-/// One value per line: the image ID, its manifest digest, each repo digest, a separator, then the environment.
+const USER_SEPARATOR: &str = "--user--";
+/// One value per line: the image ID, its manifest digest, each repo digest, the configured user after a separator, then the environment after another.
 /// Plain actions with newlines in the template: Podman 4.9 refuses a field passed to `println`.
-const INSPECT_FORMAT: &str = "{{.Id}}\n{{.Digest}}\n{{range .RepoDigests}}{{.}}\n{{end}}--env--\n{{range .Config.Env}}{{.}}\n{{end}}";
+const INSPECT_FORMAT: &str = "{{.Id}}\n{{.Digest}}\n{{range .RepoDigests}}{{.}}\n{{end}}--user--\n{{.Config.User}}\n--env--\n{{range .Config.Env}}{{.}}\n{{end}}";
 
 fn parse_inspect(text: &str) -> Option<Inspected> {
     let mut lines = text.lines();
     let id = lines.next()?.trim().to_owned();
     let digest = lines.next()?.trim().to_owned();
     let mut repo_digests = Vec::new();
+    let mut user = String::new();
     loop {
         let line = lines.next()?.trim();
         if line == ENV_SEPARATOR {
+            break;
+        }
+        if line == USER_SEPARATOR {
+            user = lines.next()?.trim().to_owned();
+            if lines.next()?.trim() != ENV_SEPARATOR {
+                return None;
+            }
             break;
         }
         if !line.is_empty() {
@@ -511,6 +540,7 @@ fn parse_inspect(text: &str) -> Option<Inspected> {
         id,
         digest,
         repo_digests,
+        user,
         env,
     })
 }
@@ -596,6 +626,7 @@ fn build_image(
         digest,
         &inspected.id,
         &inspected.env,
+        &inspected.user,
     )
 }
 
@@ -608,6 +639,7 @@ fn publish_image(
     digest: &str,
     image_id: &str,
     env: &[(String, String)],
+    user: &str,
 ) -> Result<ImageMeta> {
     let mut tmp_meta = tmp.as_os_str().to_owned();
     tmp_meta.push(".json");
@@ -618,6 +650,7 @@ fn publish_image(
             image_id: image_id.to_owned(),
             rootfs_bytes: fs::metadata(tmp)?.len(),
             env: env.to_vec(),
+            user: user.to_owned(),
         };
         fs::OpenOptions::new()
             .create_new(true)
@@ -837,6 +870,13 @@ fn connect(socket: &Path, deadline: Instant, alive: &mut dyn FnMut() -> bool) ->
                 thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+}
+
+impl Drop for Client {
+    /// A connection the worker is done with ends for the guest agent too, whoever else holds the socket.
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -1066,6 +1106,7 @@ pub struct Vm {
     child: Mutex<Child>,
     client: Client,
     env: Vec<(String, String)>,
+    user: String,
     next_id: AtomicU32,
     /// Writable mounts: their guest path and the host directory they come back to.
     writable: Vec<(String, PathBuf)>,
@@ -1189,8 +1230,10 @@ impl Plan<'_> {
             &self.guest.rootfs,
             &scratch,
             &self.dir.join("vsock.sock"),
+            &self.dir.join("cpu.json"),
             &self.shape,
         );
+        fs::write(self.dir.join("cpu.json"), CPU_CONFIG)?;
         fs::write(
             self.dir.join("vm.json"),
             serde_json::to_vec_pretty(&config).map_err(io::Error::other)?,
@@ -1324,8 +1367,10 @@ impl Plan<'_> {
             &run.join("image.ext4"),
             &run.join("scratch.ext4"),
             &run.join("vsock.sock"),
+            &run.join("cpu.json"),
             &self.shape,
         );
+        fs::write(dir.join("cpu.json"), CPU_CONFIG)?;
         fs::write(
             dir.join("vm.json"),
             serde_json::to_vec_pretty(&config).map_err(io::Error::other)?,
@@ -1569,7 +1614,7 @@ impl Vm {
             limits,
             shape: snapshot::Shape {
                 vcpus: u64::from(limits.cpu_millis.div_ceil(1000).max(1)),
-                mib: (limits.memory_bytes >> 20).max(128),
+                mib: ((limits.memory_bytes >> 20) + GUEST_OVERHEAD_MIB).max(128),
                 scratch_bytes: limits.disk_bytes.max(1 << 30),
                 net: network == Network::Egress,
             },
@@ -1617,11 +1662,16 @@ impl Vm {
             child: Mutex::new(child),
             client,
             env: guest.env,
+            user: guest.user,
             next_id: AtomicU32::new(1),
             writable: Vec::new(),
             _image: guest.lease,
         };
         let prepared = (|| -> Result<()> {
+            vm.client.send(&Request::MemoryLimit {
+                bytes: limits.memory_bytes,
+            })?;
+            vm.client.expect_done("memory limit")?;
             vm.client.put_dir(
                 workspace,
                 &guest_path(WORKSPACE_MOUNT),
@@ -1690,6 +1740,7 @@ impl Vm {
             env,
             workdir,
             root: JOB_ROOT.to_owned(),
+            user: self.user.clone(),
         }))?;
         let deadline = Instant::now() + Duration::from_secs(step.timeout_secs.max(1));
         let (mut stdout, mut stderr) = (process::Tail::new(), process::Tail::new());
@@ -1749,9 +1800,10 @@ impl Vm {
                     });
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(Error::Runtime(
-                        "the guest agent closed the connection".into(),
-                    ));
+                    return Err(Error::Runtime(format!(
+                        "the guest agent closed the connection; console: {}",
+                        console_tail(&self.dir)
+                    )));
                 }
             }
         }
@@ -1765,18 +1817,54 @@ impl Vm {
         }
     }
 
-    /// Every process an earlier step left: the guest has one PID namespace, as a container does.
+    /// Every process an earlier step left: the guest has one PID namespace, as a container does. The agent
+    /// does not count what it killed, so the number is always 0 here.
     pub fn clear_strays(&self) -> Result<usize> {
         self.client.send(&Request::KillStrays)?;
         self.client.expect_done("clear strays")?;
         Ok(0)
     }
 
+    /// Puts a step's secret directories into the guest, each under its container path (the guest keeps them
+    /// in memory: the agent mounts a tmpfs at each [`agent::SECRET_MOUNTS`] path).
+    pub fn deliver_secrets(&self, dirs: &[(&Path, &str)]) -> Result<()> {
+        for (host, container) in dirs {
+            self.client.put_dir(host, &guest_path(container), &[])?;
+        }
+        Ok(())
+    }
+
+    /// Empties the guest's secret directories: nothing a step was given stays for the next one to read.
+    pub fn retract_secrets(&self) -> Result<()> {
+        self.client.send(&Request::Wipe {
+            dirs: agent::SECRET_MOUNTS.iter().map(|d| guest_path(d)).collect(),
+        })?;
+        self.client.expect_done("retract secrets")
+    }
+
     /// Brings back what the host reads after the steps: `workspace_paths` (relative to the workspace, the
-    /// artifacts) and every writable mount, whose host directory is replaced by the guest's view.
-    pub fn sync_out(&self, workspace: &Path, workspace_paths: &[String]) -> Result<()> {
+    /// artifacts), the workspace directories in `replaced` (the cache views declared by relative paths), whose
+    /// host copy is replaced by the guest's so a file the job deleted is gone, and every writable mount, whose
+    /// host directory is replaced the same way.
+    pub fn sync_out(
+        &self,
+        workspace: &Path,
+        workspace_paths: &[String],
+        replaced: &[String],
+    ) -> Result<()> {
         let patterns: Vec<&str> = workspace_paths.iter().map(String::as_str).collect();
         self.pull_workspace(workspace, &patterns)?;
+        for rel in replaced {
+            let host = workspace.join(rel);
+            // Only a real directory is replaced: a path the job's checkout made a link or a file is left to
+            // publication, which resolves it without following links.
+            if !fs::symlink_metadata(&host).is_ok_and(|m| m.is_dir()) {
+                continue;
+            }
+            clear_dir(&host)?;
+            self.client
+                .get_into(&guest_path(WORKSPACE_MOUNT), vec![rel.clone()], workspace)?;
+        }
         for (guest, host) in &self.writable {
             clear_dir(host)?;
             self.client.get_into(guest, vec![".".into()], host)?;
@@ -1833,12 +1921,40 @@ fn canceled_start() -> Error {
 /// vsock the agent speaks on; no CPU template or custom CPU configuration, so the guest sees no hardware
 /// virtualization (`/dev/kvm` and nested KVM stay off). A network interface is attached only to a guest the
 /// worker granted egress; nothing else is.
+/// The CPU configuration of every guest (Firecracker's custom CPU template, a file in the VM's directory):
+/// the CPUID bits that advertise hardware virtualization, VMX (leaf 1, ECX bit 5) and SVM (leaf 0x8000_0001,
+/// ECX bit 2), are cleared, so a guest on a host with nested virtualization enabled sees neither. A bit the
+/// host's vendor does not define is reserved and already zero. It is part of a snapshot's name, because the
+/// saved vCPU state carries the CPUID the guest booted with.
+pub(crate) const CPU_CONFIG: &str = r#"{
+  "cpuid_modifiers": [
+    {
+      "leaf": "0x1",
+      "subleaf": "0x0",
+      "flags": 0,
+      "modifiers": [
+        { "register": "ecx", "bitmap": "0bxxxxxxxxxxxxxxxxxxxxxxxxxx0xxxxx" }
+      ]
+    },
+    {
+      "leaf": "0x80000001",
+      "subleaf": "0x0",
+      "flags": 0,
+      "modifiers": [
+        { "register": "ecx", "bitmap": "0bxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0xx" }
+      ]
+    }
+  ]
+}
+"#;
+
 fn vm_config(
     setup: &Setup,
     initrd: &Path,
     rootfs: &Path,
     scratch: &Path,
     socket: &Path,
+    cpu_config: &Path,
     shape: &snapshot::Shape,
 ) -> serde_json::Value {
     let mut config = serde_json::json!({
@@ -1852,6 +1968,7 @@ fn vm_config(
             { "drive_id": "scratch", "path_on_host": scratch, "is_root_device": false, "is_read_only": false },
         ],
         "machine-config": { "vcpu_count": shape.vcpus, "mem_size_mib": shape.mib, "smt": false },
+        "cpu-config": cpu_config,
         "vsock": { "guest_cid": GUEST_CID, "uds_path": socket },
     });
     if shape.net {
@@ -2015,23 +2132,38 @@ fn terminate_named_with(
             return Ok(Terminated::Forced);
         }
     };
-    let signaled = (|| -> Result<()> {
+    let signaled = (|| -> Result<Terminated> {
         client.send(&Request::SignalAll {
             signal: libc::SIGTERM,
         })?;
         client.expect_done_within("terminate", reply_wait)?;
-        thread::sleep(grace);
+        // The grace period ends as soon as the steps have: a step that stops on SIGTERM is a graceful stop.
+        client.send(&Request::WaitIdle {
+            timeout_ms: u32::try_from(grace.as_millis()).unwrap_or(u32::MAX),
+        })?;
+        match client.control(grace + reply_wait)? {
+            Reply::Idle(true) => return Ok(Terminated::Graceful),
+            Reply::Idle(false) => {}
+            Reply::Failed { message } => {
+                return Err(Error::Runtime(format!("terminate: {message}")));
+            }
+            other => return Err(Error::Runtime(format!("terminate: unexpected {other:?}"))),
+        }
         client.send(&Request::SignalAll {
             signal: libc::SIGKILL,
         })?;
-        client.expect_done_within("terminate", reply_wait)
+        client.expect_done_within("terminate", reply_wait)?;
+        Ok(Terminated::Forced)
     })();
-    if signaled.is_err() {
-        // The guest could not be told: the VM is all that is left to stop, and the step waiting on it ends
-        // when its connection closes.
-        remove_named_with(systemctl, root, attempt)?;
+    match signaled {
+        Ok(how) => Ok(how),
+        Err(_) => {
+            // The guest could not be told: the VM is all that is left to stop, and the step waiting on it ends
+            // when its connection closes.
+            remove_named_with(systemctl, root, attempt)?;
+            Ok(Terminated::Forced)
+        }
     }
-    Ok(Terminated::Forced)
 }
 
 /// Stops the VM's scope and removes its directory: shutdown, lease loss and startup recovery. A scope that
@@ -2154,6 +2286,36 @@ mod tests {
     }
 
     #[test]
+    fn attempts_starting_together_share_one_initramfs() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        fs::write(&agent, vec![7u8; 256 << 10]).unwrap();
+        let setup = Setup {
+            firecracker: "/nonexistent/firecracker".into(),
+            kernel: "/nonexistent/vmlinux".into(),
+            agent,
+            snapshots: true,
+            guard: net::Guard::default(),
+        };
+        for _ in 0..20 {
+            let data = tempfile::tempdir().unwrap();
+            let paths: Vec<PathBuf> = thread::scope(|scope| {
+                let writers: Vec<_> = (0..8)
+                    .map(|_| scope.spawn(|| initramfs(data.path(), &setup).unwrap()))
+                    .collect();
+                writers.into_iter().map(|w| w.join().unwrap()).collect()
+            });
+            assert!(paths.iter().all(|p| p == &paths[0] && p.is_file()));
+            let leftovers: Vec<_> = fs::read_dir(data.path().join(DIR))
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(".initramfs-"))
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
+    }
+
+    #[test]
     fn a_setup_with_missing_files_says_which() {
         let setup = Setup {
             firecracker: "/nonexistent/firecracker".into(),
@@ -2198,6 +2360,7 @@ mod tests {
             image_id: "ab".repeat(32),
             rootfs_bytes: bytes,
             env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            user: String::new(),
         };
         fs::write(&marker, meta.to_json()).unwrap();
         (rootfs, marker)
@@ -2411,6 +2574,7 @@ mod tests {
             digest,
             &"cd".repeat(32),
             &[("PATH".into(), "/bin".into())],
+            "",
         )
     }
 
@@ -2810,6 +2974,51 @@ mod tests {
     // ------------------------------------------------------------ the VM configuration
 
     #[test]
+    fn the_guest_keeps_exactly_the_paths_the_worker_delivers_secrets_to_in_memory() {
+        assert_eq!(
+            agent::SECRET_MOUNTS,
+            [
+                crate::attempt::SECRET_FILES_MOUNT,
+                crate::attempt::SECRET_ENV_MOUNT
+            ]
+        );
+    }
+
+    #[test]
+    fn the_cpu_configuration_clears_the_bits_that_advertise_virtualization() {
+        let config: serde_json::Value = serde_json::from_str(CPU_CONFIG).unwrap();
+        let cleared = |leaf: &str, register: &str| -> u32 {
+            let modifiers = config["cpuid_modifiers"].as_array().unwrap();
+            let entry = modifiers.iter().find(|m| m["leaf"] == leaf).unwrap();
+            assert_eq!(entry["subleaf"], "0x0");
+            let modifier = entry["modifiers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["register"] == register)
+                .unwrap();
+            let bitmap = modifier["bitmap"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("0b")
+                .unwrap();
+            assert_eq!(bitmap.len(), 32);
+            bitmap
+                .chars()
+                .rev()
+                .enumerate()
+                .fold(0, |acc, (bit, c)| match c {
+                    '0' => acc | 1 << bit,
+                    'x' => acc,
+                    other => panic!("bit {bit} is {other}, not a 0 or an x"),
+                })
+        };
+        assert_eq!(cleared("0x1", "ecx"), 1 << 5, "VMX");
+        assert_eq!(cleared("0x80000001", "ecx"), 1 << 2, "SVM");
+        assert_eq!(config["cpuid_modifiers"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
     fn the_guest_is_given_no_way_to_nest_virtualization() {
         let setup = Setup {
             firecracker: "/fc".into(),
@@ -2830,10 +3039,11 @@ mod tests {
             Path::new("/image.ext4"),
             Path::new("/scratch.ext4"),
             Path::new("/vsock.sock"),
+            Path::new("/cpu.json"),
             &shape,
         );
-        // A new top-level section (a CPU configuration could unmask VMX; a device could carry /dev/kvm) must
-        // be reviewed against the isolation contract before this test is changed.
+        // A new top-level section (a device could carry /dev/kvm) must be reviewed against the isolation
+        // contract before this test is changed.
         let mut sections: Vec<&str> = config
             .as_object()
             .unwrap()
@@ -2843,8 +3053,15 @@ mod tests {
         sections.sort_unstable();
         assert_eq!(
             sections,
-            ["boot-source", "drives", "machine-config", "vsock"]
+            [
+                "boot-source",
+                "cpu-config",
+                "drives",
+                "machine-config",
+                "vsock"
+            ]
         );
+        assert_eq!(config["cpu-config"], "/cpu.json");
         let machine = config["machine-config"].as_object().unwrap();
         assert!(!machine.contains_key("cpu_template"));
         assert!(!config.to_string().to_ascii_lowercase().contains("kvm"));
@@ -2873,6 +3090,7 @@ mod tests {
             Path::new("/image.ext4"),
             Path::new("/scratch.ext4"),
             Path::new("/vsock.sock"),
+            Path::new("/cpu.json"),
             &shape,
         );
         let mut sections: Vec<&str> = granted
@@ -2886,6 +3104,7 @@ mod tests {
             sections,
             [
                 "boot-source",
+                "cpu-config",
                 "drives",
                 "machine-config",
                 "network-interfaces",
@@ -3057,10 +3276,12 @@ mod tests {
 
     /// A guest agent that records the signals it is sent, with the time each arrived; `answer` says whether
     /// it confirms them. Serves one connection, then returns once it has seen `expect` signals.
+    /// A guest agent that records the signals sent to it. `answer` is whether it confirms them; `idle` whether
+    /// the steps have ended by the time it is asked to wait for them.
     fn fake_agent(
         socket: &Path,
         answer: bool,
-        expect: usize,
+        idle: bool,
     ) -> thread::JoinHandle<Vec<(i32, Instant)>> {
         let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
         thread::spawn(move || {
@@ -3086,14 +3307,22 @@ mod tests {
             )
             .unwrap();
             let mut seen = Vec::new();
-            while seen.len() < expect {
-                let Ok(Some(Request::SignalAll { signal })) = agent::read::<Request>(&mut stream)
-                else {
-                    break;
-                };
-                seen.push((signal, Instant::now()));
-                if answer {
-                    agent::write(&mut stream, &Reply::Done).unwrap();
+            // Until the host hangs up.
+            while let Ok(Some(request)) = agent::read::<Request>(&mut stream) {
+                match request {
+                    Request::SignalAll { signal } => {
+                        seen.push((signal, Instant::now()));
+                        if answer {
+                            agent::write(&mut stream, &Reply::Done).unwrap();
+                        }
+                    }
+                    Request::WaitIdle { timeout_ms } => {
+                        if !idle {
+                            thread::sleep(Duration::from_millis(u64::from(timeout_ms)));
+                        }
+                        agent::write(&mut stream, &Reply::Idle(idle)).unwrap();
+                    }
+                    other => panic!("unexpected {other:?}"),
                 }
             }
             seen
@@ -3122,7 +3351,7 @@ mod tests {
         let root = temp.path().join("d");
         let attempt = AttemptId::new();
         let dir = vm_files(&root, attempt);
-        let agent = fake_agent(&dir.join("vsock.sock"), true, 2);
+        let agent = fake_agent(&dir.join("vsock.sock"), true, false);
         let systemctl = FakeSystemctl::new(temp.path(), "inactive", "", 0);
         let grace = Duration::from_millis(150);
         let outcome = terminate(&systemctl, &root, attempt, grace).unwrap();
@@ -3148,12 +3377,36 @@ mod tests {
     }
 
     #[test]
+    fn a_step_that_stops_on_the_polite_signal_is_a_graceful_cancel() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("d");
+        let attempt = AttemptId::new();
+        let dir = vm_files(&root, attempt);
+        let agent = fake_agent(&dir.join("vsock.sock"), true, true);
+        let systemctl = FakeSystemctl::new(temp.path(), "inactive", "", 0);
+        let started = Instant::now();
+        let outcome = terminate(&systemctl, &root, attempt, Duration::from_secs(30)).unwrap();
+        assert_eq!(outcome, Terminated::Graceful);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the grace period ends with the steps"
+        );
+        let seen = agent.join().unwrap();
+        assert_eq!(
+            seen.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            [libc::SIGTERM],
+            "nothing is killed that stopped by itself"
+        );
+        assert_eq!(systemctl.calls(), "");
+    }
+
+    #[test]
     fn a_guest_that_does_not_answer_a_cancel_loses_its_vm() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("d");
         let attempt = AttemptId::new();
         let dir = vm_files(&root, attempt);
-        let agent = fake_agent(&dir.join("vsock.sock"), false, 1);
+        let agent = fake_agent(&dir.join("vsock.sock"), false, false);
         let systemctl = FakeSystemctl::new(temp.path(), "inactive", "", 0);
         let started = Instant::now();
         let outcome = terminate(&systemctl, &root, attempt, Duration::ZERO).unwrap();
