@@ -2,7 +2,7 @@
 
 How a platform administrator adds a machine to the fleet without writing a configuration file by hand (Q11). The controller issues a short-lived, single-use, pool-bound enrollment and serves a **worker-only shell script**; the script installs the pinned worker (and, by default, the pinned Tailcat helper), creates the local service account and identity, enrolls through the secret it is handed, installs the service, and can roll back or uninstall. Only the main deployment runs the controller, the API and the web interface; every other machine is a worker.
 
-The routes are in the [API](api.md), the store rules behind them in [worker link](worker-link.md#approved-policy-the-bound-node-key-and-uninstall-q11-store-layer). The web page that drives them belongs to the web interface ([web interface](web-ui.md)).
+The operator checklist is [worker enrollment](worker-enrollment.md). The routes are in the [API](api.md), the store rules behind them in [worker link](worker-link.md#approved-policy-the-bound-node-key-and-uninstall-q11-store-layer). The web page that drives them belongs to the web interface ([web interface](web-ui.md)).
 
 ## The flow
 
