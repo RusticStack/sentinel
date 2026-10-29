@@ -20,7 +20,7 @@ function ForgotPassword() {
         <details className="rounded-md border border-line p-3">
           <summary className="cursor-pointer font-medium text-strong">For the administrator</summary>
           <p className="mt-2">On the controller host, as the service user:</p>
-          <p className="mt-2">Give the administrator your registered email address. For an email-registered account, the username is generated; find it by email in the metadata database before running recovery.</p>
+          <p className="mt-2">Give the administrator your registered email address. For an email-registered account, the username is generated; find it by email in the metadata database before running recovery. Addresses are stored in lower case, so write the address in lower case in the query.</p>
           <pre className="mt-2 overflow-x-auto rounded bg-elevated p-2 text-xs text-strong"><code>{RECOVERY}</code></pre>
           <p className="mt-2 text-muted">It resets the password, clears sign-in and second-factor lockouts and revokes the account's sessions.</p>
         </details>
