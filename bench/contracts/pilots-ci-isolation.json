@@ -1,0 +1,41 @@
+{
+  "format": "sentinel.bench-contract/1",
+  "id": "pilots-ci-isolation",
+  "revision": 1,
+  "frozen": "2026-10-29",
+  "purpose": "M08: the pilots-ci revision 4 lanes measured twice on the same host, once with every job stating runs_on.isolation: container and once with isolation: microvm, to publish the microVM executor's overhead per lane and condition against the B09 gate. A new contract rather than a change to revision 4, which stays frozen: its records keep their meaning and are never mixed with these.",
+  "extends": {
+    "id": "pilots-ci",
+    "revision": 4,
+    "file": "bench/contracts/pilots-ci.json",
+    "inherited": ["reference_host", "allocation", "sources", "images", "freshness", "conditions", "lanes", "not_measured"],
+    "note": "Everything named in `inherited` applies unchanged: host, CCD placement, 10 CPUs and 26 GiB, source commits, image digests, the three conditions and the freshness rules. The reference host must be `kvm-host`, the only host with usable KVM."
+  },
+  "isolation": {
+    "conditions": ["container", "microvm"],
+    "how_stated": "bench/p14-pilot.sh prep KIT ROOT PILOT ISOLATION rewrites the committed pipeline copy so every job's runs_on reads `{ labels: [egress], isolation: <condition> }`; commands, caps, caches and images stay as examples/pilots/ has them. The worker is the same binary, host and enrollment shape for both; it states isolation.container and isolation.microvm (worker --check).",
+    "pairing": "One ROOT per isolation and lane, the same KIT (same sentinel binary), the same host, the same day. Samples alternate by isolation block, never run concurrently: CPU pressure under 2 % at the start of each sample as in revision 4, and a condition's two series are taken back to back.",
+    "guest_image": "The microVM guest is built from the same image digest the container runs; the record's attempt data carry the guest image digest (K07)."
+  },
+  "gate": {
+    "id": "B09",
+    "metric": "p95 of intake_to_finished_ns per lane and condition, non-warmup samples that passed",
+    "rule": "microvm p95 / container p95 - 1 <= 0.10",
+    "also_reported": ["median overhead", "per-phase medians (queue to first process, job start to finish)", "sample counts and min/max"],
+    "on_failure": "A lane over the gate is a bug to fix in M04-M06; the default (microVM on a KVM host) is never changed silently and the gate is never raised. Fewer than 10 non-warmup samples per series is reported as development evidence, not a gate result."
+  },
+  "b03_remeasure": {
+    "harness": "bench/b03-setup.sh and bench/b03-latency.py with SENTINEL_BENCH_ISOLATION=container|microvm at setup; each record carries `isolation`.",
+    "budgets": "dispatch p95 < 100 ms, warm first process p95 < 2 s, visible logs p95 < 250 ms, indexed failure query p95 < 200 ms, cancel to termination p95 < 2 s, 8 KiB failure view (plan 12)."
+  },
+  "record": {
+    "schema": "sentinel-bench/pilot-run/1",
+    "contract_block": "{id: pilots-ci-isolation, revision: 1, lane, condition, isolation}"
+  },
+  "revision_history": [
+    {
+      "revision": 1,
+      "note": "first revision: adds the stated isolation to the revision-4 lanes; no sample has been recorded under it yet"
+    }
+  ]
+}
