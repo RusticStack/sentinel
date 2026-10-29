@@ -2,7 +2,8 @@
 //! from: the compiler (no rustc on PATH at run time), the source commit and tracked-change state
 //! the binary was compiled from, the profile and the target. A value git or cargo could not give
 //! is the empty string, which the runner records as absent.
-//! Cargo reruns this script when the toolchain, the sources or the checkout's HEAD, branch ref or
+//! Cargo reruns this script when the toolchain, the sources (this crate, its sibling crates, the
+//! workspace manifest, lock file and Cargo configuration) or the checkout's HEAD, branch ref or
 //! index change, so the values cannot go stale.
 use std::{env, process::Command};
 
@@ -30,6 +31,30 @@ fn watch_git() {
     for path in paths.into_iter().flatten() {
         if std::path::Path::new(&path).exists() {
             println!("cargo:rerun-if-changed={path}");
+        }
+    }
+}
+
+/// Rebuild when the rest of the tree the binary is compiled from changes: the sibling crates it depends
+/// on, and the workspace manifest (profile, lints), lock file and Cargo configuration. Without these a
+/// tracked edit outside this crate would rebuild the runner but leave `dirty` as the last build saw it.
+/// A path that does not exist is skipped, because a missing watched path reruns this script every time.
+fn watch_workspace() {
+    let Some(manifest_dir) = env::var_os("CARGO_MANIFEST_DIR") else {
+        return;
+    };
+    let manifest_dir = std::path::Path::new(&manifest_dir);
+    let Some(root) = manifest_dir.parent().and_then(std::path::Path::parent) else {
+        return;
+    };
+    for path in [
+        root.join("Cargo.toml"),
+        root.join("Cargo.lock"),
+        root.join(".cargo").join("config.toml"),
+        root.join("crates"),
+    ] {
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
         }
     }
 }
@@ -69,5 +94,6 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=src");
+    watch_workspace();
     watch_git();
 }
