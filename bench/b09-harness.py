@@ -978,13 +978,13 @@ class Deploy:
                 json.dump(rec, f)
             self.worker_host[wid.removeprefix("wrk_").replace("-", "")] = p["host"]
             self.worker_ids.append(wid)
-        deadline = time.monotonic() + 180
+        deadline = time.monotonic() + cap(180)
         while True:
             live = {w["id"] for w in self.get("/admin/workers?pool=shared")["workers"] if w.get("connected")}
             if set(self.worker_ids) <= live:
                 return
             if time.monotonic() > deadline:
-                raise RuntimeError(f"workers not connected within 180s: {sorted(set(self.worker_ids) - live)}")
+                raise RuntimeError(f"workers not connected in time: {sorted(set(self.worker_ids) - live)}")
             time.sleep(1)
 
     def up_fleet(self):
@@ -1018,8 +1018,10 @@ class Deploy:
         wait the retry_after_ms it names (1 s if none) and send again, counting retries for the run's record."""
         data = None if body is None else json.dumps(body).encode()
         deadline = time.monotonic() + 300
-        # A controller that is restarted by a scenario refuses connections for a moment: wait for it, bounded.
-        down_deadline = time.monotonic() + cap(120)
+        # Only a rehearsal waits for a refused connection (its fake controller restarts under a call). A real run
+        # fails at once: a crashed controller must not be waited on inside a timed window such as intake()'s ack,
+        # and a POST must not be sent twice after a lost answer.
+        down_deadline = time.monotonic() + (cap(120) if REHEARSAL else 0)
         while True:
             req = urllib.request.Request(self.api + path, data=data, method=method)
             req.add_header("authorization", f"Bearer {token or self.token}")

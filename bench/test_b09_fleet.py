@@ -251,5 +251,43 @@ class HostLock(unittest.TestCase):
                 f.close()
 
 
+class RefusedConnection(unittest.TestCase):
+    """A real run fails at once on a refused connection; only a rehearsal waits for a restarting fake controller."""
+
+    def deploy_on_a_closed_port(self):
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        d = h.Deploy.__new__(h.Deploy)
+        d.api, d.token = f"http://127.0.0.1:{port}/api/v1", "t"
+        return d
+
+    def test_a_real_run_does_not_wait_for_a_refused_connection(self):
+        d = self.deploy_on_a_closed_port()
+        saved = h.REHEARSAL
+        h.REHEARSAL = False
+        try:
+            t0 = time.monotonic()
+            with self.assertRaises(Exception):
+                d.call("GET", "/x", timeout=2)
+            self.assertLess(time.monotonic() - t0, 1.5, "no retry window in a real run")
+        finally:
+            h.REHEARSAL = saved
+
+    def test_a_rehearsal_waits_for_a_refused_connection_up_to_its_cap(self):
+        d = self.deploy_on_a_closed_port()
+        saved = (h.REHEARSAL, h.REHEARSAL_CAP_S)
+        h.REHEARSAL, h.REHEARSAL_CAP_S = True, 1.0
+        try:
+            t0 = time.monotonic()
+            with self.assertRaises(Exception):
+                d.call("GET", "/x", timeout=2)
+            self.assertGreaterEqual(time.monotonic() - t0, 0.9)
+        finally:
+            h.REHEARSAL, h.REHEARSAL_CAP_S = saved
+
+
 if __name__ == "__main__":
     unittest.main()
