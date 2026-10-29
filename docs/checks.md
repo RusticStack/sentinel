@@ -170,6 +170,10 @@ Retries, refusals and rate limits are explicit:
   rows, each read asking for that many extra rows) and goes on with the rest;
   the first two failed passes still stop the batch, because a store that is
   failing for every row must not have the lane publish rows it cannot record.
+  The row keeps its strikes while it is left out, so when the minute lapses it
+  goes straight back to the parking write and a row that stays unwritable costs
+  no further stopped batches; it is retried once a minute for as long as it
+  stays unwritable.
   Transient store faults back off the lane without counting toward a row's
   quarantine. A generation that moved under the publisher is simply re-read;
 - **what is logged**: a quarantined row (`checks_quarantined`), undecodable rows
@@ -318,7 +322,9 @@ schedule.
   (`github_events::next_due_ms`, `github_members::next_due_ms`, one read of the
   head of the `next_ms` index) falls due; a commit wakes them at most once per
   250 ms, and `Config::idle` (2 s by default) is only the longest sleep without
-  a read.
+  a read. When a commit has already landed since the last read, the earliest-row
+  read is skipped, so a store that commits constantly costs a lane one read per
+  250 ms, as the fixed poll did. The delivery lane waits the same way.
 
 A rerequest resets each job with a compare-and-set on the full terminal state,
 fence and cancellation snapshot it just read; the run cancellation flag is
