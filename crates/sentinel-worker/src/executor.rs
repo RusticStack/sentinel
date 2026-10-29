@@ -494,6 +494,8 @@ pub struct Inner {
     budgets: Mutex<StorageBudgets>,
     image_swept: Mutex<Option<std::time::Instant>>,
     leftover_swept: Mutex<Option<Instant>>,
+    /// A leftover pass is running on its own thread, so the watchdog starts no second one and never waits for it.
+    leftover_reaping: std::sync::atomic::AtomicBool,
     /// Attempts whose leftover tree already raised a notice, so a tree that stays stuck does not repeat it.
     leftover_reported: Mutex<HashSet<AttemptId>>,
     /// A sandbox removal failed since the last container pass, so a pass is worth its `podman ps`.
@@ -659,7 +661,7 @@ impl Executor {
                 while let Some(inner) = watched.upgrade() {
                     inner.watch_lease();
                     inner.watch_specs();
-                    inner.reap_leftovers_due();
+                    Inner::spawn_reaper(&inner);
                     drop(inner);
                     thread::sleep(WATCHDOG_INTERVAL);
                 }
@@ -716,6 +718,7 @@ impl Executor {
             budgets: Mutex::new(StorageBudgets::default()),
             image_swept: Mutex::new(None),
             leftover_swept: Mutex::new(None),
+            leftover_reaping: std::sync::atomic::AtomicBool::new(false),
             leftover_reported: Mutex::new(HashSet::new()),
             sandbox_leak: std::sync::atomic::AtomicBool::new(false),
             recovered,
@@ -916,6 +919,8 @@ impl Executor {
             let mut state = self.state();
             let canceled = state.starting.remove(&offer.attempt).unwrap_or(false);
             if state.draining {
+                drop(state);
+                logs.discard();
                 return;
             }
             cancel.store(canceled, Ordering::Release);
@@ -946,6 +951,7 @@ impl Executor {
         // attempt must run in the same one. A store that cannot be prepared fails the attempt; it never falls back.
         let Ok(store) = attempt::store_for(&self.root, &secret_bundle, context.tenant) else {
             self.state().live.remove(&offer.attempt);
+            logs.discard();
             self.send(
                 offer.attempt,
                 offer.fence,
@@ -978,6 +984,7 @@ impl Executor {
         // A crash after this point must leave a marker for recovery, so an unwritable marker means the attempt must not start.
         if recovery::mark(&self.root, offer.attempt, offer.fence).is_err() {
             self.state().live.remove(&offer.attempt);
+            logs.discard();
             self.send(
                 offer.attempt,
                 offer.fence,
@@ -986,6 +993,7 @@ impl Executor {
             );
             return;
         }
+        let unstarted = Arc::clone(&logs);
         let spawned = thread::Builder::new()
             .name(format!("sentinel-attempt-{}", offer.attempt))
             .spawn(move || {
@@ -1048,6 +1056,7 @@ impl Executor {
         if spawned.is_err() {
             self.state().live.remove(&offer.attempt);
             recovery::unmark(&self.root, offer.attempt);
+            unstarted.discard();
             self.send(
                 offer.attempt,
                 offer.fence,
@@ -1244,21 +1253,46 @@ impl Inner {
             || state.starting.contains_key(&attempt)
     }
 
+    /// Whether a leftover pass is due, and if so claims it: at most one pass at a time, and at most one per
+    /// [`LEFTOVER_SWEEP_EVERY`]. The claim is released by [`ReapDone`].
+    fn claim_leftover_pass(&self) -> bool {
+        use std::sync::atomic::Ordering::AcqRel;
+        let mut swept = self
+            .leftover_swept
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if swept.is_some_and(|at| at.elapsed() < LEFTOVER_SWEEP_EVERY) {
+            return false;
+        }
+        if self.leftover_reaping.swap(true, AcqRel) {
+            return false;
+        }
+        *swept = Some(Instant::now());
+        true
+    }
+
     /// The leftover pass, at most every [`LEFTOVER_SWEEP_EVERY`]: a tree a finished attempt could not remove would
     /// otherwise hold its disk until the next start, and a worker short of disk refuses the very offers whose
-    /// attempts would have run the sweep.
-    fn reap_leftovers_due(&self) {
-        {
-            let mut swept = self
-                .leftover_swept
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if swept.is_some_and(|at| at.elapsed() < LEFTOVER_SWEEP_EVERY) {
-                return;
-            }
-            *swept = Some(Instant::now());
+    /// attempts would have run the sweep. Started on a thread of its own when one is due. Removing a large or hostile tree can
+    /// take minutes, and the watchdog loop that calls this also notices a lost lease and answers spec waits,
+    /// so it never waits for the pass. The thread holds the executor only weakly.
+    fn spawn_reaper(inner: &Arc<Inner>) {
+        if !inner.claim_leftover_pass() {
+            return;
         }
-        self.reap_leftovers();
+        let watched = Arc::downgrade(inner);
+        let spawned = thread::Builder::new()
+            .name("sentinel-leftover-reaper".into())
+            .spawn(move || {
+                if let Some(inner) = watched.upgrade() {
+                    let _done = ReapDone(&inner);
+                    inner.reap_leftovers();
+                }
+            });
+        if spawned.is_err() {
+            // No thread now: release the claim; the pass is due again after the interval.
+            drop(ReapDone(inner));
+        }
     }
 
     /// Removes the workspaces and job `/tmp` directories of attempts that are no longer running, and the
@@ -2010,6 +2044,29 @@ impl LinkExecutor for Executor {
     }
 }
 
+/// Releases the claim on the leftover pass when the pass ends, however it ends, and counts the interval from
+/// the end: a pass longer than the interval is not followed at once by another.
+struct ReapDone<'a>(&'a Inner);
+
+impl ReapDone<'_> {
+    fn release(&self) {
+        self.0
+            .leftover_reaping
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for ReapDone<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .leftover_swept
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+        self.release();
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
         for live in self.state().live.values() {
@@ -2286,6 +2343,14 @@ mod bookkeeping_tests {
         (executor, notices)
     }
 
+    /// The watchdog's decision to run a pass, with the pass run on the calling thread.
+    fn reap_due_now(executor: &Executor) {
+        if executor.claim_leftover_pass() {
+            let _done = ReapDone(executor);
+            executor.reap_leftovers();
+        }
+    }
+
     fn plant(root: &Path, attempt: AttemptId) {
         let ws = crate::workspace::Workspace::create(root, attempt).unwrap();
         ws.create_tmp().unwrap();
@@ -2353,14 +2418,61 @@ mod bookkeeping_tests {
         let (executor, _) = executor(dir.path());
         let (first, second) = (AttemptId::new(), AttemptId::new());
         plant(dir.path(), first);
-        executor.reap_leftovers_due();
+        reap_due_now(&executor);
         assert!(!exists(dir.path(), first));
         plant(dir.path(), second);
-        executor.reap_leftovers_due();
+        reap_due_now(&executor);
         assert!(
             exists(dir.path(), second),
             "a second pass ran inside the interval"
         );
+    }
+
+    #[test]
+    fn a_pass_in_progress_is_never_joined_by_a_second_one_and_the_watchdog_does_not_wait() {
+        use std::sync::atomic::Ordering::Acquire;
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, _) = executor(dir.path());
+        let left = AttemptId::new();
+        plant(dir.path(), left);
+        // A long pass holds the claim (as a deletion of millions of files would) ...
+        assert!(executor.claim_leftover_pass());
+        *executor.leftover_swept.lock().unwrap() = None;
+        // ... so the watchdog's tick returns at once, starts nothing, and leaves the tree for the running pass.
+        Inner::spawn_reaper(&executor.0);
+        assert!(exists(dir.path(), left), "a second pass started");
+        assert!(executor.leftover_reaping.load(Acquire));
+        // When the pass ends, the claim is released and the interval counts from that moment.
+        drop(ReapDone(&executor));
+        assert!(!executor.leftover_reaping.load(Acquire));
+        assert!(
+            !executor.claim_leftover_pass(),
+            "the interval restarts at the end of a pass"
+        );
+    }
+
+    #[test]
+    fn the_watchdog_hands_a_due_pass_to_a_thread_of_its_own() {
+        use std::sync::atomic::Ordering::Acquire;
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, notices) = executor(dir.path());
+        let left = AttemptId::new();
+        plant(dir.path(), left);
+        Inner::spawn_reaper(&executor.0);
+        let until = Instant::now() + Duration::from_secs(20);
+        while (exists(dir.path(), left) || executor.leftover_reaping.load(Acquire))
+            && Instant::now() < until
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!exists(dir.path(), left), "the pass never ran");
+        assert_eq!(*notices.lock().unwrap(), vec!["reaped 1".to_string()]);
+        // Not due again inside the interval.
+        let again = AttemptId::new();
+        plant(dir.path(), again);
+        Inner::spawn_reaper(&executor.0);
+        thread::sleep(Duration::from_millis(100));
+        assert!(exists(dir.path(), again));
     }
 
     #[test]
@@ -2497,6 +2609,47 @@ mod bookkeeping_tests {
         assert!(
             recovery::leftovers(dir.path()).unwrap().is_empty(),
             "no marker for an attempt that never started"
+        );
+        drop(state);
+        assert!(
+            crate::spool::Spool::leftovers(dir.path())
+                .unwrap()
+                .is_empty(),
+            "the spool of an attempt that never started stayed until the next process start"
+        );
+    }
+
+    #[test]
+    fn an_offer_that_arrives_while_draining_leaves_no_spool_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, _) = executor(dir.path());
+        executor.state().draining = true;
+        let offer = Offer {
+            attempt: AttemptId::new(),
+            tenant: TenantId::new(),
+            run: RunId::new(),
+            job: JobId::new(),
+            fence: Fence(1),
+            lease_until: UnixMillis(i64::MAX),
+            cpu_millis: 1000,
+            memory_bytes: 128 << 20,
+            image_digest: format!("sha256:{}", "0".repeat(64)),
+            image_platform: "linux/amd64".into(),
+            job_index: 0,
+        };
+        executor.spawn(
+            offer,
+            spec(),
+            context(None),
+            0,
+            Vec::new(),
+            registry_bundle(),
+        );
+        assert!(executor.state().live.is_empty());
+        assert!(
+            crate::spool::Spool::leftovers(dir.path())
+                .unwrap()
+                .is_empty()
         );
     }
 }
