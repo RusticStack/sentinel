@@ -1,4 +1,4 @@
-# Cache and environment recipes (K07)
+# Cache and environment recipes
 
 Nine tested recipes under [fixtures/recipes](../fixtures/recipes) show how
 to wire a toolchain's caches into Sentinel's three cache classes. Each

@@ -28,9 +28,9 @@ sentinel admin policy show --data-dir <PATH>
 sentinel admin policy set --data-dir <PATH> --registration approval-required
 ```
 
-## Host admission and placement (Q12)
+## Host admission and placement
 
-Everything above admits people. Admitting *work* onto a machine is a separate decision and belongs to the controller alone; the detail is in [worker link](worker-link.md#host-policy-is-the-controllers-q12) and the routes are in [API](api.md).
+Everything above admits people. Admitting *work* onto a machine is a separate decision and belongs to the controller alone; the detail is in [worker link](worker-link.md#host-policy-is-the-controllers) and the routes are in [API](api.md).
 
 - **Ceilings are approved, never claimed.** Per machine the controller stores a CPU, memory and disk ceiling (each optional) and an operator priority (-100..100). The worker only reports its size; the size the controller offers is the report under the ceilings, so a worker that claims more than its approval is offered the approval. Ceilings count once per physical host, across every worker identity on it, and a clone of a worker's identity does not add capacity.
 - **Order, not eligibility.** A job first passes hard admission per worker (pool and tenant access, architecture, OS, isolation, labels, secrets, disk, CPU and memory under the ceilings, drain). Only then are the eligible hosts ordered: by expected finish (`placement_order = "fastest"`, the default, see [configuration](configuration.md)) or by priority first and then expected finish (`"priority"`). Priority therefore never makes a host eligible for a job it could not hold, and it is separate from the tenant, repository and job fairness that decides whose job is next.

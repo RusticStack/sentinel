@@ -1,6 +1,6 @@
 # Bounded filesystem hashing
 
-`sentinel-pipeline::hash_files::hash_files` implements the worker-phase resolver; `resolve_paths` exposes the same confined walk without content hashing, and artifact capture uses it so workspace publication inherits every guarantee below. Expression grammar, event/ref filters, concurrency/dependency conditions and placement rules remain in [pipeline schema](pipeline-schema.md#expressions-c06).
+`sentinel-pipeline::hash_files::hash_files` implements the worker-phase resolver; `resolve_paths` exposes the same confined walk without content hashing, and artifact capture uses it so workspace publication inherits every guarantee below. Expression grammar, event/ref filters, concurrency/dependency conditions and placement rules remain in [pipeline schema](pipeline-schema.md#expressions).
 
 ## Limits and resource cost
 

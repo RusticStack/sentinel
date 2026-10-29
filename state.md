@@ -53,7 +53,7 @@ suites.
 4. B09 reliability and performance runs (needs Q13 and a quiet host).
 5. Remaining Part 14 measurements (B04a, B05, B06, B07 support work).
 6. B11, the Blacksmith comparison. **Blocked by: Blacksmith benchmark access.**
-7. Close Part 24, then Part 15 release qualification (V01 also needs a Windows
+7. Close Part 24 (the code-fixable open items were reconciled on 2026-10-29, uncommitted until the owner asks; what remains is RW11 and the host-window, KVM/Podman and owner-decision items in TODO.md), then Part 15 release qualification (V01 also needs a Windows
    verification host for the CLI smoke test).
 
 After v0.1: Part 25 (runner mode) first, then Part 21; Part 23's Windows guests before

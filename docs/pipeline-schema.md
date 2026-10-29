@@ -1,4 +1,4 @@
-# Pipeline schema 1 (C04)
+# Pipeline schema 1
 
 `crates/sentinel-pipeline` turns a `.sentinel.yml` into a compiled, immutable pipeline in three stages, each strict: bounded YAML loading, typed decoding, deterministic compilation. Anything the schema does not define is an error, never a silent no-op, so a repository can only rely on behaviour Sentinel implements. Fixtures live under [`fixtures/pipelines`](../fixtures/pipelines); every valid one must compile and every invalid one must fail with the message in its `# expect:` header.
 
@@ -118,7 +118,7 @@ The compiler validates cross-job references and produces a canonical form:
 - Jobs are sorted by name, then ordered by Kahn's algorithm with a name-ordered ready set, so the execution order is a pure function of the DAG and does not change when unrelated jobs are edited. `needs` become ascending indices into that order, every one smaller than the job's own index.
 - A 128-bit digest over the canonical form identifies the compiled pipeline. Reordering job declarations or `needs` lists yields the same digest; any semantic change yields a different one. The digest is FNV-1a, for equality only, never for trust.
 
-## Run specification (C05)
+## Run specification
 
 > Execution admission: a job's image digest **and** platform must be durably recorded on the job (`runs::resolve_image`, migration 12) before `jobs::lease` will hand it to a worker; a tag-only or digest-only reference is not executable.
 
@@ -130,7 +130,7 @@ The spec is persisted as one format byte plus a postcard-encoded blob in the sto
 
 `RunSpec::step_command(job, step)` derives the exact process a worker runs: argv, merged environment and working directory, plus the effective timeout (step timeout, else job timeout).
 
-## Expressions (C06)
+## Expressions
 
 `${{ … }}` in templates and the `if:` keys use one bounded grammar, parsed once at compile time into an AST stored with the run spec:
 
@@ -170,7 +170,7 @@ Templates render each interpolation as string, integer or boolean; `null` is an 
 
 The [resolver contract](hash-files.md) provides streaming directory enumeration, shared traversal and depth budgets, actual read accounting, and descriptor-rooted no-symlink/no-mount access. Matching symlinks and special files fail closed; filesystem failures are not silently treated as absent input. Secure resolution requires Linux `openat2` and host procfs; other platforms return `UnsupportedPlatform`. Portable offline validation/explanation still reports runtime hashes as unresolved.
 
-## Bindings and offline validation (C07)
+## Bindings and offline validation
 
 Three kinds of binding connect a job to state outside its container, and each is declared by name so grants can be checked before anything runs:
 

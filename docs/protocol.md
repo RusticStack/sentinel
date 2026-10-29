@@ -1,4 +1,4 @@
-# Protocol contracts (C03)
+# Protocol contracts
 
 `crates/sentinel-protocol` holds the shapes every transport shares: the HTTP API used by the CLI, MCP and web UI, and the worker session. It is pure types and functions; no transport code lives here. Everything is bounded and fixed-size where possible so parsing never allocates on the hot path.
 

@@ -10,7 +10,7 @@ The operator's view of adding a machine to the fleet and taking it out again (Q1
 | whether the secret is valid, unspent and unexpired | whether it can run a worker at all (refused before the secret is spent) |
 | whether the identity is already taken | its own labels, `job_network` and isolation settings |
 
-A worker can state what it has; it can never raise what the controller approved. Priority only orders hosts that already pass hard admission (ownership, architecture, OS, isolation, capacity); it cannot widen the set ([worker link](worker-link.md#host-policy-is-the-controllers-q12)).
+A worker can state what it has; it can never raise what the controller approved. Priority only orders hosts that already pass hard admission (ownership, architecture, OS, isolation, capacity); it cannot widen the set ([worker link](worker-link.md#host-policy-is-the-controllers)).
 
 ## Add a machine
 

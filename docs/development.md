@@ -61,7 +61,7 @@ cargo test-linux
 cargo release-linux
 ```
 
-`cargo run -p sentinel -- pipeline validate <file>` and `pipeline explain <file> [--json]` check a `.sentinel.yml` offline on any platform (see [pipeline schema](pipeline-schema.md#bindings-and-offline-validation-c07)). `cargo bench-noop --help` runs the benchmark runner in release mode; see [Benchmarking](benchmarking.md). `cargo probe --help` runs the feasibility probes; see [feasibility probes](feasibility-probes.md).
+`cargo run -p sentinel -- pipeline validate <file>` and `pipeline explain <file> [--json]` check a `.sentinel.yml` offline on any platform (see [pipeline schema](pipeline-schema.md#bindings-and-offline-validation)). `cargo bench-noop --help` runs the benchmark runner in release mode; see [Benchmarking](benchmarking.md). `cargo probe --help` runs the feasibility probes; see [feasibility probes](feasibility-probes.md).
 
 After renaming a heading or moving a file under `docs/`, run `scripts/check-doc-links.sh` (no build needed): it fails on any Markdown link to a missing file or heading anchor in `README.md`, `AGENTS.md`, `plan.md`, `TODO.md` and `docs/*.md`. Name headings for what they describe, not for the tracker item that introduced them; anchors are public.
 
