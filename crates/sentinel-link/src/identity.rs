@@ -62,7 +62,10 @@ impl Identity {
         cert_path: &Path,
         key_path: &Path,
     ) -> Result<(Identity, Origin)> {
-        let (has_cert, has_key) = (cert_path.exists(), key_path.exists());
+        let (has_cert, has_key) = (
+            present(cert_path, "certificate")?,
+            present(key_path, "private key")?,
+        );
         if has_cert && has_key {
             return Ok((Identity::load(cert_path, key_path)?, Origin::Loaded));
         }
@@ -89,6 +92,18 @@ impl Identity {
         let key = PrivateKeyDer::from_pem_file(key_path)
             .map_err(|e| Error::Identity(format!("key: {e}")))?;
         Ok(Identity { cert, key })
+    }
+}
+
+/// Whether `path` names anything, links not followed. Only "not found" means absent: a failure to look (a
+/// permission or I/O error, a symbolic-link loop) is an error, never a missing file, because a lone key is deleted
+/// and replaced and a failed look at the certificate must not destroy an enrolled identity. A dangling link is
+/// present, and loading it then fails without touching the key.
+fn present(path: &Path, what: &str) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Error::Identity(format!("cannot inspect the {what}: {e}"))),
     }
 }
 
@@ -235,6 +250,42 @@ mod tests {
         assert_eq!(
             Identity::load(&cert, &key).unwrap().fingerprint(),
             identity.fingerprint()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stat_error_on_the_certificate_is_not_a_missing_certificate() {
+        let dir = scratch("stat-error");
+        let (cert, key) = (dir.join("worker.crt"), dir.join("worker.key"));
+        Identity::generate("w").unwrap().save(&cert, &key).unwrap();
+        let enrolled = std::fs::read(&key).unwrap();
+        // The certificate is a link to nothing, as a secrets mount that has not come up would leave it.
+        std::fs::remove_file(&cert).unwrap();
+        std::os::unix::fs::symlink(dir.join("gone"), &cert).unwrap();
+        let error = Identity::load_or_generate("w", &cert, &key).unwrap_err();
+        assert!(matches!(error, Error::Identity(_)));
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            enrolled,
+            "the enrolled key was deleted"
+        );
+        // A link loop makes the look itself fail with something other than not-found.
+        std::fs::remove_file(&cert).unwrap();
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        let nested = dir.join("a/worker.crt");
+        let error = Identity::load_or_generate("w", &nested, &key).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot inspect the certificate"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            enrolled,
+            "the enrolled key was deleted"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
