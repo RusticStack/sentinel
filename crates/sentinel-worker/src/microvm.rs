@@ -1930,10 +1930,6 @@ fn canceled_start() -> Error {
     Error::Preparation("microVM start canceled".into())
 }
 
-/// The Firecracker configuration of one VM. The guest gets the image (read-only), its scratch disk and the
-/// vsock the agent speaks on; no CPU template or custom CPU configuration, so the guest sees no hardware
-/// virtualization (`/dev/kvm` and nested KVM stay off). A network interface is attached only to a guest the
-/// worker granted egress; nothing else is.
 /// The CPU configuration of every guest (Firecracker's custom CPU template, a file in the VM's directory):
 /// the CPUID bits that advertise hardware virtualization, VMX (leaf 1, ECX bit 5) and SVM (leaf 0x8000_0001,
 /// ECX bit 2), are cleared, so a guest on a host with nested virtualization enabled sees neither. A bit the
@@ -1961,6 +1957,10 @@ pub(crate) const CPU_CONFIG: &str = r#"{
 }
 "#;
 
+/// The Firecracker configuration of one VM. The guest gets the image (read-only), its scratch disk, the vsock
+/// the agent speaks on and the CPU configuration above, so it sees no hardware virtualization (`/dev/kvm` and
+/// nested KVM stay off). A network interface is attached only to a guest the worker granted egress; nothing
+/// else is.
 fn vm_config(shape: &snapshot::Shape) -> serde_json::Value {
     let mut config = serde_json::json!({
         "boot-source": {
