@@ -31,7 +31,8 @@ function eventStream(request: Request, body: (push: (e: { event?: string; id?: s
 }
 
 // The controller refuses a park (429) before it waits and states when to ask again, so the retry follows that figure
-// with no growth. Only a network error or a 5xx has no figure and backs off exponentially.
+// with no growth. A network error, a 5xx and a 429 that states no figure (a proxy's, not the controller's) have none to
+// follow and back off exponentially, so an unannotated refusal never retries at a fixed rate for good.
 export const tuning = { minRetryMs: 250, maxBackoffMs: 15000, parkedProofMs: 1000 };
 
 type Answer = { status: number; body: any };
@@ -41,8 +42,9 @@ export function pause(answer: Answer | null, backoff: number, random: () => numb
   const jitter = 0.8 + random() * 0.4;
   if (answer?.status === 429) {
     const stated = Number(answer.body?.details?.retry_after_ms);
-    const ms = Number.isFinite(stated) && stated > 0 ? stated : backoff;
-    return { ms: Math.min(Math.max(ms, tuning.minRetryMs), tuning.maxBackoffMs) * jitter, backoff };
+    if (Number.isFinite(stated) && stated > 0) {
+      return { ms: Math.min(Math.max(stated, tuning.minRetryMs), tuning.maxBackoffMs) * jitter, backoff };
+    }
   }
   return { ms: backoff * jitter, backoff: Math.min(backoff * 2, tuning.maxBackoffMs) };
 }

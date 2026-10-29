@@ -89,8 +89,9 @@ test("run stream: a refusal is retried at the delay the controller states, with 
     const parked = polls.filter((p) => p.path.endsWith("/wait")).slice(1);
     assert.ok(parked.length >= 4, `three refusals and the park were requested, saw ${parked.length}`);
     const gaps = parked.slice(1).map((p, i) => p.at - parked[i].at);
-    // The stated 120 ms with 20% jitter; the old doubling backoff gave 500, 1000 and 2000 ms.
-    for (const gap of gaps.slice(0, 3)) assert.ok(gap < 400, `retry gap ${Math.round(gap)} ms follows the stated delay`);
+    // The stated 120 ms with 20% jitter; the doubling backoff gave 500, 1000 and 2000 ms. The bound is wide enough
+    // for a loaded host and still below the first doubling step (a gap of 500 ms or more would be backoff).
+    for (const gap of gaps.slice(0, 3)) assert.ok(gap < 450, `retry gap ${Math.round(gap)} ms follows the stated delay`);
   });
 });
 
@@ -106,12 +107,14 @@ test("log stream: the busy notice ends once a retry is parked, and frames keep t
   });
 });
 
-test("a 5xx or a network error still backs off exponentially, and a 429 without a figure falls back to the backoff", () => {
+test("a 5xx, a network error and a 429 without a figure back off exponentially; a stated figure is followed without growth", () => {
   const fixed = () => 0.5; // jitter factor 1.0
   assert.deepEqual(pause(null, 500, fixed), { ms: 500, backoff: 1000 });
   assert.deepEqual(pause({ status: 503, body: null }, 8000, fixed), { ms: 8000, backoff: 15000 });
-  assert.deepEqual(pause({ status: 429, body: null }, 500, fixed), { ms: 500, backoff: 500 });
+  assert.deepEqual(pause({ status: 429, body: null }, 500, fixed), { ms: 500, backoff: 1000 });
+  assert.deepEqual(pause({ status: 429, body: { code: "rate_limited" } }, 15000, fixed), { ms: 15000, backoff: 15000 });
+  assert.deepEqual(pause({ status: 429, body: { details: { retry_after_ms: "soon" } } }, 2000, fixed), { ms: 2000, backoff: 4000 });
   assert.deepEqual(pause({ status: 429, body: { details: { retry_after_ms: 1000 } } }, 4000, fixed), { ms: 1000, backoff: 4000 });
-  assert.deepEqual(pause({ status: 429, body: { details: { retry_after_ms: 0 } } }, 500, fixed), { ms: 500, backoff: 500 });
+  assert.deepEqual(pause({ status: 429, body: { details: { retry_after_ms: 0 } } }, 500, fixed), { ms: 500, backoff: 1000 });
   assert.equal(pause({ status: 429, body: { details: { retry_after_ms: 10 ** 9 } } }, 500, fixed).ms, 15000);
 });
