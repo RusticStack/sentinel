@@ -219,7 +219,10 @@ for (let rep = 0; rep < JUMP_REPEATS; rep++) {
   await p.close();
 }
 const works = jumps.map((j) => j.work_ms);
-record.log_jump = { lines: jumps[0].lines, rows: jumps[0].rows, repeats: jumps.length, work_ms_median: r2(pct(works, 50)), work_ms_min: r2(Math.min(...works)), work_ms_max: r2(Math.max(...works)), wall_ms_median: r2(pct(jumps.map((j) => j.wall_ms), 50)) };
+// The spread of the per-repeat values (u01): every repeat's own value is kept, with min, median, p95, max and the median absolute deviation, so a median is never read without how far the repeats lay apart.
+const spread = (xs) => { const med = pct(xs, 50); return { count: xs.length, min: r2(Math.min(...xs)), median: r2(med), p95: r2(pct(xs, 95)), max: r2(Math.max(...xs)), mad: r2(pct(xs.map((x) => Math.abs(x - med)), 50)) }; };
+const walls = jumps.map((j) => j.wall_ms);
+record.log_jump = { lines: jumps[0].lines, rows: jumps[0].rows, repeats: jumps.length, jump_seed: 7, jumps_per_repeat: JUMPS, work_ms_median: r2(pct(works, 50)), work_ms_min: r2(Math.min(...works)), work_ms_max: r2(Math.max(...works)), wall_ms_median: r2(pct(walls, 50)), work_ms_samples: works.map(r2), wall_ms_samples: walls.map(r2), work_ms_spread: spread(works), wall_ms_spread: spread(walls) };
 const errors = page.errors.filter((e) => !e.startsWith("network:"));
 record.script_errors = errors.length;
 await browser.close();
