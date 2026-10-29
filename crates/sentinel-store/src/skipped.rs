@@ -41,7 +41,8 @@ pub(crate) fn note_int(table: &'static str, key: i64) {
     note(table, key.to_string());
 }
 
-/// Rows passed over since the process started; a row that stays damaged is counted again by every pass that meets it.
+/// Rows passed over since the process started, process-wide across threads; a row that stays damaged is counted again every time a
+/// batch meets it (each round of a catch-up, each replicator tick).
 pub fn total() -> u64 {
     TOTAL.load(Ordering::Relaxed)
 }

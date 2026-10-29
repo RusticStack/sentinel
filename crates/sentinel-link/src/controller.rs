@@ -1461,7 +1461,7 @@ impl Inner {
                 rows = passed_over,
                 table = row.table,
                 key = %row.key,
-                "rows with an undecodable id were passed over; the database needs inspection"
+                "rows a maintenance batch could not read were passed over; the database or the named manifest needs inspection"
             );
         }
         true

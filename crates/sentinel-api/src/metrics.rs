@@ -426,7 +426,7 @@ pub(crate) fn render(state: &State) -> String {
     out.one(
         "sentinel_maintenance_rows_skipped_total",
         "counter",
-        "Rows a maintenance batch passed over because an id did not decode, since start; a row that stays damaged is counted at every pass.",
+        "Rows a maintenance batch passed over (an id that did not decode, or a manifest file that could not be read), since start; a row that stays damaged is counted every time a batch meets it.",
         sentinel_store::skipped::total(),
     );
     if let Some(b) = state.objects.backups() {
