@@ -1,11 +1,11 @@
 // One-click GitHub App setup (U17): a platform administrator creates the deployment's App from a manifest the
 // controller builds; tenant administrators then install it on their GitHub organization or account.
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { api, ApiError } from "../../../../lib/api.ts";
 import { act } from "../../../../lib/act.tsx";
 import { useSession } from "../../../../lib/session.ts";
-import { CREATE_REFUSAL, REACHABILITY, type GithubAppStatus, type ManifestStart } from "../../../../lib/githubApp.ts";
+import { CREATE_REFUSAL, isGithubUrl, REACHABILITY, type GithubAppStatus, type ManifestStart } from "../../../../lib/githubApp.ts";
 import { Page } from "../../../../components/Page.tsx";
 import { Alert, Badge, Button, Card, Checkbox, Field, Input } from "../../../../components/ui.tsx";
 
@@ -50,12 +50,16 @@ function GithubAppView() {
     if (!started) return;
     // The manifest is posted to GitHub by a form, as GitHub's manifest flow requires; the page policy allows only github.com as a form target here.
     setManifest(started);
-    requestAnimationFrame(() => form.current?.submit());
   }
+
+  // Submitted once the form holding the manifest is in the page: a frame callback queued by `create` can run before React has rendered it.
+  useEffect(() => { if (manifest) form.current?.submit(); }, [manifest]);
 
   async function install(slug: string) {
     const answer = await act(me, `Install on ${slug}`, () => api<{ install_url: string }>(`/api/v1/tenants/${encodeURIComponent(slug)}/github/installation-url`, { method: "POST", body: {} }), false);
-    if (answer?.install_url?.startsWith("https://")) window.location.assign(answer.install_url);
+    // HTTPS to GitHub (or a GitHub Enterprise Server); plain HTTP only to a loopback test double.
+    const target = answer?.install_url;
+    if (isGithubUrl(target)) window.location.assign(target);
   }
 
   return (

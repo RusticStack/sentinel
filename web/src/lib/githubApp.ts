@@ -51,3 +51,19 @@ export const CODE = /^[A-Za-z0-9_-]{1,128}$/;
 export const STATE = /^[A-Za-z0-9_-]{16,128}$/;
 export const INSTALLATION = /^[1-9][0-9]{0,15}$/;
 export const SETUP_ACTION = /^(install|update|request)$/;
+
+const LOOPBACK_HOST = /^(?:localhost|127\.0\.0\.1|\[::1\])$/;
+
+/**
+ * Whether the installation link the controller returned may be followed: HTTPS on any host (github.com, or a GitHub
+ * Enterprise Server), or plain HTTP only to a loopback host, which is where a test double for GitHub listens and
+ * which no one else can reach. No credentials in the address, ever.
+ */
+export function isGithubUrl(text: string | null | undefined): text is string {
+  if (typeof text !== "string") return false;
+  let url: URL;
+  try { url = new URL(text); } catch { return false; }
+  if (url.username !== "" || url.password !== "") return false;
+  if (url.protocol === "https:") return true;
+  return url.protocol === "http:" && (LOOPBACK_HOST.test(url.hostname) || url.hostname.endsWith(".localhost"));
+}

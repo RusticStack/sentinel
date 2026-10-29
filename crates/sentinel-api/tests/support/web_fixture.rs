@@ -299,6 +299,15 @@ impl Fixture {
 
     /// Sign-in checks `Origin` against `public_url`, so browser tests pass the web origin.
     pub fn serving(bulk_mib: usize, public_url: Option<String>) -> Fixture {
+        Fixture::serving_with(bulk_mib, public_url, sentinel_api::Options::default())
+    }
+
+    /// `serving` with the controller's options, such as a GitHub App setup that points at a test double.
+    pub fn serving_with(
+        bulk_mib: usize,
+        public_url: Option<String>,
+        options: sentinel_api::Options,
+    ) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let store =
             Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
@@ -467,20 +476,23 @@ impl Fixture {
             "127.0.0.1:0".parse().unwrap(),
         )
         .unwrap();
-        let server = sentinel_api::Server::start(sentinel_api::Config {
-            listen: "127.0.0.1:0".parse().unwrap(),
-            store: Arc::clone(&store),
-            logs: Arc::clone(&logs),
-            objects: Arc::clone(&objects),
-            controller: controller.handle(),
-            secret_key: Some(key),
-            sessions: local_auth::Policy::default(),
-            github_webhook_secret: None,
-            intake: None,
-            public_url,
-            github_sign_in: None,
-            trusted_proxies: sentinel_api::TrustedProxy::loopback(),
-        })
+        let server = sentinel_api::Server::start_with(
+            sentinel_api::Config {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                store: Arc::clone(&store),
+                logs: Arc::clone(&logs),
+                objects: Arc::clone(&objects),
+                controller: controller.handle(),
+                secret_key: Some(key),
+                sessions: local_auth::Policy::default(),
+                github_webhook_secret: None,
+                intake: None,
+                public_url,
+                github_sign_in: None,
+                trusted_proxies: sentinel_api::TrustedProxy::loopback(),
+            },
+            options,
+        )
         .unwrap();
         let base = format!("http://{}", server.local_addr());
 
