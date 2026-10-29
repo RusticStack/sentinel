@@ -7,7 +7,7 @@ use sentinel_core::{MailId, UnixMillis};
 pub mod lane;
 pub mod resend;
 
-pub use lane::{Batch, Config as LaneConfig, Lane, Notice};
+pub use lane::{Batch, Cause, Config as LaneConfig, Health, Lane, Notice};
 pub use resend::{ApiKey, Resend, Sender};
 
 pub struct Mail<'a> {
@@ -24,6 +24,9 @@ pub enum Failure {
         why: String,
         retry_after: Option<Duration>,
     },
+    /// The message is fine; the service refuses every message the same way (a key it will not accept, a sender it does not
+    /// know). The row is left as it is and the lane pauses, so a fixed key delivers what was queued.
+    Service(String),
     Permanent(String),
 }
 

@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sentinel_auth::{sealed::Key, secret::wipe_string};
+use sentinel_auth::sealed::Key;
 use sentinel_core::{MailId, UnixMillis};
 use sentinel_store::{
     Error as StoreError, Store,
@@ -52,6 +52,8 @@ pub struct Batch {
     pub retried: usize,
     pub abandoned: usize,
     pub entries: Vec<Notice>,
+    /// Set on the pass where the lane enters or leaves a fault, never on the passes in between.
+    pub health: Option<Health>,
 }
 
 const COMMIT_GAP: Duration = Duration::from_millis(50);
@@ -110,6 +112,58 @@ enum Written {
     Moved,
 }
 
+/// Why the lane cannot do its job right now. The row contents never appear: only the class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cause {
+    /// The outbox cannot be read.
+    StoreRead,
+    /// A settled message cannot be written back.
+    StoreWrite,
+    /// Expired and delivered rows cannot be purged.
+    Maintenance,
+    /// The mail service refuses every message the same way: the key or the sender needs the operator.
+    Service,
+}
+
+impl Cause {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Cause::StoreRead => "store_read",
+            Cause::StoreWrite => "store_write",
+            Cause::Maintenance => "maintenance",
+            Cause::Service => "service",
+        }
+    }
+}
+
+/// A change of state, reported once when it happens and not on every pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Health {
+    Degraded(Cause),
+    Recovered,
+}
+
+/// Tells the owner of the lane when its state changes.
+fn report(
+    notice: &(dyn Fn(&Batch) + Send + Sync),
+    state: &mut Option<Cause>,
+    now: Option<Cause>,
+    batch: Option<&mut Batch>,
+) {
+    if *state == now {
+        return;
+    }
+    *state = now;
+    let health = Some(now.map_or(Health::Recovered, Health::Degraded));
+    match batch {
+        Some(batch) => batch.health = health,
+        None => notice(&Batch {
+            health,
+            ..Batch::default()
+        }),
+    }
+}
+
 fn run(
     store: &Store,
     key: &Key,
@@ -121,12 +175,14 @@ fn run(
 ) {
     let mut failures: u32 = 0;
     let mut maintained: Option<Instant> = None;
+    let mut maintenance_failed = false;
+    let mut degraded: Option<Cause> = None;
     loop {
         if stop.load(Ordering::Acquire) {
             break;
         }
         if maintained.is_none_or(|at| at.elapsed() >= config.maintenance) {
-            let _ = email::purge(store, UnixMillis::now(), 256);
+            maintenance_failed = email::purge(store, UnixMillis::now(), 256).is_err();
             maintained = Some(Instant::now());
         }
         // Read before the stop flag and the outbox: a commit or a shutdown
@@ -140,12 +196,19 @@ fn run(
             Ok(due) => due,
             Err(_) => {
                 failures = failures.saturating_add(1);
+                report(notice, &mut degraded, Some(Cause::StoreRead), None);
                 wait(settled, backoff(config, failures));
                 continue;
             }
         };
         if due.is_empty() {
             failures = 0;
+            report(
+                notice,
+                &mut degraded,
+                maintenance_failed.then_some(Cause::Maintenance),
+                None,
+            );
             let deadline = wake_at(store, config, polled, maintained);
             store.changes().wait_past(seen, deadline);
             if let Some(rest) = COMMIT_GAP.min(config.idle).checked_sub(polled.elapsed()) {
@@ -156,6 +219,7 @@ fn run(
         let mut batch = Batch::default();
         let mut pause = false;
         let mut store_failed = false;
+        let mut refused_by_service = false;
         for pending in due {
             if stop.load(Ordering::Acquire) {
                 break;
@@ -165,16 +229,17 @@ fn run(
             let written: Result<Written, StoreError> = if now.0 >= pending.expires_ms {
                 settle_refused(store, id, "not delivered before it expired", now)
                     .inspect(|w| count(&mut batch, w))
-            } else if let Some(mut message) = pending.open(key) {
+            } else if let Some(message) = pending.open(key) {
                 let mail = Mail {
                     id,
                     to: &pending.recipient,
-                    subject: &message.subject,
-                    body: &message.body,
+                    subject: message.subject(),
+                    body: message.body(),
                     now,
                 };
                 let sent = transport.send(&mail);
-                wipe_string(&mut message.body);
+                // The readable copy is wiped as it drops, on every outcome.
+                drop(message);
                 let at = UnixMillis::now();
                 match sent {
                     Ok(()) => store
@@ -203,6 +268,14 @@ fn run(
                                 }
                             })
                     }
+                    // Every message would get the same answer: leave this one as it is, send nothing else this
+                    // pass, and try again after the pause. A fixed key delivers what is still queued; nothing
+                    // is given up on account of a mistake that is not the message's.
+                    Err(Failure::Service(_)) => {
+                        pause = true;
+                        refused_by_service = true;
+                        Ok(Written::Moved)
+                    }
                     Err(Failure::Permanent(why)) => {
                         settle_refused(store, id, &why, at).inspect(|w| count(&mut batch, w))
                     }
@@ -229,7 +302,20 @@ fn run(
         } else {
             failures = 0;
         }
-        if !batch.entries.is_empty() {
+        let cause = if store_failed {
+            Some(Cause::StoreWrite)
+        } else if refused_by_service {
+            Some(Cause::Service)
+        } else if maintenance_failed {
+            Some(Cause::Maintenance)
+        } else {
+            None
+        };
+        // A pause for a provider outage is not a fault of this deployment: the rows retry on their own clock.
+        if cause.is_some() || !pause {
+            report(notice, &mut degraded, cause, Some(&mut batch));
+        }
+        if !batch.entries.is_empty() || batch.health.is_some() {
             notice(&batch);
         }
         if store_failed || pause {

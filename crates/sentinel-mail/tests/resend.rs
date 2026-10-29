@@ -169,13 +169,10 @@ fn a_message_is_one_authenticated_json_post_with_an_idempotency_key() {
 }
 
 #[test]
-fn key_problems_and_rejected_messages_are_permanent() {
+fn rejected_messages_are_permanent() {
     for (status, body) in [
-        (
-            401,
-            r#"{"name":"missing_api_key","message":"ada@example.com"}"#,
-        ),
-        (403, r#"{"name":"restricted_api_key","message":"x"}"#),
+        (403, r#"{"name":"forbidden_resource","message":"x"}"#),
+        (403, "not json"),
         (400, r#"{"name":"invalid_from_address","message":"x"}"#),
         (
             422,
@@ -386,5 +383,33 @@ fn the_key_file_is_read_like_the_other_secrets() {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(ApiKey::from_file(&link).is_err());
+    }
+}
+
+#[test]
+fn key_and_sender_problems_belong_to_the_service_not_to_the_message() {
+    for (status, body) in [
+        (
+            401,
+            r#"{"name":"missing_api_key","message":"ada@example.com"}"#,
+        ),
+        (401, "not json"),
+        (403, r#"{"name":"restricted_api_key","message":"x"}"#),
+        (403, r#"{"name":"invalid_api_key","message":"x"}"#),
+        (
+            403,
+            r#"{"name":"validation_error","message":"The example.com domain is not verified"}"#,
+        ),
+    ] {
+        let (url, _) = serve(vec![reply(status, body)]);
+        let failure = failure(client(&url).deliver(&mail(MailId::new())));
+        let Failure::Service(why) = failure else {
+            panic!("{status} {body} must be the service's");
+        };
+        assert!(why.contains(&status.to_string()), "{why}");
+        assert!(
+            !why.contains("ada@example.com"),
+            "the message is not kept: {why}"
+        );
     }
 }

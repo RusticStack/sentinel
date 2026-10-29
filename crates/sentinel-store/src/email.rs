@@ -4,7 +4,7 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::{
     sealed::Key,
-    secret::{Secret, wipe_string},
+    secret::{Secret, wipe, wipe_string},
     token,
 };
 use sentinel_core::{InvitationId, MailId, TenantId, UnixMillis, UserId};
@@ -239,6 +239,21 @@ pub(crate) fn enqueue(
     message: &Outgoing<'_>,
     now: UnixMillis,
 ) -> Result<bool> {
+    if !recipient_allows(tx, message.recipient, message.kind, now)? {
+        return Ok(false);
+    }
+    enqueue_judged(tx, key, message, now)?;
+    Ok(true)
+}
+
+/// Inserts the message. The caller has already had `recipient_allows` answer yes in this transaction and has written no
+/// `mail_outbox` row since, so asking again would repeat three reads on the single writer for the same answer.
+pub(crate) fn enqueue_judged(
+    tx: &Transaction<'_>,
+    key: &Key,
+    message: &Outgoing<'_>,
+    now: UnixMillis,
+) -> Result<()> {
     let Outgoing {
         kind,
         recipient,
@@ -246,9 +261,6 @@ pub(crate) fn enqueue(
         body,
         ttl_ms,
     } = *message;
-    if !recipient_allows(tx, recipient, kind, now)? {
-        return Ok(false);
-    }
     let id = MailId::new();
     let mut plain = String::with_capacity(subject.len() + 1 + body.len());
     plain.push_str(subject);
@@ -268,7 +280,7 @@ pub(crate) fn enqueue(
             now.0.saturating_add(ttl_ms)
         ],
     )?;
-    Ok(true)
+    Ok(())
 }
 
 fn verification_message(url: &str, secret: &Secret) -> (&'static str, String) {
@@ -428,8 +440,9 @@ fn request_canonical(
     let Some((key, url)) = delivery else {
         return Ok(Requested::Undelivered);
     };
-    let (subject, body) = verification_message(&url, &secret);
-    let queued = enqueue(
+    let (subject, mut body) = verification_message(&url, &secret);
+    // `delivery` is Some only after `recipient_allows` said yes above, and minting wrote no outbox row since.
+    let queued = enqueue_judged(
         tx,
         key,
         &Outgoing {
@@ -440,12 +453,10 @@ fn request_canonical(
             ttl_ms: VERIFICATION_TTL_MS,
         },
         now,
-    )?;
-    Ok(if queued {
-        Requested::Queued
-    } else {
-        Requested::Throttled
-    })
+    );
+    wipe_string(&mut body);
+    queued?;
+    Ok(Requested::Queued)
 }
 
 fn pending_for(conn: &Connection, user: UserId) -> Result<Option<(String, Option<InvitationId>)>> {
@@ -687,20 +698,43 @@ pub struct Pending {
     sealed: Vec<u8>,
 }
 
+/// A message opened from its sealed body: one buffer, holding the subject, a newline and the body, wiped when dropped.
 pub struct Message {
-    pub subject: String,
-    pub body: String,
+    text: String,
+    split: usize,
+}
+
+impl Message {
+    pub fn subject(&self) -> &str {
+        &self.text[..self.split]
+    }
+
+    pub fn body(&self) -> &str {
+        &self.text[self.split + 1..]
+    }
+}
+
+impl Drop for Message {
+    fn drop(&mut self) {
+        wipe_string(&mut self.text);
+    }
 }
 
 impl Pending {
     pub fn open(&self, key: &Key) -> Option<Message> {
         let plain = key.open(&sealing_context(&self.id), &self.sealed).ok()?;
-        let text = String::from_utf8(plain).ok()?;
-        let (subject, body) = text.split_once('\n')?;
-        Some(Message {
-            subject: subject.to_owned(),
-            body: body.to_owned(),
-        })
+        let mut text = match String::from_utf8(plain) {
+            Ok(text) => text,
+            Err(error) => {
+                wipe(&mut error.into_bytes());
+                return None;
+            }
+        };
+        let Some(split) = text.find('\n') else {
+            wipe_string(&mut text);
+            return None;
+        };
+        Some(Message { text, split })
     }
 }
 
@@ -928,6 +962,12 @@ pub fn purge_unverified(store: &Store, now: UnixMillis, limit: u32) -> Result<us
     })
 }
 
+pub fn oldest_pending_ms(conn: &Connection) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached("SELECT MIN(created_ms) FROM mail_outbox WHERE state = 0")?
+        .query_row([], |r| r.get(0))?)
+}
+
 pub fn counts(conn: &Connection) -> Result<(i64, i64, i64)> {
     let count = |state: i64| -> Result<i64> {
         Ok(conn
@@ -992,6 +1032,47 @@ mod tests {
         assert_ne!(a, normalize_domain("notexample.com").unwrap());
         assert!(normalize_domain("com").is_err());
         assert!(normalize_domain("a@example.com").is_err());
+    }
+
+    fn pending(key: &Key, plain: &[u8]) -> Pending {
+        let id = MailId::new();
+        Pending {
+            id,
+            kind: Kind::Verification,
+            recipient: "a@example.com".into(),
+            attempts: 0,
+            expires_ms: i64::MAX,
+            sealed: key.seal(&sealing_context(&id), plain),
+        }
+    }
+
+    #[test]
+    fn a_sealed_message_opens_into_one_buffer_split_into_subject_and_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("master.key");
+        Key::create(&path).unwrap();
+        let key = Key::load(&path).unwrap();
+
+        let message = pending(&key, b"The subject\nline one\nline two\n")
+            .open(&key)
+            .unwrap();
+        assert_eq!(message.subject(), "The subject");
+        assert_eq!(message.body(), "line one\nline two\n");
+        let empty_body = pending(&key, b"Only a subject\n").open(&key).unwrap();
+        assert_eq!(
+            (empty_body.subject(), empty_body.body()),
+            ("Only a subject", "")
+        );
+
+        assert!(
+            pending(&key, b"no newline at all").open(&key).is_none(),
+            "a body without the separator is refused"
+        );
+        assert!(pending(&key, b"bad \xff utf-8\nbody").open(&key).is_none());
+        let other = dir.path().join("other.key");
+        Key::create(&other).unwrap();
+        let wrong = Key::load(&other).unwrap();
+        assert!(pending(&key, b"s\nb").open(&wrong).is_none());
     }
 
     #[test]
