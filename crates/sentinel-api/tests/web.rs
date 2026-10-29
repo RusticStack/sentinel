@@ -202,6 +202,10 @@ fn attempt_steps_report_measured_phases_and_leave_the_unmeasured_out() {
     assert_eq!((status, body["present"].as_bool()), (200, Some(false)));
     let (_, page) = get(&f, &format!("/api/v1/attempts/{beta}/logs?step=0"), &f.auth);
     assert_eq!(page["step_done"], true);
+    assert!(
+        page["next"].is_string(),
+        "a live page names its cursor: {page}"
+    );
     let (_, page) = get(
         &f,
         &format!("/api/v1/attempts/{}/logs?step=0", f.live.2),
@@ -1079,6 +1083,8 @@ fn storage_policy_is_administered_per_level_and_an_expired_log_says_so() {
     let (status, body) = get(&f, &format!("/api/v1/attempts/{alpha}/logs"), &f.auth);
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["expired_ms"], 2);
+    // `next` is optional in web/src/lib/types.ts because this reply has none.
+    assert!(body.get("next").is_none(), "{body}");
     assert_eq!(body["frames"].as_array().map(Vec::len), Some(0));
     assert_eq!(body["complete"], true);
     let (status, body) = get(

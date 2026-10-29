@@ -50,7 +50,7 @@ function LogView() {
   const job = data.run.jobs.find((j) => j.attempt === attempt) ?? null;
   const spec = data.explain && job ? data.explain.jobs.find((j) => j.name === job.name) : null;
   const stepList = spec ? spec.steps.map((s, index) => ({ index, id: s.id }))
-    : data.steps.present ? data.steps.steps!.map((s) => ({ index: s.index, id: s.id })) : [{ index: 0, id: "step 0" }];
+    : data.steps.present ? data.steps.steps.map((s) => ({ index: s.index, id: s.id })) : [{ index: 0, id: "step 0" }];
   // The current attempt's log is live until its end marker is durable.
   const complete = !job || job.log_state === "complete" || (job.terminal && job.log_state === "incomplete");
 
@@ -60,7 +60,7 @@ function LogView() {
         <TextLink to={`/runs/${runId}`} className="underline">Run {shortId(runId)}</TextLink>
         <span>attempt <code>{shortId(attempt)}</code></span>
         {job && job.attempt !== attempt ? <span>an earlier attempt</span> : null}
-        {data.steps.present && data.steps.timings_ns ? (
+        {data.steps.present ? (
           <span>{Object.entries(data.steps.timings_ns).map(([k, v]) => `${words(k)} ${fmtNs(v as number)}`).join(" · ")}</span>
         ) : null}
       </div>
@@ -73,7 +73,7 @@ function LogView() {
         <Alert color="neutral" icon="archive-x" role="status" title="This log was removed by retention"
           description={`Its storage policy kept it until ${new Date(data.expired).toUTCString()}. The run's result, its steps and their timings are still here.`} />
       ) : (
-        <LogPane key={attempt} attempt={attempt} run={runId} steps={stepList} outcomes={data.steps.present ? data.steps.steps! : null} complete={complete}
+        <LogPane key={attempt} attempt={attempt} run={runId} steps={stepList} outcomes={data.steps.present ? data.steps.steps : null} complete={complete}
           onRefused={(message) => { setRefused(message); void refreshTenants(); }} />
       )}
     </Page>
