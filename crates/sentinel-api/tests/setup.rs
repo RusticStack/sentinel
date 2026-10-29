@@ -577,6 +577,76 @@ fn an_approved_user_creates_an_organization_when_policy_allows() {
 }
 
 #[test]
+fn settings_report_github_sync_only_on_a_github_backed_organization() {
+    let f = Fixture::new(1);
+    allow_creation(&f, TenantCreation::ApprovedUsers);
+    let dana = session(&f, "dana");
+    let (status, _) = send(
+        &f,
+        "POST",
+        "/api/v1/orgs",
+        Some(json!({ "slug": "dana-gh" })),
+        &dana,
+    );
+    assert_eq!(status, 201);
+    let settings = |f: &Fixture| {
+        let (status, value) = send(f, "GET", "/api/v1/tenants/dana-gh/settings", None, &dana);
+        assert_eq!(status, 200, "{value}");
+        value
+    };
+    assert!(settings(&f).get("github_sync").is_none());
+
+    // Hand the organization to GitHub: membership now follows GitHub, confirmed at a known time, with one
+    // unanswered check that is already due.
+    let confirmed = UnixMillis::now().0 - 60_000;
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE tenants SET membership_source = 1 WHERE slug = 'dana-gh'",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE memberships SET synced_ms = ?1
+                 WHERE tenant_id = (SELECT id FROM tenants WHERE slug = 'dana-gh')",
+                [confirmed],
+            )?;
+            tx.execute(
+                "INSERT INTO github_member_checks(tenant_id, user_id, next_ms, attempts)
+                 SELECT tenant_id, user_id, 1, 2 FROM memberships
+                 WHERE tenant_id = (SELECT id FROM tenants WHERE slug = 'dana-gh')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let value = settings(&f);
+    assert_eq!(value["membership"], "github", "{value}");
+    assert_eq!(
+        value["github_sync"],
+        json!({ "confirmed_ms": confirmed, "check_due": true, "unanswered": 2 }),
+        "{value}"
+    );
+    // Only the numbers a member needs: no check cursor, sequence or login leaks into the answer.
+    assert_eq!(value["github_sync"].as_object().unwrap().len(), 3);
+
+    // A check scheduled for later is not due.
+    f.store
+        .writer()
+        .write(|tx| {
+            tx.execute(
+                "UPDATE github_member_checks SET next_ms = ?1, attempts = 0",
+                [UnixMillis::now().0 + 3_600_000],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let value = settings(&f);
+    assert_eq!(value["github_sync"]["check_due"], false, "{value}");
+    assert_eq!(value["github_sync"]["unanswered"], 0, "{value}");
+}
+
+#[test]
 fn organization_creation_needs_a_browser_session_and_a_budget() {
     let f = Fixture::new(1);
     allow_creation(&f, TenantCreation::ApprovedUsers);
