@@ -31,6 +31,19 @@ fn help_and_version_are_available_without_side_effects() {
 }
 
 #[test]
+fn auth_login_help_names_the_credential_store_setting_and_its_values() {
+    let output = invoke(&["auth", "login", "--help"]);
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("SENTINEL_CREDENTIAL_STORE"), "{help}");
+    assert!(
+        help.contains("\"file\"") && help.contains("\"os\""),
+        "{help}"
+    );
+    assert!(help.contains("not a force"), "{help}");
+}
+
+#[test]
 fn missing_or_invalid_commands_are_usage_errors() {
     for args in [
         vec![],
