@@ -906,3 +906,51 @@ fn repo_authorization_runs_the_same_keyed_probe_for_present_and_absent_objects()
         })
         .unwrap();
 }
+
+#[test]
+fn platform_admin_is_not_a_tenant_member_for_uploads_and_secret_metadata() {
+    use sentinel_store::secrets::{self, Scope};
+    let (_dir, store, i) = fixture();
+    store
+        .read(|c| {
+            // `root` is a platform administrator with no membership in org-a or org-b.
+            for write in [false, true] {
+                missing(auth::require_tenant_member(
+                    c,
+                    principal(i.root),
+                    i.a,
+                    write,
+                ));
+                missing(auth::require_tenant_member(
+                    c,
+                    principal(i.root),
+                    i.b,
+                    write,
+                ));
+            }
+            missing(secrets::authorize(
+                c,
+                principal(i.root),
+                Scope::Tenant(i.a),
+                false,
+            ));
+            // Platform administration of a tenant stays on the audited override.
+            auth::require_tenant_admin(c, principal(i.root), i.a)?;
+            // Memberships still decide: reader reads, operator writes, a service account of the
+            // tenant counts, and a member of another tenant does not.
+            auth::require_tenant_member(c, principal(i.alice), i.a, true)?;
+            auth::require_tenant_member(c, principal(i.bob), i.a, true)?;
+            auth::require_tenant_member(c, principal(i.bot), i.a, true)?;
+            auth::require_tenant_member(c, principal(i.alice), i.b, false)?;
+            missing(auth::require_tenant_member(
+                c,
+                principal(i.alice),
+                i.b,
+                true,
+            ));
+            missing(auth::require_tenant_member(c, principal(i.bot), i.b, false));
+            secrets::authorize(c, principal(i.alice), Scope::Tenant(i.a), false)?;
+            Ok(())
+        })
+        .unwrap();
+}
