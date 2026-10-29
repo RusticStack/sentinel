@@ -996,6 +996,36 @@ fn retry_at(
     )
 }
 
+/// The longest a row whose target cannot be decoded waits between passes.
+pub const PARK_MAX_MS: i64 = 60 * 60 * 1000;
+
+/// The row's target is stored in a form that cannot be decoded (a binding that is not valid JSON, a bad
+/// installation id or GitHub subject). Nothing about the person was learned, so access is neither granted nor
+/// removed and no grace clock moves: the row only waits, with the back-off of a failing pass capped at
+/// `PARK_MAX_MS`, so one bad row cannot sit at the head of the queue and hold back every other tenant's
+/// check. A pass superseded by a later request leaves the row as that request set it.
+pub fn park(tx: &Transaction<'_>, check: &Check, now: UnixMillis) -> Result<&'static str> {
+    let attempts = check.attempts.saturating_add(1);
+    let wait = crate::checks::BASE_BACKOFF_MS
+        .saturating_mul(1i64 << attempts.min(20))
+        .min(PARK_MAX_MS);
+    reschedule(
+        tx,
+        check,
+        now.0.saturating_add(wait),
+        attempts,
+        check.cursor,
+    )?;
+    Ok("parked: corrupt target")
+}
+
+/// The earliest `next_ms` among rows that owe a pass, or `None` when every row is parked or there are none.
+pub fn next_due_ms(conn: &Connection) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached("SELECT MIN(next_ms) FROM github_member_checks WHERE next_ms < ?1")?
+        .query_row([PARKED_MS], |r| r.get(0))?)
+}
+
 pub fn unreachable(
     tx: &Transaction<'_>,
     check: &Check,

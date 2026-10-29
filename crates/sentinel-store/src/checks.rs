@@ -12,7 +12,7 @@ pub const EXTERNAL_PREFIX: &str = "sentinel:";
 
 pub const MAX_ATTEMPTS: u32 = 8;
 pub const MAX_TERMINAL_ATTEMPTS: u32 = 40;
-const BASE_BACKOFF_MS: i64 = 1_000;
+pub(crate) const BASE_BACKOFF_MS: i64 = 1_000;
 const MAX_BACKOFF_MS: i64 = 5 * 60 * 1000;
 const TERMINAL_MAX_BACKOFF_MS: i64 = 15 * 60 * 1000;
 pub const MAX_DEFER_MS: i64 = 60 * 60 * 1000;
@@ -162,8 +162,9 @@ pub struct Publication {
 #[derive(Debug, Default)]
 pub struct Due {
     pub publications: Vec<Publication>,
-    /// Durable IDs whose rows could not be decoded. The batch limit bounds both vectors.
-    pub corrupt: Vec<[u8; 16]>,
+    /// Durable keys of rows that could not be decoded, exactly as stored (a damaged row may hold its key as
+    /// something other than a 16-byte blob). The batch limit bounds both vectors.
+    pub corrupt: Vec<rusqlite::types::Value>,
 }
 
 impl Due {
@@ -689,8 +690,9 @@ pub fn due(conn: &Connection, now: UnixMillis, limit: u16) -> Result<Due> {
     let mut rows = stmt.query(params![now.0, limit])?;
     let mut due = Due::default();
     while let Some(row) = rows.next()? {
-        // Keep the durable key even when the typed ID or any other column is corrupt.
-        let id = row.get(0)?;
+        // Keep the durable key even when the typed ID or any other column is corrupt, and even when the key
+        // itself is not a blob: any stored value reads as a `Value`, so one damaged row cannot fail the batch.
+        let id: rusqlite::types::Value = row.get(0)?;
         match decode_row(row) {
             Ok(fields) => match decode(fields) {
                 Ok(publication) => due.publications.push(publication),
@@ -947,10 +949,11 @@ pub fn defer(
     Ok(changed == 1)
 }
 
-/// Park an undecodable row without trusting any of its other columns, including its typed ID.
+/// Park an undecodable row without trusting any of its other columns, including its typed ID. `id` is the
+/// key as `due` returned it, so it matches the stored value whatever its type.
 pub fn defer_raw(
     tx: &Transaction<'_>,
-    id: &[u8; 16],
+    id: &rusqlite::types::Value,
     now: UnixMillis,
     until_ms: i64,
 ) -> Result<bool> {
@@ -963,6 +966,9 @@ pub fn defer_raw(
     Ok(changed == 1)
 }
 
+/// Gives rows of recent runs that exhausted their attempts another budget. The window is measured from
+/// `created_ms`, which is written once on insert: `settled_ms` moves whenever a row is refused again, so a
+/// window on it would restart on every exhaustion and a check that never publishes would be re-armed for ever.
 pub fn rearm_exhausted(tx: &Transaction<'_>, now: UnixMillis, limit: u32) -> Result<usize> {
     Ok(tx.execute(
         "UPDATE check_publications SET state = 0, reason = NULL, attempts = 0,
@@ -970,8 +976,8 @@ pub fn rearm_exhausted(tx: &Transaction<'_>, now: UnixMillis, limit: u32) -> Res
          WHERE id IN (
             SELECT id FROM check_publications
             WHERE state = 2 AND reason = 'attempts' AND status = 'completed'
-              AND settled_ms >= ?2
-            ORDER BY settled_ms DESC LIMIT ?3)",
+              AND created_ms >= ?2
+            ORDER BY created_ms DESC LIMIT ?3)",
         params![now.0, now.0.saturating_sub(REARM_WINDOW_MS), limit],
     )?)
 }

@@ -223,6 +223,7 @@ fn rerequest(
         return Ok("unknown_check".into());
     }
     let mut reran = false;
+    let mut forbidden = false;
     for id in ids {
         let run = RunId::from_bytes(id).map_err(|_| Error::Corrupt("run"))?;
         let stale:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM run_provenance p JOIN run_provenance newer ON newer.repo_id=p.repo_id AND newer.trigger=p.trigger AND newer.ref_name IS p.ref_name AND newer.pr_number IS p.pr_number AND newer.created_ms>p.created_ms WHERE p.run_id=?1)",[run.as_bytes()],|r|r.get(0))?;
@@ -238,7 +239,16 @@ fn rerequest(
             continue;
         }
         let spec = runs::get_run_spec(tx, tenant, run)?;
-        crate::sources::validate_source(tx, repo, &spec.source)?;
+        // A binding that was revoked, repointed or narrowed after the run only forbids this candidate;
+        // the others of the same head are still decided on their own. Any other failure is real damage.
+        match crate::sources::validate_source(tx, repo, &spec.source) {
+            Ok(()) => {}
+            Err(Error::Forbidden) => {
+                forbidden = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
         if jobs.len() != spec.pipeline.jobs.len() {
             return Err(Error::Corrupt("run jobs"));
         }
@@ -272,6 +282,8 @@ fn rerequest(
     }
     Ok(if reran {
         "rerequested"
+    } else if forbidden {
+        "source_not_allowed"
     } else {
         "active_or_superseded"
     }
@@ -300,6 +312,12 @@ pub struct Refresh {
 }
 pub fn due(conn: &Connection, now: UnixMillis) -> Result<Option<Refresh>> {
     Ok(conn.query_row("SELECT id,kind,seq,attempts FROM github_refresh WHERE next_ms<=?1 ORDER BY next_ms,id LIMIT 1",[now.0],|r|Ok(Refresh{id:r.get(0)?,kind:r.get(1)?,seq:r.get(2)?,attempts:r.get(3)?})).optional()?)
+}
+/// The earliest `next_ms` of any refresh row, or `None` when nothing is queued.
+pub fn next_due_ms(conn: &Connection) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached("SELECT MIN(next_ms) FROM github_refresh")?
+        .query_row([], |r| r.get(0))?)
 }
 pub const QUARANTINE_AFTER: u32 = 12;
 const QUARANTINE_MS: i64 = 60 * 60 * 1000;
