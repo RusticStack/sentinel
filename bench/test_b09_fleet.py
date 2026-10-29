@@ -158,7 +158,8 @@ class RemoteCleanup(unittest.TestCase):
 
     def start(self, parent, cfg):
         os.makedirs(parent, exist_ok=True)
-        p = subprocess.Popen(["setsid", "sh", "-c", "sleep 300", "_", cfg], stdin=subprocess.DEVNULL)
+        p = subprocess.Popen(["setsid", "sh", "-c", "sleep 300; :", "_", cfg],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.3)
         return p
 
@@ -184,7 +185,7 @@ class RemoteCleanup(unittest.TestCase):
     def test_a_reused_pid_that_is_not_our_worker_is_not_signalled(self):
         with tempfile.TemporaryDirectory() as tmp:
             parent = os.path.join(tmp, "b09-x")
-            other = subprocess.Popen(["sleep", "300"])
+            other = subprocess.Popen(["sleep", "300"], stdout=subprocess.DEVNULL)
             try:
                 rec = self.record(tmp, parent, os.path.join(parent, "w1.toml"), other.pid)
                 h.fleet_release(rec)
