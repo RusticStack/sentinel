@@ -715,6 +715,31 @@ fn is_member(f: &Fixture, tenant: sentinel_core::TenantId, user: UserId) -> bool
         .unwrap()
 }
 
+// A platform administrator reaches a tenant's data only through the audited override, not as a
+// member: beginning an upload reserves that tenant's staging space, so it needs a membership.
+#[test]
+fn a_platform_administrator_outside_a_tenant_cannot_begin_an_upload_in_it() {
+    let f = Fixture::new(1);
+    let tenant = empty_organization(&f, "uploads");
+    let root = session(&f, "root");
+    let (status, body) = send(
+        &f,
+        "POST",
+        "/api/v1/tenants/uploads/uploads",
+        Some(json!({ "len": 10, "digest": "a".repeat(64) })),
+        &root,
+    );
+    assert_eq!(status, 404, "{body}");
+    let reserved: i64 = f
+        .store
+        .read(|c| {
+            c.query_row("SELECT COUNT(*) FROM uploads", [], |r| r.get(0))
+                .map_err(sentinel_store::Error::from)
+        })
+        .unwrap();
+    assert_eq!(reserved, 0, "nothing was reserved in {tenant:?}");
+}
+
 // `admin invite create --tenant ... --role admin` is host-local and carries no step-up or reason, so it
 // must not let a platform administrator join: the invitation stays unspent for the person it is for.
 #[test]

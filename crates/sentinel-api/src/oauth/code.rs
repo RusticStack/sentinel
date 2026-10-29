@@ -107,8 +107,12 @@ fn decide(state: &State, request: &mut Request) -> Reply {
     if routes::header_value(request, "origin").is_some_and(|o| o != state.oauth.origin) {
         return html::error_page(403, "This form was submitted from another site.");
     }
-    let Ok(form) = super::read_form(request) else {
-        return html::error_page(400, "The consent form is malformed.");
+    let form = match super::read_form(request) {
+        Ok(form) => form,
+        // A form over the limit (413) or a busy body slot (503) keeps the answer `read_form`
+        // built; any other failure is a malformed consent form.
+        Err(reply @ Reply::Json(413 | 503, ..)) => return reply,
+        Err(_) => return html::error_page(400, "The consent form is malformed."),
     };
     let Some((who, csrf)) = signed_in(state, request) else {
         return html::error_page(

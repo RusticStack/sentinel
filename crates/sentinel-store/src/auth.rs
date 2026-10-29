@@ -411,6 +411,9 @@ pub fn require_tenant_admin(
     }
 }
 
+/// A membership of at least reader (write: operator) in `tenant`, held by a person or by a service
+/// account of the tenant. A platform administrator is not a member by being one: reaching a
+/// tenant's data without a membership is [`require_tenant_admin`]'s audited override.
 pub fn require_tenant_member(
     conn: &Connection,
     principal: Principal,
@@ -435,14 +438,13 @@ pub fn require_tenant_member(
         LEFT JOIN memberships m ON m.tenant_id = t.id AND m.user_id = u.id
         WHERE u.id = ?1 AND u.active = 1 AND t.active = 1
         AND (u.kind = 0 OR u.service_tenant_id = t.id)
-        AND (m.role >= ?3 OR (u.kind = 0 AND u.super_admin = 1 AND ?4)))",
+        AND m.role >= ?3)",
         )?
         .query_row(
             params![
                 principal.user.as_bytes(),
                 tenant.as_bytes(),
-                if write { 2 } else { 1 },
-                principal.permissions.contains(Permissions::PLATFORM_ADMIN)
+                if write { 2 } else { 1 }
             ],
             |r| r.get(0),
         )?;

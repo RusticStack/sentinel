@@ -60,6 +60,11 @@ All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](p
 | `PUT /tenants/{slug}/service-accounts/{usr}/repos/{name}` `{access:["read","run"], reason?}` | tenant admin, **stepped-up session** | `tenant:admin` | set the account's access to one repository of the tenant (`[]` withdraws) → `{user, repo, access}`; same step-up and `reason` rule, withdrawal included; an id that is not an active service account of the tenant (a person, another tenant's account, nobody) is the same `not_found` on this and the two routes below, so the route cannot probe which `usr_` ids exist |
 | `POST /tenants/{slug}/service-accounts/{usr}/grants` `{name, scope, repo?, expires_in_ms?, reason?}` | tenant admin, **stepped-up session** | `tenant:admin` | issue a service grant (1 h..90 d, default 30 d; never `tenant:admin`/`platform:admin`) → `201 {grant, refresh_token, expires_ms, scope}`; the `sntl_rt_` token is shown this once; same step-up and `reason` rule. Grants a person minted are revoked when that person's sessions are revoked ([step-up](step-up.md#service-credentials-minted-by-a-session)) |
 | `GET /tenants/{slug}/service-accounts/{usr}/grants` | tenant admin | `tenant:admin` | the account's grants as metadata; a revoked grant stays listed until the next maintenance purge (about ten minutes) |
+| `GET /github/app` | any signed-in credential | — | whether a GitHub App is in force and its public facts: `{configured, source ("files", "manifest" or null), app, webhook_reachable, reason, can_create, install_url}`; a platform administrator also sees `public_url`, `webhook_url` and `create_refusal` ([GitHub App](github-app.md#http-contract)) |
+| `POST /github/app/manifest` `{owner:{kind:"user"} or {kind:"organization", login}, public?}` | browser session + CSRF, platform administrator, **stepped-up** | — | begin one-click App creation → `{action_url, manifest, state, expires_ms}`; `409` with `details.reason` (`files`, `configured`, `no_public_url`, `public_url_has_path`, `no_master_key`), `403` with `details.step_up`, `400` for a bad owner; the body is at most 4 KiB |
+| `POST /github/app/conversion` `{code, state, tenant?, reason?}` | browser session + CSRF, platform administrator | — | spend the single-use state, exchange GitHub's code, seal and store the App and put it in force without a restart → `{app, install_url}`; `404` for a refused state, `409`, `502 upstream_failed` |
+| `POST /github/app/installation` `{installation_id, state, setup_action}` | browser session + CSRF | — | bind an installation GitHub reports to the tenant the state names, after the App itself confirms it → `{tenant, account}`; `404` for a refused state, `403` with `details.reason`, `409` (`bound_elsewhere`, `not_configured`), `502 upstream_failed` |
+| `POST /tenants/{slug}/github/installation-url` `{reason?}` | browser session + CSRF, tenant admin (a platform administrator outside the tenant: fresh step-up and a `reason`) | — | mint a one-time installation link → `{install_url, expires_ms}`; `404` unknown tenant, `409` `not_configured`, `400` when the `reason` is missing |
 | `POST /hooks/github` | App webhook signature | — | GitHub webhooks ([intake](intake.md)): raw-body HMAC-SHA256, delivery dedup, `push` and `pull_request` intake, `ping` probe. `not_found` until `<data_dir>/github-webhook.json` exists |
 | `POST /intake/{repo}` | repository hook secret | — | generic ref updates ([intake](intake.md)): bounded JSON, dedup, durable acceptance → `202` with the delivery id |
 | `GET /tenants/{slug}/repos` | member | `runs:read` | repositories visible to the caller; a tenant the caller has no part in is `not_found`, exactly like one that does not exist |
@@ -228,15 +233,17 @@ A body longer than its limit is `413 payload_too_large` (`details.limit_bytes`; 
 | `PUT /uploads/{upl}` chunk | 8 MiB | `MAX_UPLOAD_CHUNK` |
 | secrets: value / import | 64 KiB / 1 MiB | [secrets](secrets.md) |
 | `POST /login` | 16 KiB | `MAX_LOGIN_BODY_BYTES` |
-| `POST /setup` and the public email routes | 8 KiB | per-route constants |
-| account security routes | 4 KiB | per-route constants |
+| `POST /setup` and the email routes, public and signed-in (`/me/email`, `/invitations/accept`, a tenant's invitations) | 8 KiB | `MAX_BODY_BYTES` in `routes/setup.rs` and `routes/email.rs` |
+| account security routes | 4 KiB | `MAX_BODY_BYTES` in `routes/account.rs` |
+| GitHub App routes | 4 KiB | `MAX_BODY_BYTES` in `github_app.rs` |
+| `POST /worker-enrollments/redeem` | 2 KiB | `MAX_REDEEM_BODY_BYTES` ([worker enrollment](worker-enrollment.md)) |
 | `POST /hooks/github` | 4 MiB | `MAX_WEBHOOK_BODY_BYTES` |
 | `POST /intake/{repo}` | 64 KiB | `MAX_HOOK_BODY_BYTES` |
 | `POST /mcp` message | 2 MiB | `mcp::MAX_MESSAGE_BYTES` (larger than the API limit; MCP responses are capped separately at 8 MiB, [MCP](mcp.md)) |
-| `/oauth/*` forms and the device page | 8 KiB | `MAX_OAUTH_FORM_BYTES` (the device page answers an oversized signed-in form `400`, as an HTML page) |
+| `/oauth/*` forms and the device page | 8 KiB | `MAX_OAUTH_FORM_BYTES` (the consent form answers `413 invalid_request` in the OAuth error shape, or `503 temporarily_unavailable` when no body slot frees up; the signed-in device page answers `413` as an HTML page; any other unreadable form is `400`) |
 | `POST /oauth/register` | 16 KiB | [OAuth](oauth.md) |
 
-The unauthenticated classes read their body through the public body slots below. `every_route_class_enforces_its_own_body_limit` (`crates/sentinel-api/tests/api.rs`) sends one byte over and exactly the limit to the API, upload, login, setup, GitHub webhook, intake, MCP and OAuth token routes (`oauth_code.rs` `an_open_registration_cuts_an_oversized_body_off_at_16_kib` covers `POST /oauth/register`), and a chunked login body over the limit.
+The unauthenticated classes read their body through the public body slots below. `every_route_class_enforces_its_own_body_limit` (`crates/sentinel-api/tests/api.rs`) sends one byte over and exactly the limit to the API, upload, login, setup, GitHub webhook, intake, MCP, OAuth token and consent routes, the signed-in device page, the account security, signed-in email and invitation routes and the GitHub App routes, and a chunked login body and a chunked device-page form over the limit (the enrollment redeem route has its own test in `worker_enrollment.rs`; `oauth_code.rs` `an_open_registration_cuts_an_oversized_body_off_at_16_kib` covers `POST /oauth/register`).
 
 ## Unauthenticated bodies
 
