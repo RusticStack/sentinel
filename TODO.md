@@ -166,6 +166,12 @@ Targeted tests run on `reference-host`. Each review item ends with fixes plus fa
    - Account security and GitHub linking.
    - On a running controller: setup-token file mode 0600 and token voiding on restart.
    - RW05's `members:read` check, if X3 is available.
+6. Carried from Wave 0, tests that could not run there:
+   - Worker, rootless Podman: `tests/podman.rs`, `end_to_end`, `a_panicking_attempt_is_torn_down_and_reported`, recovery and the image integration tests against real Podman, the container reaper (`podman container exists` answering 1 for a removed container), and the sealed-directory permission-denial paths as a non-root user (the Wave 0 host account is root). Also reproduce RW04's workspace trees that other in-namespace UIDs made unreadable or undeletable: the storage guard neither counts nor removes them (`crates/sentinel-worker/src/workspace.rs`). The slice test, the only caller of `permit_any_manual_source_for_tests`, was only compile-checked.
+   - `power_cut_on_dm_flakey` (`SENTINEL_POWER_LOSS_TESTS=1`, root and dm-flakey): the log index sidecar must be durable before a seal (0.9's `LineSeek.exact`).
+   - V02: build the container and web images (`--format docker`), `podman compose --profile web up`, `podman healthcheck run`, SIGTERM, and the Quadlet generator dry run. The web image ships JavaScript dependencies with no licence inventory: decide before release.
+   - Bench: the full Python suite, `bench/smoke.sh` with `SMOKE_COMPILE=1` against release binaries, and `web/bench/web-bench.mjs` once against a live `sentinel-web` (its record spread is only syntax-checked).
+   - Refresh the generic Git timings in `docs/generic-git-verification.md` on the G08 fixtures: they have no record.
 
 **Closes, each only if its own contract holds:**
 - [ ] **C08** transitions and parser limits: malformed input, duplicates, rollback, conflicting update, crash-reopen ([compatibility](docs/compatibility.md))
@@ -177,14 +183,14 @@ Targeted tests run on `reference-host`. Each review item ends with fixes plus fa
 - [ ] **G04** Checks outbox ([checks](docs/checks.md))
 - [ ] **G08** generic Git intake on the fixtures ([generic Git verification](docs/generic-git-verification.md)); Forgejo over SSH and GitLab over HTTPS are G08a (X7)
 - [ ] **D01**, **D02** objects, uploads and reads ([storage](docs/storage.md))
-- [ ] **D04** segmented logs, indexes, replay and spool acknowledgement ([logs](docs/logs.md)); needs 0.9
+- [ ] **D04** segmented logs, indexes, replay and spool acknowledgement ([logs](docs/logs.md)); includes `power_cut_on_dm_flakey` (run 6)
 - [ ] **Q05** control and bulk priority, reconnect jitter, replay, restart reconciliation
 - [ ] **Q08** remote cache hydration
 - [ ] **Q10** the fleet placement stall: `fleet.rs` stress-run clean
 - [ ] **O02**, **O06** tokens, rotation, service grants, `doctor` ([OAuth](docs/oauth.md))
 - [ ] **O07** login, refresh races and logout on the Linux CLI; Windows leg is X2, real browser launch X7
 - [ ] **S05**, **S06**, **S07** secret binding, redaction and cleanup, the end-to-end provisioning test ([auth and secrets](docs/auth-and-secrets.md))
-- [ ] **R05** upgrades and skew ([upgrades](docs/upgrades.md)); needs 0.6's compatibility entries
+- [ ] **R05** upgrades and skew ([upgrades](docs/upgrades.md)); the compatibility entries and the rollback matrix are in and checked against the code by `tests/compat_doc.rs`
 - [ ] **R07** failure drills ([resilience](docs/resilience.md))
 - [ ] **U01–U07** Part 12, carried by Part 20's React port and its browser test; a real screen reader (U06) is a recorded limit
 
@@ -222,6 +228,15 @@ Targeted tests run on `reference-host`. Each review item ends with fixes plus fa
    - API-credential, Argon2id and session-validation timings (0.13's harness).
    - The `docs/cache.md` hydration and offer-hashing figures against `bench/b04-transfer-copies.jsonl`.
    - Spread for `bench/u01-log-view.jsonl`, which holds medians only.
+5. **Carried from Wave 0** (figures the docs now label "no record", and harnesses built but not run):
+   - `ranking_cost`, `fleet_sessions` and `fleet_load` on both trees (3c8b8e5 and the Wave 2 tree), shuffled and stamped, then set the `ranking_cost` bounds as a multiple of the recorded baseline ([worker link](docs/worker-link.md)).
+   - Whether a newer pinned Tailcat helper than v0.6.0 reloads `--allow` without a restart. It cannot be answered offline: it needs the upstream release notes or a test against that build (X4).
+   - A 20k-file cache publish with per-file syncs against one `syncfs` (`docs/cache.md`), and the K07 recipe cases with spread (`docs/benchmarking.md`): the quoted figures are single development runs.
+   - The 0.13 harnesses with a quiet-host record: auth-cost (A02/A03), store-cost, spawn-cost, `q09-fleet-load`, queue-explain, backup-drill (R04), remote-cost, the log-ack and checks-lane contracts, and `tailcat_live` (pinned Tailcat build and rootful Podman). M06's cold and restore series run back to back; interleaving them changes the test body and needs an owner decision. Optional `bench/b05_report.py` once a B05 record schema is committed.
+   - Store maintenance: backup and prune materialize every object row and rebuild path sets for every kept snapshot each interval (`crates/sentinel-store/src/backup.rs`); the backup holds the maintenance lock through the rehash of the shared store, stalling reclaim, log expiry and pressure eviction. Measure both at scale, then cut them.
+   - The checks outbox: a completed create's handle can attach to a newer generation of the row (`crates/sentinel-store/src/checks.rs`); settle it with a check against GitHub.
+   - S3 deletes go one request each; batching them (`DeleteObjects`) needs its own measurement (`crates/sentinel-store/src/replicate.rs`).
+   - Bench record hygiene: `web-bench.mjs`, `measure-profile.sh` and the m01/k07-microvm recorders keep their own record shapes (listed in `LEGACY_UNSTAMPED`); move them to the common build and host stamp when they are re-run. `p14-pilot.sh`, `b02-sentinel.sh`, `b03-latency.py`, c02, k07, k09 and r06 take no shared lock, and `b01a-github.py` still defaults to `/srv/sentinel/runs/p14.lock`: retire that lock on the hosts and move them onto `/var/tmp/sentinel-verify.lock` with `flock -o` (owner decision). `f07-storage.sh` still hardcodes `/srv/f07` and `/mnt/f07-*`, and `k02-cache-clone.sh`/`f07-storage.sh` drop the host-wide page cache as root: settle on a dedicated idle host or a lock-and-idle check.
 
 **Closes:**
 - [ ] **F06** CI baseline on the real CI topology: the Docker/integration lane internals and a concurrent probe during live CI. Without access, it stays `Blocked by` that access ([CI baseline](docs/ci-baseline.md)).
@@ -256,6 +271,11 @@ Targeted tests run on `reference-host`. Each review item ends with fixes plus fa
 - [ ] **B01a** complete and assess the revision-4 baseline and Sentinel samples (`bench/b01a-github.py`, `bench/p14-pilot.sh`), recording per lane whether it reaches 300 s ([benchmark contracts](docs/benchmark-contracts.md)).
 - [ ] **M08** the pilots' Linux lanes in microVMs against rootless Podman on the same host and caps, cold/warm/small-edit, with B03 re-measured (`bench/contracts/pilots-ci-isolation.json`, `bench/m08_overhead.py`). Publish the overhead per lane; anything beyond B09's 10 % is a bug in M04–M06.
 - [ ] **RW10 item** run the feasibility probes on bare metal for a host resource budget.
+- [ ] **Carried from Wave 0:**
+  - Commit `bench/m04-lifecycle.jsonl` from `SENTINEL_MICROVM_LIFECYCLE_OUT` (stamped with host, commit and date; `observe()` writes only name and ms today), then drop the "no record is committed" wording in [executor](docs/executor.md).
+  - Run `tests/microvm.rs` with the new sync-bound and view-clearing tests under `SENTINEL_MICROVM_TESTS=1`.
+  - `PR_SET_PDEATHSIG` still has no test of its own (a killed parent kills the helper).
+  - M01–M08 measurements: `m06-start` and the M02 boot runs skip elsewhere.
 
 ## Wave 4 — real fleet
 
@@ -279,6 +299,10 @@ Targeted tests run on `reference-host`. Each review item ends with fixes plus fa
 - [ ] **Q06**, **Q07** Tailcat helper integration and path telemetry. Helper restart, changing endpoints, NAT failure, relay-only and revoked peers, on separate real networks (X6, X7).
 - [ ] **Q09** the three-worker fleet with real executors under bursts, partitions, restarts, draining, mixed capacities and noisy tenants.
 - [ ] **B09** bursts; 1/3/10 real workers; slow and full disk; direct and relay links; network loss; restarts; noisy tenants. Use `bench/b09-harness.py run --fleet`, with `kvm-host` as controller and `reference-host` and `arm64-host` as workers. Set the noise-aware regression gate: initially 10 % p95 overhead.
+- [ ] **Carried from Wave 0:**
+  - The B09 and Q13 harnesses were run end to end only against a fake; that rehearsal is not evidence.
+  - A real Tailcat address must be absent from a live controller log (the enrollment page's canary covers the direct case; X4, X6).
+  - The enrollment page's "pool no longer active" `404` and its Tailcat node-key form have API tests but no browser scenario: the fixture has `api_url` and no way to deactivate a pool.
 
 ## Wave 5 — pilots and Blacksmith
 
@@ -316,6 +340,14 @@ Targeted tests run on `reference-host`. Each review item ends with fixes plus fa
 - [ ] **V04** dogfood Sentinel's own checks, with a recovery path independent of Sentinel.
 - [ ] **V05** release qualification with `scripts/qualify/qualify.sh` on a disposable fresh host ([qualification](docs/qualification.md)).
 - [ ] **V06** publish the support limits (every X7 item and anything unverified), the `pilots-ci` and B11 benchmarks, and the open blockers; update the [release notes](docs/release-notes.md); tag v0.1. The sub-minute claim stays unmet until B08 qualifies, and "2× Blacksmith" is never claimed before B11 passes.
+- [ ] **Wave 0 leftovers** to close or file (RW02–RW12):
+  - Provenance: a manual run's actor is stored (migration 64) but in no API answer yet; a webhook run's provider sender is not stored (text its author chose).
+  - Installation tokens held by the checks lane are wiped on drop, but the `Bearer` header strings in `sentinel-github/src/http.rs` are not, and `ureq` keeps its own copy.
+  - The 64 MiB cache budget floor is two literals (`sentinel_cache::gc::MIN_BUDGET_BYTES` and `crates/sentinel/src/service.rs`) until `sentinel` may depend on `sentinel-cache` in every build (dependency decision).
+  - Run, job, attempt, run-spec and event rows have no retention, so backup and restore time grow with them ([retention](docs/retention.md); owner decision, default none).
+  - A backup's object and manifest row reads fail closed on an undecodable id, by decision ([compatibility](docs/compatibility.md)).
+  - Web: the GitHub-only step-up state has no browser check (a session for it needs the GitHub sign-in round trip against the double); the "reconnecting" label after a 5xx is untested; the enrollment page does not edit a worker's policy after enrollment (`PUT /admin/workers/{id}/policy`, Q12 interface).
+  - Optional guard: a test that every `bench/<file>` a doc cites exists or sits in a paragraph that says "no record".
 
 ## Log
 

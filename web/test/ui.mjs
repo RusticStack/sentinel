@@ -117,7 +117,12 @@ const CONTRAST = `(() => {
   return { checked, bad: bad.slice(0, 10), count: bad.length };
 })()`;
 
-const OVERFLOW = `(() => ({ scroll: document.documentElement.scrollWidth, width: window.innerWidth }))()`;
+// On an overflow it names the widest elements that stick out, so a failure points at the cause.
+const OVERFLOW = `(() => { const width = window.innerWidth, scroll = document.documentElement.scrollWidth;
+  const wide = scroll <= width + 1 ? [] : [...document.querySelectorAll('body *')].map((e) => ({ e, right: Math.round(e.getBoundingClientRect().right) }))
+    .filter((x) => x.right > width + 1).sort((a, b) => b.right - a.right).slice(0, 5)
+    .map(({ e, right }) => e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') + '.' + String(e.className).split(' ').slice(0, 4).join('.') + ' right=' + right);
+  return { scroll, width, wide }; })()`;
 
 const FOCUS_RING = `(() => { const el = document.activeElement; if (!el || el === document.body) return null;
   const r = el.getBoundingClientRect();
@@ -1008,10 +1013,12 @@ await scenario("worker enrollment page", async () => {
     return values;
   }
 
+  const enrollmentCount = async () => (await root("GET", "/api/v1/admin/worker-enrollments")).body.enrollments.length;
+  const issuedBefore = await enrollmentCount();
   await enr.key("Enter");
   await enr.waitFor("!!document.querySelector('#stepup-code')", 10000, "step-up dialog");
   check("issuing asks a fresh session for a second factor", true);
-  check("nothing was issued before the second factor", (await root("GET", "/api/v1/admin/worker-enrollments")).body.enrollments.length === 0);
+  check("nothing was issued before the second factor", (await enrollmentCount()) === issuedBefore, { issuedBefore });
   await enr.fill("#stepup-code", cfg.password);
   await enr.key("Enter");
   const [secret, address] = await saveAndClose(2);
@@ -1124,6 +1131,14 @@ await scenario("worker enrollment page", async () => {
   check("a rate-limited issue disables the button and counts down", /Try again in \d+ s\|true/.test(label), label);
   await enr.waitFor("[...document.querySelectorAll('form[aria-label=\"Issue a worker enrollment\"] button[type=submit]')].some((b) => b.textContent.trim() === 'Issue enrollment' && !b.disabled)", 20000, "countdown over");
   check("the wait ends and the button comes back", true);
+
+  // The earlier enrollments are spent or withdrawn: issue one that stays pending for the withdraw check below.
+  await enr.eval("document.querySelector('#w-hours').focus()");
+  await enr.key("Enter");
+  await stepUpIfAsked();
+  await enr.waitFor("!!document.querySelector('[role=dialog] li')", 15000, "an enrollment issued after the wait");
+  await saveAndClose(1);
+  await enr.waitFor("[...document.querySelectorAll('main table tbody tr')].some((r) => r.textContent.includes('pending'))", 10000, "pending row");
 
   // A pending enrollment withdrawn from the page.
   const pending = async () => (await root("GET", "/api/v1/admin/worker-enrollments")).body.enrollments.filter((e) => e.state === "pending").length;
