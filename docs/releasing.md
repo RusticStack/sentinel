@@ -44,6 +44,21 @@ scripts/release/package.sh verify --out dist
 
 `assemble` takes the commit and version from the checkout it runs in, so run it at the release commit; `verify` fails when an archive's `BUILD-INFO` names another commit.
 
+## Verification record
+
+`package.sh build` and `verify` ran clean from a clean checkout of the same commit on both Linux hosts: x86_64 (12 cores, with the pinned microVM inputs; the worker package carries `microvm/`) and aarch64 (2 vCPU, about 11 minutes of release builds). On aarch64 the worker package holds a `AArch64` binary, no `microvm/` and no Firecracker or kernel file, `worker --check` accepts a configuration, and the manifest lists `tailcat` for both architectures. `worker --check` on the x86_64 host reports `microvm=unavailable: no usable /dev/kvm` because that host has no KVM; a microVM run needs a KVM host. Digests of that build (the digests change with every commit, so re-run it for a release):
+
+```
+x86_64  cli     a6ba30e0f7fe4579590257d89347b4bc77cf6933fc231a75f04b3f5ee54f5241
+x86_64  server  d6e879e8b2f6bf5b44d4a4dba3ed14bd4566c3263658728cdc4a0c067ecf048c
+x86_64  worker  31d91ad6f2ec50409cab3b0f79751780cad2a5808e0252b095cee4fc7d5d1d2d
+x86_64  agent   e50ed6de4bad3ebb6aac66caac345cb35d1f528d695eb283dd9b150eba578278
+aarch64 cli     2590f88e46630316384d6346d4198ed45ba0e7615fcf7d4824a2b395db8eef18
+aarch64 server  080bc7375c63c494a593618638e6f58c5353d9d3c84dad3b082c631a8e639540
+aarch64 worker  ef878cee1ebe5bc9b832d3ca00d8ad919c229ac3153a55984057c1d92197761a
+aarch64 agent   33d2b0d7954d2db699a52f2dc85215729243395cab9c937d926a27d17ac0ad2c
+```
+
 ## Verifying a download
 
 1. Fetch the archives you need and `SHA256SUMS` (and its signature, if the release has one) into one directory.
