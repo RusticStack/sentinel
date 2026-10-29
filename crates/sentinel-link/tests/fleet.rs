@@ -312,6 +312,30 @@ impl WorkerProcess {
         profile: Profile,
         executor: Arc<Recorder>,
     ) -> WorkerProcess {
+        Self::start_as(
+            d,
+            identity,
+            id,
+            enrollment,
+            capacity,
+            hello(),
+            profile,
+            executor,
+        )
+    }
+
+    /// The same, stating its own architecture and capabilities in the hello.
+    #[allow(clippy::too_many_arguments)]
+    fn start_as(
+        d: &Deployment,
+        identity: Identity,
+        id: WorkerId,
+        enrollment: Secret,
+        capacity: Capacity,
+        hello: Hello,
+        profile: Profile,
+        executor: Arc<Recorder>,
+    ) -> WorkerProcess {
         let handle = Arc::new(worker::Handle::new());
         let events = Arc::new(Mutex::new(Vec::new()));
         let config = worker::Config {
@@ -320,7 +344,7 @@ impl WorkerProcess {
             also_pinned: Vec::new(),
             worker: id,
             name: "builder".into(),
-            hello: hello(),
+            hello,
             capacity,
             profile,
             transport: Default::default(),
@@ -1072,19 +1096,34 @@ fn start_members(
     d: &Deployment,
     members: Vec<(Profile, Secret)>,
 ) -> (Vec<WorkerId>, Vec<Arc<Recorder>>, Vec<WorkerProcess>) {
+    start_hosts(
+        d,
+        members
+            .into_iter()
+            .map(|(profile, enrollment)| (hello(), profile, enrollment))
+            .collect(),
+    )
+}
+
+/// Workers that also state their own architecture and capabilities.
+fn start_hosts(
+    d: &Deployment,
+    members: Vec<(Hello, Profile, Secret)>,
+) -> (Vec<WorkerId>, Vec<Arc<Recorder>>, Vec<WorkerProcess>) {
     let n = members.len();
     let ids: Vec<WorkerId> = (0..n).map(|_| WorkerId::new()).collect();
     let recorders: Vec<Arc<Recorder>> = (0..n).map(|_| Recorder::new()).collect();
     let processes: Vec<WorkerProcess> = members
         .into_iter()
         .enumerate()
-        .map(|(i, (profile, enrollment))| {
-            WorkerProcess::start(
+        .map(|(i, (hello, profile, enrollment))| {
+            WorkerProcess::start_as(
                 d,
                 Identity::generate(&format!("ranked-{i}")).unwrap(),
                 ids[i],
                 enrollment,
                 STANDARD,
+                hello,
                 profile,
                 Arc::clone(&recorders[i]),
             )
@@ -1535,6 +1574,214 @@ fn priority_cannot_bypass_ownership_capabilities_or_capacity() {
     );
     assert_eq!(got[1], 7, "the rest goes to the other host: {got:?}");
     finish(d, processes);
+}
+
+const ARM_JOB: &str = "schema: 1
+on: [push]
+jobs:
+  arm:
+    image: alpine:3
+    runs_on: { arch: arm64 }
+    resources: { cpu: \"0.25\", memory: 128MiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+";
+
+const MICROVM_JOB: &str = "schema: 1
+on: [push]
+jobs:
+  vm:
+    image: alpine:3
+    runs_on: { isolation: microvm }
+    resources: { cpu: \"0.25\", memory: 128MiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+";
+
+const WINDOWS_NATIVE_JOB: &str = "schema: 1
+on: [push]
+jobs:
+  win:
+    image: alpine:3
+    runs_on: { os: windows, isolation: native }
+    resources: { cpu: \"0.25\", memory: 128MiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+";
+
+const WINDOWS_MICROVM_JOB: &str = "schema: 1
+on: [push]
+jobs:
+  winvm:
+    image: alpine:3
+    runs_on: { os: windows, isolation: microvm }
+    resources: { cpu: \"0.25\", memory: 128MiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+";
+
+/// A hello stating `arch` and the runtime capabilities the worker has, on top of what every worker needs.
+fn hello_with(arch: Arch, runtime: Capabilities) -> Hello {
+    Hello {
+        arch,
+        capabilities: Capabilities::REQUIRED.union(runtime),
+        ..hello()
+    }
+}
+
+const LINUX_CONTAINER: Capabilities =
+    Capabilities(Capabilities::OS_LINUX.0 | Capabilities::ISOLATION_CONTAINER.0);
+
+/// The highest-priority host is the wrong kind of machine for four jobs in turn: a microVM job (no KVM),
+/// an arm64 job (x86_64), a Windows job (Linux), and a Windows microVM job nobody can run. Priority
+/// orders the hosts that already passed hard admission and nothing else, so each job lands on the one
+/// host that has what it needs, and the job nobody can run waits with the documented reason.
+#[test]
+fn priority_cannot_lend_a_host_the_kvm_architecture_or_os_it_lacks() {
+    let d = deployment();
+    d.controller().set_placement_order(PlacementOrder::Priority);
+    let kvm = LINUX_CONTAINER
+        .union(Capabilities::ISOLATION_MICROVM)
+        .union(Capabilities::KVM);
+    let windows = Capabilities::OS_WINDOWS.union(Capabilities::ISOLATION_NATIVE);
+    let (ids, recorders, processes) = start_hosts(
+        &d,
+        vec![
+            // 0: the highest priority, a plain Linux x86_64 container host.
+            (
+                hello_with(Arch::X86_64, LINUX_CONTAINER),
+                profile(130, 128 << 30),
+                d.enrollment_with(priority(100)),
+            ),
+            (
+                hello_with(Arch::X86_64, kvm),
+                profile(131, 128 << 30),
+                d.enrollment_with(priority(0)),
+            ),
+            (
+                hello_with(Arch::Aarch64, LINUX_CONTAINER),
+                profile(132, 128 << 30),
+                d.enrollment_with(priority(0)),
+            ),
+            (
+                hello_with(Arch::X86_64, windows),
+                profile(133, 128 << 30),
+                d.enrollment_with(priority(0)),
+            ),
+        ],
+    );
+    let ranking = d.controller().handle().placement_ranking();
+    assert_eq!(ranking[0].worker, ids[0], "the plain host ranks first");
+    assert_eq!(ranking[0].priority, 100);
+
+    let (a, repo) = (d.tenant_a, d.repo_a);
+    let one = |yaml: &str| d.runs(vec![(a, repo, yaml.to_owned())])[0][0];
+    let plain = one(&one_job());
+    let vm = one(MICROVM_JOB);
+    let arm = one(ARM_JOB);
+    let win = one(WINDOWS_NATIVE_JOB);
+    let nobody = one(WINDOWS_MICROVM_JOB);
+    d.controller().wake();
+    eventually("the four runnable jobs leased", || {
+        [plain, vm, arm, win]
+            .iter()
+            .all(|job| d.state(a, *job) == JobState::Leased)
+    });
+    eventually("every offer delivered", || {
+        offered(&recorders).iter().sum::<usize>() >= 4
+    });
+    let holds = |host: usize, job: JobId| d.held(ids[host]).iter().any(|h| h.job == job);
+    assert!(
+        holds(0, plain),
+        "the priority host takes the job it can run"
+    );
+    assert!(holds(1, vm), "the microVM job went to the KVM host");
+    assert!(holds(2, arm), "the arm64 job went to the aarch64 host");
+    assert!(holds(3, win), "the Windows job went to the Windows host");
+    assert_eq!(
+        offered(&recorders),
+        vec![1, 1, 1, 1],
+        "the priority host took exactly one job: the one it could run"
+    );
+
+    // The Windows microVM job fits no host: it waits, with the OS and isolation it required.
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(d.state(a, nobody), JobState::Queued);
+    let connected = d.controller().connected();
+    let reason = d
+        .store
+        .read(|c| dispatch::wait_reason(c, a, nobody, &connected))
+        .unwrap();
+    assert_eq!(
+        reason,
+        dispatch::WaitReason::RuntimeMissing {
+            runtime: Capabilities::OS_WINDOWS
+                .union(Capabilities::ISOLATION_MICROVM)
+                .0 as i64
+        }
+    );
+    finish(d, processes);
+}
+
+/// Without an override the fastest eligible host wins, and with the priority policy on the order
+/// changes only among the eligible hosts: the host that is both fastest and highest priority is
+/// never offered a microVM job it has no KVM for.
+#[test]
+fn the_default_picks_the_fastest_eligible_host_and_priority_never_widens_the_set() {
+    let kvm = LINUX_CONTAINER
+        .union(Capabilities::ISOLATION_MICROVM)
+        .union(Capabilities::KVM);
+    for (order, expected) in [
+        // The idle KVM host (1) is faster than the saturated one (2); host 0 is not eligible.
+        (PlacementOrder::Fastest, vec![0, 1, 0]),
+        // The saturated KVM host has the higher priority of the two eligible ones; host 0 still is not eligible.
+        (PlacementOrder::Priority, vec![0, 0, 1]),
+    ] {
+        let d = deployment();
+        d.controller().set_placement_order(order);
+        let (ids, recorders, processes) = start_hosts(
+            &d,
+            vec![
+                (
+                    hello_with(Arch::X86_64, LINUX_CONTAINER),
+                    measured(140, 0, 0),
+                    d.enrollment_with(priority(100)),
+                ),
+                (
+                    hello_with(Arch::X86_64, kvm),
+                    measured(141, 0, 0),
+                    d.enrollment_with(priority(0)),
+                ),
+                (
+                    hello_with(Arch::X86_64, kvm),
+                    measured(142, FIVE_CORES_NS, 0),
+                    d.enrollment_with(priority(20)),
+                ),
+            ],
+        );
+        let ranking = d.controller().handle().placement_ranking();
+        let first_eligible = ranking
+            .iter()
+            .find(|r| r.worker != ids[0])
+            .expect("an eligible host is ranked")
+            .worker;
+        assert_eq!(
+            first_eligible,
+            if order == PlacementOrder::Priority {
+                ids[2]
+            } else {
+                ids[1]
+            },
+            "{order:?}"
+        );
+        let job = d.runs(vec![(d.tenant_a, d.repo_a, MICROVM_JOB.to_owned())])[0][0];
+        d.controller().wake();
+        eventually("the microVM job leased", || {
+            d.state(d.tenant_a, job) == JobState::Leased
+        });
+        eventually("the offer delivered", || {
+            offered(&recorders).iter().sum::<usize>() >= 1
+        });
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(offered(&recorders), expected, "{order:?}");
+        finish(d, processes);
+    }
 }
 
 /// Lowering a ceiling below what a host already holds is not an eviction: nothing new is placed on it
