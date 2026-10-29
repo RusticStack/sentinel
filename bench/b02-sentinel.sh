@@ -204,7 +204,7 @@ host = {"hostname": os.environ.get("SENTINEL_BENCH_HOST_LABEL") or None,
         "cpu_model": field("/proc/cpuinfo", "model name"), "cpus_online": os.cpu_count(),
         "mem_total_kib": int(mem.split()[0]) if mem else None,
         "cpu_governor": first("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")}
-status = git("status", "--porcelain")
+status = git("status", "--porcelain", "--untracked-files=no")
 profile = None
 if raw and os.path.exists(raw):
     sys.path.insert(0, kit)

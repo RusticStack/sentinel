@@ -1,0 +1,107 @@
+{
+  "format": "sentinel.b11-contract/1",
+  "id": "b11-blacksmith",
+  "revision": 1,
+  "frozen": "2026-10-28",
+  "status": "rules frozen; no samples exist. Blocked by: Blacksmith benchmark access",
+  "purpose": "The B11 gate: for each selected lane and condition, Sentinel trigger-to-required-check p95 divided by Blacksmith's p95 for the same SHA, commands, assertions, freshness policy, required outputs and resource envelope is at most 0.50, shown with a one-sided 95% bootstrap upper confidence bound on the paired log-duration ratio below 0.50. This file fixes the statistic, the sample rules and the failure rules before any sample is taken; it holds no measurement. It is separate from the sentinel.bench-contract/1 contracts (pilots-ci, legacy-go-ci): their GitHub self-hosted records, vendor multipliers and the one-run Blacksmith startup probe are not B11 evidence.",
+  "gate": {
+    "metric": "trigger_to_required_check",
+    "ratio_limit": 0.5,
+    "percentile": 95,
+    "percentile_method": "nearest-rank",
+    "min_pairs": 100,
+    "max_pairs": 10000,
+    "confidence": 0.95,
+    "bound": "one-sided-upper",
+    "statistic": "mean over pairs of ln(sentinel_ns / blacksmith_ns)",
+    "bootstrap": {
+      "method": "percentile",
+      "resample_unit": "pair",
+      "resamples": 10000,
+      "bound_rank": "nearest-rank of confidence over the sorted resampled statistics",
+      "rng": "xoshiro256** seeded by splitmix64",
+      "seed": 20261028
+    },
+    "pass_requires": [
+      "every series of every selected lane and condition is present",
+      "each series has at least min_pairs contiguous pairs, numbered from 0, none dropped",
+      "every pair holds one Sentinel and one Blacksmith execution of the same source SHA",
+      "pair order alternates ABBA: Sentinel first in even pairs, Blacksmith first in odd pairs",
+      "every execution on both sides has outcome pass; a fail or incorrect outcome fails the gate and its duration stays in the distributions",
+      "the nearest-rank p95 of Sentinel divided by the nearest-rank p95 of Blacksmith is at most ratio_limit",
+      "exp(upper bound of the mean paired log ratio) is below ratio_limit"
+    ],
+    "informational": [
+      "the bootstrap upper bound of the log p95 ratio is reported beside the gate and does not decide it; making it decide is a new revision"
+    ]
+  },
+  "series": {
+    "independent_by": ["lane", "condition"],
+    "conditions": ["cold", "warm", "small-edit"],
+    "lanes": ["cli", "ripgrep", "gson"],
+    "lanes_note": "The candidate lanes are the pilots-ci revision 4 lanes (docs/pilot-repositories.md). The selection for the release gate is a revision of this contract made before the first release sample, naming the lanes it keeps; the harness refuses a lane the contract does not list and reports a listed lane with a missing condition as a failed gate.",
+    "condition_definitions": "As pilots-ci revision 4 (cold: worker or runner caches removed, images present; warm: unchanged tree, caches kept after one unrecorded warm-up; small-edit: one line appended to a compiled source of the lane's main package, caches kept). Blacksmith's side uses its equivalent cache state; the difference is disclosed in the report, not hidden."
+  },
+  "pairing": {
+    "interleaving": "abba",
+    "unit": "One pair is one Sentinel execution and one Blacksmith execution of the same trigger on the same source SHA, started back to back. The first of the two alternates every pair, so drift in network, host load or service state lands on both alike.",
+    "identity": "Both executions run the same SHA, commands, assertions, freshness policy and required outputs. Every required test runs on every sample on both sides; build caches may be kept, test results never.",
+    "resource_envelope": "Both sides get the same vCPU and memory request. When Blacksmith cannot provide equivalent resources the result stays a hosted-service comparison and states the difference."
+  },
+  "clock": {
+    "trigger": "The instant GitHub records for the event that starts the checks (the push or the pull-request update), taken from GitHub's timestamps for both sides.",
+    "required_check_complete": "The instant GitHub records for the completion of the last required check of the lane, on both sides.",
+    "duration": "required_check_complete minus trigger, in nanoseconds, for one execution. Both sides use the same clock source, so queue time and delivery latency are inside the number and cannot be hidden.",
+    "also_report": "job_ns (first job start to last job finish) and phases (named costs such as queue, checkout, cache restore, run, cache save, report in nanoseconds) beside the end-to-end clock. A phase absent from an execution is absent, never zero."
+  },
+  "failures": {
+    "outcomes": ["pass", "fail", "incorrect"],
+    "rule": "Any fail or incorrect outcome on either side fails the gate. The execution is reported and its duration stays in every distribution; no pair is removed to improve the ratio."
+  },
+  "disclosure": {
+    "label": "hosted-service comparison",
+    "never_label": "same-hardware",
+    "must_state": [
+      "Blacksmith's hardware, region and network path against Sentinel's host",
+      "cache state on each side per condition",
+      "any difference in resource envelope",
+      "sample counts per series and the raw samples"
+    ]
+  },
+  "freshness": {
+    "rule": "Every required test runs on every execution on both sides; build and dependency caches may be kept, test results never. An execution counts only when every required check passes.",
+    "cold": "worker or runner caches removed, images present; Blacksmith's side starts from its equivalent empty cache state",
+    "warm": "unchanged tree, caches kept after one unrecorded warm-up per series and side",
+    "small-edit": "one line appended to a compiled source of the lane's main package, caches kept"
+  },
+  "required_outputs": {
+    "rule": "The required checks and artifacts of the lane as in its pilots-ci lane definition are identical on both sides; a missing or different required output makes the execution incorrect.",
+    "per_lane": "named by the contract revision that selects the lanes; not yet selected"
+  },
+  "resource_envelope": {
+    "status": "unfilled until Blacksmith runner sizes are known; nothing is frozen here and no value may be guessed",
+    "sentinel": { "vcpu": null, "memory_mib": null, "disk_gib": null },
+    "blacksmith": { "runner_label": null, "vcpu": null, "memory_mib": null, "disk_gib": null },
+    "equal_request_required": true
+  },
+  "hosted_hardware_disclosure_fields": {
+    "status": "unfilled; completed in the report of each release run, never inferred",
+    "fields": ["blacksmith_cpu_model", "blacksmith_region", "blacksmith_network_path", "sentinel_cpu_model", "sentinel_host_label", "sentinel_network_path", "cache_state_per_condition", "resource_envelope_difference", "sample_counts_per_series"]
+  },
+  "failure_counts": {
+    "rule": "Reports state per series and side the number of pass, fail, incorrect and censored (never completed) executions. A censored execution is a failure whose duration is the observation window and stays in the distributions."
+  },
+  "not_evidence": [
+    "vendor-stated multipliers",
+    "GitHub self-hosted runner records",
+    "the one-run Blacksmith startup probe",
+    "series with fewer than min_pairs pairs (optimization guidance only)"
+  ],
+  "samples_format": "sentinel.b11-samples/1",
+  "report_format": "sentinel.b11-report/1",
+  "harness": "crates/sentinel-bench/src/bin/sentinel-b11.rs",
+  "revision_history": [
+    "Revision 1 (2026-10-28): rules, statistic and sample format frozen; harness with synthetic-data tests only."
+  ]
+}

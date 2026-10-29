@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Measured steps run with --network none, so every dependency must come from a checked-in store.
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/stamp.sh"
+stamp_init || exit 1
+STAMP_SED="$(stamp_sed)"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIX="$ROOT/fixtures/recipes"
@@ -17,8 +20,8 @@ log() { printf 'k07 %s %s\n' "$(date +%T)" "$*" >&2; }
 jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 
 blocked() { # recipe case reason
-    printf '{"recipe":%s,"case":%s,"status":"blocked","reason":%s}\n' \
-        "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")" >> "$OUT"
+    printf '{%s,"recipe":%s,"case":%s,"status":"blocked","reason":%s}\n' \
+        "$STAMP_BODY" "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")" >> "$OUT"
     log "blocked $1/$2: $3"
 }
 
@@ -340,7 +343,7 @@ run_case() { # recipe case sha image
         --recipe "$r" --case "$c" \
         --log-file "$LOGS/$r-$c.log" 2>"$LOGS/$r-$c.err")"
     if [ -n "$rec" ]; then
-        printf '%s\n' "$rec" >> "$OUT"
+        printf '%s\n' "$rec" | sed "s/^{/{$STAMP_SED,/" >> "$OUT"
         log "$r/$c: $(printf '%s' "$rec" | head -c 110)"
     else
         blocked "$r" "$c" "driver: $(tail -2 "$LOGS/$r-$c.err" 2>/dev/null | tr '\n' ' ' | head -c 140)"

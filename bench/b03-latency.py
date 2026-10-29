@@ -181,7 +181,7 @@ def stamp(source, binary):
     commit = git("rev-parse", "HEAD")
     if commit is None:
         raise SystemExit(f"cannot read the source commit of {source}; no record is written without it")
-    status = git("status", "--porcelain")
+    status = git("status", "--porcelain", "--untracked-files=no")
     build = {"commit": commit, "dirty": None if status is None else bool(status)}
     if binary:
         import hashlib
@@ -327,8 +327,10 @@ def cache(d, out, n):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("root")
-    p.add_argument("out")
+    p.add_argument("root", nargs="?")
+    p.add_argument("out", nargs="?")
+    p.add_argument("--print-stamp", action="store_true",
+                   help="print the build and host block as one JSON object and exit (used by bench/stamp.sh)")
     p.add_argument("--source", default=os.environ.get("SENTINEL_SRC"),
                    help="the checkout the deployment's sentinel binary was built from (or SENTINEL_SRC); "
                         "its commit and dirty state go into every record")
@@ -340,6 +342,11 @@ def main():
     if not a.source:
         p.error("--source (or SENTINEL_SRC) is required: a record must name the build it measured")
     STAMP.update(stamp(a.source, a.binary))
+    if a.print_stamp:
+        print(json.dumps(STAMP, separators=(",", ":")))
+        return
+    if not a.root or not a.out:
+        p.error("root and out are required")
     d = Deployment(a.root)
     with open(a.out, "a") as out:
         first(d, out, a.first)

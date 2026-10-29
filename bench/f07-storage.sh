@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Caches are dropped before each clone and modes are shuffled per round: the first mode to read the source would warm it.
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/stamp.sh"
+stamp_init || exit 1
+shuffle_init
+echo "shuffle seed $SHUF_SEED" >&2
+STAMP_SED="$(stamp_sed)"
 PROBE="${PROBE:-/root/sentinel-probes}"
 OUT="${OUT:-/root/f07-storage.jsonl}"; : > "$OUT"
 ROUNDS="${ROUNDS:-3}"
@@ -14,18 +19,18 @@ for fs in ext4 xfs btrfs; do
   base="${FS[$fs]}"; rm -rf "$base"; mkdir -p "$base"
   for sync in full normal; do
     $PROBE sqlite --path "$base/dispatch.sqlite" --synchronous "$sync" --jobs 2000 --backlog 100000 \
-      | sed "s/^{/{\"fs\":\"$fs\",/" >> "$OUT"
+      | sed "s/^{/{\"fs\":\"$fs\",\"shuffle_seed\":\"$SHUF_SEED\",$STAMP_SED,/" >> "$OUT"
   done
-  $PROBE generate --dest "$base/src" --files 20000 --bytes-per-file 16384 | sed "s/^{/{\"fs\":\"$fs\",/" >> "$OUT"
+  $PROBE generate --dest "$base/src" --files 20000 --bytes-per-file 16384 | sed "s/^{/{\"fs\":\"$fs\",\"shuffle_seed\":\"$SHUF_SEED\",$STAMP_SED,/" >> "$OUT"
   for round in $(seq 1 "$ROUNDS"); do
     position=0
-    for mode in $(printf '%s\n' reflink copy fs-copy | shuf); do
+    for mode in $(printf '%s\n' reflink copy fs-copy | shuffle_lines "$SHUF_SEED/$fs/$round"); do
       position=$((position + 1))
       rm -rf "$base/dst-$mode"
       dropped=$(drop_caches)
       $PROBE clone --source "$base/src" --dest "$base/dst-$mode" --mode "$mode" --verify-read 2>"$base/err-$mode.txt" \
-        | sed "s/^{/{\"fs\":\"$fs\",\"round\":$round,\"position\":$position,\"caches_dropped\":$dropped,/" >> "$OUT" \
-        || echo "{\"fs\":\"$fs\",\"round\":$round,\"position\":$position,\"probe\":\"clone/1\",\"mode\":\"$mode\",\"error\":\"$(head -c 120 "$base/err-$mode.txt" | tr -d '\n"')\"}" >> "$OUT"
+        | sed "s/^{/{\"fs\":\"$fs\",\"shuffle_seed\":\"$SHUF_SEED\",$STAMP_SED,\"round\":$round,\"position\":$position,\"caches_dropped\":$dropped,/" >> "$OUT" \
+        || echo "{\"fs\":\"$fs\",\"shuffle_seed\":\"$SHUF_SEED\",\"round\":$round,\"position\":$position,\"probe\":\"clone/1\",\"mode\":\"$mode\",\"error\":\"$(head -c 120 "$base/err-$mode.txt" | tr -d '\n"')\"}" >> "$OUT"
       sync
     done
   done

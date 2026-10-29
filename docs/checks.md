@@ -379,3 +379,7 @@ holds at most 1024 repository tokens, evicting the earliest expiry at capacity.
   installation, accepts a signed fork pull request, refuses it as
   `ignored:fork_pr` and publishes a completed neutral `sentinel / ci` on the
   delivered revision; the CLI shows the durable delivery.
+
+## Delivery latency bench
+
+`crates/sentinel-checks/examples/checks-lane-bench.rs` times a run's queued checks from the start of the write that enqueues them to their arrival at a fake GitHub endpoint, with the real lane and publisher ([benchmarking](benchmarking.md#checks-lane-delivery-latency)). No record is committed yet, so this document states no latency figure.

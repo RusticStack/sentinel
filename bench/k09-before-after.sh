@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/stamp.sh"
+stamp_init || exit 1
+STAMP_SED="$(stamp_sed)"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIX="$ROOT/fixtures/recipes"
@@ -18,8 +21,8 @@ log() { printf 'k09 %s %s\n' "$(date +%T)" "$*" >&2; }
 jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 
 blocked() { # recipe case reason
-    printf '{"recipe":%s,"case":%s,"status":"blocked","reason":%s}\n' \
-        "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")" >> "$OUT"
+    printf '{%s,"recipe":%s,"case":%s,"status":"blocked","reason":%s}\n' \
+        "$STAMP_BODY" "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")" >> "$OUT"
     log "blocked $1/$2: $3"
 }
 
@@ -126,7 +129,7 @@ run_case() { # recipe case pipeline sha
         --recipe "$r" --case "$c" \
         --log-file "$LOGS/$r-$c.log" 2>"$LOGS/$r-$c.err")"
     if [ -n "$rec" ]; then
-        printf '%s\n' "$rec" >> "$OUT"
+        printf '%s\n' "$rec" | sed "s/^{/{$STAMP_SED,/" >> "$OUT"
         log "$r/$c: $(printf '%s' "$rec" | head -c 110)"
     else
         blocked "$r" "$c" "driver: $(tail -2 "$LOGS/$r-$c.err" 2>/dev/null | tr '\n' ' ' | head -c 140)"
@@ -137,7 +140,7 @@ run_case() { # recipe case pipeline sha
 [ -x "$DRIVER" ] || { log "driver missing: $DRIVER — cargo build --release -p sentinel-worker --example k07-recipes"; exit 1; }
 command -v python3 >/dev/null || { log "python3 required"; exit 1; }
 command -v podman  >/dev/null || { log "podman required"; exit 1; }
-meta_record >> "$OUT"
+meta_record | sed "s/^{/{${STAMP_BODY%%,\"host\":*},/" >> "$OUT"
 
 SHA_NOOP="$(build_noop_repo)"
 [ -n "${SHA_NOOP:-}" ] || { log "noop repo failed"; exit 1; }

@@ -37,6 +37,12 @@ The workflow inventory is the parity reference, not a list of engine features to
 | Android and API compatibility workflows | Compatibility checks | `ci` jobs when containerized; otherwise external |
 | OSS-Fuzz, CodeQL and Scorecard workflows | Hosted-service integrations | External |
 
+### Confirming the inventory at the pinned commits
+
+The tables above name `go.yml`, `lint.yml` and `acceptance.yml` (cli), `ci.yml` (ripgrep) and `build.yml` (gson) from reading their files; every other workflow is listed from its file name only (`govulncheck.yml`, `codeql.yml`, `release.yml` and the release, triage, Android, API-compatibility, OSS-Fuzz and Scorecard families). [`bench/b06_inventory.py`](../bench/b06_inventory.py) confirms them: for each pilot it fetches the pinned commit of [`pilots-ci.json`](../bench/contracts/pilots-ci.json) from the operator mirror named by `SENTINEL_PILOT_CLI_URL`, `SENTINEL_PILOT_RIPGREP_URL` or `SENTINEL_PILOT_GSON_URL` (a blob-less shallow fetch; it never contacts the upstream address), and prints one JSON line with every file under `.github/workflows/`, its blob id, its `name:` and its job ids. The line carries no mirror URL or host. A missing variable, a mirror lacking the commit, or a failed fetch exits with status 1 and a reason; an empty inventory is never printed. Tests: [`bench/test_b06_inventory.py`](../bench/test_b06_inventory.py).
+
+Status (2026-10-28): **not yet confirmed.** The mirror URLs are private runner configuration and were not available to the session that wrote the script, so no inventory line has been produced. The operator runs the script where the variables are set, compares the file names and job ids with the tables above, corrects any row that differs, and commits the output (it holds no private data) as the inventory record.
+
 ## Conversion contract
 
 | Actions mechanism | Sentinel-native replacement |

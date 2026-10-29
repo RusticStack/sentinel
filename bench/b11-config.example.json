@@ -1,0 +1,46 @@
+{
+  "format": "sentinel.b11-collector-config/1",
+  "build": "sentinel-build-label",
+  "poll_seconds": 10,
+  "timeout_seconds": 1800,
+  "lanes": {
+    "cli": {
+      "clone": "path to a local clone of the lane's source; the series worktree is created next to it",
+      "base": "ref the series branch starts from",
+      "small_edit_file": "path of a compiled source of the lane's main package, relative to the clone",
+      "small_edit_comment": "//",
+      "sentinel": {
+        "repo": "OWNER/SENTINEL-MIRROR",
+        "remote": "git remote name of that mirror in the clone",
+        "app": "slug of the Sentinel GitHub App whose check suite marks the trigger",
+        "required": ["names of the required check runs, exactly as GitHub shows them"],
+        "label": "sentinel",
+        "host": "kvm-host",
+        "build": "sentinel-build-label",
+        "envelope": { "vcpu": 4, "memory_mib": 8192 },
+        "cache_state": {
+          "cold": "worker-caches-removed",
+          "warm": "caches-kept",
+          "small-edit": "caches-kept"
+        },
+        "prepare": { "cold": [["argv of a command that removes the worker caches"]] }
+      },
+      "blacksmith": {
+        "repo": "OWNER/BLACKSMITH-MIRROR",
+        "remote": "git remote name of that mirror in the clone",
+        "app": "github-actions",
+        "required": ["job names of the Blacksmith-backed workflow, exactly as GitHub shows them"],
+        "label": "hosted-blacksmith",
+        "host": "hosted-blacksmith",
+        "build": "not-applicable",
+        "envelope": { "vcpu": 4, "memory_mib": 8192 },
+        "cache_state": {
+          "cold": "cache-scope-rotated",
+          "warm": "caches-kept",
+          "small-edit": "caches-kept"
+        },
+        "prepare": { "cold": [["argv of a command that rotates the workflow's cache scope"]] }
+      }
+    }
+  }
+}
