@@ -1,0 +1,36 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "k02-cache-clone",
+  "revision": 1,
+  "harness": {
+    "script": "bench/k02-cache-clone.sh"
+  },
+  "run": {
+    "args": [],
+    "smoke_args": [],
+    "smoke_env": {
+      "FSLIST": "ext4",
+      "EXT4": "{scratch}/ext4",
+      "FILES": "40",
+      "BYTES": "1024",
+      "LARGE": "1",
+      "LARGE_BYTES": "65536",
+      "ROUNDS": "2"
+    }
+  },
+  "ordering": {
+    "scheme": "shuffle",
+    "seed": {
+      "env": "SHUF_SEED",
+      "recorded_as": "shuffle_seed"
+    }
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "k02-cache-clone",
+    "out": "bench/k02-cache-clone.jsonl"
+  },
+  "notes": "As f07-storage. The default OUT is the committed record: a measured run refuses it unless REPLACE=1."
+}

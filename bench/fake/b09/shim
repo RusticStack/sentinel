@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# One script, installed under the names of the host commands the B09 harness runs as root (ip, tc, losetup, dmsetup,
+# blockdev, modprobe, mkfs.ext4, mount, umount, chown, runuser, nsenter, id, podman, fallocate). It logs every call
+# to FAKE_LOG and keeps what the harness created in FAKE_STATE (netns/, links/, qdisc/, loops/, dm/, mounts/), so the
+# harness's own discovery (`ip netns list`, `losetup -a`, ...) sees the objects and its cleanup has real work to do.
+# Nothing is executed on the host: no namespace, link, device or mount exists. The fallocate shim does nothing and is
+# logged, so a test can prove that no filler ran. `<tool> --b09-shim` answers "b09-shim": the harness refuses to
+# start a rehearsal when a tool on PATH is not this shim.
+tool=$(basename "$0")
+[ "${1:-}" = --b09-shim ] && { echo b09-shim; exit 0; }
+S=${FAKE_STATE:?FAKE_STATE names the directory the shims keep their state in}
+mkdir -p "$S"/netns "$S"/links "$S"/qdisc "$S"/loops "$S"/dm "$S"/mounts
+if [ -n "${FAKE_LOG:-}" ]; then printf '%s %s\n' "$tool" "$*" >> "$FAKE_LOG"; fi
+
+do_tc() { # tc qdisc replace|del dev DEV root [netem ...]
+  local verb=$2 dev= i
+  local args=("$@")
+  for ((i = 0; i < ${#args[@]}; i++)); do [ "${args[$i]}" = dev ] && dev=${args[$((i + 1))]}; done
+  case $verb in
+    replace) printf '%s\n' "$*" > "$S/qdisc/$dev" ;;
+    del) rm -f "$S/qdisc/$dev" ;;
+  esac
+}
+
+case "$tool" in
+  ip)
+    case "${1:-} ${2:-}" in
+      "netns add") : > "$S/netns/$3" ;;
+      "netns delete") rm -f "$S/netns/$3" ;;
+      "netns list") ls "$S/netns" ;;
+      "netns exec")
+        shift 3
+        if [ "${1:-}" = tc ]; then
+          shift
+          if [ -n "${FAKE_LOG:-}" ]; then printf 'tc %s
+' "$*" >> "$FAKE_LOG"; fi
+          do_tc "$@"
+        fi ;;
+      "link add")
+        name=$3; peer=
+        args=("$@")
+        for ((i = 0; i < ${#args[@]}; i++)); do [ "${args[$i]}" = peer ] && peer=${args[$((i + 2))]}; done
+        printf '%s\n' "$peer" > "$S/links/$name"
+        [ -n "$peer" ] && printf '%s\n' "$name" > "$S/links/$peer" ;;
+      "link delete")
+        if [ -f "$S/links/$3" ]; then
+          peer=$(cat "$S/links/$3"); rm -f "$S/links/$3" "$S/qdisc/$3"
+          if [ -n "$peer" ]; then rm -f "$S/links/$peer" "$S/qdisc/$peer"; fi
+        fi ;;
+      "-o link")
+        n=1
+        for f in "$S"/links/*; do [ -e "$f" ] || continue; printf '%d: %s: <BROADCAST,UP> mtu 1500\n' "$n" "$(basename "$f")"; n=$((n + 1)); done ;;
+    esac ;;
+  tc) do_tc "$@" ;;
+  losetup)
+    case "${1:-}" in
+      -f)
+        k=$(cat "$S/loopcount" 2>/dev/null || echo 0); k=$((k + 1)); echo "$k" > "$S/loopcount"
+        printf '%s\n' "${@: -1}" > "$S/loops/loop$k"; echo "/dev/loop$k" ;;
+      -a) for f in "$S"/loops/*; do [ -e "$f" ] || continue; printf '/dev/%s: []: (%s)\n' "$(basename "$f")" "$(cat "$f")"; done ;;
+      -d) rm -f "$S/loops/$(basename "$2")" ;;
+    esac ;;
+  dmsetup)
+    case "${1:-}" in
+      create) : > "$S/dm/$2" ;;
+      remove) rm -f "$S/dm/${@: -1}" ;;
+      ls) for f in "$S"/dm/*; do [ -e "$f" ] || continue; printf '%s\t(253:0)\n' "$(basename "$f")"; done ;;
+    esac ;;
+  blockdev) echo 4096 ;;
+  mount) printf '%s\n' "$2" > "$S/mounts/$(printf '%s' "$2" | tr / _)" ;;
+  umount) rm -f "$S/mounts/$(printf '%s' "${@: -1}" | tr / _)" ;;
+  runuser)
+    # runuser -u USER -- cmd args...
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done
+    shift
+    exec "$@" ;;
+  nsenter)
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done
+    shift
+    exec "$@" ;;
+  id)
+    if [ "$*" = "-u benchmark" ]; then echo 4242; else exec /usr/bin/id "$@"; fi ;;
+  podman|chown|modprobe|mkfs.ext4|fallocate) : ;;
+esac
+exit 0

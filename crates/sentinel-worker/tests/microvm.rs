@@ -2043,7 +2043,17 @@ fn the_cold_and_restored_start_to_first_process_distributions() {
     }
     let out = lines.join("\n") + "\n";
     match std::env::var_os("SENTINEL_MICROVM_BENCH_OUT") {
-        Some(path) => fs::write(path, &out).unwrap(),
+        // Appended, never truncated: a second run must not erase the record of the first.
+        Some(path) => {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(out.as_bytes())
+                .unwrap();
+        }
         None => eprintln!("{out}"),
     }
 }

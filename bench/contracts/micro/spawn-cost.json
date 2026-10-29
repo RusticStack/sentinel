@@ -1,0 +1,25 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "spawn-cost",
+  "revision": 1,
+  "harness": {
+    "example": "spawn-cost-bench",
+    "build": "cargo build --release --locked -p sentinel-git --example spawn-cost-bench"
+  },
+  "run": {
+    "args": ["--rounds", "5", "--spawns", "200", "--resident-mib", "0,64,512"],
+    "smoke_args": ["--rounds", "2", "--spawns", "10", "--resident-mib", "0,8"]
+  },
+  "ordering": {
+    "scheme": "abba",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/spawn-cost/1",
+    "out": "bench/spawn-cost.jsonl"
+  },
+  "notes": "The resident sizes and the three variants (plain, pre_exec_noop, die_with_parent) reverse their order every round (ABBA). The hook is Linux-only; the example is built on every Unix and measures the fork path."
+}

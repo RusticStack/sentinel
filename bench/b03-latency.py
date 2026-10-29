@@ -37,6 +37,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import benchstamp  # noqa: E402
+
 IDENT = ["-c", "user.name=sentinel-bench", "-c", "user.email=bench@sentinel.invalid"]
 
 
@@ -150,53 +153,12 @@ def run_bytes(run):
     return bytes.fromhex(run.removeprefix("run_").replace("-", ""))
 
 
-def read_first(path):
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except OSError:
-        return None
-
-
-def field(path, key):
-    try:
-        with open(path) as f:
-            for line in f:
-                k, _, v = line.partition(":")
-                if k.strip() == key:
-                    return v.strip()
-    except OSError:
-        pass
-    return None
-
-
 def stamp(source, binary):
-    """What the sentinel under test was built from and where it ran, copied
-    into every record. `source` is the checkout the deployment's binary was
-    built from (git is asked there, not trusted from a name); `binary` is
-    hashed so a rebuilt kit that no longer matches the checkout shows."""
-    def git(*args):
-        r = subprocess.run(["git", "-C", source, *args], capture_output=True, text=True)
-        return r.stdout.strip() if r.returncode == 0 else None
-    commit = git("rev-parse", "HEAD")
-    if commit is None:
-        raise SystemExit(f"cannot read the source commit of {source}; no record is written without it")
-    status = git("status", "--porcelain", "--untracked-files=no")
-    build = {"commit": commit, "dirty": None if status is None else bool(status)}
-    if binary:
-        import hashlib
-        with open(binary, "rb") as f:
-            build["binary_sha256"] = hashlib.sha256(f.read()).hexdigest()
-    mem = field("/proc/meminfo", "MemTotal")
-    host = {
-        "hostname": os.environ.get("SENTINEL_BENCH_HOST_LABEL") or None,
-        "kernel": read_first("/proc/sys/kernel/osrelease"),
-        "cpu_model": field("/proc/cpuinfo", "model name"),
-        "cpus_online": os.cpu_count(),
-        "mem_total_kib": int(mem.split()[0]) if mem else None,
-        "cpu_governor": read_first("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
-    }
-    return {"build": build, "host": {k: v for k, v in host.items() if v is not None}}
+    """What the sentinel under test was built from and where it ran, copied into every record. `source` is the
+    checkout the deployment's binary was built from (git is asked there, not trusted from a name); `binary` is
+    hashed so a rebuilt kit that no longer matches the checkout shows. The rules (a readable commit and dirty
+    state, an anonymized host label) are bench/benchstamp.py's and refuse the run before any sample."""
+    return benchstamp.stamp(source, binary)
 
 
 STAMP = {}

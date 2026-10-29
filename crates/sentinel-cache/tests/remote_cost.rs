@@ -286,6 +286,14 @@ fn transfer_cost() {
             (r2 - r1) as f64 / payload as f64,
             (w2 - w1) as f64 / payload as f64,
         );
+        // One JSON line per run on stdout, so bench/run-ignored.sh can stamp it; the human line above stays on stderr.
+        println!(
+            "{{\"test\":\"sentinel-cache/tests/remote_cost.rs::transfer_cost\",\"run\":{run},\"files\":{files},\"bytes_per_file\":{bytes},\"payload_bytes\":{payload},\"backend\":\"{backend:?}\",\"offer_ns\":{offer_ns},\"offer_read_bytes\":{},\"offer_write_bytes\":{},\"hydrate_ns\":{hydrate_ns},\"syncfs_ns\":{sync_ns},\"hydrate_read_bytes\":{},\"hydrate_write_bytes\":{}}}",
+            r1 - r0,
+            w1 - w0,
+            r2 - r1,
+            w2 - w1,
+        );
         drop(attached);
     }
 }

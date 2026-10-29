@@ -4,6 +4,7 @@
     python3 bench/q13-fleet.py list
     python3 bench/q13-fleet.py selftest
     python3 bench/q13-fleet.py run --fleet FLEET.json --out OUT.jsonl [--scenarios ID[,ID...]]
+                                    --source CHECKOUT [--binary SENTINEL]
 
 The scenarios drive enrollment, worker-side uninstall, controller-side uninstall, Tailcat
 reconnect and revocation, a copied (duplicate) identity, ceiling changes, ARM placement, OS and
@@ -30,13 +31,19 @@ FLEET.json (real mode):
                        "bootstrap": "/root/sentinel-worker-bootstrap.sh"},
                "arm": {"exec": [...], "arch": "aarch64", "sentinel": "..."}},
      "tailcat": true,
-     "job_driver": ["/root/q13-job.sh"]}
+     "job_driver": ["python3", "bench/q13-job.py", "--config", "/root/q13-job.json"]}
 
 `job_driver` is run as `job_driver ARCH OS ISOLATION CPU_MILLIS MEMORY_BYTES DISK_BYTES` and prints
 one JSON line `{"worker": "wrk_..."|null, "reason": "..."|null}`: where a real executor placed a
-probe job, or the queue reason it waits with. It is the only way this harness creates jobs.
+probe job, or the queue reason it waits with. It is the only way this harness creates jobs. bench/q13-job.py is
+that driver (its job config names the bound repository, a Git clone and the tokens); `--keep` before the
+arguments leaves the probe running and `--release` cancels the kept ones.
 
-One record per scenario is appended as a JSON line, schema `sentinel-bench/q13/1`.
+One record per scenario is appended as a JSON line, schema `sentinel-bench/q13/1`. A real run names its build:
+`--source` (or SENTINEL_SRC) is the checkout the fleet's sentinel binaries were built from, `--binary` an optional
+binary to hash, and SENTINEL_BENCH_HOST_LABEL the anonymized label of the machine running this driver; each real
+record carries `build {commit, dirty[, binary_sha256]}` and `host {hostname, ...}` (bench/benchstamp.py), and the
+run refuses to start without them. Simulated records carry neither: they are never evidence.
 """
 import argparse
 import hashlib
@@ -47,6 +54,9 @@ import subprocess
 import sys
 import time
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import benchstamp  # noqa: E402
 
 SCHEMA = "sentinel-bench/q13/1"
 GIB = 1 << 30
@@ -390,10 +400,20 @@ class RealFleet:
                       "placement_order = \"%s\" and re-run" % order)
 
     def start_job(self, worker):
-        raise Blocked("holding a job on a worker needs the job_driver's long-running probe")
+        """Hold one probe job on `worker`: the driver keeps it running (`--keep`) and says where it was placed."""
+        if not self.spec.get("job_driver"):
+            raise Blocked("fleet file has no job_driver to hold a probe job on a worker")
+        p = self._run([], self.spec["job_driver"] + ["--keep", "x86_64", "linux", "container", "1000", str(GIB), str(GIB)])
+        got = json.loads(p.stdout.strip().splitlines()[-1])
+        if got.get("worker") != worker:
+            self.finish_jobs(worker)
+            raise Blocked("the probe job was not placed on the draining worker (%s); a real executor chooses its "
+                          "worker, so the scenario needs a fleet where only that worker fits" % (got.get("worker") or got.get("reason")))
 
     def finish_jobs(self, worker):
-        raise Blocked("holding a job on a worker needs the job_driver's long-running probe")
+        if not self.spec.get("job_driver"):
+            raise Blocked("fleet file has no job_driver to release a held probe job")
+        self._run([], self.spec["job_driver"] + ["--release"])
 
 
 # --------------------------------------------------------------------------- scenarios
@@ -627,6 +647,11 @@ def run_scenario(name, fleet):
                 at=int(time.time()))
 
 
+def stamped(rec, stamp):
+    """A real record with the run's build and host stamp in front; a simulated record is returned unchanged."""
+    return rec if rec["simulated"] else {**stamp, **rec}
+
+
 # --------------------------------------------------------------------------- self-test
 
 
@@ -670,6 +695,13 @@ def selftest():
     rec = run_scenario("duplicate-identity", SimFleet([SimHost("only")]))
     if rec["status"] != "blocked":
         failures.append("one host for the duplicate scenario was %s, expected blocked" % rec["status"])
+    # a real record names its build and host; a simulated one must never look stamped
+    stamp = {"build": {"commit": "c" * 40, "dirty": False}, "host": {"hostname": "test-host"}}
+    real = stamped(dict(simulated=False, scenario="x"), stamp)
+    if not (real.get("build") and real.get("host")):
+        failures.append("a real record was not stamped")
+    if "build" in stamped(dict(simulated=True, scenario="x"), stamp):
+        failures.append("a simulated record was stamped, so it could pass for evidence")
     for line in failures:
         print("FAIL", line)
     print("selftest: %d scenarios, %d injected defects, %d failures" % (len(SCENARIOS), len(DEFECTS), len(failures)))
@@ -685,6 +717,9 @@ def main():
     r.add_argument("--fleet", required=True)
     r.add_argument("--out", required=True)
     r.add_argument("--scenarios", default=",".join(SCENARIOS))
+    r.add_argument("--source", default=os.environ.get("SENTINEL_SRC"),
+                   help="the checkout the fleet's sentinel binaries were built from (or SENTINEL_SRC)")
+    r.add_argument("--binary", default=os.environ.get("SENTINEL_BIN"), help="a sentinel binary to hash (or SENTINEL_BIN)")
     a = ap.parse_args()
     if a.cmd == "list":
         print("\n".join(SCENARIOS))
@@ -696,11 +731,14 @@ def main():
         if n not in SCENARIOS:
             print("unknown scenario", n, file=sys.stderr)
             return 64
+    if not a.source:
+        ap.error("--source (or SENTINEL_SRC) is required: a record must name the build it measured")
+    stamp = benchstamp.stamp(a.source, a.binary)  # before anything is driven
     spec = json.load(open(a.fleet))
     bad = 0
     with open(a.out, "a") as out:
         for n in names:
-            rec = run_scenario(n, RealFleet(spec))
+            rec = stamped(run_scenario(n, RealFleet(spec)), stamp)
             out.write(json.dumps(rec) + "\n")
             print("%-22s %s%s" % (n, rec["status"], "  " + rec["note"] if rec["note"] else ""))
             bad += rec["status"] == "fail"

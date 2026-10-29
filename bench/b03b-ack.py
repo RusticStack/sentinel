@@ -15,6 +15,10 @@ a shuffled order so drift does not align with a kind:
   ready          GET /api/v1/ready (a store read and a commit probe)
   health         GET /api/v1/health (no store)
 
+Each record carries `shuffle_seed` (`--seed` replays a run; otherwise a fresh seed is made and printed) and
+every sample its `seq`, its position in the realised order. The two committed records predate both and used a
+fixed seed of 7.
+
 The deliveries use refs that match no branch the fixture has a pipeline for,
 so the controller resolves and drops them; the worker stays idle.
 """
@@ -22,6 +26,7 @@ import argparse
 import json
 import os
 import random
+import secrets
 import socket
 import subprocess
 import sys
@@ -72,6 +77,13 @@ def request(sock, host, method, path, token, body):
     return int(lines[0].split()[1]), t1 - t0, t2 - t1, t3 - t2
 
 
+def probe_order(kinds, n, seed):
+    """The realised probe order: every kind n times, shuffled from `seed` (a given seed replays it)."""
+    order = [k for k in kinds for _ in range(n)]
+    random.Random(seed).shuffle(order)
+    return order
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("root")
@@ -79,6 +91,8 @@ def main():
     p.add_argument("--source", required=True)
     p.add_argument("--binary")
     p.add_argument("-n", type=int, default=100)
+    p.add_argument("--seed", default=None,
+                   help="shuffle seed; fresh by default, printed, and recorded as shuffle_seed so the order can be replayed")
     a = p.parse_args()
     b03.STAMP.update(b03.stamp(a.source, a.binary))
     d = b03.Deployment(a.root)
@@ -100,12 +114,13 @@ def main():
     keep, _ = connect()
     kinds = ["intake_new", "intake_keep", "intake_dup", "refused", "ready", "health"]
     samples = {k: [] for k in kinds}
-    order = [k for k in kinds for _ in range(a.n)]
-    random.Random(7).shuffle(order)
+    seed = a.seed if a.seed is not None else secrets.token_hex(8)
+    print(f"shuffle seed {seed}", file=sys.stderr)
+    order = probe_order(kinds, a.n, seed)
     pressure_start = d.settle()
     start = open("/proc/pressure/cpu").read(), open("/proc/loadavg").read()
     dup_body = body("dup")
-    for kind in order:
+    for seq, kind in enumerate(order):
         if kind == "intake_keep":
             s, conn = keep, 0
         else:
@@ -129,7 +144,7 @@ def main():
             raise SystemExit(f"{kind}: status {status}")
         if s is not keep:
             s.close()
-        samples[kind].append({"connect_ns": conn, "send_ns": send, "first_byte_ns": first, "rest_ns": rest,
+        samples[kind].append({"seq": seq, "connect_ns": conn, "send_ns": send, "first_byte_ns": first, "rest_ns": rest,
                               "total_ns": conn + send + first + rest})
         time.sleep(0.05)
     end = open("/proc/pressure/cpu").read(), open("/proc/loadavg").read()
@@ -137,7 +152,7 @@ def main():
     summary = {}
     for k, rows in samples.items():
         summary[k] = {f: dist([r[f] / 1e6 for r in rows]) for f in ("connect_ns", "first_byte_ns", "total_ns")}
-        b03.emit(out, budget="ack_phases", kind=k, samples=rows,
+        b03.emit(out, budget="ack_phases", kind=k, shuffle_seed=seed, samples=rows,
                  cpu_pressure_avg60_start=pressure_start,
                  host_load={"start": {"cpu_psi": start[0], "loadavg": start[1]}, "end": {"cpu_psi": end[0], "loadavg": end[1]}})
         t = summary[k]["total_ns"]

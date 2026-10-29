@@ -216,5 +216,78 @@ class RemoteCleanup(unittest.TestCase):
             self.assertEqual(os.listdir(os.path.join(tmp, "fleet")), [])
 
 
+class HostLock(unittest.TestCase):
+    """The harness takes the host's one verification lock, not a file under /srv/sentinel."""
+
+    def test_the_default_lock_is_the_shared_verification_lock(self):
+        if "SENTINEL_VERIFY_LOCK" not in os.environ:
+            self.assertEqual(h.LOCK, "/var/tmp/sentinel-verify.lock")
+        self.assertNotIn("/srv/sentinel", h.LOCK)
+
+    def test_a_lock_that_cannot_be_opened_is_blocked_not_a_traceback(self):
+        with self.assertRaises(h.Blocked) as caught:
+            h.take_lock(os.path.join(tempfile.gettempdir(), "no-such-dir-b09", "x.lock"))
+        self.assertIn("cannot be opened", str(caught.exception))
+
+    def test_a_scenario_whose_lock_is_unavailable_records_blocked_and_runs_nothing(self):
+        import io
+        out, saved = io.StringIO(), h.LOCK
+        h.LOCK = os.path.join(tempfile.gettempdir(), "no-such-dir-b09", "x.lock")
+        try:
+            h.run_scenario(types.SimpleNamespace(no_lock=False), "w1-steady", out, {})
+        finally:
+            h.LOCK = saved
+        rec = json.loads(out.getvalue())
+        self.assertEqual((rec["kind"], rec["scenario"]["id"]), ("blocked", "w1-steady"))
+        self.assertIn("benchmark lock", rec["blocked_by"])
+
+    @unittest.skipUnless(hasattr(h.fcntl, "flock"), "needs fcntl")
+    def test_the_lock_descriptor_is_not_inherited_by_children(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = h.take_lock(os.path.join(tmp, "lock"))
+            try:
+                self.assertFalse(os.get_inheritable(f.fileno()))
+            finally:
+                f.close()
+
+
+class RefusedConnection(unittest.TestCase):
+    """A real run fails at once on a refused connection; only a rehearsal waits for a restarting fake controller."""
+
+    def deploy_on_a_closed_port(self):
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        d = h.Deploy.__new__(h.Deploy)
+        d.api, d.token = f"http://127.0.0.1:{port}/api/v1", "t"
+        return d
+
+    def test_a_real_run_does_not_wait_for_a_refused_connection(self):
+        d = self.deploy_on_a_closed_port()
+        saved = h.REHEARSAL
+        h.REHEARSAL = False
+        try:
+            t0 = time.monotonic()
+            with self.assertRaises(Exception):
+                d.call("GET", "/x", timeout=2)
+            self.assertLess(time.monotonic() - t0, 1.5, "no retry window in a real run")
+        finally:
+            h.REHEARSAL = saved
+
+    def test_a_rehearsal_waits_for_a_refused_connection_up_to_its_cap(self):
+        d = self.deploy_on_a_closed_port()
+        saved = (h.REHEARSAL, h.REHEARSAL_CAP_S)
+        h.REHEARSAL, h.REHEARSAL_CAP_S = True, 1.0
+        try:
+            t0 = time.monotonic()
+            with self.assertRaises(Exception):
+                d.call("GET", "/x", timeout=2)
+            self.assertGreaterEqual(time.monotonic() - t0, 0.9)
+        finally:
+            h.REHEARSAL, h.REHEARSAL_CAP_S = saved
+
+
 if __name__ == "__main__":
     unittest.main()

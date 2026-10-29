@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+. "$(dirname "$0")/../lib.sh"
+fake_start go "$@"
+case "${1:-}" in
+  version) echo "go version fake"; exit 0 ;;
+  mod) [ "${2:-}" = tidy ] && echo "fake sum" > go.sum; exit 0 ;;
+  build)
+    if [ "${GOPROXY:-}" = off ] && ! has_files "${GOMODCACHE:?}"; then
+      echo "go: module lookup disabled by GOPROXY=off and the module cache is empty" >&2; exit 1
+    fi
+    [ "${GOPROXY:-}" = off ] || populate "$GOMODCACHE" 3
+    populate "${GOCACHE:?}" 2 ;;
+  test) has_files "${GOCACHE:?}" || { echo "go: no build cache; run go build first" >&2; exit 1; } ;;
+esac

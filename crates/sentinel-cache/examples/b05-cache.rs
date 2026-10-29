@@ -3,6 +3,7 @@
 //! Usage: see `bench/b05-cache.sh` and `docs/cache.md#measured-usefulness-b05`.
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(test, allow(dead_code))]
 mod imp {
     use std::{
         collections::BTreeMap,
@@ -380,6 +381,33 @@ mod imp {
         )
     }
 
+    /// The build and host stamp from `B05_STAMP` (`bench/stamp.sh`); a record without it would name no
+    /// commit and no host, so the run refuses to start.
+    fn stamp() -> Result<String, String> {
+        let stamp = std::env::var("B05_STAMP").unwrap_or_default();
+        check_stamp(&stamp)?;
+        Ok(stamp)
+    }
+
+    fn check_stamp(stamp: &str) -> Result<(), String> {
+        // A non-empty string value for `key` inside the object `object` (`"build":{` or `"host":{`).
+        let has = |object: &str, key: &str| {
+            stamp.split_once(object).is_some_and(|(_, rest)| {
+                rest.split_once(key)
+                    .is_some_and(|(_, value)| !value.starts_with('"') && !value.is_empty())
+            })
+        };
+        if has("\"build\":{", "\"commit\":\"") && has("\"host\":{", "\"hostname\":\"") {
+            return Ok(());
+        }
+        Err(concat!(
+            "B05_STAMP must hold the build and host stamp from bench/stamp.sh (a build commit and ",
+            "a host label); run through bench/b05-cache.sh with SENTINEL_SRC and ",
+            "SENTINEL_BENCH_HOST_LABEL set"
+        )
+        .into())
+    }
+
     fn pressure() -> String {
         let read = |p: &str| fs::read_to_string(p).unwrap_or_default();
         format!(
@@ -397,6 +425,8 @@ mod imp {
         scope: Scope,
         decl: Cache,
         host: String,
+        /// The `"build":{..},"host":{..}` fields the calling script stamped (`bench/stamp.sh`), spliced in verbatim.
+        stamp: String,
         out: Mutex<Box<dyn Write + Send>>,
     }
 
@@ -436,24 +466,33 @@ mod imp {
             )
         }
 
-        fn emit(&self, kind: &str, start_state: &str, fields: &str, dists: &Dists) {
+        fn emit(
+            &self,
+            kind: &str,
+            start_state: &str,
+            fields: &str,
+            dists: &Dists,
+        ) -> Result<(), String> {
+            let stamp = &self.stamp;
             let line = format!(
-                "{{\"record\":\"b05-{kind}\",\"label\":{},\"shape\":{},\"backend\":{},\"build\":{{\"commit\":{},\"dirty\":{}}},\"host\":{},\"load_start\":{start_state},\"load_end\":{},{fields},\"dist\":{}}}",
+                "{{\"record\":\"b05-{kind}\",\"label\":{},\"shape\":{},\"backend\":{},{stamp},\"hw\":{},\"load_start\":{start_state},\"load_end\":{},{fields},\"dist\":{}}}",
                 q(&self.a.label),
                 q(&self.a.shape),
                 q(match self.backend {
                     Backend::Reflink => "reflink",
                     Backend::Copy => "copy",
                 }),
-                q(&std::env::var("B05_COMMIT").unwrap_or_default()),
-                q(&std::env::var("B05_DIRTY").unwrap_or_default()),
                 self.host,
                 pressure(),
                 dists.json()
             );
-            let mut out = self.out.lock().unwrap();
-            let _ = writeln!(out, "{line}");
-            let _ = out.flush();
+            let mut out = self
+                .out
+                .lock()
+                .map_err(|_| "the record sink is poisoned".to_owned())?;
+            writeln!(out, "{line}")
+                .and_then(|()| out.flush())
+                .map_err(|e| format!("cannot write the record: {e}"))
         }
     }
 
@@ -549,7 +588,7 @@ mod imp {
             d.add("write_amp_x1000", delta.write_bytes * 1000 / bytes.max(1));
             d.add("read_amp_x1000", delta.rchar * 1000 / bytes.max(1));
         }
-        ctx.emit("cold-publish", &started, &shape, &d);
+        ctx.emit("cold-publish", &started, &shape, &d)?;
         drop(miss);
 
         let key = "k-cold-0";
@@ -603,7 +642,7 @@ mod imp {
                     q(state)
                 ),
                 &d,
-            );
+            )?;
         }
 
         let ws = ws_root.join("job");
@@ -664,7 +703,7 @@ mod imp {
                     outs.join(",")
                 ),
                 &d,
-            );
+            )?;
         }
         drop(at);
         Ok(())
@@ -781,15 +820,51 @@ mod imp {
                         outs.join(",")
                     ),
                     &d,
-                );
+                )?;
             }
         }
         Ok(())
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::check_stamp;
+
+        const GOOD: &str = r#""build":{"commit":"0123456789abcdef0123456789abcdef01234567","dirty":false},"host":{"hostname":"reference-host","kernel":"6.1"}"#;
+
+        #[test]
+        fn a_stamped_run_starts() {
+            assert!(check_stamp(GOOD).is_ok());
+        }
+
+        #[test]
+        fn a_run_without_the_stamp_is_refused() {
+            assert!(check_stamp("").is_err(), "unset B05_STAMP");
+            assert!(
+                check_stamp(r#""build":{"commit":"","dirty":false},"host":{}"#).is_err(),
+                "an empty commit and no host label name nothing"
+            );
+            assert!(
+                check_stamp(r#""build":{"commit":"abc"}"#).is_err(),
+                "a build with no host label"
+            );
+            assert!(
+                check_stamp(r#""host":{"hostname":"reference-host"}"#).is_err(),
+                "a host with no build commit"
+            );
+        }
+    }
+
     pub fn main() -> ExitCode {
         let a = match parse() {
             Ok(a) => a,
+            Err(e) => {
+                eprintln!("b05-cache: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let stamp = match stamp() {
+            Ok(s) => s,
             Err(e) => {
                 eprintln!("b05-cache: {e}");
                 return ExitCode::from(2);
@@ -837,6 +912,7 @@ mod imp {
         };
         let ctx = Ctx {
             host: host(&a.work),
+            stamp,
             a: &a,
             cache,
             backend,
@@ -865,6 +941,7 @@ mod imp {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(test, allow(dead_code))]
 fn main() -> std::process::ExitCode {
     imp::main()
 }

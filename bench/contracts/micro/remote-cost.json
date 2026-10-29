@@ -1,0 +1,26 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "remote-cost",
+  "revision": 1,
+  "harness": {
+    "script": "bench/run-ignored.sh",
+    "build": "cargo test --release --locked -p sentinel-cache --test remote_cost --no-run"
+  },
+  "run": {
+    "args": ["sentinel-cache", "remote_cost", "transfer_cost"],
+    "smoke_args": ["--list-only", "sentinel-cache", "remote_cost", "transfer_cost"]
+  },
+  "ordering": {
+    "scheme": "single",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/ignored-test/1",
+    "out": "bench/remote-cost.jsonl",
+    "from_stdout": true
+  },
+  "notes": "Offer and hydrate cost of a cache generation; SENTINEL_REMOTE_COST_DIR names the disk under test, SENTINEL_REMOTE_COST_RUNS the repeat count."
+}
