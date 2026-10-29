@@ -710,3 +710,41 @@ fn a_file_in_tmp_is_bound_by_the_jobs_disk_budget() {
     assert!(podman::owned(worker).unwrap().is_empty());
     ws.destroy().unwrap();
 }
+
+#[test]
+fn a_job_tmp_counts_against_the_declared_disk_and_the_guard_stops_the_container() {
+    if !enabled() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    let limit: u64 = 64 << 20;
+    let (container, worker) = start_with_tmp(temp.path(), &ws, 512 << 20, limit);
+    let sandbox = sentinel_worker::sandbox::Sandbox::Container(container);
+    let guard = sandbox
+        .guard_storage(ws.path(), limit)
+        .expect("a container's workspace and /tmp are guarded");
+    // Many files in /tmp, none in the workspace: only a guard that walks /tmp can end this.
+    let exit = sandbox.exec(
+        &sh(
+            "i=0; while [ $i -lt 64 ]; do dd if=/dev/zero of=/tmp/part$i bs=1M count=32 conv=fsync 2>/dev/null; \
+             i=$((i+1)); done; echo WROTE_ALL",
+            120,
+        ),
+        &[],
+    );
+    let used = guard
+        .exceeded()
+        .expect("/tmp passed the declared disk and the guard noticed");
+    assert!(used > limit, "{used}");
+    if let Ok(exit) = exit {
+        assert!(!String::from_utf8_lossy(&exit.stdout).contains("WROTE_ALL"));
+        assert!(!exit.timed_out);
+    }
+    let written = fs::read_dir(ws.tmp_path()).unwrap().count() as u64;
+    assert!(written < 64, "{written} parts were written");
+    drop(guard);
+    let _ = sandbox.destroy();
+    assert!(podman::owned(worker).unwrap().is_empty());
+    ws.destroy().unwrap();
+}

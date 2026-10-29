@@ -96,13 +96,17 @@ impl Sandbox {
         }
     }
 
-    /// Watches the attempt's workspace against `limit` bytes while its steps run, when the sandbox has no size
-    /// bound of its own. A container's workspace is a bind mount that rootless Podman cannot bound, so the guard
-    /// measures it ([`crate::quota`]); a microVM's workspace lives on a scratch disk of exactly the declared size.
+    /// Watches the attempt's workspace and its job `/tmp` together against `limit` bytes while its steps run, when
+    /// the sandbox has no size bound of its own. A container's workspace and `/tmp` are bind mounts that rootless
+    /// Podman cannot bound, so the guard measures them ([`crate::quota`]); a microVM's disk is a scratch image of
+    /// exactly the declared size.
     pub fn guard_storage(&self, workspace: &Path, limit: u64) -> Option<crate::quota::Guard> {
         match self {
             Sandbox::Container(c) => Some(crate::quota::Guard::start(
-                workspace.to_path_buf(),
+                vec![
+                    workspace.to_path_buf(),
+                    crate::workspace::tmp_beside(workspace),
+                ],
                 limit,
                 c.stopper(),
             )),

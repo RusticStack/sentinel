@@ -217,7 +217,8 @@ struct Shared {
     wake: Condvar,
 }
 
-/// Watches one workspace while its steps run. Dropping it stops the watcher.
+/// Watches a job's directories (its workspace and its `/tmp`) while its steps run, charging them together.
+/// Dropping it stops the watcher.
 pub struct Guard {
     shared: Arc<Shared>,
     limit: u64,
@@ -225,9 +226,10 @@ pub struct Guard {
 }
 
 impl Guard {
-    /// Starts watching `workspace` against `limit` bytes (0 watches nothing). `stop` is called once, from the
-    /// watcher thread, when the workspace passes the limit; it must end the job's processes.
-    pub fn start(workspace: PathBuf, limit: u64, stop: impl FnOnce() + Send + 'static) -> Guard {
+    /// Starts watching `roots` against `limit` bytes taken together (0 watches nothing); a root that does not
+    /// exist is not charged. `stop` is called once, from the watcher thread, when they pass the limit; it must end
+    /// the job's processes.
+    pub fn start(roots: Vec<PathBuf>, limit: u64, stop: impl FnOnce() + Send + 'static) -> Guard {
         let shared = Arc::new(Shared {
             abort: AtomicBool::new(false),
             exceeded: AtomicBool::new(false),
@@ -245,7 +247,7 @@ impl Guard {
         let watcher = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("sentinel-disk-guard".into())
-            .spawn(move || watch(&watcher, &workspace, limit, stop))
+            .spawn(move || watch(&watcher, &roots, limit, stop))
             .ok();
         Guard {
             shared,
@@ -254,7 +256,7 @@ impl Guard {
         }
     }
 
-    /// The bytes the workspace occupied when it passed the limit, once it has.
+    /// The bytes the job's directories occupied when they passed the limit, once they have.
     pub fn exceeded(&self) -> Option<u64> {
         self.shared
             .exceeded
@@ -292,19 +294,31 @@ fn wait_stopped(shared: &Shared, wait: Duration) -> bool {
     *stopped
 }
 
-fn watch(shared: &Shared, workspace: &Path, limit: u64, stop: impl FnOnce()) {
+/// The bytes `roots` occupy together, stopping once the total passes `limit`. A root that cannot be read is not
+/// over its limit: the steps are ending or it is already gone.
+fn measure_all(roots: &[PathBuf], limit: u64, abort: &AtomicBool) -> u64 {
+    let mut total = 0u64;
+    for root in roots {
+        if let Ok(usage) = measure(root, limit.saturating_sub(total), WALK_BUDGET, abort) {
+            total = total.saturating_add(usage.bytes);
+        }
+        if total > limit {
+            break;
+        }
+    }
+    total
+}
+
+fn watch(shared: &Shared, roots: &[PathBuf], limit: u64, stop: impl FnOnce()) {
     let mut wait = FIRST_SAMPLE;
     loop {
         if wait_stopped(shared, wait) {
             return;
         }
         let started = Instant::now();
-        // A workspace that cannot be read is not over its limit: the steps are ending or already gone.
-        if let Ok(usage) = measure(workspace, limit, WALK_BUDGET, &shared.abort)
-            && usage.bytes > limit
-            && !shared.abort.load(Ordering::Relaxed)
-        {
-            shared.used.store(usage.bytes, Ordering::Release);
+        let used = measure_all(roots, limit, &shared.abort);
+        if used > limit && !shared.abort.load(Ordering::Relaxed) {
+            shared.used.store(used, Ordering::Release);
             shared.exceeded.store(true, Ordering::Release);
             stop();
             return;
@@ -423,7 +437,7 @@ mod tests {
         fill(&dir.path().join("data"), 1 << 20);
         let stops = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&stops);
-        let guard = Guard::start(dir.path().to_path_buf(), 4 << 20, move || {
+        let guard = Guard::start(vec![dir.path().to_path_buf()], 4 << 20, move || {
             counted.fetch_add(1, Ordering::SeqCst);
         });
         thread::sleep(FIRST_SAMPLE * 4);
@@ -442,11 +456,40 @@ mod tests {
     }
 
     #[test]
+    fn the_job_tmp_is_charged_with_the_workspace_and_a_missing_root_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, tmp) = (dir.path().join("ws"), dir.path().join("ws.tmp"));
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&tmp).unwrap();
+        // Each is under the 4 MiB limit alone; together they pass it.
+        fill(&workspace.join("data"), 3 << 20);
+        fill(&tmp.join("scratch"), 3 << 20);
+        let missing = dir.path().join("absent");
+        let stops = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&stops);
+        let guard = Guard::start(vec![workspace, tmp, missing], 4 << 20, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        while guard.exceeded().is_none() && started.elapsed() < Duration::from_secs(15) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            guard
+                .exceeded()
+                .expect("the two directories were charged together")
+                > 4 << 20
+        );
+        drop(guard);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn dropping_the_guard_ends_the_watcher_without_stopping_anything() {
         let dir = tempfile::tempdir().unwrap();
         let stops = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&stops);
-        let guard = Guard::start(dir.path().to_path_buf(), 1 << 30, move || {
+        let guard = Guard::start(vec![dir.path().to_path_buf()], 1 << 30, move || {
             counted.fetch_add(1, Ordering::SeqCst);
         });
         let started = Instant::now();
@@ -459,7 +502,9 @@ mod tests {
     fn a_zero_limit_watches_nothing() {
         let dir = tempfile::tempdir().unwrap();
         fill(&dir.path().join("data"), 1 << 20);
-        let guard = Guard::start(dir.path().to_path_buf(), 0, || panic!("must not stop"));
+        let guard = Guard::start(vec![dir.path().to_path_buf()], 0, || {
+            panic!("must not stop")
+        });
         thread::sleep(FIRST_SAMPLE * 3);
         assert_eq!(guard.exceeded(), None);
     }

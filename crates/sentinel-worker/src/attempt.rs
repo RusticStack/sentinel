@@ -1240,7 +1240,7 @@ pub fn capture_artifacts(
 /// stays `command_failed` (the job's own writes did it); this text is what names the limit.
 fn disk_exceeded(step: usize, used: u64, limit: u64) -> String {
     format!(
-        "step {step} exceeded the job's disk limit: the workspace held {used} bytes of the {limit} declared as resources.disk"
+        "step {step} exceeded the job's disk limit: the workspace and /tmp held {used} bytes of the {limit} declared as resources.disk"
     )
 }
 

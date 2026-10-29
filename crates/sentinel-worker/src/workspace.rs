@@ -16,6 +16,11 @@ pub const WORKSPACES_DIR: &str = "workspaces";
 /// Extension of the job `/tmp` directory next to a workspace (`<attempt>.tmp`).
 pub const TMP_EXTENSION: &str = "tmp";
 
+/// The job `/tmp` directory that belongs to the workspace at `workspace`.
+pub fn tmp_beside(workspace: &Path) -> PathBuf {
+    workspace.with_extension(TMP_EXTENSION)
+}
+
 pub struct Workspace {
     path: PathBuf,
     attempt: AttemptId,
@@ -47,7 +52,7 @@ impl Workspace {
     /// The job's `/tmp` on the workspace disk, beside the workspace so tools walking the checkout never see it
     /// and so it goes with the workspace: `destroy` and startup recovery remove both.
     pub fn tmp_path(&self) -> PathBuf {
-        self.path.with_extension(TMP_EXTENSION)
+        tmp_beside(&self.path)
     }
 
     /// Creates the job's `/tmp` directory, world-writable with the sticky bit as a `/tmp` is.
