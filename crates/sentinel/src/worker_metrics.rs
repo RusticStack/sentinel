@@ -36,8 +36,8 @@ pub struct Metrics {
     pub cache_copied_bytes: AtomicU64,
     pub cache_dirty_bytes: AtomicU64,
     /// Settled per-class estimates in nanoseconds, indexed by class code; zero is not yet settled.
-    pub cache_restore_ns: [AtomicU64; 3],
-    pub cache_rebuild_ns: [AtomicU64; 3],
+    pub cache_restore_ns: [AtomicU64; sentinel_protocol::cache::Class::ALL.len()],
+    pub cache_rebuild_ns: [AtomicU64; sentinel_protocol::cache::Class::ALL.len()],
     pub executor: OnceLock<sentinel_worker::executor::Executor>,
 }
 
