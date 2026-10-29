@@ -1628,12 +1628,14 @@ fn ready(state: &State) -> Route {
     {
         degraded.push("external_copy");
     }
-    if state
-        .objects
-        .backups()
-        .is_some_and(|b| !b.status()["last_failure"].is_null())
-    {
-        degraded.push("backup_failing");
+    if let Some(backups) = state.objects.backups() {
+        let status = backups.status();
+        if !status["last_failure"].is_null() {
+            degraded.push("backup_failing");
+        }
+        if crate::metrics::backup_objects_lost(&status).is_some_and(|lost| lost > 0) {
+            degraded.push("backup_incomplete");
+        }
     }
     if state.controller.connected().is_empty() {
         degraded.push("no_workers_connected");
