@@ -6,6 +6,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
     thread,
@@ -22,6 +23,8 @@ pub const PINNED_VERSION: &str = "0.6.0";
 pub const PINNED_SHA256: &str = "d46582137d21f03d15345e2be425d6317d49e5b8c8bb4f6fc56037f4c08cce73";
 pub const DEFAULT_LINK_PORT: u16 = 7443;
 pub const ALLOW_LIST_FILE: &str = "tailcat-allow";
+/// Owner-only, empty and never removed: its exclusive lock serializes every edit of the allow list.
+pub const ALLOW_LIST_LOCK_FILE: &str = "tailcat-allow.lock";
 pub const ADDRESS_FILE: &str = "address";
 pub const STAGED_ADDRESS_FILE: &str = "address.next";
 
@@ -47,6 +50,7 @@ const POLL: Duration = Duration::from_millis(100);
 const LINE_CAP: u64 = 8 * 1024;
 const OUTPUT_CAP: u64 = 64 * 1024;
 const ALLOW_LIST_CAP: u64 = 64 * 1024;
+const ALLOW_LOCK_DEADLINE: Duration = Duration::from_secs(10);
 
 const FORBIDDEN: [&str; 5] = ["all", "exit-node", "ssh", "files", "no-auth-ssh"];
 const INHERITED_ENV: [&str; 2] = ["SSL_CERT_FILE", "SSL_CERT_DIR"];
@@ -371,7 +375,45 @@ pub struct Committed {
     pub previous_deleted: bool,
 }
 
+/// Hold the allow list's edit lock until the returned file is dropped. Admit, retire, prune and
+/// revoke each read, edit and replace the file, from separate processes (the admin commands and the
+/// controller's tick), so the whole sequence runs under it or a later writer would erase an earlier
+/// one's change. Readers need no lock: the replacement is atomic.
+fn lock_allow_list(data_dir: &Path) -> Result<fs::File> {
+    let path = data_dir.join(ALLOW_LIST_LOCK_FILE);
+    let failed = |error: io::Error| {
+        Error::Unavailable(format!("cannot lock the tailcat allow list: {error}"))
+    };
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&path).map_err(failed)?;
+    let deadline = Instant::now() + ALLOW_LOCK_DEADLINE;
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(Error::Unavailable(
+                        "another process has held the tailcat allow list lock for 10 s".to_owned(),
+                    ));
+                }
+                thread::sleep(pause.min(deadline - now));
+                pause = (pause * 2).min(Duration::from_millis(25));
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(failed(error)),
+        }
+    }
+}
+
 pub fn admit(data_dir: &Path, admission: &Admission) -> Result<bool> {
+    let _lock = lock_allow_list(data_dir)?;
     let listed = allow_list(data_dir)?;
     match listed.iter().find(|line| line.key == admission.key) {
         Some(line) if line.worker == admission.worker => return Ok(false),
@@ -400,6 +442,7 @@ pub fn admit(data_dir: &Path, admission: &Admission) -> Result<bool> {
 }
 
 pub fn retire(data_dir: &Path, keep: &Admission) -> Result<usize> {
+    let _lock = lock_allow_list(data_dir)?;
     if !allow_list(data_dir)?.contains(keep) {
         return Err(Error::Unavailable(
             "that nodekey is not listed for that worker; admit it first".to_owned(),
@@ -428,6 +471,7 @@ pub fn retire(data_dir: &Path, keep: &Admission) -> Result<usize> {
 /// replaced atomically and stays owner-only; comments, blank lines and the other lines are kept
 /// byte for byte, and nothing is written when no line matches.
 pub fn prune(data_dir: &Path, mut drop_line: impl FnMut(&Admission) -> bool) -> Result<usize> {
+    let _lock = lock_allow_list(data_dir)?;
     // Refuse a file `allow_list` would refuse (not a regular owner-only file, malformed, too big).
     allow_list(data_dir)?;
     let text = read_allow_text(data_dir)?;
@@ -1957,12 +2001,18 @@ fn record_address(keydir: &Path, name: &str, address: &Address) -> Result<()> {
 }
 
 fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let target = dir.join(name);
-    let staging = dir.join(format!(".{name}.tmp"));
+    // A name of its own, so no writer removes or renames another's staging file.
+    let staging = dir.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let failed = |error: io::Error| {
+        let _ = fs::remove_file(&staging);
         Error::Unavailable(format!("cannot write the tailcat {name} file: {error}"))
     };
-    let _ = fs::remove_file(&staging);
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

@@ -175,6 +175,28 @@ impl Credentials {
     }
 }
 
+/// Why a stored credential could not be read.
+#[derive(Debug)]
+pub enum ReadFailure {
+    /// The store did not hand the blob over; asking again may succeed.
+    Store(Error),
+    /// The blob was read and does not parse; asking again reads the same bytes.
+    Damaged(Error),
+}
+
+impl ReadFailure {
+    pub fn into_error(self) -> Error {
+        match self {
+            ReadFailure::Store(e) | ReadFailure::Damaged(e) => e,
+        }
+    }
+}
+
+pub fn parse_stored(blob: Option<Vec<u8>>) -> Result<Option<Credentials>, ReadFailure> {
+    blob.map(|blob| Credentials::parse(&blob).map_err(ReadFailure::Damaged))
+        .transpose()
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     dir: PathBuf,
@@ -394,11 +416,22 @@ impl Config {
         name: &str,
         profile: &Profile,
     ) -> Result<Option<Credentials>, Error> {
-        validate_name(name)?;
-        profile.check(name)?;
-        keystore::read(profile.store, &self.dir, &profile.os_key(name), name)?
-            .map(|blob| Credentials::parse(&blob))
-            .transpose()
+        self.read_credentials_classified(name, profile)
+            .map_err(ReadFailure::into_error)
+    }
+
+    // Tells a store that did not answer (a busy Credential Manager, a refused file) from a blob that was read and is damaged:
+    // a retry can fix the first, never the second.
+    pub fn read_credentials_classified(
+        &self,
+        name: &str,
+        profile: &Profile,
+    ) -> Result<Option<Credentials>, ReadFailure> {
+        validate_name(name).map_err(ReadFailure::Store)?;
+        profile.check(name).map_err(ReadFailure::Store)?;
+        let blob = keystore::read(profile.store, &self.dir, &profile.os_key(name), name)
+            .map_err(ReadFailure::Store)?;
+        parse_stored(blob)
     }
 
     pub fn write_credentials(

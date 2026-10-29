@@ -1590,3 +1590,371 @@ fn windows_two_directories_never_refresh_one_legacy_entry_at_once() {
     }
     assert_eq!(windows::read(&legacy).unwrap(), None, "the entry moved");
 }
+
+fn grant_file(dir: &tempfile::TempDir, n: u64) -> String {
+    let path = dir.path().join(format!("grant-{n}"));
+    std::fs::write(&path, token("sntl_rt_", n)).unwrap();
+    path.to_str().unwrap().to_owned()
+}
+
+#[test]
+fn login_refuses_a_credential_store_setting_before_any_request() {
+    let server = oauth_server(|_| (200, tokens_json(71, "grt_new")));
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("cfg");
+    let file = grant_file(&dir, 70);
+    for value in ["bogus", "File"] {
+        let output = sentinel(&cfg)
+            .env("SENTINEL_CREDENTIAL_STORE", value)
+            .args([
+                "auth",
+                "login",
+                "--grant-file",
+                &file,
+                "--server",
+                &server.url,
+            ])
+            .output()
+            .unwrap();
+        assert_no_tokens(&output);
+        assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("SENTINEL_CREDENTIAL_STORE"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert_eq!(
+        server.total(),
+        0,
+        "no discovery, no token spent, no grant minted"
+    );
+}
+
+#[test]
+fn a_relogin_stores_the_new_credential_first_then_revokes_the_old_grant() {
+    let server = oauth_server(|_| (200, tokens_json(71, "grt_new")));
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("cfg");
+    let config = Config::at(&cfg).unwrap();
+    seed(&config, "default", &server.url, &credentials(1, 600_000));
+
+    let file = grant_file(&dir, 70);
+    let output = run(
+        &cfg,
+        &[
+            "auth",
+            "login",
+            "--grant-file",
+            &file,
+            "--server",
+            &server.url,
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let revokes = server.requests("/oauth/revoke");
+    assert_eq!(revokes.len(), 1, "only the previous grant is revoked");
+    assert_eq!(revokes[0].param("token"), Some(token("sntl_rt_", 1)));
+    let entry = &config.load().unwrap().profiles["default"];
+    assert_eq!(entry.grant, "grt_new");
+    let stored = config.read_credentials("default", entry).unwrap().unwrap();
+    assert_eq!(
+        stored.refresh,
+        token("sntl_rt_", 71),
+        "the old credential's cleanup did not remove the new one"
+    );
+}
+
+/// A write that fails after the browser flow must not sign the user out or strand a live grant.
+#[cfg(unix)]
+#[test]
+fn a_failed_credential_write_revokes_the_new_grant_and_keeps_the_old_sign_in() {
+    use std::os::unix::fs::PermissionsExt;
+    if rustix_euid() == 0 {
+        return; // root writes through a read-only directory
+    }
+    let server = oauth_server(|_| (200, tokens_json(71, "grt_new")));
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("cfg");
+    let config = Config::at(&cfg).unwrap();
+    let old = seed(&config, "default", &server.url, &credentials(1, 600_000));
+    let credentials_dir = cfg.join("credentials");
+    std::fs::set_permissions(&credentials_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let file = grant_file(&dir, 70);
+    let output = run(
+        &cfg,
+        &[
+            "auth",
+            "login",
+            "--grant-file",
+            &file,
+            "--server",
+            &server.url,
+        ],
+    );
+    std::fs::set_permissions(&credentials_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let revokes = server.requests("/oauth/revoke");
+    assert_eq!(revokes.len(), 1, "{revokes:?}");
+    assert_eq!(
+        revokes[0].param("token"),
+        Some(token("sntl_rt_", 71)),
+        "the new grant is revoked, the old one is not"
+    );
+    assert!(stderr(&output).contains("previous sign-in is unchanged"));
+    assert_eq!(config.load().unwrap().profiles["default"].grant, old.grant);
+    let kept = config.read_credentials("default", &old).unwrap().unwrap();
+    assert_eq!(
+        kept.refresh,
+        token("sntl_rt_", 1),
+        "the old credential is intact"
+    );
+}
+
+#[test]
+fn logout_of_a_damaged_credential_deletes_it_and_exits_1_without_a_revocation() {
+    let server = oauth_server(|_| oauth_error("invalid_grant"));
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = dir.path().join("cfg");
+    let config = Config::at(&cfg_dir).unwrap();
+    let entry = seed(&config, "default", &server.url, &credentials(1, 600_000));
+    keystore::write(
+        Backend::File,
+        config.dir(),
+        "unused",
+        "default",
+        b"{not json",
+    )
+    .unwrap();
+    assert!(config.read_credentials("default", &entry).is_err());
+
+    let output = run(&cfg_dir, &["auth", "logout"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("could not be read, so its grant was not revoked"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(server.requests("/oauth/revoke").is_empty());
+    assert!(!cfg_dir.join("credentials/default.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn logout_of_a_loose_credential_file_deletes_it_and_exits_1_without_a_revocation() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = oauth_server(|_| oauth_error("invalid_grant"));
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = dir.path().join("cfg");
+    let config = Config::at(&cfg_dir).unwrap();
+    seed(&config, "default", &server.url, &credentials(1, 600_000));
+    let file = cfg_dir.join("credentials/default.json");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let output = run(&cfg_dir, &["auth", "logout"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("chmod 600"), "{}", stderr(&output));
+    assert!(server.requests("/oauth/revoke").is_empty());
+    assert!(!file.exists());
+}
+
+/// The OS store may only be busy: deleting would destroy the only copy of the refresh token.
+#[cfg(not(windows))]
+#[test]
+fn logout_of_an_os_store_credential_that_cannot_be_read_deletes_nothing_and_exits_6() {
+    let server = oauth_server(|_| oauth_error("invalid_grant"));
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = dir.path().join("cfg");
+    let config = Config::at(&cfg_dir).unwrap();
+    let mut entry = seed(&config, "default", &server.url, &credentials(1, 600_000));
+    entry.store = Backend::Os;
+    entry.key = Some(keystore::scoped_key(config.dir(), &server.url, "default"));
+    let stored = entry.clone();
+    config
+        .update(|p| {
+            p.profiles.insert("default".to_owned(), stored);
+            Ok(())
+        })
+        .unwrap();
+
+    let output = run(&cfg_dir, &["auth", "logout"]);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    assert!(server.requests("/oauth/revoke").is_empty());
+    assert!(
+        cfg_dir.join("credentials/default.json").exists(),
+        "nothing was deleted"
+    );
+    assert!(config.load().unwrap().profiles.contains_key("default"));
+}
+
+/// `os` is a preference: off Windows it falls back to the owner-only file store with a notice.
+#[cfg(not(windows))]
+#[test]
+fn login_with_the_os_store_preference_falls_back_to_the_file_store_with_a_notice() {
+    let server = oauth_server(|_| (200, tokens_json(71, "grt_new")));
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("cfg");
+    let file = grant_file(&dir, 70);
+    let output = sentinel(&cfg)
+        .env("SENTINEL_CREDENTIAL_STORE", "os")
+        .args([
+            "auth",
+            "login",
+            "--grant-file",
+            &file,
+            "--server",
+            &server.url,
+        ])
+        .output()
+        .unwrap();
+    assert_no_tokens(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("notice:") && text.contains("SENTINEL_CREDENTIAL_STORE=file"),
+        "{text}"
+    );
+    assert!(text.contains("credential in the file store"), "{text}");
+    let config = Config::at(&cfg).unwrap();
+    let entry = &config.load().unwrap().profiles["default"];
+    assert_eq!(entry.store, Backend::File);
+    assert!(cfg.join("credentials/default.json").exists());
+}
+
+#[test]
+fn rewriting_a_file_credential_replaces_it_whole_and_leaves_no_staging_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(&dir);
+    let entry = seed(
+        &config,
+        "default",
+        "https://ci.example.com",
+        &credentials(1, 600_000),
+    );
+    for n in 2..6 {
+        config
+            .write_credentials("default", &entry, &credentials(n, 600_000))
+            .unwrap();
+        let stored = config.read_credentials("default", &entry).unwrap().unwrap();
+        assert_eq!(stored.refresh, token("sntl_rt_", n));
+    }
+    let names: Vec<_> = std::fs::read_dir(config.dir().join("credentials"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["default.json".to_owned()], "{names:?}");
+}
+
+/// Fails for every user, root included: the rename onto a non-empty directory cannot succeed.
+#[cfg(unix)]
+#[test]
+fn an_unwritable_credential_target_revokes_the_new_grant_and_leaves_no_staging_file() {
+    use std::os::unix::fs::DirBuilderExt;
+    let server = oauth_server(|_| (200, tokens_json(71, "grt_new")));
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("cfg");
+    let config = Config::at(&cfg).unwrap();
+    let old = seed(&config, "default", &server.url, &credentials(1, 600_000));
+    let target = cfg.join("credentials/default.json");
+    std::fs::remove_file(&target).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&target)
+        .unwrap();
+    std::fs::write(target.join("occupied"), b"x").unwrap();
+
+    let file = grant_file(&dir, 70);
+    let output = run(
+        &cfg,
+        &[
+            "auth",
+            "login",
+            "--grant-file",
+            &file,
+            "--server",
+            &server.url,
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let revokes = server.requests("/oauth/revoke");
+    assert_eq!(revokes.len(), 1, "{revokes:?}");
+    assert_eq!(revokes[0].param("token"), Some(token("sntl_rt_", 71)));
+    assert!(stderr(&output).contains("previous sign-in is unchanged"));
+    assert_eq!(config.load().unwrap().profiles["default"].grant, old.grant);
+    let names: Vec<_> = std::fs::read_dir(cfg.join("credentials"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["default.json".to_owned()], "{names:?}");
+}
+
+/// The new credential is stored (a file store replaced the old one in place) but profiles.json cannot be updated:
+/// the previous grant has no credential left to revoke it later, so it is revoked on the way out.
+#[test]
+fn a_failed_profile_update_still_revokes_the_previous_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("cfg");
+    let profiles = cfg.join("profiles.json");
+    let blocker = profiles.clone();
+    // Once the token request is served the sign-in has already read the profiles, so the update is what fails.
+    let server = oauth_server(move |_| {
+        if blocker.is_file() {
+            std::fs::remove_file(&blocker).unwrap();
+            std::fs::create_dir(&blocker).unwrap();
+            std::fs::write(blocker.join("occupied"), b"x").unwrap();
+        }
+        (200, tokens_json(71, "grt_new"))
+    });
+    let config = Config::at(&cfg).unwrap();
+    seed(&config, "default", &server.url, &credentials(1, 600_000));
+
+    let file = grant_file(&dir, 70);
+    let output = run(
+        &cfg,
+        &[
+            "auth",
+            "login",
+            "--grant-file",
+            &file,
+            "--server",
+            &server.url,
+        ],
+    );
+    assert_ne!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(profiles.is_dir(), "the update really was blocked");
+    let revokes = server.requests("/oauth/revoke");
+    assert_eq!(revokes.len(), 1, "{revokes:?}");
+    assert_eq!(
+        revokes[0].param("token"),
+        Some(token("sntl_rt_", 1)),
+        "the previous grant is revoked, the new one stays"
+    );
+    assert!(stderr(&output).contains("could not be updated"));
+}
+
+/// `--forget` must not drop the entry that points at a credential logout left in place.
+#[cfg(not(windows))]
+#[test]
+fn logout_forget_keeps_the_profile_whose_os_store_credential_could_not_be_read() {
+    let server = oauth_server(|_| oauth_error("invalid_grant"));
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = dir.path().join("cfg");
+    let config = Config::at(&cfg_dir).unwrap();
+    let mut entry = seed(&config, "default", &server.url, &credentials(1, 600_000));
+    entry.store = Backend::Os;
+    entry.key = Some(keystore::scoped_key(config.dir(), &server.url, "default"));
+    let stored = entry.clone();
+    config
+        .update(|p| {
+            p.profiles.insert("default".to_owned(), stored);
+            Ok(())
+        })
+        .unwrap();
+
+    let output = run(&cfg_dir, &["auth", "logout", "--forget"]);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    let profiles = config.load().unwrap();
+    assert!(profiles.profiles.contains_key("default"));
+    assert_eq!(profiles.current.as_deref(), Some("default"));
+}

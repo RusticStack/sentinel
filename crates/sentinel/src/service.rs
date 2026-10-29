@@ -1697,15 +1697,25 @@ impl TailcatServer {
 #[cfg(feature = "server")]
 const TAILCAT_ALLOW_REFRESH: Duration = Duration::from_secs(10);
 
+/// What one pass over the Tailcat allow list learned from the store.
+#[cfg(feature = "server")]
+struct Admitted {
+    /// Every node key the helper admits.
+    keys: Vec<sentinel_link::tailcat::NodeKey>,
+    /// The distinct workers on the file that are revoked or uninstalled, whose lines can go.
+    revoked: Vec<sentinel_core::WorkerId>,
+}
+
 /// Every node key the controller's Tailcat helper admits: the allow-list file's lines for workers that
 /// are not revoked, the bound key of every live worker, and the key authorized for each enrollment
 /// that can still be redeemed (without it a new worker could not reach the controller to present its
-/// secret). A worker revoked or uninstalled drops out of all three on the next pass.
+/// secret). A worker revoked or uninstalled drops out of all three on the next pass, and is reported
+/// once so the caller prunes its lines without a second read.
 #[cfg(feature = "server")]
 fn admitted_keys(
     store: &sentinel_store::Store,
     listed: &[sentinel_link::tailcat::Admission],
-) -> sentinel_store::Result<Vec<sentinel_link::tailcat::NodeKey>> {
+) -> sentinel_store::Result<Admitted> {
     admitted_keys_at(store, listed, sentinel_core::UnixMillis::now())
 }
 
@@ -1714,12 +1724,26 @@ fn admitted_keys_at(
     store: &sentinel_store::Store,
     listed: &[sentinel_link::tailcat::Admission],
     now: sentinel_core::UnixMillis,
-) -> sentinel_store::Result<Vec<sentinel_link::tailcat::NodeKey>> {
+) -> sentinel_store::Result<Admitted> {
     use sentinel_link::tailcat::NodeKey;
     store.read(|conn| {
         let mut keys = Vec::with_capacity(listed.len());
+        let mut revoked = Vec::new();
+        // One point query per distinct worker, however many keys it has listed.
+        let mut checked = std::collections::HashMap::with_capacity(listed.len());
         for admission in listed {
-            if !sentinel_store::workers::revoked(conn, admission.worker)? {
+            let gone = match checked.get(&admission.worker) {
+                Some(gone) => *gone,
+                None => {
+                    let gone = sentinel_store::workers::revoked(conn, admission.worker)?;
+                    checked.insert(admission.worker, gone);
+                    if gone {
+                        revoked.push(admission.worker);
+                    }
+                    gone
+                }
+            };
+            if !gone {
                 keys.push(admission.key.clone());
             }
         }
@@ -1737,37 +1761,24 @@ fn admitted_keys_at(
                 keys.push(key);
             }
         }
-        Ok(keys)
+        Ok(Admitted { keys, revoked })
     })
 }
 
 /// Take the lines of revoked or uninstalled workers off the allow-list file, so the file the operator
-/// reads names only the machines the controller still admits. Returns the workers it dropped.
+/// reads names only the machines the controller still admits. Returns the workers it dropped; the file
+/// is not touched when there is none.
 #[cfg(feature = "server")]
 fn prune_revoked(
-    store: &sentinel_store::Store,
     data_dir: &Path,
-    listed: &[sentinel_link::tailcat::Admission],
+    revoked: &[sentinel_core::WorkerId],
 ) -> Vec<sentinel_core::WorkerId> {
-    let revoked: Vec<sentinel_core::WorkerId> = store
-        .read(|conn| {
-            let mut gone = Vec::new();
-            for admission in listed {
-                if !gone.contains(&admission.worker)
-                    && sentinel_store::workers::revoked(conn, admission.worker)?
-                {
-                    gone.push(admission.worker);
-                }
-            }
-            Ok(gone)
-        })
-        .unwrap_or_default();
     if revoked.is_empty()
         || sentinel_link::tailcat::prune(data_dir, |line| revoked.contains(&line.worker)).is_err()
     {
         return Vec::new();
     }
-    revoked
+    revoked.to_vec()
 }
 
 #[cfg(feature = "server")]
@@ -1783,11 +1794,13 @@ fn start_tailcat(
     };
     let mut listed = sentinel_link::tailcat::allow_list(&config.data_dir)
         .map_err(|error| Error::runtime(format!("cannot read the tailcat allow list: {error}")))?;
-    let keys = admitted_keys(store, &listed).map_err(|error| {
-        Error::runtime(format!(
-            "cannot check the tailcat allow list's workers: {error}"
-        ))
-    })?;
+    let keys = admitted_keys(store, &listed)
+        .map_err(|error| {
+            Error::runtime(format!(
+                "cannot check the tailcat allow list's workers: {error}"
+            ))
+        })?
+        .keys;
     let server = sentinel_link::tailcat::start_server(&helper, &config.data_dir, &keys)
         .map_err(|error| Error::runtime(format!("cannot start the tailcat helper: {error}")))?;
     match server.wait_ready(Duration::from_secs(60)) {
@@ -1846,9 +1859,9 @@ fn start_tailcat(
                             Err(_) => {}
                         }
                         match admitted_keys(&store, &listed) {
-                            Ok(keys) => {
+                            Ok(Admitted { keys, revoked }) => {
                                 store_warned = false;
-                                let pruned = prune_revoked(&store, &data_dir, &listed);
+                                let pruned = prune_revoked(&data_dir, &revoked);
                                 if !pruned.is_empty() {
                                     tracing::info!(
                                         event = "tailcat_allow_pruned",
@@ -3621,18 +3634,39 @@ mod tests {
             },
         ];
         assert_eq!(
-            admitted_keys(&store, &listed).unwrap(),
+            admitted_keys(&store, &listed).unwrap().keys,
             vec![key('a').unwrap(), key('b').unwrap(), key('c').unwrap()]
         );
         store
             .writer()
             .write(move |tx| workers::revoke(tx, Authority::HostLocal, enrolled, UnixMillis(2_000)))
             .unwrap();
+        let admitted = admitted_keys(&store, &listed).unwrap();
         assert_eq!(
-            admitted_keys(&store, &listed).unwrap(),
+            admitted.keys,
             vec![key('b').unwrap()],
             "revoking the worker withdraws its tunnel keys, the rotated one too"
         );
+        assert_eq!(
+            admitted.revoked,
+            vec![enrolled],
+            "the revoked worker is reported once for its two lines, the unknown one never"
+        );
+
+        // The same pass prunes exactly the revoked worker's lines and nothing else.
+        let dir = tempfile::tempdir().unwrap();
+        for line in &listed {
+            sentinel_link::tailcat::admit(dir.path(), line).unwrap();
+        }
+        assert_eq!(prune_revoked(dir.path(), &admitted.revoked), vec![enrolled]);
+        assert_eq!(
+            sentinel_link::tailcat::allow_list(dir.path()).unwrap(),
+            vec![listed[1].clone()]
+        );
+        let allow = dir.path().join(sentinel_link::tailcat::ALLOW_LIST_FILE);
+        let before = std::fs::read(&allow).unwrap();
+        assert!(prune_revoked(dir.path(), &[]).is_empty());
+        assert_eq!(std::fs::read(&allow).unwrap(), before, "nothing to prune");
     }
 
     #[test]
@@ -3688,7 +3722,7 @@ mod tests {
             .unwrap();
 
         // Before the worker has connected, its authorized key is all the helper has to go on.
-        let at = |ms| admitted_keys_at(&store, &[], UnixMillis(ms)).unwrap();
+        let at = |ms| admitted_keys_at(&store, &[], UnixMillis(ms)).unwrap().keys;
         assert_eq!(at(2_000), vec![node_key.clone()]);
         assert!(at(61_001).is_empty(), "an expired enrollment admits no one");
 
@@ -3724,7 +3758,9 @@ mod tests {
             worker,
         }];
         assert_eq!(
-            admitted_keys_at(&store, &listed, UnixMillis(3_500)).unwrap(),
+            admitted_keys_at(&store, &listed, UnixMillis(3_500))
+                .unwrap()
+                .keys,
             vec![node_key.clone()]
         );
 
@@ -3738,14 +3774,12 @@ mod tests {
                 workers::settle_uninstalls(tx, UnixMillis(4_100)).map(|_| ())
             })
             .unwrap();
-        assert!(
-            admitted_keys_at(&store, &listed, UnixMillis(4_200))
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(prune_revoked(&store, dir.path(), &listed), vec![worker]);
+        let admitted = admitted_keys_at(&store, &listed, UnixMillis(4_200)).unwrap();
+        assert!(admitted.keys.is_empty());
+        assert_eq!(admitted.revoked, vec![worker]);
+        assert_eq!(prune_revoked(dir.path(), &admitted.revoked), vec![worker]);
         assert_eq!(std::fs::read_to_string(&allow).unwrap(), "");
-        assert!(prune_revoked(&store, dir.path(), &[]).is_empty());
+        assert!(prune_revoked(dir.path(), &[]).is_empty());
     }
 
     fn marks_ok(storage: &Storage, total: u64) -> sentinel_store::space::Watermarks {

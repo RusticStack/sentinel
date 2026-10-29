@@ -31,6 +31,9 @@ pub const DEFAULT_SCOPE: &str = "runs:read runs:write logs:read artifacts:read c
 pub const STATUS_SCHEMA: &str = "sentinel.auth-status/1";
 const QUICK: Duration = Duration::from_secs(5);
 const MAX_GRANT_FILE: u64 = 4 << 10;
+const LOGIN_ENV_HELP: &str = "\
+Environment:
+  SENTINEL_CREDENTIAL_STORE  where the new credential is stored: \"file\" (an owner-only file in the configuration directory) or \"os\" (the OS credential store, Windows only). Default: os on Windows, file elsewhere. A preference, not a force: when the OS store fails, the credential goes to the file store with a notice on stderr. Any other value is refused before the sign-in starts.";
 
 #[derive(Args, Debug)]
 pub struct AuthArgs {
@@ -41,6 +44,7 @@ pub struct AuthArgs {
 #[derive(Subcommand, Debug)]
 pub enum AuthCommand {
     /// Sign in through the browser (or --device, or --grant-file) and store the grant in a profile
+    #[command(after_help = LOGIN_ENV_HELP)]
     Login(LoginArgs),
     /// Show the profile, account, scopes and expiry; never token material
     Status(StatusArgs),
@@ -219,6 +223,8 @@ pub fn requested_scope(scope: Option<&str>, meta: &Metadata) -> Result<String, E
 }
 
 fn run_login(args: LoginArgs) -> Result<(), Error> {
+    // A refused store setting must fail before a browser flow mints a grant that has nowhere to go.
+    let backend = keystore::preferred()?;
     let config = Config::from_env()?;
     let name = args
         .profile
@@ -254,7 +260,20 @@ fn run_login(args: LoginArgs) -> Result<(), Error> {
             browser_login(&agent, &meta, &scope, !args.no_browser)?
         }
     };
-    save_login(&config, &agent, &name, &meta, &response, sent, previous)
+    let outcome = Outcome {
+        meta: &meta,
+        response: &response,
+        sent,
+        backend,
+    };
+    save_login(&config, &agent, &name, &outcome, previous)
+}
+
+struct Outcome<'a> {
+    meta: &'a Metadata,
+    response: &'a TokenResponse,
+    sent: u64,
+    backend: keystore::Backend,
 }
 
 fn browser_login(
@@ -425,23 +444,28 @@ fn revoke(agent: &ureq::Agent, issuer: &str, token: &str) -> Result<(), Error> {
     }
 }
 
-// Write the credential before the profile that points at it, under the profile lock.
+// The new credential is stored before anything of the previous sign-in is touched, under the profile lock:
+// a store that fails leaves the previous sign-in intact and the new grant revoked, never a signed-out user.
 fn save_login(
     config: &Config,
     agent: &ureq::Agent,
     name: &str,
-    meta: &Metadata,
-    response: &TokenResponse,
-    sent: u64,
+    outcome: &Outcome<'_>,
     previous: Option<Profile>,
 ) -> Result<(), Error> {
+    let Outcome {
+        meta,
+        response,
+        sent,
+        backend,
+    } = *outcome;
     let server = &meta.issuer;
     let credentials = Credentials::from_response(response, sent)?;
     let me = match whoami(agent, server, &credentials.access) {
         Ok((200, me)) if me["user"].as_str().is_some_and(|u| u.starts_with("usr_")) => me,
-        outcome => {
+        failure => {
             let _ = revoke(&quick_agent(), server, &credentials.refresh);
-            return Err(match outcome {
+            return Err(match failure {
                 Err(e) => e,
                 Ok((401 | 403, _)) => {
                     Error::new(Exit::Auth, "the server did not accept the new access token")
@@ -453,39 +477,31 @@ fn save_login(
         }
     };
     let _lock = config.lock(name)?;
-    if let Some(old) = &previous {
-        // A legacy shared store entry may now hold another config directory's sign-in: revoke only ours.
-        let (stored, ours) = if old.is_legacy() {
-            match config.legacy_owner(&quick_agent(), name, old) {
-                profile::Owner::Ours(stored) => (Some(stored), true),
-                profile::Owner::Absent => (None, false),
-                profile::Owner::Theirs => {
-                    eprintln!(
-                        "notice: the previous sign-in's shared credential entry now belongs to another configuration directory; it is left alone"
-                    );
-                    (None, false)
-                }
-                profile::Owner::Unknown => {
-                    eprintln!(
-                        "notice: could not tell whose sign-in the previous shared credential entry holds; it is left in place and expires on its own"
-                    );
-                    (None, false)
-                }
+    // Read before the store: a file-store write replaces the previous credential in place.
+    let superseded = previous
+        .as_ref()
+        .map(|old| (old, previous_credential(config, name, old)));
+    let (store, key) = match config.store_credentials(name, server, backend, &credentials) {
+        Ok(stored) => stored,
+        Err(error) => {
+            // The same grant is the previous sign-in's own: revoking it would sign that out as well.
+            if previous
+                .as_ref()
+                .is_none_or(|old| old.grant != response.sentinel_grant)
+            {
+                let revoked = revoke(&quick_agent(), server, &credentials.refresh).is_ok();
+                eprintln!(
+                    "notice: the new sign-in was not stored; {}",
+                    if revoked {
+                        "its grant was revoked and the previous sign-in is unchanged"
+                    } else {
+                        "its grant could not be revoked and stays valid on the server until it expires"
+                    }
+                );
             }
-        } else {
-            (config.read_credentials(name, old).ok().flatten(), true)
-        };
-        if let Some(stored) = stored
-            && old.grant != response.sentinel_grant
-        {
-            let _ = revoke(&quick_agent(), &old.issuer, &stored.refresh);
+            return Err(error);
         }
-        if ours {
-            let _ = config.delete_credentials(name, old);
-        }
-    }
-    let (store, key) =
-        config.store_credentials(name, server, keystore::preferred()?, &credentials)?;
+    };
     let username = me["username"].as_str().map(str::to_owned);
     let entry = Profile {
         server: server.clone(),
@@ -496,17 +512,42 @@ fn save_login(
         grant: response.sentinel_grant.clone(),
         scopes: response.scope.clone(),
         tenant: previous
+            .as_ref()
             .filter(|p| p.server == *server)
-            .and_then(|p| p.tenant),
+            .and_then(|p| p.tenant.clone()),
         store,
-        key,
+        key: key.clone(),
         created_ms: sent,
     };
-    config.update(|profiles| {
+    let updated = config.update(|profiles| {
         profiles.profiles.insert(name.to_owned(), entry);
         profiles.current = Some(name.to_owned());
         Ok(())
-    })?;
+    });
+    if let Err(error) = updated {
+        // The write above already replaced the previous credential in a file store: this is the last chance to revoke its grant.
+        if let Some((old, (Some(stored), _))) = &superseded
+            && old.grant != response.sentinel_grant
+        {
+            let _ = revoke(&quick_agent(), &old.issuer, &stored.refresh);
+        }
+        eprintln!(
+            "notice: the new sign-in is stored but the profile could not be updated; run sentinel auth login again"
+        );
+        return Err(error);
+    }
+    if let Some((old, (stored, ours))) = superseded {
+        if let Some(stored) = stored
+            && old.grant != response.sentinel_grant
+        {
+            let _ = revoke(&quick_agent(), &old.issuer, &stored.refresh);
+        }
+        // A file entry is keyed by profile name alone, so it was replaced by the write above.
+        let replaced = old.store == store && (store == keystore::Backend::File || old.key == key);
+        if ours && !replaced {
+            let _ = config.delete_credentials(name, old);
+        }
+    }
     eprintln!(
         "Signed in to {server} as {} (profile {name}, grant {}); scopes: {}; credential in the {} store",
         username
@@ -517,6 +558,30 @@ fn save_login(
         store.as_str()
     );
     Ok(())
+}
+
+// The previous sign-in's credential, and whether this configuration directory owns its store entry.
+fn previous_credential(config: &Config, name: &str, old: &Profile) -> (Option<Credentials>, bool) {
+    if !old.is_legacy() {
+        return (config.read_credentials(name, old).ok().flatten(), true);
+    }
+    // A legacy shared store entry may now hold another config directory's sign-in: revoke only ours.
+    match config.legacy_owner(&quick_agent(), name, old) {
+        profile::Owner::Ours(stored) => (Some(stored), true),
+        profile::Owner::Absent => (None, false),
+        profile::Owner::Theirs => {
+            eprintln!(
+                "notice: the previous sign-in's shared credential entry now belongs to another configuration directory; it is left alone"
+            );
+            (None, false)
+        }
+        profile::Owner::Unknown => {
+            eprintln!(
+                "notice: could not tell whose sign-in the previous shared credential entry holds; it is left in place and expires on its own"
+            );
+            (None, false)
+        }
+    }
 }
 
 fn pick(
@@ -715,6 +780,31 @@ pub(crate) fn verify(config: &Config, name: &str, agent: &ureq::Agent) -> Result
     ))
 }
 
+enum LogoutRead {
+    Stored(Option<Credentials>),
+    /// The store did not answer and may later: nothing is deleted.
+    Undecided(Error),
+    /// No retry can read it: the credential is deleted so that logout can finish.
+    Unreadable(Error),
+}
+
+// The OS store may only be busy or locked, and deleting would destroy the only copy of the refresh token.
+// A refused file (loose mode, foreign owner) or a damaged blob, in either store, reads the same on every retry.
+fn logout_read(
+    store: keystore::Backend,
+    read: Result<Option<Credentials>, profile::ReadFailure>,
+) -> LogoutRead {
+    match read {
+        Ok(stored) => LogoutRead::Stored(stored),
+        Err(profile::ReadFailure::Store(e)) if store == keystore::Backend::Os => {
+            LogoutRead::Undecided(e)
+        }
+        Err(profile::ReadFailure::Store(e) | profile::ReadFailure::Damaged(e)) => {
+            LogoutRead::Unreadable(e)
+        }
+    }
+}
+
 fn run_logout(args: &LogoutArgs) -> Result<(), Error> {
     let config = Config::from_env()?;
     let profiles = config.load()?;
@@ -725,6 +815,7 @@ fn run_logout(args: &LogoutArgs) -> Result<(), Error> {
     };
     let agent = profile::agent();
     let mut unrevoked = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
     let mut undecided: Vec<String> = Vec::new();
     for name in &names {
         let _lock = config.lock(name)?;
@@ -752,10 +843,25 @@ fn run_logout(args: &LogoutArgs) -> Result<(), Error> {
                 }
             }
         } else {
-            match config.read_credentials(name, &entry) {
-                Ok(stored) => stored,
-                Err(e) => {
-                    eprintln!("warning: {}", e.message);
+            match logout_read(
+                entry.store,
+                config.read_credentials_classified(name, &entry),
+            ) {
+                LogoutRead::Stored(stored) => stored,
+                LogoutRead::Undecided(e) => {
+                    eprintln!(
+                        "warning: {}; nothing was deleted (profile {name})",
+                        e.message
+                    );
+                    undecided.push(name.clone());
+                    continue;
+                }
+                LogoutRead::Unreadable(e) => {
+                    eprintln!(
+                        "warning: {}; its grant cannot be revoked from this credential, and the unusable credential is deleted",
+                        e.message
+                    );
+                    unreadable.push(name.clone());
                     None
                 }
             }
@@ -772,12 +878,18 @@ fn run_logout(args: &LogoutArgs) -> Result<(), Error> {
         config.delete_credentials(name, &entry)?;
         eprintln!("Signed out of {} (profile {name})", entry.server);
     }
-    if args.forget && !names.is_empty() {
+    // A profile whose credential was left in place keeps its entry: without it the next logout could not find the credential.
+    let forgotten: Vec<&String> = names.iter().filter(|n| !undecided.contains(n)).collect();
+    if args.forget && !forgotten.is_empty() {
         config.update(|profiles| {
-            for name in &names {
-                profiles.profiles.remove(name);
+            for name in &forgotten {
+                profiles.profiles.remove(*name);
             }
-            if profiles.current.as_ref().is_some_and(|c| names.contains(c)) {
+            if profiles
+                .current
+                .as_ref()
+                .is_some_and(|c| forgotten.contains(&c))
+            {
                 profiles.current = None;
             }
             Ok(())
@@ -787,19 +899,31 @@ fn run_logout(args: &LogoutArgs) -> Result<(), Error> {
         return Err(Error::new(
             Exit::Busy,
             format!(
-                "not signed out of {}: run sentinel auth logout again when the controller is reachable",
+                "not signed out of {}: run sentinel auth logout again when the controller and the credential store are reachable",
                 undecided.join(", ")
             ),
         ));
     }
-    if unrevoked.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::remote(format!(
-            "signed out locally, but the server did not revoke {}; run sentinel auth logout again when it is reachable, or revoke the grant from another session",
-            unrevoked.join(", ")
-        )))
+    if unrevoked.is_empty() && unreadable.is_empty() {
+        return Ok(());
     }
+    let mut message = String::from("signed out locally, but ");
+    if !unrevoked.is_empty() {
+        message.push_str(&format!(
+            "the server did not revoke {}; run sentinel auth logout again when it is reachable, or revoke the grant from another session",
+            unrevoked.join(", ")
+        ));
+    }
+    if !unreadable.is_empty() {
+        if !unrevoked.is_empty() {
+            message.push_str("; ");
+        }
+        message.push_str(&format!(
+            "the stored credential of {} could not be read, so its grant was not revoked; revoke it from another session",
+            unreadable.join(", ")
+        ));
+    }
+    Err(Error::remote(message))
 }
 
 fn context_use(tenant: &str, profile_name: Option<&str>) -> Result<(), Error> {
@@ -839,4 +963,56 @@ fn context_show(client: &ClientArgs) -> Result<(), Error> {
         None => "(no default tenant; set one with: sentinel context use TENANT)\n".to_owned(),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use profile::{ReadFailure, parse_stored};
+
+    fn damaged() -> Result<Option<Credentials>, ReadFailure> {
+        parse_stored(Some(b"{ not a credential".to_vec()))
+    }
+
+    fn busy() -> Result<Option<Credentials>, ReadFailure> {
+        Err(ReadFailure::Store(Error::new(
+            Exit::Busy,
+            "the credential store is busy",
+        )))
+    }
+
+    #[test]
+    fn a_damaged_blob_is_unreadable_in_both_stores() {
+        for store in [keystore::Backend::Os, keystore::Backend::File] {
+            assert!(
+                matches!(logout_read(store, damaged()), LogoutRead::Unreadable(_)),
+                "{store:?}: no retry can parse the same bytes, so logout must be able to delete it"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_store_that_did_not_answer_is_undecided_and_only_for_the_os_store() {
+        assert!(matches!(
+            logout_read(keystore::Backend::Os, busy()),
+            LogoutRead::Undecided(_)
+        ));
+        assert!(matches!(
+            logout_read(keystore::Backend::File, busy()),
+            LogoutRead::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn a_readable_or_absent_credential_is_used_as_read() {
+        assert!(matches!(
+            logout_read(keystore::Backend::Os, parse_stored(None)),
+            LogoutRead::Stored(None)
+        ));
+        let blob = br#"{"refresh":"r","access":"a","access_expires_ms":1,"refresh_expires_ms":2}"#;
+        assert!(matches!(
+            logout_read(keystore::Backend::Os, parse_stored(Some(blob.to_vec()))),
+            LogoutRead::Stored(Some(_))
+        ));
+    }
 }
