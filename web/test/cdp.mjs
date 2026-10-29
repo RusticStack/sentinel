@@ -88,6 +88,8 @@ export class Page {
     this.cdp = cdp; this.sessionId = sessionId; this.targetId = targetId; this.contextId = contextId;
     this.errors = [];
     this.console = [];
+    this.navigations = [];
+    this.downloads = [];
   }
   send(method, params) { return this.cdp.send(method, params, this.sessionId); }
   async init(width, height) {
@@ -99,7 +101,16 @@ export class Page {
     this.cdp.on("Runtime.exceptionThrown", (p, s) => { if (s === this.sessionId) this.errors.push(p.exceptionDetails.exception?.description || p.exceptionDetails.text); });
     this.cdp.on("Runtime.consoleAPICalled", (p, s) => { if (s === this.sessionId) this.console.push(`${p.type}: ${p.args.map((a) => a.value ?? a.description).join(" ")}`); });
     this.cdp.on("Log.entryAdded", (p, s) => { if (s === this.sessionId && p.entry.level === "error") this.errors.push(`${p.entry.source}: ${p.entry.text}`); });
+    // Every address the main frame took, loads and history changes alike, so a test can say which pages were never visited.
+    this.cdp.on("Page.frameNavigated", (p, s) => { if (s === this.sessionId && !p.frame.parentId) this.navigations.push(p.frame.url + (p.frame.urlFragment ?? "")); });
+    this.cdp.on("Page.navigatedWithinDocument", (p, s) => { if (s === this.sessionId) this.navigations.push(p.url); });
     await this.send("Log.enable");
+  }
+  /** Saves downloads started by this page's browser context into `dir` instead of asking. */
+  async allowDownloads(dir) {
+    this.cdp.on("Browser.downloadWillBegin", (p) => this.downloads.push(`begin ${p.suggestedFilename}`));
+    this.cdp.on("Browser.downloadProgress", (p) => this.downloads.push(`${p.state} ${p.receivedBytes}/${p.totalBytes}`));
+    await this.cdp.send("Browser.setDownloadBehavior", { behavior: "allow", browserContextId: this.contextId, downloadPath: dir, eventsEnabled: true });
   }
   async viewport(width, height) {
     this.width = width; this.height = height;

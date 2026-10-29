@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, existsSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
 import { createHmac } from "node:crypto";
@@ -35,7 +36,11 @@ function check(name, ok, detail) {
   if (!ok) failures.push(name);
 }
 
+// SENTINEL_UI_ONLY="name;name" runs only those scenarios (after the sign-in they build on): a way to repeat one while
+// working on it, never used by the gate.
+const only = process.env.SENTINEL_UI_ONLY ? process.env.SENTINEL_UI_ONLY.split(";") : null;
 async function scenario(name, fn) {
+  if (only && !only.includes(name) && name !== "sign-in") return;
   try { await fn(); } catch (e) {
     check(`${name} (no error)`, false, e.stack || e.message);
     if (current) await current.screenshot(join(cfg.out, `failed-${name.replace(/[^a-z0-9]+/gi, "-")}.png`)).catch(() => {});
@@ -226,6 +231,13 @@ await scenario("public pages", async () => {
   await page.key("Enter");
   await page.waitFor("[...document.querySelectorAll('[role=status]')].some((s) => s.textContent.includes('can be used here'))", 8000, "resend answer");
   check("asking for a new link answers the same whether or not the address exists", true);
+
+  // Email-registered accounts have generated usernames: the administrator needs the lookup, and the address in lower case.
+  await go(page, ...PUBLIC_PAGES.forgot);
+  const recovery = await page.eval("document.querySelector('details pre code').textContent");
+  check("forgot-password gives the administrator the lookup of a generated username by email, then the recovery",
+    ["local_credentials", "users.email", "--data-dir", "--username"].every((part) => recovery.includes(part)), recovery);
+  check("forgot-password says the address is stored in lower case", (await page.eval("document.querySelector('details').textContent")).includes("lower case"));
 });
 
 await scenario("sign-in", async () => {
@@ -492,8 +504,18 @@ await scenario("an open run page through a busy controller", async () => {
     if (Date.now() > ready) throw new Error(`the subscriber share never filled (last answer ${probe.status})`);
     await sleep(25);
   }
+  // What the page's stream said and when, to show in the failure if the notice never comes.
+  const watch = await page.send("Page.addScriptToEvaluateOnNewDocument", { source: `(() => { const Source = window.EventSource; window.__stream = [];
+    window.EventSource = class extends Source { constructor(url, init) { super(url, init); const note = (what) => window.__stream.push([Math.round(performance.now()), what]);
+      this.addEventListener("status", (e) => note("status " + e.data)); this.addEventListener("run", () => note("run")); this.addEventListener("error", () => note("error")); } }; })()` });
+  const opened = Date.now();
   await go(page, PAGES.run[0], "document.querySelectorAll('.dag .node').length === 4");
-  await page.waitFor("document.body.textContent.includes('Updates paused: controller busy')", Math.max(1000, spellEnds - Date.now() - 500), "busy notice");
+  const noticeWait = Math.max(1000, spellEnds - Date.now() - 500);
+  await page.waitFor("document.body.textContent.includes('Updates paused: controller busy')", noticeWait, "busy notice").catch(async (e) => {
+    const shown = await page.eval("JSON.stringify({ stream: window.__stream, text: document.body.innerText.replace(/\s+/g, ' ').slice(0, 300) })").catch(() => "(page unreadable)");
+    throw new Error(`${e.message}; the page loaded after ${Date.now() - opened} ms of a ${spellEnds - opened} ms spell and showed ${shown}`);
+  });
+  await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: watch.identifier });
   const alerts = await page.eval("[...document.querySelectorAll('[role=alert]')].map((a) => a.textContent.trim().slice(0, 120)).filter((t) => t)");
   const empty = await page.eval("[...document.querySelectorAll('[role=alert]')].filter((a) => !a.textContent.trim()).map((a) => a.outerHTML.slice(0, 200))");
   if (empty.length) console.log("note: empty alert elements during the busy spell", JSON.stringify(empty));
@@ -641,6 +663,291 @@ await scenario("organizations and invitations", async () => {
   check("an expired parked invitation secret is removed on the next load", (await page.eval("sessionStorage.getItem('sentinel-invitation')")) === null);
 });
 
+// A read that fails is refused in words, not drawn as an empty list. The page's fetch is replaced for the reads under
+// test, and the section is reached by a link, so the route loader runs in the browser.
+const STUB_READS = (pattern) => `(() => { window.__real ??= window.fetch; const failing = new RegExp(${JSON.stringify(pattern)});
+  window.fetch = (input, init) => { const url = String(input && input.url ? input.url : input);
+    return failing.test(url)
+      ? Promise.resolve(new Response(JSON.stringify({ code: "internal", message: "stubbed failure" }), { status: 500, headers: { "content-type": "application/json" } }))
+      : window.__real(input, init); };
+  return true; })()`;
+const UNSTUB_READS = `(() => { if (window.__real) window.fetch = window.__real; return true; })()`;
+const RECORD_PUTS = `(() => { window.__real ??= window.fetch; window.__puts = [];
+  window.fetch = (input, init) => { if (init && init.method === "PUT") window.__puts.push(String(input && input.url ? input.url : input)); return window.__real(input, init); };
+  return true; })()`;
+const members = async () => (await root("GET", "/api/v1/tenants/acme/members?limit=100")).body.members;
+const serviceNamed = async (name) => (await members()).find((m) => m.kind === "service" && m.display_name === name);
+const hasAlert = (text) => `[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes(${JSON.stringify(text)}))`;
+
+await scenario("a failed read is said, not drawn as an empty list", async () => {
+  await go(page, "/t/acme/admin/repos", "!!document.querySelector('#repos-h')");
+  // Opening a source binding is a read: it announces nothing.
+  await page.eval(clickText("main button", "Source binding"));
+  await page.waitFor("!!document.querySelector('main button[aria-expanded=true]')", 8000, "source binding opened");
+  check("a read action does not toast 'done'", await page.eval(`![...document.querySelectorAll('[aria-live]')].some((r) => r.textContent.includes('Source of'))`));
+
+  await page.eval(STUB_READS("/tenants/acme/(members\\?|settings$)"));
+  await page.eval(clickText("nav[aria-label=Sections] a", "Members"));
+  await page.waitFor(hasAlert("Could not load the members"), 10000, "members failure");
+  check("a failed members read is an alert with Try again, not an empty table",
+    await page.eval(`!document.querySelector('main table') && [...document.querySelectorAll('[role=alert] button')].some((b) => b.textContent.trim() === 'Try again')`));
+  await page.eval(UNSTUB_READS);
+  await page.eval(clickText("[role=alert] button", "Try again"));
+  await page.waitFor(`document.querySelectorAll('main table tbody tr').length >= 2 && !(${hasAlert("Could not load")})`, 10000, "members after Try again");
+  check("Try again reads the members again", true);
+
+  await page.eval(STUB_READS("/tenants/acme/(members\\?|settings$)"));
+  await page.eval(clickText("nav[aria-label=Sections] a", "Invitations"));
+  await page.waitFor(hasAlert("Could not load namespace settings"), 10000, "settings failure");
+  check("with the settings unread the invitations section says so and offers no form",
+    await page.eval("!document.querySelector('#inv-email') && !document.body.textContent.includes('No invitations yet')"));
+  await page.eval(UNSTUB_READS);
+  await page.eval(clickText("[role=alert] button", "Try again"));
+  await page.waitFor("!!document.querySelector('#inv-email')", 10000, "invitation form after Try again");
+  check("Try again brings the invitation form back", true);
+
+  await go(page, "/platform/tenants", PAGES.platform[1]);
+  await page.eval(STUB_READS("/api/v1/admin/(pools|policy)"));
+  await page.eval(clickText("nav[aria-label=Sections] a", "Pools"));
+  await page.waitFor(hasAlert("Could not load the worker pools"), 10000, "pools failure");
+  await page.eval(clickText("nav[aria-label=Sections] a", "Policy"));
+  await page.waitFor(hasAlert("Could not load the admission policy"), 10000, "policy failure");
+  check("a failed policy read shows no form of defaults that saving would overwrite the policy with", await page.eval("!document.querySelector('#pol-reg')"));
+  await page.eval(UNSTUB_READS);
+  await page.eval(clickText("[role=alert] button", "Try again"));
+  await page.waitFor("!!document.querySelector('#pol-reg')", 10000, "policy form after Try again");
+  check("Try again reads the policy again", true);
+});
+
+await scenario("adding a member by user id", async () => {
+  await go(page, "/t/acme/admin", PAGES.admin[1]);
+  await page.eval(RECORD_PUTS);
+  const puts = () => page.eval("window.__puts");
+
+  await page.fill("#m-user", "pat");
+  await page.key("Enter");
+  await page.waitFor(hasAlert("user id"), 5000, "inline refusal");
+  check("a name that is no member's is refused in the form, in words that say what to do",
+    await page.eval(`${hasAlert("invite them by email")} && !document.body.textContent.includes('no longer have access')`));
+  check("and nothing is sent", (await puts()).length === 0, await puts());
+
+  await page.fill("#m-user", "rui");
+  await page.key("Enter");
+  await page.waitFor("window.__puts.length === 1", 8000, "role change sent");
+  check("a member's username changes the role through the member's id", (await puts())[0].endsWith(`/members/${cfg.rui}`), await puts());
+  await page.waitFor("[...document.querySelectorAll('main table tbody tr')].find((r) => r.textContent.includes('rui')).textContent.includes('Reader')", 8000, "role shown");
+  check("the new role is saved", (await members()).find((m) => m.username === "rui").role === "reader");
+
+  await page.fill("#m-user", ` ${cfg.dana} `);
+  await page.key("Enter");
+  await page.waitFor("[...document.querySelectorAll('main table tbody tr')].some((r) => r.textContent.includes('dana'))", 8000, "dana added");
+  check("a user id typed with spaces around it is trimmed and adds the person", (await puts()).at(-1).endsWith(`/members/${cfg.dana}`), await puts());
+  check("the person is a member", (await members()).some((m) => m.username === "dana"));
+});
+
+// Step-up decisions: each scenario signs in on its own page (its own browser context), so its session has no earlier
+// confirmation. Every outcome is read from the controller's state, not from timing.
+const COUNT_STEPUPS = `(() => { window.__steps = 0; const real = window.fetch;
+  window.fetch = async (input, init) => { const response = await real(input, init); if (String(input && input.url ? input.url : input).endsWith("/api/v1/step-up")) window.__steps++; return response; };
+  return true; })()`;
+const ASKED = "!!document.querySelector('#stepup-code')";
+const FIELD_READY = "!!document.activeElement && document.activeElement.id === 'stepup-code' && document.querySelector('#stepup-code').value === ''";
+
+async function openServiceAccounts(p, user) {
+  await signIn(p, user);
+  await go(p, "/t/acme/admin/service-accounts", PAGES.service[1]);
+}
+async function createServiceAccount(p, name) {
+  await p.fill("#sa-name", name);
+  await p.key("Enter");
+}
+// Answers the step-up dialog with the password when one opens, then waits for the outcome.
+async function answeringStepUp(p, outcome, what) {
+  await p.waitFor(`${ASKED} || (${outcome})`, 10000, what);
+  if (await p.eval(ASKED)) {
+    await p.fill("#stepup-code", cfg.password);
+    await p.key("Enter");
+  }
+  await p.waitFor(outcome, 10000, what);
+}
+
+await scenario("step-up decisions", async () => {
+  const sp = await browser.newPage({ width: 1280, height: 860 });
+  current = sp;
+  await openServiceAccounts(sp, "root");
+
+  await createServiceAccount(sp, "cancelled-bot");
+  await sp.waitFor(ASKED, 10000, "step-up dialog");
+  await sp.clickText("[role=dialog] button", "Cancel");
+  await sp.waitFor("!document.querySelector('[role=dialog]')", 8000, "dialog closed by Cancel");
+  check("Cancel drops the change: no service account is made and nothing is said",
+    !(await serviceNamed("cancelled-bot")) && !(await sp.eval("document.body.textContent.includes('cancelled-bot')")));
+  check("Cancel returns focus to where it was", await sp.eval("document.activeElement && document.activeElement.id === 'sa-name'"), await sp.eval("document.activeElement && document.activeElement.id"));
+
+  await createServiceAccount(sp, "escaped-bot");
+  await sp.waitFor(ASKED, 10000, "step-up dialog again");
+  await sp.key("Escape");
+  await sp.waitFor("!document.querySelector('[role=dialog]')", 8000, "dialog closed by Escape");
+  check("Escape drops the change as Cancel does", !(await serviceNamed("escaped-bot")));
+
+  await createServiceAccount(sp, "ci-bot");
+  await sp.waitFor(ASKED, 10000, "step-up dialog a third time");
+  await sp.fill("#stepup-code", "not the password");
+  await sp.key("Enter");
+  await sp.waitFor("[...document.querySelectorAll('[role=dialog] [role=alert]')].some((a) => a.textContent.includes('That password was not accepted'))", 8000, "wrong proof said");
+  await sp.waitFor(FIELD_READY, 5000, "field emptied and focused");
+  check("a wrong password is said, the dialog stays, the field is empty and focused", await sp.eval("!!document.querySelector('[role=dialog]')"));
+  check("and the change still has not been made", !(await serviceNamed("ci-bot")));
+
+  await sp.fill("#stepup-code", cfg.password);
+  await sp.key("Enter");
+  await sp.waitFor("!document.querySelector('[role=dialog]') && [...document.querySelectorAll('h3')].some((h) => h.textContent.includes('ci-bot'))", 10000, "service account made");
+  check("the right password makes the change once", !!(await serviceNamed("ci-bot")));
+  check("and says so", await sp.eval("document.body.textContent.includes('Create ci-bot: done')"));
+  const traces = await sp.eval("[location.href, JSON.stringify(localStorage), JSON.stringify(sessionStorage), document.cookie].join(' ')");
+  check("neither proof is left in the address, storage or cookies", !traces.includes(cfg.password) && !traces.includes("not the password"));
+  await sp.close();
+  current = page;
+});
+
+await scenario("step-up session end", async () => {
+  const gone = await browser.newPage({ width: 1280, height: 860 });
+  current = gone;
+  await openServiceAccounts(gone, "ivy");
+  await gone.eval(COUNT_STEPUPS);
+  await createServiceAccount(gone, "ivy-bot");
+  await gone.waitFor(ASKED, 10000, "step-up dialog");
+  for (let n = 1; n <= 5; n++) {
+    await gone.fill("#stepup-code", `wrong proof ${n}`);
+    await gone.key("Enter");
+    await gone.waitFor(`window.__steps === ${n} && ${FIELD_READY}`, 8000, `wrong proof ${n} answered`);
+  }
+  // The fifth wrong proof revokes the session as it is refused; the next request learns it, even with the right proof.
+  check("five wrong proofs are each refused and said, the dialog still open", await gone.eval("!!document.querySelector('[role=dialog]')"));
+  await gone.fill("#stepup-code", cfg.password);
+  await gone.key("Enter");
+  await gone.waitFor("location.pathname === '/login'", 10000, "sign-in after five wrong proofs");
+  check("after five wrong proofs even the right one finds the session ended: the dialog is gone and the page is at sign-in", await gone.eval("!document.querySelector('[role=dialog]')"));
+  check("the change was never made", !(await serviceNamed("ivy-bot")));
+  check("the session is revoked on the controller", (await gone.eval("fetch('/api/v1/me', { headers: { accept: 'application/json' } }).then((r) => r.status)")) === 401);
+  await gone.close();
+  current = page;
+});
+
+await scenario("step-up second factor", async () => {
+  const first = await browser.newPage({ width: 1280, height: 860 });
+  current = first;
+  await openServiceAccounts(first, "mia");
+  await createServiceAccount(first, "mia-bot");
+  await first.waitFor(ASKED, 10000, "step-up dialog");
+  check("an account with an authenticator is offered its app and its recovery codes",
+    (await first.eval("[...document.querySelectorAll('[role=dialog] input[type=radio]')].map((r) => r.value).join()")) === "totp,recovery"
+    && (await first.eval("document.querySelector('label[for=stepup-code]').textContent.includes('Code from the app')")));
+  const wrong = totp(cfg.mia.key) === "000000" ? "111111" : "000000";
+  await first.fill("#stepup-code", wrong);
+  await first.key("Enter");
+  await first.waitFor(hasAlert("That code was not accepted"), 8000, "wrong code said");
+  await first.waitFor(FIELD_READY, 5000, "field emptied and focused");
+  check("a wrong authenticator code is said, and the field is emptied", true);
+  await first.click("input[value=recovery]");
+  await first.waitFor("document.querySelector('label[for=stepup-code]').textContent.includes('Recovery code')", 5000, "recovery field");
+  await first.waitFor("![...document.querySelectorAll('[role=dialog] [role=alert]')].some((a) => a.textContent.trim())", 5000, "old message dropped");
+  check("choosing a recovery code changes the field and drops the old message", true);
+  await first.fill("#stepup-code", cfg.mia.recovery[0]);
+  await first.key("Enter");
+  await first.waitFor("!document.querySelector('[role=dialog]') && [...document.querySelectorAll('h3')].some((h) => h.textContent.includes('mia-bot'))", 10000, "made with a recovery code");
+  check("a recovery code confirms the change", !!(await serviceNamed("mia-bot")));
+  await first.close();
+
+  const second = await browser.newPage({ width: 1280, height: 860 });
+  current = second;
+  await openServiceAccounts(second, "mia");
+  await createServiceAccount(second, "mia-bot-2");
+  await second.waitFor(ASKED, 10000, "step-up dialog in a second session");
+  await second.click("input[value=recovery]");
+  await second.waitFor("document.querySelector('label[for=stepup-code]').textContent.includes('Recovery code')", 5000, "recovery field");
+  await second.fill("#stepup-code", cfg.mia.recovery[0]);
+  await second.key("Enter");
+  await second.waitFor(hasAlert("already used"), 8000, "spent code refused");
+  check("a recovery code works once: the second use is refused and said", !(await serviceNamed("mia-bot-2")));
+  await second.click("input[value=totp]");
+  await second.waitFor("document.querySelector('label[for=stepup-code]').textContent.includes('Code from the app')", 5000, "app field");
+  await second.fill("#stepup-code", totp(cfg.mia.key));
+  await second.key("Enter");
+  await second.waitFor("!document.querySelector('[role=dialog]') && [...document.querySelectorAll('h3')].some((h) => h.textContent.includes('mia-bot-2'))", 10000, "made with the app's code");
+  check("the authenticator's code confirms the change", !!(await serviceNamed("mia-bot-2")));
+  await second.close();
+  current = page;
+});
+
+const inCard = (name, selector, text) => `(() => {
+  const h = [...document.querySelectorAll('h3')].find((x) => x.textContent.includes(${JSON.stringify(name)}));
+  const card = h && h.closest('.rounded-lg');
+  const el = card && [...card.querySelectorAll(${JSON.stringify(selector)})].find((e) => e.textContent.trim() === ${JSON.stringify(text)});
+  if (!el) return false; el.click(); return true; })()`;
+
+await scenario("service credential shown once", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sentinel-dl-"));
+  const sc = await browser.newPage({ width: 1280, height: 860 });
+  current = sc;
+  await sc.allowDownloads(dir);
+  await openServiceAccounts(sc, "root");
+  const account = await serviceNamed("ci-bot");
+  const row = (name, text) => `[...document.querySelectorAll('main tr')].some((r) => r.textContent.includes(${JSON.stringify(name)}) && r.textContent.includes(${JSON.stringify(text)}))`;
+
+  await sc.eval(inCard("ci-bot", "button", "Set access"));
+  await answeringStepUp(sc, "document.body.textContent.includes('Access of ci-bot to app: done')", "access set");
+
+  await sc.fill(`#sa-gname-${account.user}`, "agent-1");
+  await sc.key("Enter");
+  await answeringStepUp(sc, "!!document.querySelector('[role=dialog] li')", "credential shown");
+  const secret = await sc.eval("document.querySelector('[role=dialog] li').textContent.trim()");
+  check("a credential is shown in a dialog", secret.length > 20 && (await sc.eval("document.querySelectorAll('[role=dialog] li').length")) === 1);
+  const done = "[...document.querySelectorAll('[role=dialog] button')].find((b) => b.textContent.trim() === 'Done')";
+  check("Done stays disabled until the credential is saved", await sc.eval(`${done}.disabled`));
+  await sc.key("Escape");
+  await sc.key("Escape");
+  // A browser may close the dialog on a repeated Escape; it reopens at once, so the credential is never left unshown.
+  await sc.waitFor("!!document.querySelector('dialog[open] li')", 3000, "dialog open after Escape");
+  check("Escape does not close it", true);
+  for (const type of ["mousePressed", "mouseReleased"]) await sc.send("Input.dispatchMouseEvent", { type, x: 4, y: 4, button: "left", clickCount: 1 });
+  check("a click outside does not close it", await sc.eval("!!document.querySelector('dialog[open] li')"));
+
+  await sc.clickText("[role=dialog] button", "Download");
+  const file = join(dir, "ci-bot.token");
+  let saved = null;
+  for (let i = 0; i < 200 && saved === null; i++) {
+    if (existsSync(file) && !readdirSync(dir).some((f) => f.endsWith(".crdownload"))) saved = readFileSync(file, "utf8");
+    else await sleep(50);
+  }
+  check("the download is named for the account and holds the secret and a newline", saved === `${secret}\n`, saved === null ? { files: readdirSync(dir), events: sc.downloads } : { name: "ci-bot.token", bytes: saved.length });
+
+  await sc.click("[role=dialog] [role=checkbox]");
+  await sc.clickText("[role=dialog] button", "Done");
+  await sc.waitFor("!document.querySelector('[role=dialog]')", 8000, "dialog closed");
+  const traces = await sc.eval(`(() => { const s = ${JSON.stringify(secret)};
+    return [document.documentElement.outerHTML, location.href, JSON.stringify(localStorage), JSON.stringify(sessionStorage), document.cookie].some((t) => t.includes(s)); })()`);
+  check("once saved the credential is in no part of the page, address, storage or cookies", !traces);
+
+  await sc.eval(inCard("ci-bot", "button", "Show credentials"));
+  await sc.waitFor(row("agent-1", "agent-1"), 8000, "credential listed");
+  check("the list names the credential without its secret", !(await sc.eval(`document.querySelector('main').textContent.includes(${JSON.stringify(secret)})`)));
+  const grants = async () => (await root("GET", `/api/v1/tenants/acme/service-accounts/${account.user}/grants`)).body.grants;
+  await sc.click('[aria-label="Revoke agent-1"]');
+  await sc.waitFor("!!document.querySelector('[role=dialog]')", 5000, "revoke confirmation");
+  await sc.clickText("[role=dialog] button", "Keep");
+  await sc.waitFor("!document.querySelector('[role=dialog]')", 5000, "confirmation closed");
+  check("keeping the credential leaves it usable", (await grants()).find((g) => g.name === "agent-1").revoked === false);
+  await sc.click('[aria-label="Revoke agent-1"]');
+  await sc.waitFor("!!document.querySelector('[role=dialog]')", 5000, "revoke confirmation again");
+  await sc.clickText("[role=dialog] button", "Revoke");
+  await answeringStepUp(sc, `${row("agent-1", "revoked")} && !document.querySelector('[aria-label="Revoke agent-1"]')`, "revoked shown");
+  check("revoking marks it revoked and takes the button away", true);
+  check("the controller has it revoked", (await grants()).find((g) => g.name === "agent-1").revoked === true);
+  await sc.close();
+  current = page;
+});
+
 // Keep last: it changes rui's password, which ends every session of that account.
 await scenario("account security", async () => {
   const acct = await browser.newPage({ width: 390, height: 844 });
@@ -683,9 +990,29 @@ await scenario("account security", async () => {
   await acct.fill("#pw-current", cfg.password);
   await acct.fill("#pw-new", "a fresh password for rui");
   await acct.fill("#pw-again", "a fresh password for rui");
+  // The controller ends the session as it answers, so a page request in flight at that moment is refused with 401 before
+  // the answer is read. Hold the answer until such a request has been refused.
+  const armed = await acct.eval(`(() => {
+    const link = document.querySelector('a[href^="/t/"]');
+    if (!link) return false;
+    window.__real ??= window.fetch; window.__refused = false;
+    window.fetch = async (input, init) => {
+      const url = String(input && input.url ? input.url : input);
+      const response = await window.__real(input, init);
+      if (response.status === 401) window.__refused = true;
+      if (url.endsWith("/api/v1/password") && init && init.method === "POST" && response.ok) {
+        link.click();
+        for (let i = 0; i < 200 && !window.__refused; i++) await new Promise((r) => setTimeout(r, 25));
+      }
+      return response;
+    };
+    return true; })()`);
+  check("the password change is sent with a page request about to be refused", armed);
   await acct.key("Enter");
   await acct.waitFor("location.pathname === '/login' && document.body.textContent.includes('Password changed')", 15000, "signed out after the change");
   check("a password change signs out and says so", true);
+  check("a request refused while the change was answered did not say the session ended",
+    !acct.navigations.some((u) => u.includes("reason=expired")) && !(await acct.eval("document.body.textContent.includes('Your session ended')")), acct.navigations.slice(-4));
   await acct.close();
   current = page;
 });

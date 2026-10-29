@@ -127,6 +127,7 @@ fn config(f: &Fixture, base: &str, web: &str, out: &std::path::Path) -> serde_js
         "pr_run": f.pr_run.to_string(),
         "dana": f.dana.to_string(),
         "rui": f.rui.to_string(),
+        "pat": f.pat.to_string(),
         "subscribers_per_user": sentinel_api::SUBSCRIBERS_PER_USER,
     })
 }
@@ -162,6 +163,7 @@ fn deployment(bulk_mib: usize, relayed: bool) -> (Arc<Fixture>, Web, String, Str
 #[ignore = "needs Node, the built web interface and a Chromium-family browser"]
 fn the_web_interface_in_a_real_browser() {
     let (f, web, web_addr, origin) = deployment(64, true);
+    let seed = f.seed_step_up_users();
     let stop = Arc::new(AtomicBool::new(false));
     let writer = keep_writing(&f, &stop);
     let out = match std::env::var_os("SENTINEL_UI_OUT") {
@@ -170,11 +172,11 @@ fn the_web_interface_in_a_real_browser() {
     };
     std::fs::create_dir_all(&out).unwrap();
     let config_path = f.dir.path().join("ui.json");
-    std::fs::write(
-        &config_path,
-        config(&f, &origin, &web_addr, &out).to_string(),
-    )
-    .unwrap();
+    let mut cfg = config(&f, &origin, &web_addr, &out);
+    cfg["ivy"] = json!(seed.ivy.to_string());
+    cfg["mia"] =
+        json!({ "user": seed.mia.to_string(), "key": seed.mfa_key, "recovery": seed.recovery });
+    std::fs::write(&config_path, cfg.to_string()).unwrap();
     let status = Command::new(node())
         .arg(repo_root().join("web/test/ui.mjs"))
         .arg(&config_path)
