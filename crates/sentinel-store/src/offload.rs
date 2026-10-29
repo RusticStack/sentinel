@@ -3,25 +3,23 @@ use sentinel_core::{AttemptId, JobId, RunId, TenantId, UnixMillis};
 
 use crate::{Error, Result, objects::Digest};
 
-fn tenant(bytes: Vec<u8>) -> Result<TenantId> {
-    TenantId::from_bytes(
-        <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| Error::Corrupt("tenant_id"))?,
-    )
-    .map_err(|_| Error::Corrupt("tenant_id"))
+fn tenant(bytes: &[u8]) -> Result<TenantId> {
+    TenantId::from_bytes(<[u8; 16]>::try_from(bytes).map_err(|_| Error::Corrupt("tenant_id"))?)
+        .map_err(|_| Error::Corrupt("tenant_id"))
 }
 
-fn digest(bytes: Vec<u8>) -> Result<Digest> {
+fn digest(bytes: &[u8]) -> Result<Digest> {
     Ok(Digest::from_bytes(
-        <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| Error::Corrupt("object digest"))?,
+        <[u8; 32]>::try_from(bytes).map_err(|_| Error::Corrupt("object digest"))?,
     ))
 }
 
 fn id16<T>(
-    bytes: Vec<u8>,
+    bytes: &[u8],
     f: fn([u8; 16]) -> std::result::Result<T, sentinel_core::InvalidId>,
     what: &'static str,
 ) -> Result<T> {
-    f(<[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| Error::Corrupt(what))?)
+    f(<[u8; 16]>::try_from(bytes).map_err(|_| Error::Corrupt(what))?)
         .map_err(|_| Error::Corrupt(what))
 }
 
@@ -44,11 +42,15 @@ fn object_rows(conn: &Connection, sql: &str, limit: u32) -> Result<Vec<ObjectRef
     let mut out = Vec::new();
     for row in rows {
         let (t, d, len) = row?;
-        out.push(ObjectRef {
-            tenant: tenant(t)?,
-            digest: digest(d)?,
-            len: len.max(0) as u64,
-        });
+        // One damaged row must not stop the rows behind it: it is counted and named, and the batch goes on.
+        match (tenant(&t), digest(&d)) {
+            (Ok(tenant), Ok(digest)) => out.push(ObjectRef {
+                tenant,
+                digest,
+                len: len.max(0) as u64,
+            }),
+            _ => crate::skipped::note_blob("objects", &[t.as_slice(), d.as_slice()].concat()),
+        }
     }
     Ok(out)
 }
@@ -182,12 +184,19 @@ pub fn unreplicated_logs(
     let mut out = Vec::new();
     for row in rows {
         let (a, r, j, released_ms) = row?;
-        out.push(LogRef {
-            attempt: id16(a, AttemptId::from_bytes, "attempt_id")?,
-            run: id16(r, RunId::from_bytes, "run_id")?,
-            job: id16(j, JobId::from_bytes, "job_id")?,
-            released_ms,
-        });
+        match (
+            id16(&a, AttemptId::from_bytes, "attempt_id"),
+            id16(&r, RunId::from_bytes, "run_id"),
+            id16(&j, JobId::from_bytes, "job_id"),
+        ) {
+            (Ok(attempt), Ok(run), Ok(job)) => out.push(LogRef {
+                attempt,
+                run,
+                job,
+                released_ms,
+            }),
+            _ => crate::skipped::note_blob("attempts", &a),
+        }
     }
     Ok(out)
 }
@@ -285,22 +294,36 @@ pub fn deletes(conn: &Connection, limit: u32) -> Result<Vec<Delete>> {
     let mut out = Vec::new();
     for row in rows {
         let (id, kind, t, d, run, job, attempt) = row?;
-        out.push(match (kind, t, d, run, job, attempt) {
-            (0, Some(t), Some(d), _, _, _) => Delete::Object {
-                id,
-                tenant: tenant(t)?,
-                digest: digest(d)?,
-            },
-            (1, _, _, Some(r), Some(j), Some(a)) => Delete::Log {
-                id,
-                run: id16(r, RunId::from_bytes, "run_id")?,
-                job: id16(j, JobId::from_bytes, "job_id")?,
-                attempt: id16(a, AttemptId::from_bytes, "attempt_id")?,
-            },
-            _ => return Err(Error::Corrupt("s3 delete")),
-        });
+        // A damaged queue row must not hold the deletes behind it: it is counted and named, and the batch goes on.
+        match delete_row(
+            id,
+            kind,
+            [&t, &d, &run, &job, &attempt].map(|blob| blob.as_deref()),
+        ) {
+            Ok(delete) => out.push(delete),
+            Err(Error::Corrupt(_)) => crate::skipped::note_int("s3_deletes", id),
+            Err(e) => return Err(e),
+        }
     }
     Ok(out)
+}
+
+/// `blobs` are the tenant, digest, run, job and attempt columns.
+fn delete_row(id: i64, kind: i64, blobs: [Option<&[u8]>; 5]) -> Result<Delete> {
+    Ok(match (kind, blobs) {
+        (0, [Some(t), Some(d), ..]) => Delete::Object {
+            id,
+            tenant: tenant(t)?,
+            digest: digest(d)?,
+        },
+        (1, [_, _, Some(r), Some(j), Some(a)]) => Delete::Log {
+            id,
+            run: id16(r, RunId::from_bytes, "run_id")?,
+            job: id16(j, JobId::from_bytes, "job_id")?,
+            attempt: id16(a, AttemptId::from_bytes, "attempt_id")?,
+        },
+        _ => return Err(Error::Corrupt("s3 delete")),
+    })
 }
 
 pub fn queue_object_delete(

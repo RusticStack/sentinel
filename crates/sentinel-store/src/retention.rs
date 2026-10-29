@@ -579,6 +579,26 @@ fn id<T>(
     f(bytes).map_err(|_| Error::Corrupt(what))
 }
 
+fn unstamped_row(
+    attempt: [u8; 16],
+    run: [u8; 16],
+    job: [u8; 16],
+    tenant: [u8; 16],
+    repo: Option<[u8; 16]>,
+    released_ms: i64,
+) -> Result<Unstamped> {
+    Ok(Unstamped {
+        attempt: id(attempt, AttemptId::from_bytes, "attempt_id")?,
+        run: id(run, RunId::from_bytes, "run_id")?,
+        job: id(job, JobId::from_bytes, "job_id")?,
+        tenant: id(tenant, TenantId::from_bytes, "tenant_id")?,
+        repo: repo
+            .map(|r| id(r, RepoId::from_bytes, "repo_id"))
+            .transpose()?,
+        released_ms,
+    })
+}
+
 pub fn unstamped(conn: &Connection, limit: u32) -> Result<Vec<Unstamped>> {
     let mut stmt = conn.prepare_cached(
         "SELECT a.id, j.run_id, a.job_id, a.tenant_id, a.repo_id, a.released_ms
@@ -600,16 +620,12 @@ pub fn unstamped(conn: &Connection, limit: u32) -> Result<Vec<Unstamped>> {
     let mut out = Vec::new();
     for row in rows {
         let (attempt, run, job, tenant, repo, released_ms) = row?;
-        out.push(Unstamped {
-            attempt: id(attempt, AttemptId::from_bytes, "attempt_id")?,
-            run: id(run, RunId::from_bytes, "run_id")?,
-            job: id(job, JobId::from_bytes, "job_id")?,
-            tenant: id(tenant, TenantId::from_bytes, "tenant_id")?,
-            repo: repo
-                .map(|r| id(r, RepoId::from_bytes, "repo_id"))
-                .transpose()?,
-            released_ms,
-        });
+        // One damaged row must not stop the rows behind it: it is counted and named, and the batch goes on.
+        match unstamped_row(attempt, run, job, tenant, repo, released_ms) {
+            Ok(row) => out.push(row),
+            Err(Error::Corrupt(_)) => crate::skipped::note_blob("attempts", &attempt),
+            Err(e) => return Err(e),
+        }
     }
     Ok(out)
 }
@@ -648,6 +664,14 @@ pub struct Expiring {
     pub job: JobId,
 }
 
+fn expiring_row(attempt: [u8; 16], run: [u8; 16], job: [u8; 16]) -> Result<Expiring> {
+    Ok(Expiring {
+        attempt: id(attempt, AttemptId::from_bytes, "attempt_id")?,
+        run: id(run, RunId::from_bytes, "run_id")?,
+        job: id(job, JobId::from_bytes, "job_id")?,
+    })
+}
+
 pub fn expiring(conn: &Connection, now: UnixMillis, limit: u32) -> Result<Vec<Expiring>> {
     let mut stmt = conn.prepare_cached(
         "SELECT a.id, j.run_id, a.job_id
@@ -667,11 +691,11 @@ pub fn expiring(conn: &Connection, now: UnixMillis, limit: u32) -> Result<Vec<Ex
     let mut out = Vec::new();
     for row in rows {
         let (attempt, run, job) = row?;
-        out.push(Expiring {
-            attempt: id(attempt, AttemptId::from_bytes, "attempt_id")?,
-            run: id(run, RunId::from_bytes, "run_id")?,
-            job: id(job, JobId::from_bytes, "job_id")?,
-        });
+        match expiring_row(attempt, run, job) {
+            Ok(row) => out.push(row),
+            Err(Error::Corrupt(_)) => crate::skipped::note_blob("attempts", &attempt),
+            Err(e) => return Err(e),
+        }
     }
     Ok(out)
 }
