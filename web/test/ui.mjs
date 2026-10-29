@@ -120,7 +120,7 @@ const CONTRAST = `(() => {
 // On an overflow it names the widest elements that stick out, so a failure points at the cause.
 const OVERFLOW = `(() => { const width = window.innerWidth, scroll = document.documentElement.scrollWidth;
   const wide = scroll <= width + 1 ? [] : [...document.querySelectorAll('body *')].map((e) => ({ e, right: Math.round(e.getBoundingClientRect().right) }))
-    .filter((x) => x.right > width + 1).sort((a, b) => b.right - a.right).slice(0, 5)
+    .filter((x) => x.right > width + 1).sort((a, b) => b.right - a.right).slice(0, 12)
     .map(({ e, right }) => e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') + '.' + String(e.className).split(' ').slice(0, 4).join('.') + ' right=' + right);
   return { scroll, width, wide }; })()`;
 
@@ -1144,20 +1144,30 @@ await scenario("worker enrollment page", async () => {
   const pending = async () => (await root("GET", "/api/v1/admin/worker-enrollments")).body.enrollments.filter((e) => e.state === "pending").length;
   const before = await pending();
   check("enrollments are pending to withdraw", before >= 1, before);
-  await enr.click('main table button[aria-label^="Withdraw"]');
-  for (let i = 0; i < 100 && (await pending()) === before; i++) await sleep(100);
-  check("a pending enrollment is withdrawn from the page", (await pending()) === before - 1, { before, after: await pending() });
+  // The row withdrawn behind the page's back may still be listed; pick the button of an enrollment that is pending.
+  const live = (await root("GET", "/api/v1/admin/worker-enrollments")).body.enrollments.find((e) => e.state === "pending");
+  // The burst above spent the write budget: a withdraw answered "try again in N seconds" is retried once that has passed.
+  for (let attempt = 0; attempt < 4 && (await pending()) === before; attempt++) {
+    await enr.click(`main table button[aria-label^="Withdraw ${live.id.slice(0, 12)}"]`);
+    for (let i = 0; i < 30 && (await pending()) === before && !(await enr.eval("!!document.querySelector('#stepup-code') || !!document.querySelector('#w-list-error')")); i++) await sleep(100);
+    await stepUpIfAsked();
+    for (let i = 0; i < 30 && (await pending()) === before && !(await enr.eval("!!document.querySelector('#w-list-error')")); i++) await sleep(100);
+    if ((await pending()) === before) await sleep(7000);
+  }
+  const why = await enr.eval("JSON.stringify({error: document.querySelector('#w-list-error')?.textContent ?? null, dialog: !!document.querySelector('[role=dialog]'), stepup: !!document.querySelector('#stepup-code')})");
+  check("a pending enrollment is withdrawn from the page", (await pending()) === before - 1, { before, after: await pending(), why });
 
   // A worker's uninstall is requested from the page, behind a confirmation.
   await enr.waitFor("[...document.querySelectorAll('main table tbody tr')].some((r) => r.textContent.includes('ui-1'))", 10000, "worker listed");
-  await enr.click('main table button[aria-label^="Request the uninstall of"]');
+  await enr.click('main table button[aria-label="Request the uninstall of ui-1"]');
   await enr.waitFor("!!document.querySelector('[role=dialog]')", 5000, "confirmation");
   await enr.clickText("[role=dialog] button", "Request uninstall");
   await stepUpIfAsked();
-  let hosts = (await root("GET", "/api/v1/admin/workers")).body.workers;
+  const target = async () => (await root("GET", "/api/v1/admin/workers")).body.workers.filter((h) => h.name === "ui-1");
+  let hosts = await target();
   for (let i = 0; i < 50 && hosts.some((h) => !h.uninstall_requested_ms); i++) {
     await sleep(100);
-    hosts = (await root("GET", "/api/v1/admin/workers")).body.workers;
+    hosts = await target();
   }
   check("the uninstall is requested on the controller (or has already settled)", hosts.length === 0 || hosts.every((h) => h.uninstall_requested_ms), hosts);
 

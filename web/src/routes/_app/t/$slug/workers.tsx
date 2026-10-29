@@ -39,7 +39,7 @@ function WorkersView() {
     <Page id="workers" title={`Workers · ${slug}`}>
       {data && !data.pools.length ? <Empty icon="server-off" title="No worker pools" description="This tenant has no dedicated or granted pools." /> : null}
       {(data?.pools ?? []).map((pool) => (
-        <section key={pool.id} aria-labelledby={`pool-${pool.id}`} className="space-y-3">
+        <section key={pool.id} aria-labelledby={`pool-${pool.id}`} className="min-w-0 space-y-3">
           <h2 id={`pool-${pool.id}`} className="flex items-center gap-2 text-base font-semibold text-strong">
             {pool.name}
             <Badge>{`${pool.kind} pool`}</Badge>
