@@ -66,11 +66,26 @@ function bodyLimit(bare: string, method: string): number {
   return API_BODY;
 }
 
+// Loopback, private, link-local and unique-local addresses: a reverse proxy's hop, never a remote browser.
+function isInternal(address: string): boolean {
+  if (V4.test(address)) {
+    const [a, b] = address.split(".").map(Number) as [number, number];
+    return a === 127 || a === 10 || a === 0 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254);
+  }
+  const lower = address.toLowerCase();
+  return lower === "::1" || lower === "::" || /^f[cd][0-9a-f]{2}:/.test(lower) || /^fe[89ab][0-9a-f]:/.test(lower);
+}
+
+/**
+ * The client the controller should rate-limit: the last entry of the configured header when it is an address, else the
+ * socket peer when it is a remote one. An internal peer is a reverse proxy, and naming it would give every client behind
+ * it one shared allowance; naming nobody lets the controller key on the connection instead.
+ */
 export function clientAddress(peer: string | undefined, headerValue: string | undefined): string {
   if (headerValue) {
     const last = headerValue.slice(headerValue.lastIndexOf(",") + 1).trim();
     const bare = last.startsWith("[") && last.endsWith("]") ? last.slice(1, -1) : last;
     if (isAddress(bare)) return bare;
   }
-  return peer && isAddress(peer) ? peer : "";
+  return peer && isAddress(peer) && !isInternal(peer) ? peer : "";
 }

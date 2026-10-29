@@ -19,7 +19,9 @@ test("the controller address: new name, then the Nuxt name, then the default", (
 
 test("the client-address header: new name, then the Nuxt name; none trusts no header", () => {
   const r = request({ "x-real-ip": "203.0.113.9", "x-forwarded-for": "198.51.100.7" });
-  withEnv({}, () => assert.equal(clientIp(r), "127.0.0.1"));
+  withEnv({}, () => assert.equal(clientIp(r), ""));
+  const direct = Object.assign(new Request("http://web.invalid/"), { runtime: { node: { req: { socket: { remoteAddress: "203.0.113.50" } } } } });
+  withEnv({}, () => assert.equal(clientIp(direct), "203.0.113.50"));
   withEnv({ NUXT_CLIENT_IP_HEADER: "x-real-ip" }, () => assert.equal(clientIp(r), "203.0.113.9"));
   withEnv({ NUXT_CLIENT_IP_HEADER: "x-real-ip", SENTINEL_CLIENT_IP_HEADER: "x-forwarded-for" }, () => assert.equal(clientIp(r), "198.51.100.7"));
 });

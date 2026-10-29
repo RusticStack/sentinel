@@ -36,10 +36,15 @@ test("body ceilings follow the controller's limits", () => {
 });
 
 test("the client address never comes from a client-chosen entry", () => {
-  assert.equal(clientAddress("10.0.0.2", undefined), "10.0.0.2");
+  assert.equal(clientAddress("203.0.113.5", undefined), "203.0.113.5");
+  for (const proxy of ["127.0.0.1", "10.0.0.2", "172.20.1.1", "192.168.1.9", "169.254.1.1", "::1", "fd00::2", "fe80::1"]) {
+    assert.equal(clientAddress(proxy, undefined), "", `${proxy} is a proxy hop, not a client`);
+    assert.equal(clientAddress(proxy, "garbage"), "", proxy);
+  }
+  assert.equal(clientAddress("172.32.0.1", undefined), "172.32.0.1");
   assert.equal(clientAddress("10.0.0.2", "6.6.6.6, 203.0.113.9"), "203.0.113.9");
   assert.equal(clientAddress("10.0.0.2", "[2001:db8::1]"), "2001:db8::1");
-  assert.equal(clientAddress("10.0.0.2", "garbage"), "10.0.0.2");
+  assert.equal(clientAddress("198.51.100.4", "garbage"), "198.51.100.4");
   assert.equal(clientAddress(undefined, undefined), "");
 });
 
