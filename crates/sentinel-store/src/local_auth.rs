@@ -112,6 +112,12 @@ pub enum Event {
     MfaEnrollmentStarted = 75,
     GithubAppCreated = 76,
     GithubAppStateRefused = 77,
+    WorkerUninstallRequested = 90,
+    WorkerUninstalled = 91,
+    WorkerBootstrapDownloaded = 92,
+    WorkerEnrollmentRevoked = 93,
+    WorkerPolicyChanged = 94,
+    WorkerNodeKeyAuthorized = 95,
 }
 
 impl Event {
@@ -187,6 +193,12 @@ impl Event {
             Event::MfaEnrollmentStarted => "mfa-enrollment-started",
             Event::GithubAppCreated => "github-app-created",
             Event::GithubAppStateRefused => "github-app-state-refused",
+            Event::WorkerUninstallRequested => "worker-uninstall-requested",
+            Event::WorkerUninstalled => "worker-uninstalled",
+            Event::WorkerBootstrapDownloaded => "worker-bootstrap-downloaded",
+            Event::WorkerEnrollmentRevoked => "worker-enrollment-revoked",
+            Event::WorkerPolicyChanged => "worker-policy-changed",
+            Event::WorkerNodeKeyAuthorized => "worker-node-key-authorized",
         }
     }
 
@@ -262,6 +274,12 @@ impl Event {
             75 => Event::MfaEnrollmentStarted,
             76 => Event::GithubAppCreated,
             77 => Event::GithubAppStateRefused,
+            90 => Event::WorkerUninstallRequested,
+            91 => Event::WorkerUninstalled,
+            92 => Event::WorkerBootstrapDownloaded,
+            93 => Event::WorkerEnrollmentRevoked,
+            94 => Event::WorkerPolicyChanged,
+            95 => Event::WorkerNodeKeyAuthorized,
             _ => return None,
         })
     }

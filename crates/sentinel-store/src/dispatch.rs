@@ -68,6 +68,7 @@ impl LogState {
 }
 
 /// Zero disk means not reported only from workers older than protocol 7; from newer workers it is a real limit.
+/// `report_capacity` stores the reported size under the worker's approved ceilings (`workers::HostPolicy`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capacity {
     pub cpu_millis: i64,
@@ -81,7 +82,13 @@ pub fn report_capacity(tx: &Transaction<'_>, worker: WorkerId, capacity: Capacit
     }
     let changed = tx
         .prepare_cached(
-            "UPDATE workers SET cpu_millis = ?2, memory_bytes = ?3, disk_bytes = ?4
+            "UPDATE workers SET
+                    reported_cpu_millis = ?2, reported_memory_bytes = ?3, reported_disk_bytes = ?4,
+                    cpu_millis = MIN(?2, COALESCE(cpu_ceiling_millis, ?2)),
+                    memory_bytes = MIN(?3, COALESCE(memory_ceiling_bytes, ?3)),
+                    disk_bytes = CASE WHEN disk_ceiling_bytes IS NULL THEN ?4
+                                      WHEN ?4 = 0 THEN disk_ceiling_bytes
+                                      ELSE MIN(?4, disk_ceiling_bytes) END
              WHERE id = ?1 AND revoked_ms IS NULL",
         )?
         .execute(params![
@@ -190,6 +197,19 @@ fn caches_image(avail_images: &[u8], key: &[u8; IMAGE_KEY_BYTES]) -> bool {
         .any(|chunk| chunk == key)
 }
 
+/// The key identities are grouped by as one physical host: the machine identity a worker states, scoped by
+/// the architecture it is built for. One machine cannot run two architectures' workers, so two identities that
+/// state the same machine with different architectures are different machines (a cloned image, or a claim),
+/// and neither is charged for the other's attempts.
+pub fn scope_host(host: &[u8; 16], arch: &str) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new_derive_key("sentinel host key v1");
+    hasher.update(host);
+    hasher.update(arch.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    out
+}
+
 pub struct ReportedProfile<'a> {
     pub labels: &'a [String],
     pub host_id: Option<[u8; 16]>,
@@ -218,6 +238,16 @@ pub fn report_profile(
     for key in profile.avail_images {
         images.extend_from_slice(key);
     }
+    let host = match profile.host_id {
+        Some(host) => {
+            let arch: Option<String> = tx
+                .prepare_cached("SELECT arch FROM workers WHERE id = ?1 AND revoked_ms IS NULL")?
+                .query_row([worker.as_bytes()], |r| r.get(0))
+                .optional()?;
+            Some(scope_host(&host, &arch.ok_or(Error::NotFound)?))
+        }
+        None => None,
+    };
     let changed = tx
         .prepare_cached(
             "UPDATE workers SET labels = ?2, host_id = COALESCE(?3, host_id),
@@ -228,7 +258,7 @@ pub fn report_profile(
         .execute(params![
             worker.as_bytes(),
             labels,
-            profile.host_id.as_ref().map(|h| h.as_slice()),
+            host.as_ref().map(|h| h.as_slice()),
             images,
             profile.cache_bytes,
             profile.load_ns
@@ -1236,6 +1266,69 @@ pub fn held_by_worker(conn: &Connection) -> Result<HashMap<WorkerId, i64>> {
         );
     }
     Ok(out)
+}
+
+/// What the controller offers one live worker (its effective size, the report under the approved
+/// ceilings) and the operator priority approved for it: what a placement pass ranks by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Approved {
+    pub size: Capacity,
+    pub priority: i32,
+}
+
+/// The effective size and approved priority of every live worker, one read of a small table. The
+/// placement pass ranks and groups by these, never by the size a worker claimed in its hello, so a
+/// ceiling or a priority changed after the worker connected is used by the next pass.
+pub fn approved_by_worker(conn: &Connection) -> Result<HashMap<WorkerId, Approved>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, cpu_millis, memory_bytes, disk_bytes, priority
+         FROM workers WHERE revoked_ms IS NULL",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, [u8; 16]>(0)?,
+            Approved {
+                size: Capacity {
+                    cpu_millis: r.get(1)?,
+                    memory_bytes: r.get(2)?,
+                    disk_bytes: r.get(3)?,
+                },
+                priority: r.get(4)?,
+            },
+        ))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (worker, approved) = row?;
+        out.insert(
+            WorkerId::from_bytes(worker).map_err(|_| Error::Corrupt("worker id"))?,
+            approved,
+        );
+    }
+    Ok(out)
+}
+
+/// What the unreleased attempts of the worker's whole machine reserve (every identity that states the
+/// same host, as `free_capacity` charges them). Disk is the sum of the reservations whatever the
+/// worker measured; compare it with the effective size only when that is non-zero.
+pub fn reserved_on_host(conn: &Connection, worker: WorkerId) -> Result<Capacity> {
+    conn.prepare_cached(
+        "SELECT COALESCE(SUM(a.cpu_millis), 0), COALESCE(SUM(a.memory_bytes), 0),
+                COALESCE(SUM(a.disk_bytes), 0)
+         FROM workers me JOIN workers h
+              ON ((me.host_id IS NOT NULL AND h.host_id = me.host_id)
+                  OR (me.host_id IS NULL AND h.id = me.id))
+         JOIN attempts a ON a.worker_id = h.id AND a.released_ms IS NULL
+         WHERE me.id = ?1",
+    )?
+    .query_row([worker.as_bytes()], |r| {
+        Ok(Capacity {
+            cpu_millis: r.get(0)?,
+            memory_bytes: r.get(1)?,
+            disk_bytes: r.get(2)?,
+        })
+    })
+    .map_err(Error::from)
 }
 
 pub fn revocations(conn: &Connection) -> Result<(i64, i64)> {

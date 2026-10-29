@@ -11,6 +11,7 @@ mod oauth;
 mod refresh;
 mod routes;
 mod secret_routes;
+mod worker_bootstrap;
 
 use std::{
     net::SocketAddr,
@@ -28,6 +29,9 @@ use sentinel_store::{Store, logs::LogStore, objects::Objects};
 pub use github::GithubSignIn;
 pub use github_app::{Activation, AppSource, GithubAppSetup, OnActivate};
 pub use oauth::limit::TrustedProxy;
+pub use worker_bootstrap::{
+    Pin, Settings as WorkerBootstrapSettings, TailcatRelease, WorkerBootstrap,
+};
 
 pub const WORKERS: usize = 8;
 pub const CONNECTIONS: usize = 64;
@@ -125,11 +129,28 @@ pub struct Options {
     pub mail: Option<Arc<sentinel_mail::Resend>>,
     /// The GitHub App in force and the one-click manifest flow ([`GithubAppSetup`]).
     pub github_app: GithubAppSetup,
+    /// Lets platform administrators issue worker enrollments and download their bootstrap script (Q11).
+    pub worker_bootstrap: Option<Arc<WorkerBootstrap>>,
+    /// Called after a machine redeems an enrollment, so the controller admits its Tailcat node key
+    /// at once instead of at its next periodic pass.
+    pub on_worker_enrolled: Option<Notify>,
+}
+
+/// A callback the embedding controller hands the API.
+#[derive(Clone)]
+pub struct Notify(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Notify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Notify")
+    }
 }
 
 pub(crate) struct State {
     pub auto_join: Vec<AutoJoinRule>,
     pub mail: Option<Arc<sentinel_mail::Resend>>,
+    pub worker_bootstrap: Option<Arc<WorkerBootstrap>>,
+    pub on_worker_enrolled: Option<Notify>,
     pub setup_mail: Outbound,
     pub setup_closed: AtomicBool,
     /// Until when (milliseconds since the first status request) the last store read of "setup is open" stands.
@@ -269,6 +290,8 @@ impl Server {
         let state = Arc::new(State {
             auto_join: options.auto_join,
             mail: options.mail,
+            worker_bootstrap: options.worker_bootstrap,
+            on_worker_enrolled: options.on_worker_enrolled,
             setup_mail: Outbound::default(),
             setup_closed: AtomicBool::new(false),
             setup_open_until: AtomicU64::new(0),

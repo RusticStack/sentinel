@@ -163,6 +163,11 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (59, include_str!("migrations/059_link_admission.sql")),
     (60, include_str!("migrations/060_removal_tombstones.sql")),
     (61, include_str!("migrations/061_auto_join_generation.sql")),
+    (
+        62,
+        include_str!("migrations/062_worker_enrollment_policy.sql"),
+    ),
+    (63, include_str!("migrations/063_host_policy.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -243,6 +248,14 @@ mod tests {
         (
             61,
             "an older controller rewrites the auto-join rules without raising the generation, so a person it never re-checked would stay behind the rule change",
+        ),
+        (
+            62,
+            "an older controller would redeem enrollments without binding the node key or copying the approved host policy, and would report capacity without the ceilings",
+        ),
+        (
+            63,
+            "an older controller would write a capacity report without the reported-host columns and would redeem a Tailcat enrollment without the authorized node key",
         ),
     ];
 

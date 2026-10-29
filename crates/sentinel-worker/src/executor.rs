@@ -76,6 +76,12 @@ pub fn admission_floor(total: u64) -> u64 {
     (total / 8).clamp(512 << 20, 2 << 30)
 }
 
+/// The scratch disk a host offers jobs out of `free` bytes on the data directory's file system: the free
+/// space less the same reserve the admission floor keeps (an eighth, 512 MiB to 2 GiB).
+pub fn job_disk_room(free: u64) -> u64 {
+    free.saturating_sub(admission_floor(free))
+}
+
 fn admits(free: Option<u64>, floor: u64) -> bool {
     free.is_none_or(|free| free >= floor)
 }
@@ -410,6 +416,7 @@ pub struct Inner {
     mirrors: Option<crate::checkout::Mirrors>,
     spool: Arc<SpoolSpace>,
     admission_floor: std::sync::atomic::AtomicU64,
+    measured_disk: std::sync::atomic::AtomicBool,
     refusal_noted: Mutex<Option<Instant>>,
     state: Mutex<State>,
     gc_lock: Mutex<sentinel_cache::gc::Cursor>,
@@ -480,6 +487,16 @@ mod admission_tests {
         assert!(admits(Some(5 * GIB), GIB));
         assert!(!admits(Some(0), GIB));
         assert!(admits(None, GIB));
+    }
+
+    #[test]
+    fn the_offered_scratch_disk_is_the_free_space_less_the_reserve() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        assert_eq!(super::job_disk_room(0), 0);
+        assert_eq!(super::job_disk_room(100 * MIB), 0);
+        assert_eq!(super::job_disk_room(8 * GIB), 7 * GIB);
+        assert_eq!(super::job_disk_room(100 * GIB), 98 * GIB);
     }
 
     #[test]
@@ -565,6 +582,7 @@ impl Executor {
                 draining: false,
             }),
             admission_floor: std::sync::atomic::AtomicU64::new(floor),
+            measured_disk: std::sync::atomic::AtomicBool::new(false),
             refusal_noted: Mutex::new(None),
             notify: Box::new(notify),
             gc_lock: Mutex::new(sentinel_cache::gc::Cursor::default()),
@@ -603,6 +621,13 @@ impl Executor {
     pub fn set_admission_floor(&self, bytes: u64) {
         self.admission_floor
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the scratch disk offered to the controller follows the data directory's free space (`true`,
+    /// the default for a worker whose operator states no `disk_bytes`) or stays the figure sent at connect.
+    pub fn set_measured_disk(&self, measured: bool) {
+        self.measured_disk
+            .store(measured, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn shutdown(&self, grace: Duration) {
@@ -1353,6 +1378,16 @@ impl LinkExecutor for Executor {
                 load_ns: 0,
             },
         ))
+    }
+
+    fn disk_room(&self) -> Option<u64> {
+        if !self
+            .measured_disk
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+        crate::spool::free_bytes(&self.root).map(job_disk_room)
     }
 
     fn prefetch(&self, images: &[String]) {

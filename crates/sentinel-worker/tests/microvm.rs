@@ -278,3 +278,30 @@ fn a_cancel_by_name_ends_the_running_step_and_removal_leaves_nothing() {
         .unwrap();
     assert_ne!(text(&status.stdout), "active", "the VM's scope is gone");
 }
+
+#[test]
+fn a_guest_cannot_write_past_its_declared_scratch_disk() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    // `limits()` declares 1 GiB of disk: the guest's writable layer is a scratch image of that size, so the
+    // write below runs out of room inside the guest and no host-side guard is involved.
+    let (_, vm) = start(root.path(), &setup, workspace.path(), &[]);
+    let exit = vm
+        .exec(
+            &sh(
+                "dd if=/dev/zero of=/workspace/big bs=1M count=1600 2>&1",
+                120,
+            ),
+            &[],
+        )
+        .unwrap();
+    assert_ne!(exit.code, Some(0), "{}", text(&exit.stdout));
+    assert!(
+        text(&exit.stdout).contains("No space left on device"),
+        "{}",
+        text(&exit.stdout)
+    );
+    let _ = vm.destroy();
+}

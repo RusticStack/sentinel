@@ -18,6 +18,10 @@ mod service;
 #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]
 mod tailcat_admin;
 #[cfg(all(target_os = "linux", feature = "worker"))]
+mod worker_enroll;
+#[cfg(all(target_os = "linux", feature = "worker"))]
+mod worker_install;
+#[cfg(all(target_os = "linux", feature = "worker"))]
 mod worker_metrics;
 
 use clap::Parser;
@@ -62,6 +66,31 @@ fn run_admin(_args: cli::AdminArgs) -> ExitCode {
     ExitCode::from(2)
 }
 
+#[cfg(all(target_os = "linux", feature = "worker"))]
+fn run_worker_command(command: cli::WorkerHostCommand) -> ExitCode {
+    use cli::WorkerHostCommand;
+    let outcome = match command {
+        WorkerHostCommand::Enroll(args) => worker_enroll::run(&args),
+        WorkerHostCommand::Uninstall(args) => worker_install::uninstall(&args),
+        WorkerHostCommand::Rollback(args) => worker_install::rollback(&args),
+    };
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(failure) => {
+            eprintln!("error: {}", failure.message);
+            ExitCode::from(failure.code)
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", feature = "worker")))]
+fn run_worker_command(_command: cli::WorkerHostCommand) -> ExitCode {
+    eprintln!(
+        "error: enrolling and managing a worker needs a Linux binary built with --features worker"
+    );
+    ExitCode::from(2)
+}
+
 fn finish(outcome: Result<(), client::Error>) -> ExitCode {
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
@@ -79,9 +108,11 @@ fn parse() -> Result<Cli, ExitCode> {
         Ok(cli) => return Ok(cli),
         Err(error) => error,
     };
-    let secret = std::env::args_os()
-        .nth(1)
-        .is_some_and(|arg| arg == "secret");
+    let mut args = std::env::args_os().skip(1);
+    let first = args.next();
+    let secret = first.as_ref().is_some_and(|arg| arg == "secret");
+    let enrolling = first.as_ref().is_some_and(|arg| arg == "worker")
+        && args.next().is_some_and(|arg| arg == "enroll");
     let quoting = matches!(
         error.kind(),
         ErrorKind::UnknownArgument
@@ -100,6 +131,14 @@ fn parse() -> Result<Cli, ExitCode> {
         );
         return Err(ExitCode::from(2));
     }
+    if enrolling && quoting {
+        eprintln!(
+            "error: unexpected or invalid argument to `sentinel worker enroll` (not shown); the enrollment secret is never accepted as an argument: use --secret-stdin or --secret-file
+
+For more information, try 'sentinel worker enroll --help'."
+        );
+        return Err(ExitCode::from(2));
+    }
     error.exit()
 }
 
@@ -110,7 +149,10 @@ fn main() -> ExitCode {
     };
     let (role, args) = match cli.command {
         Command::Server(args) => ("server", args),
-        Command::Worker(args) => ("worker", args),
+        Command::Worker(args) => match args.command {
+            Some(command) => return run_worker_command(command),
+            None => ("worker", args.service),
+        },
         Command::Pipeline(args) => return pipeline::run(args),
         Command::Api(args) => return finish(api::run(args)),
         Command::Mcp(args) => return finish(sentinel::mcp::run(args)),

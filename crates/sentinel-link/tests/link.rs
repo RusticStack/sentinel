@@ -486,15 +486,76 @@ fn a_worker_enrolls_once_heartbeats_reconnects_and_is_refused_after_revocation()
         .writer()
         .write(move |tx| workers::revoke(tx, Authority::HostLocal, worker, UnixMillis::now()))
         .unwrap();
+    // A revoked identity is told so, with or without a new enrollment, and a fresh secret does not
+    // revive it.
     let refused = d.connect(load(), worker, None).unwrap_err();
-    assert!(matches!(refused, Error::Rejected(Rejection::NotEnrolled)));
+    assert!(
+        matches!(refused, Error::Rejected(Rejection::Revoked)),
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("revoked"), "{refused}");
     let fresh = d.enrollment(60_000);
     let refused = d.connect(load(), worker, Some(&fresh)).unwrap_err();
-    assert!(matches!(refused, Error::Rejected(Rejection::Identity)));
+    assert!(matches!(refused, Error::Rejected(Rejection::Revoked)));
     eventually("rejection count", || {
         d.controller().stats().rejected.load(Ordering::SeqCst) == 4
     });
     assert_eq!(d.controller().stats().admitted.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        d.controller()
+            .stats()
+            .revoked_refused
+            .load(Ordering::SeqCst),
+        2
+    );
+    // The refusal spent nothing: the new enrollment is still good for the machine meant to use it,
+    // which enrolls under a new identity.
+    let replacement = d
+        .connect(
+            Identity::generate("replacement").unwrap(),
+            WorkerId::new(),
+            Some(&fresh),
+        )
+        .unwrap();
+    assert_ne!(replacement.worker, worker);
+}
+
+/// One certificate is one worker and one worker identifier is one certificate: presenting either under
+/// the other's name is refused as an identity conflict and changes nothing.
+#[test]
+fn a_certificate_or_worker_identifier_that_belongs_to_another_worker_is_refused() {
+    let d = deployment();
+    let (first, second) = (WorkerId::new(), WorkerId::new());
+    let identity = Identity::generate("first").unwrap();
+    let (cert, key) = (d._dir.path().join("f.crt"), d._dir.path().join("f.key"));
+    identity.save(&cert, &key).unwrap();
+    let load = || Identity::load(&cert, &key).unwrap();
+    let secret = d.enrollment(60_000);
+    drop(d.connect(load(), first, Some(&secret)).unwrap());
+    let before = d.controller().stats().admitted.load(Ordering::SeqCst);
+
+    // The same certificate under another worker identifier: a copy of the identity, not a reconnect.
+    let copied = d.connect(load(), second, None).unwrap_err();
+    assert!(
+        matches!(copied, Error::Rejected(Rejection::Identity)),
+        "{copied}"
+    );
+    // Another certificate claiming the enrolled worker's identifier with a fresh enrollment.
+    let fresh = d.enrollment(60_000);
+    let taken = d
+        .connect(Identity::generate("clone").unwrap(), first, Some(&fresh))
+        .unwrap_err();
+    assert!(
+        matches!(taken, Error::Rejected(Rejection::Identity)),
+        "{taken}"
+    );
+    // Neither refusal admitted anything or changed the enrolled worker; the real machine reconnects.
+    assert_eq!(
+        d.controller().stats().admitted.load(Ordering::SeqCst),
+        before
+    );
+    drop(d.connect(load(), first, None).unwrap());
+    assert!(!d.store.read(move |c| workers::revoked(c, first)).unwrap());
 }
 
 #[test]

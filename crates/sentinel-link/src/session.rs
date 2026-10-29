@@ -728,6 +728,36 @@ pub enum Rejection {
     Identity,
     Capacity,
     Unavailable,
+    /// The certificate belongs to a worker that was revoked or uninstalled. Appended last: the variants
+    /// before it keep their wire index.
+    Revoked,
+}
+
+impl Rejection {
+    /// What an operator reads on the worker when the controller refuses its hello.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::UnsupportedVersion { .. } => {
+                "the controller and this worker share no protocol version"
+            }
+            Self::MissingCapabilities(_) => {
+                "this worker lacks capabilities the controller requires"
+            }
+            Self::InvalidRange => "the hello carried an invalid protocol range",
+            Self::NotEnrolled => "this worker is not enrolled with the controller",
+            Self::Enrollment => {
+                "the enrollment secret was not accepted (unknown, spent, expired or withdrawn)"
+            }
+            Self::Identity => {
+                "this identity conflicts with one the controller already holds for another worker"
+            }
+            Self::Capacity => "the capacity this worker reported is not valid",
+            Self::Unavailable => "the controller cannot admit workers right now",
+            Self::Revoked => {
+                "this worker was revoked or uninstalled at the controller; uninstall it and enroll again with a new enrollment"
+            }
+        }
+    }
 }
 
 impl From<Rejected> for Rejection {
@@ -2920,6 +2950,12 @@ pub trait Executor: Send + Sync {
     fn availability(&self) -> Option<(u64, sentinel_protocol::negotiate::Availability)> {
         None
     }
+    /// The scratch disk this host can offer jobs right now, when the worker measures it itself (an operator's
+    /// `disk_bytes` is a fixed statement and returns `None`). Measured on the file system, it already excludes
+    /// whatever any identity on the host keeps there: workspaces, caches, mirrors, images and spools.
+    fn disk_room(&self) -> Option<u64> {
+        None
+    }
     fn prefetch(&self, _images: &[String]) {}
 }
 
@@ -2948,23 +2984,34 @@ impl Link {
         if self.negotiated.protocol.0 < CACHE_CANCEL_MIN.0 {
             return Ok(());
         }
-        let Some((version, availability)) = executor.availability() else {
+        let availability = executor
+            .availability()
+            .filter(|(version, _)| *version != self.availability_sent);
+        let Some(sent) = self.profile.as_ref().map(|p| p.disk_bytes) else {
             return Ok(());
         };
-        if version == self.availability_sent {
+        let disk = executor.disk_room().filter(|room| disk_moved(sent, *room));
+        if availability.is_none() && disk.is_none() {
             return Ok(());
         }
         let Some(mut profile) = self.profile.clone() else {
             return Ok(());
         };
-        profile.availability.images = availability.images;
-        profile.availability.cache_bytes = availability.cache_bytes;
+        if let Some((_, availability)) = &availability {
+            profile.availability.images = availability.images.clone();
+            profile.availability.cache_bytes = availability.cache_bytes;
+        }
+        if let Some(room) = disk {
+            profile.disk_bytes = room;
+        }
         if profile.invalid().is_some() {
             return Ok(());
         }
         self.tx.send(&ClientMessage::Profile(profile.clone()))?;
         self.profile = Some(profile);
-        self.availability_sent = version;
+        if let Some((version, _)) = availability {
+            self.availability_sent = version;
+        }
         Ok(())
     }
 
@@ -3511,17 +3558,53 @@ fn fence_held(
     remote.has_fence(attempt, fence) || executor.fence_of(attempt) == Some(fence)
 }
 
+/// A measured disk figure is re-sent only when it moved by this much or by a sixteenth, so a busy host's
+/// byte-by-byte churn is not a profile message per heartbeat.
+const DISK_REFRESH_MIN_BYTES: u64 = 256 << 20;
+
+fn disk_moved(sent: u64, now: u64) -> bool {
+    sent.abs_diff(now) >= DISK_REFRESH_MIN_BYTES.max(sent / 16)
+}
+
+/// The key a worker states for the physical host it runs on: identities that state the same key are charged
+/// against one machine. It is the machine id joined with this boot's id, so a cloned image that kept the
+/// original's `/etc/machine-id` is its own host (its kernel boots with its own id), and a machine without a
+/// machine id (a minimal container) is still one host for every identity on its kernel. A reboot changes the
+/// key, and every identity of the machine restarts with it. All zeros when neither file can be read.
 pub fn host_id() -> [u8; 16] {
-    let mut out = [0u8; 16];
-    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
-        if let Ok(text) = std::fs::read_to_string(path) {
+    let read = |paths: &[&str]| {
+        paths.iter().find_map(|path| {
+            let text = std::fs::read_to_string(path).ok()?;
             let text = text.trim();
-            if !text.is_empty() {
-                out.copy_from_slice(&blake3::hash(text.as_bytes()).as_bytes()[..16]);
-                return out;
-            }
+            (!text.is_empty()).then(|| text.to_owned())
+        })
+    };
+    host_id_from(
+        read(&["/etc/machine-id", "/var/lib/dbus/machine-id"]).as_deref(),
+        read(&["/proc/sys/kernel/random/boot_id"]).as_deref(),
+    )
+}
+
+/// `host_id` over already-read machine and boot ids.
+pub fn host_id_from(machine: Option<&str>, boot: Option<&str>) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let digest = match (machine, boot) {
+        (Some(machine), Some(boot)) => {
+            let mut hasher = blake3::Hasher::new_derive_key("sentinel host id machine+boot v1");
+            hasher.update(&(machine.len() as u64).to_le_bytes());
+            hasher.update(machine.as_bytes());
+            hasher.update(boot.as_bytes());
+            hasher.finalize()
         }
-    }
+        (Some(machine), None) => blake3::hash(machine.as_bytes()),
+        (None, Some(boot)) => {
+            let mut hasher = blake3::Hasher::new_derive_key("sentinel host id boot v1");
+            hasher.update(boot.as_bytes());
+            hasher.finalize()
+        }
+        (None, None) => return out,
+    };
+    out.copy_from_slice(&digest.as_bytes()[..16]);
     out
 }
 
@@ -3539,6 +3622,46 @@ mod tests {
         assert_eq!(clamp_heartbeat(1), HEARTBEAT_MIN_INTERVAL);
         assert_eq!(clamp_heartbeat(5_000), HEARTBEAT_INTERVAL);
         assert_eq!(clamp_heartbeat(u32::MAX), HEARTBEAT_MAX_INTERVAL);
+    }
+
+    #[test]
+    fn a_measured_disk_is_resent_only_when_it_moved_enough() {
+        const GIB: u64 = 1 << 30;
+        assert!(!disk_moved(100 * GIB, 100 * GIB + (1 << 20)));
+        assert!(!disk_moved(100 * GIB, 100 * GIB - 5 * GIB));
+        assert!(disk_moved(100 * GIB, 100 * GIB - 7 * GIB));
+        assert!(disk_moved(100 * GIB, 100 * GIB + 7 * GIB));
+        assert!(!disk_moved(2 * GIB, 2 * GIB - (200 << 20)));
+        assert!(disk_moved(2 * GIB, 2 * GIB - (300 << 20)));
+        assert!(disk_moved(0, GIB));
+    }
+
+    #[test]
+    fn a_host_key_separates_clones_and_joins_identities_on_one_boot() {
+        let machine = Some("0123456789abcdef0123456789abcdef");
+        let one = host_id_from(machine, Some("boot-a"));
+        // Identities of one machine in one boot state the same key.
+        assert_eq!(one, host_id_from(machine, Some("boot-a")));
+        // A clone keeps the machine id but boots its own kernel.
+        assert_ne!(one, host_id_from(machine, Some("boot-b")));
+        // A machine id alone is the key older workers stated; a boot id alone covers a container with no
+        // machine id, and the two never collide with each other or with the joined key.
+        let keys = [
+            one,
+            host_id_from(machine, None),
+            host_id_from(None, Some("boot-a")),
+        ];
+        assert!(keys.iter().all(|k| *k != [0u8; 16]));
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[0], keys[2]);
+        assert_ne!(keys[1], keys[2]);
+        // Nothing readable is the unreported host, never a shared key.
+        assert_eq!(host_id_from(None, None), [0u8; 16]);
+        // The joined key cannot be forged by moving bytes between the two ids.
+        assert_ne!(
+            host_id_from(Some("ab"), Some("c")),
+            host_id_from(Some("a"), Some("bc"))
+        );
     }
 
     fn tls_pair() -> (Sender, Receiver) {

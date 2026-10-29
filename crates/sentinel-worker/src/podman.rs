@@ -502,6 +502,16 @@ fn exited(pid: i32) -> bool {
 
 pub const CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
 
+impl Container {
+    /// A handle that force-removes this container from another thread: the storage guard's stop.
+    pub fn stopper(&self) -> impl FnOnce() + Send + 'static {
+        let (name, store) = (self.name.clone(), self.store.clone());
+        move || {
+            let _ = remove_named(&name, &store);
+        }
+    }
+}
+
 pub fn terminate_named(name: &str, store: &Store, grace: Duration) -> Result<Terminated> {
     let (init, cgroup) = match inspect_named(name, store) {
         Ok(found) => found,

@@ -45,6 +45,10 @@ pub(crate) enum Budget {
     Setup,
     SetupStatus,
     Organization,
+    Enrollment,
+    Bootstrap,
+    HostPolicy,
+    Redeem,
 }
 
 const TOKEN_CLIENT: Rate = Rate::per_sec(10, 20);
@@ -67,6 +71,18 @@ const SETUP_STATUS_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(2), 1
 const SETUP_STATUS_CEILING: Rate = Rate::per_sec(20, 40);
 const ORGANIZATION_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(10), 5);
 const ORGANIZATION_CEILING: Rate = Rate::per_sec(2, 10);
+// Per platform administrator, not per address: one enrollment per 6 s sustained, 5 in a burst; 1 a second overall.
+const ENROLLMENT_ACTOR: Rate = Rate::new(std::time::Duration::from_secs(6), 5);
+const ENROLLMENT_CEILING: Rate = Rate::per_sec(1, 5);
+const BOOTSTRAP_ACTOR: Rate = Rate::new(std::time::Duration::from_secs(2), 10);
+const BOOTSTRAP_CEILING: Rate = Rate::per_sec(2, 10);
+// Host policy and uninstall requests, per platform administrator: 10 in a burst, then one a second.
+const HOST_POLICY_ACTOR: Rate = Rate::new(std::time::Duration::from_secs(1), 10);
+const HOST_POLICY_CEILING: Rate = Rate::per_sec(2, 10);
+// An unauthenticated enrollment redemption: 5 attempts per address then one every 12 s, and 20 then one every 3 s
+// overall, the same bounds as the link's own enrollment attempts. Each wrong secret may write an audit row.
+const REDEEM_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(12), 5);
+const REDEEM_CEILING: Rate = Rate::new(std::time::Duration::from_secs(3), 20);
 
 pub(crate) struct OAuthState {
     pub issuer: String,
@@ -90,6 +106,10 @@ pub(crate) struct OAuthState {
     pub setup_budget: Mutex<Limiter>,
     pub setup_status_budget: Mutex<Limiter>,
     pub organization_budget: Mutex<Limiter>,
+    pub enrollment_budget: Mutex<Limiter>,
+    pub bootstrap_budget: Mutex<Limiter>,
+    pub host_policy_budget: Mutex<Limiter>,
+    pub redeem_budget: Mutex<Limiter>,
     pub client_metadata: client::MetadataCache,
     pub device_polls: Mutex<HashMap<[u8; 32], (Instant, u32)>>,
     pub user_code_failures: Mutex<device::WrongCodes>,
@@ -144,6 +164,22 @@ impl OAuthState {
                 Some(ORGANIZATION_CEILING),
                 now,
             )),
+            enrollment_budget: Mutex::new(Limiter::new(
+                ENROLLMENT_ACTOR,
+                Some(ENROLLMENT_CEILING),
+                now,
+            )),
+            bootstrap_budget: Mutex::new(Limiter::new(
+                BOOTSTRAP_ACTOR,
+                Some(BOOTSTRAP_CEILING),
+                now,
+            )),
+            host_policy_budget: Mutex::new(Limiter::new(
+                HOST_POLICY_ACTOR,
+                Some(HOST_POLICY_CEILING),
+                now,
+            )),
+            redeem_budget: Mutex::new(Limiter::new(REDEEM_CLIENT, Some(REDEEM_CEILING), now)),
             client_metadata: client::MetadataCache::default(),
             device_polls: Mutex::new(HashMap::new()),
             user_code_failures: Mutex::new(device::WrongCodes::new()),
@@ -311,7 +347,11 @@ pub(crate) fn admit(state: &State, request: &Request, budget: Budget) -> Result<
 }
 
 pub(crate) fn admitted(state: &State, request: &Request, budget: Budget) -> bool {
-    let client = client_of(state, request);
+    admitted_as(state, client_of(state, request), budget)
+}
+
+/// Like [`admitted`], for a budget kept per authenticated actor instead of per client address.
+pub(crate) fn admitted_as(state: &State, client: u128, budget: Budget) -> bool {
     let now = Instant::now();
     let take = |limiter: &Mutex<Limiter>| {
         limiter
@@ -333,6 +373,10 @@ pub(crate) fn admitted(state: &State, request: &Request, budget: Budget) -> bool
         Budget::Setup => take(&oauth.setup_budget),
         Budget::SetupStatus => take(&oauth.setup_status_budget),
         Budget::Organization => take(&oauth.organization_budget),
+        Budget::Enrollment => take(&oauth.enrollment_budget),
+        Budget::Bootstrap => take(&oauth.bootstrap_budget),
+        Budget::HostPolicy => take(&oauth.host_policy_budget),
+        Budget::Redeem => take(&oauth.redeem_budget),
     }
 }
 

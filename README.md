@@ -57,7 +57,7 @@ The primary target is **trigger-to-required-check p95 in at most half of Blacksm
    +-------------+ +-------------+
 ```
 
-The controller never executes jobs. Workers run as separate processes, receive only work they are authorized and equipped to run, and report logs and outcomes through durable, fenced attempts. The intended Q11/Q12 host model adds UI-generated worker-only Tailcat enrollment, controller-approved host CPU/RAM/storage ceilings and fastest-eligible placement with an explicit operator priority override; those flows are not yet implemented.
+The controller never executes jobs. Workers run as separate processes, receive only work they are authorized and equipped to run, and report logs and outcomes through durable, fenced attempts. The intended Q11/Q12 host model adds UI-generated worker-only Tailcat enrollment, controller-approved host CPU/RAM/storage ceilings and fastest-eligible placement with an explicit operator priority override; the enrollment API and the generated worker-only install script exist ([worker bootstrap](docs/worker-bootstrap.md)); the web page, controller-side Tailcat admission and their fleet verification are still open.
 
 ## A pipeline looks like this
 
@@ -114,7 +114,7 @@ Then follow [operator first run](docs/development.md#operator-first-run) to crea
 | Multi-tenancy, authentication, OAuth and secrets | Implemented; authorization/admission rework open |
 | Logs, artifacts, caches, recovery and retention | Implemented; durability and cache rework open |
 | Web interface, CLI, MCP and GitHub Checks | Implemented; current verification open |
-| UI worker enrollment, host caps and host priority | Planned as Q11–Q13 |
+| UI worker enrollment, host caps and host priority | Enrollment API, install script, authorized Tailcat node keys and authoritative ceilings/priority (API and CLI) built ([worker bootstrap](docs/worker-bootstrap.md)); web page, priority-aware placement and Q13 open |
 | Same-hardware optimization and pilot measurements | Revision-4 records exist; B08 unmet |
 | 2× Blacksmith comparison | B11 blocked by benchmark access |
 | Firecracker microVMs for Linux jobs | Implemented; networking, snapshots and verification open |

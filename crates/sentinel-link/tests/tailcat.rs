@@ -1266,3 +1266,213 @@ fn a_hand_off_closes_a_carried_connection_still_in_its_handshake() {
     server.shutdown();
     assert!(controller.shutdown(Duration::from_secs(5)));
 }
+
+#[test]
+fn revoking_a_worker_takes_every_key_of_it_off_the_list_and_the_helper_stops_serving_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stays, leaves) = (WorkerId::new(), WorkerId::new());
+    let admit = |k: &str, worker| {
+        tailcat::admit(
+            dir.path(),
+            &Admission {
+                key: key(k),
+                worker,
+            },
+        )
+        .unwrap()
+    };
+    assert!(admit(KEY, stays));
+    assert!(admit(OTHER, leaves));
+    // The overlap window of a rotation: a second key for the leaving worker.
+    assert!(admit(THIRD, leaves));
+    let path = dir.path().join(tailcat::ALLOW_LIST_FILE);
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.insert_str(0, "# builders\n");
+    fs::write(&path, &text).unwrap();
+
+    let fake = Fake::write(SERVE_FOREVER);
+    let config = fake.config(7443);
+    let listed: Vec<NodeKey> = tailcat::allow_list(dir.path())
+        .unwrap()
+        .into_iter()
+        .map(|line| line.key)
+        .collect();
+    assert_eq!(listed.len(), 3);
+    let server = tailcat::start_server(&config, fake.path(), &listed).unwrap();
+    server.wait_ready(Duration::from_secs(10)).unwrap();
+    let served = &fake.calls("serve")[0];
+    for k in [KEY, OTHER, THIRD] {
+        assert!(served.contains(k), "{served}");
+    }
+
+    // Revocation drops both of the leaving worker's lines and nothing else, comments included.
+    assert_eq!(tailcat::revoke(dir.path(), leaves).unwrap(), 2);
+    assert_eq!(tailcat::revoke(dir.path(), leaves).unwrap(), 0);
+    let kept = fs::read_to_string(&path).unwrap();
+    assert_eq!(kept, format!("# builders\nnodekey:{KEY} {stays}\n"));
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        tailcat::allow_list(dir.path()).unwrap(),
+        vec![Admission {
+            key: key(KEY),
+            worker: stays
+        }]
+    );
+    // A predicate decides the rest: nothing matching writes nothing.
+    assert_eq!(tailcat::prune(dir.path(), |_| false).unwrap(), 0);
+    assert_eq!(fs::read_to_string(&path).unwrap(), kept);
+
+    // The helper is restarted with only the remaining key.
+    let remaining: Vec<NodeKey> = tailcat::allow_list(dir.path())
+        .unwrap()
+        .into_iter()
+        .map(|line| line.key)
+        .collect();
+    server.set_allow(&remaining);
+    wait_until("serve without the revoked keys", || {
+        fake.calls("serve").len() == 2
+    });
+    assert_eq!(
+        fake.calls("serve")[1],
+        format!(
+            "argv serve --allow={KEY_ARG} 7443",
+            KEY_ARG = remaining[0].expose()
+        )
+    );
+    server.shutdown();
+
+    // A file `allow_list` refuses is not rewritten.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(tailcat::revoke(dir.path(), stays).is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), kept);
+}
+
+/// Revoking a worker that holds a store-bound node key takes the key out of what the helper serves, with
+/// the real store deciding the list and the fake helper recording what it was started with; the key of
+/// a worker still enrolled stays, and a node key that already belongs to a worker cannot be bound to a
+/// second one.
+#[test]
+fn revoking_a_bound_worker_stops_the_helper_serving_its_key_and_a_second_worker_cannot_take_it() {
+    use sentinel_auth::secret::{Digest as Fingerprint, Secret};
+    use sentinel_core::UnixMillis;
+    use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
+    use sentinel_store::{
+        Durability, Store,
+        auth::Authority,
+        tenancy::{self, PoolKind},
+        workers::{self, EnrollmentTerms, HostPolicy, Presentation},
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
+    let pool = sentinel_core::PoolId::new();
+    let now = UnixMillis(1_000);
+    store
+        .writer()
+        .write(move |tx| {
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                pool,
+                "builders",
+                PoolKind::Shared,
+                now,
+            )
+        })
+        .unwrap();
+    let enroll = |worker: WorkerId, node_key: [u8; 32]| {
+        let enrollment = store
+            .writer()
+            .write(move |tx| {
+                workers::issue_enrollment_with(
+                    tx,
+                    Authority::HostLocal,
+                    EnrollmentTerms {
+                        pool,
+                        lifetime_ms: 60_000,
+                        policy: HostPolicy::default(),
+                        tailcat: true,
+                    },
+                    now,
+                )
+            })
+            .unwrap();
+        let mut text = String::new();
+        enrollment.secret.expose(&mut text);
+        let secret = Secret::parse(&text).unwrap();
+        store.writer().write(move |tx| {
+            workers::redeem_presented(
+                tx,
+                &secret,
+                Presentation {
+                    worker,
+                    fingerprint: Fingerprint(*blake3::hash(worker.as_bytes()).as_bytes()),
+                    name: "builder",
+                    negotiated: Negotiated {
+                        protocol: ProtocolVersion(1),
+                        capabilities: Capabilities::REQUIRED,
+                        arch: Arch::X86_64,
+                    },
+                },
+                Some(node_key),
+                now,
+            )
+        })
+    };
+    let (stays, leaves) = (WorkerId::new(), WorkerId::new());
+    let (stays_key, leaves_key) = ([0x11; 32], [0x22; 32]);
+    assert!(enroll(stays, stays_key).unwrap().is_some());
+    assert!(enroll(leaves, leaves_key).unwrap().is_some());
+    // A third machine presenting a node key that is already bound is a conflict and binds nothing.
+    assert!(matches!(
+        enroll(WorkerId::new(), leaves_key),
+        Err(sentinel_store::Error::Conflict)
+    ));
+
+    let admitted = || -> Vec<NodeKey> {
+        let mut keys: Vec<NodeKey> = store
+            .read(workers::admitted_node_keys)
+            .unwrap()
+            .into_iter()
+            .map(|(_, bound)| {
+                let hex: String = bound.iter().map(|byte| format!("{byte:02x}")).collect();
+                key(&hex)
+            })
+            .collect();
+        keys.sort_by(|a, b| a.expose().cmp(b.expose()));
+        keys
+    };
+    let fake = Fake::write(SERVE_FOREVER);
+    let config = fake.config(7443);
+    let both = admitted();
+    assert_eq!(both.len(), 2);
+    let server = tailcat::start_server(&config, fake.path(), &both).unwrap();
+    server.wait_ready(Duration::from_secs(10)).unwrap();
+    let served = &fake.calls("serve")[0];
+    assert!(served.contains(&"11".repeat(32)) && served.contains(&"22".repeat(32)));
+
+    store
+        .writer()
+        .write(move |tx| workers::revoke(tx, Authority::HostLocal, leaves, UnixMillis(2_000)))
+        .unwrap();
+    let remaining = admitted();
+    assert_eq!(remaining.len(), 1);
+    server.set_allow(&remaining);
+    wait_until("serve without the revoked worker's key", || {
+        fake.calls("serve").len() == 2
+    });
+    let restarted = &fake.calls("serve")[1];
+    assert!(restarted.contains(&"11".repeat(32)), "{restarted}");
+    assert!(!restarted.contains(&"22".repeat(32)), "{restarted}");
+
+    // The revoked key cannot come back through a new enrollment either.
+    assert!(matches!(
+        enroll(WorkerId::new(), leaves_key),
+        Err(sentinel_store::Error::Conflict)
+    ));
+    assert_eq!(admitted(), remaining);
+    server.shutdown();
+}
