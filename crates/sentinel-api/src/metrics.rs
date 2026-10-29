@@ -314,6 +314,7 @@ pub(crate) fn render(state: &State) -> String {
         ("prefetch_hints", &s.prefetch_hints),
         ("cancels_pushed", &s.cancels_pushed),
         ("revoked_sessions", &s.revoked_sessions),
+        ("revoked_refused", &s.revoked_refused),
     ] {
         out.value(
             "sentinel_link_events_total",

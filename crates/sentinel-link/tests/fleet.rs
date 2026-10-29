@@ -918,10 +918,18 @@ fn revoking_a_connected_worker_ends_its_session_and_fences_its_work() {
         Some(sentinel_core::FailureClass::Reconciled)
     );
     assert!(d.held(worker).is_empty());
+    // The worker redials after its shortest back-off and is told why it is refused, not just that it is.
+    eventually("the redial refused as revoked", || {
+        d.controller()
+            .stats()
+            .revoked_refused
+            .load(Ordering::SeqCst)
+            >= 1
+    });
     let process = processes.pop().unwrap();
     let outcome = process.stop();
     assert!(
-        matches!(outcome, Err(Error::Rejected(_)) | Ok(())),
+        matches!(outcome, Err(Error::Rejected(session::Rejection::Revoked))),
         "{outcome:?}"
     );
     drop(recorders);

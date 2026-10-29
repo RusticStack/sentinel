@@ -90,6 +90,8 @@ pub struct Stats {
     pub prefetch_hints: AtomicU64,
     pub cancels_pushed: AtomicU64,
     pub revoked_sessions: AtomicU64,
+    /// Hellos refused because the certificate belongs to a revoked or uninstalled worker.
+    pub revoked_refused: AtomicU64,
     pub deferred_worker_messages: AtomicU64,
     pub deferred_dropped: AtomicU64,
 }
@@ -1980,7 +1982,9 @@ impl Admission for Inner {
         };
         match self.store.read(|c| workers::authenticate(c, fingerprint)) {
             Ok(known) => {
-                if known.negotiated.arch != negotiated.arch {
+                // A certificate belongs to one worker. A hello that carries it under another worker
+                // identifier is a copy of the identity (or a confused host), not a reconnect.
+                if known.id != worker || known.negotiated.arch != negotiated.arch {
                     return Err(Rejection::Identity);
                 }
                 let id = known.id;
@@ -2009,7 +2013,21 @@ impl Admission for Inner {
                     negotiated,
                 });
             }
-            Err(sentinel_store::Error::NotFound) => {}
+            Err(sentinel_store::Error::NotFound) => {
+                // A revoked identity is told so, with or without a new enrollment: a fresh secret
+                // never revives a certificate the controller has revoked.
+                match self
+                    .store
+                    .read(|c| workers::revoked_fingerprint(c, fingerprint))
+                {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        self.stats.revoked_refused.fetch_add(1, Ordering::Relaxed);
+                        return Err(Rejection::Revoked);
+                    }
+                    Err(_) => return Err(Rejection::Unavailable),
+                }
+            }
             Err(_) => return Err(Rejection::Unavailable),
         }
         let Some(secret) = enrollment else {

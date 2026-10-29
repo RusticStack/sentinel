@@ -722,10 +722,31 @@ check_root_only() {
     [ -f "$STATE_FILE" ] || die "no worker is installed on this host"
 }
 
+# The last line of an uninstall: removing the files does not tell the controller, and what the controller does
+# when told (revoke, end the session, release the leases, drop the Tailcat allow entry) is part of the removal.
+controller_report() {
+    # arguments: the worker identifier (or empty), 1 if the host held a Tailcat key
+    if [ -z "$1" ]; then
+        say "no worker identity was found on this host, so the controller holds nothing to revoke for it"
+        return 0
+    fi
+    extra=
+    [ "$2" != 1 ] || extra=", removes its Tailcat allow entry"
+    say "the controller still lists worker $1 until a platform administrator requests its uninstall there (POST /api/v1/admin/workers/$1/uninstall); that revokes it, ends its session, releases the leases it holds through the controller's reconciliation$extra and refuses it if it ever dials again"
+}
+
 remove_installation() {
     # argument: 1 to remove the data directory too
     created=$(state_get created_account)
     linger=$(state_get enabled_linger)
+    # Read before the data directory goes: the controller knows this machine by this identifier.
+    worker_id=$(head -n 1 "$DATA_DIR/worker.id" 2>/dev/null | tr -cd 'A-Za-z0-9_-' || true)
+    case $worker_id in
+        wrk_*) [ "${#worker_id}" -le 64 ] || worker_id= ;;
+        *) worker_id= ;;
+    esac
+    has_tailcat=0
+    [ ! -d "$DATA_DIR/tailcat" ] || has_tailcat=1
     # The installed worker removes what the install made; this function finishes the job when it cannot run
     # (a release that predates the command, a broken binary) or stops partway.
     bin="$PREFIX/current/sentinel"
@@ -755,6 +776,7 @@ remove_installation() {
     if [ "$created" = 1 ] && getent passwd "$ACCOUNT" >/dev/null 2>&1; then
         userdel "$ACCOUNT" 2>/dev/null || say "could not remove the '$ACCOUNT' account"
     fi
+    controller_report "$worker_id" "$has_tailcat"
 }
 
 cmd_uninstall() {

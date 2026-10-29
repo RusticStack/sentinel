@@ -1249,6 +1249,16 @@ pub fn revoked(conn: &Connection, worker: WorkerId) -> Result<bool> {
         .unwrap_or(false))
 }
 
+/// Whether a TLS fingerprint belongs to a worker that was revoked or uninstalled. A revoked identity
+/// never authenticates again; this lets the controller say so instead of "not enrolled".
+pub fn revoked_fingerprint(conn: &Connection, fingerprint: &Digest) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM workers WHERE fingerprint = ?1 AND revoked_ms IS NOT NULL)",
+        )?
+        .query_row([fingerprint.0], |row| row.get::<_, bool>(0))?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

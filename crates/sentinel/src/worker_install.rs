@@ -191,6 +191,9 @@ pub fn uninstall_with(
     let state = read_state(layout)?;
     let created_account = state_value(&state, "created_account").as_deref() == Some("1");
     let enabled_linger = state_value(&state, "enabled_linger").as_deref() == Some("1");
+    // Read before the data directory goes: the controller knows this machine by this identifier.
+    let worker = enrolled_worker(&layout.data_dir);
+    let tailcat = layout.data_dir.join("tailcat").is_dir();
 
     let mut left = Vec::new();
     let unit = format!("{}.service", layout.unit);
@@ -239,7 +242,43 @@ pub fn uninstall_with(
     if created_account {
         removed.push(format!("removed the '{}' account", layout.account));
     }
+    removed.push(controller_side(worker.as_deref(), tailcat));
     Ok(removed)
+}
+
+/// The worker identifier this host's data directory holds, if it is a well-formed one.
+fn enrolled_worker(data_dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(data_dir.join("worker.id")).ok()?;
+    let id = text.trim();
+    (id.starts_with("wrk_")
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+    .then(|| id.to_owned())
+}
+
+/// The last line of the report: removing the files does not tell the controller, and what the controller
+/// does when told is part of the uninstall.
+fn controller_side(worker: Option<&str>, tailcat: bool) -> String {
+    match worker {
+        Some(id) => format!(
+            concat!(
+                "the controller still lists worker {id} until a platform administrator requests its ",
+                "uninstall there (POST /api/v1/admin/workers/{id}/uninstall); that revokes it, ends its ",
+                "session, releases the leases it holds through the controller's reconciliation{} and ",
+                "refuses it if it ever dials again"
+            ),
+            if tailcat {
+                ", removes its Tailcat allow entry"
+            } else {
+                ""
+            },
+            id = id
+        ),
+        None => "no worker identity was found on this host, so the controller holds nothing to revoke for it"
+            .to_owned(),
+    }
 }
 
 fn release_of(layout: &Layout, link: &str) -> Option<String> {
@@ -451,6 +490,15 @@ mod tests {
         let said = uninstall_with(&tree.layout, &mut host, false).unwrap();
         assert!(stray(&tree).is_empty(), "{:?}", stray(&tree));
         assert!(said.iter().any(|line| line.contains("account")));
+        // The final line says what is left to do at the controller, for the worker the host held.
+        let last = said.last().unwrap();
+        assert!(last.contains("worker wrk_x"), "{last}");
+        assert!(
+            last.contains("/api/v1/admin/workers/wrk_x/uninstall"),
+            "{last}"
+        );
+        assert!(last.contains("Tailcat allow entry"), "{last}");
+        assert!(last.contains("releases the leases"), "{last}");
         assert_eq!(
             host.calls,
             [
@@ -461,6 +509,17 @@ mod tests {
                 "userdel sentinel-worker",
             ]
         );
+    }
+
+    #[test]
+    fn a_host_that_never_started_holds_no_identity_to_revoke() {
+        let tree = installed(STATE);
+        fs::remove_file(tree.layout.data_dir.join("worker.id")).unwrap();
+        fs::remove_dir_all(tree.layout.data_dir.join("tailcat")).unwrap();
+        let said = uninstall_with(&tree.layout, &mut root(), false).unwrap();
+        let last = said.last().unwrap();
+        assert!(last.contains("nothing to revoke"), "{last}");
+        assert!(!last.contains("Tailcat"), "{last}");
     }
 
     #[test]

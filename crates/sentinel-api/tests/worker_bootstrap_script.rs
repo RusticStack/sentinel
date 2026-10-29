@@ -1046,6 +1046,18 @@ gone full
     assert_eq!(f["rc_fresh"], "0", "{}", s.out_file("install2.out"));
     assert_eq!(f["rc_full"], "0", "{}", s.out_file("uninstall2.out"));
     assert_eq!(f["data_full"], "no");
+    // The final report names the worker and what is left to do at the controller, kept data or not.
+    for out in ["uninstall1.out", "uninstall2.out"] {
+        let report = s.out_file(out);
+        assert!(
+            report.contains(
+                "worker wrk_00000000-0000-4000-8000-000000000001 until a platform administrator"
+            ) && report.contains(
+                "/api/v1/admin/workers/wrk_00000000-0000-4000-8000-000000000001/uninstall"
+            ) && report.contains("releases the leases"),
+            "{out}: {report}"
+        );
+    }
     for phase in ["keep", "full"] {
         for key in ["opt", "etc", "unit", "account", "linger", "active"] {
             assert_eq!(

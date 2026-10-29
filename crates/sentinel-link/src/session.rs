@@ -728,6 +728,36 @@ pub enum Rejection {
     Identity,
     Capacity,
     Unavailable,
+    /// The certificate belongs to a worker that was revoked or uninstalled. Appended last: the variants
+    /// before it keep their wire index.
+    Revoked,
+}
+
+impl Rejection {
+    /// What an operator reads on the worker when the controller refuses its hello.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::UnsupportedVersion { .. } => {
+                "the controller and this worker share no protocol version"
+            }
+            Self::MissingCapabilities(_) => {
+                "this worker lacks capabilities the controller requires"
+            }
+            Self::InvalidRange => "the hello carried an invalid protocol range",
+            Self::NotEnrolled => "this worker is not enrolled with the controller",
+            Self::Enrollment => {
+                "the enrollment secret was not accepted (unknown, spent, expired or withdrawn)"
+            }
+            Self::Identity => {
+                "this identity conflicts with one the controller already holds for another worker"
+            }
+            Self::Capacity => "the capacity this worker reported is not valid",
+            Self::Unavailable => "the controller cannot admit workers right now",
+            Self::Revoked => {
+                "this worker was revoked or uninstalled at the controller; uninstall it and enroll again with a new enrollment"
+            }
+        }
+    }
 }
 
 impl From<Rejected> for Rejection {

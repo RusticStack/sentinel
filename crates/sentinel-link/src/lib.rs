@@ -33,7 +33,7 @@ impl fmt::Display for Error {
             Self::Protocol(what) => write!(f, "protocol violation: {what}"),
             Self::Lost => f.write_str("peer stopped answering"),
             Self::Closed => f.write_str("peer closed the session"),
-            Self::Rejected(why) => write!(f, "rejected: {why:?}"),
+            Self::Rejected(why) => write!(f, "rejected ({why:?}): {}", why.reason()),
             Self::Internal(what) => write!(f, "controller: {what}"),
             Self::Io(e) => write!(f, "io: {e}"),
         }
