@@ -22,7 +22,7 @@ The credential yields a `Principal`; every route then asks the store — `auth::
 
 ## Routes
 
-All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](protocol.md)); bodies bounded at 1 MiB before they are read, with the intake routes bounding their own bodies ([intake](intake.md)).
+All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](protocol.md)); bodies bounded before they are read, each route class by its own limit ([body limits](#body-limits)); the intake routes bound their own bodies ([intake](intake.md)).
 
 | Route | Auth | Scope | Does |
 |---|---|---|---|
@@ -199,6 +199,26 @@ Quotas that reconnecting must not mint are still keyed on the proxy's address al
 ## Mail limits
 
 Every message the controller queues (an address verification or an email invitation) is bounded per **recipient address**, whoever asked for it, on top of the per-account and per-client limits: at most **5 messages to one address per hour** and **at least 60 seconds between two messages of the same kind** to it. A request refused by this allowance sends nothing and leaves the link already mailed valid (the link is minted only when the message can be queued). The bounds are shared by every requester, so they cap the mail a stranger can make the deployment send to a victim, but they also mean a stranger can spend a victim's allowance: while it is spent, the holder's own resend waits (at most until the oldest message leaves the hour; `POST /me/email/resend` answers `429`, every unauthenticated or address-taking route still answers `202`), and an operator can still mint a link on the host with `sentinel admin account email-link` ([admission](admission.md#email-identity-and-email-invitations)). An invitation is not delayed by a verification message, or the reverse; both count toward the hourly 5. Delivered messages keep counting for seven days of outbox retention, so delivery does not reset the allowance. Email-registered accounts that never verify their address are retired after seven days ([admission](admission.md#email-identity-and-email-invitations)).
+
+## Body limits
+
+A body longer than its limit is `413 payload_too_large` (`details.limit_bytes`; the OAuth endpoints answer `413 invalid_request` in their own error shape). A declared `Content-Length` over the limit is refused from the request head alone; a body without a length is cut off while it is read, one byte past the limit.
+
+| Route class | Limit | Source |
+|---|---|---|
+| authenticated JSON (`/api/v1`, the default) | 1 MiB | `MAX_API_BODY_BYTES` in `sentinel-protocol` (a pipeline file inside it is at most 256 KiB, `MAX_PIPELINE_FILE_BYTES`) |
+| `PUT /uploads/{upl}` chunk | 8 MiB | `MAX_UPLOAD_CHUNK` |
+| secrets: value / import | 64 KiB / 1 MiB | [secrets](secrets.md) |
+| `POST /login` | 16 KiB | `MAX_LOGIN_BODY_BYTES` |
+| `POST /setup` and the public email routes | 8 KiB | per-route constants |
+| account security routes | 4 KiB | per-route constants |
+| `POST /hooks/github` | 4 MiB | `MAX_WEBHOOK_BODY_BYTES` |
+| `POST /intake/{repo}` | 64 KiB | `MAX_HOOK_BODY_BYTES` |
+| `POST /mcp` message | 2 MiB | `mcp::MAX_MESSAGE_BYTES` (larger than the API limit; MCP responses are capped separately at 8 MiB, [MCP](mcp.md)) |
+| `/oauth/*` forms and the device page | 8 KiB | `MAX_OAUTH_FORM_BYTES` |
+| `POST /oauth/register` | 16 KiB | [OAuth](oauth.md) |
+
+The unauthenticated classes read their body through the public body slots below. `every_route_class_enforces_its_own_body_limit` (`crates/sentinel-api/tests/api.rs`) sends one byte over and exactly the limit to the API, upload, login, setup, GitHub webhook, intake, MCP and OAuth token routes, and a chunked login body over the limit.
 
 ## Unauthenticated bodies
 
