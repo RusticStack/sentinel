@@ -25,6 +25,7 @@ A **degraded** code does not make the controller unready. It still serves, but a
 | `external_copy_backlog` | admission is closed because the external S3 copy's backlog is past its budget ([s3](s3.md)) |
 | `external_copy` | the replicator's last pass failed |
 | `backup_failing` | the most recent scheduled backup failed ([backup](backup.md)) |
+| `backup_incomplete` | the last scheduled backup finished but recorded objects it could not copy (missing or failing their digest); it is a recovery point with those holes ([backup](backup.md)) |
 | `no_workers_connected` | no worker holds a control session |
 
 The commit check writes an empty transaction through the single writer, so a stalled writer or a full disk shows as `503` rather than a controller that answers but cannot record anything.
@@ -66,9 +67,11 @@ No metric has a tenant, repository, user or worker label, so a scrape never name
 | `sentinel_storage_free_bytes`, `_reserve_bytes`, `_inflight_bytes`, `_admission_open`, `_metadata_bytes`, `_stored_bytes` | gauge | disk, reserve, admission ([retention](retention.md)) |
 | `sentinel_s3_healthy`, `_backlog_bytes`, `_backlog_full`, `_replicated_bytes_total`, `_consecutive_failures` | gauge/counter | the external copy, when configured ([s3](s3.md)) |
 | `sentinel_backup_last_success_seconds`, `sentinel_backup_last_failed` | gauge | the backup scheduler, when configured ([backup](backup.md)) |
+| `sentinel_backup_last_objects_lost` | gauge | objects the last successful backup recorded as missing or corrupt at the source; absent until a backup has finished since the controller started |
+| `sentinel_maintenance_rows_skipped_total` | counter | rows a maintenance batch passed over because an id column did not decode (an outside edit or disk damage); a row that stays damaged is counted at every pass, and the controller logs `maintenance_rows_skipped` with the table and key of the latest. Alert on any increase |
 | `sentinel_github_check_publications{state}`, `sentinel_github_oldest_pending_seconds` | gauge | the GitHub Checks outbox: `pending` and `refused` publications, and the age of the oldest pending one ([checks](checks.md)) |
 
-Suggested alerts: `sentinel_storage_admission_open == 0`; `sentinel_s3_healthy == 0` for 15 minutes; `sentinel_workers{state="no_disk"} > 0`; `time() - sentinel_backup_last_success_seconds` above twice the backup interval; `sentinel_jobs_oldest_queued_seconds` above your queue objective while `sentinel_workers{state="connected"} > 0`; `sentinel_github_oldest_pending_seconds > 600`; a 5xx rate above zero.
+Suggested alerts: `sentinel_storage_admission_open == 0`; `sentinel_s3_healthy == 0` for 15 minutes; `sentinel_workers{state="no_disk"} > 0`; `time() - sentinel_backup_last_success_seconds` above twice the backup interval; `sentinel_backup_last_objects_lost > 0`; `increase(sentinel_maintenance_rows_skipped_total[1h]) > 0`; `sentinel_jobs_oldest_queued_seconds` above your queue objective while `sentinel_workers{state="connected"} > 0`; `sentinel_github_oldest_pending_seconds > 600`; a 5xx rate above zero.
 
 ## Worker metrics
 
