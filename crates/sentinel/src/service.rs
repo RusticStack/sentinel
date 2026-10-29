@@ -2647,60 +2647,6 @@ mod worker_role {
         fn log_refused(&self, _: AttemptId) {}
     }
 
-    #[cfg(test)]
-    mod worker_id_tests {
-        use super::*;
-
-        fn id_of(dir: &Path) -> sentinel_core::WorkerId {
-            match worker_id(dir) {
-                Ok(id) => id,
-                Err(error) => panic!("{}", error.message),
-            }
-        }
-
-        #[test]
-        fn the_worker_id_is_written_whole_with_no_staging_file_left() {
-            use std::os::unix::fs::PermissionsExt;
-            let dir = tempfile::tempdir().unwrap();
-            let first = id_of(dir.path());
-            let path = dir.path().join("worker.id");
-            assert_eq!(fs::read_to_string(&path).unwrap(), format!("{first}\n"));
-            assert_eq!(
-                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-            let names: Vec<_> = fs::read_dir(dir.path())
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect();
-            assert_eq!(names.len(), 1, "only worker.id remains: {names:?}");
-            assert_eq!(id_of(dir.path()), first, "the id is stable across starts");
-        }
-
-        #[test]
-        fn a_staging_file_from_a_crashed_start_neither_blocks_nor_leaks_into_the_id() {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("worker.id");
-            // A crash between the staging write and the rename leaves a partial staged file and no worker.id.
-            fs::write(dir.path().join("worker.id.new"), b"wrk_tor").unwrap();
-            let id = id_of(dir.path());
-            assert_eq!(fs::read_to_string(&path).unwrap(), format!("{id}\n"));
-            assert!(!dir.path().join("worker.id.new").exists());
-            assert_eq!(id_of(dir.path()), id);
-        }
-
-        #[test]
-        fn a_failed_save_leaves_neither_worker_id_nor_a_staging_file() {
-            let dir = tempfile::tempdir().unwrap();
-            // The data directory is missing, so staging fails whoever runs the test.
-            let gone = dir.path().join("absent");
-            assert!(
-                save_worker_id(&gone.join("worker.id"), sentinel_core::WorkerId::new()).is_err()
-            );
-            assert!(!gone.exists());
-        }
-    }
-
     #[expect(
         clippy::too_many_arguments,
         reason = "worker assembly receives independent process settings"
@@ -3330,6 +3276,60 @@ mod worker_role {
             tailcat: forward,
             metrics,
         })
+    }
+
+    #[cfg(test)]
+    mod worker_id_tests {
+        use super::*;
+
+        fn id_of(dir: &Path) -> sentinel_core::WorkerId {
+            match worker_id(dir) {
+                Ok(id) => id,
+                Err(error) => panic!("{}", error.message),
+            }
+        }
+
+        #[test]
+        fn the_worker_id_is_written_whole_with_no_staging_file_left() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let first = id_of(dir.path());
+            let path = dir.path().join("worker.id");
+            assert_eq!(fs::read_to_string(&path).unwrap(), format!("{first}\n"));
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let names: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(names.len(), 1, "only worker.id remains: {names:?}");
+            assert_eq!(id_of(dir.path()), first, "the id is stable across starts");
+        }
+
+        #[test]
+        fn a_staging_file_from_a_crashed_start_neither_blocks_nor_leaks_into_the_id() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("worker.id");
+            // A crash between the staging write and the rename leaves a partial staged file and no worker.id.
+            fs::write(dir.path().join("worker.id.new"), b"wrk_tor").unwrap();
+            let id = id_of(dir.path());
+            assert_eq!(fs::read_to_string(&path).unwrap(), format!("{id}\n"));
+            assert!(!dir.path().join("worker.id.new").exists());
+            assert_eq!(id_of(dir.path()), id);
+        }
+
+        #[test]
+        fn a_failed_save_leaves_neither_worker_id_nor_a_staging_file() {
+            let dir = tempfile::tempdir().unwrap();
+            // The data directory is missing, so staging fails whoever runs the test.
+            let gone = dir.path().join("absent");
+            assert!(
+                save_worker_id(&gone.join("worker.id"), sentinel_core::WorkerId::new()).is_err()
+            );
+            assert!(!gone.exists());
+        }
     }
 }
 
