@@ -70,14 +70,19 @@ LEGACY_UNSTAMPED = {
 STAMPED_WRITERS = {
     "b02-sentinel.sh": '"build"',
     "b03-latency.py": "def stamp(",
-    "backup-rehash.sh": "stamp.sh",
+    "auth-cost.sh": "micro-run.sh",
+    "noop-interleave.sh": "micro-run.sh",
+    "store-cost.sh": "micro-run.sh",
+    "spawn-cost.sh": "micro-run.sh",
+    "backup-rehash.sh": "micro-run.sh",
     "c02-engines.sh": "stamp.sh",
-    "checks-lane.sh": "stamp.sh",
+    "checks-lane.sh": "micro-run.sh",
     "f07-storage.sh": "stamp.sh",
     "k02-cache-clone.sh": "stamp.sh",
     "k07-recipes.sh": "stamp.sh",
+    "m01-detect.sh": "stamp.sh",
     "k09-before-after.sh": "stamp.sh",
-    "log-ack.sh": "stamp.sh",
+    "log-ack.sh": "micro-run.sh",
     "b05-cache.sh": "stamp.sh",
     "b05-workloads.sh": "stamp.sh",
     "b05-timed.sh": "B05_STAMP",
@@ -85,7 +90,7 @@ STAMPED_WRITERS = {
     "p14-pilot.sh": '"build"',
     "q13-fleet.py": "benchstamp.stamp(",
     "r06-idle.sh": "stamp.sh",
-    "s3-hash.sh": "stamp.sh",
+    "s3-hash.sh": "micro-run.sh",
 }
 
 HOST_LABEL, IPV4 = benchstamp.HOST_LABEL, benchstamp.IPV4  # one definition, shared with the writers
@@ -136,7 +141,8 @@ def lock_scripts():
     for root, exts in ((HERE, (".sh", ".py")), (os.path.join(REPO, "scripts"), (".sh", ".py"))):
         for dirpath, _dirs, files in os.walk(root):
             paths += [os.path.join(dirpath, f) for f in files if f.endswith(exts)]
-    return sorted(p for p in paths if os.path.abspath(p) != os.path.abspath(__file__))
+    skip = {os.path.abspath(__file__), os.path.join(HERE, "test_micro_contract.py")}  # the runner's tests probe the lock on purpose
+    return sorted(p for p in paths if os.path.abspath(p) not in skip)
 
 
 class LockHandling(unittest.TestCase):
@@ -520,6 +526,62 @@ class B05Records(unittest.TestCase):
             text = f.read()
         self.assertIn("FAILED=$((FAILED + 1))", text)
         self.assertRegex(text, r'\[ "\$FAILED" -gt 0 \]')
+
+
+class MicroContracts(unittest.TestCase):
+    """Every in-process micro bench has a contract and runs through bench/micro-run.sh (docs/benchmarking.md)."""
+
+    def contracts(self):
+        paths = sorted(glob.glob(os.path.join(HERE, "contracts", "micro", "*.json")))
+        out = []
+        for p in paths:
+            with open(p, encoding="utf-8") as f:
+                out.append((p, json.load(f)))
+        return out
+
+    def test_each_contract_names_its_runner_and_a_record_under_bench(self):
+        found = self.contracts()
+        self.assertTrue(found)
+        for path, c in found:
+            name = os.path.basename(path)[:-5]
+            self.assertEqual(c["id"], name, path)
+            self.assertEqual(c["format"], "sentinel.bench-micro-contract/1", path)
+            self.assertRegex(c["record"]["out"], r"^bench/[a-z0-9-]+\.jsonl$", path)
+            self.assertTrue(c["ordering"]["scheme"] in ("abba", "shuffle", "single") and "seed" in c["ordering"], path)
+            if "script" in c["harness"]:
+                self.assertTrue(os.path.isfile(os.path.join(REPO, c["harness"]["script"])), f"{name}: missing script")
+            else:
+                wrapper = os.path.join(HERE, name + ".sh")
+                self.assertTrue(os.path.isfile(wrapper), f"{name}: no bench/{name}.sh wrapper")
+                with open(wrapper, encoding="utf-8") as f:
+                    self.assertIn("micro-run.sh", f.read(), f"{name}: the wrapper bypasses the runner (no lock, no quiet check)")
+
+    def test_a_shuffled_contract_names_the_seed_it_records(self):
+        for path, c in self.contracts():
+            if c["ordering"]["scheme"] == "shuffle":
+                self.assertEqual(sorted(c["ordering"]["seed"]), ["env", "recorded_as"], path)
+            else:
+                self.assertIsNone(c["ordering"]["seed"], path)
+
+    def test_the_runner_does_not_hand_its_lock_to_the_bench(self):
+        with open(os.path.join(HERE, "micro_contract.py"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertNotIn("pass_fds", text)
+        self.assertNotIn("close_fds=False", text)
+        self.assertNotIn("set_inheritable", text)
+
+    def test_no_committed_record_is_a_smoke_or_simulated_one(self):
+        for path in sorted(glob.glob(os.path.join(HERE, "*.jsonl"))):
+            for n, rec in enumerate(records(path), 1):
+                for key in ("smoke", "simulated", "rehearsal"):
+                    self.assertIsNot(rec.get(key), True, f"{os.path.basename(path)}:{n} is marked {key}: harness checks never become baselines")
+
+    def test_a_record_that_names_a_contract_names_its_ordering_and_lock(self):
+        for path in sorted(glob.glob(os.path.join(HERE, "*.jsonl"))):
+            for n, rec in enumerate(records(path), 1):
+                if isinstance(rec.get("contract"), dict) and rec["contract"].get("sha256") and "revision" in rec["contract"] and "conditions" in rec:
+                    self.assertIn("ordering", rec, f"{os.path.basename(path)}:{n}")
+                    self.assertIn("lock", rec, f"{os.path.basename(path)}:{n}")
 
 
 class ErrorLinesAreStamped(unittest.TestCase):
