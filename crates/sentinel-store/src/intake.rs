@@ -89,7 +89,20 @@ pub struct Delivery {
     pub run: Option<sentinel_core::RunId>,
 }
 
+/// How the caller proved a delivery's origin before handing it over. The adapter that verified it names the level;
+/// the store records it with the delivery and the secret gate reads it back, so a run's provenance cannot claim it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Authentication {
+    /// No inbound authentication: a ref transition the controller observed itself (polling).
+    Observed = 0,
+    /// The repository's generic hook secret was presented.
+    HookToken = 1,
+    /// The forge's webhook signature verified.
+    SignedWebhook = 2,
+}
+
 pub struct NewDelivery<'a> {
+    pub authentication: Authentication,
     pub provider: &'a str,
     pub external_id: &'a str,
     pub event: &'a str,
@@ -215,8 +228,8 @@ pub fn accept(
     let id = DeliveryId::new();
     tx.execute(
         "INSERT INTO webhook_deliveries(id, tenant_id, repo_id, provider, external_id,
-            event, ref_name, old_sha, new_sha, state, received_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
+            event, ref_name, old_sha, new_sha, state, received_ms, authentication)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)",
         params![
             id.as_bytes(),
             tenant.as_bytes(),
@@ -227,7 +240,8 @@ pub fn accept(
             delivery.ref_name,
             delivery.old_sha,
             delivery.new_sha,
-            now.0
+            now.0,
+            delivery.authentication as i64
         ],
     )?;
     if let Some(pr) = pr {

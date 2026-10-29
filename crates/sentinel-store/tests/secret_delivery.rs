@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use sentinel_auth::{sealed::Key, secret::Secret};
 use sentinel_core::{
-    Event, Fence, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
+    DeliveryId, Event, Fence, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Namespace, Permissions, Principal, Role},
 };
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
@@ -11,6 +11,7 @@ use sentinel_store::{
     Durability, Error, Store,
     auth::{self, Authority, NamespaceKind, provisioning},
     dispatch::{self, Capacity},
+    intake::Authentication,
     provenance::{self, Provenance},
     runs,
     secrets::{self, Binding, Scope},
@@ -165,13 +166,16 @@ fn fixture_at(protocol: u16) -> Fixture {
 }
 
 fn create_run(f: &Fixture, now: UnixMillis) -> (RunId, sentinel_core::JobId) {
-    create_run_as(f, now, Some("push"))
+    create_run_as(f, now, Some("push"), Some(Authentication::SignedWebhook))
 }
 
+/// `trigger` is the provenance's own text; `delivery` is the authentication the intake adapter recorded on the stored
+/// delivery the provenance names (`None`: no delivery, as for a manual run or a forged provenance row).
 fn create_run_as(
     f: &Fixture,
     now: UnixMillis,
     trigger: Option<&'static str>,
+    delivery: Option<Authentication>,
 ) -> (RunId, sentinel_core::JobId) {
     let spec = RunSpec::new(
         PinnedSource::new("https://example.test/acme/app.git", SHA, Some("main")).unwrap(),
@@ -185,15 +189,34 @@ fn create_run_as(
         .write(move |tx| {
             let jobs = runs::create_run(tx, tenant, repo, run, &spec, now)?;
             runs::resolve_image(tx, tenant, jobs[0], DIGEST, "linux/amd64")?;
+            let delivery = delivery.map(|authentication| {
+                let id = DeliveryId::new();
+                tx.execute(
+                    "INSERT INTO webhook_deliveries(id, tenant_id, repo_id, provider, external_id,
+                        event, ref_name, old_sha, new_sha, state, received_ms, settled_ms, authentication)
+                     VALUES (?1, ?2, ?3, 'github', ?4, 'push', 'refs/heads/main', ?5, ?5, 2, ?6, ?6, ?7)",
+                    rusqlite::params![
+                        id.as_bytes(),
+                        tenant.as_bytes(),
+                        repo.as_bytes(),
+                        id.to_string(),
+                        SHA,
+                        now.0,
+                        authentication as i64
+                    ],
+                )?;
+                Ok::<_, Error>(id)
+            });
             if let Some(trigger) = trigger {
+                let delivery = delivery.transpose()?;
                 provenance::insert(
                     tx,
                     &Provenance {
                         tenant,
                         repo,
                         trigger: trigger.into(),
-                        delivery: None,
-                        provider: None,
+                        provider: delivery.map(|_| "github".to_owned()),
+                        delivery,
                         ref_name: Some("refs/heads/main".into()),
                         old_sha: None,
                         new_sha: Some(SHA.into()),
@@ -598,32 +621,73 @@ fn a_refused_delivery_is_explained_and_audited() {
 }
 
 #[test]
-fn manual_and_unclassified_runs_never_receive_secrets() {
-    for trigger in [Some("manual"), None] {
+fn only_a_run_from_an_authenticated_delivery_receives_secrets() {
+    // (provenance trigger, authentication of the delivery it names, expected to receive)
+    let cases = [
+        (Some("push"), Some(Authentication::SignedWebhook), true),
+        (Some("push"), Some(Authentication::HookToken), true),
+        // A polled transition is the controller's own observation, never an authenticated delivery.
+        (Some("push"), Some(Authentication::Observed), false),
+        // A provenance row that merely says "push" without a stored delivery proves nothing.
+        (Some("push"), None, false),
+        (Some("tag"), None, false),
+        (Some("pull_request"), None, false),
+        (Some("manual"), None, false),
+        // Even a signed delivery cannot make a run a manual one.
+        (Some("manual"), Some(Authentication::SignedWebhook), false),
+        (None, None, false),
+    ];
+    for (trigger, authentication, receives) in cases {
         let f = fixture();
-        create_run_as(&f, UnixMillis(2_000), trigger);
+        create_run_as(&f, UnixMillis(2_000), trigger, authentication);
         let offer = next_offer(&f, UnixMillis(2_100));
         acknowledge(&f, &offer, UnixMillis(2_120));
         let (worker, attempt) = (f.worker, offer.attempt);
-        let delivered =
-            secrets::deliver(&f.store, f.key.clone(), worker, attempt, UnixMillis(2_135));
-        assert!(
-            matches!(delivered, Err(Error::Forbidden)),
-            "{trigger:?}: delivered to a caller-authored run"
-        );
         let refusal = f
             .store
             .writer()
             .write(move |tx| secrets::refuse_delivery(tx, worker, attempt))
-            .unwrap()
-            .expect("an explanation");
+            .unwrap();
+        let delivered =
+            secrets::deliver(&f.store, f.key.clone(), worker, attempt, UnixMillis(2_135));
+        let label = format!("{trigger:?} {authentication:?}");
+        if receives {
+            assert!(delivered.is_ok(), "{label}: {:?}", delivered.as_ref().err());
+            assert!(refusal.is_none(), "{label}");
+            continue;
+        }
+        assert!(
+            matches!(delivered, Err(Error::Forbidden)),
+            "{label}: delivered without a verified delivery"
+        );
         assert_eq!(
-            refusal.detail, "secret OCI_AUTH: withheld from a manual run",
-            "{trigger:?}"
+            refusal.expect("an explanation").detail,
+            "secret OCI_AUTH: withheld from a run without a verified webhook delivery",
+            "{label}"
         );
         assert_eq!(
             use_audit(&f, attempt),
-            [("OCI_AUTH".to_owned(), "denied".to_owned())]
+            [("OCI_AUTH".to_owned(), "denied".to_owned())],
+            "{label}"
         );
     }
+}
+
+#[test]
+fn a_delivery_authentication_never_changes_after_it_is_recorded() {
+    let f = fixture();
+    create_run(&f, UnixMillis(2_000));
+    let promoted = f
+        .store
+        .writer()
+        .write(|tx| Ok(tx.execute("UPDATE webhook_deliveries SET authentication = 0", [])?));
+    assert!(promoted.is_err(), "authentication moved: {promoted:?}");
+    let forged = f
+        .store
+        .writer()
+        .write(|tx| Ok(tx.execute("UPDATE webhook_deliveries SET authentication = 3", [])?));
+    assert!(
+        forged.is_err(),
+        "an unknown authentication level was stored"
+    );
 }

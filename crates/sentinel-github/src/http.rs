@@ -75,6 +75,33 @@ impl Client {
         json(response)
     }
 
+    /// An unauthenticated empty `POST` whose answer may carry credentials: the response text is
+    /// wiped once parsed, and the caller moves the secrets out of the returned value.
+    pub fn post_anonymous(&self, url: &str) -> Result<Reply> {
+        let mut response = self
+            .agent
+            .post(url)
+            .header("accept", "application/vnd.github+json")
+            .header("x-github-api-version", "2022-11-28")
+            .send_empty()
+            .map_err(transport)?;
+        let status = response.status().as_u16();
+        let mut text = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_BODY)
+            .read_to_string()
+            .map_err(transport)?;
+        let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        sentinel_auth::secret::wipe_string(&mut text);
+        Ok(Reply {
+            status,
+            retry_after_s: None,
+            rate_limit_reset_s: None,
+            body,
+        })
+    }
+
     pub fn send_json(
         &self,
         method: &str,

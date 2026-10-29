@@ -7,8 +7,37 @@ use std::{
 
 pub const PENDING_PER_SOURCE: usize = 8;
 pub const PENDING_PER_KNOWN_SOURCE: usize = 64;
-const KNOWN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const KNOWN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const KNOWN_MAX: usize = 4096;
+/// A known source is written to the store when first seen and then at most this often.
+const KNOWN_PERSIST_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// Whether an address says nothing about who is behind it: a local process or, under Tailcat, any tunnelled peer.
+pub fn is_loopback(ip: IpAddr) -> bool {
+    ip.is_loopback()
+        || matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()))
+}
+
+/// The key the store keeps a known source under.
+pub fn source_bytes(ip: IpAddr) -> [u8; 16] {
+    match source_key(ip) {
+        IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+        IpAddr::V6(v6) => v6.octets(),
+    }
+}
+
+/// Who a refused enrollment is charged to in the store: a hash of the source key, so the audit log holds no address.
+/// Behind a Tailcat helper every peer shares one source, so there this is a per-tunnel cap, not a per-node one.
+pub fn peer_key(ip: IpAddr) -> [u8; 16] {
+    let hash = blake3::hash(&source_bytes(ip));
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hash.as_bytes()[..16]);
+    key
+}
+
+fn source_from_bytes(bytes: [u8; 16]) -> IpAddr {
+    source_key(IpAddr::V6(Ipv6Addr::from(bytes)))
+}
 
 /// IPv6 is counted per /64: the unit an attacker controls, so rotating low bits buys nothing.
 pub fn source_key(ip: IpAddr) -> IpAddr {
@@ -25,6 +54,10 @@ pub fn source_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+fn stranger_ceiling(max_pending: usize) -> usize {
+    max_pending - max_pending / 4
+}
+
 #[derive(Default)]
 pub struct Pending {
     book: Mutex<Book>,
@@ -34,22 +67,31 @@ pub struct Pending {
 struct Book {
     total: usize,
     by_source: HashMap<IpAddr, usize>,
-    known: HashMap<IpAddr, Instant>,
+    known: HashMap<IpAddr, Known>,
+}
+
+#[derive(Clone, Copy)]
+struct Known {
+    seen: Instant,
+    persisted: Option<Instant>,
 }
 
 impl Pending {
+    /// A loopback source gets the whole pool: the address cannot tell tunnelled peers apart, so the
+    /// reserve is closed to strangers later, at the hello, by `stranger_room`.
     pub fn enter(&self, ip: IpAddr, max_pending: usize, now: Instant) -> bool {
-        let loopback = ip.is_loopback();
+        let loopback = is_loopback(ip);
         let key = source_key(ip);
         let mut book = self.book.lock().unwrap_or_else(|p| p.into_inner());
-        let known = book
-            .known
-            .get(&key)
-            .is_some_and(|at| now.saturating_duration_since(*at) < KNOWN_TTL);
+        let known = loopback
+            || book
+                .known
+                .get(&key)
+                .is_some_and(|k| now.saturating_duration_since(k.seen) < KNOWN_TTL);
         let ceiling = if known {
             max_pending
         } else {
-            max_pending - max_pending / 4
+            stranger_ceiling(max_pending)
         };
         if book.total >= ceiling {
             return false;
@@ -81,17 +123,78 @@ impl Pending {
         }
     }
 
-    pub fn vouch(&self, ip: IpAddr, now: Instant) {
+    /// Whether a connection that has completed its handshake as an unknown identity may go on: the
+    /// reserve is for authenticated workers, so a stranger needs room in the unreserved part. The
+    /// connection being asked about holds one slot itself.
+    pub fn stranger_room(&self, max_pending: usize) -> bool {
+        self.book.lock().unwrap_or_else(|p| p.into_inner()).total <= stranger_ceiling(max_pending)
+    }
+
+    /// Record that `ip` authenticated a worker. Returns the key to persist when the store should hear
+    /// of it (first sight, or not written for an hour). Loopback is never recorded.
+    pub fn vouch(&self, ip: IpAddr, now: Instant) -> Option<[u8; 16]> {
+        if is_loopback(ip) {
+            return None;
+        }
         let key = source_key(ip);
         let mut book = self.book.lock().unwrap_or_else(|p| p.into_inner());
         if book.known.len() >= KNOWN_MAX && !book.known.contains_key(&key) {
             book.known
-                .retain(|_, at| now.saturating_duration_since(*at) < KNOWN_TTL);
+                .retain(|_, k| now.saturating_duration_since(k.seen) < KNOWN_TTL);
             if book.known.len() >= KNOWN_MAX {
-                return;
+                return None;
             }
         }
-        book.known.insert(key, now);
+        let stale = book.known.get(&key).is_none_or(|k| {
+            k.persisted
+                .is_none_or(|at| now.saturating_duration_since(at) >= KNOWN_PERSIST_EVERY)
+        });
+        let persisted = if stale {
+            Some(now)
+        } else {
+            book.known.get(&key).and_then(|k| k.persisted)
+        };
+        book.known.insert(
+            key,
+            Known {
+                seen: now,
+                persisted,
+            },
+        );
+        stale.then(|| source_bytes(key))
+    }
+
+    /// Load sources stored by an earlier run: each `(key, age)` is how long ago it was last seen.
+    pub fn restore(&self, sources: impl IntoIterator<Item = ([u8; 16], Duration)>, now: Instant) {
+        let mut book = self.book.lock().unwrap_or_else(|p| p.into_inner());
+        for (bytes, age) in sources {
+            if book.known.len() >= KNOWN_MAX {
+                break;
+            }
+            let ip = source_from_bytes(bytes);
+            if age >= KNOWN_TTL || is_loopback(ip) {
+                continue;
+            }
+            let Some(seen) = now.checked_sub(age) else {
+                continue;
+            };
+            book.known.insert(
+                ip,
+                Known {
+                    seen,
+                    persisted: Some(seen),
+                },
+            );
+        }
+    }
+
+    /// Sources currently vouched for (expired ones included until the next prune).
+    pub fn known(&self) -> usize {
+        self.book
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .known
+            .len()
     }
 
     #[cfg(test)]
@@ -181,44 +284,76 @@ impl Enrollments {
     }
 }
 
-#[cfg(unix)]
-const FDS_PER_SESSION: usize = 2;
-#[cfg(unix)]
-const FD_HEADROOM: usize = 256;
+/// Descriptors one session holds on the link: its socket and the clone its writer half uses.
+pub const FDS_PER_SESSION: usize = 2;
+/// Descriptors a session's attempt adds: an open log writer is two files. The store keeps at most
+/// `MAX_OPEN_WRITERS` writers open and `MAX_SESSIONS` does not exceed it, so one pair per session bounds them all.
+pub const LOG_FDS_PER_SESSION: usize = 2;
+/// Descriptors outside any session: standard streams, the link and API listeners, the API's connection pool
+/// (`CONNECTIONS` is 64), the database files, the object and log directories, the Tailcat helper's pipes and a margin
+/// for outbound sockets (GitHub, mail, S3, checks).
+pub const FD_BASE: usize = 192;
+/// Fewer sessions than this is not a controller worth starting: refuse with a message instead.
+pub const MIN_SESSIONS: usize = 16;
 
-/// Raise the soft descriptor limit first: a common 1024 soft limit would stop the controller at about 380 sessions with EMFILE.
+/// The descriptors the controller needs to hold `sessions` sessions at once: the fixed base plus a share per session,
+/// so the headroom follows the configured session limit instead of a constant.
+pub const fn descriptors_for(sessions: usize) -> usize {
+    FD_BASE + sessions * (FDS_PER_SESSION + LOG_FDS_PER_SESSION)
+}
+
+/// How many sessions a soft descriptor limit holds, at most `wanted`; the pure half of [`session_cap`].
+pub fn sessions_within(soft: u64, wanted: usize) -> usize {
+    let usable = usize::try_from(soft)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(FD_BASE)
+        / (FDS_PER_SESSION + LOG_FDS_PER_SESSION);
+    usable.min(wanted)
+}
+
+/// The session cap for the process's current soft descriptor limit. This only reads the limit: raising it is the
+/// service's one startup decision (it owns the process), never a side effect of constructing a controller. A limit that
+/// cannot hold [`MIN_SESSIONS`] fails with the numbers an operator needs instead of shedding every worker at runtime.
+pub fn session_cap(wanted: usize) -> crate::Result<usize> {
+    let Some(soft) = soft_limit() else {
+        return Ok(wanted);
+    };
+    let cap = sessions_within(soft, wanted);
+    if cap < MIN_SESSIONS.min(wanted) {
+        return Err(crate::Error::Descriptors(format!(
+            "the soft open-files limit is {soft}, which holds {cap} worker sessions; at least {} are required, and {wanted} sessions need {} descriptors. Raise it (systemd: LimitNOFILE=, shell: ulimit -n) and restart",
+            MIN_SESSIONS.min(wanted),
+            descriptors_for(wanted),
+        )));
+    }
+    Ok(cap)
+}
+
+/// The soft `RLIMIT_NOFILE`, `None` where it cannot be read or does not apply.
 #[cfg(unix)]
-pub fn session_cap(wanted: usize) -> usize {
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "`rlim_t` is 32 bits on 32-bit targets"
+)]
+pub fn soft_limit() -> Option<u64> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
     // SAFETY: `limit` is a valid, writable `rlimit` for the whole call.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-        return wanted;
+        return None;
     }
-    let needed = (wanted * FDS_PER_SESSION + FD_HEADROOM) as libc::rlim_t;
-    if limit.rlim_cur < needed && limit.rlim_cur < limit.rlim_max {
-        let raised = libc::rlimit {
-            rlim_cur: needed.min(limit.rlim_max),
-            rlim_max: limit.rlim_max,
-        };
-        // SAFETY: `raised` is a valid `rlimit`; failure leaves the limit as
-        // it was, which the re-read below accounts for.
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
-            limit.rlim_cur = raised.rlim_cur;
-        }
-    }
-    let usable = usize::try_from(limit.rlim_cur)
-        .unwrap_or(usize::MAX)
-        .saturating_sub(FD_HEADROOM)
-        / FDS_PER_SESSION;
-    usable.clamp(1, wanted)
+    Some(if limit.rlim_cur == libc::RLIM_INFINITY {
+        u64::MAX
+    } else {
+        limit.rlim_cur as u64
+    })
 }
 
 #[cfg(not(unix))]
-pub fn session_cap(wanted: usize) -> usize {
-    wanted
+pub fn soft_limit() -> Option<u64> {
+    None
 }
 
 pub fn accept_backoff(failures: u32) -> Duration {
@@ -239,6 +374,24 @@ mod tests {
 
     fn ip(last: u8) -> IpAddr {
         IpAddr::from([203, 0, 113, last])
+    }
+
+    #[test]
+    fn the_descriptor_headroom_follows_the_session_limit() {
+        assert_eq!(descriptors_for(0), FD_BASE);
+        assert_eq!(descriptors_for(1024), FD_BASE + 1024 * 4);
+        for wanted in [16, 100, 1024] {
+            assert_eq!(
+                sessions_within(descriptors_for(wanted) as u64, 4096),
+                wanted
+            );
+            assert_eq!(
+                sessions_within(descriptors_for(wanted) as u64 - 1, 4096),
+                wanted - 1
+            );
+        }
+        assert_eq!(sessions_within(u64::MAX, 1024), 1024);
+        assert_eq!(sessions_within(100, 1024), 0, "below the base nothing fits");
     }
 
     #[test]
@@ -272,6 +425,134 @@ mod tests {
         assert!(!pending.enter(ip(100), 256, now), "a stranger is shed");
         assert!(pending.enter(ip(200), 256, now), "a known worker enters");
         assert_eq!(pending.len(), 193);
+    }
+
+    /// Fill the unreserved part of the pool with strangers, one share each; returns how many slots are held.
+    fn fill_unreserved(pending: &Pending, now: Instant) -> usize {
+        let mut taken = 0;
+        'fill: for host in 1..=60u8 {
+            for _ in 0..PENDING_PER_SOURCE {
+                if !pending.enter(ip(host), 256, now) {
+                    break 'fill;
+                }
+                taken += 1;
+            }
+        }
+        taken
+    }
+
+    #[test]
+    fn a_restart_restores_known_sources_so_the_reserve_still_admits_them() {
+        use sentinel_store::{Durability, Store, known_sources};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
+        let ttl = KNOWN_TTL.as_millis() as i64;
+        let start = Instant::now();
+
+        let before = Pending::default();
+        let key = before.vouch(ip(200), start).expect("first sight is stored");
+        assert!(
+            before
+                .vouch(ip(200), start + Duration::from_secs(600))
+                .is_none(),
+            "a source seen again within the hour is not rewritten"
+        );
+        assert!(
+            before
+                .vouch(
+                    ip(200),
+                    start + KNOWN_PERSIST_EVERY + Duration::from_secs(1)
+                )
+                .is_some(),
+            "and is refreshed once the hour is past"
+        );
+        let seen_ms = 5_000_000;
+        store
+            .writer()
+            .write(move |tx| known_sources::record(tx, key, seen_ms, ttl))
+            .unwrap();
+
+        // The controller restarts three hours later and reads the set back.
+        let wall = seen_ms + 3 * 60 * 60 * 1000;
+        let stored = store.read(|c| known_sources::load(c, wall, ttl)).unwrap();
+        let after = Pending::default();
+        let now = Instant::now();
+        after.restore(
+            stored
+                .into_iter()
+                .map(|(source, at)| (source, Duration::from_millis((wall - at) as u64))),
+            now,
+        );
+        assert_eq!(after.known(), 1);
+        assert_eq!(fill_unreserved(&after, now), 192);
+        assert!(!after.enter(ip(100), 256, now), "a stranger is still shed");
+        assert!(
+            after.enter(ip(200), 256, now),
+            "the restored worker enters the reserve"
+        );
+
+        let forgetful = Pending::default();
+        assert_eq!(fill_unreserved(&forgetful, now), 192);
+        assert!(
+            !forgetful.enter(ip(200), 256, now),
+            "without the stored set the same worker is shed"
+        );
+    }
+
+    #[test]
+    fn restoring_skips_what_is_past_the_day_and_never_stores_loopback() {
+        let pending = Pending::default();
+        let now = Instant::now() + KNOWN_TTL * 2;
+        let fresh = source_bytes(ip(7));
+        let old = source_bytes(ip(8));
+        let local = source_bytes(IpAddr::from([127, 0, 0, 1]));
+        pending.restore(
+            [
+                (fresh, Duration::from_secs(3600)),
+                (old, KNOWN_TTL + Duration::from_secs(1)),
+                (local, Duration::from_secs(1)),
+            ],
+            now,
+        );
+        assert_eq!(pending.known(), 1);
+        assert!(pending.vouch(IpAddr::from([127, 0, 0, 1]), now).is_none());
+        assert!(pending.vouch("::1".parse().unwrap(), now).is_none());
+        assert!(
+            pending
+                .vouch("::ffff:127.0.0.1".parse().unwrap(), now)
+                .is_none()
+        );
+        assert_eq!(pending.known(), 1);
+    }
+
+    #[test]
+    fn peers_behind_a_loopback_tunnel_are_told_apart_by_identity_not_address() {
+        let pending = Pending::default();
+        let now = Instant::now();
+        let tunnel = IpAddr::from([127, 0, 0, 1]);
+        // A worker through the tunnel does not make the tunnel "known": nothing is stored for it, and
+        // loopback needs no vouch to use the whole pool.
+        assert!(pending.vouch(tunnel, now).is_none());
+        for _ in 0..PENDING_PER_SOURCE * 32 {
+            assert!(pending.enter(tunnel, 256, now));
+        }
+        // The pool is full of tunnelled handshakes; an identity that turns out to be unknown is shed at
+        // the hello, while one the store knows is never asked.
+        assert_eq!(pending.len(), 256);
+        assert!(!pending.stranger_room(256));
+        for _ in 0..64 {
+            pending.leave(tunnel);
+        }
+        assert!(
+            pending.stranger_room(256),
+            "at the stranger ceiling it still has room"
+        );
+        pending.leave(tunnel);
+        assert!(pending.stranger_room(256));
+        // The same pool seen from a direct address keeps the reserve closed to strangers.
+        let direct = Pending::default();
+        assert_eq!(fill_unreserved(&direct, now), 192);
+        assert!(!direct.enter(ip(100), 256, now));
     }
 
     #[test]

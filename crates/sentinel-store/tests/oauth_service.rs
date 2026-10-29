@@ -724,6 +724,99 @@ fn repository_access_is_allowed_only_within_the_tenant() {
 }
 
 #[test]
+fn withdrawing_repository_access_needs_the_same_step_up_and_reason_as_allowing_it() {
+    let (_dir, store, i) = fixture();
+    let admin = person(i.admin, false);
+    let root = person(i.root, true);
+    let bot = Principal::new(i.bot, P::REPOSITORY, None, None);
+    let withdraw = |authority: Authority, reason: Option<&str>| {
+        let reason = reason.map(str::to_owned);
+        store.writer().write(move |tx| {
+            service::allow_repo(
+                tx,
+                authority,
+                i.tenant,
+                i.bot,
+                i.repo,
+                P::NONE,
+                reason.as_deref(),
+            )
+        })
+    };
+    let holds = || {
+        store
+            .read(|c| auth::require_repo(c, bot, i.repo, P::READ))
+            .is_ok()
+    };
+    let last_audit = || {
+        store
+            .read(|c| local_auth::recent_audit(c, 1))
+            .unwrap()
+            .remove(0)
+            .seq
+    };
+    assert!(holds());
+    let before = last_audit();
+    // Without a fresh proof every caller is refused, a tenant administrator and a bearer credential
+    // included; a person who administers nothing learns nothing about proof.
+    for (authority, reason) in [
+        (Authority::credential(admin), None),
+        (Authority::credential(admin), Some("not needed")),
+        (Authority::credential(root), None),
+        (Authority::credential(root), Some("incident 9")),
+    ] {
+        assert!(matches!(
+            withdraw(authority, reason),
+            Err(Error::StepUpRequired)
+        ));
+    }
+    for authority in [
+        Authority::credential(person(i.dev, false)),
+        stepped(person(i.dev, false)),
+        stepped(person(i.outsider, false)),
+        Authority::HostLocal,
+    ] {
+        assert!(matches!(withdraw(authority, None), Err(Error::Forbidden)));
+    }
+    // A platform administrator who administers nothing in the tenant also needs a reason of 1-100 bytes.
+    let long = "x".repeat(101);
+    for reason in [None, Some(""), Some(long.as_str())] {
+        assert!(matches!(
+            withdraw(stepped(root), reason),
+            Err(Error::InvalidInput("reason"))
+        ));
+    }
+    assert!(holds());
+    assert_eq!(last_audit(), before, "a refusal leaves no audit row");
+    // A stepped-up tenant administrator needs no reason; the platform administrator's reason is recorded.
+    withdraw(stepped(admin), None).unwrap();
+    assert!(!holds());
+    let allow = |p: Principal, reason: Option<&str>| {
+        let reason = reason.map(str::to_owned);
+        store.writer().write(move |tx| {
+            service::allow_repo(
+                tx,
+                stepped(p),
+                i.tenant,
+                i.bot,
+                i.repo,
+                P::READ,
+                reason.as_deref(),
+            )
+        })
+    };
+    allow(admin, None).unwrap();
+    assert!(holds());
+    withdraw(stepped(root), Some("incident 9")).unwrap();
+    assert!(!holds());
+    let audit = store.read(|c| local_auth::recent_audit(c, 2)).unwrap();
+    assert_eq!(audit[0].event, Event::GrantChanged);
+    assert_eq!(audit[1].event, Event::PlatformOverride);
+    assert_eq!(audit[1].actor, Some(i.root));
+    assert_eq!(audit[1].detail.as_deref(), Some("incident 9"));
+}
+
+#[test]
 fn creating_a_service_account_is_audited_and_needs_an_administrator() {
     let (_dir, store, i) = fixture();
     let audit = store.read(|c| local_auth::recent_audit(c, 3)).unwrap();
@@ -768,4 +861,42 @@ fn creating_a_service_account_is_audited_and_needs_an_administrator() {
         Event::GrantChanged,
         "a refusal writes nothing"
     );
+}
+
+fn plan(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap_or_else(|e| panic!("SQLite refused {sql}: {e}"));
+    let values = vec![rusqlite::types::Value::Null; stmt.parameter_count()];
+    stmt.query_map(rusqlite::params_from_iter(values), |r| r.get(3))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+#[test]
+fn revoking_minted_grants_seeks_the_minter_by_key_and_never_walks_other_users_grants() {
+    let (_dir, store, _) = fixture();
+    // Each statement is one index search on `created_by`; none may fall back to the expiry
+    // or user indexes, which would read every unexpired grant of every account.
+    for (sql, search) in [
+        (
+            oauth::REVOKE_MINTED_BY_SESSION,
+            "SEARCH oauth_grants USING INDEX oauth_grants_by_created_session \
+             (created_by=? AND created_session=?)",
+        ),
+        (
+            oauth::REVOKE_MINTED_BY_USER,
+            "SEARCH oauth_grants USING INDEX oauth_grants_by_created_session \
+             (created_by=? AND created_session>?)",
+        ),
+        (
+            oauth::REVOKE_MINTED_LEGACY,
+            "SEARCH oauth_grants USING INDEX oauth_grants_by_unattributed_minter \
+             (created_by=? AND created_ms>? AND created_ms<?)",
+        ),
+    ] {
+        let plan = store.read(|c| Ok(plan(c, sql))).unwrap();
+        assert_eq!(plan, [search], "{sql}");
+    }
 }

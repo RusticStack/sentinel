@@ -12,7 +12,7 @@ use std::{
 };
 
 use sentinel_core::{
-    AttemptId, JobId, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
+    AttemptId, DeliveryId, JobId, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Namespace, Permissions as P, Principal},
 };
 use sentinel_link::{
@@ -264,7 +264,7 @@ impl Live {
         self.enqueue_with(yaml, digest, None)
     }
 
-    /// A push run: secrets reach push runs and never manual ones, so a test of their delivery needs this provenance.
+    /// A push run from a signature-verified delivery: secrets reach only such runs, so a test of their delivery needs this provenance.
     pub fn enqueue_push(&self, yaml: &str) -> (RunId, Vec<JobId>) {
         self.enqueue_with(yaml, DIGEST, Some("push"))
     }
@@ -292,14 +292,31 @@ impl Live {
                     runs::resolve_image(tx, tenant, *job, &digest, "linux/amd64")?;
                 }
                 if let Some(trigger) = trigger {
+                    // The secret gate reads a signature-verified delivery, not the trigger text.
+                    let delivery = DeliveryId::new();
+                    tx.execute(
+                        "INSERT INTO webhook_deliveries(id, tenant_id, repo_id, provider,
+external_id, event, ref_name, old_sha, new_sha, state, received_ms,
+                            settled_ms, authentication)
+                         VALUES (?1, ?2, ?3, 'github', ?4, 'push', 'refs/heads/main', ?5, ?5, 2,
+                            ?6, ?6, 2)",
+                        rusqlite::params![
+                            delivery.as_bytes(),
+                            tenant.as_bytes(),
+                            repo_id.as_bytes(),
+                            delivery.to_string(),
+                            sha,
+                            UnixMillis::now().0
+                        ],
+                    )?;
                     provenance::insert(
                         tx,
                         &Provenance {
                             tenant,
                             repo: repo_id,
                             trigger: trigger.into(),
-                            delivery: None,
-                            provider: None,
+                            delivery: Some(delivery),
+                            provider: Some("github".into()),
                             ref_name: Some("refs/heads/main".into()),
                             old_sha: None,
                             new_sha: Some(sha.clone()),

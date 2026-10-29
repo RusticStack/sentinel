@@ -14,7 +14,7 @@ use crate::{
 #[derive(Debug)]
 pub enum Sandbox {
     Container(Container),
-    Vm(microvm::Vm),
+    Vm(Box<microvm::Vm>),
 }
 
 impl Sandbox {
@@ -49,11 +49,43 @@ impl Sandbox {
     }
 
     /// Makes what the host reads after the steps current on the host: a container shares the host's
-    /// directories already; a VM copies the artifact paths and its writable mounts back.
-    pub fn sync_out(&self, workspace: &Path, artifact_paths: &[String]) -> Result<()> {
+    /// directories already; a VM copies the artifact paths, the `replaced` workspace directories (cache
+    /// views) and its writable mounts back.
+    pub fn sync_out(
+        &self,
+        workspace: &Path,
+        artifact_paths: &[String],
+        replaced: &[String],
+    ) -> Result<()> {
         match self {
             Sandbox::Container(_) => Ok(()),
-            Sandbox::Vm(vm) => vm.sync_out(workspace, artifact_paths),
+            Sandbox::Vm(vm) => vm.sync_out(workspace, artifact_paths, replaced),
+        }
+    }
+
+    /// Puts directories of the host (a step's secret files and environment file) into the guest at their
+    /// container paths; a container has them bind-mounted already.
+    pub fn deliver_secrets(&self, dirs: &[(&Path, &str)]) -> Result<()> {
+        match self {
+            Sandbox::Container(_) => Ok(()),
+            Sandbox::Vm(vm) => vm.deliver_secrets(dirs),
+        }
+    }
+
+    /// Takes what [`Sandbox::deliver_secrets`] put into the guest out of it again.
+    pub fn retract_secrets(&self) -> Result<()> {
+        match self {
+            Sandbox::Container(_) => Ok(()),
+            Sandbox::Vm(vm) => vm.retract_secrets(),
+        }
+    }
+
+    /// Brings the workspace files matching `patterns` current on the host (a VM's workspace is a copy; a
+    /// container shares the host's directory already): what a step `if:` reads after earlier steps ran.
+    pub fn pull_workspace(&self, workspace: &Path, patterns: &[&str]) -> Result<()> {
+        match self {
+            Sandbox::Container(_) => Ok(()),
+            Sandbox::Vm(vm) => vm.pull_workspace(workspace, patterns),
         }
     }
 
@@ -61,6 +93,24 @@ impl Sandbox {
         match self {
             Sandbox::Container(c) => c.destroy(),
             Sandbox::Vm(vm) => vm.destroy(),
+        }
+    }
+
+    /// Watches the attempt's workspace and its job `/tmp` together against `limit` bytes while its steps run, when
+    /// the sandbox has no size bound of its own. A container's workspace and `/tmp` are bind mounts that rootless
+    /// Podman cannot bound, so the guard measures them ([`crate::quota`]); a microVM's disk is a scratch image of
+    /// exactly the declared size.
+    pub fn guard_storage(&self, workspace: &Path, limit: u64) -> Option<crate::quota::Guard> {
+        match self {
+            Sandbox::Container(c) => Some(crate::quota::Guard::start(
+                vec![
+                    workspace.to_path_buf(),
+                    crate::workspace::tmp_beside(workspace),
+                ],
+                limit,
+                c.stopper(),
+            )),
+            Sandbox::Vm(_) => None,
         }
     }
 

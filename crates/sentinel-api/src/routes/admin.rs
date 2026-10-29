@@ -18,7 +18,11 @@ use super::{Reply, Route, body, err, id, identify, ok, parse, query_param, store
 use crate::{State, auth, auth::Identity, http::Request};
 
 /// Checks live platform rows, not the credential's claims, so a revoked super admin is refused at once.
-fn platform(state: &State, request: &Request, mutation: bool) -> Result<Identity, ApiError> {
+pub(super) fn platform(
+    state: &State,
+    request: &Request,
+    mutation: bool,
+) -> Result<Identity, ApiError> {
     let who = identify(state, request, mutation)?;
     auth::require_scope(&who, Scopes::PLATFORM_ADMIN)?;
     let authority = who.authority();
@@ -35,12 +39,12 @@ fn tenant_admin(state: &State, request: &Request, mutation: bool) -> Result<Iden
     Ok(who)
 }
 
-fn limit(query: &str) -> u16 {
+pub(super) fn limit(query: &str) -> u16 {
     page_size(query_param(query, "limit").and_then(|v| v.parse().ok()))
         .min(usize::from(views::MAX_PAGE)) as u16
 }
 
-fn before(query: &str) -> Result<Option<i64>, ApiError> {
+pub(super) fn before(query: &str) -> Result<Option<i64>, ApiError> {
     query_param(query, "before")
         .map(|v| {
             v.parse::<i64>()

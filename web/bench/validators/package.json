@@ -1,0 +1,9 @@
+{
+  "name": "sentinel-web-validator-spike",
+  "private": true,
+  "type": "module",
+  "description": "U09: client bundle cost of the search-param validator candidates",
+  "dependencies": { "effect": "4.0.5", "valibot": "1.5.0", "zod": "4.6.7" },
+  "devDependencies": { "esbuild": "0.28.2" },
+  "packageManager": "pnpm@12.15.0"
+}

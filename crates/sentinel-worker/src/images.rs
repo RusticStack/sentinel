@@ -7,10 +7,10 @@ use std::{
         Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
-use crate::{Error, Result, attempt::Cancel, podman};
+use crate::{Error, Result, attempt::Cancel, microvm::GuestEntry, podman};
 
 pub const MAX_HELD: usize = 1024;
 
@@ -488,9 +488,62 @@ impl Images {
         out
     }
 
+    /// Cached microVM root file systems to remove to bring the guest images back under their share of the
+    /// image budget (`over` bytes, see [`guest_overage`]): least recently used first, never one a live attempt
+    /// holds (`in_use`), one used within `IMAGE_KEEP` (an attempt may be about to boot from it) or one whose
+    /// digest is being pulled.
+    pub fn reclaimable_guests(&self, guests: &[GuestEntry], over: u64) -> Vec<String> {
+        let state = self.state();
+        let pulling: HashSet<&str> = state
+            .pulling
+            .keys()
+            .filter_map(|k| k.image.split_once('@').map(|(_, d)| d))
+            .collect();
+        plan_guest_reclaim(guests, &pulling, over, SystemTime::now())
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.inner.state.lock().unwrap_or_else(|p| p.into_inner())
     }
+}
+
+/// How many bytes of cached guest images must go so that they and the Podman store together fit `budget`:
+/// guest images that still fit alongside what Podman holds are left alone, and never more than all of them.
+pub fn guest_overage(guest_total: u64, podman_total: u64, budget: u64) -> u64 {
+    guest_total
+        .saturating_add(podman_total)
+        .saturating_sub(budget)
+        .min(guest_total)
+}
+
+fn plan_guest_reclaim(
+    guests: &[GuestEntry],
+    pulling: &HashSet<&str>,
+    over: u64,
+    now: SystemTime,
+) -> Vec<String> {
+    if over == 0 {
+        return Vec::new();
+    }
+    let mut candidates: Vec<&GuestEntry> = guests
+        .iter()
+        .filter(|g| !g.in_use && !pulling.contains(g.digest.as_str()))
+        .filter(|g| {
+            now.duration_since(g.used)
+                .is_ok_and(|age| age >= IMAGE_KEEP)
+        })
+        .collect();
+    candidates.sort_by_key(|g| g.used);
+    let mut over = over;
+    let mut out = Vec::new();
+    for guest in candidates {
+        if over == 0 || out.len() >= MAX_IMAGE_REMOVALS {
+            break;
+        }
+        over = over.saturating_sub(guest.bytes);
+        out.push(guest.key.clone());
+    }
+    out
 }
 
 fn validate_pinned_reference(image: &str) -> Result<()> {
@@ -879,5 +932,86 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert_eq!(images.in_flight(), 0);
         assert!(images.held().is_empty());
+    }
+
+    fn guest(key: &str, digest: &str, bytes: u64, idle: Duration) -> GuestEntry {
+        GuestEntry {
+            key: key.into(),
+            digest: digest.into(),
+            bytes,
+            used: SystemTime::now() - idle,
+            in_use: false,
+        }
+    }
+
+    #[test]
+    fn guest_images_give_back_only_what_does_not_fit_beside_the_podman_store() {
+        // Both together within the budget: nothing to give back.
+        assert_eq!(guest_overage(300, 500, 1_000), 0);
+        assert_eq!(guest_overage(300, 700, 1_000), 0);
+        // 100 over: that much of the guest images goes.
+        assert_eq!(guest_overage(300, 800, 1_000), 100);
+        // Never more than all the guest images, however far over Podman is.
+        assert_eq!(guest_overage(300, 5_000, 1_000), 300);
+        assert_eq!(guest_overage(0, 5_000, 1_000), 0);
+        assert_eq!(guest_overage(u64::MAX, u64::MAX, 1), u64::MAX - 1);
+    }
+
+    #[test]
+    fn guest_reclamation_takes_the_least_recently_used_and_spares_the_recent_and_the_pulled() {
+        let images = Images::new(PathBuf::new());
+        let hour = Duration::from_secs(3_600);
+        let guests = [
+            guest("old", "sha256:old", 100, hour * 5),
+            guest("older", "sha256:older", 200, hour * 9),
+            guest("recent", "sha256:recent", 400, Duration::from_secs(5)),
+            guest("middle", "sha256:middle", 300, hour * 2),
+        ];
+        assert!(images.reclaimable_guests(&guests, 0).is_empty());
+        // Least recently used first, stopping once enough is freed.
+        assert_eq!(images.reclaimable_guests(&guests, 250), ["older", "old"]);
+        assert_eq!(images.reclaimable_guests(&guests, 200), ["older"]);
+        // Asking for more than there is takes every idle one and still spares the recent one.
+        assert_eq!(
+            images.reclaimable_guests(&guests, u64::MAX),
+            ["older", "old", "middle"]
+        );
+        // An image whose digest is being pulled right now may be about to boot.
+        images.state().pulling.insert(
+            PullKey::anonymous("example.test/i@sha256:older"),
+            Arc::new(Pull::default()),
+        );
+        assert_eq!(images.reclaimable_guests(&guests, 200), ["old", "middle"]);
+    }
+
+    #[test]
+    fn guest_reclamation_never_takes_an_image_a_live_attempt_holds() {
+        let images = Images::new(PathBuf::new());
+        let hour = Duration::from_secs(3_600);
+        let busy = GuestEntry {
+            in_use: true,
+            ..guest("busy", "sha256:busy", 500, hour * 48)
+        };
+        let guests = [busy, guest("idle", "sha256:idle", 100, hour * 2)];
+        // The busy image is the least recently used by far, and still not offered.
+        assert_eq!(images.reclaimable_guests(&guests, u64::MAX), ["idle"]);
+        assert!(images.reclaimable_guests(&guests[..1], u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn guest_reclamation_is_bounded_per_pass() {
+        let hour = Duration::from_secs(3_600);
+        let guests: Vec<GuestEntry> = (0..MAX_IMAGE_REMOVALS + 5)
+            .map(|i| guest(&format!("k{i}"), &format!("sha256:{i}"), 1, hour * 2))
+            .collect();
+        let none = HashSet::new();
+        let planned = plan_guest_reclaim(&guests, &none, u64::MAX, SystemTime::now());
+        assert_eq!(planned.len(), MAX_IMAGE_REMOVALS);
+        // A stamp from the future (a clock step) is never old enough.
+        let future = GuestEntry {
+            used: SystemTime::now() + hour,
+            ..guest("future", "sha256:f", 9, hour)
+        };
+        assert!(plan_guest_reclaim(&[future], &none, u64::MAX, SystemTime::now()).is_empty());
     }
 }

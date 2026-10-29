@@ -634,6 +634,103 @@ fn enrollment_guessing_is_rate_limited_and_never_touches_enrolled_workers() {
 }
 
 #[test]
+fn one_peer_burning_the_guess_budget_cannot_keep_a_real_enrollment_out() {
+    let d = deployment();
+    let secret = d.enrollment();
+    // Every peer here is loopback, as every peer behind a Tailcat helper is: they all share one budget.
+    let mut limited = 0;
+    for _ in 0..40 {
+        match d
+            .connect(
+                Identity::generate("guesser").unwrap(),
+                WorkerId::new(),
+                Some(&Secret::generate()),
+                6,
+            )
+            .unwrap_err()
+        {
+            Error::Rejected(Rejection::Unavailable) => limited += 1,
+            Error::Rejected(Rejection::Enrollment) => {}
+            other => panic!("unexpected {other}"),
+        }
+    }
+    assert!(limited >= 30, "{limited} guesses were deferred");
+    let enrolled = WorkerId::new();
+    let link = d
+        .connect(
+            Identity::generate("real").unwrap(),
+            enrolled,
+            Some(&secret),
+            6,
+        )
+        .expect("a valid secret is not held behind the guessing budget");
+    drop(link);
+
+    // The refusals that reached the writer left a bounded number of audit rows.
+    let (recorded, suppressed) = d.store.read(workers::refusal_counts).unwrap();
+    assert!(
+        (1..=workers::REFUSAL_ROWS_PER_PEER).contains(&recorded),
+        "{recorded} audit rows"
+    );
+    assert_eq!(suppressed, 0);
+}
+
+#[test]
+fn a_stranger_through_a_busy_tunnel_is_shed_at_the_hello_but_a_known_worker_is_not() {
+    let d = deployment();
+    let (worker, identity) = (WorkerId::new(), Identity::generate("w").unwrap());
+    let (cert, key) = (d._dir.path().join("w.crt"), d._dir.path().join("w.key"));
+    identity.save(&cert, &key).unwrap();
+    let load = || Identity::load(&cert, &key).unwrap();
+    let secret = d.enrollment();
+    drop(d.connect(load(), worker, Some(&secret), 6).unwrap());
+    let fresh = d.enrollment();
+
+    // Eight slots: six are the unreserved part. Six idle handshakes fill it, and the loopback address
+    // alone would still let the seventh in.
+    d.controller
+        .set_admission_limits(8, Duration::from_secs(20));
+    let idle: Vec<TcpStream> = (0..6)
+        .map(|_| TcpStream::connect(d.controller.local_addr()).unwrap())
+        .collect();
+    thread::sleep(Duration::from_millis(300));
+    let shed = d.controller.stats().shed.load(Ordering::SeqCst);
+
+    match d
+        .connect(
+            Identity::generate("stranger").unwrap(),
+            WorkerId::new(),
+            Some(&fresh),
+            6,
+        )
+        .unwrap_err()
+    {
+        Error::Rejected(Rejection::Unavailable) => {}
+        other => panic!("unexpected {other}"),
+    }
+    assert!(d.controller.stats().shed.load(Ordering::SeqCst) > shed);
+    assert!(
+        d.connect(load(), worker, None, 6).is_ok(),
+        "an authenticated worker still gets the reserve"
+    );
+
+    drop(idle);
+    eventually(
+        "the stranger enrolls once the pool drains",
+        Duration::from_secs(10),
+        || {
+            d.connect(
+                Identity::generate("stranger").unwrap(),
+                WorkerId::new(),
+                Some(&fresh),
+                6,
+            )
+            .is_ok()
+        },
+    );
+}
+
+#[test]
 fn deferred_log_frames_are_acknowledged_only_after_a_sync() {
     let handler = Arc::new(Scripted {
         verdicts: Mutex::new((1..=8).map(LogVerdict::Stored).collect()),

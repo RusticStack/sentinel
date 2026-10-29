@@ -13,8 +13,9 @@ User=sentinel
 Environment=NODE_ENV=production
 Environment=HOST=127.0.0.1
 Environment=PORT=3000
-# The controller's api_listen, as reached from this host.
-Environment=NUXT_SENTINEL_API=http://127.0.0.1:7080
+# The controller's api_listen, as reached from this host (NUXT_SENTINEL_API, the
+# Nuxt release's name, is still read for one release when this is unset).
+Environment=SENTINEL_API=http://127.0.0.1:7080
 ExecStart=/usr/bin/node /opt/sentinel/web/.output/server/index.mjs
 Restart=on-failure
 NoNewPrivileges=true

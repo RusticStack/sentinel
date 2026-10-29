@@ -265,6 +265,37 @@ mod linux {
     }
 
     #[test]
+    fn placement_order_is_fastest_or_priority_for_the_server_only() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("config.toml");
+        let data = temp.path().join("data");
+        let check = |role: &str, order: &str| {
+            fs::write(
+                &file,
+                format!(
+                    "data_dir = '{}'
+placement_order = '{order}'",
+                    data.display()
+                ),
+            )
+            .unwrap();
+            invoke(&[role, "--config", file.to_str().unwrap(), "--check"])
+        };
+        if cfg!(feature = "server") {
+            for accepted in ["fastest", "priority"] {
+                assert!(check("server", accepted).status.success(), "{accepted}");
+            }
+            for refused in ["", "Priority", "speed", "fastest,priority"] {
+                assert_eq!(check("server", refused).status.code(), Some(2), "{refused}");
+            }
+        }
+        if cfg!(feature = "worker") {
+            assert_eq!(check("worker", "priority").status.code(), Some(2));
+        }
+        assert!(!data.exists());
+    }
+
+    #[test]
     fn spool_limits_are_worker_link_settings_and_a_zero_quota_is_refused() {
         let temp = tempdir().unwrap();
         let file = temp.path().join("config.toml");
@@ -1401,6 +1432,28 @@ mod linux {
             "{}",
             String::from_utf8_lossy(&verified.stdout)
         );
+        // The recovery-point check an operator alerts on: fresh within the objective, stale past a limit of zero.
+        let rpo = |limit: &str| {
+            Command::new(env!("CARGO_BIN_EXE_sentinel"))
+                .args([
+                    "admin",
+                    "backup",
+                    "rpo",
+                    "--dir",
+                    backups.to_str().unwrap(),
+                    "--limit-secs",
+                    limit,
+                ])
+                .output()
+                .unwrap()
+        };
+        let fresh = rpo("3600");
+        assert!(fresh.status.success());
+        let state: serde_json::Value =
+            serde_json::from_slice(fresh.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        assert_eq!(state["newest"], backup_id.as_str());
+        assert_eq!(state["within_limit"], true);
+        assert!(!rpo("0").status.success());
         fs::remove_dir_all(&old_host).unwrap();
 
         let restore = Command::new(env!("CARGO_BIN_EXE_sentinel"))

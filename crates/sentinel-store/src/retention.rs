@@ -279,8 +279,15 @@ pub fn reapply_step(
     })
 }
 
+/// The two statements of one reapply step: the cursor bound and the update.
+///
 /// INDEXED BY pins the tenant's keyed index: without it the planner may walk every tenant's rows.
-fn reapply_sql(logs_phase: bool, scoped: bool, expires: &str, batch: i64) -> (String, String) {
+/// Both statements read at most one batch of the tenant's rows from the cursor: the bound stops at
+/// `OFFSET batch - 1` and the update is confined to `(after, bound]`. A repository filter is a
+/// per-row primary-key probe inside that range, never a set built from the repository's runs.
+/// Public only so the query-plan tests in `tests/retention.rs` assert on the statements that run.
+#[doc(hidden)]
+pub fn reapply_sql(logs_phase: bool, scoped: bool, expires: &str, batch: i64) -> (String, String) {
     let (table, index, filter) = if logs_phase {
         (
             "attempts",
@@ -294,7 +301,7 @@ fn reapply_sql(logs_phase: bool, scoped: bool, expires: &str, batch: i64) -> (St
         (false, _) => "",
         (true, true) => " AND repo_id = ?3",
         (true, false) => {
-            " AND run_id IN (SELECT id FROM runs WHERE tenant_id = ?1 AND repo_id = ?3)"
+            " AND EXISTS (SELECT 1 FROM runs WHERE id = artifacts.run_id AND tenant_id = ?1 AND repo_id = ?3)"
         }
     };
     let bound = format!(
@@ -726,48 +733,4 @@ pub fn purge_aborted_uploads(tx: &Transaction<'_>, now: UnixMillis, limit: u32) 
             .execute([id])? as u32;
     }
     Ok(purged)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusqlite::Connection;
-
-    fn plans(conn: &Connection, sql: &str) -> Vec<String> {
-        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-        let values = vec![rusqlite::types::Value::Null; stmt.parameter_count()];
-        stmt.query_map(rusqlite::params_from_iter(values), |r| r.get(3))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
-    }
-
-    #[test]
-    fn reapply_statements_read_the_tenants_rows_by_key() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        crate::migrate(&mut conn).unwrap();
-        crate::register_functions(&conn).unwrap();
-        for logs in [true, false] {
-            let index = if logs {
-                "attempts_log_reapply"
-            } else {
-                "artifacts_reapply"
-            };
-            for scoped in [false, true] {
-                let (bound, update) = reapply_sql(logs, scoped, "log_retention_ms", REAPPLY_BATCH);
-                for sql in [bound, update] {
-                    let plan = plans(&conn, &sql);
-                    assert!(
-                        plan.iter()
-                            .any(|p| p.contains(index) && p.contains("tenant_id=?")),
-                        "{sql} does not seek {index} by tenant: {plan:?}"
-                    );
-                    assert!(
-                        plan.iter().all(|p| !p.contains("TEMP B-TREE")),
-                        "{sql} sorts: {plan:?}"
-                    );
-                }
-            }
-        }
-    }
 }

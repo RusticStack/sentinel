@@ -599,3 +599,407 @@ fn pruning_waits_for_a_running_backup_instead_of_deleting_its_files() {
     assert_eq!(pruned.backups.len(), 1);
     assert_eq!(backup::list(&f.target()).unwrap().len(), 1);
 }
+
+fn shared_object(f: &Fixture, digest: Digest) -> std::path::PathBuf {
+    let hex = digest.to_string();
+    f.target()
+        .join("objects")
+        .join(f.tenant.to_string())
+        .join(&hex[..2])
+        .join(&hex)
+}
+
+fn pairs(snapshot: &std::path::Path) -> (i64, i64) {
+    let conn =
+        rusqlite::Connection::open_with_flags(snapshot, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    conn.query_row("SELECT COUNT(*), COUNT(DISTINCT i) FROM pairs", [], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })
+    .unwrap()
+}
+
+// Every transaction writes two rows; a snapshot that split one would hold an odd row.
+#[test]
+fn a_backup_taken_during_commits_never_splits_a_transaction() {
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    let f = fixture();
+    f.store
+        .writer()
+        .write(|tx| {
+            tx.execute(
+                "CREATE TABLE pairs(i INTEGER NOT NULL, half INTEGER NOT NULL)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let committed = Arc::new(AtomicI64::new(0));
+    let writer = {
+        let (store, stop, committed) = (
+            Arc::clone(&f.store),
+            Arc::clone(&stop),
+            Arc::clone(&committed),
+        );
+        std::thread::spawn(move || {
+            let mut i = 0i64;
+            while !stop.load(Ordering::Relaxed) {
+                store
+                    .writer()
+                    .write(move |tx| {
+                        tx.execute("INSERT INTO pairs VALUES (?1, 0)", [i])?;
+                        tx.execute("INSERT INTO pairs VALUES (?1, 1)", [i])?;
+                        Ok(())
+                    })
+                    .unwrap();
+                i += 1;
+                committed.store(i, Ordering::Release);
+            }
+        })
+    };
+    while committed.load(Ordering::Acquire) == 0 {
+        std::thread::yield_now();
+    }
+    for _ in 0..3 {
+        let report = f.backup();
+        let (rows, distinct) = pairs(&f.target().join(&report.id).join("metadata.sqlite"));
+        assert_eq!(
+            rows,
+            distinct * 2,
+            "a transaction was split: {rows} rows for {distinct}"
+        );
+        assert!(distinct > 0);
+        assert!(backup::verify(&f.target(), &report.id).unwrap().ok());
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    let last = backup::list(&f.target()).unwrap().pop().unwrap();
+    let fresh = f.dir.path().join("restored");
+    backup::restore(&f.target(), &last, &fresh, Some(&f.key)).unwrap();
+    let (rows, distinct) = pairs(&fresh.join("metadata.sqlite"));
+    assert_eq!(rows, distinct * 2);
+    assert!(distinct <= committed.load(Ordering::Acquire));
+}
+
+// A backup that completed with losses recorded must still bring everything else back.
+#[test]
+fn a_restore_goes_on_without_the_objects_the_backup_recorded_as_lost() {
+    let f = fixture();
+    let kept = f.put(b"an object that survived");
+    let lost = f.put(b"an object the data directory lost before the backup");
+    let hex = lost.to_string();
+    fs::remove_file(
+        f.data
+            .join("objects")
+            .join(f.tenant.to_string())
+            .join(&hex[..2])
+            .join(&hex),
+    )
+    .unwrap();
+    let report = f.backup();
+    assert_eq!(report.objects_missing.len(), 1, "{report:?}");
+    assert!(!backup::verify(&f.target(), &report.id).unwrap().ok());
+
+    let fresh = f.dir.path().join("restored");
+    let restored = backup::restore(&f.target(), &report.id, &fresh, Some(&f.key)).unwrap();
+    assert_eq!(restored.objects, 1);
+    assert_eq!(restored.objects_unavailable, report.objects_missing);
+    let store = Store::open(fresh.join("metadata.sqlite"), Durability::Normal).unwrap();
+    let objects = Objects::open(&fresh).unwrap();
+    let mut out = Vec::new();
+    store
+        .read(|c| objects.read(c, f.tenant, kept, &mut out))
+        .unwrap();
+    assert_eq!(out, b"an object that survived");
+    let recovery = store.read(|c| objects.recover(c)).unwrap();
+    assert_eq!(
+        recovery.missing.len(),
+        1,
+        "recovery names the loss: {recovery:?}"
+    );
+    drop((store, objects));
+
+    // An object lost afterwards, which the backup did not record, still stops the restore.
+    fs::remove_file(shared_object(&f, kept)).unwrap();
+    let second = f.dir.path().join("again");
+    assert!(backup::restore(&f.target(), &report.id, &second, Some(&f.key)).is_err());
+    assert!(!second.join("metadata.sqlite").exists());
+}
+
+// The database lands last: whatever stops a restore earlier leaves a directory a retry can fill.
+#[test]
+fn a_failed_restore_leaves_no_database_and_a_retry_succeeds() {
+    let f = fixture();
+    let digest = f.put(b"an object whose backup copy rots before the restore");
+    let report = f.backup();
+    let shared = shared_object(&f, digest);
+    let good = fs::read(&shared).unwrap();
+    let mut rotten = good.clone();
+    rotten[0] ^= 1;
+    fs::write(&shared, &rotten).unwrap();
+
+    let fresh = f.dir.path().join("restored");
+    let failed = backup::restore(&f.target(), &report.id, &fresh, Some(&f.key));
+    assert!(matches!(failed, Err(Error::Corrupt(_))), "{failed:?}");
+    assert!(
+        !fresh.join("metadata.sqlite").exists(),
+        "a half-restored directory is never taken for a controller's"
+    );
+    fs::write(&shared, &good).unwrap();
+    let restored = backup::restore(&f.target(), &report.id, &fresh, Some(&f.key)).unwrap();
+    assert_eq!(restored.objects, 1);
+    assert!(fresh.join("metadata.sqlite").is_file());
+}
+
+// controller.key and controller.crt keep the workers' pin: rot in a backup's copy must not pass silently.
+#[test]
+fn rot_in_a_backed_up_controller_identity_is_caught_and_refused() {
+    let f = fixture();
+    let report = f.backup();
+    let manifest = backup::manifest(&f.target(), &report.id).unwrap();
+    assert!(manifest["config_blake3"]["controller.key"].is_string());
+    assert!(backup::verify(&f.target(), &report.id).unwrap().ok());
+
+    let copy = f
+        .target()
+        .join(&report.id)
+        .join("config")
+        .join("controller.key");
+    let mut bytes = fs::read(&copy).unwrap();
+    bytes[0] ^= 1;
+    fs::write(&copy, &bytes).unwrap();
+    let check = backup::verify(&f.target(), &report.id).unwrap();
+    assert!(!check.ok());
+    assert_eq!(check.corrupt, vec!["config/controller.key".to_owned()]);
+
+    let fresh = f.dir.path().join("restored");
+    let refused = backup::restore(&f.target(), &report.id, &fresh, Some(&f.key));
+    assert!(matches!(refused, Err(Error::Corrupt(_))), "{refused:?}");
+    assert!(!fresh.join("metadata.sqlite").exists());
+
+    fs::remove_file(&copy).unwrap();
+    let check = backup::verify(&f.target(), &report.id).unwrap();
+    assert_eq!(check.missing, vec!["config/controller.key".to_owned()]);
+    let refused = backup::restore(&f.target(), &report.id, &fresh, Some(&f.key));
+    assert!(matches!(refused, Err(Error::Corrupt(_))), "{refused:?}");
+}
+
+#[test]
+fn a_damaged_backup_directory_fails_verification_instead_of_crashing_it() {
+    let f = fixture();
+    let report = f.backup();
+    let dir = f.target().join(&report.id);
+
+    // A snapshot cut short fails its checksum and, being no database, its integrity check.
+    let snapshot = fs::read(dir.join("metadata.sqlite")).unwrap();
+    fs::write(dir.join("metadata.sqlite"), &snapshot[..snapshot.len() / 2]).unwrap();
+    let check = backup::verify(&f.target(), &report.id).unwrap();
+    assert!(!check.ok() && !check.metadata_matches, "{check:?}");
+    fs::remove_file(dir.join("metadata.sqlite")).unwrap();
+    let check = backup::verify(&f.target(), &report.id).unwrap();
+    assert!(
+        !check.ok() && check.integrity.starts_with("unreadable"),
+        "{check:?}"
+    );
+    let fresh = f.dir.path().join("restored");
+    assert!(backup::restore(&f.target(), &report.id, &fresh, Some(&f.key)).is_err());
+    assert!(!fresh.join("metadata.sqlite").exists());
+
+    // A backup.json that is not the format is an error to name, not a pass.
+    fs::write(
+        dir.join("backup.json"),
+        b"{\"format\":\"sentinel.backup/1\"",
+    )
+    .unwrap();
+    assert!(matches!(
+        backup::verify(&f.target(), &report.id),
+        Err(Error::Corrupt(_))
+    ));
+    fs::write(
+        dir.join("backup.json"),
+        b"{\"format\":\"sentinel.backup/2\"}",
+    )
+    .unwrap();
+    assert!(matches!(
+        backup::verify(&f.target(), &report.id),
+        Err(Error::Corrupt("backup format"))
+    ));
+    assert!(matches!(
+        backup::verify(&f.target(), "20260101T000000Z"),
+        Err(Error::NotFound)
+    ));
+}
+
+#[test]
+fn a_restore_refuses_a_bad_key_file_and_a_leftover_journal_before_writing_anything() {
+    let f = fixture();
+    let report = f.backup();
+    let garbage = f.dir.path().join("garbage.key");
+    fs::write(&garbage, b"not a key").unwrap();
+    let fresh = f.dir.path().join("restored");
+    for key in [None, Some(garbage.as_path())] {
+        let refused = backup::restore(&f.target(), &report.id, &fresh, key);
+        assert!(
+            matches!(refused, Err(Error::InvalidInput(_))),
+            "{refused:?}"
+        );
+        assert!(!fresh.exists(), "nothing was written");
+    }
+
+    fs::create_dir_all(&fresh).unwrap();
+    fs::write(
+        fresh.join("metadata.sqlite-wal"),
+        b"the journal of a database that is gone",
+    )
+    .unwrap();
+    let refused = backup::restore(&f.target(), &report.id, &fresh, Some(&f.key));
+    assert!(
+        matches!(refused, Err(Error::InvalidInput(_))),
+        "{refused:?}"
+    );
+    assert!(!fresh.join("metadata.sqlite").exists());
+}
+
+// RPO: a backup is the newest only once it is listed, so the window between two backups includes the later one's duration.
+#[test]
+fn the_exposure_counts_the_interval_and_the_backup_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        backup::exposure(dir.path(), UnixMillis(1)).unwrap(),
+        backup::Exposure::default()
+    );
+    let write = |id: &str, started: i64, took: i64| {
+        let at = dir.path().join(id);
+        fs::create_dir_all(&at).unwrap();
+        fs::write(
+            at.join("backup.json"),
+            format!(
+                "{{\"format\":\"sentinel.backup/1\",\"started_ms\":{started},\"took_ms\":{took}}}"
+            ),
+        )
+        .unwrap();
+    };
+    write("20260101T000000Z", 0, 5_000);
+    write("20260101T010000Z", 3_600_000, 20_000);
+    write("20260101T020000Z", 7_200_000, 10_000);
+    let e = backup::exposure(dir.path(), UnixMillis(7_300_000)).unwrap();
+    assert_eq!(e.backups, 3);
+    assert_eq!(e.newest_id.as_deref(), Some("20260101T020000Z"));
+    assert_eq!(e.age_ms, Some(100_000));
+    assert_eq!(
+        e.worst_ms,
+        Some(3_620_000),
+        "the interval plus the slower backup's duration"
+    );
+    // Long after the last backup, the age is the worst window.
+    let e = backup::exposure(dir.path(), UnixMillis(7_200_000 + 9_000_000)).unwrap();
+    assert_eq!((e.age_ms, e.worst_ms), (Some(9_000_000), Some(9_000_000)));
+
+    fs::write(
+        dir.path().join("20260101T020000Z").join("backup.json"),
+        b"{\"format\":\"sentinel.backup/1\"}",
+    )
+    .unwrap();
+    assert!(matches!(
+        backup::exposure(dir.path(), UnixMillis(1)),
+        Err(Error::Corrupt(_))
+    ));
+}
+
+// R07: a controller killed at any instant of a backup (power cut, OOM kill) must leave only complete backups behind.
+#[test]
+fn backups_killed_at_staggered_points_leave_only_complete_ones() {
+    const CHILD: &str = "SENTINEL_R07_BACKUP_CHILD";
+    const TARGET: &str = "SENTINEL_R07_BACKUP_TARGET";
+    if let (Some(data), Some(target)) = (std::env::var_os(CHILD), std::env::var_os(TARGET)) {
+        let data = std::path::PathBuf::from(data);
+        let store = Store::open(data.join("metadata.sqlite"), Durability::Normal).unwrap();
+        let objects = Objects::open(&data).unwrap();
+        loop {
+            let _ = backup::create(
+                &store,
+                &objects,
+                &data,
+                std::path::Path::new(&target),
+                "child",
+            );
+        }
+    }
+    let f = fixture();
+    for i in 0..300u32 {
+        let body: Vec<u8> = (0..16 * 1024u32)
+            .map(|b| (b.wrapping_mul(i + 1) >> 3) as u8)
+            .collect();
+        let digest = f.put(&body);
+        if i == 0 {
+            f.manifest(digest, body.len() as u64);
+        }
+    }
+    f.log();
+    let Fixture {
+        dir,
+        data,
+        store,
+        objects,
+        key,
+        ..
+    } = f;
+    drop((store, objects));
+    let target = dir.path().join("backups");
+
+    for delay_ms in [120, 250, 400, 650, 1_000, 1_600] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "backups_killed_at_staggered_points_leave_only_complete_ones",
+                "--nocapture",
+            ])
+            .env(CHILD, &data)
+            .env(TARGET, &target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        for id in backup::list(&target).unwrap() {
+            let check = backup::verify(&target, &id).unwrap();
+            assert!(
+                check.ok(),
+                "a listed backup is incomplete after a kill at {delay_ms} ms: {check:?}"
+            );
+        }
+    }
+
+    let store = Arc::new(Store::open(data.join("metadata.sqlite"), Durability::Normal).unwrap());
+    let objects = Arc::new(Objects::open(&data).unwrap());
+    let survivors = backup::list(&target).unwrap().len();
+    let report = backup::create(&store, &objects, &data, &target, "after").unwrap();
+    assert!(report.objects_corrupt.is_empty() && report.objects_missing.is_empty());
+    assert!(
+        fs::read_dir(&target)
+            .unwrap()
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().ends_with(".partial")),
+        "the next backup removed every staging directory"
+    );
+    backup::prune(&target, 2).unwrap();
+    let ids = backup::list(&target).unwrap();
+    assert!(ids.len() <= 2 && ids.contains(&report.id));
+    for id in &ids {
+        assert!(backup::verify(&target, id).unwrap().ok());
+    }
+    let fresh = dir.path().join("restored");
+    let restored = backup::restore(&target, &report.id, &fresh, Some(&key)).unwrap();
+    assert_eq!(restored.objects, 300);
+    let reopened = Store::open(fresh.join("metadata.sqlite"), Durability::Normal).unwrap();
+    let reobjects = Objects::open(&fresh).unwrap();
+    let recovery = reopened.read(|c| reobjects.recover(c)).unwrap();
+    assert!(
+        recovery.missing.is_empty() && recovery.corrupt.is_empty(),
+        "{recovery:?}"
+    );
+    eprintln!("{survivors} complete backups were on disk after six kills");
+}

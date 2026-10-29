@@ -244,3 +244,93 @@ fn a_contract_for_another_host_measures_nothing() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A `systemd-run` stand-in that drops its own options and runs the command,
+/// so the scoped runtime can be exercised where no user manager exists.
+#[cfg(unix)]
+fn fake_systemd_run(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let shim = dir.join("systemd-run");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interleaved_group_writes_one_record_per_runtime_in_abba_order() {
+    let dir = std::env::temp_dir().join(format!("sentinel-bench-group-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    fake_systemd_run(&dir);
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = dir.join("out.jsonl");
+    let out = bench()
+        .env("PATH", path)
+        .args([
+            "--runtime",
+            "direct",
+            "--interleave",
+            "scoped",
+            "--samples",
+            "4",
+            "--warmup",
+            "1",
+            "--warm-state",
+            "warm",
+        ])
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    if !source_readable() {
+        assert!(refused_for_provenance(&out), "{out:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "records go to --output");
+    let text = std::fs::read_to_string(&output).unwrap();
+    let records: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2, "one record per runtime");
+    assert_eq!(records[0]["runtime"], "direct");
+    assert_eq!(records[1]["runtime"], "scoped");
+    let seqs = |r: &serde_json::Value| -> Vec<u64> {
+        r["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["seq"].as_u64().unwrap())
+            .collect()
+    };
+    // ABBA: sample 0 runs direct then scoped, sample 1 scoped then direct, ...
+    assert_eq!(seqs(&records[0]), [0, 3, 4, 7]);
+    assert_eq!(seqs(&records[1]), [1, 2, 5, 6]);
+    for r in &records {
+        assert_eq!(
+            r["interleave"]["runtimes"],
+            serde_json::json!(["direct", "scoped"])
+        );
+        assert_eq!(r["interleave"]["order"], "abba");
+        assert_eq!(r["interleave"]["conditions"], "per-runtime");
+        assert_eq!(r["summary"]["count"], 4);
+        assert!(r["conditions"].is_object());
+        for s in r["samples"].as_array().unwrap() {
+            assert_eq!(s["exit_code"], 0);
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

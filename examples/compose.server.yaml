@@ -1,0 +1,32 @@
+# The controller as a container: `podman compose -f compose.server.yaml up -d`
+# (or `docker compose`). Build the image first (Containerfile.server). The
+# data volume holds the database and the master key; create the key once:
+#
+#   podman compose -f compose.server.yaml run --rm --no-deps server admin key create --data-dir /var/lib/sentinel
+#
+# Read docs/deployment.md#container-examples before exposing a port.
+name: sentinel
+services:
+  server:
+    image: localhost/sentinel-server:${SENTINEL_VERSION:-0.1.0-dev}
+    # Runs as uid 10001 (the image's sentinel user).
+    command: ["server", "--config", "/etc/sentinel/server.toml", "--data-dir", "/var/lib/sentinel"]
+    restart: on-failure
+    stop_grace_period: 30s
+    ports:
+      # API: reached by the reverse proxy / sentinel-web on this host.
+      - "127.0.0.1:7080:7080"
+      # Worker link: use a private address of this host to serve workers on other machines.
+      - "127.0.0.1:7443:7443"
+    volumes:
+      - data:/var/lib/sentinel
+      - ./server-container.toml:/etc/sentinel/server.toml:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 4096
+    mem_limit: 4g
+volumes:
+  data:

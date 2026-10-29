@@ -18,9 +18,45 @@ mod imp {
     use sentinel_worker::{
         artifacts::NoSink,
         attempt::{self, CacheNote, Job, NoOutput, Output, Report, Verdict},
+        host::Isolation,
         images::Images,
+        microvm::Setup,
         podman,
     };
+
+    /// The isolation switch (`SENTINEL_K07_ISOLATION`): unset or `container` runs rootless Podman as before;
+    /// `microvm` runs each attempt in a Firecracker VM, with the setup in `SENTINEL_FIRECRACKER`,
+    /// `SENTINEL_GUEST_KERNEL` and `SENTINEL_GUEST_AGENT`.
+    fn runtime() -> Result<(attempt::Runtime, &'static str), String> {
+        match std::env::var("SENTINEL_K07_ISOLATION").as_deref() {
+            Err(_) | Ok("") | Ok("container") => Ok((Default::default(), "container")),
+            Ok("microvm") => {
+                let path = |name: &str| {
+                    std::env::var_os(name)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| format!("{name} is required for microvm isolation"))
+                };
+                let setup = Setup {
+                    firecracker: path("SENTINEL_FIRECRACKER")?,
+                    kernel: path("SENTINEL_GUEST_KERNEL")?,
+                    agent: path("SENTINEL_GUEST_AGENT")?,
+                    snapshots: true,
+                    guard: Default::default(),
+                };
+                setup.check().map_err(|e| format!("microvm setup: {e}"))?;
+                Ok((
+                    attempt::Runtime {
+                        default: Some(Isolation::Microvm),
+                        microvm: Some(Arc::new(setup)),
+                    },
+                    "microvm",
+                ))
+            }
+            Ok(other) => Err(format!(
+                "SENTINEL_K07_ISOLATION={other}: use container or microvm"
+            )),
+        }
+    }
 
     #[derive(Default)]
     struct Notes {
@@ -168,6 +204,10 @@ mod imp {
         if let Err(e) = podman::probe() {
             return fail(recipe, case, format!("podman probe: {e}"));
         }
+        let (runtime, isolation) = match runtime() {
+            Ok(r) => r,
+            Err(e) => return fail(recipe, case, e),
+        };
         let text = match std::fs::read_to_string(&args.pipeline) {
             Ok(t) => t,
             Err(e) => return fail(recipe, case, format!("pipeline read: {e}")),
@@ -220,6 +260,7 @@ mod imp {
             spec,
             context: JobContext {
                 source: None,
+                source_valid_until: None,
                 run: RunId::new(),
                 repo: args.repo_id,
                 repo_name: recipe.to_owned(),
@@ -245,7 +286,7 @@ mod imp {
             mirrors: None,
             prepare_hold: Duration::ZERO,
             network: sentinel_worker::podman::Network::None,
-            runtime: Default::default(),
+            runtime,
         };
         let notes = Notes::default();
         let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -264,6 +305,12 @@ mod imp {
             "recipe": recipe,
             "case": case,
             "status": "measured",
+            "isolation": isolation,
+            "guest_image": summary.guest_image.as_ref().map(|g| serde_json::json!({
+                "digest": g.digest,
+                "rootfs_bytes": g.rootfs_bytes,
+                "built": g.built,
+            })),
             "repo_id": args.repo_id.to_string(),
             "sha": args.sha,
             "image": format!("{}@{}", image.name, job.digest),

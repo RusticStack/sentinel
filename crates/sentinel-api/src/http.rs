@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
     io::{self, BufRead, BufReader, Cursor, Read, Write},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::oauth::limit::{TrustedProxy, client_key, is_proxy};
+use crate::oauth::limit::{TrustedProxy, client_key, connection_key, is_proxy};
 
 #[derive(Clone, Copy)]
 pub(crate) struct Tune {
@@ -22,6 +22,10 @@ pub(crate) struct Tune {
     pub body_time: Duration,
     pub public_bodies: usize,
     pub public_body_time: Duration,
+    /// Of the public body slots, how many readers behind a trusted proxy may hold together.
+    pub proxy_bodies: usize,
+    /// The longest a reader behind a trusted proxy holds a public body slot, slot wait included.
+    pub proxy_body_time: Duration,
     pub per_peer: usize,
     pub write_stall: Duration,
     pub poll: Duration,
@@ -36,6 +40,8 @@ impl Tune {
         body_time: Duration::from_secs(120),
         public_bodies: crate::PUBLIC_BODIES,
         public_body_time: Duration::from_secs(10),
+        proxy_bodies: crate::PROXY_BODIES,
+        proxy_body_time: crate::PROXY_BODY_TIME,
         per_peer: crate::CONNECTIONS_PER_PEER,
         write_stall: Duration::from_secs(60),
         poll: Duration::from_millis(100),
@@ -114,7 +120,11 @@ impl Pool {
 struct Gate {
     handlers: Arc<Pool>,
     bodies: Arc<Pool>,
+    /// The share of `bodies` that readers behind a trusted proxy hold together, so a crowd of forwarded
+    /// addresses cannot take the slots direct clients need.
+    forwarded: Arc<Pool>,
     body_time: Duration,
+    proxy_body_time: Duration,
     readers: Arc<Mutex<HashSet<u128>>>,
     trusted: Vec<TrustedProxy>,
 }
@@ -790,7 +800,11 @@ impl Request<'_> {
     }
 
     pub(crate) fn peer(&self) -> Option<std::net::IpAddr> {
-        self.writer.peer_addr().ok().map(|addr| addr.ip())
+        self.peer_addr().map(|addr| addr.ip())
+    }
+
+    pub(crate) fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.writer.peer_addr().ok()
     }
 
     pub(crate) fn peer_gone(&self) -> bool {
@@ -817,24 +831,45 @@ impl Request<'_> {
         }
         let mut slot = None;
         if let (false, Some(gate)) = (self.ready, self.gate) {
-            let deadline = Instant::now() + gate.body_time;
+            // A trusted-proxy peer is not capped per peer, and the one-slot-per-client key below does not
+            // bound how many clients it names: its readers draw on a sub-pool and hold a slot for less.
+            let via_proxy = self
+                .peer_addr()
+                .is_some_and(|addr| is_proxy(addr.ip(), &gate.trusted));
+            let hold = if via_proxy {
+                gate.body_time.min(gate.proxy_body_time)
+            } else {
+                gate.body_time
+            };
+            let deadline = Instant::now() + hold;
             self.handler = None;
             let forwarded = self
                 .headers
                 .iter()
                 .find(|h| h.field.equiv("x-forwarded-for"))
                 .map(|h| h.value.as_str());
-            let key = client_key(self.peer(), forwarded, &gate.trusted);
+            let key = connection_key(self.peer_addr(), forwarded, &gate.trusted);
             let Some(reader) = ReaderKey::take(&gate.readers, key) else {
                 self.restore_handler(gate)?;
                 return Err(BodyErr::Busy);
             };
+            let share = if via_proxy {
+                let Some(share) = gate.forwarded.acquire_until(self.stop, self.poll, deadline)
+                else {
+                    drop(reader);
+                    self.restore_handler(gate)?;
+                    return Err(BodyErr::Busy);
+                };
+                Some(share)
+            } else {
+                None
+            };
             let Some(permit) = gate.bodies.acquire_until(self.stop, self.poll, deadline) else {
-                drop(reader);
+                drop((share, reader));
                 self.restore_handler(gate)?;
                 return Err(BodyErr::Busy);
             };
-            slot = Some((permit, reader));
+            slot = Some((permit, share, reader));
             self.body.cap_deadline(deadline);
         }
         let mut bytes = Vec::new();
@@ -984,16 +1019,27 @@ pub(crate) struct Conns {
     sockets: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
     permits: Arc<Pool>,
     poll: Duration,
+    /// A second handle on the listening socket, kept to wake the acceptor: it outlives the acceptor's own, so the
+    /// descriptor cannot be reused by anything else while shutdown signals it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    waker: Option<TcpListener>,
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     wake: SocketAddr,
     acceptor: Option<JoinHandle<()>>,
 }
+
+/// How long a platform without a listener-shutdown wake may spend reaching the acceptor with a loopback connect.
+#[cfg(not(target_os = "linux"))]
+const WAKE_BY_CONNECT: Duration = Duration::from_secs(2);
 
 impl Conns {
     pub(crate) fn close(mut self) {
         self.shutdown();
     }
 
-    fn shutdown(&mut self) {
+    /// Stop accepting, cut every open connection, join the acceptor and wait for the handlers to finish. Returns
+    /// whether the acceptor was joined.
+    fn shutdown(&mut self) -> bool {
         self.stop.store(true, Ordering::Release);
         for socket in self
             .sockets
@@ -1003,33 +1049,55 @@ impl Conns {
         {
             let _ = socket.shutdown(Shutdown::Both);
         }
+        let mut joined = true;
         if let Some(acceptor) = self.acceptor.take() {
-            let target = match self.wake.ip() {
-                IpAddr::V4(ip) if ip.is_unspecified() => {
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, self.wake.port()))
-                }
-                IpAddr::V6(ip) if ip.is_unspecified() => {
-                    SocketAddr::from((Ipv6Addr::LOCALHOST, self.wake.port()))
-                }
-                _ => self.wake,
-            };
-            for _ in 0..50 {
-                if acceptor.is_finished() {
-                    break;
-                }
-                let _ = TcpStream::connect_timeout(&target, Duration::from_millis(100));
-                for _ in 0..20 {
-                    if acceptor.is_finished() {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
-            if acceptor.is_finished() {
+            self.wake_acceptor(&acceptor);
+            joined = acceptor.is_finished();
+            if joined {
                 let _ = acceptor.join();
             }
         }
         self.permits.wait_full(self.poll);
+        joined
+    }
+
+    /// Linux: `shutdown(2)` on a listening socket fails a blocked `accept` at once and every later one, so the acceptor
+    /// always reaches its stop check; every other wait it has is bounded by `poll`, and the join below cannot hang.
+    #[cfg(target_os = "linux")]
+    fn wake_acceptor(&self, acceptor: &JoinHandle<()>) {
+        use std::os::fd::AsRawFd;
+        if let Some(listener) = &self.waker {
+            // SAFETY: the descriptor is owned by `listener`, open for this whole call.
+            unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) };
+        }
+        // A failed signal (the acceptor was already past it) still ends within `poll`; wait for that, not for a retry.
+        let deadline = Instant::now() + self.poll * 4 + Duration::from_millis(250);
+        while !acceptor.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Elsewhere there is no wake for a blocked `accept` but a connection, so make one and look again, bounded.
+    #[cfg(not(target_os = "linux"))]
+    fn wake_acceptor(&self, acceptor: &JoinHandle<()>) {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let target = match self.wake.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => {
+                SocketAddr::from((Ipv4Addr::LOCALHOST, self.wake.port()))
+            }
+            IpAddr::V6(ip) if ip.is_unspecified() => {
+                SocketAddr::from((Ipv6Addr::LOCALHOST, self.wake.port()))
+            }
+            _ => self.wake,
+        };
+        let deadline = Instant::now() + WAKE_BY_CONNECT;
+        while !acceptor.is_finished() && Instant::now() < deadline {
+            let _ = TcpStream::connect_timeout(&target, Duration::from_millis(100));
+            let settle = Instant::now() + Duration::from_millis(20);
+            while !acceptor.is_finished() && Instant::now() < settle {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
 
@@ -1048,6 +1116,7 @@ pub(crate) fn listen(
 ) -> io::Result<Conns> {
     listener.set_nonblocking(false)?;
     let wake = listener.local_addr()?;
+    let waker = listener.try_clone().ok();
     let (sockets, permits) = (
         Arc::new(Mutex::new(BTreeMap::new())),
         Pool::new(tune.connections),
@@ -1055,7 +1124,9 @@ pub(crate) fn listen(
     let gate = Arc::new(Gate {
         handlers: Pool::new(tune.handlers),
         bodies: Pool::new(tune.public_bodies),
+        forwarded: Pool::new(tune.proxy_bodies.min(tune.public_bodies)),
         body_time: tune.public_body_time,
+        proxy_body_time: tune.proxy_body_time,
         readers: Arc::new(Mutex::new(HashSet::new())),
         trusted: exempt.clone(),
     });
@@ -1079,6 +1150,7 @@ pub(crate) fn listen(
         sockets,
         permits,
         poll: tune.poll,
+        waker,
         wake,
         acceptor: Some(acceptor),
     })
@@ -1188,6 +1260,7 @@ fn accept_loop(
                         .remove(&id);
                 }
             }
+            Err(_) if stop.load(Ordering::Acquire) => break,
             Err(_) => thread::sleep(tune.poll),
         }
     }
@@ -1313,6 +1386,8 @@ mod tests {
             body_time: Duration::from_millis(300),
             public_bodies: 1,
             public_body_time: Duration::from_millis(300),
+            proxy_bodies: 1,
+            proxy_body_time: Duration::from_secs(60),
             per_peer: 16,
             write_stall: Duration::from_secs(1),
             poll: Duration::from_millis(10),
@@ -1623,6 +1698,71 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_joins_the_acceptor_well_under_a_second_with_the_default_poll() {
+        for busy in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut conns = listen(
+                listener,
+                Arc::new(|request: &mut Request| {
+                    let _ = request.respond(Response::from_string("ok"));
+                }),
+                Arc::new(AtomicBool::new(false)),
+                Tune {
+                    poll: Duration::from_millis(100),
+                    ..tune()
+                },
+                Vec::new(),
+            )
+            .unwrap();
+            // Busy: fill the pool so the acceptor waits for a permit instead of sitting in accept.
+            let held: Vec<TcpStream> = if busy {
+                (0..2).map(|_| TcpStream::connect(addr).unwrap()).collect()
+            } else {
+                Vec::new()
+            };
+            thread::sleep(Duration::from_millis(150));
+            let started = Instant::now();
+            assert!(conns.shutdown(), "the acceptor must be joined");
+            assert!(
+                started.elapsed() < Duration::from_millis(800),
+                "shutdown took {:?}",
+                started.elapsed()
+            );
+            drop(held);
+            assert!(conns.acceptor.is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_does_not_need_the_wake_address_to_be_reachable() {
+        // A listener on an address a self-connect cannot reach used to cost the whole retry budget (about 6 s) and leave
+        // the acceptor detached; the listener-level wake does not use the address at all.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut conns = listen(
+            listener,
+            Arc::new(|_: &mut Request| {}),
+            Arc::new(AtomicBool::new(false)),
+            Tune {
+                poll: Duration::from_millis(100),
+                ..tune()
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        conns.wake = SocketAddr::from((std::net::Ipv4Addr::new(192, 0, 2, 1), 9));
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        assert!(conns.shutdown());
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "shutdown took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn server_caps_connections_and_parks_overflow() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1771,6 +1911,7 @@ mod tests {
                 connections: 6,
                 handlers: 4,
                 public_bodies: 2,
+                proxy_bodies: 2,
                 public_body_time: Duration::from_secs(3),
                 ..tune()
             },
@@ -1807,6 +1948,171 @@ mod tests {
         other.write_all(b"k").unwrap();
         let other = status(other);
         assert!(other.starts_with(b"HTTP/1.1 200"), "got {other:?}");
+        conns.close();
+    }
+
+    // A trusted proxy that names no client must not serialize everyone behind it onto one body slot.
+    #[test]
+    fn connections_of_an_unforwarding_proxy_hold_separate_body_slots() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conns = listen(
+            listener,
+            Arc::new(|request: &mut Request| {
+                let outcome = request.public_body(1024).map(|b| b.len());
+                let status = if outcome.is_ok() { 200 } else { 400 };
+                let _ = request.respond(
+                    Response::from_string(String::new()).with_status_code(StatusCode(status)),
+                );
+            }),
+            Arc::new(AtomicBool::new(false)),
+            Tune {
+                connections: 6,
+                handlers: 4,
+                public_bodies: 2,
+                proxy_bodies: 2,
+                public_body_time: Duration::from_secs(3),
+                ..tune()
+            },
+            TrustedProxy::loopback(),
+        )
+        .unwrap();
+        let post = |body: &str, declared: usize| {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "POST /p HTTP/1.1\r\nhost: h\r\ncontent-length: {declared}\r\n\r\n{body}"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stream
+        };
+        let _slow = post("x", 100);
+        thread::sleep(Duration::from_millis(150));
+        // A second connection from the same proxy address is another client, not a refused duplicate.
+        let mut other = post("o", 2);
+        thread::sleep(Duration::from_millis(100));
+        other.write_all(b"k").unwrap();
+        other
+            .set_read_timeout(Some(Duration::from_millis(1500)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let n = other.read(&mut buf).expect("answered in time");
+        assert!(buf[..n].starts_with(b"HTTP/1.1 200"), "got {:?}", &buf[..n]);
+        conns.close();
+    }
+
+    // The listener is dual-stack. Only ::1 is the proxy; a client that connects to 127.0.0.1 arrives as the
+    // untrusted ::ffff:127.0.0.1. (A connection to 127.0.0.2 would not do: Linux picks 127.0.0.1 as its
+    // source, which would make every "direct" client the proxy.)
+    const PROXY_HOST: &str = "::1";
+    const DIRECT_HOST: &str = "127.0.0.1";
+
+    fn proxy_listener(proxy_time: Duration) -> (Conns, u16) {
+        let listener = TcpListener::bind("[::]:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conns = listen(
+            listener,
+            Arc::new(|request: &mut Request| {
+                let outcome = request.public_body(1024).map(|b| b.len());
+                let status = if outcome.is_ok() { 200 } else { 400 };
+                let _ = request.respond(
+                    Response::from_string(String::new()).with_status_code(StatusCode(status)),
+                );
+            }),
+            Arc::new(AtomicBool::new(false)),
+            Tune {
+                connections: 8,
+                handlers: 4,
+                public_bodies: 2,
+                proxy_bodies: 1,
+                public_body_time: Duration::from_secs(3),
+                body_time: Duration::from_secs(5),
+                proxy_body_time: proxy_time,
+                ..tune()
+            },
+            vec![TrustedProxy::parse(PROXY_HOST).unwrap()],
+        )
+        .unwrap();
+        (conns, port)
+    }
+
+    fn post_via(
+        host: &str,
+        port: u16,
+        client: Option<&str>,
+        body: &str,
+        declared: usize,
+    ) -> TcpStream {
+        let mut stream = TcpStream::connect((host, port)).unwrap();
+        let forwarded = client.map_or(String::new(), |c| format!("x-forwarded-for: {c}\r\n"));
+        stream
+            .write_all(
+                format!(
+                    "POST /p HTTP/1.1\r\nhost: h\r\n{forwarded}content-length: {declared}\r\n\r\n{body}"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        stream
+    }
+
+    fn reply_of(mut stream: TcpStream, within: Duration) -> Vec<u8> {
+        stream.set_read_timeout(Some(within)).unwrap();
+        let mut buf = [0u8; 16];
+        let n = stream.read(&mut buf).expect("answered in time");
+        buf[..n].to_vec()
+    }
+
+    #[test]
+    fn forwarded_clients_cannot_take_the_slot_direct_clients_need() {
+        let (conns, port) = proxy_listener(Duration::from_millis(1500));
+        let _slow = post_via(PROXY_HOST, port, Some("198.51.100.1"), "x", 100);
+        thread::sleep(Duration::from_millis(150));
+
+        // A direct client still gets the remaining slot while a forwarded reader is held.
+        let mut direct = post_via(DIRECT_HOST, port, None, "o", 2);
+        thread::sleep(Duration::from_millis(100));
+        direct.write_all(b"k").unwrap();
+        let direct = reply_of(direct, Duration::from_millis(400));
+        assert!(direct.starts_with(b"HTTP/1.1 200"), "got {direct:?}");
+
+        // Another forwarded address waits for the proxy share although a slot is free, and is served
+        // once the first reader's shorter hold ends.
+        let mut other = post_via(PROXY_HOST, port, Some("198.51.100.2"), "o", 2);
+        thread::sleep(Duration::from_millis(100));
+        other.write_all(b"k").unwrap();
+        other
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        assert!(other.read(&mut buf).is_err(), "served past the proxy share");
+        let late = reply_of(other, Duration::from_millis(2500));
+        assert!(late.starts_with(b"HTTP/1.1 200"), "got {late:?}");
+        conns.close();
+    }
+
+    #[test]
+    fn a_forwarded_reader_holds_its_slot_for_less_than_a_direct_one() {
+        let (conns, port) = proxy_listener(Duration::from_millis(500));
+        let started = Instant::now();
+        let forwarded = post_via(PROXY_HOST, port, Some("198.51.100.1"), "x", 100);
+        let reply = reply_of(forwarded, Duration::from_millis(2500));
+        assert!(reply.starts_with(b"HTTP/1.1 400"), "got {reply:?}");
+        assert!(started.elapsed() < Duration::from_millis(2000));
+
+        // The same trickle from a direct client is still being waited on after the forwarded limit.
+        let mut direct = post_via(DIRECT_HOST, port, None, "x", 100);
+        direct
+            .set_read_timeout(Some(Duration::from_millis(1200)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        assert!(
+            direct.read(&mut buf).is_err(),
+            "direct reader cut too early"
+        );
         conns.close();
     }
 

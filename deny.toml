@@ -1,0 +1,50 @@
+# Dependency policy for the release artifacts (docs/releasing.md#dependency-and-license-inventory).
+# Checked by `cargo licenses`; the committed inventory is THIRD-PARTY-LICENSES.md,
+# regenerated and compared by scripts/release/check-inventory.sh.
+
+[graph]
+# Only what the release packages contain: Linux x86_64/arm64 (server, worker,
+# CLI), the static musl guest agent and the Windows CLI.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+exclude-dev = true
+
+[licenses]
+version = 2
+# Permissive licenses only. A dependency under any other license fails the check
+# until a person adds it here with a reason.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[advisories]
+version = 2
+yanked = "warn"

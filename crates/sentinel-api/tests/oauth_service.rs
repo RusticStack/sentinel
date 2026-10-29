@@ -694,3 +694,190 @@ fn a_foreign_tenant_is_not_found_like_a_missing_one() {
         );
     }
 }
+
+#[test]
+fn withdrawing_a_service_accounts_repository_access_needs_a_stepped_up_session() {
+    let d = deployment();
+    let account = create_account(&d);
+    let path = format!("{ACCOUNTS}/{account}/repos/app");
+    let id: UserId = account.parse().unwrap();
+    let principal = Principal::new(id, P::REPOSITORY, None, None);
+    let holds = || {
+        d.store
+            .read(|c| auth::require_repo(c, principal, d.repo, P::READ))
+            .is_ok()
+    };
+    let allowed = as_session(&d, "PUT", &path, &json!({"access": ["read"]}));
+    assert_eq!(allowed.status, 200, "{}", allowed.body);
+    assert!(holds());
+    let none = json!({"access": []});
+    // A bearer token, even the platform administrator's, and a session without a fresh proof both stay out.
+    let bearer = call(&d, "PUT", &path, &none, &root(&d));
+    assert_eq!(bearer.status, 403, "{}", bearer.body);
+    assert_eq!(bearer.body["details"]["step_up"], true);
+    let login = send(
+        &d,
+        "POST",
+        "/api/v1/login",
+        Body::Json(&json!({ "username": "root", "password": PASSWORD })),
+        &[],
+    );
+    let cookie = login
+        .header("set-cookie")
+        .and_then(|v| v.split(';').next())
+        .unwrap()
+        .to_owned();
+    let csrf = login.body["csrf"].as_str().unwrap().to_owned();
+    let cold = send(
+        &d,
+        "PUT",
+        &path,
+        Body::Json(&none),
+        &[("cookie", &cookie), ("x-sentinel-csrf", &csrf)],
+    );
+    assert_eq!(cold.status, 403, "{}", cold.body);
+    assert_eq!(cold.body["details"]["step_up"], true);
+    assert!(holds(), "a refused withdrawal keeps the access");
+    let withdrawn = as_session(&d, "PUT", &path, &none);
+    assert_eq!(withdrawn.status, 200, "{}", withdrawn.body);
+    assert_eq!(withdrawn.body["access"], json!([]));
+    assert!(!holds());
+}
+
+/// An administrator learns nothing about which `usr_` ids exist: a person, another tenant's account and an
+/// id that names nobody get the same status and body on every service-account route.
+#[test]
+fn service_account_routes_answer_alike_for_any_id_that_is_not_the_tenants_account() {
+    let d = deployment();
+    let (globex, root_id, foreign) = (TenantId::new(), d.root, UserId::new());
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            let root = Principal::new(root_id, P::ALL, None, None);
+            auth::create_namespace(
+                tx,
+                root,
+                globex,
+                Namespace::parse("globex").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )?;
+            auth::create_service_account(
+                tx,
+                auth::Authority::Credential {
+                    principal: root,
+                    stepped_up: true,
+                },
+                globex,
+                foreign,
+                "their-bot",
+                Role::Reader,
+                Some("fixture"),
+                now,
+            )
+        })
+        .unwrap();
+    let missing = UserId::new();
+    let routes = |account: UserId| {
+        [
+            (
+                "PUT",
+                format!("{ACCOUNTS}/{account}/repos/app"),
+                json!({"access": ["read"]}),
+            ),
+            (
+                "PUT",
+                format!("{ACCOUNTS}/{account}/repos/app"),
+                json!({"access": []}),
+            ),
+            (
+                "POST",
+                format!("{ACCOUNTS}/{account}/grants"),
+                json!({"name": "ci", "scope": "runs:read"}),
+            ),
+            ("GET", format!("{ACCOUNTS}/{account}/grants"), Value::Null),
+        ]
+    };
+    let answer = |account: UserId| -> Vec<(u16, Value)> {
+        routes(account)
+            .into_iter()
+            .map(|(method, path, body)| {
+                let reply = as_session(&d, method, &path, &body);
+                (reply.status, reply.body)
+            })
+            .collect()
+    };
+    let nobody = answer(missing);
+    assert!(
+        nobody.iter().all(|(status, _)| *status == 404),
+        "{nobody:?}"
+    );
+    for account in [d.dev, foreign, d.root] {
+        assert_eq!(answer(account), nobody, "{account}");
+    }
+}
+
+#[test]
+fn a_github_backed_tenant_refuses_member_edits_alike_for_every_unknown_id() {
+    let d = deployment();
+    let (tenant, foreign, globex, root_id) = (d.tenant, UserId::new(), TenantId::new(), d.root);
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            let root = Principal::new(root_id, P::ALL, None, None);
+            auth::create_namespace(
+                tx,
+                root,
+                globex,
+                Namespace::parse("globex").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )?;
+            auth::create_service_account(
+                tx,
+                auth::Authority::Credential {
+                    principal: root,
+                    stepped_up: true,
+                },
+                globex,
+                foreign,
+                "their-bot",
+                Role::Reader,
+                Some("fixture"),
+                now,
+            )?;
+            tx.execute(
+                "UPDATE tenants SET membership_source = 1 WHERE id = ?1",
+                [tenant.as_bytes()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let missing = UserId::new();
+    let answer = |account: UserId| -> Vec<(u16, Value)> {
+        let member = format!("/api/v1/tenants/acme/members/{account}");
+        let grant = format!("/api/v1/tenants/acme/repos/app/grants/{account}");
+        [
+            ("PUT", &member, json!({"role": "reader"})),
+            ("DELETE", &member, Value::Null),
+            ("PUT", &grant, json!({"access": ["read"]})),
+            ("PUT", &grant, json!({"access": []})),
+        ]
+        .into_iter()
+        .map(|(method, path, body)| {
+            let reply = as_session(&d, method, path, &body);
+            (reply.status, reply.body)
+        })
+        .collect()
+    };
+    let nobody = answer(missing);
+    assert!(
+        nobody.iter().all(|(status, _)| *status == 403),
+        "{nobody:?}"
+    );
+    for account in [d.dev, foreign] {
+        assert_eq!(answer(account), nobody, "{account}");
+    }
+}

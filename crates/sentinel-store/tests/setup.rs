@@ -696,3 +696,77 @@ fn settings_report_only_the_callers_own_github_standing() {
         Err(Error::NotFound)
     ));
 }
+
+impl World {
+    fn install(&self, provider: &str, external: &str, login: &str) {
+        let (provider, external, login) =
+            (provider.to_owned(), external.to_owned(), login.to_owned());
+        self.store
+            .writer()
+            .write(move |tx| {
+                registration::record_installation(tx, &provider, &external, &login, at(5))
+                    .map(|_| ())
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_self_service_organization_cannot_take_the_name_of_an_unbound_github_organization() {
+    let w = world(TenantCreation::ApprovedUsers);
+    let ada = w.member("ada");
+    // GitHub spells logins in mixed case; organization names are lowercase.
+    w.install("github", "1001", "Initech");
+    w.install("github", "1002", "acme");
+
+    for name in ["initech", "acme"] {
+        assert!(
+            matches!(w.create(ada, name, 10), Err(Error::Conflict)),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        count(
+            &w.store,
+            "SELECT COUNT(*) FROM tenants WHERE created_by IS NOT NULL"
+        ),
+        0
+    );
+    // The refusal is the same value as a taken name, so it adds no oracle beyond the slug check.
+    w.create(ada, "free-name", 11).unwrap();
+    let bob = w.member("bob");
+    assert!(matches!(
+        w.create(bob, "free-name", 12).unwrap_err(),
+        Error::Conflict
+    ));
+}
+
+#[test]
+fn a_github_name_stays_reserved_after_it_is_bound_to_a_differently_named_tenant() {
+    let w = world(TenantCreation::ApprovedUsers);
+    let ada = w.member("ada");
+    let tenant = w.create(ada, "acme-ci", 10).unwrap();
+    w.store
+        .writer()
+        .write(move |tx| {
+            let installation =
+                registration::record_installation(tx, "github", "2001", "acme", at(6))?;
+            registration::bind_installation(tx, ada, installation, tenant, at(7))
+        })
+        .unwrap();
+    let bob = w.member("bob");
+    assert!(matches!(w.create(bob, "acme", 20), Err(Error::Conflict)));
+}
+
+#[test]
+fn a_platform_administrator_and_other_providers_are_not_held_by_the_reservation() {
+    let w = world(TenantCreation::ApprovedUsers);
+    let ada = w.member("ada");
+    w.install("github", "3001", "bigco");
+    w.install("gitlab", "3002", "gitlab-only");
+
+    // The operator names an organization first and binds the installation afterwards.
+    w.create(w.admin, "bigco", 10).unwrap();
+    // Another forge's account name is not a GitHub organization.
+    w.create(ada, "gitlab-only", 11).unwrap();
+}

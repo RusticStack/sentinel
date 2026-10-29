@@ -37,7 +37,7 @@ Run from the repository root; aliases live in `.cargo/config.toml`. The test com
 
 | Purpose | Command |
 |---|---|
-| Portable checks (all OSes) | `cargo fmt-check`, `cargo lint`, `cargo test-cli`, `cargo release-cli` |
+| Portable checks (all OSes) | `cargo fmt-check`, `cargo lint`, `cargo test-cli`, `cargo release-cli`, `cargo licenses` (dependency policy, needs cargo-deny) |
 | Linux role checks | `cargo lint-linux`, `cargo test-server`, `cargo test-worker`, `cargo test-linux`, `cargo release-linux` |
 | Benchmark runner | `cargo bench-noop --runtime direct --warm-state warm`; contract runs `sentinel-bench --contract <file> --lane <id> --condition <c>` |
 | Feasibility probes | `cargo probe sqlite --path /tmp/d.sqlite` |
@@ -66,9 +66,9 @@ All aliases pass `--locked`; a dependency change must update and commit `Cargo.l
 | `crates/sentinel-pipeline` | `.sentinel.yml` loader, schema and compiler; see [docs/pipeline-schema.md](docs/pipeline-schema.md) |
 | `crates/sentinel-cache` | Worker-local cache metadata: scope paths, sealed-generation manifests, explainable hit/miss reasons; see [docs/cache.md](docs/cache.md) |
 | `crates/sentinel` | CLI (`pipeline`, `api` client, host-local `admin`) plus Linux `server`/`worker` roles behind features |
-| `crates/sentinel-bench` | Benchmark runner and contract checks; see [docs/benchmarking.md](docs/benchmarking.md), [benchmark contracts](docs/benchmark-contracts.md) |
+| `crates/sentinel-bench` | Benchmark runner, contract checks and the B11 paired-sample harness (`sentinel-b11`); see [docs/benchmarking.md](docs/benchmarking.md), [benchmark contracts](docs/benchmark-contracts.md) |
 | `crates/sentinel-probes` | SQLite/clone probes; see [docs/feasibility-probes.md](docs/feasibility-probes.md) |
-| `web/` | The web interface, `sentinel-web` (Nuxt 4, Vue, TypeScript, Nuxt UI; pnpm): pages, live event streams, the proxy to the API, its tests and benchmark; see [web interface](docs/web-ui.md) |
+| `web/` | The web interface, `sentinel-web` (TanStack Start, React, TypeScript, Tailwind CSS v4; pnpm), its own Node process with server rendering: pages, live event streams, the proxy to the API, its tests and benchmark; see [web interface](docs/web-ui.md) |
 | `bench/` | Committed machine-readable benchmark records, frozen contracts (`bench/contracts/`), harness scripts and host setup (`bench/hosts/`) |
 | `fixtures/` | Valid and invalid pipeline fixtures exercised by tests |
 | `docs/` | Contracts and guides: [development](docs/development.md), [configuration](docs/configuration.md), [runtime foundations](docs/runtime-foundation.md) |

@@ -22,7 +22,8 @@ use sentinel_store::{
 };
 
 const RUNS: u32 = 20_000;
-const BIG: u32 = 2_048;
+// 1 MiB objects; SENTINEL_DRILL_BIG overrides it (102400 is the 100 GiB objective, which needs three times that in free disk).
+const BIG_DEFAULT: u32 = 2_048;
 const SMALL: u32 = 1_000;
 const LOGS: u32 = 200;
 // Each frame stays under the 32 KiB frame cap.
@@ -47,6 +48,10 @@ fn mib(bytes: u64) -> f64 {
 #[test]
 #[ignore = "the R04 drill: minutes and gigabytes; run on the verification VPS"]
 fn drill() {
+    let big: u32 = std::env::var("SENTINEL_DRILL_BIG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BIG_DEFAULT);
     let root_dir = std::env::var_os("SENTINEL_DRILL_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -175,8 +180,8 @@ fn drill() {
         logs.finish(run, offer.job, offer.attempt, LOG_FRAMES, &[])
             .unwrap();
     }
-    for i in 0..BIG + SMALL {
-        let body = bytes(u64::from(i) + 1, if i < BIG { 1 << 20 } else { 4 << 10 });
+    for i in 0..big + SMALL {
+        let body = bytes(u64::from(i) + 1, if i < big { 1 << 20 } else { 4 << 10 });
         let staged = objects
             .stage(tenant, body.as_slice(), u64::MAX, Expect::default())
             .unwrap();
@@ -215,9 +220,14 @@ fn drill() {
         recovery.missing.is_empty() && recovery.corrupt.is_empty(),
         "{recovery:?}"
     );
-    assert_eq!(report.objects, u64::from(BIG + SMALL));
+    assert_eq!(report.objects, u64::from(big + SMALL));
     assert!(report.log_files >= u64::from(LOGS) * 2);
 
+    // The restore is an I/O-bound copy, so its rate per GiB carries over to the objective's size.
+    let gib = (u64::from(big) * (1 << 20) + u64::from(SMALL) * (4 << 10) + full.log_bytes_copied)
+        as f64
+        / (1u64 << 30) as f64;
+    let restore_s_per_gib = (restore_ms + open_ms) as f64 / 1_000.0 / gib;
     let load = std::fs::read_to_string("/proc/pressure/cpu")
         .ok()
         .and_then(|p| p.lines().next().map(str::to_owned));
@@ -228,8 +238,8 @@ fn drill() {
             "date_ms": UnixMillis::now().0,
             "dataset": {
                 "runs": RUNS,
-                "objects": BIG + SMALL,
-                "object_mib": mib(u64::from(BIG) * (1 << 20) + u64::from(SMALL) * (4 << 10)),
+                "objects": big + SMALL,
+                "object_mib": mib(u64::from(big) * (1 << 20) + u64::from(SMALL) * (4 << 10)),
                 "logs": LOGS,
                 "log_mib_copied": mib(full.log_bytes_copied),
                 "metadata_mib": mib(metadata_bytes),
@@ -242,6 +252,9 @@ fn drill() {
             "restore_copy_ms": restore_ms,
             "restore_open_and_recover_ms": open_ms,
             "restore_total_ms": restore_ms + open_ms,
+            "data_gib": (gib * 100.0).round() / 100.0,
+            "restore_s_per_gib": (restore_s_per_gib * 100.0).round() / 100.0,
+            "rto_100gib_extrapolated_s": (restore_s_per_gib * 100.0).round(),
             "cpu_pressure": load,
         })
     );

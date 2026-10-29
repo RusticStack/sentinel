@@ -2,19 +2,22 @@
 
 pub mod auth;
 mod github;
+mod github_app;
 mod http;
 mod login_guard;
 mod mcp;
 mod metrics;
 mod oauth;
+mod refresh;
 mod routes;
 mod secret_routes;
+mod worker_bootstrap;
 
 use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize},
     },
     time::Duration,
 };
@@ -24,13 +27,25 @@ use sentinel_link::controller::Handle;
 use sentinel_store::{Store, logs::LogStore, objects::Objects};
 
 pub use github::GithubSignIn;
+pub use github_app::{Activation, AppSource, GithubAppSetup, OnActivate};
 pub use oauth::limit::TrustedProxy;
+pub use worker_bootstrap::{
+    Pin, Settings as WorkerBootstrapSettings, TailcatRelease, WorkerBootstrap,
+};
 
 pub const WORKERS: usize = 8;
 pub const CONNECTIONS: usize = 64;
 /// Connections one peer address (an IPv6 /64 counts as one) may hold; a configured reverse proxy is exempt.
 pub const CONNECTIONS_PER_PEER: usize = 16;
 pub const PUBLIC_BODIES: usize = 4;
+/// Public body slots that clients behind a trusted proxy hold together; the rest are for direct clients.
+pub const PROXY_BODIES: usize = 3;
+/// The longest a client behind a trusted proxy holds a public body slot (direct clients: 10 s).
+pub const PROXY_BODY_TIME: Duration = Duration::from_secs(5);
+const _: () = assert!(
+    PROXY_BODIES >= 1 && PROXY_BODIES < PUBLIC_BODIES,
+    "forwarded clients must leave a public body slot for direct ones"
+);
 pub const LOG_WAIT: Duration = Duration::from_secs(25);
 pub const TRANSFERS: usize = 3;
 pub const SUBSCRIBERS: usize = 32;
@@ -51,7 +66,7 @@ const _: () = assert!(
 /// Keeps a handler permit free for control requests: a third-party call past the budget is refused, never queued.
 pub const OUTBOUND: usize = 1;
 const _: () = assert!(
-    WORKERS - TRANSFERS - 3 * OUTBOUND >= 1,
+    WORKERS - TRANSFERS - 4 * OUTBOUND >= 1,
     "keep a handler permit for control requests"
 );
 
@@ -112,32 +127,56 @@ pub struct AutoJoinRule {
 pub struct Options {
     pub auto_join: Vec<AutoJoinRule>,
     pub mail: Option<Arc<sentinel_mail::Resend>>,
+    /// The GitHub App in force and the one-click manifest flow ([`GithubAppSetup`]).
+    pub github_app: GithubAppSetup,
+    /// Lets platform administrators issue worker enrollments and download their bootstrap script (Q11).
+    pub worker_bootstrap: Option<Arc<WorkerBootstrap>>,
+    /// Called after a machine redeems an enrollment, so the controller admits its Tailcat node key
+    /// at once instead of at its next periodic pass.
+    pub on_worker_enrolled: Option<Notify>,
+}
+
+/// A callback the embedding controller hands the API.
+#[derive(Clone)]
+pub struct Notify(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Notify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Notify")
+    }
 }
 
 pub(crate) struct State {
     pub auto_join: Vec<AutoJoinRule>,
     pub mail: Option<Arc<sentinel_mail::Resend>>,
+    pub worker_bootstrap: Option<Arc<WorkerBootstrap>>,
+    pub on_worker_enrolled: Option<Notify>,
     pub setup_mail: Outbound,
     pub setup_closed: AtomicBool,
+    /// Until when (milliseconds since the first status request) the last store read of "setup is open" stands.
+    pub setup_open_until: AtomicU64,
     pub store: Arc<Store>,
     pub logs: Arc<LogStore>,
     pub objects: Arc<Objects>,
     pub controller: Handle,
     pub secret_key: Option<Arc<sentinel_auth::sealed::Key>>,
     pub sessions: sentinel_store::local_auth::Policy,
-    pub github_webhook_secret: Option<Arc<[u8]>>,
+    /// Set at most once: at start, or when a manifest conversion puts a new App in force.
+    pub github_webhook_secret: std::sync::OnceLock<Arc<[u8]>>,
     pub intake: Option<sentinel_intake::Waker>,
     pub transfers: Arc<AtomicUsize>,
     pub subscribers: Subscribers,
     pub stop: Arc<AtomicBool>,
     pub oauth: oauth::OAuthState,
     pub mcp_sessions: mcp::Sessions,
-    pub github: Option<github::Github>,
+    pub github: std::sync::OnceLock<github::Github>,
+    pub github_app: github_app::Runtime,
     pub trusted_proxies: Vec<TrustedProxy>,
     pub fetches: Outbound,
     pub logins: login_guard::LoginGuard,
     pub exchanges: Outbound,
     pub requests: metrics::Requests,
+    pub refresh: refresh::Refresh,
 }
 
 #[derive(Default)]
@@ -219,7 +258,7 @@ impl Server {
     pub fn start_with(config: Config, options: Options) -> std::io::Result<Server> {
         let listener = std::net::TcpListener::bind(config.listen)?;
         let addr = listener.local_addr()?;
-        let issuer = match config.public_url {
+        let issuer = match &config.public_url {
             Some(url) => url.trim_end_matches('/').to_owned(),
             None => format!("http://{addr}"),
         };
@@ -235,18 +274,34 @@ impl Server {
             })?;
         let stop = Arc::new(AtomicBool::new(false));
         let proxies = config.trusted_proxies.clone();
+        let github = github.map(std::sync::OnceLock::from).unwrap_or_default();
+        let github_webhook_secret = config
+            .github_webhook_secret
+            .map(std::sync::OnceLock::from)
+            .unwrap_or_default();
+        let github_app = github_app::Runtime::new(
+            options.github_app,
+            config
+                .public_url
+                .as_deref()
+                .map(|url| url.trim_end_matches('/')),
+        );
+        let refresh = refresh::Refresh::start(Arc::downgrade(&config.store))?;
         let state = Arc::new(State {
             auto_join: options.auto_join,
             mail: options.mail,
+            worker_bootstrap: options.worker_bootstrap,
+            on_worker_enrolled: options.on_worker_enrolled,
             setup_mail: Outbound::default(),
             setup_closed: AtomicBool::new(false),
+            setup_open_until: AtomicU64::new(0),
             store: config.store,
             logs: config.logs,
             objects: config.objects,
             controller: config.controller,
             secret_key: config.secret_key,
             sessions: config.sessions,
-            github_webhook_secret: config.github_webhook_secret,
+            github_webhook_secret,
             intake: config.intake,
             transfers: Arc::new(AtomicUsize::new(0)),
             subscribers: Subscribers::default(),
@@ -254,11 +309,13 @@ impl Server {
             oauth: oauth::OAuthState::new(issuer.clone()),
             mcp_sessions: mcp::Sessions::default(),
             github,
+            github_app,
             trusted_proxies: config.trusted_proxies,
             fetches: Outbound::default(),
             logins: login_guard::LoginGuard::default(),
             exchanges: Outbound::default(),
             requests: metrics::Requests::default(),
+            refresh,
         });
         let conns = http::listen(
             listener,

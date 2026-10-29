@@ -1,0 +1,39 @@
+# A worker (`sentinel worker`) as an image that carries its own rootless
+# Podman, built from the unpacked release package.
+#
+#   tar -xzf sentinel-<version>-<arch>-linux-worker.tar.gz
+#   podman build -f sentinel-*/examples/Containerfile.worker -t sentinel-worker:<version> sentinel-*/
+#
+# Jobs run in containers started by the Podman inside this one, so the
+# container needs to run privileged (examples/compose.worker.yaml; what that
+# means and what was measured: docs/deployment.md#a-worker).
+# A systemd unit on the host (examples/sentinel-worker.service) is the
+# better-isolated way to run a worker; use this where only containers are
+# allowed. BASE needs the glibc of the host the package was built on, or newer.
+ARG BASE=docker.io/library/ubuntu:26.04
+FROM ${BASE}
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates git podman uidmap fuse-overlayfs passt crun dbus-user-session \
+ && rm -rf /var/lib/apt/lists/* \
+ && (userdel -r ubuntu 2>/dev/null || true) \
+ && groupadd --system --gid 10002 sentinel-worker \
+ && useradd --no-create-home --uid 10002 --gid sentinel-worker \
+      --home-dir /var/lib/sentinel-worker --shell /usr/sbin/nologin sentinel-worker \
+ && echo 'sentinel-worker:20000:30000' >/etc/subuid \
+ && echo 'sentinel-worker:20000:30000' >/etc/subgid \
+ && install -d -o sentinel-worker -g sentinel-worker -m 0700 \
+      /var/lib/sentinel-worker /var/lib/sentinel-worker/tmp
+COPY --chmod=0755 bin/sentinel /usr/local/bin/sentinel
+COPY --chmod=0644 LICENSE THIRD-PARTY-LICENSES.md BUILD-INFO /usr/share/doc/sentinel/
+USER sentinel-worker
+WORKDIR /var/lib/sentinel-worker
+ENV HOME=/var/lib/sentinel-worker \
+    TMPDIR=/var/lib/sentinel-worker/tmp
+# Podman's images and containers live under $HOME/.local/share/containers: the
+# volume holds them with the worker's own state.
+VOLUME /var/lib/sentinel-worker
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/sentinel"]
+CMD ["worker", "--config", "/etc/sentinel/worker.toml", "--data-dir", "/var/lib/sentinel-worker"]

@@ -1223,6 +1223,7 @@ version = "0.1.0-dev"
 dependencies = [
  "blake3",
  "form_urlencoded",
+ "libc",
  "ring",
  "sentinel-auth",
  "sentinel-core",
@@ -1432,6 +1433,7 @@ dependencies = [
  "md-5",
  "quick-xml",
  "ring",
+ "serde_json",
  "ureq",
  "zeroize",
 ]

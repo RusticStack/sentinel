@@ -28,6 +28,7 @@ rustix = { version = "1.1", features = ["fs"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks", "trace"] }
 tempfile = "3.20"
 
 [lints]

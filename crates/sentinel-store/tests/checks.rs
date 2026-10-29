@@ -203,6 +203,7 @@ fn accept(f: &mut Fixture, repo: RepoId, id: &str, ref_name: &str) -> DeliveryId
         &tx,
         repo,
         &NewDelivery {
+            authentication: sentinel_store::intake::Authentication::HookToken,
             provider: "generic",
             external_id: id,
             event: "ref_update",
@@ -446,6 +447,7 @@ fn a_settled_event_owes_a_completed_check_unless_nothing_can_be_told() {
         &tx,
         f.repo,
         &NewDelivery {
+            authentication: sentinel_store::intake::Authentication::SignedWebhook,
             provider: "github",
             external_id: "pr-1",
             event: "pull_request",

@@ -4,6 +4,7 @@
 pub mod attach;
 pub mod clone;
 mod confined;
+pub mod cost;
 pub mod gc;
 pub mod lease;
 pub mod manifest;
@@ -15,6 +16,7 @@ pub mod scope;
 
 pub use attach::{Attached, Committed, Costly, Stats, Target};
 pub use clone::Backend;
+pub use cost::{ClassFigures, CostBook, Estimate};
 pub use manifest::{Boundary, Compat, FileEntry, FilesBlob, Manifest, Request};
 pub use outcome::{Hit, Miss, Outcome};
 pub use scope::{Os, Platform, Scope};

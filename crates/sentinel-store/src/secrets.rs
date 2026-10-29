@@ -1235,7 +1235,7 @@ fn prepare(
             encoded: encode_bundle(&DeliveryBundle::empty())?,
         });
     }
-    // Bindings match any job and step, so only provenance keeps manual pipelines from receiving secrets.
+    // Bindings match any job and step, so only a verified delivery keeps caller-authored and polled runs from receiving secrets.
     if !crate::provenance::may_receive_secrets(tx, run)? {
         let (step, name) = declared_targets(compiled)
             .next()
@@ -1453,7 +1453,9 @@ pub fn refuse_delivery(
     {
         return Ok(Some(Refusal {
             fence: Fence(fence as u64),
-            detail: format!("secret {name}: withheld from a manual run"),
+            detail: format!(
+                "secret {name}: withheld from a run without a verified webhook delivery"
+            ),
         }));
     }
     for (step, name) in declared_targets(compiled) {

@@ -103,12 +103,21 @@ pub enum Event {
     EmailVerificationRequested = 59,
     EmailVerified = 60,
     MailAbandoned = 61,
+    UnverifiedAccountPurged = 62,
     GithubMemberJoined = 70,
     GithubMemberRoleChanged = 71,
     GithubMemberRemoved = 72,
     TenantBackingChanged = 73,
     DomainAutoJoined = 74,
     MfaEnrollmentStarted = 75,
+    GithubAppCreated = 76,
+    GithubAppStateRefused = 77,
+    WorkerUninstallRequested = 90,
+    WorkerUninstalled = 91,
+    WorkerBootstrapDownloaded = 92,
+    WorkerEnrollmentRevoked = 93,
+    WorkerPolicyChanged = 94,
+    WorkerNodeKeyAuthorized = 95,
 }
 
 impl Event {
@@ -175,12 +184,21 @@ impl Event {
             Event::EmailVerificationRequested => "email-verification-requested",
             Event::EmailVerified => "email-verified",
             Event::MailAbandoned => "mail-abandoned",
+            Event::UnverifiedAccountPurged => "unverified-account-purged",
             Event::GithubMemberJoined => "github-member-joined",
             Event::GithubMemberRoleChanged => "github-member-role-changed",
             Event::GithubMemberRemoved => "github-member-removed",
             Event::TenantBackingChanged => "tenant-backing-changed",
             Event::DomainAutoJoined => "domain-auto-joined",
             Event::MfaEnrollmentStarted => "mfa-enrollment-started",
+            Event::GithubAppCreated => "github-app-created",
+            Event::GithubAppStateRefused => "github-app-state-refused",
+            Event::WorkerUninstallRequested => "worker-uninstall-requested",
+            Event::WorkerUninstalled => "worker-uninstalled",
+            Event::WorkerBootstrapDownloaded => "worker-bootstrap-downloaded",
+            Event::WorkerEnrollmentRevoked => "worker-enrollment-revoked",
+            Event::WorkerPolicyChanged => "worker-policy-changed",
+            Event::WorkerNodeKeyAuthorized => "worker-node-key-authorized",
         }
     }
 
@@ -247,12 +265,21 @@ impl Event {
             59 => Event::EmailVerificationRequested,
             60 => Event::EmailVerified,
             61 => Event::MailAbandoned,
+            62 => Event::UnverifiedAccountPurged,
             70 => Event::GithubMemberJoined,
             71 => Event::GithubMemberRoleChanged,
             72 => Event::GithubMemberRemoved,
             73 => Event::TenantBackingChanged,
             74 => Event::DomainAutoJoined,
             75 => Event::MfaEnrollmentStarted,
+            76 => Event::GithubAppCreated,
+            77 => Event::GithubAppStateRefused,
+            90 => Event::WorkerUninstallRequested,
+            91 => Event::WorkerUninstalled,
+            92 => Event::WorkerBootstrapDownloaded,
+            93 => Event::WorkerEnrollmentRevoked,
+            94 => Event::WorkerPolicyChanged,
+            95 => Event::WorkerNodeKeyAuthorized,
             _ => return None,
         })
     }
@@ -683,7 +710,7 @@ pub fn issue_session(
         ],
     )?;
     crate::github_members::enqueue_user(tx, user, now)?;
-    crate::auto_join::apply(tx, user, now)?;
+    crate::auto_join::apply_if_due(tx, user, now)?;
     Ok(Issued {
         user,
         session,
@@ -1133,6 +1160,24 @@ pub fn audit_page(conn: &Connection, before: Option<i64>, limit: u16) -> Result<
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
+
+    use super::Event;
+
+    #[test]
+    fn audit_event_codes_and_names_are_unique_and_round_trip() {
+        let mut names = std::collections::HashSet::new();
+        let mut known = 0;
+        for code in 0..=255i64 {
+            if let Some(event) = Event::from_code(code) {
+                known += 1;
+                assert_eq!(event as i64, code, "{event:?} decodes from another code");
+                assert!(names.insert(event.name()), "name {} reused", event.name());
+            }
+        }
+        // 62 contiguous codes plus the 70..=77 and 90..=95 blocks; a new event must be added to `from_code` too.
+        assert_eq!(known, 62 + 8 + 6, "an event is missing from from_code");
+        assert!(Event::from_code(0).is_none() && Event::from_code(63).is_none());
+    }
 
     #[test]
     fn session_validation_and_credential_lookup_are_index_searches() {

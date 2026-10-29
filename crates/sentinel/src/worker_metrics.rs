@@ -25,6 +25,19 @@ pub struct Metrics {
     pub cache_entries: AtomicU64,
     pub images_held: AtomicU64,
     pub images_in_flight: AtomicU64,
+    pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
+    pub cache_costly_hits: AtomicU64,
+    pub cache_lock_wait_ns: AtomicU64,
+    pub cache_clone_ns: AtomicU64,
+    pub cache_first_touch_ns: AtomicU64,
+    pub cache_commit_ns: AtomicU64,
+    pub cache_restored_bytes: AtomicU64,
+    pub cache_copied_bytes: AtomicU64,
+    pub cache_dirty_bytes: AtomicU64,
+    /// Settled per-class estimates in nanoseconds, indexed by class code; zero is not yet settled.
+    pub cache_restore_ns: [AtomicU64; 3],
+    pub cache_rebuild_ns: [AtomicU64; 3],
     pub executor: OnceLock<sentinel_worker::executor::Executor>,
 }
 
@@ -46,7 +59,27 @@ impl Metrics {
             Notice::ImagesReclaimed(removed) => {
                 self.images_reclaimed.fetch_add(*removed as u64, Relaxed);
             }
+            Notice::CacheFigures(t) => {
+                let sum = |a: &AtomicU64, v: u64| {
+                    a.fetch_add(v, Relaxed);
+                };
+                sum(&self.cache_hits, t.hits);
+                sum(&self.cache_misses, t.misses);
+                sum(&self.cache_costly_hits, t.costly_hits);
+                sum(&self.cache_lock_wait_ns, t.lock_wait_ns);
+                sum(&self.cache_clone_ns, t.clone_ns);
+                sum(&self.cache_first_touch_ns, t.first_touch_ns);
+                sum(&self.cache_commit_ns, t.commit_ns);
+                sum(&self.cache_restored_bytes, t.restored_bytes);
+                sum(&self.cache_copied_bytes, t.copied_bytes);
+                sum(&self.cache_dirty_bytes, t.dirty_bytes);
+            }
             Notice::Availability(snapshot) => {
+                for f in &snapshot.cache_costs {
+                    let at = usize::from(f.class.to_u8());
+                    self.cache_restore_ns[at].store(f.restore.map_or(0, |e| e.ns), Relaxed);
+                    self.cache_rebuild_ns[at].store(f.rebuild.map_or(0, |e| e.ns), Relaxed);
+                }
                 self.cache_bytes.store(snapshot.cache_bytes, Relaxed);
                 self.cache_entries.store(snapshot.cache_entries, Relaxed);
                 self.images_held
@@ -231,6 +264,101 @@ impl Metrics {
             free.to_string(),
         );
 
+        {
+            let mut counter = |name: &str, help: &str, value: String| {
+                let _ = writeln!(
+                    out,
+                    "# HELP {name} {help}
+# TYPE {name} counter
+{name} {value}"
+                );
+            };
+            let seconds = |a: &AtomicU64| format!("{:.9}", a.load(Relaxed) as f64 / 1e9);
+            counter(
+                "sentinel_worker_cache_hits_total",
+                "Cache entries restored from a local generation.",
+                n(&self.cache_hits),
+            );
+            counter(
+                "sentinel_worker_cache_misses_total",
+                "Cache entries that restored nothing.",
+                n(&self.cache_misses),
+            );
+            counter(
+                "sentinel_worker_cache_costly_hits_total",
+                "Hits whose restore cost more than rebuilding what they held (docs/cache.md).",
+                n(&self.cache_costly_hits),
+            );
+            counter(
+                "sentinel_worker_cache_lock_wait_seconds_total",
+                "Time attempts waited for a cache entry before restoring it.",
+                seconds(&self.cache_lock_wait_ns),
+            );
+            counter(
+                "sentinel_worker_cache_restore_seconds_total",
+                "Time spent cloning hit generations into attempt views.",
+                seconds(&self.cache_clone_ns),
+            );
+            counter(
+                "sentinel_worker_cache_first_touch_seconds_total",
+                "Time the first read of restored cache files took.",
+                seconds(&self.cache_first_touch_ns),
+            );
+            counter(
+                "sentinel_worker_cache_commit_seconds_total",
+                "Time spent publishing cache generations.",
+                seconds(&self.cache_commit_ns),
+            );
+            counter(
+                "sentinel_worker_cache_restored_bytes_total",
+                "Bytes restored by hits.",
+                n(&self.cache_restored_bytes),
+            );
+            counter(
+                "sentinel_worker_cache_copied_bytes_total",
+                "Bytes a hit copied because a clone was not possible.",
+                n(&self.cache_copied_bytes),
+            );
+            counter(
+                "sentinel_worker_cache_dirty_bytes_total",
+                "Bytes jobs rewrote relative to the generation they restored.",
+                n(&self.cache_dirty_bytes),
+            );
+        }
+        for (name, help, values) in [
+            (
+                "sentinel_worker_cache_restore_estimate_seconds",
+                "Weighted restore time of a hit, per class, once settled.",
+                &self.cache_restore_ns,
+            ),
+            (
+                "sentinel_worker_cache_rebuild_estimate_seconds",
+                "Weighted time a hit saves over rebuilding, per class, once settled.",
+                &self.cache_rebuild_ns,
+            ),
+        ] {
+            let mut rows = String::new();
+            for class in sentinel_protocol::cache::Class::ALL {
+                let ns = values[usize::from(class.to_u8())].load(Relaxed);
+                if ns > 0 {
+                    let _ = writeln!(
+                        rows,
+                        "{name}{{class=\"{}\"}} {:.9}",
+                        class.as_str(),
+                        ns as f64 / 1e9
+                    );
+                }
+            }
+            if !rows.is_empty() {
+                let _ = write!(
+                    out,
+                    "# HELP {name} {help}
+# TYPE {name} gauge
+{rows}"
+                );
+            }
+        }
+
         out
     }
 }
@@ -292,6 +420,77 @@ fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_figures_accumulate_and_settled_costs_are_labelled_by_class() {
+        use sentinel_worker::executor::{Availability, CacheTotals, Notice};
+        let metrics = Metrics::default();
+        let attempt = CacheTotals {
+            entries: 2,
+            hits: 1,
+            misses: 1,
+            costly_hits: 1,
+            lock_wait_ns: 500_000_000,
+            clone_ns: 1_500_000_000,
+            first_touch_ns: 250_000_000,
+            commit_ns: 2_000_000_000,
+            restored_bytes: 4096,
+            copied_bytes: 1024,
+            staged_bytes: 9000,
+            dirty_bytes: 512,
+        };
+        metrics.count(&Notice::CacheFigures(attempt));
+        metrics.count(&Notice::CacheFigures(attempt));
+        let costs = sentinel_worker::cache::CostBook::new();
+        for _ in 0..sentinel_worker::cache::cost::MIN_SAMPLES {
+            costs.record_rebuild(sentinel_protocol::cache::Class::Compiler, 2_000_000_000);
+        }
+        metrics.count(&Notice::Availability(Availability {
+            cache_costs: costs.figures(),
+            images_held: Vec::new(),
+            images_in_flight: 0,
+            cache_entries: 0,
+            cache_generations: 0,
+            cache_bytes: 0,
+            truncated: false,
+        }));
+        let page = metrics.render(1);
+        for line in [
+            "sentinel_worker_cache_hits_total 2
+",
+            "sentinel_worker_cache_misses_total 2
+",
+            "sentinel_worker_cache_costly_hits_total 2
+",
+            "sentinel_worker_cache_lock_wait_seconds_total 1.000000000
+",
+            "sentinel_worker_cache_restore_seconds_total 3.000000000
+",
+            "sentinel_worker_cache_first_touch_seconds_total 0.500000000
+",
+            "sentinel_worker_cache_commit_seconds_total 4.000000000
+",
+            "sentinel_worker_cache_restored_bytes_total 8192
+",
+            "sentinel_worker_cache_copied_bytes_total 2048
+",
+            "sentinel_worker_cache_dirty_bytes_total 1024
+",
+            "sentinel_worker_cache_rebuild_estimate_seconds{class=\"compiler\"} 2.000000000
+",
+        ] {
+            assert!(
+                page.contains(line),
+                "{line}
+{page}"
+            );
+        }
+        assert!(
+            !page.contains("estimate_seconds{class=\"dependencies\"}")
+                && !page.contains("sentinel_worker_cache_restore_estimate_seconds"),
+            "an unsettled estimate is absent, never zero"
+        );
+    }
 
     #[test]
     fn the_listener_answers_metrics_and_nothing_else() {

@@ -14,16 +14,16 @@ const arg = (name, fallback) => { const i = process.argv.indexOf(name); return i
 const LINES = Number(arg("--lines", "200000"));
 const REPEATS = Number(arg("--repeats", "3"));
 const JUMPS = 300;
-const preactDir = process.env.PREACT_DIR, htmDir = process.env.HTM_DIR;
-if (!preactDir || !htmDir) { console.error("set PREACT_DIR and HTM_DIR to unpacked preact@10 and htm@3 packages"); process.exit(2); }
+const preactDir = process.env.PREACT_DIR, htmDir = process.env.HTM_DIR, vueDir = process.env.VUE_DIR;
+if (!preactDir || !htmDir || !vueDir) { console.error("set PREACT_DIR, HTM_DIR and VUE_DIR to unpacked preact@10, htm@3 and vue@3 packages"); process.exit(2); }
 const files = {
   preact: join(preactDir, "dist/preact.min.umd.js"),
   hooks: join(preactDir, "hooks/dist/hooks.umd.js"),
   htm: join(htmDir, "dist/htm.umd.js"),
-  vue: join(web, "node_modules/vue/dist/vue.global.prod.js"),
-  viewer: join(web, "app/utils/logviewer.ts"),
+  vue: join(vueDir, "dist/vue.global.prod.js"),
+  viewer: join(web, "src/lib/logviewer.ts"),
   candidates: join(here, "candidates.js"),
-  css: join(web, "app/assets/css/main.css"),
+  css: join(web, "src/styles.css"),
 };
 const url = (p) => pathToFileURL(p).href;
 const gz = (...paths) => paths.reduce((n, p) => n + gzipSync(readFileSync(p), { level: 9 }).length, 0);
@@ -31,7 +31,7 @@ const gz = (...paths) => paths.reduce((n, p) => n + gzipSync(readFileSync(p), { 
 const dir = mkdtempSync(join(tmpdir(), "sentinel-u01-"));
 const viewerBundle = join(dir, "viewer.js");
 await build({ entryPoints: [files.viewer], bundle: true, minify: true, format: "iife", globalName: "SentinelLog", outfile: viewerBundle, logLevel: "silent" });
-// Only the log viewer's rules: the rest of main.css is Tailwind input.
+// Only the log viewer's rules: the rest of styles.css is Tailwind input.
 const css = readFileSync(files.css, "utf8");
 const logCss = css.slice(css.indexOf("[hidden]"), css.indexOf("/* Job graph. */"));
 function pageFor(name) {

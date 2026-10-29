@@ -705,3 +705,200 @@ fn reapplying_for_a_repository_with_no_rows_finishes_and_touches_nothing() {
         assert_eq!(f.expires(a), Some(NOW.0 + d.log_retention_ms));
     }
 }
+
+fn plan(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap_or_else(|e| panic!("SQLite refused {sql}: {e}"));
+    let values = vec![rusqlite::types::Value::Null; stmt.parameter_count()];
+    stmt.query_map(rusqlite::params_from_iter(values), |r| r.get(3))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+fn expires_column(logs: bool) -> &'static str {
+    if logs {
+        "log_retention_ms"
+    } else {
+        "artifact_retention_ms"
+    }
+}
+
+#[test]
+fn reapply_statements_seek_the_tenants_keyed_index_and_probe_runs_by_key() {
+    let f = fixture();
+    for logs in [true, false] {
+        let (table, index) = if logs {
+            ("attempts", "attempts_log_reapply")
+        } else {
+            ("artifacts", "artifacts_reapply")
+        };
+        for scoped in [false, true] {
+            let (bound, update) = retention::reapply_sql(
+                logs,
+                scoped,
+                expires_column(logs),
+                retention::REAPPLY_BATCH,
+            );
+            for (is_update, sql) in [(false, bound), (true, update)] {
+                // `plan` also proves SQLite accepts INDEXED BY, including on the partial index.
+                let plan = f.store.read(|c| Ok(plan(c, &sql))).unwrap();
+                assert!(
+                    plan.iter()
+                        .any(|p| p.starts_with(&format!("SEARCH {table} USING "))
+                            && p.contains(&format!("INDEX {index} (tenant_id=? AND id>?"))),
+                    "{sql} does not range-seek {index} from the cursor: {plan:?}"
+                );
+                for scanned in ["attempts", "artifacts", "runs"] {
+                    assert!(
+                        plan.iter()
+                            .all(|p| !p.starts_with(&format!("SCAN {scanned}"))),
+                        "{sql} scans {scanned}: {plan:?}"
+                    );
+                }
+                assert!(
+                    plan.iter()
+                        .all(|p| !p.contains("TEMP B-TREE") && !p.contains("LIST SUBQUERY")),
+                    "{sql} sorts or builds a set per batch: {plan:?}"
+                );
+                if is_update && !logs {
+                    // Each artifact reads its run by primary key for the retention it inherits;
+                    // a repository scope adds one more such probe, and never a set of runs.
+                    let probes = plan
+                        .iter()
+                        .filter(|p| p.starts_with("SEARCH runs USING PRIMARY KEY (id=?"))
+                        .count();
+                    assert_eq!(probes, 1 + usize::from(scoped), "{sql}: {plan:?}");
+                }
+            }
+        }
+    }
+}
+
+impl Fixture {
+    /// `n` more released attempts, each with an artifact, all in this repository.
+    fn add_rows(&self, n: usize) {
+        for i in 0..n {
+            let (run, job, attempt) = self.released_attempt(NOW);
+            let tenant = self.tenant;
+            let name = format!("out{i}");
+            self.store
+                .writer()
+                .write(move |tx| {
+                    artifacts::record(
+                        tx,
+                        tenant,
+                        run,
+                        job,
+                        attempt,
+                        &name,
+                        artifacts::State::Failed,
+                        None,
+                        0,
+                        0,
+                        UnixMillis(NOW.0 + DAY),
+                        NOW,
+                    )
+                })
+                .unwrap();
+        }
+    }
+
+    /// SQLite virtual-machine steps the cursor bound and the update take for the first batch.
+    fn first_batch_steps(&self, d: Deployment, logs: bool, scoped: bool, batch: i64) -> (i32, i32) {
+        use rusqlite::{params, types::ValueRef};
+        let (tenant, repo) = (self.tenant, self.repo);
+        self.store
+            .writer()
+            .write(move |tx| {
+                let (bound_sql, update_sql) =
+                    retention::reapply_sql(logs, scoped, expires_column(logs), batch);
+                let retention = if logs {
+                    d.log_retention_ms
+                } else {
+                    d.artifact_retention_ms
+                };
+                let t = tenant.as_bytes().as_slice();
+                let r = scoped.then(|| repo.as_bytes().as_slice());
+                let after = [0u8; 16];
+                let mut bound_stmt = tx.prepare(&bound_sql)?;
+                let mut rows = bound_stmt.query(params![t, retention, r, after.as_slice()])?;
+                let upper: [u8; 16] = match rows.next()? {
+                    Some(row) => match row.get_ref(0)? {
+                        ValueRef::Blob(b) => b.try_into().expect("a 16-byte id"),
+                        other => panic!("not an id: {other:?}"),
+                    },
+                    None => panic!("the first batch has a bound"),
+                };
+                drop(rows);
+                let bound_steps = bound_stmt.get_status(rusqlite::StatementStatus::VmStep);
+                let mut update = tx.prepare(&update_sql)?;
+                let changed =
+                    update.execute(params![t, retention, r, after.as_slice(), upper.as_slice()])?;
+                assert!(changed >= 1 && changed as i64 <= batch, "{changed} rows");
+                Ok((
+                    bound_steps,
+                    update.get_status(rusqlite::StatementStatus::VmStep),
+                ))
+            })
+            .unwrap()
+    }
+}
+
+#[test]
+fn a_reapply_batch_scans_rows_in_proportion_to_the_batch_not_to_the_table() {
+    let f = fixture();
+    let d = Deployment::default();
+    f.store
+        .writer()
+        .write(move |tx| retention::install(tx, &d))
+        .unwrap();
+    f.add_rows(4);
+    f.stamp(d, 10);
+    let cases = [(true, false), (true, true), (false, false), (false, true)];
+    let small: Vec<_> = cases
+        .iter()
+        .map(|&(logs, scoped)| f.first_batch_steps(d, logs, scoped, 2))
+        .collect();
+    f.add_rows(56);
+    f.stamp(d, 10);
+    for (&(logs, scoped), (bound, update)) in cases.iter().zip(small) {
+        let (big_bound, big_update) = f.first_batch_steps(d, logs, scoped, 2);
+        // Fifteen times the rows (and runs) must not move the work of a two-row batch: a scan
+        // of the tenant's rows, or a set built from the repository's runs, would multiply it.
+        assert!(
+            big_bound <= bound + bound / 4 && big_update <= update + update / 4,
+            "logs={logs} scoped={scoped}: bound {bound} -> {big_bound}, update {update} -> {big_update}"
+        );
+    }
+}
+
+/// Each maintenance read names a partial index with `INDEXED BY`; SQLite refuses to prepare the statement when
+/// that index cannot answer the query, so running them against the migrated schema proves the index still serves
+/// its predicate.
+#[test]
+fn maintenance_reads_are_served_by_their_partial_indexes() {
+    let f = fixture();
+    f.store
+        .read(|c| {
+            assert!(retention::unstamped(c, 256).unwrap().is_empty());
+            assert!(
+                retention::expiring(c, UnixMillis(i64::MAX), 256)
+                    .unwrap()
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .unwrap();
+    f.store
+        .writer()
+        .write(|tx| {
+            assert_eq!(
+                retention::purge_aborted_uploads(tx, UnixMillis(i64::MAX), 256).unwrap(),
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
+}

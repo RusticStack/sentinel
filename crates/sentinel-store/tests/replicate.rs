@@ -17,6 +17,7 @@ use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersi
 use sentinel_store::{
     Durability, Error, Store,
     auth::{self, Authority, NamespaceKind, provisioning},
+    backup,
     dispatch::{self, Capacity},
     jobs,
     logs::LogStore,
@@ -760,6 +761,74 @@ fn a_refused_credential_degrades_the_copy_until_it_is_replaced() {
     assert_eq!(r.pass().unwrap().replicated, 1);
     assert_eq!(r.status().state(), "healthy");
     assert_eq!(r.status().consecutive_failures.load(Ordering::Relaxed), 0);
+}
+
+// R07: the external copy is down or refuses the credential while a controller is backed up and restored onto a second directory.
+#[test]
+fn a_backup_and_restore_during_an_s3_failure_keep_local_objects_and_fetch_evicted_ones_later() {
+    let f = fixture();
+    let evicted = f.put(b"evicted to the external copy before the backup");
+    f.replicator(SETTINGS).pass().unwrap();
+    f.replicator(Settings {
+        local_bytes: 1,
+        ..SETTINGS
+    })
+    .pass()
+    .unwrap();
+    assert!(!f.local(evicted));
+    let local = f.put(b"written after the last pass, local only");
+    f.bucket.refused.store(true, Ordering::Relaxed);
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let target = elsewhere.path().join("backups");
+    let report = backup::create(&f.store, &f.objects, f.dir.path(), &target, "drill").unwrap();
+    assert_eq!(
+        (report.objects, report.objects_remote, report.objects_copied),
+        (2, 1, 1)
+    );
+    assert!(report.objects_missing.is_empty() && report.objects_corrupt.is_empty());
+    assert!(backup::verify(&target, &report.id).unwrap().ok());
+
+    let second = elsewhere.path().join("second");
+    let restored = backup::restore(&target, &report.id, &second, None).unwrap();
+    assert_eq!((restored.objects, restored.objects_remote), (1, 1));
+    let store = Store::open(second.join("metadata.sqlite"), Durability::Normal).unwrap();
+    let objects = Objects::open(&second).unwrap();
+    objects.set_remote(Arc::new(Fetch(Arc::clone(&f.bucket))));
+    let read = |digest: Digest| {
+        let mut out = Vec::new();
+        store
+            .read(|c| objects.read(c, f.tenant, digest, &mut out))
+            .map(|_| out)
+    };
+    let placed = |digest: Digest| {
+        second
+            .join("objects")
+            .join(f.tenant.to_string())
+            .join(&digest.to_string()[..2])
+            .join(digest.to_string())
+            .exists()
+    };
+    assert_eq!(
+        read(local).unwrap(),
+        b"written after the last pass, local only"
+    );
+    assert!(
+        read(evicted).is_err(),
+        "an expired credential is a clean refusal"
+    );
+    f.bucket.refused.store(false, Ordering::Relaxed);
+    f.bucket.down.store(true, Ordering::Relaxed);
+    assert!(read(evicted).is_err(), "so is an outage");
+    assert!(!placed(evicted), "nothing placed from a failed fetch");
+    let recovery = store.read(|c| objects.recover(c)).unwrap();
+    assert!(recovery.missing.is_empty(), "{recovery:?}");
+    f.bucket.down.store(false, Ordering::Relaxed);
+    assert_eq!(
+        read(evicted).unwrap(),
+        b"evicted to the external copy before the backup"
+    );
+    assert!(placed(evicted));
 }
 
 #[test]

@@ -14,8 +14,9 @@ pub struct Cli {
 pub enum Command {
     /// Start the Linux controller: metadata store, worker link and dispatcher
     Server(ServiceArgs),
-    /// Start the separate Linux worker: connects to its controller and executes assigned jobs
-    Worker(ServiceArgs),
+    /// Start the separate Linux worker (connects to its controller and executes assigned jobs), or enroll,
+    /// uninstall or roll back the worker this host runs
+    Worker(WorkerRoleArgs),
     /// Validate or explain a `.sentinel.yml` offline, on any platform
     Pipeline(PipelineArgs),
     /// Host-local administration of local login, on the controller's own host
@@ -172,6 +173,15 @@ pub struct DataDir {
     /// Absolute controller data directory holding the metadata database
     #[arg(long, value_name = "PATH")]
     pub data_dir: PathBuf,
+}
+
+impl DataDir {
+    #[cfg(all(target_os = "linux", feature = "server"))]
+    pub fn at(path: &std::path::Path) -> Self {
+        Self {
+            data_dir: path.to_path_buf(),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -457,6 +467,15 @@ pub enum BackupCommand {
         #[arg(long, value_name = "ID")]
         id: Option<String>,
     },
+    /// How much a loss now would cost: the newest backup's age and the longest
+    /// window between kept backups; exit 2 when the age passes `--limit-secs`
+    Rpo {
+        #[arg(long, value_name = "DIR")]
+        dir: PathBuf,
+        /// The recovery-point objective in seconds
+        #[arg(long, value_name = "SECS", default_value_t = 3_600)]
+        limit_secs: u64,
+    },
     /// Keep the newest backups and remove the rest and what only they named
     Prune {
         #[arg(long, value_name = "DIR")]
@@ -489,6 +508,13 @@ pub struct WorkerArgs {
     pub command: WorkerCommand,
 }
 
+/// The transport a worker enrollment is issued for.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EnrollTransport {
+    Direct,
+    Tailcat,
+}
+
 #[derive(Subcommand)]
 pub enum WorkerCommand {
     /// Issue a one-time enrollment for a pool; the secret alone goes to stdout
@@ -500,6 +526,27 @@ pub enum WorkerCommand {
         /// Lifetime such as 1h or 30m; bounded by one day
         #[arg(long, value_name = "DURATION", default_value = "1h")]
         expires_in: String,
+        /// How the machine reaches the controller: direct TLS (the default here) or the pinned
+        /// Tailcat helper, whose node key is then authorized with `admin tailcat authorize`
+        #[arg(long, value_enum, default_value = "direct")]
+        transport: EnrollTransport,
+        /// CPU ceiling approved for the machine, in milli-cores
+        #[arg(long, value_name = "MILLIS")]
+        cpu_millis: Option<i64>,
+        /// Memory ceiling approved for the machine, in bytes
+        #[arg(long, value_name = "BYTES")]
+        memory_bytes: Option<i64>,
+        /// Storage ceiling approved for the machine, in bytes
+        #[arg(long, value_name = "BYTES")]
+        disk_bytes: Option<i64>,
+        /// Operator priority, -100 to 100; higher is preferred, 0 is neutral
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = 0,
+            allow_hyphen_values = true
+        )]
+        priority: i32,
     },
     /// Live workers of a pool
     List {
@@ -526,6 +573,36 @@ pub enum WorkerCommand {
     },
     /// Revoke a worker; its session is refused at its next authentication
     Revoke {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `wrk_` identifier the worker generated
+        #[arg(long)]
+        id: String,
+    },
+    /// Show or change the CPU, memory and storage ceilings and the priority approved for a worker.
+    /// Only the flags given change; the worker's own report can never raise any of them
+    Policy {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `wrk_` identifier the worker generated
+        #[arg(long)]
+        id: String,
+        /// CPU ceiling in milli-cores (1000 = one core), or `none` to remove it
+        #[arg(long, value_name = "MILLIS|none")]
+        cpu_millis: Option<String>,
+        /// Memory ceiling in bytes, or `none` to remove it
+        #[arg(long, value_name = "BYTES|none")]
+        memory_bytes: Option<String>,
+        /// Storage ceiling in bytes, or `none` to remove it
+        #[arg(long, value_name = "BYTES|none")]
+        disk_bytes: Option<String>,
+        /// Operator priority, -100 to 100; higher is preferred, 0 is neutral
+        #[arg(long, value_name = "N", allow_hyphen_values = true)]
+        priority: Option<i32>,
+    },
+    /// Drain a worker and revoke it, with its fingerprint and Tailcat node key, once the work it
+    /// already accepted has settled
+    Uninstall {
         #[command(flatten)]
         data: DataDir,
         /// The `wrk_` identifier the worker generated
@@ -581,6 +658,24 @@ pub enum TailcatCommand {
     Retire {
         #[command(flatten)]
         data: DataDir,
+    },
+    /// Authorize the `nodekey:<hex> wrk_<id>` line on standard input for one pending Tailcat
+    /// enrollment: the controller admits that key to its helper until the enrollment is spent,
+    /// withdrawn or expired, and redemption binds exactly that key to exactly that worker
+    Authorize {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `tok_` identifier of a pending Tailcat enrollment
+        #[arg(long)]
+        enrollment: String,
+    },
+    /// Take every key of one worker off the controller's allow list
+    Revoke {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `wrk_` identifier of the worker
+        #[arg(long)]
+        id: String,
     },
 }
 
@@ -1153,4 +1248,118 @@ pub struct ServiceArgs {
     /// Internal diagnostic verbosity; defaults to info
     #[arg(long, value_enum)]
     pub log_level: Option<LogLevel>,
+
+    /// Comma-separated exact https://host[:port] authorities an unbound repository's manual remote may name
+    /// although they are internal; overrides the configuration file and SENTINEL_MANUAL_DESTINATIONS
+    #[arg(long, value_name = "AUTHORITIES", value_delimiter = ',')]
+    pub manual_destinations: Option<Vec<String>>,
+}
+
+/// `sentinel worker`: the service itself, or one of the host-management subcommands the generated
+/// bootstrap script calls.
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct WorkerRoleArgs {
+    #[command(flatten)]
+    pub service: ServiceArgs,
+
+    #[command(subcommand)]
+    pub command: Option<WorkerHostCommand>,
+}
+
+#[derive(Subcommand)]
+pub enum WorkerHostCommand {
+    /// Generate this host's identities and redeem an enrollment with the controller over HTTPS
+    Enroll(EnrollArgs),
+    /// Remove the worker service, its files and, unless kept, its data and account
+    Uninstall(UninstallArgs),
+    /// Switch back to the previous release and restart the service
+    Rollback(RollbackArgs),
+}
+
+#[derive(Args)]
+pub struct EnrollArgs {
+    /// The controller's API base URL (https://, or http:// for a loopback host)
+    #[arg(long, value_name = "URL")]
+    pub api_url: String,
+
+    /// Where to write the worker configuration
+    #[arg(long, value_name = "FILE")]
+    pub config: PathBuf,
+
+    /// Absolute worker data directory that will hold the identities
+    #[arg(long, value_name = "PATH")]
+    pub data_dir: PathBuf,
+
+    /// Name the controller lists this worker under; defaults to the host name
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Read the enrollment secret from the first line of this owner-only file
+    #[arg(long, value_name = "FILE", conflicts_with = "secret_stdin")]
+    pub secret_file: Option<PathBuf>,
+
+    /// Read the enrollment secret from the first line of standard input (never a terminal)
+    #[arg(long)]
+    pub secret_stdin: bool,
+
+    /// Enroll over Tailcat: the helper binary that generates this host's node key
+    #[arg(long, value_name = "FILE", requires = "tailcat_sha256")]
+    pub tailcat_binary: Option<PathBuf>,
+
+    /// SHA-256 of the Tailcat helper, 64 lower-case hex characters
+    #[arg(long, value_name = "HEX", requires = "tailcat_binary")]
+    pub tailcat_sha256: Option<String>,
+
+    /// Operator-owned DERP map URL for the helper
+    #[arg(long, value_name = "URL", requires = "tailcat_binary")]
+    pub derpmap_url: Option<String>,
+
+    /// DERP region for the helper
+    #[arg(long, value_name = "NAME", requires = "tailcat_binary")]
+    pub region: Option<String>,
+
+    /// Link port on the controller's tailnet address
+    #[arg(long, value_name = "PORT", requires = "tailcat_binary")]
+    pub tailcat_port: Option<u16>,
+}
+
+/// The install layout the generated bootstrap script creates; the defaults are the script's.
+#[derive(Args)]
+pub struct InstallLayoutArgs {
+    /// Root of the installed releases
+    #[arg(long, value_name = "PATH", default_value = "/opt/sentinel-worker")]
+    pub prefix: PathBuf,
+
+    /// Directory holding worker.toml
+    #[arg(long, value_name = "PATH", default_value = "/etc/sentinel-worker")]
+    pub conf_dir: PathBuf,
+
+    /// The worker's data directory
+    #[arg(long, value_name = "PATH", default_value = "/var/lib/sentinel-worker")]
+    pub data_dir: PathBuf,
+
+    /// The systemd unit file
+    #[arg(
+        long,
+        value_name = "FILE",
+        default_value = "/etc/systemd/system/sentinel-worker.service"
+    )]
+    pub unit_file: PathBuf,
+}
+
+#[derive(Args)]
+pub struct UninstallArgs {
+    #[command(flatten)]
+    pub layout: InstallLayoutArgs,
+
+    /// Keep the data directory (the worker's identity and caches)
+    #[arg(long)]
+    pub keep_data: bool,
+}
+
+#[derive(Args)]
+pub struct RollbackArgs {
+    #[command(flatten)]
+    pub layout: InstallLayoutArgs,
 }

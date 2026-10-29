@@ -93,7 +93,7 @@ fn sign_in(state: &State, query: &str, client_name: Option<&str>) -> Reply {
     let here = format!("/oauth/authorize?{query}");
     let github = state
         .github
-        .as_ref()
+        .get()
         .map(|g| (g.start_url.as_str(), here.as_str()));
     html::sign_in_page(
         &state.oauth.login_url,

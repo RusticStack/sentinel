@@ -219,8 +219,8 @@ pub fn poll(store: &Store, client_id: &str, device: &Secret, now: UnixMillis) ->
 pub fn issue_service_grant(tx: &Transaction<'_>, principal: Principal, tenant: TenantId, account: UserId, name: &str,
   scopes: Scopes, repo: Option<RepoId>, lifetime_ms: i64, now: UnixMillis) -> Result<(GrantId, Secret, UnixMillis)>
 pub fn service_grants(conn: &Connection, principal: Principal, tenant: TenantId, account: UserId) -> Result<Vec<GrantRecord>>
-pub fn allow_repo(tx: &Transaction<'_>, principal: Principal, tenant: TenantId, account: UserId, repo: RepoId,
-  permissions: Permissions) -> Result<()>
+pub fn allow_repo(tx: &Transaction<'_>, authority: Authority, tenant: TenantId, account: UserId, repo: RepoId,
+  permissions: Permissions, reason: Option<&str>) -> Result<()> // NONE withdraws; step-up and reason as for issuing
 ```
 
 Migration 30 details the flows rely on: `oauth_device_codes.status` moves only 0→1|2 and 1→3, the approver may narrow `scopes` once in the 0→1 update, and `user_id`/`tenant_id`/`repo_id`/`decided_ms` are written once; `oauth_codes.consumed_ms` and `grant_id` are set once; the partial index `oauth_device_pending(expires_ms) WHERE status = 0` serves the pending cap; `oauth_codes_by_grant` and `oauth_device_by_grant` index the grant links.
@@ -343,4 +343,4 @@ Known limits:
 - **One profile, one machine.** Two machines sharing one profile's credential present the same refresh token twice, which is replay and revokes the grant; the lock only serializes processes that share one configuration directory. Separate configuration directories on one machine hold separate credentials (the OS-store key names the directory; [CLI](cli.md)).
 - **Narrowing granularity.** A grant narrows to at most one tenant and one repository (the `Principal` shape).
 - **Open consent pages end with the process.** The form key is per process, so a controller restart invalidates consent and device pages that are already open; reloading them works.
-- **Credential stores.** Linux has no Secret Service backend (the owner-only file store is used). Windows uses Credential Manager. macOS is not supported.
+- **Credential stores.** Linux has no Secret Service backend by decision (the owner-only file store is used; the reasoning is in [the CLI's credential storage](cli.md#credential-storage)). Windows uses Credential Manager. macOS is not supported.

@@ -78,6 +78,7 @@ fn an_upgrade_keeps_a_copy_of_the_database_from_before_it() {
     assert!(readable.contains(&(50, 50)), "{readable:?}");
     assert!(readable.contains(&(52, 51)), "{readable:?}");
     assert!(readable.contains(&(53, 51)), "{readable:?}");
+    assert!(readable.contains(&(57, 56)), "{readable:?}");
     let (_, again) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
     assert!(again.is_none());
     let other = dir.path().join("other");
@@ -347,4 +348,69 @@ fn a_process_killed_mid_migration_leaves_the_last_committed_version() {
     assert_eq!(tenants, 1, "the committed row survived");
     drop(store);
     assert_eq!(version(&path), schema::LATEST);
+}
+
+/// Releases an operator may be upgrading from: every schema named as a `READABLE_BY` target (the
+/// oldest release that may keep running on a later database) and the two releases before the
+/// current schema.
+fn upgrade_sources() -> Vec<u32> {
+    let mut sources: Vec<u32> = schema::READABLE_BY.iter().map(|&(_, by)| by).collect();
+    sources.extend([schema::LATEST - 2, schema::LATEST - 1]);
+    sources.sort_unstable();
+    sources.dedup();
+    sources
+}
+
+#[test]
+fn every_readable_by_release_upgrades_and_the_rollback_matrix_matches_the_docs() {
+    // docs/upgrades.md: a database at schema N runs on release R only when no migration in
+    // (R, N] declares a readable_by above R. Rows are R, columns are N = 53, 55, 58, LATEST.
+    let readable = |db: &Connection, release: u32, newest: u32| -> bool {
+        let needs: u32 = db
+            .query_row(
+                "SELECT COALESCE(MAX(readable_by), 0) FROM schema_migrations WHERE version > ?1 AND version <= ?2",
+                [release, newest],
+                |r| r.get(0),
+            )
+            .unwrap();
+        needs <= release
+    };
+    assert_eq!(
+        schema::LATEST,
+        63,
+        "extend the matrix in docs/upgrades.md for the new migration"
+    );
+    let sources = upgrade_sources();
+    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 61, 62]);
+    for from in sources {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.sqlite");
+        drop(database_at(&path, from));
+        let (store, snapshot) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
+        let snapshot = snapshot.expect("a pending migration takes a copy");
+        assert_eq!(
+            version(&snapshot),
+            from,
+            "the copy is release {from}'s database"
+        );
+        drop(store);
+        assert_eq!(version(&path), schema::LATEST, "from {from}");
+        let db = Connection::open(&path).unwrap();
+        let ok: Vec<bool> = [53, 55, 58, 63]
+            .iter()
+            .map(|&newest| from >= newest || readable(&db, from, newest))
+            .collect();
+        // 44, 47 and 48 cannot run on schema 53 (migrations 46, 49 and 50 need 46, 48 and 50); 51 can
+        // (52 and 53 are readable by 51) but not on 55 (54 needs 54); 56 and 57 are the targets of
+        // migrations 57 and 58, so 57 runs on a database at 58 and 56 does not (58 needs 57); nothing
+        // runs on 63 below the migration's own schema (59 to 63 are readable by nothing older).
+        let expected = match from {
+            44 | 47 | 48 => [false, false, false, false],
+            51 => [true, false, false, false],
+            56 => [true, true, false, false],
+            57 | 61 | 62 => [true, true, true, false],
+            _ => unreachable!(),
+        };
+        assert_eq!(ok, expected, "release {from} on schemas 53, 55, 58, 63");
+    }
 }

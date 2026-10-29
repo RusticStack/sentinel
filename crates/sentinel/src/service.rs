@@ -73,6 +73,8 @@ struct FileConfig {
     api_listen: Option<String>,
     public_url: Option<String>,
     trusted_proxies: Option<Vec<String>>,
+    placement_order: Option<String>,
+    manual_destinations: Option<Vec<String>>,
     controller: Option<String>,
     controller_fingerprint: Option<String>,
     controller_fingerprint_also: Option<Vec<String>>,
@@ -98,6 +100,7 @@ struct FileConfig {
     s3: Option<S3File>,
     backup: Option<BackupFile>,
     mail: Option<MailFile>,
+    worker_bootstrap: Option<WorkerBootstrapFile>,
     tailcat_address: Option<String>,
 }
 
@@ -108,6 +111,8 @@ struct MicrovmFile {
     firecracker: PathBuf,
     kernel: PathBuf,
     agent: PathBuf,
+    /// Start VMs from snapshots of a booted guest (default true, M06).
+    snapshots: Option<bool>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -231,6 +236,141 @@ impl MailFile {
         }))
     }
 }
+
+/// What the controller's worker-enrollment bootstrap script pins: where workers dial, where the release lives and
+/// its V01 `SHA256SUMS`, and (for Tailcat enrollments) the pinned helper builds. Server role only.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerBootstrapFile {
+    /// IP address and port workers dial for a direct TLS enrollment (the link listener as workers reach it).
+    controller: String,
+    /// Directory URL holding the release archives.
+    release_url: String,
+    /// The release's `SHA256SUMS` file.
+    release_sums: PathBuf,
+    /// HTTPS base URL workers redeem their enrollment at (`https://`, or `http://` on a loopback host).
+    /// Without it the generated script keeps the older flow, in which the secret rides the worker's
+    /// first link hello and a Tailcat key is authorized by an administrator.
+    api_url: Option<String>,
+    tailcat: Option<BootstrapTailcatFile>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapTailcatFile {
+    /// Defaults to the helper version this build pins.
+    version: Option<String>,
+    x86_64_url: Option<String>,
+    /// Defaults to the pinned build's digest.
+    x86_64_sha256: Option<String>,
+    aarch64_url: Option<String>,
+    aarch64_sha256: Option<String>,
+}
+
+impl WorkerBootstrapFile {
+    fn check(&self, server_tailcat: Option<&TailcatFile>) -> Result<(), Error> {
+        if self.controller.parse::<SocketAddr>().is_err() {
+            return Err(Error::config(
+                "[worker_bootstrap] controller must be an IP address and port, as in 10.0.0.5:7443",
+            ));
+        }
+        if !self.release_sums.is_absolute() {
+            return Err(Error::config(
+                "[worker_bootstrap] release_sums must be an absolute path",
+            ));
+        }
+        if let Some(url) = &self.api_url
+            && !(url.starts_with("https://") || url.starts_with("http://"))
+        {
+            return Err(Error::config(
+                "[worker_bootstrap] api_url must be an https:// URL (http:// only for a loopback host)",
+            ));
+        }
+        if let Some(tailcat) = &self.tailcat {
+            if !server_tailcat.is_some_and(|t| t.enabled == Some(true)) {
+                return Err(Error::config(
+                    "[worker_bootstrap.tailcat] needs the controller's own [tailcat] enabled = true: the generated script hands workers its address",
+                ));
+            }
+            if tailcat.x86_64_url.is_none() && tailcat.aarch64_url.is_none() {
+                return Err(Error::config(
+                    "[worker_bootstrap.tailcat] needs x86_64_url or aarch64_url",
+                ));
+            }
+            if tailcat.aarch64_url.is_some() != tailcat.aarch64_sha256.is_some() {
+                return Err(Error::config(
+                    "[worker_bootstrap.tailcat] aarch64_url and aarch64_sha256 are set together: this build pins no arm64 helper digest",
+                ));
+            }
+            if tailcat.x86_64_url.is_none() && tailcat.x86_64_sha256.is_some() {
+                return Err(Error::config(
+                    "[worker_bootstrap.tailcat] x86_64_sha256 needs x86_64_url",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "server")]
+    fn build(
+        &self,
+        data_dir: &Path,
+        fingerprint: &str,
+        server_tailcat: Option<&TailcatFile>,
+    ) -> Result<sentinel_api::WorkerBootstrap, Error> {
+        let sums = sentinel::bounded::text(&self.release_sums, 1 << 20).map_err(|error| {
+            Error::config(format!(
+                "cannot read [worker_bootstrap] release_sums {}: {error}",
+                self.release_sums.display()
+            ))
+        })?;
+        let tailcat = self.tailcat.as_ref().map(|t| {
+            let pin = |url: &Option<String>, sha256: Option<String>| {
+                url.clone().map(|url| sentinel_api::Pin {
+                    url,
+                    sha256: sha256.unwrap_or_default(),
+                })
+            };
+            sentinel_api::TailcatRelease {
+                version: t
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| sentinel_link::tailcat::PINNED_VERSION.to_owned()),
+                x86_64: pin(
+                    &t.x86_64_url,
+                    Some(
+                        t.x86_64_sha256
+                            .clone()
+                            .unwrap_or_else(|| sentinel_link::tailcat::PINNED_SHA256.to_owned()),
+                    ),
+                ),
+                aarch64: pin(&t.aarch64_url, t.aarch64_sha256.clone()),
+                derpmap_url: server_tailcat.and_then(|s| s.derpmap_url.clone()),
+                region: server_tailcat.and_then(|s| s.region.clone()),
+            }
+        });
+        sentinel_api::WorkerBootstrap::new(sentinel_api::WorkerBootstrapSettings {
+            controller: self
+                .controller
+                .parse()
+                .map_err(|_| Error::config("[worker_bootstrap] controller is not an address"))?,
+            fingerprint: fingerprint.to_owned(),
+            release_url: self.release_url.clone(),
+            release_sums: sums,
+            tailcat_address_file: tailcat.is_some().then(|| {
+                data_dir
+                    .join("tailcat")
+                    .join(sentinel_link::tailcat::ADDRESS_FILE)
+            }),
+            tailcat,
+            api_url: self.api_url.clone(),
+        })
+        .map_err(|error| Error::config(format!("[worker_bootstrap] {error}")))
+    }
+}
+
+/// The recovery point is the interval plus how long a backup takes, so the default leaves ten minutes of the one-hour objective for the backup itself.
+const DEFAULT_BACKUP_INTERVAL_SECS: u64 = 3_000;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -388,6 +528,36 @@ struct MicrovmSetup {
     firecracker: PathBuf,
     kernel: PathBuf,
     agent: PathBuf,
+    snapshots: bool,
+}
+
+impl MicrovmSetup {
+    /// `ready`, or `unavailable: <every missing piece>`, for `--check`.
+    fn status(&self) -> String {
+        #[cfg(all(feature = "worker", target_os = "linux"))]
+        {
+            let setup = sentinel_worker::microvm::Setup {
+                firecracker: self.firecracker.clone(),
+                kernel: self.kernel.clone(),
+                agent: self.agent.clone(),
+                snapshots: self.snapshots,
+                guard: sentinel_worker::microvm::net::Guard { link: Vec::new() },
+            };
+            let (virtualization, absent) = sentinel_worker::host::detect();
+            match (setup.check(), virtualization.kvm) {
+                (Ok(()), true) => "ready".to_owned(),
+                (Ok(()), false) => format!(
+                    "unavailable: no usable /dev/kvm ({})",
+                    absent.map_or_else(|| "reason unknown".to_owned(), |a| a.0)
+                ),
+                (Err(why), _) => format!("unavailable: {why}"),
+            }
+        }
+        #[cfg(not(all(feature = "worker", target_os = "linux")))]
+        {
+            "unavailable: microVMs need a Linux worker".to_owned()
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -451,12 +621,16 @@ enum Role {
         tailcat: Option<TailcatFile>,
         remote_cache: bool,
         remote_cache_budget: Option<u64>,
+        /// `placement_order = "priority"`: the operator's host priority orders free workers ahead of
+        /// speed (after hard admission). `false` is the default, fastest eligible first.
+        priority_placement: bool,
     },
     Worker(Option<WorkerLink>),
 }
 
 struct Config {
     data_dir: PathBuf,
+    manual_destinations: Option<Vec<String>>,
     log_format: LogFormat,
     log_level: LogLevel,
     #[cfg(feature = "server")]
@@ -465,6 +639,8 @@ struct Config {
     s3: Option<S3File>,
     #[cfg(feature = "server")]
     backup: Option<BackupFile>,
+    #[cfg(feature = "server")]
+    worker_bootstrap: Option<WorkerBootstrapFile>,
     #[cfg(feature = "server")]
     mail: Option<MailSettings>,
     #[cfg(feature = "server")]
@@ -497,6 +673,21 @@ fn hex32(bytes: &[u8; 32]) -> String {
         out.push(HEX[usize::from(byte & 0x0f)] as char);
     }
     out
+}
+
+/// Reads the auto-join variable's value: unset is no rules, a non-Unicode value is a startup
+/// error (it must not silently turn the rules off), and the message never echoes the value.
+#[cfg(feature = "server")]
+fn auto_join_from_env(
+    value: Result<String, std::env::VarError>,
+) -> Result<sentinel_store::auto_join::Parsed, Error> {
+    match value {
+        Ok(text) => Ok(sentinel_store::auto_join::parse(&text)),
+        Err(std::env::VarError::NotPresent) => Ok(sentinel_store::auto_join::Parsed::default()),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::config(
+            "SENTINEL_AUTO_JOIN_DOMAINS is not valid Unicode; fix or unset it",
+        )),
+    }
 }
 
 impl Config {
@@ -613,11 +804,21 @@ impl Config {
                     "trusted_proxies must list at most 64 IP addresses or CIDR networks with zero host bits, as in [\"127.0.0.1\", \"10.0.0.0/24\"]",
                 ));
             }
+            let priority_placement = match file.placement_order.as_deref() {
+                None | Some("fastest") => false,
+                Some("priority") => true,
+                Some(_) => {
+                    return Err(Error::config(
+                        "placement_order must be \"fastest\" (the default) or \"priority\"",
+                    ));
+                }
+            };
             Role::Server {
                 listen,
                 api_listen,
                 public_url,
                 trusted_proxies,
+                priority_placement,
                 tailcat: file.tailcat,
                 remote_cache: file
                     .remote_cache
@@ -647,9 +848,10 @@ impl Config {
                 || file.api_listen.is_some()
                 || file.public_url.is_some()
                 || file.trusted_proxies.is_some()
+                || file.placement_order.is_some()
             {
                 return Err(Error::config(
-                    "listen, api_listen, public_url and trusted_proxies apply to the server role only",
+                    "listen, api_listen, public_url, trusted_proxies and placement_order apply to the server role only",
                 ));
             }
             let link = match (file.controller, file.controller_fingerprint) {
@@ -819,6 +1021,7 @@ impl Config {
                             firecracker: m.firecracker,
                             kernel: m.kernel,
                             agent: m.agent,
+                            snapshots: m.snapshots.unwrap_or(true),
                         }),
                         disk_bytes: file.disk_bytes,
                         spool_reserve_bytes: file.spool_reserve_bytes,
@@ -870,6 +1073,14 @@ impl Config {
             }
             backup.check(&data_dir)?;
         }
+        if let Some(bootstrap) = &file.worker_bootstrap {
+            let Role::Server { tailcat, .. } = &role else {
+                return Err(Error::config(
+                    "[worker_bootstrap] applies to the server role only",
+                ));
+            };
+            bootstrap.check(tailcat.as_ref())?;
+        }
         let mail = match &role {
             Role::Server { public_url, .. } => {
                 let mail = file
@@ -894,13 +1105,22 @@ impl Config {
         let _ = mail;
         #[cfg(feature = "server")]
         let auto_join = match &role {
-            Role::Server { .. } => std::env::var("SENTINEL_AUTO_JOIN_DOMAINS")
-                .map(|text| sentinel_store::auto_join::parse(&text))
-                .unwrap_or_default(),
+            Role::Server { .. } => auto_join_from_env(std::env::var("SENTINEL_AUTO_JOIN_DOMAINS"))?,
             Role::Worker(_) => sentinel_store::auto_join::Parsed::default(),
         };
+        if let Some(list) = args
+            .manual_destinations
+            .as_ref()
+            .or(file.manual_destinations.as_ref())
+        {
+            sentinel_protocol::source::validate_manual_destinations(list).map_err(Error::config)?;
+        }
         Ok(Self {
             data_dir,
+            manual_destinations: args
+                .manual_destinations
+                .clone()
+                .or(file.manual_destinations),
             log_format: args.log_format.or(file.log_format).unwrap_or_default(),
             log_level: args.log_level.or(file.log_level).unwrap_or_default(),
             #[cfg(feature = "server")]
@@ -909,6 +1129,8 @@ impl Config {
             s3: file.s3,
             #[cfg(feature = "server")]
             backup: file.backup,
+            #[cfg(feature = "server")]
+            worker_bootstrap: file.worker_bootstrap,
             #[cfg(feature = "server")]
             mail,
             #[cfg(feature = "server")]
@@ -935,12 +1157,19 @@ impl Config {
                 text
             }
             Role::Worker(None) => "controller=none (idle)".to_owned(),
-            Role::Worker(Some(link)) => format!(
-                "controller={} controller_fingerprint={} worker_name={}",
-                link.controller,
-                hex32(&link.fingerprint),
-                link.name
-            ),
+            Role::Worker(Some(link)) => {
+                let mut text = format!(
+                    "controller={} controller_fingerprint={} worker_name={}",
+                    link.controller,
+                    hex32(&link.fingerprint),
+                    link.name
+                );
+                if let Some(microvm) = &link.microvm {
+                    text.push_str(" microvm=");
+                    text.push_str(&microvm.status());
+                }
+                text
+            }
         }
     }
 }
@@ -999,16 +1228,26 @@ pub fn run(role: &str, args: ServiceArgs) -> Result<(), Error> {
     let config = Config::load(role, &args, &io, &cpu)?;
     let configuration_ns = elapsed_ns(configuration_started);
     if args.check {
+        #[cfg_attr(not(feature = "worker"), allow(unused_mut))]
+        let mut description = config.describe();
+        #[cfg(feature = "worker")]
+        if let Role::Worker(link) = &config.role {
+            description.push_str("; ");
+            description.push_str(&worker_role::check_report(link.as_ref())?);
+        }
         sentinel::outln!(
             "{role} configuration valid; data_dir={}; log_format={:?}; log_level={:?}; {}",
             config.data_dir.display(),
             config.log_format,
             config.log_level,
-            config.describe()
+            description
         );
         return Ok(());
     }
 
+    if let Some(list) = &config.manual_destinations {
+        sentinel_protocol::source::set_manual_destinations(list.clone());
+    }
     let mut diagnostics = Diagnostics::stderr(config.log_format, config.log_level)
         .map_err(|error| Error::runtime(format!("cannot initialize diagnostics: {error}")))?;
     let dispatch = diagnostics.dispatch().clone();
@@ -1120,6 +1359,7 @@ pub(crate) fn tailcat_setup(
         check: true,
         log_format: None,
         log_level: None,
+        manual_destinations: None,
     };
     let mut io = Executor::new(WorkClass::BlockingIo, 1)
         .map_err(|error| Error::runtime(format!("cannot start I/O lane: {error}")))?;
@@ -1152,6 +1392,34 @@ pub(crate) fn tailcat_setup(
         helper,
         controller,
     })
+}
+
+/// The checks `sentinel worker --check` runs, plus the host's runtime: the configuration must load and the
+/// isolation it names must be possible here. Enrollment runs it before it spends the enrollment secret.
+#[cfg(feature = "worker")]
+pub(crate) fn check_worker(config: PathBuf, data_dir: PathBuf) -> Result<(), Error> {
+    let args = ServiceArgs {
+        config: Some(config),
+        data_dir: Some(data_dir),
+        check: true,
+        log_format: None,
+        log_level: None,
+        manual_destinations: None,
+    };
+    let mut io = Executor::new(WorkClass::BlockingIo, 1)
+        .map_err(|error| Error::runtime(format!("cannot start I/O lane: {error}")))?;
+    let mut cpu = Executor::new(WorkClass::Cpu, 1)
+        .map_err(|error| Error::runtime(format!("cannot start CPU lane: {error}")))?;
+    let loaded = Config::load("worker", &args, &io, &cpu);
+    io.shutdown(Duration::from_secs(1));
+    cpu.shutdown(Duration::from_secs(1));
+    let loaded = loaded?;
+    let Role::Worker(Some(link)) = &loaded.role else {
+        return Err(Error::config(
+            "the worker configuration names no controller",
+        ));
+    };
+    worker_role::check_runtime(link)
 }
 
 fn bootstrap_work<T: Send + 'static>(
@@ -1259,10 +1527,8 @@ enum Running {
         store: Arc<sentinel_store::Store>,
         lane: Box<sentinel_intake::Lane>,
         poll: Box<sentinel_intake::Poll>,
-        checks: Option<Box<sentinel_checks::Lane>>,
-        reconcile: Option<Box<sentinel_checks::Reconcile>>,
+        github_lanes: Arc<std::sync::Mutex<Option<GithubLanes>>>,
         mail: Option<Box<sentinel_mail::Lane>>,
-        members: Option<Box<sentinel_checks::Members>>,
         tailcat: Option<TailcatServer>,
         replicator: Option<sentinel::offload::Running>,
         backups: Option<(
@@ -1279,17 +1545,115 @@ enum Running {
     },
 }
 
+/// The lanes that act as the GitHub App: started at boot when an App is configured, or when a
+/// one-click setup puts one in force. Fields drop in declaration order: members, reconcile,
+/// then the check publisher.
+#[cfg(feature = "server")]
+struct GithubLanes {
+    _members: Box<sentinel_checks::Members>,
+    _reconcile: Box<sentinel_checks::Reconcile>,
+    _checks: Box<sentinel_checks::Lane>,
+}
+
+#[cfg(feature = "server")]
+impl GithubLanes {
+    fn start(
+        store: &Arc<sentinel_store::Store>,
+        app: Arc<sentinel_github::app::App>,
+        details_url: Option<String>,
+        members: sentinel_checks::members::Config,
+    ) -> GithubLanes {
+        let reconcile_dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let reconcile = Box::new(sentinel_checks::Reconcile::start(
+            Arc::clone(store),
+            Arc::clone(&app),
+            sentinel_checks::reconcile::Config::default(),
+            move |notice| {
+                tracing::dispatcher::with_default(&reconcile_dispatch, || {
+                    tracing::info!(
+                        event = "github_reconciled",
+                        kind = notice.kind,
+                        outcome = %notice.outcome
+                    );
+                });
+            },
+        ));
+        let members_dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let members = Box::new(sentinel_checks::Members::start(
+            Arc::clone(store),
+            Arc::clone(&app),
+            members,
+            move |notice| {
+                tracing::dispatcher::with_default(&members_dispatch, || {
+                    tracing::info!(event = "github_members_checked", outcome = %notice.outcome);
+                });
+            },
+        ));
+        let publisher =
+            sentinel_checks::github::GithubChecks::new(Arc::clone(store), app, details_url);
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let checks = Box::new(sentinel_checks::Lane::start(
+            Arc::clone(store),
+            Box::new(publisher),
+            sentinel_checks::lane::Config::default(),
+            move |batch| {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    if batch.refused > 0 {
+                        tracing::warn!(
+                            event = "checks_failed",
+                            refused = batch.refused,
+                            "publications were refused"
+                        );
+                    }
+                    if let Some(until) = batch.paused_until_ms {
+                        tracing::warn!(event = "checks_paused", until_ms = until);
+                    }
+                    for entry in &batch.entries {
+                        tracing::info!(
+                            event = "check_settled",
+                            check = %entry.id,
+                            name = %entry.name,
+                            outcome = %entry.outcome
+                        );
+                    }
+                });
+            },
+        ));
+        GithubLanes {
+            _members: members,
+            _reconcile: reconcile,
+            _checks: checks,
+        }
+    }
+}
+
+/// What wakes the node-key pass: the periodic tick still catches edits to the operator's allow-list file, but a
+/// machine that redeems an enrollment is admitted at once.
+#[cfg(feature = "server")]
+enum Wake {
+    Refresh,
+    Stop,
+}
+
 #[cfg(feature = "server")]
 struct TailcatServer {
     server: Arc<sentinel_link::tailcat::Server>,
-    stop: mpsc::SyncSender<()>,
+    wake: mpsc::SyncSender<Wake>,
     refresher: std::thread::JoinHandle<()>,
 }
 
 #[cfg(feature = "server")]
 impl TailcatServer {
+    /// Run the node-key pass now. A pass already queued covers this request too.
+    fn refresh_now(&self) -> sentinel_api::Notify {
+        let wake = self.wake.clone();
+        sentinel_api::Notify(Arc::new(move || {
+            let _ = wake.try_send(Wake::Refresh);
+        }))
+    }
+
     fn shutdown(self) {
-        drop(self.stop);
+        let _ = self.wake.send(Wake::Stop);
         let _ = self.refresher.join();
         self.server.shutdown();
     }
@@ -1298,11 +1662,25 @@ impl TailcatServer {
 #[cfg(feature = "server")]
 const TAILCAT_ALLOW_REFRESH: Duration = Duration::from_secs(10);
 
+/// Every node key the controller's Tailcat helper admits: the allow-list file's lines for workers that
+/// are not revoked, the bound key of every live worker, and the key authorized for each enrollment
+/// that can still be redeemed (without it a new worker could not reach the controller to present its
+/// secret). A worker revoked or uninstalled drops out of all three on the next pass.
 #[cfg(feature = "server")]
 fn admitted_keys(
     store: &sentinel_store::Store,
     listed: &[sentinel_link::tailcat::Admission],
 ) -> sentinel_store::Result<Vec<sentinel_link::tailcat::NodeKey>> {
+    admitted_keys_at(store, listed, sentinel_core::UnixMillis::now())
+}
+
+#[cfg(feature = "server")]
+fn admitted_keys_at(
+    store: &sentinel_store::Store,
+    listed: &[sentinel_link::tailcat::Admission],
+    now: sentinel_core::UnixMillis,
+) -> sentinel_store::Result<Vec<sentinel_link::tailcat::NodeKey>> {
+    use sentinel_link::tailcat::NodeKey;
     store.read(|conn| {
         let mut keys = Vec::with_capacity(listed.len());
         for admission in listed {
@@ -1310,8 +1688,51 @@ fn admitted_keys(
                 keys.push(admission.key.clone());
             }
         }
+        let bound = sentinel_store::workers::admitted_node_keys(conn)?;
+        let pending = sentinel_store::workers::pending_node_keys(conn, now)?;
+        for (_, key) in bound.into_iter().chain(pending) {
+            let text = key.iter().fold(String::from("nodekey:"), |mut text, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(text, "{byte:02x}");
+                text
+            });
+            if let Some(key) = NodeKey::parse(&text)
+                && !keys.contains(&key)
+            {
+                keys.push(key);
+            }
+        }
         Ok(keys)
     })
+}
+
+/// Take the lines of revoked or uninstalled workers off the allow-list file, so the file the operator
+/// reads names only the machines the controller still admits. Returns the workers it dropped.
+#[cfg(feature = "server")]
+fn prune_revoked(
+    store: &sentinel_store::Store,
+    data_dir: &Path,
+    listed: &[sentinel_link::tailcat::Admission],
+) -> Vec<sentinel_core::WorkerId> {
+    let revoked: Vec<sentinel_core::WorkerId> = store
+        .read(|conn| {
+            let mut gone = Vec::new();
+            for admission in listed {
+                if !gone.contains(&admission.worker)
+                    && sentinel_store::workers::revoked(conn, admission.worker)?
+                {
+                    gone.push(admission.worker);
+                }
+            }
+            Ok(gone)
+        })
+        .unwrap_or_default();
+    if revoked.is_empty()
+        || sentinel_link::tailcat::prune(data_dir, |line| revoked.contains(&line.worker)).is_err()
+    {
+        return Vec::new();
+    }
+    revoked
 }
 
 #[cfg(feature = "server")]
@@ -1348,7 +1769,7 @@ fn start_tailcat(
         ),
     }
     let server = Arc::new(server);
-    let (stop, wake) = mpsc::sync_channel::<()>(0);
+    let (wake_tx, wake) = mpsc::sync_channel::<Wake>(1);
     let refresher = {
         let server = Arc::clone(&server);
         let store = Arc::clone(store);
@@ -1360,9 +1781,10 @@ fn start_tailcat(
                 tracing::dispatcher::with_default(&dispatch, || {
                     let (mut file_warned, mut store_warned) = (false, false);
                     let mut rotation_warned = false;
-                    while let Err(mpsc::RecvTimeoutError::Timeout) =
-                        wake.recv_timeout(TAILCAT_ALLOW_REFRESH)
-                    {
+                    while !matches!(
+                        wake.recv_timeout(TAILCAT_ALLOW_REFRESH),
+                        Ok(Wake::Stop) | Err(mpsc::RecvTimeoutError::Disconnected)
+                    ) {
                         match server.reload_keys() {
                             Ok(()) => rotation_warned = false,
                             Err(_) if !rotation_warned => {
@@ -1391,6 +1813,14 @@ fn start_tailcat(
                         match admitted_keys(&store, &listed) {
                             Ok(keys) => {
                                 store_warned = false;
+                                let pruned = prune_revoked(&store, &data_dir, &listed);
+                                if !pruned.is_empty() {
+                                    tracing::info!(
+                                        event = "tailcat_allow_pruned",
+                                        workers = pruned.len()
+                                    );
+                                    listed.retain(|line| !pruned.contains(&line.worker));
+                                }
                                 if let Some(handoff) = link.hand_off(&server, &keys) {
                                     tracing::info!(
                                         event = "tailcat_allow_changed",
@@ -1424,7 +1854,7 @@ fn start_tailcat(
     };
     Ok(Some(TailcatServer {
         server,
-        stop,
+        wake: wake_tx,
         refresher,
     }))
 }
@@ -1480,13 +1910,19 @@ fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
     let wall = sentinel_core::UnixMillis::now();
     // Idempotency keys are stamped by the deadline clock, so their TTL is judged on it.
     let steady = sentinel_core::UnixMillis::steady();
-    let purges: [(&str, Purge, sentinel_core::UnixMillis); 8] = [
+    let purges: [(&str, Purge, sentinel_core::UnixMillis); 10] = [
         ("setup", sentinel_store::setup::purge, wall),
+        ("github_app_states", sentinel_store::github_app::purge, wall),
         ("oauth", sentinel_store::oauth::purge_expired, wall),
         ("api_tokens", sentinel_store::tokens::purge_expired, wall),
         ("sessions", sentinel_store::local_auth::purge_expired, wall),
         ("sign_in", sentinel_store::sign_in::purge_expired, wall),
         ("email", sentinel_store::email::purge, wall),
+        (
+            "unverified_accounts",
+            sentinel_store::email::purge_unverified,
+            wall,
+        ),
         (
             "idempotency",
             sentinel_store::idempotency::purge_expired,
@@ -1514,6 +1950,47 @@ fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
     backlog
 }
 
+/// Raise the soft open-files limit once, at startup, to what the controller's session limit needs and never past the
+/// hard limit, which stays as it was. The link library only reads the limit and sizes its session cap from it, so the
+/// process-wide change is made here, by the one owner of the process, and a limit that stays too low is reported by
+/// `Controller::start` with the numbers instead of being papered over.
+#[cfg(all(feature = "server", target_os = "linux"))]
+fn raise_descriptor_soft_limit() {
+    let need =
+        sentinel_link::controller::descriptors_needed(sentinel_link::controller::MAX_SESSIONS)
+            as libc::rlim_t;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable `rlimit` for the whole call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 || limit.rlim_cur >= need {
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: need.min(limit.rlim_max),
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: `raised` is a valid `rlimit` that only moves the soft limit up to the hard one; failure leaves the
+    // limit as it was.
+    let raised_ok = raised.rlim_cur > limit.rlim_cur
+        && unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0;
+    tracing::info!(
+        event = "descriptor_limit",
+        soft = if raised_ok {
+            raised.rlim_cur
+        } else {
+            limit.rlim_cur
+        },
+        hard = limit.rlim_max,
+        needed = need,
+        raised = raised_ok,
+    );
+}
+
+#[cfg(all(feature = "server", not(target_os = "linux")))]
+fn raise_descriptor_soft_limit() {}
+
 #[cfg(feature = "server")]
 fn start_server(
     config: &Config,
@@ -1522,7 +1999,7 @@ fn start_server(
     public_url: Option<String>,
     trusted_proxies: Option<&[String]>,
     tailcat: Option<&TailcatFile>,
-    (remote_cache, remote_cache_budget): (bool, Option<u64>),
+    (remote_cache, remote_cache_budget, priority_placement): (bool, Option<u64>, bool),
 ) -> Result<Running, Error> {
     let path = config.data_dir.join(sentinel_store::METADATA_FILE);
     let (store, snapshot) =
@@ -1620,6 +2097,7 @@ fn start_server(
     if swept > 0 {
         tracing::info!(event = "uploads_swept", expired = swept);
     }
+    raise_descriptor_soft_limit();
     let controller = sentinel_link::controller::Controller::start(
         Arc::clone(&store),
         Arc::clone(&logs),
@@ -1632,6 +2110,9 @@ fn start_server(
     controller.set_storage_policy(sentinel_link::controller::StoragePolicy {
         interval_ms: config.storage.sweep_interval_ms,
     });
+    if priority_placement {
+        controller.set_placement_order(sentinel_link::controller::PlacementOrder::Priority);
+    }
     if remote_cache {
         let root = config.data_dir.join("remote-cache");
         fs::create_dir_all(&root).map_err(|error| {
@@ -1644,15 +2125,27 @@ fn start_server(
         controller.set_remote_cache_budget(budget);
         controller.set_remote_cache(root);
     }
+    let tailcat_file = tailcat;
     let tailcat = start_tailcat(config, &store, tailcat, listen, controller.handle())?;
     let destinations = crate::source_admin::load_destinations(&config.data_dir)
         .map_err(|_| Error::runtime("cannot load source destination policy"))?;
     let intake_destinations: Arc<[String]> = destinations.clone().into();
     controller.set_source_destinations(destinations);
-    let app = crate::source_admin::load_app(&config.data_dir)
-        .map_err(|_| Error::runtime("cannot load GitHub App configuration"))?;
-    if let Some(app) = &app {
-        controller.set_source_app(Arc::clone(&app.app));
+    let github = crate::source_admin::load_github(
+        &config.data_dir,
+        &store,
+        key.as_deref(),
+        public_url.as_deref(),
+    )
+    .map_err(|error| Error::runtime(error.message))?;
+    if github.stored_ignored {
+        tracing::warn!(
+            event = "github_app_stored_ignored",
+            "a GitHub App made with one-click setup is stored, but the GitHub files in the data directory take precedence"
+        );
+    }
+    if let Some(app) = github.current.get() {
+        controller.set_source_app(Arc::clone(app));
     }
     if let Some(key) = &key {
         controller.set_source_key(Arc::clone(key));
@@ -1660,7 +2153,7 @@ fn start_server(
     let resolver = sentinel_intake::Resolver::new(
         Arc::clone(&store),
         key.clone(),
-        app.as_ref().map(|app| Arc::clone(&app.app)),
+        github.current.clone(),
         Arc::clone(&intake_destinations),
         Arc::new(sentinel_intake::resolve::GitFetch),
         config.data_dir.join("intake-work"),
@@ -1707,7 +2200,7 @@ fn start_server(
     let poll = sentinel_intake::Poll::start(
         Arc::clone(&store),
         key.clone(),
-        app.as_ref().map(|app| Arc::clone(&app.app)),
+        github.current.clone(),
         intake_destinations,
         Arc::new(sentinel_intake::GitLister),
         config.data_dir.join("poll-work"),
@@ -1731,84 +2224,56 @@ fn start_server(
         },
     )
     .map_err(|_| Error::runtime("cannot prepare the poll work directory"))?;
-    let github_webhook_secret = crate::source_admin::load_webhook_secret(&config.data_dir)
-        .map_err(|_| Error::runtime("cannot load the GitHub webhook secret"))?;
+    let github_webhook_secret = github.webhook_secret.clone();
     if github_webhook_secret.is_some() {
         tracing::info!(event = "github_webhook_enabled");
     }
-    let mut reconcile = None;
-    let mut members = None;
-    let checks = match &app {
+    let github_lanes: Arc<std::sync::Mutex<Option<GithubLanes>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    match github.current.get() {
         Some(app) => {
             tracing::info!(
                 event = "checks_enabled",
-                endpoint = %app.app.endpoint(),
-                details_url = app.public_url.is_some()
+                endpoint = %app.endpoint(),
+                details_url = github.details_url.is_some() || public_url.is_some()
             );
-            let reconcile_dispatch = tracing::dispatcher::get_default(Clone::clone);
-            reconcile = Some(Box::new(sentinel_checks::Reconcile::start(
-                Arc::clone(&store),
-                Arc::clone(&app.app),
-                sentinel_checks::reconcile::Config::default(),
-                move |notice| {
-                    tracing::dispatcher::with_default(&reconcile_dispatch, || {
-                        tracing::info!(
-                            event = "github_reconciled",
-                            kind = notice.kind,
-                            outcome = %notice.outcome
-                        );
-                    });
-                },
-            )));
-            let members_dispatch = tracing::dispatcher::get_default(Clone::clone);
-            members = Some(Box::new(sentinel_checks::Members::start(
-                Arc::clone(&store),
-                Arc::clone(&app.app),
-                app.members,
-                move |notice| {
-                    tracing::dispatcher::with_default(&members_dispatch, || {
-                        tracing::info!(event = "github_members_checked", outcome = %notice.outcome);
-                    });
-                },
-            )));
-            let publisher = sentinel_checks::github::GithubChecks::new(
-                Arc::clone(&store),
-                Arc::clone(&app.app),
-                app.public_url.clone(),
-            );
-            let dispatch = tracing::dispatcher::get_default(Clone::clone);
-            Some(Box::new(sentinel_checks::Lane::start(
-                Arc::clone(&store),
-                Box::new(publisher),
-                sentinel_checks::lane::Config::default(),
-                move |batch| {
-                    tracing::dispatcher::with_default(&dispatch, || {
-                        if batch.refused > 0 {
-                            tracing::warn!(
-                                event = "checks_failed",
-                                refused = batch.refused,
-                                "publications were refused"
-                            );
-                        }
-                        if let Some(until) = batch.paused_until_ms {
-                            tracing::warn!(event = "checks_paused", until_ms = until);
-                        }
-                        for entry in &batch.entries {
-                            tracing::info!(
-                                event = "check_settled",
-                                check = %entry.id,
-                                name = %entry.name,
-                                outcome = %entry.outcome
-                            );
-                        }
-                    });
-                },
-            )))
+            *github_lanes.lock().unwrap_or_else(|p| p.into_inner()) = Some(GithubLanes::start(
+                &store,
+                Arc::clone(app),
+                github.details_url.clone().or_else(|| public_url.clone()),
+                github.members,
+            ));
         }
-        None => {
-            tracing::info!(event = "checks_disabled", "no GitHub App");
-            None
-        }
+        None => tracing::info!(event = "checks_disabled", "no GitHub App"),
+    }
+    let on_activate: sentinel_api::OnActivate = {
+        let (store, lanes, link) = (
+            Arc::clone(&store),
+            Arc::clone(&github_lanes),
+            controller.handle(),
+        );
+        let details_url = public_url.clone();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        Arc::new(move |activation: &sentinel_api::Activation| {
+            tracing::dispatcher::with_default(&dispatch, || {
+                link.set_source_app(Arc::clone(&activation.app));
+                let mut slot = lanes.lock().unwrap_or_else(|p| p.into_inner());
+                if slot.is_none() {
+                    *slot = Some(GithubLanes::start(
+                        &store,
+                        Arc::clone(&activation.app),
+                        details_url.clone(),
+                        sentinel_checks::members::Config::default(),
+                    ));
+                }
+                tracing::info!(
+                    event = "github_app_activated",
+                    app_id = activation.app_id,
+                    slug = %activation.slug,
+                    "the GitHub App made with one-click setup is in force; no restart needed"
+                );
+            });
+        })
     };
     tracing::info!(
         event = "link_listening",
@@ -1819,8 +2284,7 @@ fn start_server(
         orphaned = reconciled.orphaned,
         "workers pin this fingerprint with their enrollment"
     );
-    let github_sign_in = crate::source_admin::load_sign_in(&config.data_dir)
-        .map_err(|error| Error::runtime(error.message))?;
+    let github_sign_in = github.sign_in;
     if let Some(sign_in) = &github_sign_in {
         tracing::info!(event = "github_sign_in_enabled", client_id = %sign_in.client_id);
     }
@@ -1835,7 +2299,7 @@ fn start_server(
                 Arc::clone(&objects),
                 config.data_dir.clone(),
                 backup.dir.clone(),
-                Duration::from_secs(backup.interval_secs.unwrap_or(3_600)),
+                Duration::from_secs(backup.interval_secs.unwrap_or(DEFAULT_BACKUP_INTERVAL_SECS)),
                 backup.keep.unwrap_or(24),
                 env!("CARGO_PKG_VERSION").to_owned(),
             );
@@ -1843,7 +2307,7 @@ fn start_server(
             let thread = scheduler
                 .start()
                 .map_err(|error| Error::runtime(format!("cannot start backups: {error}")))?;
-            tracing::info!(event = "backups_scheduled", dir = %backup.dir.display(), interval_secs = backup.interval_secs.unwrap_or(3_600), keep = backup.keep.unwrap_or(24));
+            tracing::info!(event = "backups_scheduled", dir = %backup.dir.display(), interval_secs = backup.interval_secs.unwrap_or(DEFAULT_BACKUP_INTERVAL_SECS), keep = backup.keep.unwrap_or(24));
             Some((scheduler, thread))
         }
         None => None,
@@ -1851,7 +2315,21 @@ fn start_server(
     let (mail, mail_sender) = start_mail(config, public_url.as_deref(), &store, key.as_ref())?;
     announce_setup(&config.data_dir, &store)?;
     record_auto_join(&config.auto_join, &store)?;
+    let worker_bootstrap = match &config.worker_bootstrap {
+        Some(file) => {
+            let built = file.build(&config.data_dir, &fingerprint, tailcat_file)?;
+            tracing::info!(
+                event = "worker_bootstrap_enabled",
+                release = built.release_version(),
+                tailcat = built.tailcat_configured()
+            );
+            Some(Arc::new(built))
+        }
+        None => None,
+    };
     let options = sentinel_api::Options {
+        worker_bootstrap,
+        on_worker_enrolled: tailcat.as_ref().map(TailcatServer::refresh_now),
         mail: mail_sender,
         auto_join: config
             .auto_join
@@ -1862,6 +2340,12 @@ fn start_server(
                 organization: rule.slug.clone(),
             })
             .collect(),
+        github_app: sentinel_api::GithubAppSetup {
+            current: github.current.clone(),
+            source: github.source,
+            on_activate: Some(on_activate),
+            ..sentinel_api::GithubAppSetup::default()
+        },
     };
     let api = sentinel_api::Server::start_with(
         sentinel_api::Config {
@@ -1897,10 +2381,8 @@ fn start_server(
         store,
         lane: Box::new(lane),
         poll: Box::new(poll),
-        checks,
-        reconcile,
+        github_lanes,
         mail,
-        members,
         tailcat,
         replicator,
         backups,
@@ -2175,6 +2657,7 @@ mod worker_role {
         git_mirrors: bool,
         spool: (Option<u64>, Option<u64>),
         budgets: [Option<u64>; 3],
+        measured_disk: bool,
         network: sentinel_worker::podman::Network,
         runtime: sentinel_worker::attempt::Runtime,
         metrics: Arc<crate::worker_metrics::Metrics>,
@@ -2234,6 +2717,7 @@ mod worker_role {
                     sentinel_worker::executor::Notice::ShutDown { ended, left, handed_back } => {
                         tracing::info!(event = "attempts_shut_down", ended, left, handed_back);
                     }
+                    sentinel_worker::executor::Notice::CacheFigures(_) => {}
                     sentinel_worker::executor::Notice::Availability(snapshot) => {
                         tracing::info!(event = "availability", images_held = snapshot.images_held.len(), images_in_flight = snapshot.images_in_flight, cache_entries = snapshot.cache_entries, cache_generations = snapshot.cache_generations, cache_bytes = snapshot.cache_bytes, truncated = snapshot.truncated);
                     }
@@ -2270,13 +2754,26 @@ mod worker_role {
                     image_bytes = budgets.image_bytes
                 );
                 executor.set_storage_budgets(budgets);
+                executor.set_measured_disk(measured_disk);
                 executor.set_job_network(network);
+                let microvm_egress = network == sentinel_worker::podman::Network::Egress
+                    && runtime.microvm.is_some();
                 executor.set_runtime(runtime);
                 if network == sentinel_worker::podman::Network::Egress {
                     tracing::warn!(
                         event = "job_egress_enabled",
                         "job containers on this worker have outbound network (job_network = \"egress\")"
                     );
+                }
+                if microvm_egress {
+                    let missing = sentinel_worker::microvm::net::missing_prerequisites();
+                    if !missing.is_empty() {
+                        tracing::warn!(
+                            event = "microvm_egress_unavailable",
+                            missing = %missing.join(", "),
+                            "microVM jobs on this worker cannot get network until these are installed"
+                        );
+                    }
                 }
                 let runtime = executor.runtime();
                 let recovered = executor.recovered();
@@ -2297,6 +2794,49 @@ mod worker_role {
                 Box::new(NoExecutor)
             }
         }
+    }
+
+    /// The isolation preference and microVM setup a worker configuration states (the default preference and
+    /// no setup when there is no configuration).
+    fn runtime_request(
+        link: Option<&WorkerLink>,
+    ) -> (
+        sentinel_worker::host::Preference,
+        Option<sentinel_worker::microvm::Setup>,
+    ) {
+        match link {
+            Some(link) => (
+                match link.isolation {
+                    IsolationSetting::Auto => sentinel_worker::host::Preference::Auto,
+                    IsolationSetting::Container => sentinel_worker::host::Preference::Container,
+                    IsolationSetting::Microvm => sentinel_worker::host::Preference::Microvm,
+                },
+                link.microvm
+                    .as_ref()
+                    .map(|m| sentinel_worker::microvm::Setup {
+                        firecracker: m.firecracker.clone(),
+                        kernel: m.kernel.clone(),
+                        agent: m.agent.clone(),
+                        snapshots: m.snapshots,
+                        guard: sentinel_worker::microvm::net::Guard { link: Vec::new() },
+                    }),
+            ),
+            None => (sentinel_worker::host::Preference::Auto, None),
+        }
+    }
+
+    /// Whether the isolation the configuration asks for can run on this host.
+    pub(super) fn check_runtime(link: &WorkerLink) -> Result<(), Error> {
+        let (preference, setup) = runtime_request(Some(link));
+        runtime_selection(preference, setup.as_ref()).map(drop)
+    }
+
+    /// The runtime record `worker --check` prints: what this host and configuration would state.
+    pub(super) fn check_report(link: Option<&WorkerLink>) -> Result<String, Error> {
+        let (preference, setup) = runtime_request(link);
+        let (_, absent) = sentinel_worker::host::detect();
+        let selection = runtime_selection(preference, setup.as_ref())?;
+        Ok(sentinel_worker::host::report(&selection, absent.as_ref()))
     }
 
     /// Detects the host's virtualization and picks the default executor (plan 16.8, runtime selection).
@@ -2325,24 +2865,6 @@ mod worker_role {
             kvm_absent = absent.as_ref().map(|a| a.0.as_str())
         );
         Ok(selection)
-    }
-
-    /// What the worker states it can run; a job that states an OS or isolation is placed only where they match.
-    fn runtime_capabilities(
-        selection: &sentinel_worker::host::Selection,
-    ) -> sentinel_protocol::negotiate::Capabilities {
-        use sentinel_protocol::negotiate::Capabilities as C;
-        let mut bits = C::OS_LINUX.union(C::ISOLATION_CONTAINER);
-        if selection.virtualization.kvm {
-            bits = bits.union(C::KVM);
-        }
-        if selection.virtualization.nested {
-            bits = bits.union(C::KVM_NESTED);
-        }
-        if selection.microvm {
-            bits = bits.union(C::ISOLATION_MICROVM);
-        }
-        bits
     }
 
     fn capacity(link: &WorkerLink) -> Capacity {
@@ -2390,11 +2912,7 @@ mod worker_role {
     fn profile_disk(link: &WorkerLink, data_dir: &Path) -> u64 {
         match link.disk_bytes {
             Some(bytes) => bytes,
-            None => {
-                let free = disk_free(data_dir);
-                let reserve = (free / 8).clamp(512 << 20, 2 << 30);
-                free.saturating_sub(reserve)
-            }
+            None => sentinel_worker::executor::job_disk_room(disk_free(data_dir)),
         }
     }
 
@@ -2547,6 +3065,16 @@ mod worker_role {
                 firecracker: m.firecracker.clone(),
                 kernel: m.kernel.clone(),
                 agent: m.agent.clone(),
+                snapshots: m.snapshots,
+                // A guest granted egress never reaches the controller's link: the address the worker dials
+                // (the Tailcat helper's local forward, when there is one) and the configured one.
+                guard: sentinel_worker::microvm::net::Guard {
+                    link: if controller == link.controller {
+                        vec![controller]
+                    } else {
+                        vec![controller, link.controller]
+                    },
+                },
             });
         let preference = match link.isolation {
             IsolationSetting::Auto => sentinel_worker::host::Preference::Auto,
@@ -2554,7 +3082,7 @@ mod worker_role {
             IsolationSetting::Microvm => sentinel_worker::host::Preference::Microvm,
         };
         let selection = runtime_selection(preference, setup.as_ref())?;
-        capabilities = capabilities.union(runtime_capabilities(&selection));
+        capabilities = capabilities.union(sentinel_worker::host::capabilities(&selection));
         let runtime = sentinel_worker::attempt::Runtime {
             default: Some(selection.default),
             microvm: setup.filter(|_| selection.microvm).map(Arc::new),
@@ -2627,6 +3155,7 @@ mod worker_role {
             link.git_mirrors,
             (link.spool_reserve_bytes, link.spool_quota_bytes),
             link.budgets,
+            link.disk_bytes.is_none(),
             network,
             runtime,
             Arc::clone(&metrics),
@@ -2731,6 +3260,7 @@ fn initialize_and_wait(
                 tailcat,
                 remote_cache,
                 remote_cache_budget,
+                priority_placement,
             } => start_server(
                 config,
                 *listen,
@@ -2738,7 +3268,7 @@ fn initialize_and_wait(
                 public_url.clone(),
                 trusted_proxies.as_deref(),
                 tailcat.as_ref(),
-                (*remote_cache, *remote_cache_budget),
+                (*remote_cache, *remote_cache_budget, *priority_placement),
             ),
             #[cfg(feature = "worker")]
             Role::Worker(Some(link)) => worker_role::start(config, link),
@@ -2770,10 +3300,8 @@ fn initialize_and_wait(
             store,
             lane,
             poll,
-            checks,
-            reconcile,
+            github_lanes,
             mail,
-            members,
             tailcat,
             replicator,
             backups,
@@ -2790,9 +3318,12 @@ fn initialize_and_wait(
             if let Some(tailcat) = tailcat {
                 tailcat.shutdown();
             }
-            drop(members);
-            drop(reconcile);
-            drop(checks);
+            drop(
+                github_lanes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take(),
+            );
             drop(mail);
             drop(poll);
             drop(lane);
@@ -2951,11 +3482,139 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_authorized_enrollment_key_is_admitted_until_the_worker_is_uninstalled() {
+        use sentinel_auth::secret::Secret;
+        use sentinel_core::{PoolId, UnixMillis, WorkerId};
+        use sentinel_link::tailcat::{Admission, NodeKey};
+        use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
+        use sentinel_store::{auth::Authority, tenancy, workers};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = sentinel_store::Store::open(
+            dir.path().join("metadata.sqlite"),
+            sentinel_store::Durability::Normal,
+        )
+        .unwrap();
+        let (pool, worker) = (PoolId::new(), WorkerId::new());
+        let hex = "d".repeat(64);
+        let node_key = NodeKey::parse(&format!("nodekey:{hex}")).unwrap();
+        let raw = [0xdd_u8; 32];
+        let issued = store
+            .writer()
+            .write(move |tx| {
+                tenancy::create_pool(
+                    tx,
+                    Authority::HostLocal,
+                    pool,
+                    "builders",
+                    tenancy::PoolKind::Shared,
+                    UnixMillis(1_000),
+                )?;
+                let issued = workers::issue_enrollment_with(
+                    tx,
+                    Authority::HostLocal,
+                    workers::EnrollmentTerms {
+                        pool,
+                        lifetime_ms: 60_000,
+                        policy: workers::HostPolicy::default(),
+                        tailcat: true,
+                    },
+                    UnixMillis(1_000),
+                )?;
+                workers::authorize_node_key(
+                    tx,
+                    Authority::HostLocal,
+                    issued.id,
+                    worker,
+                    raw,
+                    UnixMillis(1_100),
+                )?;
+                Ok(issued)
+            })
+            .unwrap();
+
+        // Before the worker has connected, its authorized key is all the helper has to go on.
+        let at = |ms| admitted_keys_at(&store, &[], UnixMillis(ms)).unwrap();
+        assert_eq!(at(2_000), vec![node_key.clone()]);
+        assert!(at(61_001).is_empty(), "an expired enrollment admits no one");
+
+        let mut text = String::new();
+        issued.secret.expose(&mut text);
+        let secret = Secret::parse(&text).unwrap();
+        store
+            .writer()
+            .write(move |tx| {
+                workers::redeem_authorized(
+                    tx,
+                    &secret,
+                    workers::Presentation {
+                        worker,
+                        fingerprint: Secret::generate().digest(),
+                        name: "w",
+                        negotiated: Negotiated {
+                            protocol: ProtocolVersion(7),
+                            capabilities: Capabilities::REQUIRED,
+                            arch: Arch::X86_64,
+                        },
+                    },
+                    UnixMillis(3_000),
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        // Spent: the key is now the worker's own, and it stays admitted past the enrollment's expiry.
+        assert_eq!(at(2_000_000), vec![node_key.clone()]);
+        // A hand-listed line for the same worker adds nothing.
+        let listed = [Admission {
+            key: node_key.clone(),
+            worker,
+        }];
+        assert_eq!(
+            admitted_keys_at(&store, &listed, UnixMillis(3_500)).unwrap(),
+            vec![node_key.clone()]
+        );
+
+        // The uninstall settles, the key leaves the helper's list and the file loses its line.
+        let allow = dir.path().join(sentinel_link::tailcat::ALLOW_LIST_FILE);
+        sentinel_link::tailcat::admit(dir.path(), &listed[0]).unwrap();
+        store
+            .writer()
+            .write(move |tx| {
+                workers::request_uninstall(tx, Authority::HostLocal, worker, UnixMillis(4_000))?;
+                workers::settle_uninstalls(tx, UnixMillis(4_100)).map(|_| ())
+            })
+            .unwrap();
+        assert!(
+            admitted_keys_at(&store, &listed, UnixMillis(4_200))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(prune_revoked(&store, dir.path(), &listed), vec![worker]);
+        assert_eq!(std::fs::read_to_string(&allow).unwrap(), "");
+        assert!(prune_revoked(&store, dir.path(), &[]).is_empty());
+    }
+
     fn marks_ok(storage: &Storage, total: u64) -> sentinel_store::space::Watermarks {
         match storage.marks(total) {
             Ok(marks) => marks,
             Err(_) => panic!("watermarks must resolve for {total}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_auto_join_value_stops_startup_without_echoing_it() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = std::ffi::OsString::from_vec(b"secret-\xff.example=org".to_vec());
+        let Err(error) = auto_join_from_env(Err(std::env::VarError::NotUnicode(raw))) else {
+            panic!("a non-Unicode value must be an error");
+        };
+        let text = error.message;
+        assert!(text.contains("SENTINEL_AUTO_JOIN_DOMAINS"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+        assert!(auto_join_from_env(Err(std::env::VarError::NotPresent)).is_ok());
+        assert!(auto_join_from_env(Ok("example.com=eng".into())).is_ok());
     }
 
     fn resolve_ok(file: StorageFile) -> Storage {
@@ -3022,6 +3681,43 @@ mod tests {
             assert!(parse(bad).check(data).is_err(), "{bad}");
         }
         assert!(toml::from_str::<BackupFile>("dir = '/x'\nextra = 1").is_err());
+    }
+
+    #[test]
+    fn worker_bootstrap_settings_need_a_dialable_controller_and_the_controllers_own_tailcat() {
+        let parse = |text: &str| toml::from_str::<WorkerBootstrapFile>(text).unwrap();
+        let tailcat_on = TailcatFile {
+            enabled: Some(true),
+            ..TailcatFile::default()
+        };
+        let base = "controller = '10.0.0.5:7443'\nrelease_url = 'https://r.example.test/0.1.0'\nrelease_sums = '/etc/sentinel/SHA256SUMS'\n";
+        assert!(parse(base).check(None).is_ok());
+        let with_helper =
+            format!("{base}[tailcat]\nx86_64_url = 'https://r.example.test/tailcat'\n");
+        assert!(parse(&with_helper).check(Some(&tailcat_on)).is_ok());
+        // A script that hands out the controller's Tailcat address needs the controller to serve one.
+        assert!(parse(&with_helper).check(None).is_err());
+        assert!(
+            parse(&with_helper)
+                .check(Some(&TailcatFile::default()))
+                .is_err()
+        );
+        for bad in [
+            "controller = 'ci.example.test:7443'\nrelease_url = 'https://r.example.test'\nrelease_sums = '/s'\n",
+            "controller = '10.0.0.5:7443'\nrelease_url = 'https://r.example.test'\nrelease_sums = 'SHA256SUMS'\n",
+        ] {
+            assert!(parse(bad).check(None).is_err(), "{bad}");
+        }
+        // No arm64 digest is pinned by this build, so an arm64 helper must state its own.
+        let arm_without_digest =
+            format!("{base}[tailcat]\naarch64_url = 'https://r.example.test/tailcat-arm'\n");
+        assert!(parse(&arm_without_digest).check(Some(&tailcat_on)).is_err());
+        let empty_helper = format!("{base}[tailcat]\nversion = '0.6.0'\n");
+        assert!(parse(&empty_helper).check(Some(&tailcat_on)).is_err());
+        assert!(
+            toml::from_str::<WorkerBootstrapFile>(&format!("{base}extra = 1")).is_err(),
+            "unknown keys are refused"
+        );
     }
 
     #[test]

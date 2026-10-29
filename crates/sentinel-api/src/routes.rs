@@ -43,6 +43,7 @@ mod email;
 mod failure;
 mod setup;
 mod views;
+mod worker_enrollment;
 use failure::attempt_failure;
 
 pub(crate) enum Reply {
@@ -52,6 +53,8 @@ pub(crate) enum Reply {
     Stream(u16, Box<dyn Read + Send>, u64, Vec<Header>),
     Html(u16, String, Vec<Header>),
     Text(u16, &'static str, String),
+    /// A generated shell script for the administrator to save and run: an attachment, never rendered.
+    Script(u16, String),
 }
 pub(crate) type Route = Result<Reply, ApiError>;
 
@@ -128,7 +131,8 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
         | Reply::Empty(s, ..)
         | Reply::Stream(s, ..)
         | Reply::Html(s, ..)
-        | Reply::Text(s, ..) => *s,
+        | Reply::Text(s, ..)
+        | Reply::Script(s, ..) => *s,
     };
     state.requests.observe(status, started.elapsed());
     match reply {
@@ -136,6 +140,18 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
             let response = Response::from_string(body)
                 .with_status_code(StatusCode(status))
                 .with_header(header("content-type", content_type))
+                .with_header(header("cache-control", "no-store"));
+            let _ = request.respond(response);
+        }
+        Reply::Script(status, body) => {
+            let response = Response::from_string(body)
+                .with_status_code(StatusCode(status))
+                .with_header(header("content-type", "text/x-shellscript; charset=utf-8"))
+                .with_header(header(
+                    "content-disposition",
+                    "attachment; filename=\"sentinel-worker-bootstrap.sh\"",
+                ))
+                .with_header(header("x-content-type-options", "nosniff"))
                 .with_header(header("cache-control", "no-store"));
             let _ = request.respond(response);
         }
@@ -376,6 +392,9 @@ pub(crate) fn route(
     if let Some(reply) = crate::github::route(state, request, method, &parts, query) {
         return reply;
     }
+    if let Some(reply) = crate::github_app::route(state, request, method, &parts) {
+        return reply;
+    }
     if let Some(reply) = account::route(state, request, method, &parts) {
         return reply;
     }
@@ -386,6 +405,9 @@ pub(crate) fn route(
         return reply;
     }
     if let Some(reply) = admin::route(state, request, method, &parts, query) {
+        return reply;
+    }
+    if let Some(reply) = worker_enrollment::route(state, request, method, &parts, query) {
         return reply;
     }
     match (method, parts.as_slice()) {
@@ -426,7 +448,7 @@ pub(crate) fn route(
             }))
         }
         ("GET", ["api", "v1", "health"]) => {
-            ok(json!({ "ok": true, "github_sign_in": state.github.is_some() }))
+            ok(json!({ "ok": true, "github_sign_in": state.github.get().is_some() }))
         }
         ("GET", ["api", "v1", "ready"]) => ready(state),
         ("POST", ["mcp"]) => crate::mcp::post(state, request),
@@ -493,11 +515,10 @@ pub(crate) fn route(
                 })
                 .map_err(store_error)?;
             if stale {
-                let user = who.principal.user;
-                let _ = state
-                    .store
-                    .writer()
-                    .write(move |tx| sentinel_store::github_members::enqueue_user(tx, user, now));
+                // Off the request path: the refresh is filed, never written here.
+                state
+                    .refresh
+                    .request(who.principal.user, std::time::Instant::now());
             }
             ok(json!({
                 "repos": repos.iter().map(|r| json!({ "id": r.id.to_string(), "name": r.name })).collect::<Vec<_>>()
@@ -791,7 +812,7 @@ fn wake_intake(state: &State, duplicate: bool) {
 }
 
 fn github_hook(state: &State, request: &mut Request) -> Route {
-    let Some(secret) = state.github_webhook_secret.as_deref() else {
+    let Some(secret) = state.github_webhook_secret.get().map(|s| &**s) else {
         return Err(err(ErrorCode::NotFound, "no such route"));
     };
     let event =

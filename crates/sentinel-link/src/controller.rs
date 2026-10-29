@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -46,6 +46,15 @@ const _: () = assert!(
 );
 pub const MAX_SESSIONS: usize = 1024;
 pub const MAX_PENDING: usize = 256;
+const _: () = assert!(
+    MAX_SESSIONS <= sentinel_store::logs::MAX_OPEN_WRITERS,
+    "admission::LOG_FDS_PER_SESSION assumes one open log writer per session at most"
+);
+
+/// The open descriptors the controller needs to hold `sessions` worker sessions; the service raises its soft limit to this.
+pub const fn descriptors_needed(sessions: usize) -> usize {
+    admission::descriptors_for(sessions)
+}
 const SPEC_RESOLVERS: usize = 8;
 const MAX_SPEC_QUEUE: usize = 4096;
 const SPEC_ACK_WAIT: Duration = Duration::from_millis(dispatch::OFFER_ACK_MS as u64);
@@ -90,6 +99,8 @@ pub struct Stats {
     pub prefetch_hints: AtomicU64,
     pub cancels_pushed: AtomicU64,
     pub revoked_sessions: AtomicU64,
+    /// Hellos refused because the certificate belongs to a revoked or uninstalled worker.
+    pub revoked_refused: AtomicU64,
     pub deferred_worker_messages: AtomicU64,
     pub deferred_dropped: AtomicU64,
 }
@@ -260,9 +271,12 @@ struct Peer {
     disk_bytes: AtomicI64,
     load_ns: AtomicI64,
     cache_bytes: AtomicI64,
+    /// The machine identity from the worker's profile; identities sharing one are one physical host.
+    host: Mutex<Option<[u8; 16]>>,
     seen_recorded_ms: AtomicI64,
     fingerprint: Digest,
     protocol: u16,
+    arch: sentinel_protocol::negotiate::Arch,
     transport: Mutex<Option<TransportStats>>,
     logging: Mutex<HashMap<AttemptId, (RunId, JobId)>>,
     bulk: Mutex<Option<Sender>>,
@@ -399,6 +413,7 @@ struct Inner {
     artifacts: Mutex<ArtifactState>,
     storage: Mutex<Option<StoragePolicy>>,
     remote_budget: AtomicU64,
+    order: AtomicU8,
     last_storage: AtomicI64,
     maintenance: (Mutex<bool>, Condvar),
     remote_cache: Mutex<Option<std::path::PathBuf>>,
@@ -426,33 +441,219 @@ struct Inner {
 
 const WARN_INTERVAL_MS: i64 = 60_000;
 
-fn rank(size: Ranked, held_millis: i64) -> (i64, i64, i64, i64, i64) {
-    let cpu = size.cpu_millis.max(1);
-    (
-        held_millis.saturating_mul(1_000) / cpu,
-        size.load_ns / cpu,
-        size.cache_bytes.saturating_neg(),
-        size.cpu_millis,
-        size.memory_bytes,
-    )
-}
+/// The busy CPU time `Availability::load_ns` counts is measured over this window (the worker samples
+/// `/proc/stat` for 100 ms), so `load_ns / LOAD_WINDOW_NS` is the number of busy cores.
+const LOAD_WINDOW_NS: i64 = 100_000_000;
+/// Placement ranks workers by when a reference job would finish on them: [`REFERENCE_JOB_MILLIS`] of CPU
+/// and [`REFERENCE_WORK_NS`] of service with no contention. Only the ratios matter; neither is a claim
+/// about real jobs.
+const REFERENCE_JOB_MILLIS: i64 = 1_000;
+const REFERENCE_WORK_NS: i128 = 10_000_000_000;
+/// A host already fully used runs the reference job `1 / INTERFERENCE_DIVISOR` slower even before the
+/// job oversubscribes it (memory bandwidth, disk and cache are shared).
+const INTERFERENCE_DIVISOR: i64 = 16;
+/// A warm cache of `CACHE_CREDIT_FULL_BYTES` or more is worth at most a tenth of the reference service
+/// time. The credit is bounded on purpose: locality can offset a mild slowdown but never an
+/// oversubscribed host, so cache affinity cannot strand work behind a saturated machine.
+const CACHE_CREDIT_FULL_BYTES: i64 = 4 << 30;
+const CACHE_CREDIT_MAX_NS: i128 = REFERENCE_WORK_NS / 10;
 
+/// What the controller knows of one worker when it ranks it. `committed_millis` is the **host's**
+/// commitment, not the identity's: the larger of what every connected identity on the host has been
+/// offered and what the host measured busy (the two overlap, running attempts are inside the
+/// measurement, so they are not added).
 #[derive(Clone, Copy, Debug)]
-struct Ranked {
+struct Standing {
     cpu_millis: i64,
     memory_bytes: i64,
-    load_ns: i64,
+    committed_millis: i64,
     cache_bytes: i64,
 }
 
-impl Peer {
-    fn ranked(&self) -> Ranked {
-        Ranked {
-            cpu_millis: self.cpu_millis,
-            memory_bytes: self.memory_bytes,
-            load_ns: self.load_ns.load(Ordering::Relaxed),
-            cache_bytes: self.cache_bytes.load(Ordering::Relaxed),
+fn busy_millis(load_ns: i64) -> i64 {
+    load_ns.max(0) / (LOAD_WINDOW_NS / 1_000)
+}
+
+/// Nanoseconds until the reference job would finish if it started on this worker now, less the bounded
+/// credit for a warm cache. Processor sharing: once the host's commitment plus the job exceeds its
+/// cores, every core's share falls with it. Lower is better.
+fn expected_finish_ns(standing: Standing) -> i64 {
+    let cpu = i128::from(standing.cpu_millis.max(1));
+    let committed = i128::from(standing.committed_millis.max(0));
+    let after = committed + i128::from(REFERENCE_JOB_MILLIS);
+    let slowdown_ppm = (after * 1_000_000 / cpu).max(1_000_000);
+    let busy_ppm = committed.min(cpu) * 1_000_000 / cpu;
+    let factor_ppm = slowdown_ppm + busy_ppm / i128::from(INTERFERENCE_DIVISOR);
+    let service = REFERENCE_WORK_NS * factor_ppm / 1_000_000;
+    let warm = i128::from(standing.cache_bytes.clamp(0, CACHE_CREDIT_FULL_BYTES));
+    let credit = CACHE_CREDIT_MAX_NS * warm / i128::from(CACHE_CREDIT_FULL_BYTES);
+    i64::try_from(service - credit).unwrap_or(i64::MAX)
+}
+
+/// Earliest expected finish first; among equals the smaller worker (best fit keeps the larger one free
+/// for work only it can hold), then the smaller memory.
+fn rank(standing: Standing) -> (i64, i64, i64) {
+    (
+        expected_finish_ns(standing),
+        standing.cpu_millis,
+        standing.memory_bytes,
+    )
+}
+
+/// How the sweep orders the free workers once hard admission has decided what each may take.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlacementOrder {
+    /// Earliest expected finish first (the default): the fastest eligible worker.
+    #[default]
+    Fastest,
+    /// Highest operator priority first, then earliest expected finish. The operator's priority
+    /// overrides speed and nothing else: the order only decides which free worker is asked first, and
+    /// a worker is asked to take only work that tenant, pool, architecture, OS, isolation, label,
+    /// disk, CPU and memory admission already let it have ([`dispatch::place_in_fleet`]).
+    Priority,
+}
+
+impl PlacementOrder {
+    pub fn parse(text: &str) -> Option<PlacementOrder> {
+        match text {
+            "fastest" => Some(PlacementOrder::Fastest),
+            "priority" => Some(PlacementOrder::Priority),
+            _ => None,
         }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlacementOrder::Fastest => "fastest",
+            PlacementOrder::Priority => "priority",
+        }
+    }
+}
+
+/// The first thing that puts one worker ahead of the next in the order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderFactor {
+    /// A higher operator priority (only under [`PlacementOrder::Priority`]).
+    Priority,
+    /// An earlier expected finish.
+    ExpectedFinish,
+    /// Equal finish: the smaller worker, which keeps the larger one free.
+    BestFit,
+    /// Everything equal: the worker identifier, so the order is deterministic.
+    Identity,
+}
+
+impl OrderFactor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OrderFactor::Priority => "priority",
+            OrderFactor::ExpectedFinish => "expected_finish",
+            OrderFactor::BestFit => "best_fit",
+            OrderFactor::Identity => "identity",
+        }
+    }
+}
+
+/// One free worker as the next placement round orders it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ranked {
+    pub worker: WorkerId,
+    /// The priority the controller approved for the host (0 when it has none).
+    pub priority: i32,
+    pub expected_finish_ns: i64,
+    /// Why this worker is ahead of the next one; `None` for the last.
+    pub ahead_because: Option<OrderFactor>,
+}
+
+type OrderKey = (i32, (i64, i64, i64));
+
+/// The sort key of one worker: the (negated) priority first under [`PlacementOrder::Priority`] and a
+/// constant under [`PlacementOrder::Fastest`], then the speed rank. Lower sorts first.
+fn order_key(order: PlacementOrder, priority: i32, standing: Standing) -> OrderKey {
+    let lead = match order {
+        PlacementOrder::Fastest => 0,
+        PlacementOrder::Priority => priority.saturating_neg(),
+    };
+    (lead, rank(standing))
+}
+
+fn ahead_because(ahead: OrderKey, behind: OrderKey) -> OrderFactor {
+    if ahead.0 != behind.0 {
+        OrderFactor::Priority
+    } else if (ahead.1).0 != (behind.1).0 {
+        OrderFactor::ExpectedFinish
+    } else if ((ahead.1).1, (ahead.1).2) != ((behind.1).1, (behind.1).2) {
+        OrderFactor::BestFit
+    } else {
+        OrderFactor::Identity
+    }
+}
+
+/// The order the next round uses, with the reason each worker is ahead of the next. The placement
+/// pass sorts by the same [`order_key`], so this is the order, not a description of it.
+fn ranking(order: PlacementOrder, entries: &[(WorkerId, i32, Standing)]) -> Vec<Ranked> {
+    let mut keyed: Vec<(OrderKey, WorkerId, i32)> = entries
+        .iter()
+        .map(|(w, priority, standing)| (order_key(order, *priority, *standing), *w, *priority))
+        .collect();
+    keyed.sort_unstable_by_key(|(key, worker, _)| (*key, *worker));
+    (0..keyed.len())
+        .map(|i| Ranked {
+            worker: keyed[i].1,
+            priority: keyed[i].2,
+            expected_finish_ns: (keyed[i].0.1).0,
+            ahead_because: keyed
+                .get(i + 1)
+                .map(|next| ahead_because(keyed[i].0, next.0)),
+        })
+        .collect()
+}
+
+/// The size the controller offers a worker: the store's effective size (the report under the approved
+/// ceilings), not the size its hello claimed. A worker the store has not listed yet keeps its hello.
+fn effective_size(peer: &Peer, approved: Option<&dispatch::Approved>) -> dispatch::Capacity {
+    match approved {
+        Some(a) => dispatch::Capacity {
+            cpu_millis: a.size.cpu_millis,
+            memory_bytes: a.size.memory_bytes,
+            disk_bytes: if peer.protocol >= PROFILE_MIN.0 {
+                a.size.disk_bytes
+            } else {
+                i64::MAX
+            },
+        },
+        None => peer.size(),
+    }
+}
+
+/// Per machine: the CPU its identities hold and the busy cores the machine measured. Identities are
+/// grouped by machine over the whole fleet, busy sessions included: their attempts and their
+/// measurements are still the host's.
+fn host_commitments(
+    fleet: &[(WorkerId, Arc<Peer>)],
+    hosts: &HashMap<WorkerId, [u8; 16]>,
+    held: &HashMap<WorkerId, i64>,
+) -> (HashMap<[u8; 16], i64>, HashMap<[u8; 16], i64>) {
+    let mut host_held: HashMap<[u8; 16], i64> = HashMap::new();
+    let mut host_busy: HashMap<[u8; 16], i64> = HashMap::new();
+    for (worker, peer) in fleet {
+        let host = hosts[worker];
+        *host_held.entry(host).or_default() += held.get(worker).copied().unwrap_or(0);
+        let busy = host_busy.entry(host).or_default();
+        *busy = (*busy).max(busy_millis(peer.load_ns.load(Ordering::Relaxed)));
+    }
+    (host_held, host_busy)
+}
+
+/// The machine key placement groups identities by: the reported host, or the worker itself when it
+/// reported none (each such identity is accounted alone, as the store does).
+fn host_key(worker: WorkerId, host: Option<[u8; 16]>) -> [u8; 16] {
+    host.unwrap_or(*worker.as_bytes())
+}
+
+impl Peer {
+    fn host(&self) -> Option<[u8; 16]> {
+        *self.host.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -547,6 +748,21 @@ impl Inner {
             .map_err(|_| Error::Internal("store write"))
     }
 
+    /// A worker authenticated from `ip`: remember the source, and tell the store when it has not heard of it lately.
+    fn vouch(&self, ip: IpAddr) {
+        let Some(source) = self.pending.vouch(ip, Instant::now()) else {
+            return;
+        };
+        let _ = self.write_store(move |tx| {
+            sentinel_store::known_sources::record(
+                tx,
+                source,
+                UnixMillis::now().0,
+                admission::KNOWN_TTL.as_millis() as i64,
+            )
+        });
+    }
+
     fn register(&self, worker: WorkerId, peer: Arc<Peer>) {
         let old = self
             .fleet
@@ -605,11 +821,11 @@ impl Inner {
         self.pending.leave(addr.ip());
         let mut session = match outcome {
             Ok(Accepted::Control(session)) => {
-                self.pending.vouch(addr.ip(), Instant::now());
+                self.vouch(addr.ip());
                 session
             }
             Ok(Accepted::Bulk(bulk)) => {
-                self.pending.vouch(addr.ip(), Instant::now());
+                self.vouch(addr.ip());
                 self.leave(arrival.as_ref());
                 self.serve_bulk(bulk);
                 return;
@@ -643,9 +859,11 @@ impl Inner {
             disk_bytes: AtomicI64::new(0),
             load_ns: AtomicI64::new(0),
             cache_bytes: AtomicI64::new(0),
+            host: Mutex::new(None),
             seen_recorded_ms: AtomicI64::new(0),
             fingerprint: session.fingerprint,
             protocol: session.admitted.negotiated.protocol.0,
+            arch: session.admitted.negotiated.arch,
             transport: Mutex::new(None),
             logging: Mutex::new(HashMap::new()),
             bulk: Mutex::new(None),
@@ -788,6 +1006,7 @@ impl Inner {
             }
             Err(e) => self.failed(false, "lapse", &e),
         }
+        self.uninstall_pass();
         self.revocation_pass(now);
         self.placement_pass();
         self.prefetch_pass();
@@ -876,6 +1095,22 @@ impl Inner {
         }
     }
 
+    /// An uninstall is a drain plus a revoke once the accepted work has settled; the revocation pass
+    /// that follows closes the session and fences whatever is left.
+    fn uninstall_pass(&self) {
+        match self.store.read(workers::uninstalling) {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(e) =
+                    self.write_store(|tx| workers::settle_uninstalls(tx, UnixMillis::now()))
+                {
+                    self.failed(false, "uninstall", &e);
+                }
+            }
+            Err(e) => self.failed(false, "uninstall", &e),
+        }
+    }
+
     fn revocation_pass(&self, now: UnixMillis) {
         let stamp = match self.store.read(dispatch::revocations) {
             Ok(stamp) => stamp,
@@ -922,18 +1157,77 @@ impl Inner {
         }
     }
 
-    fn placement_pass(&self) {
-        if !self.objects.admission().is_none_or(|a| a.is_open()) {
-            return;
+    fn placement_order(&self) -> PlacementOrder {
+        if self.order.load(Ordering::Relaxed) == PlacementOrder::Priority as u8 {
+            PlacementOrder::Priority
+        } else {
+            PlacementOrder::Fastest
         }
-        let mut peers: Vec<(WorkerId, Arc<Peer>)> = self
+    }
+
+    /// The order the next placement round would use, from the same inputs and the same sort key as
+    /// the pass, with the reason each free worker is ahead of the next. Read-only.
+    fn placement_ranking(&self) -> Vec<Ranked> {
+        let fleet: Vec<(WorkerId, Arc<Peer>)> = self
             .fleet
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
             .map(|(w, p)| (*w, Arc::clone(p)))
             .collect();
-        peers.retain(|(_, p)| session::is_free(&p.sender));
+        let (held, approved) = match (
+            self.store.read(dispatch::held_by_worker),
+            self.store.read(dispatch::approved_by_worker),
+        ) {
+            (Ok(held), Ok(approved)) => (held, approved),
+            _ => return Vec::new(),
+        };
+        let hosts: HashMap<WorkerId, [u8; 16]> = fleet
+            .iter()
+            .map(|(w, p)| (*w, host_key(*w, p.host())))
+            .collect();
+        let (host_held, host_busy) = host_commitments(&fleet, &hosts, &held);
+        let entries: Vec<(WorkerId, i32, Standing)> = fleet
+            .iter()
+            .filter(|(_, p)| session::is_free(&p.sender))
+            .map(|(w, p)| {
+                let size = effective_size(p, approved.get(w));
+                let host = hosts[w];
+                (
+                    *w,
+                    approved.get(w).map_or(0, |a| a.priority),
+                    Standing {
+                        cpu_millis: size.cpu_millis,
+                        memory_bytes: size.memory_bytes,
+                        committed_millis: host_held
+                            .get(&host)
+                            .copied()
+                            .unwrap_or(0)
+                            .max(host_busy.get(&host).copied().unwrap_or(0)),
+                        cache_bytes: p.cache_bytes.load(Ordering::Relaxed),
+                    },
+                )
+            })
+            .collect();
+        ranking(self.placement_order(), &entries)
+    }
+
+    fn placement_pass(&self) {
+        if !self.objects.admission().is_none_or(|a| a.is_open()) {
+            return;
+        }
+        let fleet: Vec<(WorkerId, Arc<Peer>)> = self
+            .fleet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(w, p)| (*w, Arc::clone(p)))
+            .collect();
+        let mut peers: Vec<(WorkerId, Arc<Peer>)> = fleet
+            .iter()
+            .filter(|(_, p)| session::is_free(&p.sender))
+            .map(|(w, p)| (*w, Arc::clone(p)))
+            .collect();
         if peers.is_empty() {
             return;
         }
@@ -946,23 +1240,72 @@ impl Inner {
             Ok(held) => held,
             Err(e) => return self.failed(true, "held", &e),
         };
-        peers.sort_unstable_by_key(|(worker, p)| (p.cpu_millis, p.memory_bytes, *worker));
-        let reach = Reach::of(peers.iter().map(|(_, p)| (p.pool, p.size())));
+        // The effective size and the approved priority come from the store on every pass, so a
+        // ceiling lowered or a priority changed after a worker connected is used at once.
+        let approved = match self.store.read(dispatch::approved_by_worker) {
+            Ok(approved) => approved,
+            Err(e) => return self.failed(true, "approved", &e),
+        };
+        peers.sort_unstable_by_key(|(worker, p)| {
+            let size = effective_size(p, approved.get(worker));
+            (size.cpu_millis, size.memory_bytes, *worker)
+        });
+        let sizes: Vec<dispatch::Capacity> = peers
+            .iter()
+            .map(|(w, p)| effective_size(p, approved.get(w)))
+            .collect();
+        let priorities: Vec<i32> = peers
+            .iter()
+            .map(|(w, _)| approved.get(w).map_or(0, |a| a.priority))
+            .collect();
+        let order = self.placement_order();
+        let reach = Reach::of(
+            peers
+                .iter()
+                .zip(&sizes)
+                .map(|((_, p), size)| (p.pool, *size)),
+        );
+        let hosts: HashMap<WorkerId, [u8; 16]> = fleet
+            .iter()
+            .map(|(w, p)| (*w, host_key(*w, p.host())))
+            .collect();
+        let host_of: Vec<[u8; 16]> = peers.iter().map(|(w, _)| hosts[w]).collect();
         let mut active: Vec<usize> = (0..peers.len()).collect();
         for _ in 0..dispatch::MAX_HELD_ATTEMPTS {
             if active.is_empty() {
                 return;
             }
+            let (host_held, host_busy) = host_commitments(&fleet, &hosts, &held);
             active.sort_by_cached_key(|&i| {
                 let (worker, peer) = &peers[i];
+                let host = host_of[i];
                 (
-                    rank(peer.ranked(), held.get(worker).copied().unwrap_or(0)),
+                    order_key(
+                        order,
+                        priorities[i],
+                        Standing {
+                            cpu_millis: sizes[i].cpu_millis,
+                            memory_bytes: sizes[i].memory_bytes,
+                            committed_millis: host_held
+                                .get(&host)
+                                .copied()
+                                .unwrap_or(0)
+                                .max(host_busy.get(&host).copied().unwrap_or(0)),
+                            cache_bytes: peer.cache_bytes.load(Ordering::Relaxed),
+                        },
+                    ),
                     *worker,
                 )
             });
+            // One identity per machine per round: the next placement on a host is ranked again
+            // against what this round just committed, so several identities on one host cannot
+            // each take a job from the same stale view and oversubscribe it.
+            let mut taken: HashSet<[u8; 16]> = HashSet::new();
             let round: Vec<(usize, WorkerId, PoolId, Option<dispatch::Capacity>)> = active
                 .iter()
-                .map(|&i| {
+                .copied()
+                .filter(|&i| taken.insert(host_of[i]))
+                .map(|i| {
                     (
                         i,
                         peers[i].0,
@@ -1394,8 +1737,15 @@ impl Inner {
     ) {
         let (tenant, run, job) = (f.tenant, f.run, f.job);
         let name = f.name.clone();
-        let entries = f.done.len() as u64;
-        let bytes = f.done.iter().map(|(_, _, s)| s.len()).sum::<u64>();
+        // Only a captured artifact keeps what it staged; a failed one discards it, so it holds
+        // no bytes against the repository's quota.
+        let captured = state == artifacts::State::Captured;
+        let entries = if captured { f.done.len() as u64 } else { 0 };
+        let bytes = if captured {
+            f.done.iter().map(|(_, _, s)| s.len()).sum::<u64>()
+        } else {
+            0
+        };
         let retain_until = UnixMillis(
             UnixMillis::now()
                 .0
@@ -1663,7 +2013,9 @@ impl Admission for Inner {
         };
         match self.store.read(|c| workers::authenticate(c, fingerprint)) {
             Ok(known) => {
-                if known.negotiated.arch != negotiated.arch {
+                // A certificate belongs to one worker. A hello that carries it under another worker
+                // identifier is a copy of the identity (or a confused host), not a reconnect.
+                if known.id != worker || known.negotiated.arch != negotiated.arch {
                     return Err(Rejection::Identity);
                 }
                 let id = known.id;
@@ -1692,20 +2044,36 @@ impl Admission for Inner {
                     negotiated,
                 });
             }
-            Err(sentinel_store::Error::NotFound) => {}
+            Err(sentinel_store::Error::NotFound) => {
+                // A revoked identity is told so, with or without a new enrollment: a fresh secret
+                // never revives a certificate the controller has revoked.
+                match self
+                    .store
+                    .read(|c| workers::revoked_fingerprint(c, fingerprint))
+                {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        self.stats.revoked_refused.fetch_add(1, Ordering::Relaxed);
+                        return Err(Rejection::Revoked);
+                    }
+                    Err(_) => return Err(Rejection::Unavailable),
+                }
+            }
             Err(_) => return Err(Rejection::Unavailable),
+        }
+        // Behind a Tailcat helper every peer is loopback, so the address cannot say who is asking; the
+        // identity can, and an unknown one does not get the reserved part of the pool.
+        if source.is_some_and(admission::is_loopback)
+            && !self
+                .pending
+                .stranger_room(self.max_pending.load(Ordering::Relaxed))
+        {
+            self.stats.shed.fetch_add(1, Ordering::Relaxed);
+            return Err(Rejection::Unavailable);
         }
         let Some(secret) = enrollment else {
             return Err(Rejection::NotEnrolled);
         };
-        if let Some(source) = source
-            && !self.enrollments.allow(source, Instant::now())
-        {
-            self.stats
-                .enrollment_limited
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(Rejection::Unavailable);
-        }
         let (secret, fingerprint, name) = (
             Secret::parse(&{
                 let mut t = String::new();
@@ -1716,12 +2084,28 @@ impl Admission for Inner {
             *fingerprint,
             name.to_owned(),
         );
+        // A secret that would redeem is never charged to the guessing budget, so a peer that burns the
+        // budget (or the audit allowance) cannot keep the real machine from enrolling.
+        let redeemable = self
+            .store
+            .read(|c| workers::redeemable(c, &secret, UnixMillis::now()))
+            .map_err(|_| Rejection::Unavailable)?;
+        if !redeemable
+            && let Some(source) = source
+            && !self.enrollments.allow(source, Instant::now())
+        {
+            self.stats
+                .enrollment_limited
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(Rejection::Unavailable);
+        }
+        let peer = source.map_or(workers::UNATTRIBUTED, admission::peer_key);
         let immediate_capacity = (!deferred).then_some(capacity);
         let enrolled_software = workers::software_label(&hello.software);
         self.store
             .writer()
             .write(move |tx| {
-                let Some(enrolled) = workers::redeem(
+                let Some(enrolled) = workers::redeem_authorized_from(
                     tx,
                     &secret,
                     workers::Presentation {
@@ -1731,6 +2115,7 @@ impl Admission for Inner {
                         negotiated,
                     },
                     UnixMillis::now(),
+                    peer,
                 )?
                 else {
                     return Ok(None);
@@ -1900,6 +2285,10 @@ impl SessionHandler for Inner {
             peer.load_ns.store(load_ns.unwrap_or(0), Ordering::Relaxed);
             peer.cache_bytes
                 .store(cache_bytes.unwrap_or(0), Ordering::Relaxed);
+            // The store scopes the stated machine by architecture when it records it; the placement key
+            // must be the same value, so it is scoped here too.
+            *peer.host.lock().unwrap_or_else(|p| p.into_inner()) =
+                host_id.map(|h| dispatch::scope_host(&h, peer.arch.as_str()));
         }
         self.write(move |tx| {
             dispatch::report_capacity(tx, worker, capacity)?;
@@ -2237,8 +2626,34 @@ impl SessionHandler for Inner {
         let objects = Arc::clone(&self.objects);
         let bytes = entries.iter().map(|e| e.len).sum::<u64>();
         let count = entries.len() as u64;
+        let deployment = self.objects.deployment();
         // One transaction: a crash mid-commit leaves only adoptable orphans; the stages stay pinned until it ends.
         self.write(move |tx| {
+            // The repository quota binds at commit, not only when the artifact begins: the
+            // begin check cannot know the size, and the single writer makes this one exact.
+            if matches!(
+                retention::check_run_repo(tx, &deployment, tenant, run, bytes),
+                Err(sentinel_store::Error::QuotaExceeded)
+            ) {
+                for s in staged {
+                    objects.discard(tx, s)?;
+                }
+                artifacts::record(
+                    tx,
+                    tenant,
+                    run,
+                    job,
+                    attempt,
+                    &artifact_name,
+                    artifacts::State::Failed,
+                    None,
+                    0,
+                    0,
+                    retain_until,
+                    UnixMillis::now(),
+                )?;
+                return Ok(ArtifactCode::TooLarge);
+            }
             for s in &staged {
                 objects.commit(tx, s)?;
             }
@@ -2263,11 +2678,12 @@ impl SessionHandler for Inner {
                 retain_until,
                 UnixMillis::now(),
             )?;
-            Ok(())
+            Ok(ArtifactCode::Stored)
         })
-        .map(|()| {
-            self.stats.artifacts.fetch_add(1, Ordering::Relaxed);
-            ArtifactCode::Stored
+        .inspect(|&code| {
+            if code == ArtifactCode::Stored {
+                self.stats.artifacts.fetch_add(1, Ordering::Relaxed);
+            }
         })
         .unwrap_or(ArtifactCode::Store)
     }
@@ -2403,6 +2819,7 @@ fn resolve_spec(
         let bytes = dispatch::spec_bytes(&tx, worker, attempt)?;
         let context = JobContext {
             source: None,
+            source_valid_until: None,
             run: c.run,
             repo: c.repo,
             repo_name: c.repo_name,
@@ -2605,6 +3022,12 @@ impl Controller {
         *self.inner.storage.lock().unwrap_or_else(|p| p.into_inner()) = Some(policy);
     }
 
+    /// Choose how free workers are ordered (default [`PlacementOrder::Fastest`]). Takes effect on the
+    /// next placement pass.
+    pub fn set_placement_order(&self, order: PlacementOrder) {
+        self.inner.order.store(order as u8, Ordering::Relaxed);
+    }
+
     pub fn set_remote_cache_budget(&self, bytes: u64) {
         self.inner.remote_budget.store(bytes, Ordering::Relaxed);
     }
@@ -2661,6 +3084,16 @@ impl Controller {
         identity: Identity,
         listen: SocketAddr,
     ) -> Result<Controller> {
+        let session_cap = admission::session_cap(MAX_SESSIONS)?;
+        if session_cap < MAX_SESSIONS {
+            tracing::warn!(
+                event = "session_cap_lowered",
+                cap = session_cap,
+                wanted = MAX_SESSIONS,
+                needed = descriptors_needed(MAX_SESSIONS),
+                "the open-files limit holds fewer worker sessions than the controller allows"
+            );
+        }
         let fingerprint = identity.fingerprint();
         let config = tls::server_config(identity)?;
         let reconcile_logs = Arc::clone(&logs);
@@ -2672,6 +3105,24 @@ impl Controller {
             .map_err(|_| Error::Internal("startup reconciliation"))?;
         let listener = TcpListener::bind(listen)?;
         let addr = listener.local_addr()?;
+        let pending = admission::Pending::default();
+        let wall = UnixMillis::now().0;
+        // A failed read leaves every source a stranger until it connects, as before a restart was survivable.
+        if let Ok(known) = store.read(|c| {
+            sentinel_store::known_sources::load(c, wall, admission::KNOWN_TTL.as_millis() as i64)
+        }) {
+            pending.restore(
+                known.into_iter().map(|(source, seen_ms)| {
+                    (
+                        source,
+                        Duration::from_millis(
+                            u64::try_from(wall.saturating_sub(seen_ms)).unwrap_or(0),
+                        ),
+                    )
+                }),
+                Instant::now(),
+            );
+        }
         let inner = Arc::new(Inner {
             me: std::sync::OnceLock::new(),
             source_destinations: Mutex::new(Arc::new(Vec::new())),
@@ -2684,6 +3135,7 @@ impl Controller {
             artifacts: Mutex::new(ArtifactState::default()),
             storage: Mutex::new(None),
             remote_budget: AtomicU64::new(sentinel_cache::remote::STORE_BUDGET_BYTES),
+            order: AtomicU8::new(PlacementOrder::Fastest as u8),
             last_storage: AtomicI64::new(0),
             maintenance: (Mutex::new(false), Condvar::new()),
             remote_cache: Mutex::new(None),
@@ -2693,8 +3145,8 @@ impl Controller {
             wake: (Mutex::new(false), Condvar::new()),
             stop: AtomicBool::new(false),
             sessions: AtomicUsize::new(0),
-            session_cap: admission::session_cap(MAX_SESSIONS),
-            pending: admission::Pending::default(),
+            session_cap,
+            pending,
             enrollments: admission::Enrollments::new(Instant::now()),
             arrivals: Mutex::new(Vec::new()),
             arrived: AtomicU64::new(0),
@@ -2742,12 +3194,22 @@ impl Controller {
         self.reconciled
     }
 
+    /// The most worker sessions admitted at once, as the open-files limit allows.
+    pub fn session_cap(&self) -> usize {
+        self.inner.session_cap
+    }
+
     pub fn handle(&self) -> Handle {
         Handle(Arc::clone(&self.inner))
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Network sources remembered as having authenticated a worker (restored from the store at start).
+    pub fn known_sources(&self) -> usize {
+        self.inner.pending.known()
     }
 
     pub fn fingerprint(&self) -> Digest {
@@ -2873,6 +3335,11 @@ impl Handle {
         self.0.wake();
     }
 
+    /// Puts a GitHub App in force for source resolution without a restart.
+    pub fn set_source_app(&self, app: Arc<sentinel_github::app::App>) {
+        *self.0.source_app.lock().unwrap_or_else(|p| p.into_inner()) = Some(app);
+    }
+
     pub fn cancel_hint(&self) {
         self.0.cancel_hint.store(true, Ordering::Release);
         self.0.wake();
@@ -2880,6 +3347,19 @@ impl Handle {
 
     pub fn stats(&self) -> &Stats {
         &self.0.stats
+    }
+
+    /// The configured order of the free workers.
+    pub fn placement_order(&self) -> PlacementOrder {
+        self.0.placement_order()
+    }
+
+    /// The free workers in the order the next placement round uses, each with its approved priority,
+    /// its expected finish and the first factor that puts it ahead of the next. It answers "why this
+    /// host before that one"; whether a worker may take a given job is hard admission, explained per
+    /// job by the queue's wait reasons.
+    pub fn placement_ranking(&self) -> Vec<Ranked> {
+        self.0.placement_ranking()
     }
 
     pub fn connected(&self) -> Vec<WorkerId> {
@@ -3379,24 +3859,199 @@ mod tests {
         assert_eq!(ids(&q).len(), MAX_DEFERRED);
     }
 
-    fn ranked(cpu_millis: i64, load_ns: i64, cache_bytes: i64) -> Ranked {
-        Ranked {
+    fn standing(cpu_millis: i64, committed_millis: i64, cache_bytes: i64) -> Standing {
+        Standing {
             cpu_millis,
             memory_bytes: 8 << 30,
-            load_ns,
+            committed_millis,
             cache_bytes,
         }
     }
 
     #[test]
-    fn the_sweep_ranks_workers_by_commitment_then_load_then_cache_then_size() {
-        let idle = ranked(8_000, 0, 0);
-        assert!(rank(idle, 0) < rank(ranked(8_000, 0, 1 << 40), 2_000));
-        assert!(rank(ranked(16_000, 0, 0), 2_000) < rank(ranked(8_000, 0, 0), 2_000));
-        assert!(rank(ranked(8_000, 10_000_000, 0), 0) < rank(ranked(8_000, 400_000_000, 0), 0));
-        assert!(rank(ranked(16_000, 200_000_000, 0), 0) < rank(ranked(8_000, 200_000_000, 0), 0));
-        assert!(rank(ranked(8_000, 0, 1 << 30), 0) < rank(idle, 0));
-        assert!(rank(ranked(2_500, 0, 0), 0) < rank(idle, 0));
+    fn measured_load_is_busy_cores_over_the_sampling_window() {
+        assert_eq!(busy_millis(0), 0);
+        assert_eq!(busy_millis(100_000_000), 1_000);
+        assert_eq!(busy_millis(800_000_000), 8_000);
+        assert_eq!(busy_millis(-5), 0);
+    }
+
+    #[test]
+    fn the_sweep_ranks_workers_by_expected_finish() {
+        let idle = standing(8_000, 0, 0);
+        // A host with spare cores is slowed only by sharing; the idle one finishes first.
+        assert!(rank(idle) < rank(standing(8_000, 4_000, 0)));
+        // The same absolute commitment hurts the smaller host more.
+        assert!(rank(standing(16_000, 8_000, 0)) < rank(standing(8_000, 8_000, 0)));
+        // At equal finish the smaller worker goes first, keeping the larger one free.
+        assert!(rank(standing(2_500, 0, 0)) < rank(idle));
+        let mut bigger_memory = idle;
+        bigger_memory.memory_bytes += 1;
+        assert!(rank(idle) < rank(bigger_memory));
+    }
+
+    #[test]
+    fn a_warm_cache_offsets_sharing_but_never_an_oversubscribed_host() {
+        let idle = standing(8_000, 0, 0);
+        // Warm and half busy still finishes before cold and idle...
+        assert!(rank(standing(8_000, 4_000, 4 << 30)) < rank(idle));
+        // ...and so does warm and full to the last core, since the job still gets a core of its own...
+        assert!(rank(standing(8_000, 7_000, 4 << 30)) < rank(idle));
+        // ...but once the job would oversubscribe the host, no amount of cache wins.
+        assert!(rank(idle) < rank(standing(8_000, 8_000, 1 << 50)));
+        assert!(rank(idle) < rank(standing(8_000, 20_000, 1 << 50)));
+        // The credit is bounded by the warm size and saturates.
+        assert!(rank(standing(8_000, 0, 1 << 30)) < rank(idle));
+        assert!(rank(standing(8_000, 0, 4 << 30)) < rank(standing(8_000, 0, 1 << 30)));
+        assert_eq!(
+            expected_finish_ns(standing(8_000, 0, 4 << 30)),
+            expected_finish_ns(standing(8_000, 0, i64::MAX))
+        );
+    }
+
+    /// A valid identifier whose order is `n`'s.
+    fn wrk(n: u8) -> WorkerId {
+        let mut bytes = [0u8; 16];
+        bytes[0] = n;
+        bytes[6] = 0x40;
+        bytes[8] = 0x80;
+        WorkerId::from_bytes(bytes).unwrap()
+    }
+
+    fn order_of(order: PlacementOrder, entries: &[(WorkerId, i32, Standing)]) -> Vec<WorkerId> {
+        ranking(order, entries)
+            .into_iter()
+            .map(|r| r.worker)
+            .collect()
+    }
+
+    #[test]
+    fn the_default_order_ignores_priority() {
+        let idle = standing(8_000, 0, 0);
+        let busy = standing(8_000, 4_000, 0);
+        let entries = [(wrk(1), 100, busy), (wrk(2), -100, idle)];
+        assert_eq!(
+            order_of(PlacementOrder::Fastest, &entries),
+            vec![wrk(2), wrk(1)],
+            "the fastest eligible host goes first however it is ranked by the operator"
+        );
+        let ranked = ranking(PlacementOrder::Fastest, &entries);
+        assert_eq!(ranked[0].ahead_because, Some(OrderFactor::ExpectedFinish));
+        assert_eq!(ranked[1].ahead_because, None);
+    }
+
+    #[test]
+    fn priority_overrides_speed_and_falls_back_to_speed_within_a_priority() {
+        let idle = standing(8_000, 0, 0);
+        let busy = standing(8_000, 4_000, 0);
+        let entries = [
+            (wrk(1), 0, idle),
+            (wrk(2), 10, busy),
+            (wrk(3), 10, idle),
+            (wrk(4), -5, idle),
+        ];
+        let ranked = ranking(PlacementOrder::Priority, &entries);
+        assert_eq!(
+            ranked.iter().map(|r| r.worker).collect::<Vec<_>>(),
+            vec![wrk(3), wrk(2), wrk(1), wrk(4)]
+        );
+        assert_eq!(
+            ranked.iter().map(|r| r.ahead_because).collect::<Vec<_>>(),
+            vec![
+                Some(OrderFactor::ExpectedFinish),
+                Some(OrderFactor::Priority),
+                Some(OrderFactor::Priority),
+                None
+            ],
+            "the busy priority-10 host is ahead of the idle neutral one because of priority, not speed"
+        );
+        assert_eq!(ranked[1].priority, 10);
+        assert!(ranked[1].expected_finish_ns > ranked[2].expected_finish_ns);
+    }
+
+    #[test]
+    fn equal_priority_and_finish_go_to_the_smaller_worker_then_the_identifier() {
+        let small = standing(2_500, 0, 0);
+        let large = standing(8_000, 0, 0);
+        let order = PlacementOrder::Priority;
+        // The smaller worker is first among equals, whatever the input order.
+        for entries in [
+            [(wrk(1), 7, large), (wrk(2), 7, small)],
+            [(wrk(2), 7, small), (wrk(1), 7, large)],
+        ] {
+            let ranked = ranking(order, &entries);
+            assert_eq!(ranked[0].worker, wrk(2));
+            assert_eq!(ranked[0].ahead_because, Some(OrderFactor::BestFit));
+        }
+        let twins = [(wrk(9), 7, small), (wrk(3), 7, small)];
+        let ranked = ranking(order, &twins);
+        assert_eq!(ranked[0].worker, wrk(3));
+        assert_eq!(ranked[0].ahead_because, Some(OrderFactor::Identity));
+    }
+
+    #[test]
+    fn the_priority_bounds_order_without_overflow() {
+        let idle = standing(8_000, 0, 0);
+        let entries = [
+            (wrk(1), -100, idle),
+            (wrk(2), 100, idle),
+            (wrk(3), i32::MIN, idle),
+        ];
+        assert_eq!(
+            order_of(PlacementOrder::Priority, &entries),
+            vec![wrk(2), wrk(1), wrk(3)]
+        );
+    }
+
+    #[test]
+    fn extreme_inputs_rank_without_overflow() {
+        let huge = standing(i64::MAX, i64::MAX, i64::MAX);
+        let tiny = standing(0, i64::MAX, i64::MIN);
+        assert!(expected_finish_ns(huge) > 0);
+        assert_eq!(expected_finish_ns(tiny), i64::MAX);
+        assert!(rank(huge) < rank(tiny));
+    }
+
+    /// The ordering step of one placement round (the sort key of every free worker, then the sort) at
+    /// the fleet size of `tests/fleet_sessions.rs`. Ignored because it measures time:
+    /// `cargo test --release -p sentinel-link --lib ranking_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "ordering cost: cargo test --release -p sentinel-link --lib ranking_cost -- --ignored --nocapture"]
+    fn ranking_cost_stays_microseconds_for_a_hundred_and_a_thousand_workers() {
+        for (workers, bound_us) in [(100usize, 2_000u128), (1_000, 20_000)] {
+            let entries: Vec<(WorkerId, i32, Standing)> = (0..workers)
+                .map(|i| {
+                    let n = i as i64;
+                    let key = u32::try_from(i).unwrap().to_be_bytes();
+                    let mut bytes = [0u8; 16];
+                    bytes[..4].copy_from_slice(&key);
+                    bytes[6] = 0x40;
+                    bytes[8] = 0x80;
+                    (
+                        WorkerId::from_bytes(bytes).unwrap(),
+                        i32::try_from(i % 7).unwrap() - 3,
+                        standing(2_000 + (n % 5) * 2_000, (n % 9) * 500, (n % 4) * (1 << 30)),
+                    )
+                })
+                .collect();
+            for order in [PlacementOrder::Fastest, PlacementOrder::Priority] {
+                let rounds = 200u32;
+                let start = std::time::Instant::now();
+                for _ in 0..rounds {
+                    std::hint::black_box(ranking(order, std::hint::black_box(&entries)));
+                }
+                let per_round = start.elapsed() / rounds;
+                println!(
+                    "ranking_cost workers={workers} order={} per_round_ns={}",
+                    order.as_str(),
+                    per_round.as_nanos()
+                );
+                assert!(
+                    per_round.as_micros() < bound_us,
+                    "ordering {workers} workers took {per_round:?} per round"
+                );
+            }
+        }
     }
 
     #[test]

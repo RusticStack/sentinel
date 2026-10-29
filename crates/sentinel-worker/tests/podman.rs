@@ -508,3 +508,243 @@ fn a_mounted_cache_is_seen_where_declared_and_never_under_the_workspace() {
     );
     assert_eq!(fs::read_to_string(cache.join("new.go")).unwrap(), "built\n");
 }
+
+fn started_sandbox(
+    temp: &std::path::Path,
+    disk_bytes: u64,
+) -> (sentinel_worker::sandbox::Sandbox, Workspace) {
+    let authfile = authfile(temp);
+    podman::pull(
+        IMAGE,
+        &authfile,
+        &podman::Store::Shared,
+        Duration::from_secs(600),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    let attempt = AttemptId::new();
+    let ws = Workspace::create(temp, attempt).unwrap();
+    let container = Container::start(
+        WorkerId::new(),
+        attempt,
+        IMAGE,
+        Limits {
+            cpu_millis: 500,
+            memory_bytes: 512 << 20,
+            pids: 32,
+            disk_bytes,
+            lifetime_secs: 0,
+        },
+        ws.path(),
+        &[],
+        &podman::Store::Shared,
+        podman::Network::None,
+    )
+    .unwrap();
+    (sentinel_worker::sandbox::Sandbox::Container(container), ws)
+}
+
+fn start_with_tmp(
+    root: &std::path::Path,
+    ws: &Workspace,
+    memory_bytes: u64,
+    disk_bytes: u64,
+) -> (Container, WorkerId) {
+    let authfile = authfile(root);
+    podman::pull(
+        IMAGE,
+        &authfile,
+        &podman::Store::Shared,
+        Duration::from_secs(600),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    let worker = WorkerId::new();
+    let tmp = podman::Mount {
+        host: ws.create_tmp().unwrap(),
+        container: podman::TMP_MOUNT.into(),
+        read_only: false,
+    };
+    let container = Container::start(
+        worker,
+        ws.attempt(),
+        IMAGE,
+        Limits {
+            cpu_millis: 500,
+            memory_bytes,
+            pids: 32,
+            disk_bytes,
+            lifetime_secs: 0,
+        },
+        ws.path(),
+        &[tmp],
+        &podman::Store::Shared,
+        podman::Network::None,
+    )
+    .unwrap();
+    (container, worker)
+}
+
+#[test]
+fn a_workspace_that_passes_its_declared_disk_stops_the_container() {
+    if !enabled() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let limit: u64 = 64 << 20;
+    let (sandbox, ws) = started_sandbox(temp.path(), limit);
+    let guard = sandbox
+        .guard_storage(ws.path(), limit)
+        .expect("a container's workspace is guarded");
+    // Many files, not one: `--ulimit fsize` only stops a single file past the limit. Two GiB are asked for;
+    // the guard must end the step long before they are written.
+    let started = std::time::Instant::now();
+    let exit = sandbox.exec(
+        &sh(
+            "i=0; while [ $i -lt 64 ]; do dd if=/dev/zero of=/workspace/part$i bs=1M count=32 conv=fsync 2>/dev/null; \
+             i=$((i+1)); done; echo WROTE_ALL",
+            120,
+        ),
+        &[],
+    );
+    let took = started.elapsed();
+    let used = guard
+        .exceeded()
+        .expect("the workspace passed its limit and the guard noticed");
+    assert!(used > limit, "{used}");
+    // The step was cut short: it did not reach its last line, and not by timing out.
+    // (An `Err` is the container removed under the exec, which is the same stop.)
+    if let Ok(exit) = exit {
+        assert!(!String::from_utf8_lossy(&exit.stdout).contains("WROTE_ALL"));
+        assert!(!exit.timed_out);
+    }
+    assert!(took < Duration::from_secs(60), "{took:?}");
+    let written = fs::read_dir(ws.path()).unwrap().count() as u64;
+    assert!(written < 64, "{written} parts were written");
+    drop(guard);
+    // The guard already removed the container, so there is nothing left for the teardown to stop.
+    let _ = sandbox.destroy();
+}
+
+#[test]
+fn a_workspace_under_its_declared_disk_is_left_alone() {
+    if !enabled() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let limit: u64 = 256 << 20;
+    let (sandbox, ws) = started_sandbox(temp.path(), limit);
+    let guard = sandbox.guard_storage(ws.path(), limit).unwrap();
+    let exit = sandbox
+        .exec(
+            &sh(
+                "dd if=/dev/zero of=/workspace/data bs=1M count=16 2>/dev/null; sleep 2; echo DONE",
+                60,
+            ),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(exit.code, Some(0));
+    assert!(String::from_utf8_lossy(&exit.stdout).contains("DONE"));
+    assert_eq!(guard.exceeded(), None);
+    drop(guard);
+    sandbox.destroy().unwrap();
+}
+
+#[test]
+fn a_job_tmp_outgrows_the_old_one_gib_tmpfs_on_the_workspace_disk() {
+    if !enabled() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    // 512 MiB of memory and a 3 GiB disk budget: a 1.1 GiB file in /tmp can only succeed if /tmp is disk, not a
+    // memory-charged tmpfs. (Dirty page cache is charged to the cgroup like any workspace write, so the limit
+    // must leave room for write-back to keep up.)
+    let (container, worker) = start_with_tmp(temp.path(), &ws, 512 << 20, 3 << 30);
+    let big = 1100u64 << 20;
+    let exit = container
+        .exec(
+            &sh(
+                "dd if=/dev/zero of=/tmp/big bs=1M count=1100 2>/dev/null; \
+                 ls -l /tmp/big; ls -ld /tmp; mount | grep ' on /tmp ' || true",
+                300,
+            ),
+            &[],
+        )
+        .unwrap();
+    let text = String::from_utf8_lossy(&exit.stdout).to_string();
+    assert_eq!(exit.code, Some(0), "{text} {}", exit.stderr_excerpt());
+    assert!(text.contains(&big.to_string()), "{text}");
+    assert!(
+        text.contains("drwxrwxrwt"),
+        "sticky and world-writable: {text}"
+    );
+    assert_eq!(container.oom_kills().unwrap(), 0);
+    // The bytes are on the host in the directory the workspace owns, not in memory.
+    assert_eq!(fs::metadata(ws.tmp_path().join("big")).unwrap().len(), big);
+    container.destroy().unwrap();
+    assert!(podman::owned(worker).unwrap().is_empty());
+    let tmp = ws.tmp_path();
+    ws.destroy().unwrap();
+    assert!(!tmp.exists(), "the job /tmp goes with its workspace");
+}
+
+#[test]
+fn a_file_in_tmp_is_bound_by_the_jobs_disk_budget() {
+    if !enabled() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    let (container, worker) = start_with_tmp(temp.path(), &ws, 256 << 20, 64 << 20);
+    let exit = container
+        .exec(&sh("dd if=/dev/zero of=/tmp/big bs=1M count=100", 60), &[])
+        .unwrap();
+    assert_ne!(exit.code, Some(0), "a 100 MiB file passed a 64 MiB cap");
+    assert!(
+        fs::metadata(ws.tmp_path().join("big")).map_or(0, |m| m.len()) <= 64 << 20,
+        "the per-file cap stopped the write"
+    );
+    container.destroy().unwrap();
+    assert!(podman::owned(worker).unwrap().is_empty());
+    ws.destroy().unwrap();
+}
+
+#[test]
+fn a_job_tmp_counts_against_the_declared_disk_and_the_guard_stops_the_container() {
+    if !enabled() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    let limit: u64 = 64 << 20;
+    let (container, worker) = start_with_tmp(temp.path(), &ws, 512 << 20, limit);
+    let sandbox = sentinel_worker::sandbox::Sandbox::Container(container);
+    let guard = sandbox
+        .guard_storage(ws.path(), limit)
+        .expect("a container's workspace and /tmp are guarded");
+    // Many files in /tmp, none in the workspace: only a guard that walks /tmp can end this.
+    let exit = sandbox.exec(
+        &sh(
+            "i=0; while [ $i -lt 64 ]; do dd if=/dev/zero of=/tmp/part$i bs=1M count=32 conv=fsync 2>/dev/null; \
+             i=$((i+1)); done; echo WROTE_ALL",
+            120,
+        ),
+        &[],
+    );
+    let used = guard
+        .exceeded()
+        .expect("/tmp passed the declared disk and the guard noticed");
+    assert!(used > limit, "{used}");
+    if let Ok(exit) = exit {
+        assert!(!String::from_utf8_lossy(&exit.stdout).contains("WROTE_ALL"));
+        assert!(!exit.timed_out);
+    }
+    let written = fs::read_dir(ws.tmp_path()).unwrap().count() as u64;
+    assert!(written < 64, "{written} parts were written");
+    drop(guard);
+    let _ = sandbox.destroy();
+    assert!(podman::owned(worker).unwrap().is_empty());
+    ws.destroy().unwrap();
+}

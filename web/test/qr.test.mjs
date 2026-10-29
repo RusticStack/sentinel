@@ -1,7 +1,7 @@
 // Run with node --test on the verification VPS.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { encodeQr, formatBits, rsRemainder, totpSecret } from "../app/utils/qr.ts";
+import { encodeQr, formatBits, rsRemainder, totpSecret } from "../src/lib/qr.ts";
 
 const URI = "otpauth://totp/Sentinel:alice?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=Sentinel&algorithm=SHA1&digits=6&period=30";
 

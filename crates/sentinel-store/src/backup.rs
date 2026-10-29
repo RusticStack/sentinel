@@ -9,7 +9,7 @@
 //! ```
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -398,11 +398,14 @@ pub fn create(
 
     let config = staging.join(CONFIG_DIR);
     fs::create_dir_all(&config)?;
+    // The controller's link identity decides whether workers reconnect, so it is checksummed like the database.
+    let mut config_sums = BTreeMap::new();
     for name in CONFIG_FILES {
         let src = data_dir.join(name);
         if src.is_file() {
-            copy_file(&src, &config.join(name))?;
+            let (sum, _) = copy_file(&src, &config.join(name))?;
             restrict(&config.join(name))?;
+            config_sums.insert((*name).to_owned(), sum.to_string());
             report.config_files.push((*name).to_owned());
         }
     }
@@ -412,11 +415,11 @@ pub fn create(
             for entry in fs::read_dir(&src)?.flatten() {
                 if entry.metadata().is_ok_and(|m| m.is_file()) {
                     let dst = config.join(name).join(entry.file_name());
-                    copy_file(&entry.path(), &dst)?;
+                    let (sum, _) = copy_file(&entry.path(), &dst)?;
                     restrict(&dst)?;
-                    report
-                        .config_files
-                        .push(format!("{name}/{}", entry.file_name().to_string_lossy()));
+                    let rel = format!("{name}/{}", entry.file_name().to_string_lossy());
+                    config_sums.insert(rel.clone(), sum.to_string());
+                    report.config_files.push(rel);
                 }
             }
         }
@@ -443,6 +446,7 @@ pub fn create(
         "manifests": { "rows": report.manifests, "copied": report.manifests_copied, "recopied": report.manifests_recopied },
         "logs": { "files_copied": report.log_files_copied, "bytes_copied": report.log_bytes_copied },
         "config": report.config_files,
+        "config_blake3": config_sums,
         "key": {
             "required": !report.key_ids.is_empty(),
             "key_ids": report.key_ids,
@@ -518,6 +522,45 @@ pub fn manifest(target: &Path, id: &str) -> Result<Value> {
     Ok(value)
 }
 
+/// What a loss at `now` would cost, read from the backups' own `started_ms` and `took_ms`.
+///
+/// A backup is the database at the instant it started but becomes the newest one only when it is listed, `took_ms` later. A
+/// loss just before that rolls back to the previous backup, so the longest window between two kept backups is
+/// `started(k+1) + took(k+1) - started(k)`, and a loss right now costs `now - started(newest)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Exposure {
+    pub backups: usize,
+    pub newest_id: Option<String>,
+    /// Data lost if the data directory vanished at `now`.
+    pub age_ms: Option<i64>,
+    /// The longest loss any moment between the oldest kept backup and `now` would have cost.
+    pub worst_ms: Option<i64>,
+}
+
+pub fn exposure(target: &Path, now: UnixMillis) -> Result<Exposure> {
+    let mut out = Exposure::default();
+    let mut previous: Option<i64> = None;
+    for id in list(target)? {
+        let m = manifest(target, &id)?;
+        let started = m["started_ms"]
+            .as_i64()
+            .ok_or(Error::Corrupt("backup manifest"))?;
+        let took = m["took_ms"].as_i64().unwrap_or(0).max(0);
+        if let Some(before) = previous {
+            out.worst_ms = out.worst_ms.max(Some(started + took - before));
+        }
+        previous = Some(started);
+        out.backups += 1;
+        out.newest_id = Some(id);
+    }
+    if let Some(started) = previous {
+        let age = (now.0 - started).max(0);
+        out.age_ms = Some(age);
+        out.worst_ms = out.worst_ms.max(Some(age));
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Verification {
     pub integrity: String,
@@ -527,6 +570,7 @@ pub struct Verification {
     pub missing: Vec<String>,
     pub corrupt: Vec<String>,
     pub manifests_checked: u64,
+    pub config_checked: u64,
 }
 
 impl Verification {
@@ -538,14 +582,32 @@ impl Verification {
     }
 }
 
+fn config_sums(manifest: &Value) -> BTreeMap<String, String> {
+    manifest["config_blake3"]
+        .as_object()
+        .map(|sums| {
+            sums.iter()
+                .filter_map(|(name, sum)| Some((name.clone(), sum.as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn verify(target: &Path, id: &str) -> Result<Verification> {
     let manifest = manifest(target, id)?;
     let dir = target.join(id);
-    let (got, _) = hash_file(&dir.join(METADATA))?;
-    let mut out = Verification {
-        metadata_matches: manifest["metadata"]["blake3"].as_str() == Some(got.to_string().as_str()),
-        ..Verification::default()
-    };
+    let mut out = Verification::default();
+    // A snapshot that cannot even be read is a failed verification, not an error: the caller is asking whether the backup is usable.
+    match hash_file(&dir.join(METADATA)) {
+        Ok((got, _)) => {
+            out.metadata_matches =
+                manifest["metadata"]["blake3"].as_str() == Some(got.to_string().as_str());
+        }
+        Err(e) => {
+            out.integrity = format!("unreadable: {e}");
+            return Ok(out);
+        }
+    }
     let checked = open_snapshot(&dir.join(METADATA)).and_then(|snapshot| {
         let integrity: String = snapshot.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
         Ok((snapshot, integrity))
@@ -560,6 +622,10 @@ pub fn verify(target: &Path, id: &str) -> Result<Verification> {
             return Ok(out);
         }
     };
+    if out.integrity != "ok" {
+        // Its rows cannot be trusted to name the files to check.
+        return Ok(out);
+    }
     for row in object_rows(&snapshot)? {
         if row.remote_only {
             out.objects_remote += 1;
@@ -580,6 +646,15 @@ pub fn verify(target: &Path, id: &str) -> Result<Verification> {
             Err(_) => out.missing.push(rel.display().to_string()),
         }
     }
+    for (name, want) in config_sums(&manifest) {
+        out.config_checked += 1;
+        let shown = format!("{CONFIG_DIR}/{name}");
+        match hash_file(&dir.join(CONFIG_DIR).join(&name)) {
+            Ok((d, _)) if d.to_string() == want => {}
+            Ok(_) => out.corrupt.push(shown),
+            Err(_) => out.missing.push(shown),
+        }
+    }
     Ok(out)
 }
 
@@ -591,6 +666,8 @@ pub struct Restored {
     pub log_files: u64,
     pub config_files: Vec<String>,
     pub key_checked: bool,
+    /// Objects the backup itself recorded as missing or corrupt at the source: the restore carries on without them and recovery names them.
+    pub objects_unavailable: Vec<String>,
 }
 
 pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> Result<Restored> {
@@ -599,6 +676,14 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
         return Err(Error::InvalidInput(
             "the data directory already holds a database",
         ));
+    }
+    // A stale journal beside the restored file would be replayed into it when the store opens.
+    for suffix in ["-wal", "-shm"] {
+        if data_dir.join(format!("{METADATA}{suffix}")).exists() {
+            return Err(Error::InvalidInput(
+                "the data directory holds the journal of a database that is gone: empty it first",
+            ));
+        }
     }
     let dir = target.join(id);
     let (got, _) = hash_file(&dir.join(METADATA))?;
@@ -634,17 +719,24 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
         ..Restored::default()
     };
     let mut dirty = BTreeSet::new();
+    // What the backup itself recorded as lost at the source. Restoring everything else beats refusing to restore at all.
+    let acknowledged: HashSet<&str> = ["missing", "corrupt"]
+        .iter()
+        .flat_map(|list| manifest["objects"][list].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect();
     for row in object_rows(&snapshot)? {
         if row.remote_only {
             out.objects_remote += 1;
             continue;
         }
-        let (d, len) = copy_file_into(
-            &target.join(&row.rel),
-            &data_dir.join(&row.rel),
-            data_dir,
-            &mut dirty,
-        )?;
+        let src = target.join(&row.rel);
+        let shown = row.rel.display().to_string();
+        if acknowledged.contains(shown.as_str()) && !src.exists() {
+            out.objects_unavailable.push(shown);
+            continue;
+        }
+        let (d, len) = copy_file_into(&src, &data_dir.join(&row.rel), data_dir, &mut dirty)?;
         if d != row.digest || len != row.len {
             return Err(Error::Corrupt("backup object content"));
         }
@@ -687,6 +779,7 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
         }
     }
     let config = dir.join(CONFIG_DIR);
+    let mut sums = config_sums(&manifest);
     if config.exists() {
         let mut stack = vec![config.clone()];
         while let Some(d) = stack.pop() {
@@ -699,11 +792,21 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
                 let rel = path
                     .strip_prefix(&config)
                     .map_err(|_| Error::Corrupt("config path"))?;
-                copy_file(&path, &data_dir.join(rel))?;
+                let (sum, _) = copy_file(&path, &data_dir.join(rel))?;
+                let name = rel.to_string_lossy().replace('\\', "/");
+                if sums
+                    .remove(&name)
+                    .is_some_and(|want| want != sum.to_string())
+                {
+                    return Err(Error::Corrupt("backup config content"));
+                }
                 restrict(&data_dir.join(rel))?;
-                out.config_files.push(rel.display().to_string());
+                out.config_files.push(name);
             }
         }
+    }
+    if !sums.is_empty() {
+        return Err(Error::Corrupt("backup config content"));
     }
     if let Some(path) = key {
         let dst = data_dir.join(crate::MASTER_KEY_FILE);
@@ -922,6 +1025,8 @@ impl Scheduler {
                 state.requested = false;
                 state.running = true;
             }
+            // The interval runs from the start of a backup: counting from its end would add its duration to the recovery point.
+            let started = std::time::Instant::now();
             let outcome = self.once();
             let now = UnixMillis::now().0;
             let mut state = self.state();
@@ -938,7 +1043,7 @@ impl Scheduler {
                 }
             }
             drop(state);
-            next = std::time::Instant::now() + self.interval;
+            next = started + self.interval;
         }
     }
 }

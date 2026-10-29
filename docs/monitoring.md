@@ -81,6 +81,10 @@ A worker exposes its own figures only when `metrics_listen` names a loopback add
 | `sentinel_worker_attempts_live`, `_attempts_started_total`, `_finished_total`, `_canceled_total`, `_handed_back_total`, `_abandoned_total`, `_leases_lost_total` | attempts |
 | `sentinel_worker_spool_bytes`, `_spool_refusals_total`, `_reports_pending` | log spools: bytes held now, and attempts whose output was partly declared as gaps ([logs](logs.md)) |
 | `sentinel_worker_cache_bytes`, `_cache_entries`, `_cache_sweeps_total` | the local cache, as its last sweep saw it |
+| `sentinel_worker_cache_hits_total`, `_cache_misses_total`, `_cache_costly_hits_total` | cache entries restored, not restored, and hits that cost more than rebuilding ([cache](cache.md)) |
+| `sentinel_worker_cache_lock_wait_seconds_total`, `_cache_restore_seconds_total`, `_cache_first_touch_seconds_total`, `_cache_commit_seconds_total` | time waiting for an entry, cloning hit generations, first-reading restored files, and publishing generations |
+| `sentinel_worker_cache_restored_bytes_total`, `_cache_copied_bytes_total`, `_cache_dirty_bytes_total` | bytes restored by hits, copied because a clone was not possible, and rewritten by jobs |
+| `sentinel_worker_cache_restore_estimate_seconds{class}`, `_cache_rebuild_estimate_seconds{class}` | the weighted restore time and the time a hit saves over rebuilding, per class, once settled (absent until then) |
 | `sentinel_worker_images_held`, `_images_in_flight`, `_images_reclaimed_total` | the image store |
 | `sentinel_worker_disk_free_bytes` | free space on the data directory's file system |
 

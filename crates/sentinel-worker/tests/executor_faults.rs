@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -79,6 +79,7 @@ struct Probe {
     skew_ms: i64,
     offers: Mutex<Vec<Offer>>,
     cancels: AtomicUsize,
+    stalled: AtomicBool,
     stops: Mutex<Vec<Duration>>,
     notices: Arc<Mutex<Vec<String>>>,
     held_specs: Mutex<Option<Vec<HeldSpec>>>,
@@ -101,6 +102,7 @@ impl Probe {
             skew_ms,
             offers: Mutex::new(Vec::new()),
             cancels: AtomicUsize::new(0),
+            stalled: AtomicBool::new(false),
             stops: Mutex::new(Vec::new()),
             notices,
             held_specs: Mutex::new(None),
@@ -169,9 +171,15 @@ impl LinkExecutor for Probe {
         self.inner.held()
     }
     fn renewed(&self, until: UnixMillis) {
+        if self.stalled.load(Ordering::SeqCst) {
+            return;
+        }
         self.inner.renewed(UnixMillis(until.0 - self.skew_ms));
     }
     fn renewed_at(&self, until: UnixMillis, sent: Instant) {
+        if self.stalled.load(Ordering::SeqCst) {
+            return;
+        }
         self.inner
             .renewed_at(UnixMillis(until.0 - self.skew_ms), sent);
     }
@@ -246,6 +254,48 @@ fn a_worker_clock_a_minute_ahead_never_ends_live_work() {
         probe.notices.lock().unwrap()
     );
     assert!(!probe.noticed("LeaseLost"));
+    live.stop();
+}
+
+/// The other half of the lease rule: with no renewal, the worker ends its work before the controller could
+/// have expired it, and reports nothing (the controller settles the attempt by expiry).
+#[test]
+fn a_lease_that_is_never_renewed_ends_the_work_and_reports_nothing() {
+    if !podman_enabled() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    shim();
+    let (live, probe) = Live::start(|dir, worker| Probe::start(dir, worker, 0));
+    probe.stalled.store(true, Ordering::SeqCst);
+    let (_, jobs) = live.enqueue(&one_job(
+        "      - id: wait\n        run: 'echo started; sleep 300'\n",
+    ));
+    let began = Instant::now();
+    eventually("the lease lost", Duration::from_secs(90), || {
+        probe.noticed("LeaseLost")
+    });
+    assert!(
+        began.elapsed() < Duration::from_secs(60),
+        "the worker kept its work {:?} past a lease of 30 s",
+        began.elapsed()
+    );
+    eventually("containers gone", Duration::from_secs(30), || {
+        podman::owned(live.worker).unwrap().is_empty()
+    });
+    // A forced verdict would be a cancel nobody asked for; the job is either still held or expired by the
+    // controller, never recorded as the user's cancel.
+    let row = live.job(jobs[0]);
+    assert_ne!(
+        row.state,
+        JobState::Terminal(Outcome::Canceled),
+        "{:?}",
+        probe.notices.lock().unwrap()
+    );
+    assert_ne!(
+        row.failure_class,
+        Some(sentinel_core::FailureClass::Canceled)
+    );
     live.stop();
 }
 
@@ -393,6 +443,55 @@ fn a_repeated_offer_is_acknowledged_again_and_never_started_twice() {
     assert!(!probe.noticed("SpecRefused"));
     let created = fs::read_to_string(&creates).unwrap_or_default();
     assert_eq!(created.lines().count(), 1, "podman create calls: {created}");
+    eventually("nothing held", Duration::from_secs(30), || {
+        probe.inner.held().is_empty()
+    });
+    live.stop();
+}
+
+/// A cancel the controller sends while the worker still waits for the spec must not be lost: the attempt
+/// starts canceled and never runs its steps.
+#[test]
+fn a_cancel_that_arrives_before_the_spec_cancels_the_attempt() {
+    if !podman_enabled() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    shim();
+    let (live, probe) = Live::start(|dir, worker| Probe::start(dir, worker, 0));
+    probe.hold_specs();
+    let (run, jobs) = live.enqueue(&one_job(
+        "      - id: work\n        run: 'echo must-not-run; sleep 5'\n",
+    ));
+    let job = jobs[0];
+    eventually("the spec held back", Duration::from_secs(60), || {
+        probe.specs_held() > 0
+    });
+    let (tenant, id) = (live.tenant, job);
+    live.store
+        .writer()
+        .write(move |tx| dispatch::cancel(tx, tenant, id, UnixMillis::now()))
+        .unwrap();
+    eventually(
+        "the cancel reached the worker",
+        Duration::from_secs(30),
+        || probe.cancels.load(Ordering::SeqCst) >= 1,
+    );
+    probe.release_specs();
+    eventually("the job canceled", Duration::from_secs(60), || {
+        matches!(live.job(job).state, JobState::Terminal(_))
+    });
+    let row = live.job(job);
+    assert_eq!(
+        (row.state, row.failure_class),
+        (
+            JobState::Terminal(Outcome::Canceled),
+            Some(sentinel_core::FailureClass::Canceled)
+        ),
+        "notices: {:?}",
+        probe.notices.lock().unwrap()
+    );
+    assert!(!live.printed(run, job, "must-not-run"));
     eventually("nothing held", Duration::from_secs(30), || {
         probe.inner.held().is_empty()
     });

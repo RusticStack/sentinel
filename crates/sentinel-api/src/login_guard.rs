@@ -112,6 +112,38 @@ mod tests {
         assert!(guard.allowed(attacker, "someone", start));
     }
 
+    // Behind a trusted proxy that names no client, the lockout pair is the proxy's connection: one
+    // guesser's connection is locked and the account owner's connection through the same proxy is not.
+    #[test]
+    fn a_guesser_behind_an_unforwarding_proxy_does_not_lock_out_the_owner() {
+        use crate::oauth::limit::{TrustedProxy, connection_key};
+        use std::net::SocketAddr;
+        let trusted = TrustedProxy::loopback();
+        let via = |port: u16| {
+            let peer: SocketAddr = ([127, 0, 0, 1], port).into();
+            connection_key(Some(peer), None, &trusted)
+        };
+        let (guesser, owner) = (via(50_001), via(50_002));
+        assert_ne!(guesser, owner);
+        let guard = LoginGuard::default();
+        let start = Instant::now();
+        for _ in 0..3 {
+            guard.failed(guesser, "root", 3, LOCKOUT, start);
+        }
+        assert!(!guard.allowed(guesser, "root", start));
+        assert!(guard.allowed(owner, "root", start));
+        // A proxy that does name the client keys the pair by that client, on any connection.
+        let named = |port: u16, client: &str| {
+            let peer: SocketAddr = ([127, 0, 0, 1], port).into();
+            connection_key(Some(peer), Some(client), &trusted)
+        };
+        for _ in 0..3 {
+            guard.failed(named(50_003, "198.51.100.7"), "root", 3, LOCKOUT, start);
+        }
+        assert!(!guard.allowed(named(50_004, "198.51.100.7"), "root", start));
+        assert!(guard.allowed(named(50_003, "198.51.100.8"), "root", start));
+    }
+
     #[test]
     fn a_served_lockout_leaves_one_failure_of_credit() {
         let guard = LoginGuard::default();

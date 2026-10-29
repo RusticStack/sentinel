@@ -1,11 +1,23 @@
 #!/usr/bin/env bash
 # Measured steps run with --network none, so every dependency must come from a checked-in store.
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/stamp.sh"
+stamp_init || exit 1
+STAMP_SED="$(stamp_sed)"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIX="$ROOT/fixtures/recipes"
 WORK="${WORK:-/srv/k07}"
-OUT="${OUT:-$ROOT/bench/k07-recipes.jsonl}"
+# ISOLATION=container (default) runs rootless Podman; ISOLATION=microvm runs each attempt in a Firecracker VM
+# on a KVM host (SENTINEL_FIRECRACKER, SENTINEL_GUEST_KERNEL and SENTINEL_GUEST_AGENT name the setup). A microVM
+# run is functional only and never overwrites the committed container records.
+ISOLATION="${ISOLATION:-container}"
+case "$ISOLATION" in
+    container) OUT="${OUT:-$ROOT/bench/k07-recipes.jsonl}" ;;
+    microvm) OUT="${OUT:-$ROOT/bench/k07-recipes-microvm.jsonl}" ;;
+    *) echo "k07 ISOLATION must be container or microvm" >&2; exit 2 ;;
+esac
+export SENTINEL_K07_ISOLATION="$ISOLATION"
 DRIVER="${DRIVER:-$ROOT/target/wsl/release/examples/k07-recipes}"
 LOGS="$WORK/logs"
 RECIPES="${RECIPES:-custom-tool go rust npm pnpm bun python maven gradle}"
@@ -17,8 +29,8 @@ log() { printf 'k07 %s %s\n' "$(date +%T)" "$*" >&2; }
 jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 
 blocked() { # recipe case reason
-    printf '{"recipe":%s,"case":%s,"status":"blocked","reason":%s}\n' \
-        "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")" >> "$OUT"
+    printf '{%s,"recipe":%s,"case":%s,"status":"blocked","reason":%s}\n' \
+        "$STAMP_BODY" "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")" >> "$OUT"
     log "blocked $1/$2: $3"
 }
 
@@ -340,7 +352,7 @@ run_case() { # recipe case sha image
         --recipe "$r" --case "$c" \
         --log-file "$LOGS/$r-$c.log" 2>"$LOGS/$r-$c.err")"
     if [ -n "$rec" ]; then
-        printf '%s\n' "$rec" >> "$OUT"
+        printf '%s\n' "$rec" | sed "s/^{/{$STAMP_SED,/" >> "$OUT"
         log "$r/$c: $(printf '%s' "$rec" | head -c 110)"
     else
         blocked "$r" "$c" "driver: $(tail -2 "$LOGS/$r-$c.err" 2>/dev/null | tr '\n' ' ' | head -c 140)"

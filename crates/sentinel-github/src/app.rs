@@ -16,6 +16,98 @@ pub struct App {
     endpoint: String,
 }
 
+/// The App in force, shared by every component that acts as it. It is set at most once — at
+/// start from the files or the store, or by a completed manifest conversion — and read with one
+/// atomic load, so the hot paths never take a lock or ask the database.
+#[derive(Clone, Default)]
+pub struct Current(std::sync::Arc<std::sync::OnceLock<std::sync::Arc<App>>>);
+
+impl Current {
+    pub fn get(&self) -> Option<&std::sync::Arc<App>> {
+        self.0.get()
+    }
+
+    /// `false` when an App is already in force: the first one stays.
+    pub fn set(&self, app: std::sync::Arc<App>) -> bool {
+        self.0.set(app).is_ok()
+    }
+}
+
+impl From<Option<std::sync::Arc<App>>> for Current {
+    fn from(app: Option<std::sync::Arc<App>>) -> Current {
+        let current = Current::default();
+        if let Some(app) = app {
+            current.set(app);
+        }
+        current
+    }
+}
+
+/// The public facts GitHub reports about the App itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Described {
+    pub id: u64,
+    pub slug: String,
+    pub name: String,
+    pub html_url: String,
+    pub owner: String,
+}
+
+pub(crate) fn valid_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 100
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        && slug != "."
+        && slug != ".."
+}
+
+pub(crate) fn valid_text(text: &str, max: usize) -> bool {
+    !text.trim().is_empty() && text.len() <= max && !text.chars().any(char::is_control)
+}
+
+/// An `https://` page, or plain HTTP to the loopback fake.
+pub(crate) fn valid_page(url: &str) -> bool {
+    (url.starts_with("https://") || url.starts_with("http://127.0.0.1:"))
+        && url.len() <= 256
+        && !url
+            .bytes()
+            .any(|b| b <= b' ' || b == 127 || b"\"'<>\\`".contains(&b))
+}
+
+pub(crate) fn parse_described(v: &Value) -> Result<Described> {
+    let text = |value: &Value, max: usize, what: &'static str| -> Result<String> {
+        value
+            .as_str()
+            .filter(|s| valid_text(s, max))
+            .map(str::to_owned)
+            .ok_or(Error::Response(what))
+    };
+    Ok(Described {
+        id: v["id"]
+            .as_u64()
+            .filter(|id| *id > 0)
+            .ok_or(Error::Response("app id"))?,
+        slug: v["slug"]
+            .as_str()
+            .filter(|s| valid_slug(s))
+            .ok_or(Error::Response("app slug"))?
+            .to_owned(),
+        name: text(&v["name"], 100, "app name")?,
+        html_url: v["html_url"]
+            .as_str()
+            .filter(|s| valid_page(s))
+            .ok_or(Error::Response("app page"))?
+            .to_owned(),
+        owner: v["owner"]["login"]
+            .as_str()
+            .filter(|s| valid_login(s))
+            .ok_or(Error::Response("app owner"))?
+            .to_owned(),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installation {
     pub id: u64,
@@ -79,7 +171,7 @@ impl<T> Answer<T> {
     }
 }
 
-fn valid_login(login: &str) -> bool {
+pub(crate) fn valid_login(login: &str) -> bool {
     !login.is_empty()
         && login.len() <= 128
         && login
@@ -174,6 +266,22 @@ impl App {
 
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// `GET /app` as the App itself: its slug, name, page and owner, all public.
+    pub fn describe(&self, now_ms: i64) -> Result<Described> {
+        let value = self
+            .http
+            .get_authenticated(&format!("{}/app", self.endpoint), &self.jwt(now_ms)?)?;
+        let described = parse_described(&value)?;
+        if described.id != self.id {
+            return Err(Error::Response("app identity"));
+        }
+        Ok(described)
     }
 
     fn jwt(&self, now_ms: i64) -> Result<String> {
@@ -388,6 +496,12 @@ impl App {
             Ok(reply) => reply,
             Err(_) => return Answer::unknown(None),
         };
+        // The person's account was just resolved by id, so a 404 here means this token cannot see the
+        // repository (removed, transferred, renamed or no longer installed); the caller confirms the
+        // organization is unchanged before it believes that.
+        if reply.status == 404 {
+            return Answer::Absent;
+        }
         if reply.status != 200 {
             return Answer::from_failure(&reply);
         }

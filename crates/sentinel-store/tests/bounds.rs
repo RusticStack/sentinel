@@ -102,18 +102,28 @@ fn a_panicking_write_rolls_back_and_the_writer_keeps_serving() {
 fn a_stalled_write_is_reported_as_ambiguous_not_as_failed() {
     let (_dir, store) = store();
     let tenant = TenantId::new();
+    // The closure blocks until released, so it outlasts the wait however slow the host is; a fixed
+    // sleep only just outlasted it and raced the scheduler.
+    let (release, held) = std::sync::mpsc::channel::<()>();
     let started = Instant::now();
     let outcome = store.writer().write(move |tx| {
         jobs::insert_tenant(tx, tenant, "slow", UnixMillis(1))?;
-        thread::sleep(WRITE_WAIT + Duration::from_millis(500));
+        let _ = held.recv();
         Ok(())
     });
     let waited = started.elapsed();
     assert!(matches!(outcome, Err(Error::WriteAmbiguous)), "{outcome:?}");
-    assert!(waited >= WRITE_WAIT && waited < WRITE_WAIT + Duration::from_secs(2));
+    // The wait is a lower bound; how far a loaded host overshoots it is not the contract.
+    assert!(waited >= WRITE_WAIT, "gave up after {waited:?}");
 
-    thread::sleep(Duration::from_secs(1));
-    assert_eq!(tenant_count(&store), 1);
+    release.send(()).unwrap();
+    // The writer is serial: this write returns only after the stalled one finished and committed.
+    let marker = TenantId::new();
+    store
+        .writer()
+        .write(move |tx| jobs::insert_tenant(tx, marker, "after", UnixMillis(2)))
+        .unwrap();
+    assert_eq!(tenant_count(&store), 2);
 }
 
 #[test]

@@ -60,6 +60,8 @@ pub enum Notice {
         stats: sentinel_cache::Stats,
     },
     Availability(Availability),
+    /// One attempt's cache figures, summed over its entries.
+    CacheFigures(CacheTotals),
     OfferRefused {
         attempt: AttemptId,
         free_bytes: u64,
@@ -76,12 +78,66 @@ pub fn admission_floor(total: u64) -> u64 {
     (total / 8).clamp(512 << 20, 2 << 30)
 }
 
+/// The scratch disk a host offers jobs out of `free` bytes on the data directory's file system: the free
+/// space less the same reserve the admission floor keeps (an eighth, 512 MiB to 2 GiB).
+pub fn job_disk_room(free: u64) -> u64 {
+    free.saturating_sub(admission_floor(free))
+}
+
 fn admits(free: Option<u64>, floor: u64) -> bool {
     free.is_none_or(|free| free >= floor)
 }
 
+/// What one attempt's cache entries cost and did, summed; durations are monotonic nanoseconds, and a phase that
+/// never ran adds nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheTotals {
+    pub entries: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub costly_hits: u64,
+    pub lock_wait_ns: u64,
+    pub clone_ns: u64,
+    pub first_touch_ns: u64,
+    pub commit_ns: u64,
+    /// Bytes and copied bytes of the hits only: a miss restored nothing.
+    pub restored_bytes: u64,
+    pub copied_bytes: u64,
+    pub staged_bytes: u64,
+    pub dirty_bytes: u64,
+}
+
+impl CacheTotals {
+    pub fn of(records: &[sentinel_protocol::summary::CacheRecord]) -> CacheTotals {
+        let mut totals = CacheTotals::default();
+        for r in records {
+            totals.entries += 1;
+            if r.outcome == "hit" {
+                totals.hits += 1;
+                totals.restored_bytes = totals.restored_bytes.saturating_add(r.bytes);
+                totals.copied_bytes = totals.copied_bytes.saturating_add(r.copied_bytes);
+            } else {
+                totals.misses += 1;
+            }
+            totals.costly_hits += u64::from(r.costly_hit);
+            let add = |sum: &mut u64, value: Option<u64>| {
+                *sum = sum.saturating_add(value.unwrap_or(0));
+            };
+            add(&mut totals.lock_wait_ns, r.lock_wait_ns);
+            add(&mut totals.clone_ns, r.clone_ns);
+            add(&mut totals.first_touch_ns, r.first_touch_ns);
+            add(&mut totals.commit_ns, r.commit_ns);
+            add(&mut totals.staged_bytes, r.staged_bytes);
+            add(&mut totals.dirty_bytes, r.dirty_bytes);
+        }
+        totals
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Availability {
+    /// The measured restore and rebuild cost per cache class, settled estimates only (docs/cache.md).
+    pub cache_costs: [sentinel_cache::ClassFigures; 3],
     pub images_held: Vec<String>,
     pub images_in_flight: usize,
     pub cache_entries: u64,
@@ -112,6 +168,8 @@ struct Awaiting {
     since: Instant,
     asked: Instant,
     declining: bool,
+    /// A cancel arrived before the spec did: the attempt starts canceled.
+    canceled: bool,
     secrets: Vec<sentinel_protocol::secrets::SecretBytes>,
 }
 
@@ -325,6 +383,8 @@ struct State {
     reporter: Option<Reporter>,
     unconfirmed: HashMap<AttemptId, Unconfirmed>,
     awaiting: HashMap<AttemptId, Awaiting>,
+    /// Attempts whose spec arrived and whose live entry is not made yet, with whether a cancel came meanwhile.
+    starting: HashMap<AttemptId, bool>,
     live: HashMap<AttemptId, Live>,
     pending: Vec<(AttemptId, Fence, Event, Option<Vec<u8>>)>,
     lease_deadline: Option<Instant>,
@@ -410,6 +470,7 @@ pub struct Inner {
     mirrors: Option<crate::checkout::Mirrors>,
     spool: Arc<SpoolSpace>,
     admission_floor: std::sync::atomic::AtomicU64,
+    measured_disk: std::sync::atomic::AtomicBool,
     refusal_noted: Mutex<Option<Instant>>,
     state: Mutex<State>,
     gc_lock: Mutex<sentinel_cache::gc::Cursor>,
@@ -419,6 +480,7 @@ pub struct Inner {
     image_swept: Mutex<Option<std::time::Instant>>,
     notify: Box<dyn Fn(Notice) + Send + Sync>,
     recovered: Recovered,
+    costs: sentinel_cache::CostBook,
 }
 
 const REFUSAL_NOTICE_EVERY: Duration = Duration::from_secs(30);
@@ -480,6 +542,16 @@ mod admission_tests {
         assert!(admits(Some(5 * GIB), GIB));
         assert!(!admits(Some(0), GIB));
         assert!(admits(None, GIB));
+    }
+
+    #[test]
+    fn the_offered_scratch_disk_is_the_free_space_less_the_reserve() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        assert_eq!(super::job_disk_room(0), 0);
+        assert_eq!(super::job_disk_room(100 * MIB), 0);
+        assert_eq!(super::job_disk_room(8 * GIB), 7 * GIB);
+        assert_eq!(super::job_disk_room(100 * GIB), 98 * GIB);
     }
 
     #[test]
@@ -552,6 +624,7 @@ impl Executor {
                 reporter: None,
                 unconfirmed: HashMap::new(),
                 awaiting: HashMap::new(),
+                starting: HashMap::new(),
                 live: HashMap::new(),
                 pending: Vec::new(),
                 lease_deadline: None,
@@ -565,6 +638,7 @@ impl Executor {
                 draining: false,
             }),
             admission_floor: std::sync::atomic::AtomicU64::new(floor),
+            measured_disk: std::sync::atomic::AtomicBool::new(false),
             refusal_noted: Mutex::new(None),
             notify: Box::new(notify),
             gc_lock: Mutex::new(sentinel_cache::gc::Cursor::default()),
@@ -573,6 +647,7 @@ impl Executor {
             budgets: Mutex::new(StorageBudgets::default()),
             image_swept: Mutex::new(None),
             recovered,
+            costs: sentinel_cache::CostBook::new(),
         }));
         let watched = Arc::downgrade(&executor.0);
         let _ = thread::Builder::new()
@@ -603,6 +678,13 @@ impl Executor {
     pub fn set_admission_floor(&self, bytes: u64) {
         self.admission_floor
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the scratch disk offered to the controller follows the data directory's free space (`true`,
+    /// the default for a worker whose operator states no `disk_bytes`) or stays the figure sent at connect.
+    pub fn set_measured_disk(&self, measured: bool) {
+        self.measured_disk
+            .store(measured, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn shutdown(&self, grace: Duration) {
@@ -713,7 +795,10 @@ impl Executor {
             if state.awaiting.get(&attempt).is_none_or(|w| w.declining) {
                 return;
             }
-            state.awaiting.remove(&attempt).expect("checked present")
+            let waiting = state.awaiting.remove(&attempt).expect("checked present");
+            // In one step with the removal, so a cancel never finds the attempt in neither place.
+            state.starting.insert(attempt, waiting.canceled);
+            waiting
         };
         let offer = waiting.offer;
         let job_index = offer.job_index as usize;
@@ -729,12 +814,15 @@ impl Executor {
                     secret_bundle,
                 );
             }
-            _ => self.send(
-                attempt,
-                offer.fence,
-                Event::Failed(sentinel_core::FailureClass::Preparation),
-                None,
-            ),
+            _ => {
+                self.state().starting.remove(&attempt);
+                self.send(
+                    attempt,
+                    offer.fence,
+                    Event::Failed(sentinel_core::FailureClass::Preparation),
+                    None,
+                )
+            }
         }
     }
 
@@ -749,7 +837,7 @@ impl Executor {
     ) {
         let cancel: Cancel = Arc::new(AtomicBool::new(false));
         let logs = {
-            let state = self.state();
+            let mut state = self.state();
             let mut redactor = Redactor::new();
             for secret in &secrets {
                 redactor.register(secret.as_slice());
@@ -760,6 +848,7 @@ impl Executor {
             match LogPipe::open_in(&self.spool, offer.attempt, redactor, state.reporter.clone()) {
                 Ok(pipe) => Arc::new(pipe),
                 Err(_) => {
+                    state.starting.remove(&offer.attempt);
                     drop(state);
                     self.send(
                         offer.attempt,
@@ -773,9 +862,11 @@ impl Executor {
         };
         {
             let mut state = self.state();
+            let canceled = state.starting.remove(&offer.attempt).unwrap_or(false);
             if state.draining {
                 return;
             }
+            cancel.store(canceled, Ordering::Release);
             state.live.insert(
                 offer.attempt,
                 Live {
@@ -902,6 +993,11 @@ impl Executor {
 }
 
 impl Inner {
+    /// The measured cache costs the costly-hit rule reads; a cold-rebuild measurement is recorded here.
+    pub fn costs(&self) -> &sentinel_cache::CostBook {
+        &self.costs
+    }
+
     pub fn runtime(&self) -> &podman::Runtime {
         &self.runtime
     }
@@ -982,14 +1078,32 @@ impl Inner {
             *swept = Some(std::time::Instant::now());
         }
         let mut removed = 0usize;
+        // Cached microVM root file systems count against the same budget as Podman's images: Podman's go
+        // first, against what the guest images leave; the guest images then give back whatever still does
+        // not fit, least recently used first.
+        let guests = crate::microvm::guest_images(&self.root);
+        let guest_total: u64 = guests.iter().map(|g| g.bytes).sum();
+        let podman_budget = budget.saturating_sub(guest_total);
+        let mut podman_left = 0u64;
         for store in podman::Store::all(&self.root) {
             let Ok(images) = podman::list_images(&store) else {
                 continue;
             };
-            for id in self.images.reclaimable(&images, budget) {
-                removed += usize::from(podman::remove_image(&store, &id));
+            let mut left: u64 = images.iter().map(|i| i.bytes).sum();
+            for id in self.images.reclaimable(&images, podman_budget) {
+                if podman::remove_image(&store, &id) {
+                    removed += 1;
+                    left = left
+                        .saturating_sub(images.iter().find(|i| i.id == id).map_or(0, |i| i.bytes));
+                }
             }
+            podman_left = podman_left.max(left);
         }
+        let over = crate::images::guest_overage(guest_total, podman_left, budget);
+        for key in self.images.reclaimable_guests(&guests, over) {
+            removed += usize::from(crate::microvm::remove_guest_image(&self.root, &key));
+        }
+        crate::microvm::sweep_guest_orphans(&self.root);
         if removed > 0 {
             (self.notify)(Notice::ImagesReclaimed(removed));
         }
@@ -1022,6 +1136,7 @@ impl Inner {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         (self.notify)(Notice::Availability(Availability {
+            cache_costs: self.costs.figures(),
             images_held: self.images.held(),
             images_in_flight: self.images.in_flight(),
             cache_entries: stats.entries_seen,
@@ -1201,11 +1316,21 @@ impl Report for Inner {
             stats: *stats,
         });
     }
+    fn cache_records(
+        &self,
+        _attempt: AttemptId,
+        records: &[sentinel_protocol::summary::CacheRecord],
+    ) {
+        (self.notify)(Notice::CacheFigures(CacheTotals::of(records)));
+    }
     fn remote(&self) -> Option<std::sync::Arc<dyn sentinel_cache::remote::Remote>> {
         self.state()
             .reporter
             .as_ref()
             .and_then(Reporter::remote_cache)
+    }
+    fn cost_book(&self) -> Option<&sentinel_cache::CostBook> {
+        Some(&self.costs)
     }
 }
 
@@ -1355,6 +1480,16 @@ impl LinkExecutor for Executor {
         ))
     }
 
+    fn disk_room(&self) -> Option<u64> {
+        if !self
+            .measured_disk
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+        crate::spool::free_bytes(&self.root).map(job_disk_room)
+    }
+
     fn prefetch(&self, images: &[String]) {
         self.prefetch.hint(images);
     }
@@ -1406,6 +1541,7 @@ impl LinkExecutor for Executor {
                 since: now,
                 asked: now,
                 declining: false,
+                canceled: false,
                 secrets: Vec::new(),
             },
         );
@@ -1467,7 +1603,17 @@ impl LinkExecutor for Executor {
                     live.canceling = true;
                     (Arc::clone(&live.cancel), grace, live.store.clone())
                 }
-                _ => return,
+                Some(_) => return,
+                None => {
+                    // Offered and accepted, or its spec arrived and it is starting: the cancel is kept, so the
+                    // attempt starts canceled instead of running a job the controller already gave up on.
+                    if let Some(waiting) = state.awaiting.get_mut(&attempt) {
+                        waiting.canceled = true;
+                    } else if let Some(canceled) = state.starting.get_mut(&attempt) {
+                        *canceled = true;
+                    }
+                    return;
+                }
             }
         };
         // Desired state is set first, so a step that ends by itself meanwhile is still reported as canceled.
@@ -1709,6 +1855,66 @@ mod tests {
     use super::live::{DIGEST, IMAGE, Live, eventually, podman_enabled};
     use super::*;
     use sentinel_core::{FailureClass, JobState, Outcome};
+
+    fn record(outcome: &str) -> sentinel_protocol::summary::CacheRecord {
+        sentinel_protocol::summary::CacheRecord {
+            name: "deps".into(),
+            class: 1,
+            outcome: outcome.into(),
+            lookup_ns: Some(1),
+            lock_wait_ns: None,
+            clone_ns: None,
+            first_touch_ns: None,
+            files: 0,
+            bytes: 0,
+            copied_bytes: 0,
+            reflink: false,
+            commit_ns: None,
+            staged_bytes: None,
+            reused_bytes: None,
+            dirty_bytes: None,
+            publish: None,
+            costly_hit: false,
+        }
+    }
+
+    #[test]
+    fn cache_totals_sum_hits_misses_and_only_the_phases_that_ran() {
+        let mut hit = record("hit");
+        hit.lock_wait_ns = Some(5);
+        hit.clone_ns = Some(7);
+        hit.first_touch_ns = Some(11);
+        hit.bytes = 1000;
+        hit.copied_bytes = 400;
+        hit.costly_hit = true;
+        hit.commit_ns = Some(13);
+        hit.staged_bytes = Some(300);
+        hit.dirty_bytes = Some(120);
+        let mut miss = record("absent");
+        miss.bytes = 99;
+        miss.copied_bytes = 99;
+        miss.commit_ns = Some(17);
+        let totals = CacheTotals::of(&[hit, miss, record("hit")]);
+        assert_eq!(
+            totals,
+            CacheTotals {
+                entries: 3,
+                hits: 2,
+                misses: 1,
+                costly_hits: 1,
+                lock_wait_ns: 5,
+                clone_ns: 7,
+                first_touch_ns: 11,
+                commit_ns: 30,
+                restored_bytes: 1000,
+                copied_bytes: 400,
+                staged_bytes: 300,
+                dirty_bytes: 120,
+            },
+            "a miss restored nothing, so its bytes are not restored bytes"
+        );
+        assert_eq!(CacheTotals::of(&[]), CacheTotals::default());
+    }
 
     #[test]
     fn a_panicking_attempt_is_torn_down_and_reported() {

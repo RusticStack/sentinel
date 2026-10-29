@@ -1,0 +1,97 @@
+# A worker host (`sentinel worker`, docs/deployment.md): the rootless-Podman
+# executor, optionally the Firecracker microVM executor and the Tailcat helper.
+# Installed as /etc/systemd/system/sentinel-worker.service. It is a separate unit
+# and a separate account from examples/sentinel-server.service: a worker host
+# never needs the controller's database or master key, and a compromised job
+# never reaches either.
+#
+# The account is unprivileged, owns /var/lib/sentinel-worker and has subordinate
+# ids that overlap no other account. Rootless Podman needs the account's own
+# systemd user manager (linger), because job limits are enforced through user
+# scopes it creates over the user bus:
+#
+#   useradd --system --create-home --home-dir /var/lib/sentinel-worker \
+#           --shell /usr/sbin/nologin sentinel-worker
+#   usermod --add-subuids 300000-365535 --add-subgids 300000-365535 sentinel-worker
+#   loginctl enable-linger sentinel-worker
+#   # a KVM host that runs microVMs: usermod -aG kvm sentinel-worker
+#
+# A system unit cannot name the account's numeric id, so the user manager, its
+# runtime directory and its bus are wired in by a drop-in that is written once
+# at install time (the snippet is in docs/deployment.md). Without it the unit
+# refuses to start: the executor would have no usable runtime directory.
+#
+# Refuses to run as root: the pre-start check below fails with status 2 (not
+# retried), and a worker that Podman finds is not rootless declines every offer.
+[Unit]
+Description=Sentinel worker
+Documentation=https://github.com/RusticStack/sentinel/blob/main/docs/deployment.md
+After=network-online.target
+Wants=network-online.target
+# A Tailcat helper is a child of this service, not a unit: nothing to order
+# beyond the network. On the controller's own host also add
+# After=sentinel-server.service so a boot does not spend its first back-off
+# dialing a controller that is still starting.
+# An invalid configuration (exit status 2) is not retried; a crash loop stops
+# after five starts in five minutes.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=sentinel-worker
+Group=sentinel-worker
+# Refuse root, whatever User= was edited to. `$$` is systemd's literal dollar.
+ExecStartPre=/bin/sh -c 'test "$$(id -u)" -ne 0 || { echo "sentinel-worker: refusing to run as root; use an unprivileged account with subordinate ids" >&2; exit 2; }'
+# Refuse to start without the account's user manager: no runtime dir or bus means
+# no enforced job limits. Status 1: at boot the manager may still be coming up.
+ExecStartPre=/bin/sh -c 'test -n "$$XDG_RUNTIME_DIR" && test -S "$$XDG_RUNTIME_DIR/bus" || { echo "sentinel-worker: no user manager bus; enable linger and install the session drop-in (docs/deployment.md)" >&2; exit 1; }'
+ExecStart=/opt/sentinel/bin/sentinel worker --config /etc/sentinel/worker.toml --data-dir /var/lib/sentinel-worker
+Restart=on-failure
+RestartSec=2s
+RestartPreventExitStatus=2
+# SIGTERM drains: attempts are handed back, sessions close in 2 s, the store drains in 5 s.
+TimeoutStopSec=60s
+WorkingDirectory=/var/lib/sentinel-worker
+
+# The worker's data directory: identity, spool, mirrors, caches, private image
+# stores and workspaces. Owner-only, kept when the unit is removed. `tmp` is
+# where Podman stages image layers (TMPDIR), on the data disk rather than the
+# root disk's /var/tmp.
+StateDirectory=sentinel-worker sentinel-worker/tmp
+StateDirectoryMode=0700
+Environment=TMPDIR=/var/lib/sentinel-worker/tmp
+UMask=0077
+
+# Caps on the service itself: the worker, its git and podman clients and the
+# Tailcat helper. Jobs do not run in this cgroup; each runs in a user scope of the
+# account's own manager, limited by its job resources and by the worker's
+# cpu_millis and memory_bytes (to cap the account as a whole, see
+# docs/deployment.md). Starting points, raised with `systemctl edit`.
+MemoryMax=2G
+TasksMax=4096
+LimitNOFILE=65536
+LimitCORE=0
+
+# Sandbox. Only what rootless Podman provably tolerates (docs/deployment.md lists
+# each directive left out and what broke). Seccomp-based directives are not set
+# on purpose: the filter would be inherited by every job process through conmon.
+# The bounding set holds what the setuid newuidmap/newgidmap helpers need to
+# write a user namespace's id maps, and nothing else.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_SYS_ADMIN
+AmbientCapabilities=
+ProtectSystem=strict
+# `read-only`, not `yes`: `yes` hides /run/user, where Podman keeps its runtime.
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateMounts=yes
+RemoveIPC=yes
+# /dev/fuse for fuse-overlayfs, /dev/net/tun for pasta (job_network = "egress"),
+# /dev/kvm for the microVM executor (ignored where the device does not exist).
+DevicePolicy=closed
+DeviceAllow=/dev/fuse rw
+DeviceAllow=/dev/net/tun rw
+DeviceAllow=/dev/kvm rw
+
+[Install]
+WantedBy=multi-user.target

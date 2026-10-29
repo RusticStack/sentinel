@@ -437,6 +437,8 @@ fn backup(args: &crate::cli::BackupArgs) -> Result<(), Error> {
                             "id": id,
                             "schema": m["schema"],
                             "version": m["version"],
+                            "started_ms": m["started_ms"],
+                            "took_ms": m["took_ms"],
                             "metadata_bytes": m["metadata"]["bytes"],
                             "objects": m["objects"]["rows"],
                             "key_ids": m["key"]["key_ids"],
@@ -459,12 +461,40 @@ fn backup(args: &crate::cli::BackupArgs) -> Result<(), Error> {
                     "objects_checked": check.objects_checked,
                     "objects_remote_only": check.objects_remote,
                     "manifests_checked": check.manifests_checked,
+                    "config_checked": check.config_checked,
                     "missing": check.missing,
                     "corrupt": check.corrupt,
                 })
             );
             if !check.ok() {
                 return Err(fail(format!("backup {id} failed verification")));
+            }
+        }
+        BackupCommand::Rpo { dir, limit_secs } => {
+            let exposure = backup::exposure(dir, sentinel_core::UnixMillis::now())
+                .map_err(|error| fail(format!("cannot read the backups: {error}")))?;
+            let limit_ms = i64::try_from(*limit_secs)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000);
+            let secs = |ms: Option<i64>| ms.map(|ms| ms / 1_000);
+            let within = exposure.age_ms.is_some_and(|age| age <= limit_ms);
+            sentinel::outln!(
+                "{}",
+                serde_json::json!({
+                    "backups": exposure.backups,
+                    "newest": exposure.newest_id,
+                    "age_secs": secs(exposure.age_ms),
+                    "worst_window_secs": secs(exposure.worst_ms),
+                    "limit_secs": limit_secs,
+                    "within_limit": within,
+                })
+            );
+            if !within {
+                return Err(fail(if exposure.backups == 0 {
+                    "no backup in the directory".to_owned()
+                } else {
+                    format!("the newest backup is older than {limit_secs} s")
+                }));
             }
         }
         BackupCommand::Prune { dir, keep } => {
@@ -520,6 +550,7 @@ fn restore(
             "log_files": restored.log_files,
             "config_files": restored.config_files,
             "key_checked": restored.key_checked,
+            "objects_unavailable": restored.objects_unavailable,
             "copy_ms": copied.as_millis() as u64,
             "total_ms": started.elapsed().as_millis() as u64,
             "recovery": {
@@ -529,6 +560,12 @@ fn restore(
             },
         })
     );
+    if !restored.objects_unavailable.is_empty() {
+        eprintln!(
+            "{} objects were already missing or corrupt when the backup was taken and are not restored; recovery names them",
+            restored.objects_unavailable.len()
+        );
+    }
     if restored.objects_remote > 0 {
         eprintln!(
             "{} objects live only in the external S3 copy: configure the same [s3] section to read them",
@@ -767,6 +804,20 @@ fn token(args: &TokenArgs, now: UnixMillis) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// `None`: flag absent, leave the ceiling alone. `Some(None)`: `none`, remove it.
+fn ceiling_flag(text: Option<&str>, flag: &str) -> Result<Option<Option<i64>>, Error> {
+    match text {
+        None => Ok(None),
+        Some("none") => Ok(Some(None)),
+        Some(number) => number
+            .parse::<i64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .map(|value| Some(Some(value)))
+            .ok_or_else(|| fail(format!("{flag} takes a positive number or `none`"))),
+    }
 }
 
 fn identity(args: &IdentityArgs, now: UnixMillis) -> Result<(), Error> {
@@ -1748,6 +1799,11 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
             data,
             pool,
             expires_in,
+            transport,
+            cpu_millis,
+            memory_bytes,
+            disk_bytes,
+            priority,
         } => {
             let store = open(data, true)?;
             let lifetime_ms = lifetime_ms(expires_in)?;
@@ -1758,13 +1814,26 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
             let pool = store
                 .read(move |conn| lookup::pool_by_name(conn, &owned))
                 .map_err(|_| fail("no pool with that name"))?;
+            let terms = workers::EnrollmentTerms {
+                pool,
+                lifetime_ms,
+                policy: workers::HostPolicy {
+                    cpu_millis: *cpu_millis,
+                    memory_bytes: *memory_bytes,
+                    disk_bytes: *disk_bytes,
+                    priority: *priority,
+                },
+                tailcat: *transport == crate::cli::EnrollTransport::Tailcat,
+            };
+            let tailcat = terms.tailcat;
             let enrollment = store
                 .writer()
                 .write(move |tx| {
-                    workers::issue_enrollment(tx, Authority::HostLocal, pool, lifetime_ms, now)
+                    workers::issue_enrollment_with(tx, Authority::HostLocal, terms, now)
                 })
                 .map_err(|error| match error {
                     sentinel_store::Error::NotFound => fail("that pool is not active"),
+                    sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
                     other => fail(format!("cannot issue the enrollment: {other}")),
                 })?;
             sentinel::outln!("{}", sentinel_auth::token::format(&enrollment.secret));
@@ -1772,6 +1841,12 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
                 "issued {} for pool {} expiring at {} (shown once)",
                 enrollment.id, enrollment.pool, enrollment.expires.0
             );
+            if tailcat {
+                eprintln!(
+                    "tailcat: authorize the worker's key with `sentinel admin tailcat authorize --enrollment {}`",
+                    enrollment.id
+                );
+            }
         }
         WorkerCommand::List { data, pool } => {
             let store = open(data, true)?;
@@ -1830,6 +1905,106 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
                     other => fail(format!("revocation failed: {other}")),
                 })?;
             eprintln!("revoked {id}");
+        }
+        WorkerCommand::Policy {
+            data,
+            id,
+            cpu_millis,
+            memory_bytes,
+            disk_bytes,
+            priority,
+        } => {
+            let store = open(data, true)?;
+            let id: WorkerId = id
+                .parse()
+                .map_err(|_| fail("expected a wrk_ worker identifier"))?;
+            let change = (
+                ceiling_flag(cpu_millis.as_deref(), "--cpu-millis")?,
+                ceiling_flag(memory_bytes.as_deref(), "--memory-bytes")?,
+                ceiling_flag(disk_bytes.as_deref(), "--disk-bytes")?,
+                *priority,
+            );
+            let changing = cpu_millis.is_some()
+                || memory_bytes.is_some()
+                || disk_bytes.is_some()
+                || priority.is_some();
+            let view = store
+                .writer()
+                .write(move |tx| {
+                    if changing {
+                        let current = workers::host_view(tx, Authority::HostLocal, id)?.policy;
+                        let policy = workers::HostPolicy {
+                            cpu_millis: change.0.unwrap_or(current.cpu_millis),
+                            memory_bytes: change.1.unwrap_or(current.memory_bytes),
+                            disk_bytes: change.2.unwrap_or(current.disk_bytes),
+                            priority: change.3.unwrap_or(current.priority),
+                        };
+                        workers::set_policy(tx, Authority::HostLocal, id, policy)?;
+                    }
+                    workers::host_view(tx, Authority::HostLocal, id)
+                })
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound => fail("no live worker with that identifier"),
+                    sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
+                    other => fail(format!("cannot change the policy: {other}")),
+                })?;
+            let show =
+                |value: Option<i64>| value.map_or_else(|| "none".to_owned(), |v| v.to_string());
+            sentinel::outln!(
+                "approved  cpu_millis={} memory_bytes={} disk_bytes={} priority={}",
+                show(view.policy.cpu_millis),
+                show(view.policy.memory_bytes),
+                show(view.policy.disk_bytes),
+                view.policy.priority
+            );
+            sentinel::outln!(
+                "reported  cpu_millis={} memory_bytes={} disk_bytes={} (0: not stated)",
+                view.reported_cpu_millis,
+                view.reported_memory_bytes,
+                view.reported_disk_bytes
+            );
+            sentinel::outln!(
+                "effective cpu_millis={} memory_bytes={} disk_bytes={} (0 disk: not enforced)",
+                view.effective_cpu_millis,
+                view.effective_memory_bytes,
+                view.effective_disk_bytes
+            );
+            sentinel::outln!(
+                "reserved  cpu_millis={} memory_bytes={} disk_bytes={} (the whole machine's accepted work)",
+                view.reserved_cpu_millis,
+                view.reserved_memory_bytes,
+                view.reserved_disk_bytes
+            );
+            let over = view.over_cap();
+            if over.is_over() {
+                sentinel::outln!(
+                    "over-cap  cpu_millis={} memory_bytes={} disk_bytes={} (accepted work finishes; nothing new is placed until it fits)",
+                    over.cpu_millis,
+                    over.memory_bytes,
+                    over.disk_bytes
+                );
+            } else {
+                sentinel::outln!("over-cap  no");
+            }
+            if changing {
+                eprintln!("policy of {id} replaced; running work keeps its resources");
+            }
+        }
+        WorkerCommand::Uninstall { data, id } => {
+            let store = open(data, true)?;
+            let id: WorkerId = id
+                .parse()
+                .map_err(|_| fail("expected a wrk_ worker identifier"))?;
+            store
+                .writer()
+                .write(move |tx| workers::request_uninstall(tx, Authority::HostLocal, id, now))
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound => fail("no live worker with that identifier"),
+                    other => fail(format!("cannot request the uninstall: {other}")),
+                })?;
+            eprintln!(
+                "{id} is draining; the controller revokes it, with its node key, once its accepted work has settled"
+            );
         }
     }
     Ok(())

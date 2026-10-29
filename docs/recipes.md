@@ -72,7 +72,7 @@ each recipe declares the environment the tool reads:
 Two rules this enforces: the whole *tool-managed home* must be writable
 (mounting only `CARGO_HOME/registry` breaks cargo's bookkeeping on the
 read-only rootfs — mount the home), and scratch state the cache is not
-meant to carry (`PNPM_HOME`) goes to the `/tmp` tmpfs, not a mount.
+meant to carry (`PNPM_HOME`) goes to the job's `/tmp` (a directory on the workspace disk, removed with the workspace), not a mount.
 
 ## What each case measures
 

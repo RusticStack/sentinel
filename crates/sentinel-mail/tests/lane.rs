@@ -208,3 +208,34 @@ fn dropping_the_lane_stops_it_promptly() {
     drop(lane);
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+#[test]
+fn a_delivered_message_still_counts_against_its_mailbox_allowance() {
+    let w = world();
+    w.queue("guest@example.com");
+    let (lane, _sent) = w.start(Arc::clone(&w.key), vec![Ok(())]);
+    eventually("the message to settle", || w.counts() == (0, 1, 0));
+    drop(lane);
+
+    let (key, user) = (Arc::clone(&w.key), w.user);
+    let again = w
+        .store
+        .writer()
+        .write(move |tx| {
+            email::request(
+                tx,
+                Some(&key),
+                user,
+                "guest@example.com",
+                None,
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        again,
+        email::Requested::Throttled,
+        "delivery does not reset the cooldown"
+    );
+    assert_eq!(w.counts(), (0, 1, 0), "nothing new was queued");
+}

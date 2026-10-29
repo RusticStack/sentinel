@@ -7,11 +7,13 @@ pub mod checks;
 pub mod codec;
 pub mod dispatch;
 pub mod email;
+pub mod github_app;
 pub mod github_events;
 pub mod github_members;
 pub mod idempotency;
 pub mod intake;
 pub mod jobs;
+pub mod known_sources;
 pub mod local_auth;
 pub mod logs;
 pub mod lookup;
@@ -453,6 +455,9 @@ struct Readers {
 pub struct Store {
     path: PathBuf,
     durability: Durability,
+    /// A registered SQLite VFS every connection opens through; `None` is SQLite's default. Only fault-injection
+    /// tests set it.
+    vfs: Option<String>,
     writer: Writer,
     readers: Mutex<Readers>,
     freed: Condvar,
@@ -491,7 +496,18 @@ impl Store {
     }
 
     pub fn open(path: impl AsRef<Path>, durability: Durability) -> Result<Store> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_through(path.as_ref(), durability, None)
+    }
+
+    /// Opens through a SQLite VFS the caller registered by name, with every other setting identical to [`Store::open`].
+    /// It exists so the power-loss tests can interpose a file layer that records writes and syncs and discards what
+    /// was never synced; production code uses [`Store::open`].
+    pub fn open_on_vfs(path: impl AsRef<Path>, durability: Durability, vfs: &str) -> Result<Store> {
+        Self::open_through(path.as_ref(), durability, Some(vfs))
+    }
+
+    fn open_through(path: &Path, durability: Durability, vfs: Option<&str>) -> Result<Store> {
+        let path = path.to_path_buf();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -509,17 +525,19 @@ impl Store {
             Err(std::fs::TryLockError::WouldBlock) => return Err(Error::AlreadyOwned),
             Err(std::fs::TryLockError::Error(e)) => return Err(Error::Io(e)),
         }
-        let mut conn = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let mut conn = match vfs {
+            Some(vfs) => Connection::open_with_flags_and_vfs(&path, flags, vfs)?,
+            None => Connection::open_with_flags(&path, flags)?,
+        };
         configure(&conn, durability)?;
         migrate(&mut conn)?;
         Ok(Store {
             path,
             durability,
+            vfs: vfs.map(str::to_owned),
             writer: Writer::start(conn, WRITER_QUEUE),
             readers: Mutex::new(Readers {
                 idle: Vec::new(),
@@ -581,10 +599,11 @@ impl Store {
     }
 
     fn open_reader(&self) -> Result<Connection> {
-        let c = Connection::open_with_flags(
-            &self.path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let c = match &self.vfs {
+            Some(vfs) => Connection::open_with_flags_and_vfs(&self.path, flags, vfs.as_str())?,
+            None => Connection::open_with_flags(&self.path, flags)?,
+        };
         configure(&c, self.durability)?;
         c.execute_batch("PRAGMA query_only=ON")?;
         Ok(c)

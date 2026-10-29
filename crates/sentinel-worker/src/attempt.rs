@@ -373,7 +373,13 @@ pub trait Report: Send + Sync {
         _stats: &sentinel_cache::Stats,
     ) {
     }
+    /// The attempt's cache figures, once per attempt that declared a cache entry.
+    fn cache_records(&self, _attempt: AttemptId, _records: &[CacheRecord]) {}
     fn remote(&self) -> Option<Arc<dyn sentinel_cache::remote::Remote>> {
+        None
+    }
+    /// The worker's measured restore and rebuild costs; without one the fixed default rule applies.
+    fn cost_book(&self) -> Option<&sentinel_cache::CostBook> {
         None
     }
 }
@@ -439,11 +445,25 @@ pub fn run(
     let remote = report.remote();
     let mut summary = AttemptSummary::default();
     let prepared = prepare(root, job, cancel, &mut summary, remote.as_deref());
-    for attached in &job.caches {
-        if let Some(costly) = attached.costly_hit() {
-            report.costly_hit(job.attempt, &attached.name, costly, &attached.stats);
-        }
-    }
+    // Judged once, before publication rewrites the carrier's stats, so the notice and the summary agree.
+    let costly: Vec<Option<sentinel_cache::Costly>> = job
+        .caches
+        .iter()
+        .map(|attached| {
+            let verdict = match report.cost_book() {
+                Some(book) => {
+                    let verdict = attached.costly_hit_with(book);
+                    book.observe(attached);
+                    verdict
+                }
+                None => attached.costly_hit(),
+            };
+            if let Some(costly) = verdict {
+                report.costly_hit(job.attempt, &attached.name, costly, &attached.stats);
+            }
+            verdict
+        })
+        .collect();
     let mut sealed: Vec<SealedCache> = Vec::new();
     let verdict = match prepared {
         Err(_) if cancel.load(Ordering::Acquire) => {
@@ -484,9 +504,29 @@ pub fn run(
                 .iter()
                 .flat_map(|a| a.paths.iter().cloned())
                 .collect();
-            if let Err(e) = prepared.sandbox.sync_out(prepared.workspace.path(), &paths) {
-                summary.detail = format!("copying results out of the microVM: {e}");
-            }
+            // The cache views declared by a relative path live in the workspace: a VM works on a copy, so they
+            // are brought back whole before publication reads them.
+            let views: Vec<String> = job
+                .caches
+                .iter()
+                .flat_map(|attached| attached.targets.iter())
+                .filter(|target| !target.mount)
+                .filter_map(|target| target.dir.strip_prefix(&target.root).ok())
+                .filter(|rel| !rel.as_os_str().is_empty())
+                .filter_map(|rel| rel.to_str().map(str::to_owned))
+                .collect();
+            // A cache sealed from a view that could not be brought back would hold a truncated tree, so
+            // none is published then.
+            let synced = match prepared
+                .sandbox
+                .sync_out(prepared.workspace.path(), &paths, &views)
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    summary.detail = format!("copying results out of the microVM: {e}");
+                    false
+                }
+            };
             let artifact_failure = capture_artifacts(
                 job.attempt,
                 prepared.workspace.path(),
@@ -494,7 +534,7 @@ pub fn run(
                 matches!(verdict, Verdict::Passed),
                 sink,
             );
-            sealed = finalize(root, job, &verdict, report, prepared, cancel);
+            sealed = finalize(root, job, &verdict, synced, report, prepared, cancel);
             let published = output.complete();
             if published {
                 recovery::mark_ended(root, job.attempt);
@@ -528,9 +568,18 @@ pub fn run(
     summary.caches = job
         .caches
         .iter()
+        .zip(&costly)
         .take(MAX_CACHE_RECORDS)
-        .map(cache_record)
+        .map(|(attached, costly)| cache_record(attached, costly.is_some()))
         .collect();
+    if let Some(book) = report.cost_book()
+        && matches!(verdict, Verdict::Passed)
+    {
+        book.observe_run(&job.caches, summary.steps_ns.unwrap_or(0));
+    }
+    if !summary.caches.is_empty() {
+        report.cache_records(job.attempt, &summary.caches);
+    }
     match summary.encode() {
         Ok(bytes) => report.finish(job.attempt, job.fence, event, bytes),
         Err(_) => report.event(job.attempt, job.fence, event),
@@ -589,6 +638,7 @@ fn prepare(
                 let path = workspace.path().to_path_buf();
                 let source = job.spec.source.clone();
                 let access = job.context.source.clone();
+                let valid_until = job.context.source_valid_until;
                 let mirrors = job.mirrors.clone();
                 let repo = job.context.repo;
                 let lease = job.attempt.to_string();
@@ -602,6 +652,7 @@ fn prepare(
                             &repo,
                             &source,
                             access.as_ref(),
+                            valid_until,
                             &lease,
                             CHECKOUT_TIMEOUT,
                         )?;
@@ -710,6 +761,15 @@ fn prepare(
                 });
             }
         }
+        let isolation = job.runtime.for_job(stated_isolation);
+        if matches!(isolation, Isolation::Container) {
+            // The job's `/tmp` lives on the workspace disk, under the same disk budget, not in memory.
+            mounts.push(podman::Mount {
+                host: workspace.create_tmp()?,
+                container: podman::TMP_MOUNT.into(),
+                read_only: false,
+            });
+        }
         let started = Instant::now();
         let limits = Limits {
             cpu_millis: resources.cpu_millis,
@@ -720,7 +780,7 @@ fn prepare(
                 .max(1)
                 .saturating_add(podman::KEEPALIVE_SLACK_SECS),
         };
-        let sandbox = match job.runtime.for_job(stated_isolation) {
+        let sandbox = match isolation {
             Isolation::Container => Sandbox::Container(Container::start_canceled(
                 job.worker,
                 job.attempt,
@@ -736,7 +796,7 @@ fn prepare(
                 let setup = job.runtime.microvm.as_deref().ok_or_else(|| {
                     Error::Preparation("this worker has no microVM executor".into())
                 })?;
-                Sandbox::Vm(microvm::Vm::start(
+                let vm = microvm::Vm::start_canceled(
                     root,
                     setup,
                     job.worker,
@@ -747,7 +807,11 @@ fn prepare(
                     &mounts,
                     &store,
                     job.network,
-                )?)
+                    cancel,
+                )?;
+                // The digest the guest ran is the one it was built and checked against.
+                summary.guest_image = Some(vm.guest_image().clone());
+                Sandbox::Vm(Box::new(vm))
             }
         };
         summary.container_start_ns = ns(started);
@@ -898,9 +962,28 @@ fn execute(
     ];
     let compiled = &job.spec.pipeline.jobs[job.job_index].spec;
     let job_deadline = Instant::now() + Duration::from_secs(compiled.timeout_secs.max(1));
-    let context = WorkerContext::new(&job.context, &job.spec, workspace);
+    // A VM works on its own copy of the workspace: before `hash_files` reads one, bring back what the steps
+    // that already ran changed there. Nothing ran before the first step, and a container shares the directory.
+    let ran = AtomicBool::new(false);
+    let refresh = |patterns: &[&str]| {
+        if ran.load(Ordering::Acquire) {
+            let _ = container.pull_workspace(workspace, patterns);
+        }
+    };
+    let context = WorkerContext::new(&job.context, &job.spec, workspace).with_refresh(&refresh);
     let mut oom_seen = container.oom_kills().unwrap_or(0);
     let mut failure: Option<(FailureClass, String)> = None;
+    // A container's workspace has no kernel quota: the guard measures it and stops the container once it passes
+    // the declared disk (docs/executor.md#disk). A microVM's scratch disk is the bound there.
+    let guard = container.guard_storage(workspace, compiled.resources.disk_bytes);
+    let over_disk = |index: usize| {
+        guard.as_ref().and_then(|g| g.exceeded()).map(|used| {
+            (
+                FailureClass::CommandFailed,
+                disk_exceeded(index, used, compiled.resources.disk_bytes),
+            )
+        })
+    };
     for (index, step) in compiled.steps.iter().enumerate() {
         let mut record = StepRecord {
             index: index as u32,
@@ -922,6 +1005,11 @@ fn execute(
                 FailureClass::Canceled,
                 format!("canceled before step {index}"),
             ));
+            continue;
+        }
+        if let Some(over) = over_disk(index) {
+            summary.steps.push(record);
+            failure = Some(over);
             continue;
         }
         if let Some(condition) = &step.condition {
@@ -981,7 +1069,22 @@ fn execute(
                 continue;
             }
             match materialize_step_secrets(directory, &job.secret_bundle, index) {
-                Ok(paths) => Some(paths),
+                // A VM has file systems of its own: the step's secrets go in now and come out after it.
+                Ok(paths) => match container.deliver_secrets(&[
+                    (&directory.files_dir, SECRET_FILES_MOUNT),
+                    (&directory.env_dir, SECRET_ENV_MOUNT),
+                ]) {
+                    Ok(()) => Some(paths),
+                    Err(_) => {
+                        let _ = container.retract_secrets();
+                        summary.steps.push(record);
+                        failure = Some((
+                            FailureClass::Preparation,
+                            format!("step {index} secret delivery failed"),
+                        ));
+                        continue;
+                    }
+                },
                 Err(_) => {
                     summary.steps.push(record);
                     failure = Some((
@@ -1001,6 +1104,7 @@ fn execute(
             Arc::new(move |stream, bytes: &[u8]| output.write(step_index, stream, bytes))
         };
         let exec = container.exec_streaming(&command, &extra, Some(sink));
+        ran.store(true, Ordering::Release);
         let cleared = if secret_step
             && exec.as_ref().is_ok_and(|exit| !exit.timed_out)
             && !cancel.load(Ordering::Acquire)
@@ -1009,13 +1113,28 @@ fn execute(
         } else {
             Ok(())
         };
+        // Taken out of the guest even when the step timed out; a canceled attempt's VM is going anyway.
+        let retracted = if secret_step && !cancel.load(Ordering::Acquire) {
+            container.retract_secrets()
+        } else {
+            Ok(())
+        };
         drop(step_secrets);
         output.step_done(index as u32);
-        let exit = match exec.and_then(|exit| cleared.map(|()| exit)) {
+        let exit = match exec.and_then(|exit| cleared.and(retracted).map(|()| exit)) {
             Ok(exit) => exit,
             Err(e) => {
-                record.outcome = StepOutcome::Runtime;
                 record.duration_ns = ns(started);
+                // The guard removed the container under the running step: that is the disk limit, not a fault.
+                if !cancel.load(Ordering::Acquire)
+                    && let Some(over) = over_disk(index)
+                {
+                    record.outcome = StepOutcome::Failed { code: -1 };
+                    summary.steps.push(record);
+                    failure = Some(over);
+                    continue;
+                }
+                record.outcome = StepOutcome::Runtime;
                 summary.steps.push(record);
                 failure = Some((FailureClass::Runtime, format!("step {index}: {e}")));
                 continue;
@@ -1028,6 +1147,13 @@ fn execute(
                     signal: exit.signal.unwrap_or(0),
                 },
                 Some((FailureClass::Canceled, format!("step {index} canceled"))),
+            )
+        } else if let Some(over) = over_disk(index) {
+            (
+                StepOutcome::Failed {
+                    code: exit.code.unwrap_or(-1),
+                },
+                Some(over),
             )
         } else if exit.timed_out {
             (
@@ -1110,6 +1236,14 @@ pub fn capture_artifacts(
     failed
 }
 
+/// The verdict text for a step stopped because the workspace passed the job's declared disk. The failure class
+/// stays `command_failed` (the job's own writes did it); this text is what names the limit.
+fn disk_exceeded(step: usize, used: u64, limit: u64) -> String {
+    format!(
+        "step {step} exceeded the job's disk limit: the workspace and /tmp held {used} bytes of the {limit} declared as resources.disk"
+    )
+}
+
 fn describe(error: &EvalError) -> String {
     match error {
         EvalError::Unresolved { needs, .. } => {
@@ -1132,7 +1266,7 @@ fn cache_worthy(verdict: &Verdict) -> bool {
     }
 }
 
-fn cache_record(attached: &sentinel_cache::attach::Attached) -> CacheRecord {
+fn cache_record(attached: &sentinel_cache::attach::Attached, costly_hit: bool) -> CacheRecord {
     let stats = &attached.stats;
     let (staged, reused, dirty, publish) = match stats.committed {
         Some(sentinel_cache::Committed::Sealed {
@@ -1170,7 +1304,7 @@ fn cache_record(attached: &sentinel_cache::attach::Attached) -> CacheRecord {
         reused_bytes: reused,
         dirty_bytes: dirty,
         publish,
-        costly_hit: attached.costly_hit().is_some(),
+        costly_hit,
     }
 }
 
@@ -1250,6 +1384,7 @@ fn finalize(
     root: &Path,
     job: &mut Job,
     verdict: &Verdict,
+    synced: bool,
     report: &dyn Report,
     prepared: PreparedExecution,
     cancel: &Cancel,
@@ -1262,7 +1397,7 @@ fn finalize(
     // Stop the sandbox first: no job process may rewrite the views publication reads.
     let _ = sandbox.destroy();
     drop(secret_directory);
-    let sealed = if cache_worthy(verdict) {
+    let sealed = if synced && cache_worthy(verdict) {
         publish_caches(root, job, report, cancel)
     } else {
         Vec::new()
@@ -1514,6 +1649,7 @@ mod tests {
             spec,
             context: JobContext {
                 source: None,
+                source_valid_until: None,
                 run: RunId::new(),
                 repo: RepoId::new(),
                 repo_name: "app".into(),
@@ -1575,7 +1711,7 @@ mod tests {
         assert_eq!(mounts[0].host, attached.targets[1].dir);
         assert!(mounts[0].host.is_dir());
 
-        let record = cache_record(attached);
+        let record = cache_record(attached, attached.costly_hit().is_some());
         assert_eq!(record.name, "deps");
         assert_eq!(
             record.class,
@@ -1673,7 +1809,7 @@ mod tests {
                 reused_bytes: 0
             })
         ));
-        let record = cache_record(attached);
+        let record = cache_record(attached, attached.costly_hit().is_some());
         assert_eq!(record.publish.as_deref(), Some("sealed"));
         assert_eq!(record.staged_bytes, Some(3));
         assert_eq!(record.reused_bytes, Some(0));
@@ -1793,7 +1929,7 @@ mod tests {
             attached.costly_hit(),
             Some(sentinel_cache::Costly::CopiedAll)
         );
-        let record = cache_record(attached);
+        let record = cache_record(attached, attached.costly_hit().is_some());
         assert!(record.costly_hit);
         assert_eq!(record.outcome, "hit");
     }

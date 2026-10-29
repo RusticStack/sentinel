@@ -1,5 +1,8 @@
 #[cfg(target_os = "linux")]
 pub mod artifacts;
+/// The cache crate the executor's notices are typed in, for roles that count them.
+#[cfg(target_os = "linux")]
+pub use sentinel_cache as cache;
 #[cfg(target_os = "linux")]
 pub mod attempt;
 #[cfg(target_os = "linux")]
@@ -21,6 +24,8 @@ pub mod podman;
 pub mod prefetch;
 #[cfg(target_os = "linux")]
 mod process;
+#[cfg(target_os = "linux")]
+pub mod quota;
 /// A step's output callback: the log path and tests take it.
 #[cfg(target_os = "linux")]
 pub use process::Sink as OutputSink;

@@ -6,6 +6,7 @@ pub mod checks;
 #[cfg(feature = "fake")]
 pub mod fake;
 pub mod http;
+pub mod manifest;
 pub mod oauth;
 pub mod webhook;
 

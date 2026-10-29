@@ -60,12 +60,40 @@ The aggregate is the run's own aggregate (`sentinel-core`'s precedence:
 infra failure > failed > timed out > canceled > passed; all-skipped is
 `skipped`) and its output summarises `n/m jobs passed · …`.
 
-`details_url` is `<public_url>/runs/<run id>` when the deployment configures
-a public URL: the web interface's run page ([web interface](web-ui.md)), which
-asks a signed-out visitor to sign in and then opens it. Legacy links of the form
-`<public_url>/#/runs/<run id>` still open the run. A check that belongs to no
-run (a refused event) has no link, and a deployment without `public_url`
-publishes checks without one.
+### Details link contract
+
+`details_url` is built by one function (`sentinel_checks::details`) from a
+configured base and a fixed route table. The base is the `public_url` of
+`github-app.json` when set, otherwise the server's `public_url`
+([configuration](configuration.md)); it is the origin the web interface answers
+on. A deployment with neither publishes checks without a link, never a guess.
+
+| Check kind | `details_url` |
+|---|---|
+| Run aggregate (`sentinel / ci`) | `<base>/runs/<run id>` |
+| Per-job check (`sentinel / <job>`) | `<base>/runs/<run id>?job=<job id>` |
+| Refused delivery (belongs to no run) | none |
+
+The contract with the web interface, which is its own process and may be
+rebuilt without touching the controller ([web interface](web-ui.md)):
+
+- `GET /runs/<run id>` is served for as long as links to it may exist in
+  GitHub, which keeps them forever. A signed-out visitor is asked to sign in and
+  then returned to the page; a visitor without access gets the same refusal as
+  for any run.
+- `job` is advisory. A page that does not highlight the job still shows the
+  whole run, so ignoring it is correct; an unknown value is ignored too.
+- Only these two shapes are promised. A change to either is a change to this
+  contract and needs a redirect from the old shape, because a completed check
+  is never updated again and keeps the link it last published.
+- The controller serves no human page of its own, so the base must be the
+  web interface's origin, not the API listener's, when the two differ. The
+  older `<base>/#/runs/<run id>` form still opens the run in the interface that
+  was current when it was published.
+
+`cargo test -p sentinel-checks` covers the URL built for each kind (aggregate,
+job, refused delivery, unrecognised scope, no or empty base) and the lane's
+published bodies.
 
 Each check row has a stable id `sentinel:<run id>:<aggregate|job id>` (or
 `sentinel:dlv:<delivery id>`), and every create sends it suffixed with the
@@ -195,7 +223,7 @@ exception: a fresh event for it re-arms it.
 A late completion from a superseded attempt cannot reach GitHub at all: the
 store's job fence refuses the report before any check row moves.
 
-## Rerequests and lifecycle reconciliation (G05)
+## Rerequests and lifecycle reconciliation
 
 GitHub sends control events on the same signed webhook: `check_run` and
 `check_suite` `rerequested`, `installation` lifecycle, `installation_repositories`
@@ -290,7 +318,8 @@ bound stays.
 ```
 
 - `public_url` (optional) is the deployment-facing base URL used for
-  `details_url`; absent means checks carry no link.
+  `details_url` ([contract](#details-link-contract)); absent falls back to the
+  server's own `public_url`, and without either checks carry no link.
 - `api_url` (optional) overrides the GitHub API endpoint, for example for a
   test stub. Repository clone URLs currently remain GitHub.com URLs. HTTP is
   accepted only for a loopback host.
@@ -350,3 +379,7 @@ holds at most 1024 repository tokens, evicting the earliest expiry at capacity.
   installation, accepts a signed fork pull request, refuses it as
   `ignored:fork_pr` and publishes a completed neutral `sentinel / ci` on the
   delivered revision; the CLI shows the durable delivery.
+
+## Delivery latency bench
+
+`crates/sentinel-checks/examples/checks-lane-bench.rs` times a run's queued checks from the start of the write that enqueues them to their arrival at a fake GitHub endpoint, with the real lane and publisher ([benchmarking](benchmarking.md#checks-lane-delivery-latency)). No record is committed yet, so this document states no latency figure.

@@ -30,11 +30,21 @@ loopback, link-local, private, shared, multicast, reserved, or an IPv6 form
 embedding one), and then pins Git's connection to exactly those addresses
 (`http.curloptResolve`), so a second DNS answer cannot rebind the name after
 the check. The option needs Git 2.37; an older or unreadable Git refuses
-unbound remotes rather than fetch them unpinned. A deployment that really
+unbound remotes rather than fetch them unpinned. Only a successfully parsed
+`git --version` is remembered for the life of the process; a probe that fails
+or cannot be parsed refuses that remote and is retried for the next one, so a
+transient failure never latches. The name is resolved by a `getent ahosts`
+child (so `getent` must be on the worker's `PATH`; without it unbound remotes
+are refused) with a cleared environment, in its own process group, under the
+remaining checkout deadline capped at 15 seconds and a 256 KiB output cap. A
+resolver that hangs, floods, exits non-zero or prints a line that is not an
+address is killed and refused; no resolver thread or process outlives the
+call. A deployment that really
 needs an internal manual destination lists its exact authorities,
-comma-separated, in `SENTINEL_MANUAL_DESTINATIONS` (for example
-`https://git.corp.internal:8443`) in **both** the controller's and the
-worker's environment; a listed authority skips the check and the pin. Every
+comma-separated, in `SENTINEL_MANUAL_DESTINATIONS` or as `manual_destinations`
+(configuration key and `--manual-destinations` flag, which take precedence;
+for example `https://git.corp.internal:8443`) for **both** the controller and
+the worker; a listed authority skips the check and the pin. Every
 refusal or failure of an unbound remote surfaces as one message ("the manual
 remote was refused or could not be fetched") — never Git's own stderr — so
 neither the policy nor the worker's network is an oracle. A bound
@@ -107,6 +117,17 @@ spec): on receipt it checks only the access's shape and restates the expiry as
 after a mirror lock wait or timeout still holds a valid access. The access
 exists only in the attempt's in-memory context, bounded by the attempt's fence
 and lease, and is never persisted or re-sent.
+
+The restated wall-clock expiry can still be moved by a host clock step, so
+receipt also stamps a **monotonic** `Instant` (`JobContext::source_valid_until`,
+`now + 12 min`, worker-local and never on the wire). The checkout functions
+(`checkout_mirrored`, `through_mirror`, `checkout_authorized`) take it: an access
+whose instant has passed is refused with `source access expired` before the
+workspace is initialised, the credential is opened, or any connection is made,
+and every checkout deadline is capped by the validity that remains. This covers
+the mirror attempt and the direct fallback after it, each of which re-checks
+and re-caps. An unrepresentable instant is treated as already expired. The
+controller's own wall-clock validation of the 60 s access is unchanged.
 
 `checkout::checkout_authorized` validates the access object (expiry, exact
 remote, allowed ref) before starting Git, then:
@@ -275,6 +296,11 @@ the event context; a worker below protocol 3 is served `NoSpec`. Intake uses
   no credential file left behind; a real `sshd` deployment-key checkout with
   pinned host trust and a refused wrong host, both proving the private
   directory is removed and the key never reaches `.git/config`.
+- `crates/sentinel-worker/tests/checkout.rs` and `tests/mirror.rs`: a
+  monotonically expired access is refused on the direct, mirrored and mirror
+  fallback routes before any file, credential or connection (a loopback
+  listener sees no connection), and a remaining validity of seconds caps a
+  60 s checkout or fallback deadline against a remote that never answers.
 - `crates/sentinel-link/tests/source_delivery.rs`: a bound source reaches a
   protocol-2 worker with its credential only after acknowledgement, its
   validity restated on the worker's clock to cover a whole checkout, and a
@@ -284,7 +310,9 @@ the event context; a worker below protocol 3 is served `NoSpec`. Intake uses
   manual remotes naming IP literals, bare hostnames or private suffixes are
   refused at admission and at the worker with one message; address
   classification, Git version parsing and the unreadable-`HOME` guarantee are
-  unit tested.
+  unit tested, as are the version-probe cache (fail then succeed), strict
+  `getent ahosts` parsing, helper-injected resolution and a hung or flooding
+  resolver that is killed with no thread or process left behind.
 - `crates/sentinel-github` unit tests: installation identity, account type,
   suspension, permission validity, a read-only scoped token, lifetime bounds
   and redacted debug output.

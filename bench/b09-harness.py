@@ -21,6 +21,14 @@ dm-delay; restarts and partitions act on this run's own processes by PID. All
 state is registered for removal and removed on exit, on a signal and by the
 `cleanup` command, which is idempotent and touches only b09-named objects.
 
+Fleet mode (`run --fleet FLEET.json`, scenarios `fleet-w{1,3,10}-{steady,burst}`): the controller and the
+Git fixture stay on this host, but every worker runs on a real host of the fleet file, enrolled through the
+Q11 flow (`sentinel admin worker enroll` with the host's Q12 ceilings and priority, then `sentinel worker
+enroll` on the host over the controller's API URL). Ten workers are several identities per host, each with
+its share of the host's ceiling. Records carry the host label of every run. Faults stay confined to this
+host's namespaces, loop devices and Sentinel's own processes, so fleet mode runs the performance scenarios
+only. The fleet file format is in docs/benchmarking.md.
+
 One record per repeat (perf) or per scenario (reliability) is appended to OUT
 as a JSON line, schema `sentinel-bench/b09/1`. Durations are monotonic
 nanoseconds measured by this driver; store stamps are wall-clock milliseconds
@@ -31,10 +39,12 @@ import atexit
 import concurrent.futures
 import fcntl
 import hashlib
+import ipaddress
 import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -88,6 +98,13 @@ SCENARIOS["restart-worker-kill"] = dict(kind="reliability", workers=3)
 SCENARIOS["noisy-tenant"] = dict(kind="reliability", workers=3, tenants=["acme", "noisy"])
 SCENARIOS["noisy-tenant-control"] = dict(kind="reliability", workers=3, tenants=["acme", "noisy"])
 SCENARIOS["tailcat-relay"] = dict(kind="blocked", workers=1)
+# Fleet scenarios: the same measurements with workers on the fleet file's real hosts (see load_fleet).
+FLEET_SCENARIOS = {}
+for n in (1, 3, 10):
+    FLEET_SCENARIOS[f"fleet-w{n}-steady"] = dict(kind="perf", workers=n, mode="steady", fleet=True)
+    FLEET_SCENARIOS[f"fleet-w{n}-burst"] = dict(kind="perf", workers=n, mode="burst", fleet=True)
+SCENARIOS.update(FLEET_SCENARIOS)
+MAX_IDENTITIES_PER_HOST = 10
 
 
 def log(*a):
@@ -133,6 +150,7 @@ def install_traps():
 
 def hard_cleanup(root):
     """Remove every b09 object, whether this process made it or a crashed one did."""
+    fleet_cleanup(root)
     # processes recorded by pgid files
     pids = os.path.join(root, "pids")
     if os.path.isdir(pids):
@@ -163,6 +181,209 @@ def hard_cleanup(root):
         if f"{root}/img/" in line:
             sh(["losetup", "-d", line.split(":")[0]], check=False)
     shutil.rmtree(os.path.join(root, "img"), ignore_errors=True)
+
+
+# ---------------------------------------------------------------- fleet (real hosts)
+
+class Blocked(Exception):
+    """A prerequisite is missing; the record names it and nothing is invented."""
+
+
+LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+CEILING_KEYS = ("cpu_millis", "memory_bytes", "disk_bytes")
+
+
+def load_fleet(path):
+    """Read and validate a fleet file. Raises SystemExit with the exact problem; never guesses a value."""
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"cannot read the fleet file {path}: {e}")
+    c = raw.get("controller") if isinstance(raw, dict) else None
+    if not isinstance(c, dict):
+        raise SystemExit("fleet file: missing \"controller\" object")
+    try:
+        ip = ipaddress.ip_address(c.get("address", ""))
+    except ValueError:
+        raise SystemExit("fleet file: controller.address must be the IP address the worker hosts dial")
+    if ip.is_loopback or ip.is_unspecified:
+        raise SystemExit("fleet file: controller.address must be reachable from the worker hosts, not loopback")
+    wb = c.get("worker_bootstrap")
+    if not isinstance(wb, dict) or not all(isinstance(wb.get(k), str) and wb[k] for k in ("release_url", "release_sums")):
+        raise SystemExit("fleet file: controller.worker_bootstrap needs release_url and release_sums "
+                         "(the controller serves enrollments only with a [worker_bootstrap] section)")
+    hosts = raw.get("hosts")
+    if not isinstance(hosts, list) or not hosts:
+        raise SystemExit("fleet file: \"hosts\" must list at least one worker host")
+    seen, out = set(), []
+    for h in hosts:
+        label = h.get("label") if isinstance(h, dict) else None
+        if not isinstance(label, str) or not LABEL_RE.match(label) or label in seen:
+            raise SystemExit(f"fleet file: host label {label!r} must be unique, lower-case letters, digits and '-'")
+        seen.add(label)
+        ex = h.get("exec")
+        if not (isinstance(ex, list) and ex and all(isinstance(x, str) for x in ex)):
+            raise SystemExit(f"fleet file: host {label}: exec must be a non-empty argument list (for example an ssh prefix)")
+        for k in ("sentinel", "work_dir"):
+            if not (isinstance(h.get(k), str) and h[k].startswith("/")):
+                raise SystemExit(f"fleet file: host {label}: {k} must be an absolute path on that host")
+        if not (isinstance(h.get("api_url"), str) and re.match(r"^https?://", h["api_url"])):
+            raise SystemExit(f"fleet file: host {label}: api_url must be the controller API URL as that host reaches it")
+        ids = h.get("identities", 1)
+        if not (isinstance(ids, int) and 1 <= ids <= MAX_IDENTITIES_PER_HOST):
+            raise SystemExit(f"fleet file: host {label}: identities must be 1..{MAX_IDENTITIES_PER_HOST}")
+        ceil = h.get("ceilings")
+        if ceil is not None:
+            if not (isinstance(ceil, dict) and set(ceil) <= set(CEILING_KEYS)
+                    and all(isinstance(v, int) and v > 0 for v in ceil.values())):
+                raise SystemExit(f"fleet file: host {label}: ceilings may hold only positive integers for {', '.join(CEILING_KEYS)}")
+        prio = h.get("priority", 0)
+        if not (isinstance(prio, int) and -100 <= prio <= 100):
+            raise SystemExit(f"fleet file: host {label}: priority must be -100..100")
+        out.append({"label": label, "exec": ex, "sentinel": h["sentinel"], "work_dir": h["work_dir"].rstrip("/"),
+                    "api_url": h["api_url"], "identities": ids, "ceilings": ceil, "priority": prio,
+                    "arch": h.get("arch")})
+    if len({h["api_url"] for h in out}) != 1:
+        raise SystemExit("fleet file: every host must redeem at the same api_url (the controller has one [worker_bootstrap] api_url)")
+    return {"controller": {"address": str(ip), "worker_bootstrap": wb}, "hosts": out}
+
+
+def plan_fleet(fleet, n):
+    """Spread n worker identities over the hosts, one at a time to the least loaded host that still has room.
+
+    A host that carries more than one identity must have Q12 ceilings, and each identity is approved an equal share,
+    so the identities of one host together never exceed what the operator declared for it. Raises Blocked."""
+    hosts = fleet["hosts"]
+    capacity = sum(h["identities"] for h in hosts)
+    if n > capacity:
+        raise Blocked(f"{n} workers need {n} identities but the fleet file allows {capacity} "
+                      f"({', '.join(h['label'] + ':' + str(h['identities']) for h in hosts)}); raise identities on a host "
+                      f"or add a host")
+    count = {h["label"]: 0 for h in hosts}
+    order = []
+    for _ in range(n):
+        h = min((h for h in hosts if count[h["label"]] < h["identities"]), key=lambda h: (count[h["label"]], hosts.index(h)))
+        count[h["label"]] += 1
+        order.append(h)
+    plan, seq = [], {}
+    for i, h in enumerate(order, 1):
+        k = count[h["label"]]
+        if k > 1 and not h["ceilings"]:
+            raise Blocked(f"host {h['label']} would carry {k} identities but declares no ceilings; Q12 ceilings are what "
+                          f"keep the identities of one host from oversubscribing it")
+        share = None
+        if h["ceilings"]:
+            share = {key: v // k for key, v in h["ceilings"].items()}
+            if any(v < 1 for v in share.values()):
+                raise Blocked(f"host {h['label']}: a ceiling is too small to split over {k} identities")
+        seq[h["label"]] = seq.get(h["label"], 0) + 1
+        plan.append({"index": i, "host": h["label"], "slot": seq[h["label"]], "ceilings": share,
+                     "priority": h["priority"], "name": f"b09-{h['label']}-{seq[h['label']]}"})
+    return plan
+
+
+def fleet_shape(fleet, plan):
+    """The part of the fleet that defines what was measured; the gate compares it (SHAPE_KEYS)."""
+    shape = {}
+    for h in fleet["hosts"]:
+        mine = [p for p in plan if p["host"] == h["label"]]
+        if mine:
+            shape[h["label"]] = {"identities": len(mine), "per_identity_ceilings": mine[0]["ceilings"],
+                                 "priority": h["priority"], "arch": h["arch"]}
+    return shape
+
+
+def remote(h, argv, stdin=None, check=True, timeout=300):
+    """Run argv on a fleet host through its exec prefix. Arguments are passed as-is; a secret goes only on stdin."""
+    r = subprocess.run([*h["exec"], *argv], input=stdin, capture_output=True, text=True, timeout=timeout)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"{h['label']}: {os.path.basename(argv[0])} failed ({r.returncode}): {r.stderr.strip()[:300]}")
+    return r
+
+
+def remote_sh(h, script, check=True, timeout=300):
+    """A POSIX script given on the host shell's stdin, so no quoting layer of the exec prefix touches it."""
+    return remote(h, ["sh", "-s"], stdin=script, check=check, timeout=timeout)
+
+
+def host_facts(h):
+    r = remote_sh(h, "uname -r; nproc; grep -m1 'model name' /proc/cpuinfo; grep -m1 MemTotal /proc/meminfo\n")
+    lines = r.stdout.splitlines() + [""] * 4
+    mem = re.search(r"(\d+)", lines[3])
+    facts = {"kernel": lines[0], "cpus_online": int(lines[1]) if lines[1].isdigit() else None,
+             "cpu_model": lines[2].partition(":")[2].strip() or None, "mem_total_kib": int(mem.group(1)) if mem else None}
+    return {k: v for k, v in facts.items() if v is not None}
+
+
+def host_conditions(h):
+    r = remote_sh(h, "cat /proc/loadavg; cat /proc/pressure/cpu 2>/dev/null\n", check=False)
+    lines = r.stdout.splitlines()
+    out = {}
+    if lines:
+        out["load_avg"] = [float(x) for x in lines[0].split()[:3]]
+    for line in lines[1:]:
+        parts = line.split()
+        if parts and parts[0] == "some":
+            kv = dict(p.split("=") for p in parts[1:])
+            out["cpu_some"] = {"avg10": float(kv["avg10"]), "avg60": float(kv["avg60"])}
+    return out
+
+
+def settle_fleet(fleet, limit_s=900):
+    """Every worker host, like the harness host, must be below the CPU pressure start limit."""
+    deadline = time.monotonic() + limit_s
+    while True:
+        busy = [h["label"] for h in fleet["hosts"]
+                if (host_conditions(h).get("cpu_some") or {}).get("avg60", 0) >= SETTLE_BELOW]
+        if not busy:
+            return
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"hosts {busy} did not settle below {SETTLE_BELOW}% CPU pressure in {limit_s}s")
+        time.sleep(5)
+
+
+def release_script(rec):
+    """The shell that stops one recorded remote worker and removes what the harness put on its host."""
+    parent = rec["parent"]
+    if not os.path.basename(parent).startswith("b09-"):
+        raise RuntimeError(f"refusing to clean {parent}: not a b09 directory")
+    q = shlex.quote
+    wid = rec.get("worker_id") or ""
+    # The PID is signalled only while its command line still names this identity's own configuration file.
+    return (f"pid={int(rec['pid'])}\n"
+            f"if [ \"$pid\" -gt 1 ] && [ -r /proc/$pid/cmdline ] && tr '\\0' ' ' < /proc/$pid/cmdline | grep -qF -- {q(rec['config'])}; then\n"
+            f"  kill -KILL -- -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null\nfi\n"
+            f"if [ -n {q(wid)} ] && command -v podman >/dev/null 2>&1; then\n"
+            f"  ids=$(podman ps -aq --filter label=io.sentinel.worker={q(wid)} 2>/dev/null)\n"
+            f"  [ -z \"$ids\" ] || podman rm -f $ids >/dev/null 2>&1\nfi\n"
+            f"rm -rf -- {q(parent)}\n")
+
+
+def fleet_release(rec_path):
+    """Release one recorded remote worker (everything needed is in the record). Idempotent."""
+    try:
+        with open(rec_path) as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return
+    remote_sh({"label": rec["host"], "exec": rec["exec"]}, release_script(rec), check=False, timeout=120)
+    try:
+        os.unlink(rec_path)
+    except OSError:
+        pass
+
+
+def fleet_cleanup(root):
+    """Release every remote worker a crashed or finished run recorded under ROOT/fleet."""
+    d = os.path.join(root, "fleet")
+    if not os.path.isdir(d):
+        return
+    for f in sorted(os.listdir(d)):
+        try:
+            fleet_release(os.path.join(d, f))
+        except Exception as e:  # cleanup must continue past one failure
+            log("fleet cleanup step failed:", repr(e)[:200])
 
 
 # ---------------------------------------------------------------- host state
@@ -222,14 +443,14 @@ def settle(limit_s=900):
     raise RuntimeError(f"host did not settle below {SETTLE_BELOW}% CPU pressure in {limit_s}s")
 
 
-def stamp(source, binary):
+def stamp(source, binary, fleet=None):
     def git(*args):
         r = subprocess.run(["git", "-C", source, *args], capture_output=True, text=True)
         return r.stdout.strip() if r.returncode == 0 else None
     commit = git("rev-parse", "HEAD")
     if commit is None:
         raise SystemExit(f"cannot read the source commit of {source}; no record is written without it")
-    status = git("status", "--porcelain")
+    status = git("status", "--porcelain", "--untracked-files=no")
     with open(binary, "rb") as f:
         digest = hashlib.sha256(f.read()).hexdigest()
     mem = field("/proc/meminfo", "MemTotal")
@@ -239,6 +460,9 @@ def stamp(source, binary):
             "mem_total_kib": int(mem.split()[0]) if mem else None,
             "cpu_governor": read_first("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
             "shared_host": "all workers, the controller and the Git fixture run on this one host"}
+    if fleet:
+        host["shared_host"] = ("the controller and the Git fixture run on this host; the workers run on the fleet's "
+                               "hosts (see fleet), so this host's figures describe the control plane only")
     return {"build": {"commit": commit, "dirty": None if status is None else bool(status), "binary_sha256": digest},
             "host": {k: v for k, v in host.items() if v is not None}}
 
@@ -343,17 +567,6 @@ def bench_env():
     return {"HOME": f"/home/{BENCH_USER}", "XDG_RUNTIME_DIR": f"/run/user/{uid}",
             "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
-
-
-MEMBERSHIPS = """
-import sqlite3, sys
-c = sqlite3.connect(sys.argv[1], timeout=20)
-user = c.execute("SELECT id FROM users WHERE super_admin = 1").fetchone()[0]
-for slug in sys.argv[2:]:
-    tenant = c.execute("SELECT id FROM tenants WHERE slug = ?", (slug,)).fetchone()[0]
-    c.execute("INSERT OR REPLACE INTO memberships(tenant_id, user_id, role) VALUES (?, ?, 3)", (tenant, user))
-c.commit()
-"""
 
 
 _RETRIES = threading.local()
@@ -515,6 +728,9 @@ class Deploy:
         self.bin = os.path.join(a.kit, "sentinel")
         self.tenants = spec.get("tenants", ["acme"])
         self.n = spec.get("workers", 1)
+        self.fleet = getattr(a, "fleet_cfg", None) if spec.get("fleet") else None
+        self.addr = self.fleet["controller"]["address"] if self.fleet else BRIDGE_ADDR
+        self.plan, self.worker_host, self.secrets, self.host_facts = [], {}, {}, {}
         self.api = f"http://127.0.0.1:{API_PORT}/api/v1"
         self.workers = []
         self.mounts = {}
@@ -545,9 +761,14 @@ class Deploy:
             sh(["git", "-C", work, "remote", "add", "bench", bare])
             sh(["git", "-C", work, *PUSH, "bench", "main"])
             sh(["chown", "-R", f"{BENCH_USER}:{BENCH_USER}", os.path.join(r, "git")])
+        marker = os.path.join(r, "tls.addr")
+        if read_first(marker) != self.addr:
+            for f in ("tls.key", "ca.pem"):
+                if os.path.exists(os.path.join(r, f)):
+                    os.unlink(os.path.join(r, f))
         if not os.path.exists(os.path.join(r, "tls.key")):
             sh(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "30", "-subj", "/CN=b09",
-                "-addext", f"subjectAltName=IP:{BRIDGE_ADDR}", "-keyout", os.path.join(r, "tls.key"),
+                "-addext", f"subjectAltName=IP:{self.addr}", "-keyout", os.path.join(r, "tls.key"),
                 "-out", os.path.join(r, "ca.pem")])
             pw = os.path.join(r, "password")
             with open(pw, "w") as f:
@@ -555,6 +776,8 @@ class Deploy:
             for f in ("tls.key", "ca.pem", "password"):
                 sh(["chown", BENCH_USER, os.path.join(r, f)])
             os.chmod(os.path.join(r, "tls.key"), 0o600)
+            with open(marker, "w") as f:
+                f.write(self.addr)
         self.work, self.bare = work, bare
 
     def provision(self):
@@ -583,7 +806,7 @@ class Deploy:
             self.admin("pool", "grant", "--pool", "shared", "--tenant", t)
         self.repos, self.hooks = {}, {}
         with open(os.path.join(self.ctl, "source-destinations.json"), "w") as f:
-            json.dump([f"https://{BRIDGE_ADDR}:{GIT_PORT}"], f)
+            json.dump([f"https://{self.addr}:{GIT_PORT}"], f)
         self.token = self.admin("token", "issue", "--user", "root", "--name", "b09",
                                 "--scope", "read,run,tenant-admin,platform-admin", "--expires-in", "2d").strip()
         storage = ""
@@ -591,14 +814,19 @@ class Deploy:
             storage = ("[storage]\nreserve_bytes = 67108864\nlow_watermark_bytes = 134217728\n"
                        "high_watermark_bytes = 201326592\n")
         with open(os.path.join(base, "server.toml"), "w") as f:
-            f.write(f'listen = "{BRIDGE_ADDR}:{LINK_PORT}"\napi_listen = "127.0.0.1:{API_PORT}"\n{storage}')
+            f.write(f'listen = "{self.addr}:{LINK_PORT}"\napi_listen = "127.0.0.1:{API_PORT}"\n{storage}')
+            if self.fleet:
+                wb = self.fleet["controller"]["worker_bootstrap"]
+                f.write(f'\n[worker_bootstrap]\ncontroller = "{self.addr}:{LINK_PORT}"\n'
+                        f'release_url = {json.dumps(wb["release_url"])}\nrelease_sums = {json.dumps(wb["release_sums"])}\n'
+                        f'api_url = {json.dumps(self.fleet["hosts"][0]["api_url"])}\n')
         sh(["chown", BENCH_USER, os.path.join(base, "server.toml")])
 
     def start_git(self):
         env = {"FIXTURE_PASSWORD": os.path.join(self.root, "password")}
         self.git = Proc(self.root, "git", ["python3", os.path.join(self.a.kit, "b09-git.py"), os.path.join(self.root, "git"),
                                          os.path.join(self.root, "ca.pem"), os.path.join(self.root, "tls.key"),
-                                         BRIDGE_ADDR, str(GIT_PORT)], os.path.join(self.logs, "git.log"), extra_env=env).start()
+                                         self.addr, str(GIT_PORT)], os.path.join(self.logs, "git.log"), extra_env=env).start()
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline and not read_first(os.path.join(self.logs, "git.log")):
             time.sleep(0.05)
@@ -618,7 +846,7 @@ class Deploy:
         for t in self.tenants:
             rid = json.loads(self.source_admin("create", "--tenant", self.tenant_ids[t], "--name", "probe"))["repo"]
             self.repos[t] = rid
-            payload = {"binding": {"remote": f"https://{BRIDGE_ADDR}:{GIT_PORT}/probe", "allowed_refs": ["refs/heads/*"],
+            payload = {"binding": {"remote": f"https://{self.addr}:{GIT_PORT}/probe", "allowed_refs": ["refs/heads/*"],
                                    "pipeline_path": ".sentinel.yml", "trust": open(os.path.join(self.root, "ca.pem")).read()},
                        "credential": {"Https": {"username": "deploy", "secret": open(os.path.join(self.root, "password")).read()}},
                        "forge": None}
@@ -627,9 +855,14 @@ class Deploy:
             self.hooks[t] = self.source_admin("hook-token", "--repo", rid).strip()
 
     def memberships(self):
-        """The host-local CLI has no membership command and a platform admin cannot add itself over the API.
-        Written as the bench user, before the controller starts, so the database files keep their owner."""
-        sh(as_bench(["python3", "-c", MEMBERSHIPS, os.path.join(self.ctl, "metadata.sqlite"), *self.tenants]))
+        """A platform admin has no ambient tenant access and no host-local command adds it to one. The audited
+        override (session, step-up, reason) is the supported path, so it runs against the started controller;
+        KIT/seed-membership.py (bench/seed-membership.py) walks it."""
+        cmd = ["python3", os.path.join(self.a.kit, "seed-membership.py"), "--api", self.api,
+               "--username", "root", "--reason", "b09 seed"]
+        for t in self.tenants:
+            cmd += ["--tenant", t]
+        sh(cmd, input="correct horse battery staple")
 
     def enroll_workers(self):
         """Host-local admin needs the database to itself, so every enrollment is issued before the controller starts."""
@@ -643,7 +876,7 @@ class Deploy:
         w = self.wk(i)
         if not os.path.exists(w["cfg"]):
             with open(w["cfg"], "w") as f:
-                f.write(f'controller = "{BRIDGE_ADDR}:{LINK_PORT}"\ncontroller_fingerprint = "{self.fingerprint}"\n'
+                f.write(f'controller = "{self.addr}:{LINK_PORT}"\ncontroller_fingerprint = "{self.fingerprint}"\n'
                         f'worker_name = "b09-w{i}"\nenrollment_file = "{w["enroll"]}"\n')
             sh(["chown", BENCH_USER, w["cfg"]])
         self.workers[i - 1]["offset"] = os.path.getsize(w["log"]) if os.path.exists(w["log"]) else 0
@@ -671,14 +904,94 @@ class Deploy:
             ev = wait_event(w["log"], "link_connected", timeout=90, offset=w["offset"])
             self.worker_ids.append(ev[0]["fields"]["worker"])
 
+    # -- fleet: workers on the fleet file's real hosts
+    def fleet_preflight(self):
+        """Each used host answers and runs the same binary as the kit; its facts are recorded. Else Blocked."""
+        want = hashlib.sha256(open(self.bin, "rb").read()).hexdigest()
+        for h in self.fleet["hosts"]:
+            if not any(p["host"] == h["label"] for p in self.plan):
+                continue
+            try:
+                got = remote(h, ["sha256sum", h["sentinel"]]).stdout.split()[:1]
+                facts = host_facts(h)
+            except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+                raise Blocked(f"host {h['label']} cannot be driven through its exec prefix: {repr(e)[:200]}")
+            if got != [want]:
+                raise Blocked(f"host {h['label']}: {h['sentinel']} is not the kit's binary (sha256 {got} vs {want}); "
+                              f"a fleet record must name the build that ran everywhere")
+            self.host_facts[h["label"]] = dict(facts, sentinel_sha256=want)
+
+    def issue_fleet_enrollments(self):
+        """Q11 + Q12: one enrollment per identity with its approved ceilings and priority, issued before the
+        controller starts (host-local admin needs the database to itself). Secrets stay in memory."""
+        for p in self.plan:
+            args = ["worker", "enroll", "--pool", "shared", "--transport", "direct", "--expires-in", "1h",
+                    "--priority", str(p["priority"])]
+            for key, flag in (("cpu_millis", "--cpu-millis"), ("memory_bytes", "--memory-bytes"), ("disk_bytes", "--disk-bytes")):
+                if p["ceilings"] and key in p["ceilings"]:
+                    args += [flag, str(p["ceilings"][key])]
+            self.secrets[p["index"]] = self.admin(*args).strip()
+
+    def start_fleet_workers(self):
+        """Redeem each enrollment on its host (secret on stdin only), start the worker, wait until all are connected."""
+        hosts = {h["label"]: h for h in self.fleet["hosts"]}
+        os.makedirs(os.path.join(self.root, "fleet"), exist_ok=True)
+        self.worker_ids = []
+        q = shlex.quote
+        for p in self.plan:
+            h = hosts[p["host"]]
+            parent = f"{h['work_dir']}/b09-{self.name}"
+            cfg, data, logf = f"{parent}/w{p['slot']}.toml", f"{parent}/w{p['slot']}", f"{parent}/w{p['slot']}.log"
+            rec_path = os.path.join(self.root, "fleet", f"{self.name}-{p['index']}.json")
+            rec = {"host": h["label"], "exec": h["exec"], "parent": parent, "config": cfg, "pid": 0, "worker_id": None}
+            with open(rec_path, "w") as f:  # recorded before anything starts, so a crash still cleans the host
+                json.dump(rec, f)
+            on_exit(lambda r=rec_path: fleet_release(r))
+            remote_sh(h, f"mkdir -p -- {q(parent)}\n")
+            remote(h, [h["sentinel"], "worker", "enroll", "--api-url", h["api_url"], "--config", cfg, "--data-dir", data,
+                       "--name", p["name"], "--secret-stdin"], stdin=self.secrets.pop(p["index"]) + "\n")
+            wid = remote(h, ["cat", f"{data}/worker.id"]).stdout.strip()
+            rec["worker_id"] = wid
+            with open(rec_path, "w") as f:
+                json.dump(rec, f)
+            pid = remote_sh(h, f"nice -n 10 setsid nohup {q(h['sentinel'])} worker --config {q(cfg)} --data-dir {q(data)} "
+                               f"--log-format json >>{q(logf)} 2>&1 </dev/null &\necho $!\n").stdout.strip()
+            rec["pid"] = int(pid)
+            with open(rec_path, "w") as f:
+                json.dump(rec, f)
+            self.worker_host[wid.removeprefix("wrk_").replace("-", "")] = p["host"]
+            self.worker_ids.append(wid)
+        deadline = time.monotonic() + 180
+        while True:
+            live = {w["id"] for w in self.get("/admin/workers?pool=shared")["workers"] if w.get("connected")}
+            if set(self.worker_ids) <= live:
+                return
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"workers not connected within 180s: {sorted(set(self.worker_ids) - live)}")
+            time.sleep(1)
+
+    def up_fleet(self):
+        self.plan = plan_fleet(self.fleet, self.n)
+        self.fleet_preflight()
+        self.fixtures()
+        self.provision()
+        self.start_git()
+        self.bind_repos()
+        self.issue_fleet_enrollments()
+        self.memberships()
+        self.start_controller()
+        self.start_fleet_workers()
+
     def up(self):
+        if self.fleet:
+            return self.up_fleet()
         self.fixtures()
         self.provision()
         self.start_git()
         self.bind_repos()
         self.enroll_workers()
-        self.memberships()
         self.start_controller()
+        self.memberships()
         self.start_workers()
         on_exit(self.remove_containers)
 
@@ -773,7 +1086,7 @@ class Deploy:
         con = sqlite3.connect(f"file:{os.path.join(self.ctl, 'metadata.sqlite')}?mode=ro", uri=True, timeout=10)
         try:
             rid = bytes.fromhex(run.removeprefix("run_").replace("-", ""))
-            rows = con.execute("""SELECT j.queued_ms, a.offered_ms, a.acked_ms, a.fence FROM jobs j
+            rows = con.execute("""SELECT j.queued_ms, a.offered_ms, a.acked_ms, a.fence, a.worker_id FROM jobs j
                 JOIN attempts a ON a.job_id = j.id WHERE j.run_id = ? ORDER BY a.fence""", (rid,)).fetchall()
         finally:
             con.close()
@@ -796,7 +1109,9 @@ class Deploy:
             rows = self.stamps(r["run"])
             if rows:
                 r["attempts"] = len(rows)
-                q, o, k, _ = rows[-1]
+                q, o, k, _, wk = rows[-1]
+                if self.worker_host:
+                    r["host"] = self.worker_host.get(bytes(wk).hex())
                 if o is not None and q is not None:
                     r["queue_wait_ms"] = o - q
         except sqlite3.Error:
@@ -840,8 +1155,11 @@ def perf(d, a, name, spec, out, stamp_):
     d.fire(tenant, *d.make_commits(1)[0])  # warm-up: image, mirror and worker paths; not recorded
     for rep in range(a.repeats):
         settle()
+        if d.fleet:
+            settle_fleet(d.fleet)
         refs = d.make_commits(n)
         c0, t0 = conditions(), time.time()
+        h0 = {h["label"]: host_conditions(h) for h in d.fleet["hosts"] if h["label"] in d.host_facts} if d.fleet else None
         if mode == "burst":
             runs = burst(d, tenant, refs)
         else:
@@ -854,6 +1172,13 @@ def perf(d, a, name, spec, out, stamp_):
                   "summary": {m: distribution([r[m] for r in ok if m in r])
                               for m in ("overhead_ns", "e2e_ns", "steps_ns", "checkout_ns", "container_start_ns",
                                         "finalize_ns", "intake_ack_ns", "queue_wait_ms")}}
+        if d.fleet:
+            hosts = sorted({r["host"] for r in runs if r.get("host")})
+            record["conditions"]["hosts"] = {"start": h0, "end": {h["label"]: host_conditions(h) for h in d.fleet["hosts"]
+                                                                   if h["label"] in d.host_facts}}
+            record["fleet_hosts"] = d.host_facts
+            record["runs_by_host"] = {lb: sum(1 for r in runs if r.get("host") == lb) for lb in hosts}
+            record["summary_by_host"] = {lb: distribution([r["overhead_ns"] for r in ok if r.get("host") == lb]) for lb in hosts}
         emit(out, stamp_, record)
         s = record["summary"]["overhead_ns"]
         log(f"{name} repeat {rep}: n={s.get('n')} passed={len(ok)}/{len(runs)} overhead p50 {s.get('p50', 0) / 1e6:.0f} ms p95 {s.get('p95', 0) / 1e6:.0f} ms")
@@ -866,6 +1191,8 @@ def scenario_desc(name, spec, a):
             "job": {"image": IMAGE, "step": "true", "cpu": "0.25", "memory": "128MiB"}}
     if a.handicap_delay_ms:
         desc["injected_handicap"] = {"delay_ms_each_way": a.handicap_delay_ms}
+    if spec.get("fleet"):
+        desc["fleet"] = a.fleet_shape[name]
     return {k: v for k, v in desc.items() if v is not None}
 
 
@@ -1129,10 +1456,6 @@ def r_blocked(d, a, name, spec, chk, obs):
                   "python3 bench/b09-harness.py run --scenarios w1-steady --tailcat BINARY")
 
 
-class Blocked(Exception):
-    pass
-
-
 RELIABILITY = {"restart-controller-kill": r_restart_controller, "restart-controller-term": r_restart_controller,
                "restart-worker-kill": r_restart_worker, "partition": r_partition, "partition-long": r_partition, "disk-full-worker": r_disk_full_worker,
                "disk-full-controller": r_disk_full_controller, "noisy-tenant": r_noisy, "noisy-tenant-control": r_noisy,
@@ -1158,15 +1481,24 @@ def run_scenario(a, name, out, stamp_):
             return
         hard_cleanup(a.root)
         os.makedirs(a.root, exist_ok=True)
+        if spec.get("fleet"):
+            try:
+                a.fleet_shape = getattr(a, "fleet_shape", {})
+                a.fleet_shape[name] = fleet_shape(a.fleet_cfg, plan_fleet(a.fleet_cfg, spec["workers"]))
+            except Blocked as b:
+                emit(out, stamp_, {"kind": "blocked", "scenario": {"id": name}, "blocked_by": str(b)})
+                log(f"{name}: Blocked by: {b}")
+                return
         d = Deploy(a, name, spec)
-        d.net = Net(spec.get("workers", 1))
+        d.net = None if spec.get("fleet") else Net(spec.get("workers", 1))
         link = dict(LINKS.get(spec.get("link", "direct"), {}))
         if a.handicap_delay_ms:
             link["delay_ms"] = link.get("delay_ms", 0) + a.handicap_delay_ms
         t_up = time.monotonic()
         try:
             d.up()
-            d.net.shape_all(link)
+            if d.net:
+                d.net.shape_all(link)
             log(f"{name}: deployment up in {time.monotonic() - t_up:.1f}s")
             if spec["kind"] == "perf":
                 perf(d, a, name, spec, out, stamp_)
@@ -1180,6 +1512,9 @@ def run_scenario(a, name, out, stamp_):
                 emit(out, stamp_, {"kind": "reliability", "scenario": scenario_desc(name, spec, a),
                                    "conditions": {"start": c0, "end": conditions()}, "ok": chk.ok,
                                    "assertions": chk.items, "observations": obs})
+        except Blocked as b:
+            emit(out, stamp_, {"kind": "blocked", "scenario": {"id": name}, "blocked_by": str(b)})
+            log(f"{name}: Blocked by: {b}")
         finally:
             d.down()
     finally:
@@ -1204,11 +1539,12 @@ def main():
     r.add_argument("--runs", type=int, default=20, help="runs per perf repeat (at least 20 for a p95)")
     r.add_argument("--handicap-delay-ms", type=int, default=0,
                    help="add this one-way delay on every link: an injected regression for the gate's sensitivity check")
+    r.add_argument("--fleet", help="fleet file: run the fleet-* scenarios with workers on its real hosts")
     r.add_argument("--no-lock", action="store_true")
     a = p.parse_args()
     if a.cmd == "list":
         for k, v in SCENARIOS.items():
-            print(f"{k:34} {v['kind']:12} workers={v.get('workers', 1)}")
+            print(f"{k:34} {v['kind']:12} workers={v.get('workers', 1)}{'  needs --fleet' if v.get('fleet') else ''}")
         return
     if os.geteuid() != 0:
         sys.exit("run as root: the scenarios create namespaces, loop devices and mounts")
@@ -1217,13 +1553,20 @@ def main():
     if a.cmd == "cleanup":
         hard_cleanup(a.root)
         return
-    names = a.scenarios.split(",") if a.scenarios != "all" else list(SCENARIOS)
+    a.fleet_cfg = load_fleet(a.fleet) if a.fleet else None
+    simulated = [k for k in SCENARIOS if k not in FLEET_SCENARIOS]
+    names = a.scenarios.split(",") if a.scenarios != "all" else (list(FLEET_SCENARIOS) if a.fleet_cfg else simulated)
     for n in names:
         if n not in SCENARIOS:
             sys.exit(f"unknown scenario {n}")
+        if (n in FLEET_SCENARIOS) != bool(a.fleet_cfg):
+            sys.exit(f"{n}: " + ("fleet scenarios need --fleet" if n in FLEET_SCENARIOS else
+                                  "with --fleet only the fleet-* scenarios run (faults stay on this host's namespaces and loop devices)"))
+    if a.fleet_cfg and a.handicap_delay_ms:
+        sys.exit("--handicap-delay-ms shapes this host's veth links; it cannot be applied to real worker hosts")
     if a.runs < 20 and any(SCENARIOS[n]["kind"] == "perf" for n in names):
         sys.exit("--runs below 20 makes the nearest-rank p95 the maximum")
-    stamp_ = stamp(a.source, os.path.join(a.kit, "sentinel"))
+    stamp_ = stamp(a.source, os.path.join(a.kit, "sentinel"), a.fleet_cfg)
     with open(a.out, "a") as out:
         for n in names:
             try:

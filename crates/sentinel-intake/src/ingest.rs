@@ -70,6 +70,7 @@ pub fn generic(
         store,
         repo,
         intake::NewDelivery {
+            authentication: intake::Authentication::HookToken,
             provider: "generic",
             external_id: &update.delivery_id,
             event: "ref_update",
@@ -138,6 +139,7 @@ pub fn github(
         store,
         target.1,
         intake::NewDelivery {
+            authentication: intake::Authentication::SignedWebhook,
             provider: "github",
             external_id: delivery_id,
             event: "push",
@@ -259,6 +261,7 @@ fn pull_request(
         store,
         target.1,
         intake::NewDelivery {
+            authentication: intake::Authentication::SignedWebhook,
             provider: "github",
             external_id: delivery_id,
             event: "pull_request",
@@ -280,6 +283,7 @@ fn accept(
     now: UnixMillis,
 ) -> Result<Ingested, Error> {
     let delivery = OwnedDelivery {
+        authentication: delivery.authentication,
         provider: delivery.provider.to_owned(),
         external_id: delivery.external_id.to_owned(),
         event: delivery.event.to_owned(),
@@ -314,6 +318,7 @@ fn accept(
             tx,
             repo,
             &intake::NewDelivery {
+                authentication: delivery.authentication,
                 provider: &delivery.provider,
                 external_id: &delivery.external_id,
                 event: &delivery.event,
@@ -344,6 +349,7 @@ struct OwnedPr {
 }
 
 struct OwnedDelivery {
+    authentication: intake::Authentication,
     provider: String,
     external_id: String,
     event: String,

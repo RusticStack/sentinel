@@ -111,14 +111,12 @@ pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover
         }
     }
     // A microVM's scope and directory, as strictly as a container: its guest may still be running steps.
-    for attempt in crate::microvm::owned(root) {
-        crate::microvm::remove_named(root, attempt)?;
-        done.containers_removed += 1;
-    }
+    done.containers_removed += crate::microvm::reconcile(root)?;
     for attempt in workspace::Workspace::leftovers(root)? {
         let path = root
             .join(workspace::WORKSPACES_DIR)
             .join(attempt.to_string());
+        let _ = workspace::remove_tree(&path.with_extension(workspace::TMP_EXTENSION));
         if workspace::remove_tree(&path).is_ok() {
             done.workspaces_removed += 1;
         }

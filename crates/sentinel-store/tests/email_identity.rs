@@ -592,13 +592,309 @@ fn a_mailbox_cannot_be_buried_in_messages() {
             },
             Some(&invitation),
             Some(Arc::clone(&key)),
-            at(10 + n),
+            at(10 + n * (email::RECIPIENT_COOLDOWN_MS + 1)),
         )
         .unwrap();
         assert!(matches!(admission, Admission::Admitted(_)));
     }
     let queued = f.store.read(email::counts).unwrap().0;
     assert_eq!(queued, email::RECIPIENT_PER_WINDOW);
+}
+
+fn link_in(message: &email::Pending, key: &Key) -> Secret {
+    let body = message.open(key).unwrap().body;
+    let token = body
+        .split("#token=")
+        .nth(1)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap();
+    Secret::parse(token).unwrap()
+}
+
+#[test]
+fn a_mailbox_gets_one_message_a_minute_whoever_asks_and_a_refusal_keeps_the_mailed_link() {
+    let f = fixture();
+    let key = f.key();
+    email::set_delivery(&f.store, true, Some("https://ci.example.com"), at(1)).unwrap();
+    // A stranger registers the victim's address; the sign-up queues the first message.
+    let stranger =
+        f.user_of(f.sign_up("victim@example.com", &f.admission(), Some(Arc::clone(&key))));
+    let due = f.store.read(|c| email::due(c, at(10), 10)).unwrap();
+    assert_eq!(due.len(), 1);
+    let mailed = link_in(&due[0], &key);
+
+    // Another account, a resend and a second registration inside the minute all add nothing.
+    let other = f.user_of(f.sign_up("victim@example.com", &f.admission(), Some(Arc::clone(&key))));
+    let again = |user: UserId, now: i64| {
+        let key = Arc::clone(&key);
+        f.store
+            .writer()
+            .write(move |tx| email::resend(tx, Some(&key), user, at(now)))
+            .unwrap()
+    };
+    let soon = 10 + email::RECIPIENT_COOLDOWN_MS - 1;
+    assert_eq!(again(stranger, soon), Requested::Throttled);
+    assert_eq!(again(other, soon), Requested::Throttled);
+    assert_eq!(f.store.read(email::counts).unwrap().0, 1);
+
+    // The refused requests did not void the link already mailed.
+    assert!(matches!(
+        f.confirm(&mailed, soon),
+        Confirmation::Verified { user, .. } if user == stranger
+    ));
+
+    // A different kind of message is not delayed by it: an invitation to the same mailbox queues.
+    let invited = {
+        let (admin, tenant, key) = (f.admin, f.tenant, Arc::clone(&key));
+        f.store
+            .writer()
+            .write(move |tx| {
+                registration::invite_by_email(
+                    tx,
+                    Authority::credential(admin),
+                    Terms {
+                        tenant: Some(tenant),
+                        role: Some(Role::Reader),
+                        ..Terms::default()
+                    },
+                    "victim@example.com",
+                    Some(&*key),
+                    at(soon),
+                )
+            })
+            .unwrap()
+    };
+    assert!(invited.queued);
+    assert_eq!(f.store.read(email::counts).unwrap().0, 2);
+}
+
+#[test]
+fn a_mailbox_may_be_written_to_again_once_the_cooldown_passes() {
+    let f = fixture();
+    let key = f.key();
+    email::set_delivery(&f.store, true, Some("https://ci.example.com"), at(1)).unwrap();
+    let user = f.user_of(f.sign_up("holder@example.com", &f.admission(), Some(Arc::clone(&key))));
+    let resend = |now: i64| {
+        let key = Arc::clone(&key);
+        f.store
+            .writer()
+            .write(move |tx| email::resend(tx, Some(&key), user, at(now)))
+            .unwrap()
+    };
+    let step = email::RECIPIENT_COOLDOWN_MS;
+    assert_eq!(resend(10 + step), Requested::Queued);
+    assert_eq!(resend(10 + step + 1), Requested::Throttled);
+    assert_eq!(resend(10 + 2 * step + 1), Requested::Queued);
+    assert_eq!(f.store.read(email::counts).unwrap().0, 3);
+}
+
+impl Fixture {
+    /// Registers with an invitation issued at the same moment, so a late registration is not refused as expired.
+    fn register_at(&self, address: &str, now: i64) -> UserId {
+        let admin = self.admin;
+        let invitation = self
+            .store
+            .writer()
+            .write(move |tx| {
+                registration::invite(tx, Authority::credential(admin), Terms::default(), at(now))
+            })
+            .unwrap()
+            .secret;
+        match registration::register_with(
+            &self.store,
+            Applicant::Email {
+                display_name: "Late Person",
+                email: address,
+                password: PASSWORD,
+            },
+            Some(&invitation),
+            None,
+            at(now),
+        )
+        .unwrap()
+        {
+            Admission::Admitted(user) => user,
+            other => panic!("expected admission, got {other:?}"),
+        }
+    }
+
+    fn purge_unverified(&self, now: i64) -> usize {
+        email::purge_unverified(&self.store, at(now), 100).unwrap()
+    }
+
+    fn row(&self, user: UserId) -> (i64, bool, Option<String>, String, bool, i64) {
+        self.store
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT status, active, email, display_name,
+                        EXISTS(SELECT 1 FROM local_credentials WHERE user_id = ?1),
+                        (SELECT COUNT(*) FROM email_verifications WHERE user_id = ?1)
+                     FROM users WHERE id = ?1",
+                    [user.as_bytes()],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
+                )
+                .map_err(Error::from)
+            })
+            .unwrap()
+    }
+}
+
+#[test]
+fn an_account_that_never_verified_its_address_is_retired_after_the_ttl() {
+    let f = fixture();
+    let stale = f.user_of(f.sign_up("stale@example.com", &f.admission(), None));
+    let pending_row = f.row(stale);
+    assert_eq!(pending_row.0, 1);
+    assert!(pending_row.4 && pending_row.5 == 1);
+
+    assert_eq!(f.purge_unverified(10 + email::UNVERIFIED_TTL_MS - 1), 0);
+    assert_eq!(f.row(stale).2.as_deref(), Some("stale@example.com"));
+
+    assert_eq!(f.purge_unverified(10 + email::UNVERIFIED_TTL_MS), 1);
+    let (status, active, address, name, has_credential, links) = f.row(stale);
+    assert_eq!((status, active), (2, false));
+    assert_eq!(address, None, "the unverified address is released");
+    assert_eq!(name, "expired registration");
+    assert!(!has_credential && links == 0, "no password or link remains");
+    assert!(!f.sign_in("stale@example.com"));
+
+    let record = f
+        .store
+        .read(|c| local_auth::recent_audit(c, 100))
+        .unwrap()
+        .into_iter()
+        .find(|r| r.event == Event::UnverifiedAccountPurged)
+        .expect("the purge is audited");
+    assert_eq!(record.subject, Some(stale));
+    assert!(!record.host_local);
+    assert!(
+        !record.detail.unwrap_or_default().contains('@'),
+        "the audit row never names the address"
+    );
+
+    // Once retired the row is not selected again, and the address is free to be registered.
+    assert_eq!(f.purge_unverified(i64::MAX / 2), 0);
+    let fresh = f.register_at("stale@example.com", 20);
+    assert_eq!(f.row(fresh).2.as_deref(), Some("stale@example.com"));
+}
+
+#[test]
+fn the_purge_keeps_every_account_that_verified_joined_signed_in_or_is_young() {
+    let f = fixture();
+    let admission = |f: &Fixture| f.admission();
+    let verified = f.user_of(f.sign_up("verified@example.com", &admission(&f), None));
+    let link = f.link(verified, None, 20);
+    f.confirm(&link, 21);
+
+    let (admin, tenant) = (f.admin, f.tenant);
+    let team = f
+        .store
+        .writer()
+        .write(move |tx| {
+            registration::invite(
+                tx,
+                Authority::credential(admin),
+                Terms {
+                    tenant: Some(tenant),
+                    role: Some(Role::Reader),
+                    ..Terms::default()
+                },
+                at(2),
+            )
+        })
+        .unwrap()
+        .secret;
+    let member = f.user_of(f.sign_up("member@example.com", &team, None));
+    assert_ne!(f.role_in(f.tenant, member), 0);
+
+    let signed_in = f.user_of(f.sign_up("session@example.com", &admission(&f), None));
+    f.store
+        .writer()
+        .write(move |tx| local_auth::issue_session(tx, signed_in, Policy::default(), at(30)))
+        .unwrap();
+
+    let local = match registration::register(
+        &f.store,
+        Applicant::Local {
+            display_name: "Local",
+            username: "localuser",
+            password: PASSWORD,
+        },
+        Some(&admission(&f)),
+        at(10),
+    )
+    .unwrap()
+    {
+        Admission::Admitted(user) => user,
+        other => panic!("{other:?}"),
+    };
+    // An operator's pending address claim on an ordinary account is not a never-verified registration.
+    f.link(local, Some("claim@example.com"), 11);
+
+    let young = f.register_at("young@example.com", 10 + email::UNVERIFIED_TTL_MS);
+
+    assert_eq!(f.purge_unverified(10 + email::UNVERIFIED_TTL_MS + 1_000), 0);
+    for user in [verified, member, signed_in, local, young] {
+        assert_ne!(f.row(user).0, 2, "{user:?} was kept");
+    }
+    assert_eq!(f.row(local).2.as_deref(), Some("claim@example.com"));
+    assert!(f.sign_in("verified@example.com"));
+}
+
+#[test]
+fn the_purge_is_bounded_per_call_and_covers_accounts_awaiting_approval() {
+    let f = fixture();
+    f.store
+        .writer()
+        .write(move |tx| {
+            registration::set_policy(
+                tx,
+                Authority::HostLocal,
+                registration::DeploymentPolicy {
+                    registration: registration::Registration::ApprovalRequired,
+                    ..registration::policy(tx)?
+                },
+                at(3),
+            )
+        })
+        .unwrap();
+    let mut waiting = Vec::new();
+    for n in 0..3 {
+        let applied = registration::register_with(
+            &f.store,
+            Applicant::Email {
+                display_name: "Waiting",
+                email: &format!("waiting{n}@example.com"),
+                password: PASSWORD,
+            },
+            None,
+            None,
+            at(10 + n),
+        )
+        .unwrap();
+        match applied {
+            Admission::Pending(user) => waiting.push(user),
+            other => panic!("{other:?}"),
+        }
+    }
+    let later = 10 + email::UNVERIFIED_TTL_MS + 10;
+    assert_eq!(email::purge_unverified(&f.store, at(later), 2).unwrap(), 2);
+    assert_eq!(email::purge_unverified(&f.store, at(later), 2).unwrap(), 1);
+    assert_eq!(email::purge_unverified(&f.store, at(later), 2).unwrap(), 0);
+    for user in waiting {
+        assert_eq!(f.row(user).0, 2);
+    }
 }
 
 #[test]

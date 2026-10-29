@@ -258,3 +258,136 @@ fn adding_a_non_member_is_audited_apart_from_changing_a_member() {
     assert_eq!(audit[0].event, Event::MembershipSet);
     assert_ne!(audit[1].event, Event::MemberAdded);
 }
+
+/// Everything an administrator tries on an id that is not a member: the answer and the rows touched.
+fn probe(store: &Store, i: Ids, target: UserId, adding: bool) -> Vec<Result<(), Error>> {
+    let admin = stepped(i.admin, false);
+    let mut results = Vec::new();
+    if adding {
+        results.push(set_member(store, i, admin, target, Role::Reader, None));
+    }
+    let remove = store.writer().write(move |tx| {
+        auth::remove_membership(
+            tx,
+            principal(i.admin, false),
+            i.tenant,
+            target,
+            UnixMillis(NOW.0 + 5),
+        )
+    });
+    results.push(remove);
+    results.push(grant(store, i, admin, target, None));
+    results
+}
+
+fn counts(store: &Store) -> (i64, i64, i64) {
+    store
+        .read(|c| {
+            let one = |sql: &str| c.query_row(sql, [], |r| r.get::<_, i64>(0));
+            Ok((
+                one("SELECT COUNT(*) FROM memberships")?,
+                one("SELECT COUNT(*) FROM repo_grants")?,
+                one("SELECT COALESCE(MAX(seq), 0) FROM auth_audit")?,
+            ))
+        })
+        .unwrap()
+}
+
+fn same_refusal(results: &[Result<(), Error>], expected: fn(&Error) -> bool) {
+    for result in results {
+        let error = result.as_ref().expect_err("a non-member is never changed");
+        assert!(expected(error), "{error:?}");
+    }
+}
+
+#[test]
+fn ids_that_name_nobody_a_member_or_an_inactive_account_are_refused_alike() {
+    let (_dir, store, i) = fixture();
+    let inactive = UserId::new();
+    store
+        .writer()
+        .write(move |tx| {
+            provisioning::insert_human(tx, inactive, "Gone", false, NOW)?;
+            tx.execute(
+                "UPDATE users SET active = 0 WHERE id = ?1",
+                [inactive.as_bytes()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // An existing active person who is not a member is added by the add itself, so the add is probed only
+    // for ids that name nobody usable; removal and a repository grant treat every other id the same way.
+    let before = counts(&store);
+    for target in [UserId::new(), inactive] {
+        let results = probe(&store, i, target, true);
+        same_refusal(&results, |e| matches!(e, Error::NotFound));
+    }
+    let results = probe(&store, i, i.stranger, false);
+    same_refusal(&results, |e| matches!(e, Error::NotFound));
+    // Refusals write nothing: no membership, grant or audit row differs between the three kinds of id.
+    assert_eq!(counts(&store), before);
+}
+
+#[test]
+fn a_github_backed_tenant_refuses_every_id_but_its_own_service_accounts_alike() {
+    let (_dir, store, i) = fixture();
+    let bot = UserId::new();
+    let foreign_bot = UserId::new();
+    let elsewhere = TenantId::new();
+    let inactive = UserId::new();
+    store
+        .writer()
+        .write(move |tx| {
+            let root = principal(i.root, true);
+            auth::create_namespace(
+                tx,
+                root,
+                elsewhere,
+                Namespace::parse("elsewhere").unwrap(),
+                NamespaceKind::Organization,
+                NOW,
+            )?;
+            for (account, tenant) in [(bot, i.tenant), (foreign_bot, elsewhere)] {
+                auth::create_service_account(
+                    tx,
+                    stepped(i.root, true),
+                    tenant,
+                    account,
+                    "bot",
+                    Role::Reader,
+                    Some("fixture"),
+                    NOW,
+                )?;
+            }
+            provisioning::insert_human(tx, inactive, "Gone", false, NOW)?;
+            tx.execute(
+                "UPDATE users SET active = 0 WHERE id = ?1",
+                [inactive.as_bytes()],
+            )?;
+            tx.execute(
+                "UPDATE tenants SET membership_source = 1 WHERE id = ?1",
+                [i.tenant.as_bytes()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let before = counts(&store);
+    // A member, a person who is not a member, an inactive person, another tenant's service account and an
+    // id that names nothing: the same refusal for all of them, so it does not reveal which ones exist.
+    for target in [i.dev, i.stranger, inactive, foreign_bot, UserId::new()] {
+        let results = probe(&store, i, target, true);
+        same_refusal(&results, |e| matches!(e, Error::Forbidden));
+    }
+    assert_eq!(counts(&store), before);
+    // The tenant's own service accounts stay editable by hand.
+    set_member(
+        &store,
+        i,
+        stepped(i.admin, false),
+        bot,
+        Role::Operator,
+        None,
+    )
+    .unwrap();
+    grant(&store, i, stepped(i.admin, false), bot, None).unwrap();
+}

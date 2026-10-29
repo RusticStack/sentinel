@@ -18,6 +18,15 @@ pub const REPOS_PER_STEP: u32 = 25;
 
 pub const MIN_ON_DEMAND_GAP_MS: i64 = 60_000;
 
+/// `next_ms` of a row that owes no check. A finished pass that has nothing left to ask (a person who is
+/// not a member, an unreachable candidate that gave up) parks its row here instead of deleting it, so
+/// `checked_ms` keeps holding the on-demand gap: deleting the row would let the next sign-in insert a
+/// fresh one with `checked_ms = 0` and ask GitHub again at once. Nothing selects a parked row as due.
+pub const PARKED_MS: i64 = i64::MAX;
+
+/// Parked rows older than the gap are equivalent to no row; each on-demand enqueue sweeps a few of them.
+const PARKED_SWEEP: i64 = 64;
+
 const MAX_TENANTS_PER_SIGN_IN: i64 = 256;
 
 const MAX_CANDIDATE_ATTEMPTS: u32 = 5;
@@ -86,18 +95,22 @@ pub fn is_github_backed(conn: &Connection, tenant: TenantId) -> Result<bool> {
         .unwrap_or(false))
 }
 
+/// On a GitHub-backed tenant only the tenant's own service accounts can be edited by hand. Every other
+/// id is refused the same way, whether it names a person, an account elsewhere or nothing at all, so the
+/// refusal cannot tell an administrator which `usr_` ids exist.
 pub(crate) fn require_app_managed(
     conn: &Connection,
     tenant: TenantId,
-    human: Option<UserId>,
+    target: Option<UserId>,
 ) -> Result<()> {
     let backed: bool = conn
         .prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM tenants t WHERE t.id = ?1 AND t.membership_source = 1
-             AND (?2 IS NULL OR EXISTS(SELECT 1 FROM users u WHERE u.id = ?2 AND u.kind = 0)))",
+             AND (?2 IS NULL OR NOT EXISTS(SELECT 1 FROM users u WHERE u.id = ?2
+                  AND u.kind = 1 AND u.service_tenant_id = ?1)))",
         )?
         .query_row(
-            params![tenant.as_bytes(), human.as_ref().map(UserId::as_bytes)],
+            params![tenant.as_bytes(), target.as_ref().map(UserId::as_bytes)],
             |r| r.get(0),
         )?;
     if backed {
@@ -261,6 +274,17 @@ fn superseded(tx: &Transaction<'_>, check: &Check) -> Result<bool> {
 }
 
 pub fn enqueue_user(tx: &Transaction<'_>, user: UserId, now: UnixMillis) -> Result<usize> {
+    tx.prepare_cached(
+        "DELETE FROM github_member_checks WHERE (tenant_id, user_id) IN (
+            SELECT tenant_id, user_id FROM github_member_checks
+            WHERE next_ms = ?1 AND checked_ms <= ?2 - ?3 LIMIT ?4)",
+    )?
+    .execute(params![
+        PARKED_MS,
+        now.0,
+        MIN_ON_DEMAND_GAP_MS,
+        PARKED_SWEEP
+    ])?;
     Ok(tx
         .prepare_cached(
             "INSERT INTO github_member_checks(tenant_id, user_id, next_ms)
@@ -349,8 +373,8 @@ pub fn hint(
         None => {
             tx.execute(
                 "UPDATE github_member_checks SET next_ms = MIN(next_ms, ?2), seq = seq + 1,
-                    cursor = NULL WHERE tenant_id = ?1",
-                params![tenant.as_bytes(), now.0],
+                    cursor = NULL WHERE tenant_id = ?1 AND next_ms != ?3",
+                params![tenant.as_bytes(), now.0, PARKED_MS],
             )?;
         }
     }
@@ -602,7 +626,7 @@ pub fn apply(
     now: UnixMillis,
 ) -> Result<&'static str> {
     if !is_github_backed(tx, check.tenant)? {
-        drop_row(tx, check)?;
+        remove_row(tx, check)?;
         return Ok("not github-backed");
     }
     if superseded(tx, check)? {
@@ -641,12 +665,12 @@ pub fn apply(
     if observed.github_id.is_none() {
         return match existing {
             None => {
-                drop_row(tx, check)?;
+                drop_row(tx, check, now)?;
                 Ok("nothing to check")
             }
             Some(_) if expired => {
                 remove_derived(tx, check.tenant, check.user, now, "no linked account")?;
-                drop_row(tx, check)?;
+                drop_row(tx, check, now)?;
                 Ok("removed: no linked account")
             }
             Some(_) => {
@@ -665,7 +689,7 @@ pub fn apply(
     match observed.membership {
         Membership::Absent => {
             let removed = remove_derived(tx, check.tenant, check.user, now, "not a member")?;
-            drop_row(tx, check)?;
+            drop_row(tx, check, now)?;
             Ok(if removed {
                 "removed: not a member"
             } else {
@@ -675,7 +699,7 @@ pub fn apply(
         Membership::Unknown => match existing {
             Some(_) if expired => {
                 remove_derived(tx, check.tenant, check.user, now, "grace expired")?;
-                drop_row(tx, check)?;
+                drop_row(tx, check, now)?;
                 Ok("removed: grace expired")
             }
             Some(_) => {
@@ -683,7 +707,7 @@ pub fn apply(
                 Ok("kept: unknown")
             }
             None if check.attempts.saturating_add(1) >= MAX_CANDIDATE_ATTEMPTS => {
-                drop_row(tx, check)?;
+                drop_row(tx, check, now)?;
                 Ok("dropped: unknown")
             }
             None => {
@@ -708,7 +732,7 @@ pub fn apply(
                         ],
                     )?;
                     if inserted == 0 {
-                        drop_row(tx, check)?;
+                        drop_row(tx, check, now)?;
                         return Ok("account not active");
                     }
                     audit(
@@ -870,14 +894,47 @@ const fn role_label(role: Role) -> &'static str {
     }
 }
 
-pub fn finish(tx: &Transaction<'_>, check: &Check) -> Result<()> {
-    drop_row(tx, check)
+/// The pair has no target: the tenant has no organization installation to ask about. A tenant that is not
+/// GitHub-backed owes nothing, so the row goes. A GitHub-backed one still holds derived members that nobody
+/// can confirm any more (an installation that lost its account, a release that never reached the tenant), so
+/// the pass counts as an unanswered one: the grace clock starts if it never did, derived access lapses when it
+/// is over, and a first-time candidate is dropped after its tries. Deleting the row instead would leave that
+/// access with no expiry.
+pub fn no_target(
+    tx: &Transaction<'_>,
+    check: &Check,
+    timing: Timing,
+    now: UnixMillis,
+) -> Result<&'static str> {
+    if !is_github_backed(tx, check.tenant)? {
+        remove_row(tx, check)?;
+        return Ok("target gone");
+    }
+    unreachable(tx, check, timing, now, None)
 }
 
-fn drop_row(tx: &Transaction<'_>, check: &Check) -> Result<()> {
+/// Deletes the row: the pair is not checkable at all (no target, not GitHub-backed), so no gap is owed.
+fn remove_row(tx: &Transaction<'_>, check: &Check) -> Result<()> {
     tx.execute(
         "DELETE FROM github_member_checks WHERE tenant_id = ?1 AND user_id = ?2 AND seq = ?3",
         params![check.tenant.as_bytes(), check.user.as_bytes(), check.seq],
+    )?;
+    Ok(())
+}
+
+/// The pass is over and nothing is owed: park the row and keep the time GitHub was last asked, so repeated
+/// on-demand requests still wait out `MIN_ON_DEMAND_GAP_MS`. A signed event for the pair wakes it at once.
+fn drop_row(tx: &Transaction<'_>, check: &Check, now: UnixMillis) -> Result<()> {
+    tx.execute(
+        "UPDATE github_member_checks SET next_ms = ?4, checked_ms = ?5, attempts = 0, cursor = NULL
+         WHERE tenant_id = ?1 AND user_id = ?2 AND seq = ?3",
+        params![
+            check.tenant.as_bytes(),
+            check.user.as_bytes(),
+            check.seq,
+            PARKED_MS,
+            now.0
+        ],
     )?;
     Ok(())
 }
@@ -947,7 +1004,7 @@ pub fn unreachable(
     retry_after_ms: Option<i64>,
 ) -> Result<&'static str> {
     if !is_github_backed(tx, check.tenant)? {
-        drop_row(tx, check)?;
+        remove_row(tx, check)?;
         return Ok("not github-backed");
     }
     if superseded(tx, check)? {
@@ -971,12 +1028,12 @@ pub fn unreachable(
             }
             if now.0.saturating_sub(since) >= timing.grace_ms {
                 remove_derived(tx, check.tenant, check.user, now, "grace expired")?;
-                drop_row(tx, check)?;
+                drop_row(tx, check, now)?;
                 return Ok("removed: grace expired");
             }
         }
         None if check.attempts.saturating_add(1) >= MAX_CANDIDATE_ATTEMPTS => {
-            drop_row(tx, check)?;
+            drop_row(tx, check, now)?;
             return Ok("dropped: unreachable");
         }
         None => {}

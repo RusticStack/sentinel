@@ -192,11 +192,13 @@ fn target(tx: &Transaction<'_>, slug: &str) -> Result<Target> {
     })
 }
 
+/// Records the rules in force. The controller calls it at every start; the stored rules, and the
+/// generation that decides who is checked again at sign-in, change only when the effective set does.
 pub fn set_rules(store: &Store, rules: &Rules) -> Result<Vec<Ignored>> {
     let rules = rules.clone();
     store.writer().write(move |tx| {
-        tx.execute("DELETE FROM auto_join_domains", [])?;
         let mut refused = Vec::new();
+        let mut accepted: Vec<(&str, &str)> = Vec::with_capacity(rules.len());
         for rule in rules.iter() {
             if let Target::Refused(reason) = target(tx, &rule.slug)? {
                 refused.push(Ignored {
@@ -205,17 +207,75 @@ pub fn set_rules(store: &Store, rules: &Rules) -> Result<Vec<Ignored>> {
                 });
                 continue;
             }
+            accepted.push((rule.domain.as_str(), rule.slug.as_str()));
+        }
+        accepted.sort_unstable();
+        let stored: Vec<(String, String)> = tx
+            .prepare_cached("SELECT domain, slug FROM auto_join_domains ORDER BY domain")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        let unchanged = stored.len() == accepted.len()
+            && stored
+                .iter()
+                .zip(&accepted)
+                .all(|((d, s), (ad, asl))| d == ad && s == asl);
+        if unchanged {
+            return Ok(refused);
+        }
+        tx.execute("DELETE FROM auto_join_domains", [])?;
+        for (domain, slug) in accepted {
             tx.execute(
                 "INSERT INTO auto_join_domains(domain, slug) VALUES (?1, ?2)",
-                params![rule.domain, rule.slug],
+                params![domain, slug],
             )?;
         }
+        tx.execute("UPDATE auto_join_state SET generation = generation + 1", [])?;
         Ok(refused)
     })
 }
 
 const JOINED_ROLE: Role = Role::Reader;
 
+/// Remembers that an administrator removed `user` from `tenant`, so `apply` never re-adds them.
+/// Idempotent; the newest removal time wins.
+pub(crate) fn record_removal(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    user: UserId,
+    now: UnixMillis,
+) -> Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO membership_removals(tenant_id, user_id, removed_ms) VALUES (?1, ?2, ?3)
+         ON CONFLICT(tenant_id, user_id) DO UPDATE SET removed_ms = excluded.removed_ms",
+    )?
+    .execute(params![tenant.as_bytes(), user.as_bytes(), now.0])?;
+    Ok(())
+}
+
+/// The sign-in entry point: runs [`apply`] only for a person who has not been checked under the rules in
+/// force. One conditional UPDATE, no read of the rules, is all a sign-in pays once the person was checked;
+/// it records the check only for a person `apply` can act on, so an account that is not yet eligible
+/// (unverified, waiting for approval) is looked at again at its next sign-in.
+pub(crate) fn apply_if_due(
+    tx: &Transaction<'_>,
+    user: UserId,
+    now: UnixMillis,
+) -> Result<Option<TenantId>> {
+    let due = tx
+        .prepare_cached(
+            "UPDATE users SET auto_join_gen = (SELECT generation FROM auto_join_state)
+             WHERE id = ?1 AND kind = 0 AND active = 1 AND status = 1 AND super_admin = 0
+               AND email_verified_ms IS NOT NULL
+               AND auto_join_gen != (SELECT generation FROM auto_join_state)",
+        )?
+        .execute([user.as_bytes()])?;
+    if due == 0 {
+        return Ok(None);
+    }
+    apply(tx, user, now)
+}
+
+/// A platform administrator is never auto-joined: joining a tenant takes step-up and an audited reason.
 pub(crate) fn apply(
     tx: &Transaction<'_>,
     user: UserId,
@@ -225,7 +285,7 @@ pub(crate) fn apply(
         .prepare_cached(
             "SELECT j.slug FROM users u
              JOIN auto_join_domains j ON j.domain = substr(u.email, instr(u.email, '@') + 1)
-             WHERE u.id = ?1 AND u.kind = 0 AND u.active = 1 AND u.status = 1
+             WHERE u.id = ?1 AND u.kind = 0 AND u.active = 1 AND u.status = 1 AND u.super_admin = 0
                AND u.email_verified_ms IS NOT NULL",
         )?
         .query_row([user.as_bytes()], |r| r.get(0))
@@ -238,7 +298,9 @@ pub(crate) fn apply(
         Target::Open(tenant) => {
             let added = tx
                 .prepare_cached(
-                    "INSERT INTO memberships(tenant_id, user_id, role) VALUES (?1, ?2, ?3)
+                    "INSERT INTO memberships(tenant_id, user_id, role) SELECT ?1, ?2, ?3
+                     WHERE NOT EXISTS(SELECT 1 FROM membership_removals
+                                      WHERE tenant_id = ?1 AND user_id = ?2)
                      ON CONFLICT(tenant_id, user_id) DO NOTHING",
                 )?
                 .execute(params![

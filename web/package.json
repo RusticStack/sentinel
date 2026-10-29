@@ -2,27 +2,31 @@
   "name": "sentinel-web",
   "private": true,
   "type": "module",
-  "description": "Sentinel's web interface: a Nuxt server in front of the controller's API",
+  "description": "Sentinel's web interface: a TanStack Start server in front of the controller's API",
   "scripts": {
-    "build": "nuxt build",
-    "dev": "nuxt dev",
-    "preview": "nuxt preview",
-    "typecheck": "nuxt typecheck",
-    "test:unit": "node --test test/*.test.mjs",
-    "postinstall": "nuxt prepare"
+    "build": "vite build",
+    "dev": "vite dev",
+    "typecheck": "tsr generate && tsc --noEmit",
+    "test:unit": "node --import ./test/ts-register.mjs --test test/*.test.mjs"
   },
   "dependencies": {
-    "@iconify-json/lucide": "^1.2.137",
-    "@nuxt/ui": "^4.11.2",
-    "nuxt": "^4.5.2",
-    "tailwindcss": "^4.1.0",
-    "vue": "^3.5.0",
-    "vue-router": "^4.5.0"
+    "@tanstack/react-router": "1.170.45",
+    "@tanstack/react-start": "1.169.3",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
   },
   "devDependencies": {
-    "esbuild": "^0.28.2",
-    "typescript": "^5.9.0",
-    "vue-tsc": "^3.0.0"
+    "@tailwindcss/vite": "4.3.3",
+    "@tanstack/router-cli": "1.167.45",
+    "@types/node": "22.19.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "esbuild": "0.28.2",
+    "nitro": "3.0.260903-beta",
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2",
+    "vite": "8.3.4"
   },
-  "packageManager": "pnpm@12.3.4"
+  "packageManager": "pnpm@12.15.0"
 }

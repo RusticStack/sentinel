@@ -5,7 +5,7 @@ use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 use sentinel_auth::sealed::Key;
 use sentinel_core::{RunId, UnixMillis};
-use sentinel_github::app::App;
+use sentinel_github::app::Current;
 use sentinel_pipeline::{Event, EventKind, PinnedSource, RunSpec};
 use sentinel_store::{
     Error as StoreError, Store,
@@ -157,7 +157,7 @@ impl Fetch for GitFetch {
 pub struct Resolver {
     store: Arc<Store>,
     key: Option<Arc<Key>>,
-    app: Option<Arc<App>>,
+    app: Current,
     destinations: Arc<[String]>,
     fetch: Arc<dyn Fetch>,
     work_root: PathBuf,
@@ -169,7 +169,7 @@ impl Resolver {
     pub fn new(
         store: Arc<Store>,
         key: Option<Arc<Key>>,
-        app: Option<Arc<App>>,
+        app: impl Into<Current>,
         destinations: Arc<[String]>,
         fetch: Arc<dyn Fetch>,
         work_root: PathBuf,
@@ -184,7 +184,7 @@ impl Resolver {
         Ok(Resolver {
             store,
             key,
-            app,
+            app: app.into(),
             destinations,
             fetch,
             work_root,
@@ -251,7 +251,7 @@ impl Resolver {
         let access = match source::issue(
             &self.store,
             self.key.as_deref(),
-            self.app.as_ref(),
+            self.app.get(),
             &binding,
             now,
         ) {

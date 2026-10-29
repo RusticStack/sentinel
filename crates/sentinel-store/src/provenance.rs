@@ -208,13 +208,16 @@ pub fn cache_trust(
     Ok(Trust::derive(&trigger, verified, exact))
 }
 
-/// Only non-manual runs with recorded provenance may receive secrets: a manual pipeline is authored by its caller,
-/// and a run without provenance fails closed.
+/// A run may receive secrets only when its provenance names a stored delivery that was authenticated at intake (a
+/// verified webhook signature or the repository's hook secret). The fact is read from the delivery row, which only the
+/// ingest adapter writes, never from the trigger text the run's provenance carries. A manual run (no delivery), a polled
+/// transition (observed, never authenticated) and a run without provenance fail closed.
 pub fn may_receive_secrets(conn: &Connection, run: RunId) -> Result<bool> {
     Ok(conn
         .prepare_cached(
-            "SELECT trigger != 'manual'
-             FROM run_provenance WHERE run_id = ?1",
+            "SELECT p.trigger != 'manual' AND d.authentication IN (1, 2)
+             FROM run_provenance p JOIN webhook_deliveries d ON d.id = p.delivery_id
+             WHERE p.run_id = ?1",
         )?
         .query_row([run.as_bytes()], |r| r.get(0))
         .optional()?

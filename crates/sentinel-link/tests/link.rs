@@ -486,15 +486,76 @@ fn a_worker_enrolls_once_heartbeats_reconnects_and_is_refused_after_revocation()
         .writer()
         .write(move |tx| workers::revoke(tx, Authority::HostLocal, worker, UnixMillis::now()))
         .unwrap();
+    // A revoked identity is told so, with or without a new enrollment, and a fresh secret does not
+    // revive it.
     let refused = d.connect(load(), worker, None).unwrap_err();
-    assert!(matches!(refused, Error::Rejected(Rejection::NotEnrolled)));
+    assert!(
+        matches!(refused, Error::Rejected(Rejection::Revoked)),
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("revoked"), "{refused}");
     let fresh = d.enrollment(60_000);
     let refused = d.connect(load(), worker, Some(&fresh)).unwrap_err();
-    assert!(matches!(refused, Error::Rejected(Rejection::Identity)));
+    assert!(matches!(refused, Error::Rejected(Rejection::Revoked)));
     eventually("rejection count", || {
         d.controller().stats().rejected.load(Ordering::SeqCst) == 4
     });
     assert_eq!(d.controller().stats().admitted.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        d.controller()
+            .stats()
+            .revoked_refused
+            .load(Ordering::SeqCst),
+        2
+    );
+    // The refusal spent nothing: the new enrollment is still good for the machine meant to use it,
+    // which enrolls under a new identity.
+    let replacement = d
+        .connect(
+            Identity::generate("replacement").unwrap(),
+            WorkerId::new(),
+            Some(&fresh),
+        )
+        .unwrap();
+    assert_ne!(replacement.worker, worker);
+}
+
+/// One certificate is one worker and one worker identifier is one certificate: presenting either under
+/// the other's name is refused as an identity conflict and changes nothing.
+#[test]
+fn a_certificate_or_worker_identifier_that_belongs_to_another_worker_is_refused() {
+    let d = deployment();
+    let (first, second) = (WorkerId::new(), WorkerId::new());
+    let identity = Identity::generate("first").unwrap();
+    let (cert, key) = (d._dir.path().join("f.crt"), d._dir.path().join("f.key"));
+    identity.save(&cert, &key).unwrap();
+    let load = || Identity::load(&cert, &key).unwrap();
+    let secret = d.enrollment(60_000);
+    drop(d.connect(load(), first, Some(&secret)).unwrap());
+    let before = d.controller().stats().admitted.load(Ordering::SeqCst);
+
+    // The same certificate under another worker identifier: a copy of the identity, not a reconnect.
+    let copied = d.connect(load(), second, None).unwrap_err();
+    assert!(
+        matches!(copied, Error::Rejected(Rejection::Identity)),
+        "{copied}"
+    );
+    // Another certificate claiming the enrolled worker's identifier with a fresh enrollment.
+    let fresh = d.enrollment(60_000);
+    let taken = d
+        .connect(Identity::generate("clone").unwrap(), first, Some(&fresh))
+        .unwrap_err();
+    assert!(
+        matches!(taken, Error::Rejected(Rejection::Identity)),
+        "{taken}"
+    );
+    // Neither refusal admitted anything or changed the enrolled worker; the real machine reconnects.
+    assert_eq!(
+        d.controller().stats().admitted.load(Ordering::SeqCst),
+        before
+    );
+    drop(d.connect(load(), first, None).unwrap());
+    assert!(!d.store.read(move |c| workers::revoked(c, first)).unwrap());
 }
 
 #[test]
@@ -900,6 +961,36 @@ fn an_older_worker_still_gets_a_hinted_cancel_on_its_next_heartbeat() {
 }
 
 #[test]
+fn a_worker_that_stops_cleanly_leaves_its_running_jobs_lease_in_place() {
+    let d = deployment();
+    let secret = d.enrollment(60_000);
+    let (recorder, offers) = Recorder::new();
+    let id = WorkerId::new();
+    let process = WorkerProcess::start(
+        &d,
+        Identity::generate("w").unwrap(),
+        id,
+        Some(secret),
+        Arc::clone(&recorder),
+    );
+    let (_, ids) = d.run(ONE_JOB);
+    let offer = offers.recv_timeout(Duration::from_secs(5)).unwrap().0;
+    eventually("attempt held and acknowledged", || {
+        d.store
+            .read(|c| dispatch::held_by(c, id))
+            .unwrap()
+            .iter()
+            .any(|h| h.attempt == offer.attempt && h.acknowledged)
+    });
+    process.stop().unwrap();
+    eventually("session gone", || d.controller().connected().is_empty());
+    // The attempt stays the worker's until its lease lapses: a clean stop reports nothing and releases nothing.
+    let held = d.store.read(|c| dispatch::held_by(c, id)).unwrap();
+    assert!(held.iter().any(|h| h.attempt == offer.attempt), "{held:?}");
+    assert_eq!(d.state(ids[0]), JobState::Leased);
+}
+
+#[test]
 fn a_declined_offer_returns_to_the_queue_and_is_reoffered_under_a_higher_fence() {
     let d = deployment();
     let secret = d.enrollment(60_000);
@@ -1162,6 +1253,243 @@ fn artifact_publication_commits_and_refusals_are_terminal() {
             && v.iter()
                 .any(|v| v.1 == "dist" && v.2 == session::ArtifactCode::Duplicate)
     });
+    process.stop().unwrap();
+}
+
+/// A connected worker holding the one attempt of `ARTIFACT_PIPELINE`.
+fn artifact_attempt(
+    d: &Deployment,
+) -> (
+    WorkerProcess,
+    Arc<Recorder>,
+    session::Reporter,
+    AttemptId,
+    RunId,
+) {
+    let secret = d.enrollment(60_000);
+    let (recorder, offers) = Recorder::new();
+    let id = WorkerId::new();
+    let process = WorkerProcess::start_version(
+        d,
+        Identity::generate("w").unwrap(),
+        id,
+        Some(secret),
+        Arc::clone(&recorder),
+        4,
+    );
+    process.wait_for("Connected", 1);
+    let (run, _) = d.run(ARTIFACT_PIPELINE);
+    let offer = offers.recv_timeout(Duration::from_secs(5)).unwrap().0;
+    eventually("attempt held", || {
+        d.store
+            .read(|c| dispatch::held_by(c, id))
+            .unwrap()
+            .iter()
+            .any(|h| h.attempt == offer.attempt && h.acknowledged)
+    });
+    let reporter = recorder.reporter.lock().unwrap().clone().unwrap();
+    (process, recorder, reporter, offer.attempt, run)
+}
+
+fn verdict_seen(
+    recorder: &Recorder,
+    attempt: AttemptId,
+    name: &str,
+    code: session::ArtifactCode,
+) -> bool {
+    recorder
+        .artifact_verdicts
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|v| v.0 == attempt && v.1 == name && v.2 == code)
+}
+
+fn granted(recorder: &Recorder, attempt: AttemptId, name: &str) -> bool {
+    recorder
+        .artifact_grants
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(a, n)| *a == attempt && n == name)
+}
+
+fn limits(run_artifact_bytes: u64) -> sentinel_store::retention::Deployment {
+    sentinel_store::retention::Deployment {
+        run_artifact_bytes,
+        ..sentinel_store::retention::Deployment::default()
+    }
+}
+
+fn repo_quota(d: &Deployment, bytes: u64) {
+    let (tenant, repo) = (d.tenant, d.repo);
+    let policy = sentinel_store::retention::Policy {
+        quota_bytes: Some(bytes),
+        ..Default::default()
+    };
+    d.store
+        .writer()
+        .write(move |tx| {
+            sentinel_store::retention::set(
+                tx,
+                &sentinel_store::auth::Authority::HostLocal,
+                &sentinel_store::retention::Deployment::default(),
+                tenant,
+                Some(repo),
+                policy,
+                UnixMillis::now(),
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+}
+
+#[test]
+fn the_run_budget_refuses_a_file_that_would_pass_it_and_releases_what_it_held() {
+    let d = deployment();
+    d.objects.set_deployment(limits(8));
+    let (process, recorder, reporter, attempt, run) = artifact_attempt(&d);
+
+    reporter.artifact_begin(attempt, "dist").unwrap();
+    eventually("grant", || granted(&recorder, attempt, "dist"));
+    reporter
+        .artifact_file(attempt, "out/a.txt", 4, 0o644)
+        .unwrap();
+    reporter.artifact_data(attempt, 0, b"data").unwrap();
+    // 4 bytes are held for this run; another 5 would pass the budget of 8.
+    reporter
+        .artifact_file(attempt, "out/b.txt", 5, 0o644)
+        .unwrap();
+    eventually("budget verdict", || {
+        verdict_seen(&recorder, attempt, "dist", session::ArtifactCode::TooLarge)
+    });
+    let (tenant, repo) = (d.tenant, d.repo);
+    let rows = d
+        .store
+        .read(move |c| sentinel_store::artifacts::for_run(c, tenant, run))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, sentinel_store::artifacts::State::Failed);
+
+    // The refused artifact gave its 4 bytes back, so a whole budget's worth fits.
+    reporter.artifact_begin(attempt, "cov").unwrap();
+    eventually("second grant", || granted(&recorder, attempt, "cov"));
+    reporter
+        .artifact_file(attempt, "coverage/c.txt", 8, 0o644)
+        .unwrap();
+    reporter.artifact_data(attempt, 0, b"12345678").unwrap();
+    reporter.artifact_end(attempt, "cov").unwrap();
+    eventually("stored", || {
+        verdict_seen(&recorder, attempt, "cov", session::ArtifactCode::Stored)
+    });
+    let usage = d
+        .store
+        .read(move |c| sentinel_store::retention::repo_usage(c, tenant, repo))
+        .unwrap();
+    assert_eq!(usage.artifact_bytes, 8);
+    process.stop().unwrap();
+}
+
+#[test]
+fn a_committed_run_budget_refuses_the_next_artifact_at_begin() {
+    let d = deployment();
+    d.objects.set_deployment(limits(4));
+    let (process, recorder, reporter, attempt, _) = artifact_attempt(&d);
+
+    reporter.artifact_begin(attempt, "dist").unwrap();
+    eventually("grant", || granted(&recorder, attempt, "dist"));
+    reporter
+        .artifact_file(attempt, "out/a.txt", 4, 0o644)
+        .unwrap();
+    reporter.artifact_data(attempt, 0, b"data").unwrap();
+    reporter.artifact_end(attempt, "dist").unwrap();
+    eventually("stored", || {
+        verdict_seen(&recorder, attempt, "dist", session::ArtifactCode::Stored)
+    });
+    reporter.artifact_begin(attempt, "cov").unwrap();
+    eventually("refused at begin", || {
+        verdict_seen(&recorder, attempt, "cov", session::ArtifactCode::TooLarge)
+    });
+    assert!(!granted(&recorder, attempt, "cov"));
+    process.stop().unwrap();
+}
+
+#[test]
+fn the_repository_quota_binds_at_commit_not_only_at_begin() {
+    let d = deployment();
+    repo_quota(&d, 6);
+    let (process, recorder, reporter, attempt, run) = artifact_attempt(&d);
+    let (tenant, repo) = (d.tenant, d.repo);
+
+    // Two 4-byte files pass the begin check, which cannot know the size, but would
+    // leave the repository at 8 of 6, so the commit refuses and keeps nothing.
+    reporter.artifact_begin(attempt, "dist").unwrap();
+    eventually("grant", || granted(&recorder, attempt, "dist"));
+    for path in ["out/a.txt", "out/b.txt"] {
+        reporter.artifact_file(attempt, path, 4, 0o644).unwrap();
+        reporter.artifact_data(attempt, 0, b"data").unwrap();
+    }
+    reporter.artifact_end(attempt, "dist").unwrap();
+    eventually("commit refused", || {
+        verdict_seen(&recorder, attempt, "dist", session::ArtifactCode::TooLarge)
+    });
+    let rows = d
+        .store
+        .read(move |c| sentinel_store::artifacts::for_run(c, tenant, run))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, sentinel_store::artifacts::State::Failed);
+    let usage = d
+        .store
+        .read(move |c| sentinel_store::retention::repo_usage(c, tenant, repo))
+        .unwrap();
+    assert_eq!(usage.total(), 0, "a refused artifact leaves no usage");
+    let held = d
+        .store
+        .read(move |c| sentinel_store::retention::tenant_usage(c, tenant))
+        .unwrap();
+    assert_eq!(held.total(), 0, "its staged objects were discarded");
+
+    // Exactly the quota fits.
+    reporter.artifact_begin(attempt, "cov").unwrap();
+    eventually("second grant", || granted(&recorder, attempt, "cov"));
+    reporter
+        .artifact_file(attempt, "coverage/c.txt", 6, 0o644)
+        .unwrap();
+    reporter.artifact_data(attempt, 0, b"123456").unwrap();
+    reporter.artifact_end(attempt, "cov").unwrap();
+    eventually("stored", || {
+        verdict_seen(&recorder, attempt, "cov", session::ArtifactCode::Stored)
+    });
+    let usage = d
+        .store
+        .read(move |c| sentinel_store::retention::repo_usage(c, tenant, repo))
+        .unwrap();
+    assert_eq!(usage.artifact_bytes, 6);
+    process.stop().unwrap();
+}
+
+#[test]
+fn a_repository_at_its_quota_is_refused_at_begin() {
+    let d = deployment();
+    repo_quota(&d, 4);
+    let (process, recorder, reporter, attempt, _) = artifact_attempt(&d);
+
+    reporter.artifact_begin(attempt, "cov").unwrap();
+    eventually("grant", || granted(&recorder, attempt, "cov"));
+    reporter
+        .artifact_file(attempt, "coverage/c.txt", 4, 0o644)
+        .unwrap();
+    reporter.artifact_data(attempt, 0, b"data").unwrap();
+    reporter.artifact_end(attempt, "cov").unwrap();
+    eventually("stored", || {
+        verdict_seen(&recorder, attempt, "cov", session::ArtifactCode::Stored)
+    });
+    reporter.artifact_begin(attempt, "dist").unwrap();
+    eventually("refused at begin", || {
+        verdict_seen(&recorder, attempt, "dist", session::ArtifactCode::TooLarge)
+    });
+    assert!(!granted(&recorder, attempt, "dist"));
     process.stop().unwrap();
 }
 

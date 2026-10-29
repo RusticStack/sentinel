@@ -13,6 +13,14 @@ use crate::{Error, Result};
 
 pub const WORKSPACES_DIR: &str = "workspaces";
 
+/// Extension of the job `/tmp` directory next to a workspace (`<attempt>.tmp`).
+pub const TMP_EXTENSION: &str = "tmp";
+
+/// The job `/tmp` directory that belongs to the workspace at `workspace`.
+pub fn tmp_beside(workspace: &Path) -> PathBuf {
+    workspace.with_extension(TMP_EXTENSION)
+}
+
 pub struct Workspace {
     path: PathBuf,
     attempt: AttemptId,
@@ -41,8 +49,28 @@ impl Workspace {
         self.attempt
     }
 
+    /// The job's `/tmp` on the workspace disk, beside the workspace so tools walking the checkout never see it
+    /// and so it goes with the workspace: `destroy` and startup recovery remove both.
+    pub fn tmp_path(&self) -> PathBuf {
+        tmp_beside(&self.path)
+    }
+
+    /// Creates the job's `/tmp` directory, world-writable with the sticky bit as a `/tmp` is.
+    pub fn create_tmp(&self) -> Result<PathBuf> {
+        let path = self.tmp_path();
+        match fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o1777))?;
+        Ok(path)
+    }
+
     pub fn destroy(self) -> Result<()> {
-        remove_tree(&self.path)
+        let tmp = remove_tree(&self.tmp_path());
+        remove_tree(&self.path)?;
+        tmp
     }
 
     pub fn leftovers(root: &Path) -> Result<Vec<AttemptId>> {
@@ -55,10 +83,13 @@ impl Workspace {
         };
         for entry in entries {
             let entry = entry?;
-            if let Some(id) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<AttemptId>().ok())
+            // A job's `/tmp` directory survives its workspace only when removal half-failed; it is a leftover too.
+            if let Some(id) = entry.file_name().to_str().and_then(|name| {
+                name.strip_suffix(&format!(".{TMP_EXTENSION}"))
+                    .unwrap_or(name)
+                    .parse::<AttemptId>()
+                    .ok()
+            }) && !found.contains(&id)
             {
                 found.push(id);
             }
@@ -132,6 +163,39 @@ fn make_walkable(dir: &OwnedFd, depth: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_job_tmp_is_world_writable_beside_the_workspace_and_goes_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = AttemptId::new();
+        let ws = Workspace::create(dir.path(), attempt).unwrap();
+        let tmp = ws.create_tmp().unwrap();
+        assert_eq!(tmp.parent(), ws.path().parent());
+        assert_ne!(tmp, ws.path());
+        assert_eq!(
+            fs::metadata(&tmp).unwrap().permissions().mode() & 0o7777,
+            0o1777
+        );
+        // Created twice for one attempt is the same directory, not an error.
+        assert_eq!(ws.create_tmp().unwrap(), tmp);
+        fs::write(tmp.join("big"), b"x").unwrap();
+        assert_eq!(Workspace::leftovers(dir.path()).unwrap(), vec![attempt]);
+        ws.destroy().unwrap();
+        assert!(!tmp.exists());
+        assert!(Workspace::leftovers(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_job_tmp_left_without_its_workspace_is_still_a_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = AttemptId::new();
+        let ws = Workspace::create(dir.path(), attempt).unwrap();
+        let tmp = ws.create_tmp().unwrap();
+        remove_tree(ws.path()).unwrap();
+        assert_eq!(Workspace::leftovers(dir.path()).unwrap(), vec![attempt]);
+        remove_tree(&tmp).unwrap();
+        assert!(Workspace::leftovers(dir.path()).unwrap().is_empty());
+    }
 
     #[test]
     fn a_read_only_tree_is_removed() {

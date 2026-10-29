@@ -29,35 +29,26 @@ use sentinel_store::{
     sources_forge::{self, Snapshot},
 };
 
-/// A test-only RSA key, generated for this suite; it authenticates nothing.
-const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
-MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDf6rEvjDV4LPW4
-lLht6MWXLarjIFjXnB53o9UxkubIhOGY4RuGq7L2hz8Be5pLy+dA79JbgdoyCzrW
-wR8IGVVdWFeSLC3U4RK+AvYhejVxForWyHIjb60GltbZN2pIADLCx2jS7KZK+3sP
-fQQa7YxkRCAoZmqqEMV/JqNuFebmICrwN+Zm2NCRIsqxcjbbefIdhlHShveZ6ulS
-QLxBN/ZFnCEWSZvZ5D5HDbJx3KHSFGpPZJ4Hyoghv20dYOmv8J2O2U246x9hq46Z
-zeutnBkTY11jrYKTJnSt4Oc8Alsf75G9V+Q/nSbmbS2nje8y0qtpKIosSoqEd6Rb
-e2+UrQSRAgMBAAECggEAAbj+T9iFGwmEAq10uYY9WmlT16tamZ6KKrcWQ1tPJpbk
-niqprbydi+lclAonlMqS2vBZYsI2C7VjyI4L60HYIvekdVO9DsakQHVY/8cPGRGQ
-hABe5exElVDU4m8LZJZJTa+vbBN9YEVs5ACtBtjB4C3YvjzS+F/YiB7TyiuVlxq/
-r265ZXQdqjy/Hl5G8gwIEVWPF8diR1fQi5nfqKjybSe5DL5kdo3CDHvm6UbY1arI
-0j7n/CDCERP/j4XnkS97vbKML3j2l2PFzQ42bgU6GuEtAlJLKHZKja1NiDfmCX2+
-0zH6ueVcqVO9iZnxthWznJeUnVWp1V3NeUa8eN1HIQKBgQD8YzEzbpHmXFLd5CCG
-i19bgpGIN0bPUpPF6Ipb73j8NW1dXdENRYgPKizWRdBQZygUmwvfuzsUnN+MZMgw
-ic09xbw/slO75bDhLtnBDZ34hFloCjJHSXlxeKqlQCkifKmhcS2vkKgVoO3TMp1Z
-iyZh2jvCVNOm9U+JfEE4y0+C8QKBgQDjHy0vNtnIvN65DHWsuJWoqrIORDcluExv
-50tMySPQ6l/5t6zYW3GNdnUUkXdtjworvIunp7yCnM0FTL/mpFHOkruwr2fJXMIg
-GOn0nzcGxKdyy9tFDx7FmJzwUiMow18qXptIdCQJZo0JO+w0iJYBX1pZYtvQSAjd
-TJqXdiBboQKBgAQUCkB9gegKB+DEBe6GpATTiEx+MCu7dt3U0x+HMBpLNrgyguVH
-AVrVYKIZwLL7577lfnygBuVfX5FiM4XtRB7CajdRR18a6A/LdQNUl//jC5rNx2A1
-hLvbqk4/SirfftI4BPf4S28GCbHG+Jnw0K72Gs8aFc1121IqatdjGabRAoGAekkQ
-9PjdbZ1zdcLloOeJfNTbJZ9I6gA+94lbG664oAVxQ2zHnX4ut3HuO/LOkKiRW1cb
-AlvnvZNbN91I/Y+/lC+g6tKmWN6ejtWbMeB/qh874S0tlBM+CDnRVfuDfrEijhd+
-GBagSId0rGIdHXPlADws0y/NFmmSjERwf9hUN8ECgYAlWpgQzrKS7xkaYaCngYgr
-sDhna8Obj+EC26+CgQs5BEXE+xkfrGXrPnsjcKpYHXATzMc9wnlWbuTzqWbqkvM7
-ya49XtXpSauI28m06lYEfdjXXItrna7u1Kxn02j/ZdJPmLT4KOy2QeDGJopezxB2
-N1m0wYzl/x50+EWUWQ1veg==
------END PRIVATE KEY-----";
+/// A test-only RSA key generated fresh for this test process with the `openssl`
+/// CLI; it authenticates nothing and no private key is committed (see
+/// `no_committed_keys` in the `sentinel` crate tests).
+fn test_key() -> &'static str {
+    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        let out = std::process::Command::new("openssl")
+            .args([
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+            ])
+            .output()
+            .expect("the openssl CLI must be installed to generate the test-only App key");
+        assert!(out.status.success(), "openssl genpkey failed");
+        String::from_utf8(out.stdout).expect("PEM is ASCII")
+    })
+}
 
 const INSTALLATION: u64 = 42;
 const ORG: u64 = 73;
@@ -66,11 +57,14 @@ const ALICE_ID: u64 = 1001;
 
 struct World {
     org_login: String,
+    /// The login the installation snapshot reports when it differs from `org_login`.
+    snapshot_login: Option<String>,
     logins: HashMap<u64, String>,
     members: HashMap<String, (u64, &'static str, &'static str)>,
     perms: HashMap<(String, String), (u64, &'static str, &'static str)>,
     fail_memberships: Option<(u16, Option<i64>)>,
     fail_tokens: Option<u16>,
+    fail_repos: HashMap<String, u16>,
     requests: Vec<String>,
 }
 
@@ -88,11 +82,13 @@ impl Stub {
         let addr = listener.local_addr().unwrap();
         let world = Arc::new(Mutex::new(World {
             org_login: "acme".into(),
+            snapshot_login: None,
             logins: HashMap::new(),
             members: HashMap::new(),
             perms: HashMap::new(),
             fail_memberships: None,
             fail_tokens: None,
+            fail_repos: HashMap::new(),
             requests: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -219,7 +215,7 @@ fn route(world: &World, method: &str, path: &str) -> (u16, Option<i64>, serde_js
             serde_json::json!({
                 "id": INSTALLATION,
                 "app_id": 1234,
-                "account": {"id": ORG, "login": world.org_login, "type": "Organization"},
+                "account": {"id": ORG, "login": world.snapshot_login.as_ref().unwrap_or(&world.org_login), "type": "Organization"},
                 "suspended_at": null,
                 "permissions": {"contents": "read", "checks": "write", "members": "read"},
             }),
@@ -276,6 +272,9 @@ fn route(world: &World, method: &str, path: &str) -> (u16, Option<i64>, serde_js
             }
         }
         ("GET", ["repos", owner, name, "collaborators", login, "permission"]) => {
+            if let Some(status) = world.fail_repos.get(&format!("{owner}/{name}")) {
+                return (*status, None, serde_json::json!({"message": "no"}));
+            }
             match world
                 .perms
                 .get(&(format!("{owner}/{name}"), (*login).to_owned()))
@@ -311,6 +310,7 @@ struct Fixture {
     app: Arc<sentinel_github::app::App>,
     tenant: TenantId,
     repo: RepoId,
+    lib: RepoId,
     alice: UserId,
     notices: Arc<Mutex<Vec<String>>>,
 }
@@ -324,13 +324,18 @@ fn fixture() -> Fixture {
         Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
     let stub = Stub::start();
     let app = Arc::new(
-        sentinel_github::app::App::new(1234, TEST_KEY)
+        sentinel_github::app::App::new(1234, test_key())
             .unwrap()
             .with_endpoint(&stub.endpoint())
             .unwrap(),
     );
-    let (tenant, repo, alice, root) =
-        (TenantId::new(), RepoId::new(), UserId::new(), UserId::new());
+    let (tenant, repo, lib, alice, root) = (
+        TenantId::new(),
+        RepoId::new(),
+        RepoId::new(),
+        UserId::new(),
+        UserId::new(),
+    );
     let now = UnixMillis::now();
     let admin = Principal::new(root, Permissions::ALL, None, None);
     store
@@ -382,6 +387,27 @@ fn fixture() -> Fixture {
                 &key,
                 now,
             )?;
+            auth::create_repo(tx, admin, tenant, lib, "lib", now)?;
+            sources::bind(
+                tx,
+                Authority::HostLocal,
+                Some(root),
+                sources::Update {
+                    repo: lib,
+                    expected: 0,
+                    binding: &Binding {
+                        remote: "https://github.com/acme/lib.git".into(),
+                        allowed_refs: vec!["refs/heads/main".into()],
+                        pipeline_path: ".sentinel.yml".into(),
+                        trust: String::new(),
+                    },
+                    credential: &Credential::Public,
+                    forge: Some((installation, GITHUB_REPO + 1)),
+                },
+                &["https://github.com".into()],
+                &key,
+                now,
+            )?;
             github_members::set_backing_trusted(tx, tenant, true, now)
         })
         .unwrap();
@@ -401,6 +427,7 @@ fn fixture() -> Fixture {
         app,
         tenant,
         repo,
+        lib,
         alice,
         notices: Arc::new(Mutex::new(Vec::new())),
     }
@@ -457,7 +484,11 @@ impl Fixture {
     }
 
     fn grant(&self) -> Option<i64> {
-        let (tenant, alice, repo) = (self.tenant, self.alice, self.repo);
+        self.grant_on(self.repo)
+    }
+
+    fn grant_on(&self, repo: RepoId) -> Option<i64> {
+        let (tenant, alice) = (self.tenant, self.alice);
         self.store
             .read(move |c| {
                 Ok(c.query_row(
@@ -683,4 +714,79 @@ fn a_person_without_a_linked_account_is_never_asked_about() {
         "{:?}",
         f.stub.requests()
     );
+}
+
+#[test]
+fn a_repository_that_cannot_be_read_does_not_stop_the_walk_over_the_rest() {
+    let f = fixture();
+    f.stub.with(|w| {
+        w.perms.insert(
+            ("acme/lib".into(), "alice-gh".into()),
+            (ALICE_ID, "read", "read"),
+        );
+        w.fail_repos.insert("acme/lib".into(), 500);
+    });
+    let _lane = f.start();
+    assert_eq!(f.pass(), "joined");
+    assert_eq!(f.role(), Some(2));
+    assert_eq!(f.grant(), Some(3), "the readable repository is settled");
+    assert_eq!(f.grant_on(f.lib), None, "unknown grants nothing new");
+
+    f.stub.with(|w| w.fail_repos.clear());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while f.grant_on(f.lib).is_none() {
+        assert!(Instant::now() < deadline, "the repository was never read");
+        f.pass();
+    }
+    assert_eq!(f.grant_on(f.lib), Some(1), "read maps to read");
+
+    // An existing grant survives a repository that stops answering.
+    f.stub.with(|w| {
+        w.fail_repos.insert("acme/lib".into(), 502);
+    });
+    f.pass();
+    assert_eq!(f.grant_on(f.lib), Some(1), "unknown keeps what exists");
+    assert_eq!(f.grant(), Some(3));
+}
+
+#[test]
+fn a_repository_the_installation_cannot_see_withdraws_only_that_grant() {
+    let f = fixture();
+    f.stub.with(|w| {
+        w.perms.insert(
+            ("acme/lib".into(), "alice-gh".into()),
+            (ALICE_ID, "read", "read"),
+        );
+    });
+    let _lane = f.start();
+    assert_eq!(f.pass(), "joined");
+    assert_eq!(f.grant_on(f.lib), Some(1));
+
+    f.stub.with(|w| {
+        w.fail_repos.insert("acme/lib".into(), 404);
+    });
+    f.pass();
+    assert_eq!(f.grant_on(f.lib), None, "a confirmed 404 is no access");
+    assert_eq!(f.grant(), Some(3), "the other repository is untouched");
+    assert_eq!(f.role(), Some(2), "the person is still a member");
+}
+
+#[test]
+fn a_renamed_organization_answering_404_for_every_repository_withdraws_nothing() {
+    let f = fixture();
+    let _lane = f.start();
+    assert_eq!(f.pass(), "joined");
+    assert_eq!(f.grant(), Some(3));
+
+    // The membership read still works (a cached session), but every repository path is stale and the
+    // fresh installation snapshot names another login: the 404s are not believed.
+    f.stub.with(|w| {
+        w.snapshot_login = Some("acme-renamed".into());
+        w.fail_repos.insert("acme/app".into(), 404);
+        w.fail_repos.insert("acme/lib".into(), 404);
+    });
+    let outcome = f.pass();
+    assert_eq!(outcome, "kept: unreachable");
+    assert_eq!(f.role(), Some(2));
+    assert_eq!(f.grant(), Some(3));
 }
