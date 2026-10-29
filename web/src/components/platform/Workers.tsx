@@ -5,7 +5,7 @@ import { useState, type FormEvent } from "react";
 import { api, apiBytes, ApiError } from "../../lib/api.ts";
 import { StepUpDeclined, useRetryWait, withStepUp } from "../../lib/act.tsx";
 import {
-  type Ceilings, type CeilingField, digestCommand, digestVerdict, enrollmentError, fmtUtc, identityCommand, installCommand, parseIdentityLine,
+  type Ceilings, type CeilingField, digestCommand, digestVerdict, enrollmentError, fmtUtc, identityCommand, installCommand, parseIdentityLine, statedDigest,
   parseTerms, rollbackCommand, SCRIPT_NAME, secretFileCommand, sha256Hex, uninstallCommand, type Context, type Verdict,
 } from "../../lib/enrollment.ts";
 import { cpu as fmtCpu, fmtBytes } from "../../lib/format.ts";
@@ -222,7 +222,7 @@ export function Workers({ initial }: { initial: WorkersPage | null }) {
       const computed = await sha256Hex(bytes);
       const stated = [t.sha256, current?.transports?.[t.transport].bootstrap_sha256];
       const verdict = digestVerdict(computed, stated);
-      const shown = stated.find((d): d is string => typeof d === "string" && d !== "") ?? null;
+      const shown = statedDigest(stated);
       if (verdict === "mismatch") {
         setScript({ kind: "mismatch", computed: computed ?? "", stated: shown });
         return null;
@@ -362,7 +362,13 @@ export function Workers({ initial }: { initial: WorkersPage | null }) {
                   script.verdict === "verified" ? (
                     <p>The script's SHA-256 matches the controller digest, so the copy is intact: <code className="break-all font-mono text-xs">{script.computed}</code></p>
                   ) : (
-                    <p>This browser could not compute a SHA-256 (it needs HTTPS or localhost), so nothing was compared. Before running it, check on the machine that <code className="font-mono text-xs">{digestCommand()}</code> prints <code className="break-all font-mono text-xs">{script.stated}</code></p>
+                    <p>This browser could not compute a SHA-256 (it needs HTTPS or localhost), so nothing was compared.{" "}
+                      {script.stated ? (
+                        <>Before running it, check on the machine that <code className="font-mono text-xs">{digestCommand()}</code> prints <code className="break-all font-mono text-xs">{script.stated}</code></>
+                      ) : (
+                        <>The controller stated no digest for this script either, so there is nothing to check it against. Reload the page over HTTPS before running it.</>
+                      )}
+                    </p>
                   )
                 ) : null}
                 {script.kind === "mismatch" ? (

@@ -112,6 +112,10 @@ export function digestVerdict(computed: string | null, stated: readonly (string 
   return known.length > 0 && known.every((d) => d === computed) ? "verified" : "mismatch";
 }
 
+/** The first digest the controller actually stated, or null when it stated none; the page never prints a digest it was not given. */
+export const statedDigest = (stated: readonly (string | null | undefined)[]): string | null =>
+  stated.find((d): d is string => typeof d === "string" && d !== "") ?? null;
+
 /** What a failed call told us, as the page needs it. `details` is the controller's, never the person's input. */
 export interface Failure { status: number; code: string; message: string; details?: Record<string, any> }
 export type Context = "issue" | "withdraw" | "node-key" | "download" | "uninstall" | "load";

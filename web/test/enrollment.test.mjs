@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   digestVerdict, enrollmentError, identityCommand, installCommand, MAX_GIB, parseIdentityLine, parseTerms, rollbackCommand,
-  scrub, secretFileCommand, sha256Hex, uninstallCommand, workerName,
+  scrub, secretFileCommand, sha256Hex, statedDigest, uninstallCommand, workerName,
 } from "../src/lib/enrollment.ts";
 
 const HEX = "0123456789abcdef".repeat(4);
@@ -140,4 +140,11 @@ test("without Web Crypto the digest is unavailable rather than wrong", async () 
   } finally {
     if (saved) Object.defineProperty(globalThis, "crypto", saved);
   }
+});
+
+test("the page prints only a digest the controller stated, never a null", () => {
+  assert.equal(statedDigest([null, undefined, ""]), null);
+  assert.equal(statedDigest([]), null);
+  assert.equal(statedDigest([null, HEX]), HEX);
+  assert.equal(statedDigest([HEX, "f".repeat(64)]), HEX);
 });
