@@ -118,6 +118,65 @@ fn a_record_names_its_source_and_compiler_even_outside_the_checkout() {
     assert!(rustc.starts_with("rustc "), "{rustc}");
 }
 
+/// The record names the build the runner was compiled from, so it stays true when the checkout
+/// is no longer readable or has moved on. With `GIT_DIR` pointing nowhere, the run-time `git` the
+/// runner used to ask fails and the old code refused to write.
+#[test]
+fn a_record_names_its_build_not_the_checkout_head() {
+    let head = Command::new("git")
+        .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned());
+    let Some(head) = head else {
+        return; // built outside a readable checkout: the build has no commit to name
+    };
+    let out = bench()
+        .env(
+            "GIT_DIR",
+            std::env::temp_dir().join("sentinel-bench-no-such-git-dir"),
+        )
+        .args([
+            "--runtime",
+            "direct",
+            "--samples",
+            "1",
+            "--warmup",
+            "0",
+            "--warm-state",
+            "warm",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let build = &record["build"];
+    assert_eq!(build["commit"], head.as_str(), "the build-time commit");
+    assert_eq!(record["source"]["git_commit"], head.as_str());
+    assert!(build["dirty"].is_boolean());
+    assert_eq!(build["debug_assertions"], cfg!(debug_assertions));
+    assert_eq!(
+        build["profile"],
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    assert!(!build["target"].as_str().unwrap().is_empty());
+    let exe = std::fs::read(env!("CARGO_BIN_EXE_sentinel-bench")).unwrap();
+    assert_eq!(
+        build["binary_blake3"],
+        blake3::hash(&exe).to_hex().to_string().as_str(),
+        "the digest of the running executable"
+    );
+}
+
 #[test]
 fn an_unwarmed_or_cold_declaration_is_labelled_unverified() {
     let out = bench()
