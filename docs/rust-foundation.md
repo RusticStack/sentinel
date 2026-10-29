@@ -23,7 +23,7 @@ The package is `0.1.0-dev`, MIT, and not published to crates.io.
 - Commit `Cargo.lock` because Sentinel is an application; use `--locked` for reproducible dependency resolution. Compiler/lockfile pins do not alone guarantee bit-for-bit builds across different host SDKs/linkers.
 - Do not set a global compilation target or `target-cpu=native`: developers build on their host by default, and portable release artifacts must not accidentally require the build machine's CPU features.
 - Keep Cargo's standard development/release profiles initially. LTO, allocator, panic strategy, codegen and CPU tuning need benchmark evidence.
-- Inherit the workspace lint that denies implicit unsafe operations inside unsafe functions. Every `unsafe` block needs a `// SAFETY:` comment stating its invariant ([AGENTS.md](../AGENTS.md)); dependencies are not rewritten to avoid their maintained implementations.
+- Inherit the workspace lint that denies implicit unsafe operations inside unsafe functions. Every `unsafe` block needs a `// SAFETY:` comment stating its invariant ([CLAUDE.md](../CLAUDE.md)); dependencies are not rewritten to avoid their maintained implementations.
 
 ## Platform and feature matrix
 

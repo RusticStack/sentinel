@@ -3,7 +3,7 @@
 #
 #   scripts/check-doc-links.sh [file.md ...]
 #
-# Without arguments it checks README.md, AGENTS.md, plan.md, TODO.md and docs/*.md. It checks
+# Without arguments it checks README.md, CLAUDE.md, plan.md, TODO.md and docs/*.md. It checks
 # relative links to files, and `#anchor` fragments against the target's headings using GitHub's
 # slug rules (lower case, punctuation dropped, spaces to hyphens, -1/-2 for repeated headings).
 # External links are not fetched. Links inside fenced code and inline code are ignored.
@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 if [ "$#" -gt 0 ]; then
   files=("$@")
 else
-  files=(README.md AGENTS.md plan.md TODO.md docs/*.md)
+  files=(README.md CLAUDE.md plan.md TODO.md docs/*.md)
 fi
 
 slugs() { # the anchors of one file's headings, one per line

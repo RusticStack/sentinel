@@ -46,7 +46,7 @@ if [ "$list" = 1 ]; then printf '%s\n' $STAGE_IDS; exit 0; fi
 [ -n "$out" ] || { echo "--out is required" >&2; exit 2; }
 src=$(cd "$src" 2>/dev/null && pwd) || { echo "--src is not a directory" >&2; exit 2; }
 case $src in /srv/sentinel|/srv/sentinel/*) echo "refusing to qualify inside /srv/sentinel" >&2; exit 2 ;; esac
-[ -f "$src/Cargo.toml" ] && [ -f "$src/AGENTS.md" ] || { echo "$src is not a Sentinel checkout" >&2; exit 2; }
+[ -f "$src/Cargo.toml" ] && [ -f "$src/CLAUDE.md" ] || { echo "$src is not a Sentinel checkout" >&2; exit 2; }
 mkdir -p "$out" || exit 2
 out=$(cd "$out" && pwd)
 case $out in /srv/sentinel|/srv/sentinel/*) echo "refusing to write inside /srv/sentinel" >&2; exit 2 ;; esac

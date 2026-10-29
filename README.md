@@ -120,7 +120,7 @@ Then follow [operator first run](docs/development.md#operator-first-run) to crea
 | Firecracker microVMs for Linux jobs | Implemented; networking, snapshots and verification open |
 | GitHub Actions runner mode and Windows jobs | Planned after v0.1 unless separately promoted |
 
-The v0.1 release still requires Part 24 correctness rework, deployment packaging, Q11–Q13, required microVM gaps, pilot/benchmark work, B09, B11 and the release gates. [TODO.md](TODO.md) is the authoritative task tracker; [plan.md](plan.md) explains the architecture and longer-term direction.
+The remaining v0.1 work is organized in waves in [TODO.md](TODO.md), the authoritative task tracker; [plan.md](plan.md) explains the architecture and longer-term direction.
 
 ## Documentation
 
@@ -134,7 +134,7 @@ Start with the task you want to accomplish:
 
 ## Contributing
 
-Bug reports and focused pull requests are welcome. Please read [the development guide](docs/development.md) and [AGENTS.md](AGENTS.md) before making changes, and discuss substantial features or architectural changes first.
+Bug reports and focused pull requests are welcome. Please read [the development guide](docs/development.md) and [CLAUDE.md](CLAUDE.md) before making changes, and discuss substantial features or architectural changes first.
 
 Keep pull requests focused, include behavior and failure-path tests where appropriate, and never commit credentials or production data. Commit messages and code must stay free of AI attribution; disclose AI-assisted work in the pull-request description instead.
 

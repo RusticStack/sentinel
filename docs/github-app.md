@@ -102,7 +102,7 @@ An unreachable controller can still create the App: everything outbound works â€
 
 ## Permissions and events
 
-Exactly what the controller uses today ([AGENTS.md](../AGENTS.md): a feature that needs more asks for it only when a tenant turns it on, so nothing for runner mode or migration):
+Exactly what the controller uses today ([CLAUDE.md](../CLAUDE.md): a feature that needs more asks for it only when a tenant turns it on, so nothing for runner mode or migration):
 
 | Permission | Access | Why |
 |---|---|---|
