@@ -998,8 +998,17 @@ impl Client {
         self.expect_done("put")
     }
 
-    /// Unpacks `paths` (relative to `guest_root`) from the guest into `host`.
-    fn get_into(&self, guest_root: &str, paths: Vec<String>, host: &Path) -> Result<()> {
+    /// Unpacks `paths` (relative to `guest_root`) from the guest into `host`. The guest is hostile, so the stream
+    /// is bounded: it may carry at most `*budget` bytes, which is what it has left of its declared disk. The bytes
+    /// it did carry are taken off the budget. A stream past the budget ends the connection (the guest is no longer
+    /// trusted to keep the protocol) and fails the call.
+    fn get_into(
+        &self,
+        guest_root: &str,
+        paths: Vec<String>,
+        host: &Path,
+        budget: &mut u64,
+    ) -> Result<()> {
         self.send(&Request::Get {
             root: guest_root.to_owned(),
             paths,
@@ -1015,19 +1024,17 @@ impl Client {
             ended: false,
             failed: None,
         };
-        let unpacked = {
-            let mut archive = tar::Archive::new(&mut input);
-            archive.set_preserve_permissions(true);
-            archive.set_preserve_mtime(true);
-            archive.set_overwrite(true);
-            archive.unpack(host)
-        };
-        let drained = input.finish();
+        let outcome = unpack_bounded(&mut input, host, budget);
+        if outcome
+            .as_ref()
+            .is_err_and(|e| e.kind() == io::ErrorKind::FileTooLarge)
+        {
+            self.close();
+        }
         if let Some(message) = input.failed {
             return Err(Error::Runtime(format!("get {guest_root}: {message}")));
         }
-        drained.map_err(Error::Io)?;
-        unpacked.map_err(Error::Io)
+        outcome.map_err(Error::Io)
     }
 }
 
@@ -1092,12 +1099,72 @@ impl Read for DataIn<'_> {
     }
 }
 
-impl DataIn<'_> {
-    fn finish(&mut self) -> io::Result<()> {
-        let mut sink = [0u8; 8192];
-        while self.read(&mut sink)? > 0 {}
-        Ok(())
+/// Bytes the guest may stream beyond its declared disk: tar headers and padding, and the end of the archive.
+const STREAM_SLACK: u64 = 64 << 20;
+
+/// What a guest may stream in one sync: what fits on its scratch disk (a tar of it carries the same bytes plus
+/// headers) and the slack. A sparse file, a hard-linked file archived once per link, or a stream that never ends
+/// all pass the disk but not this.
+fn stream_budget(scratch_bytes: u64) -> u64 {
+    scratch_bytes
+        .saturating_add(scratch_bytes / 8)
+        .saturating_add(STREAM_SLACK)
+}
+
+const STREAM_EXCEEDED: &str = "the guest streamed more than its declared disk";
+
+/// A reader that fails once more than `left` bytes have come through it.
+struct Capped<R> {
+    inner: R,
+    left: u64,
+    exceeded: bool,
+}
+
+impl<R: Read> Read for Capped<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.left == 0 {
+            // The budget is spent: only the end of the stream is acceptable now.
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => {
+                    self.exceeded = true;
+                    Err(io::Error::new(io::ErrorKind::FileTooLarge, STREAM_EXCEEDED))
+                }
+            };
+        }
+        let room = usize::try_from(self.left).unwrap_or(usize::MAX);
+        let want = out.len().min(room);
+        let n = self.inner.read(&mut out[..want])?;
+        self.left -= n as u64;
+        Ok(n)
     }
+}
+
+/// Unpacks a tar stream into `host` and reads the stream to its end so the next request starts on a frame
+/// boundary, taking at most `*budget` bytes from it; the bytes taken are subtracted. Every entry costs at least
+/// its 512-byte header, so the budget bounds the entry count and the length of the names as well as the data
+/// written. Past the budget the result is `ErrorKind::FileTooLarge` whatever the unpacker made of the cut stream.
+fn unpack_bounded(source: impl Read, host: &Path, budget: &mut u64) -> io::Result<()> {
+    let mut capped = Capped {
+        inner: source,
+        left: *budget,
+        exceeded: false,
+    };
+    let unpacked = {
+        let mut archive = tar::Archive::new(&mut capped);
+        archive.set_preserve_permissions(true);
+        archive.set_preserve_mtime(true);
+        archive.set_overwrite(true);
+        archive.unpack(host)
+    };
+    let drained = io::copy(&mut capped, &mut io::sink());
+    *budget = capped.left;
+    if capped.exceeded {
+        return Err(io::Error::new(io::ErrorKind::FileTooLarge, STREAM_EXCEEDED));
+    }
+    drained?;
+    unpacked
 }
 
 // ---------------------------------------------------------------- the VM
@@ -1140,6 +1207,8 @@ pub struct Vm {
     next_id: AtomicU32,
     /// Writable mounts: their guest path and the host directory they come back to.
     writable: Vec<(String, PathBuf)>,
+    /// What one sync may take from the guest's stream ([`stream_budget`]).
+    stream_budget: u64,
     /// Keeps image GC off this VM's root file system until the VM is gone.
     _image: Arc<ImageLease>,
     /// Set once the scope is confirmed stopped and the directory removed, so dropping the handle is then a no-op.
@@ -1677,6 +1746,7 @@ impl Vm {
             user: guest.user,
             next_id: AtomicU32::new(1),
             writable: Vec::new(),
+            stream_budget: stream_budget(limits.disk_bytes.max(1 << 30)),
             _image: guest.lease,
             gone: AtomicBool::new(false),
         };
@@ -1865,22 +1935,27 @@ impl Vm {
         workspace_paths: &[String],
         replaced: &[String],
     ) -> Result<()> {
+        // One budget for the whole sync: all of it comes off the guest's one disk.
+        let mut left = self.stream_budget;
         let patterns: Vec<&str> = workspace_paths.iter().map(String::as_str).collect();
-        self.pull_workspace(workspace, &patterns)?;
+        self.pull_workspace_within(workspace, &patterns, &mut left)?;
         for rel in replaced {
-            let host = workspace.join(rel);
-            // Only a real directory is replaced: a path the job's checkout made a link or a file is left to
-            // publication, which resolves it without following links.
-            if !fs::symlink_metadata(&host).is_ok_and(|m| m.is_dir()) {
+            // Only a real directory is replaced: a path the job's checkout made a link or a file, or one that
+            // lies behind such a link, is left to publication, which resolves it without following links.
+            if !clear_view(workspace, rel)? {
                 continue;
             }
-            clear_dir(&host)?;
-            self.client
-                .get_into(&guest_path(WORKSPACE_MOUNT), vec![rel.clone()], workspace)?;
+            self.client.get_into(
+                &guest_path(WORKSPACE_MOUNT),
+                vec![rel.clone()],
+                workspace,
+                &mut left,
+            )?;
         }
         for (guest, host) in &self.writable {
             clear_dir(host)?;
-            self.client.get_into(guest, vec![".".into()], host)?;
+            self.client
+                .get_into(guest, vec![".".into()], host, &mut left)?;
         }
         Ok(())
     }
@@ -1889,12 +1964,22 @@ impl Vm {
     /// them) back over the host copy. The agent returns literal paths, so each pattern is fetched as the
     /// directory it starts from and the host applies the glob to what arrived.
     pub fn pull_workspace(&self, workspace: &Path, patterns: &[&str]) -> Result<()> {
+        let mut left = self.stream_budget;
+        self.pull_workspace_within(workspace, patterns, &mut left)
+    }
+
+    fn pull_workspace_within(
+        &self,
+        workspace: &Path,
+        patterns: &[&str],
+        budget: &mut u64,
+    ) -> Result<()> {
         let roots = fetch_roots(patterns);
         if roots.is_empty() {
             return Ok(());
         }
         self.client
-            .get_into(&guest_path(WORKSPACE_MOUNT), roots, workspace)
+            .get_into(&guest_path(WORKSPACE_MOUNT), roots, workspace, budget)
     }
 
     pub fn destroy(self) -> Result<()> {
@@ -2030,16 +2115,85 @@ fn guest_path(container: &str) -> String {
     format!("{JOB_ROOT}{container}")
 }
 
+/// Opens `path` as a directory, refusing a link at its last component.
+fn open_dir(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// Where the directory held by `held` can be named for as long as it is held, whatever happens to its path.
+fn through(held: &fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()))
+}
+
+/// Empties `dir`, which must be a directory and not a link to one.
 fn clear_dir(dir: &Path) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
+    clear_held(&open_dir(dir)?)
+}
+
+/// Empties the directory held by `held`: every name is taken relative to the held descriptor, so nothing the
+/// path leading to it may become matters.
+fn clear_held(held: &fs::File) -> Result<()> {
+    let held = through(held);
+    for entry in fs::read_dir(&held)? {
         let entry = entry?;
+        let path = held.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            crate::workspace::remove_tree(&entry.path())?;
+            crate::workspace::remove_tree(&path)?;
         } else {
-            fs::remove_file(entry.path())?;
+            fs::remove_file(&path)?;
         }
     }
     Ok(())
+}
+
+/// Opens the directory `rel` names beneath `base`, one component at a time and without following a link at any
+/// of them, so a link the job's checkout planted can neither stand for a component nor for the last one. `None`
+/// when some component is missing, is a link or is not a directory, or when `rel` leaves `base` or names it.
+fn open_view(base: &Path, rel: &str) -> io::Result<Option<fs::File>> {
+    use std::path::Component;
+    let mut held = open_dir(base)?;
+    let mut named = false;
+    for part in Path::new(rel).components() {
+        match part {
+            Component::Normal(name) => {
+                named = true;
+                let next = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(through(&held).join(name));
+                held = match next {
+                    Ok(next) => next,
+                    Err(e)
+                        if e.kind() == io::ErrorKind::NotFound
+                            || matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e),
+                };
+            }
+            Component::CurDir => {}
+            _ => return Ok(None),
+        }
+    }
+    Ok(named.then_some(held))
+}
+
+/// Empties the cache view `rel` of `workspace` before the guest's copy replaces it. False, with nothing
+/// touched, when `rel` is not a real directory reached through real directories only: the checkout is the job's
+/// and may hold a link at any level (`link -> /`), and clearing through it would empty a directory of the host.
+fn clear_view(workspace: &Path, rel: &str) -> Result<bool> {
+    match open_view(workspace, rel)? {
+        Some(held) => {
+            clear_held(&held)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 fn scratch_disk(path: &Path, bytes: u64) -> Result<()> {
@@ -3544,5 +3698,190 @@ mod tests {
         );
         assert!(!exists(&root, attempt));
         assert!(owned(&root).is_empty());
+    }
+
+    // ------------------------------------------------------------ host side of a sync
+
+    /// A workspace whose checkout planted `link -> outside`, with `outside/sub/keep` standing for a host
+    /// directory the worker owns (another tenant's cache, say).
+    fn planted() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(outside.join("sub")).unwrap();
+        fs::write(outside.join("sub/keep"), b"precious").unwrap();
+        fs::write(outside.join("also"), b"precious").unwrap();
+        let workspace = temp.path().join("ws");
+        fs::create_dir(&workspace).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("link")).unwrap();
+        (temp, workspace, outside)
+    }
+
+    #[test]
+    fn a_cache_view_behind_a_checkout_symlink_is_never_cleared() {
+        let (_temp, workspace, outside) = planted();
+        // The link as an intermediate component, as the last one, and a link below a real directory.
+        fs::create_dir(workspace.join("real")).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("real/hop")).unwrap();
+        for rel in ["link/sub", "link", "real/hop/sub", "real/hop", "link/./sub"] {
+            assert!(
+                !clear_view(&workspace, rel).unwrap(),
+                "{rel} was treated as a view"
+            );
+        }
+        assert_eq!(fs::read(outside.join("sub/keep")).unwrap(), b"precious");
+        assert_eq!(fs::read(outside.join("also")).unwrap(), b"precious");
+        assert!(fs::symlink_metadata(workspace.join("link")).is_ok());
+    }
+
+    #[test]
+    fn a_view_that_leaves_the_workspace_or_names_nothing_is_not_cleared() {
+        let (temp, workspace, outside) = planted();
+        for rel in ["", ".", "..", "../outside", "/", "/etc", "a/../../outside"] {
+            assert!(
+                !clear_view(&workspace, rel).unwrap(),
+                "{rel:?} was treated as a view"
+            );
+        }
+        assert!(
+            !clear_view(&workspace, "absent/dir").unwrap(),
+            "a missing view is skipped"
+        );
+        fs::write(workspace.join("file"), b"x").unwrap();
+        assert!(
+            !clear_view(&workspace, "file").unwrap(),
+            "a file is not a view"
+        );
+        assert!(outside.join("sub/keep").exists() && temp.path().join("outside/also").exists());
+        assert!(workspace.join("file").exists());
+    }
+
+    #[test]
+    fn a_real_view_is_emptied_in_place_and_its_links_are_removed_not_followed() {
+        let (_temp, workspace, outside) = planted();
+        let view = workspace.join("vendor/deps");
+        fs::create_dir_all(view.join("nested/deeper")).unwrap();
+        fs::write(view.join("nested/deeper/old"), b"x").unwrap();
+        fs::write(view.join("top"), b"x").unwrap();
+        // A link inside the view is removed as a link; what it points at is not touched.
+        std::os::unix::fs::symlink(&outside, view.join("escape")).unwrap();
+        fs::write(workspace.join("vendor/sibling"), b"stay").unwrap();
+        assert!(clear_view(&workspace, "vendor/deps").unwrap());
+        assert!(view.is_dir(), "the view itself stays");
+        assert_eq!(fs::read_dir(&view).unwrap().count(), 0);
+        assert_eq!(fs::read(workspace.join("vendor/sibling")).unwrap(), b"stay");
+        assert_eq!(fs::read(outside.join("sub/keep")).unwrap(), b"precious");
+    }
+
+    #[test]
+    fn a_mount_directory_that_became_a_link_is_refused_not_emptied() {
+        let (_temp, workspace, outside) = planted();
+        assert!(clear_dir(&workspace.join("link")).is_err());
+        assert_eq!(fs::read(outside.join("sub/keep")).unwrap(), b"precious");
+        fs::create_dir(workspace.join("mount")).unwrap();
+        fs::write(workspace.join("mount/x"), b"x").unwrap();
+        clear_dir(&workspace.join("mount")).unwrap();
+        assert_eq!(fs::read_dir(workspace.join("mount")).unwrap().count(), 0);
+    }
+
+    fn small_tar() -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, body) in [("one.txt", &b"first"[..]), ("dir/two.txt", &b"second"[..])] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, body).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    /// The header of a regular file that claims `size` bytes, as the agent's `append_dir_all` writes for a sparse
+    /// file: the apparent length, not what is allocated.
+    fn claiming(name: &str, size: u64) -> Vec<u8> {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(name).unwrap();
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_cksum();
+        header.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn a_stream_within_its_budget_unpacks_and_is_charged_by_what_it_carried() {
+        let host = tempfile::tempdir().unwrap();
+        let tar = small_tar();
+        let mut budget = tar.len() as u64 + 4096;
+        unpack_bounded(io::Cursor::new(tar.clone()), host.path(), &mut budget).unwrap();
+        assert_eq!(fs::read(host.path().join("one.txt")).unwrap(), b"first");
+        assert_eq!(
+            fs::read(host.path().join("dir/two.txt")).unwrap(),
+            b"second"
+        );
+        assert_eq!(budget, 4096, "the whole archive was charged");
+        // Exactly the budget is allowed; one byte less is not.
+        let mut exact = tar.len() as u64;
+        unpack_bounded(io::Cursor::new(tar.clone()), host.path(), &mut exact).unwrap();
+        assert_eq!(exact, 0);
+        let mut short = tar.len() as u64 - 1;
+        let error = unpack_bounded(io::Cursor::new(tar), host.path(), &mut short).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+    }
+
+    #[test]
+    fn a_guest_cannot_stream_a_sparse_file_past_its_declared_disk() {
+        use std::os::unix::fs::MetadataExt;
+        let host = tempfile::tempdir().unwrap();
+        // `truncate -s 1T` in the guest: a header that claims a terabyte, then zeros for as long as it is read.
+        let stream = io::Cursor::new(claiming("big", 1 << 40)).chain(io::repeat(0));
+        let mut budget = 1 << 20;
+        let error = unpack_bounded(stream, host.path(), &mut budget).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(error.to_string(), STREAM_EXCEEDED);
+        let written = fs::metadata(host.path().join("big"))
+            .map(|m| m.blocks() * 512)
+            .unwrap_or(0);
+        assert!(
+            written <= 1 << 20,
+            "{written} bytes reached the host disk past a 1 MiB budget"
+        );
+    }
+
+    #[test]
+    fn a_guest_cannot_keep_streaming_after_the_archive_ends() {
+        let host = tempfile::tempdir().unwrap();
+        // A well-formed archive followed by a stream that never stops, which a drain-to-the-end would follow forever.
+        let stream = io::Cursor::new(small_tar()).chain(io::repeat(0));
+        let mut budget = 1 << 20;
+        let error = unpack_bounded(stream, host.path(), &mut budget).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn a_flood_of_entries_is_bounded_by_the_header_each_one_costs() {
+        let host = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        for i in 0..2000 {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("f{i}"), io::empty())
+                .unwrap();
+        }
+        let tar = builder.into_inner().unwrap();
+        // 2000 headers of 512 bytes are a megabyte: a budget of 100 KiB admits about 200 of them, no more.
+        let mut budget = 100 << 10;
+        let error = unpack_bounded(io::Cursor::new(tar), host.path(), &mut budget).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        assert!(fs::read_dir(host.path()).unwrap().count() <= 200);
+    }
+
+    #[test]
+    fn the_stream_budget_is_the_declared_disk_plus_slack() {
+        assert_eq!(stream_budget(0), STREAM_SLACK);
+        assert_eq!(stream_budget(8 << 30), (8 << 30) + (1 << 30) + STREAM_SLACK);
+        assert_eq!(stream_budget(u64::MAX), u64::MAX);
     }
 }
