@@ -168,6 +168,10 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("migrations/062_worker_enrollment_policy.sql"),
     ),
     (63, include_str!("migrations/063_host_policy.sql")),
+    (
+        64,
+        include_str!("migrations/064_provenance_actor_put_marks_and_check_head_index.sql"),
+    ),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -181,6 +185,7 @@ pub const READABLE_BY: &[(u32, u32)] = &[
     (53, 51),
     (57, 56),
     (58, 57),
+    (64, 63),
 ];
 
 pub fn readable_by(version: u32) -> u32 {

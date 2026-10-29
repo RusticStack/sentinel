@@ -1,7 +1,7 @@
 //! Values are what the authorizing adapter supplied, never inferred from a ref, so a generic Git event cannot claim PR metadata.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use sentinel_core::{DeliveryId, RepoId, RunId, TenantId, UnixMillis};
+use sentinel_core::{DeliveryId, RepoId, RunId, TenantId, UnixMillis, UserId};
 
 use crate::{Error, Result};
 
@@ -63,12 +63,24 @@ pub fn insert(
     run: RunId,
     now: UnixMillis,
 ) -> Result<()> {
+    insert_with_actor(tx, provenance, run, now, None)
+}
+
+/// A manual run also records the Sentinel user (or service account) who started it. A webhook run has no
+/// such principal: the provider's sender is text its author chose, so it is not stored as one.
+pub fn insert_with_actor(
+    tx: &Transaction<'_>,
+    provenance: &Provenance,
+    run: RunId,
+    now: UnixMillis,
+    actor: Option<UserId>,
+) -> Result<()> {
     provenance.check()?;
     tx.execute(
         "INSERT INTO run_provenance(run_id, tenant_id, repo_id, trigger, delivery_id, provider,
             ref_name, old_sha, new_sha, head_sha, base_sha, merge_sha, pipeline_sha,
-            pipeline_path, pipeline_digest, pr_number, created_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            pipeline_path, pipeline_digest, pr_number, created_ms, actor_user_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             run.as_bytes(),
             provenance.tenant.as_bytes(),
@@ -86,7 +98,8 @@ pub fn insert(
             provenance.pipeline_path,
             provenance.pipeline_digest.as_slice(),
             provenance.pr_number.map(|n| n as i64),
-            now.0
+            now.0,
+            actor.as_ref().map(UserId::as_bytes)
         ],
     )?;
     Ok(())

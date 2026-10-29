@@ -1065,3 +1065,52 @@ fn the_candidate_limit_bounds_a_rerequest() {
     );
     assert_eq!(outcome, "rerequest_limit");
 }
+
+#[test]
+fn the_rerequest_lookups_are_index_ranges() {
+    let f = fixture();
+    let plan_of = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> String {
+        let mut stmt = f
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map(params, |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        rows.join(" | ")
+    };
+    let id = [0u8; 16];
+    let candidates = plan_of(
+        github_events::RERUN_CANDIDATES_SQL,
+        &[&id.as_slice(), &SHA_B, &Some(1i64), &"x", &1i64],
+    );
+    assert!(
+        candidates.contains("check_publications_head"),
+        "a rerequest finds a head's runs on its index: {candidates}"
+    );
+    assert!(
+        !candidates.contains("SCAN check_publications"),
+        "{candidates}"
+    );
+    let stale = plan_of(github_events::RERUN_STALE_SQL, &[&id.as_slice()]);
+    assert!(
+        stale.contains("provenance_by_repo"),
+        "the newer-run check is a range of the repository's runs: {stale}"
+    );
+    assert!(!stale.contains("SCAN newer"), "{stale}");
+}
+
+#[test]
+fn a_runs_recorded_actor_cannot_be_rewritten() {
+    let mut f = fixture();
+    let (run, _) = create_run(&mut f, NOW);
+    let alice = [7u8; 16];
+    f.conn
+        .execute(
+            "UPDATE run_provenance SET actor_user_id = ?2 WHERE run_id = ?1",
+            rusqlite::params![run.as_bytes().as_slice(), alice.as_slice()],
+        )
+        .expect_err("provenance is written once");
+}

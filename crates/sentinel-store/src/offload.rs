@@ -64,9 +64,23 @@ pub fn unreplicated(conn: &Connection, limit: u32) -> Result<Vec<ObjectRef>> {
     )
 }
 
+/// Marks a window of objects before their bytes are sent, in one write. A row deleted while marked queues
+/// the S3 delete, so a crash between the PUT and `replicated` cannot leave a copy nothing removes.
+pub fn mark_puts(tx: &Transaction<'_>, objects: &[ObjectRef]) -> Result<()> {
+    let mut stmt =
+        tx.prepare_cached("INSERT OR IGNORE INTO s3_puts(tenant_id, digest) VALUES (?1, ?2)")?;
+    for object in objects {
+        stmt.execute(params![
+            object.tenant.as_bytes().as_slice(),
+            object.digest.as_bytes().as_slice()
+        ])?;
+    }
+    Ok(())
+}
+
 pub fn replicated(tx: &Transaction<'_>, object: &ObjectRef, now: UnixMillis) -> Result<bool> {
-    Ok(tx
-        .prepare_cached(
+    let recorded =
+        tx.prepare_cached(
             "UPDATE objects SET remote_ms = ?3
              WHERE tenant_id = ?1 AND digest = ?2 AND remote_ms IS NULL",
         )?
@@ -74,8 +88,16 @@ pub fn replicated(tx: &Transaction<'_>, object: &ObjectRef, now: UnixMillis) -> 
             object.tenant.as_bytes().as_slice(),
             object.digest.as_bytes().as_slice(),
             now.0
-        ])?
-        == 1)
+        ])? == 1;
+    if recorded {
+        // The row now says the copy exists, so the mark is spent.
+        tx.prepare_cached("DELETE FROM s3_puts WHERE tenant_id = ?1 AND digest = ?2")?
+            .execute(params![
+                object.tenant.as_bytes().as_slice(),
+                object.digest.as_bytes().as_slice()
+            ])?;
+    }
+    Ok(recorded)
 }
 
 pub fn evictable(conn: &Connection, limit: u32) -> Result<Vec<ObjectRef>> {

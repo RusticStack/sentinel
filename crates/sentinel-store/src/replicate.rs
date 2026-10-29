@@ -635,7 +635,15 @@ impl Replicator {
         };
         let full = due.len() >= OBJECTS_PER_PASS as usize;
         let mut progressed = false;
-        for object in due.into_iter().take(OBJECTS_PER_PASS as usize) {
+        let window: Vec<ObjectRef> = due.into_iter().take(OBJECTS_PER_PASS as usize).collect();
+        if !window.is_empty() {
+            let marked = window.clone();
+            self.store
+                .writer()
+                .write(move |tx| offload::mark_puts(tx, &marked))
+                .map_err(|e| e.to_string())?;
+        }
+        for object in window {
             let item = Item::Object(object.tenant, object.digest);
             match self.replicate(&object) {
                 Ok(()) => {

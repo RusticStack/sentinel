@@ -389,7 +389,7 @@ fn storage_work_killed_at_staggered_points_leaves_only_what_the_sweeps_collect()
     );
 
     // Every unreferenced object is gone with its file; the kept ones are all evicted. A kill between an eviction's commit and
-    // its unlink can leave that file behind: it belongs to an evicted row, so it is counted here and not asserted away.
+    // its unlink leaves that file behind, and the recovery above removed it (`evicted_leftovers`).
     let (rows, evicted_rows): (i64, i64) = store
         .read(|c| {
             Ok(
@@ -404,8 +404,11 @@ fn storage_work_killed_at_staggered_points_leaves_only_what_the_sweeps_collect()
         (EVICTABLE, EVICTABLE)
     );
     let left = files(&data.join("objects")).len();
-    assert!(left <= EVICTABLE, "{left} files for {EVICTABLE} rows");
-    eprintln!("{left} files of evicted objects were left on disk by the kills");
+    assert_eq!(left, 0, "{left} files of evicted objects were left on disk");
+    eprintln!(
+        "{} files of evicted objects were left by the kills and removed by recovery",
+        recovery.evicted_leftovers
+    );
 
     // The counters equal the rows.
     let (local, held): (u64, i64) = store

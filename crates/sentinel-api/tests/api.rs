@@ -873,6 +873,22 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     assert_eq!(status, 201, "{run}");
     let run_id = run["id"].as_str().unwrap().to_owned();
     assert_eq!(run["state"], "pending");
+    let actor: Option<Vec<u8>> = d
+        .store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT actor_user_id FROM run_provenance WHERE trigger = 'manual'
+                 ORDER BY created_ms DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(
+        actor.as_deref(),
+        Some(d.root.as_bytes().as_slice()),
+        "a manual run names the user who started it"
+    );
     assert_eq!(run["jobs"].as_array().unwrap().len(), 2);
     assert_eq!(run["jobs"][0]["name"], "build");
     assert_eq!(run["jobs"][0]["state"], "queued");

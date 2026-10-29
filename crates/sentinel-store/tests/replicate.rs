@@ -1638,3 +1638,66 @@ fn a_full_backlog_does_not_evict_for_pressure() {
     );
     assert!(f.local(a));
 }
+
+fn put_marks(f: &Fixture) -> i64 {
+    f.store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM s3_puts", [], |r| r.get(0))?))
+        .unwrap()
+}
+
+fn delete_row(f: &Fixture, digest: Digest) {
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "DELETE FROM objects WHERE tenant_id = ?1 AND digest = ?2",
+                rusqlite::params![tenant.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_row_removed_after_its_bytes_may_have_been_sent_queues_the_remote_delete() {
+    let f = fixture();
+    let sent = f.put(b"sent before the crash");
+    let unsent = f.put(b"never sent");
+    let object = f
+        .store
+        .read(|c| offload::unreplicated(c, 2))
+        .unwrap()
+        .into_iter()
+        .find(|o| o.digest == sent)
+        .unwrap();
+    // The replicator marked the object, the PUT reached the bucket, and the process died before the record.
+    f.store
+        .writer()
+        .write(move |tx| offload::mark_puts(tx, &[object]))
+        .unwrap();
+    assert_eq!(put_marks(&f), 1);
+    delete_row(&f, unsent);
+    assert_eq!(
+        queued_deletes(&f),
+        0,
+        "a row that was never marked sent nothing"
+    );
+    delete_row(&f, sent);
+    assert_eq!(
+        queued_deletes(&f),
+        1,
+        "the marked row's copy is queued for removal"
+    );
+    assert_eq!(put_marks(&f), 0, "the mark leaves with the row");
+}
+
+#[test]
+fn a_recorded_copy_leaves_no_mark_behind() {
+    let f = fixture();
+    let digest = f.put(b"copied once");
+    let r = f.replicator(SETTINGS);
+    r.pass().unwrap();
+    assert!(remote_ms(&f, digest).is_some());
+    assert_eq!(put_marks(&f), 0, "replicated() spends the mark");
+}
