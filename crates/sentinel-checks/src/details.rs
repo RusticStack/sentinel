@@ -22,13 +22,16 @@ pub struct Details {
 }
 
 impl Details {
-    /// `base` is the deployment-facing origin (`https://ci.example.com`); a
-    /// trailing slash is dropped and an empty one means no links.
+    /// `base` is the web interface's origin (`https://ci.example.com`); a
+    /// trailing slash is dropped. Anything that is not an `http(s)` origin
+    /// (empty, a path prefix, another scheme) means no links: the interface is
+    /// served at the root of its origin, so a prefixed base would publish a
+    /// link that never resolves and a completed check is never updated again.
     pub fn new(base: Option<String>) -> Details {
         Details {
             base: base
                 .map(|url| url.trim_end_matches('/').to_owned())
-                .filter(|url| !url.is_empty()),
+                .filter(|url| is_web_origin(url)),
         }
     }
 
@@ -51,6 +54,12 @@ impl Details {
         }
         Some(url)
     }
+}
+
+fn is_web_origin(url: &str) -> bool {
+    (url.starts_with("https://") || url.starts_with("http://"))
+        && sentinel_github::manifest::is_origin(url)
+        && !url.contains(['?', '#'])
 }
 
 #[cfg(test)]
@@ -109,6 +118,27 @@ mod tests {
             details.of(&publication(Some(run), "not a job?x=1&y")),
             Some(format!("https://ci.example.com/runs/{run}"))
         );
+    }
+
+    #[test]
+    fn a_base_that_is_not_a_web_origin_publishes_no_link_instead_of_a_dead_one() {
+        let run = RunId::new();
+        for base in [
+            "https://ci.example.com/sentinel",
+            "https://ci.example.com/sentinel/",
+            "https://ci.example.com/?x=1",
+            "https://ci.example.com#top",
+            "ftp://ci.example.com",
+            "ci.example.com",
+        ] {
+            let details = Details::new(Some(base.into()));
+            assert_eq!(details.run(run), None, "{base}");
+            assert_eq!(details.of(&publication(Some(run), AGGREGATE_SCOPE)), None);
+        }
+        for base in ["https://ci.example.com", "http://127.0.0.1:3000/"] {
+            let details = Details::new(Some(base.into()));
+            assert!(details.run(run).is_some(), "{base}");
+        }
     }
 
     #[test]
