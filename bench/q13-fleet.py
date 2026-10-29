@@ -31,11 +31,13 @@ FLEET.json (real mode):
                        "bootstrap": "/root/sentinel-worker-bootstrap.sh"},
                "arm": {"exec": [...], "arch": "aarch64", "sentinel": "..."}},
      "tailcat": true,
-     "job_driver": ["/root/q13-job.sh"]}
+     "job_driver": ["python3", "bench/q13-job.py", "--config", "/root/q13-job.json"]}
 
 `job_driver` is run as `job_driver ARCH OS ISOLATION CPU_MILLIS MEMORY_BYTES DISK_BYTES` and prints
 one JSON line `{"worker": "wrk_..."|null, "reason": "..."|null}`: where a real executor placed a
-probe job, or the queue reason it waits with. It is the only way this harness creates jobs.
+probe job, or the queue reason it waits with. It is the only way this harness creates jobs. bench/q13-job.py is
+that driver (its job config names the bound repository, a Git clone and the tokens); `--keep` before the
+arguments leaves the probe running and `--release` cancels the kept ones.
 
 One record per scenario is appended as a JSON line, schema `sentinel-bench/q13/1`. A real run names its build:
 `--source` (or SENTINEL_SRC) is the checkout the fleet's sentinel binaries were built from, `--binary` an optional
@@ -398,10 +400,20 @@ class RealFleet:
                       "placement_order = \"%s\" and re-run" % order)
 
     def start_job(self, worker):
-        raise Blocked("holding a job on a worker needs the job_driver's long-running probe")
+        """Hold one probe job on `worker`: the driver keeps it running (`--keep`) and says where it was placed."""
+        if not self.spec.get("job_driver"):
+            raise Blocked("fleet file has no job_driver to hold a probe job on a worker")
+        p = self._run([], self.spec["job_driver"] + ["--keep", "x86_64", "linux", "container", "1000", str(GIB), str(GIB)])
+        got = json.loads(p.stdout.strip().splitlines()[-1])
+        if got.get("worker") != worker:
+            self.finish_jobs(worker)
+            raise Blocked("the probe job was not placed on the draining worker (%s); a real executor chooses its "
+                          "worker, so the scenario needs a fleet where only that worker fits" % (got.get("worker") or got.get("reason")))
 
     def finish_jobs(self, worker):
-        raise Blocked("holding a job on a worker needs the job_driver's long-running probe")
+        if not self.spec.get("job_driver"):
+            raise Blocked("fleet file has no job_driver to release a held probe job")
+        self._run([], self.spec["job_driver"] + ["--release"])
 
 
 # --------------------------------------------------------------------------- scenarios
