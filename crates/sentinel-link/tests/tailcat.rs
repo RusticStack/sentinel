@@ -1419,8 +1419,8 @@ fn revoking_a_bound_worker_stops_the_helper_serving_its_key_and_a_second_worker_
             .read(workers::admitted_node_keys)
             .unwrap()
             .into_iter()
-            .map(|(_, key)| {
-                let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+            .map(|(_, bound)| {
+                let hex: String = bound.iter().map(|byte| format!("{byte:02x}")).collect();
                 key(&hex)
             })
             .collect();
