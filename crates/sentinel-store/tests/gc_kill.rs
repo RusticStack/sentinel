@@ -306,6 +306,9 @@ fn storage_work_killed_at_staggered_points_leaves_only_what_the_sweeps_collect()
     fs::create_dir_all(&data).unwrap();
     let seeded = seed(&data);
 
+    // Kills that found the child still working. A host fast enough to finish all the work before the first kill would
+    // otherwise pass this drill without a process ever being cut off.
+    let mut interrupted = 0u32;
     for delay_ms in [150, 300, 500, 800, 1_200] {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -319,7 +322,10 @@ fn storage_work_killed_at_staggered_points_leaves_only_what_the_sweeps_collect()
             .spawn()
             .unwrap();
         std::thread::sleep(Duration::from_millis(delay_ms));
-        let _ = child.kill();
+        if child.try_wait().unwrap().is_none() {
+            interrupted += 1;
+            child.kill().unwrap();
+        }
         child.wait().unwrap();
 
         // Whatever instant the kill landed on, the database opens and no committed, local object is missing.
@@ -330,6 +336,9 @@ fn storage_work_killed_at_staggered_points_leaves_only_what_the_sweeps_collect()
             "after a kill at {delay_ms} ms: {recovery:?}"
         );
     }
+
+    eprintln!("{interrupted} of 5 kills landed on a child still at work");
+    assert!(interrupted > 0, "no kill landed inside storage work");
 
     // What is left finishes under the same stages, then the sweeps collect the rest.
     let (store, objects, logs) = open(&data);
