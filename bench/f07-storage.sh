@@ -30,7 +30,7 @@ for fs in ext4 xfs btrfs; do
       dropped=$(drop_caches)
       $PROBE clone --source "$base/src" --dest "$base/dst-$mode" --mode "$mode" --verify-read 2>"$base/err-$mode.txt" \
         | sed "s/^{/{\"fs\":\"$fs\",\"shuffle_seed\":\"$SHUF_SEED\",$STAMP_SED,\"round\":$round,\"position\":$position,\"caches_dropped\":$dropped,/" >> "$OUT" \
-        || echo "{\"fs\":\"$fs\",\"shuffle_seed\":\"$SHUF_SEED\",\"round\":$round,\"position\":$position,\"probe\":\"clone/1\",\"mode\":\"$mode\",\"error\":\"$(head -c 120 "$base/err-$mode.txt" | tr -d '\n"')\"}" >> "$OUT"
+        || echo "{\"fs\":\"$fs\",\"shuffle_seed\":\"$SHUF_SEED\",$STAMP_BODY,\"round\":$round,\"position\":$position,\"probe\":\"clone/1\",\"mode\":\"$mode\",\"error\":\"$(head -c 120 "$base/err-$mode.txt" | tr -d '\n"\\')\"}" >> "$OUT"
       sync
     done
   done

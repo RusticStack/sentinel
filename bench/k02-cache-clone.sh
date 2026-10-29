@@ -8,9 +8,11 @@ echo "shuffle seed $SHUF_SEED" >&2
 STAMP_SED="$(stamp_sed)"
 PROBE="${PROBE:-$PWD/target/wsl/release/sentinel-probes}"
 OUT="${OUT:-bench/k02-cache-clone.jsonl}"
-IMG="${IMG:-/srv/k02/btrfs.img}"
-MNT="${MNT:-/mnt/k02-btrfs}"
-EXT4="${EXT4:-/root/k02-ext4}"
+# Scratch under /var/tmp: a shared host keeps its disk images and mounts away from /root, /srv and /mnt.
+K02_DIR="${K02_DIR:-/var/tmp/k02}"
+IMG="${IMG:-$K02_DIR/btrfs.img}"
+MNT="${MNT:-$K02_DIR/mnt-btrfs}"
+EXT4="${EXT4:-$K02_DIR/ext4}"
 FILES="${FILES:-20000}"; BYTES="${BYTES:-16384}"
 LARGE="${LARGE:-4}"; LARGE_BYTES="${LARGE_BYTES:-67108864}"
 ROUNDS="${ROUNDS:-5}"
@@ -47,7 +49,7 @@ for fs in ext4 btrfs; do
       dropped=$(drop_caches)
       $PROBE clone --source "$src" --dest "$dst" --mode "$mode" --verify-read 2>"$err" \
         | placed "$fs" "$round" "$position" "$dropped" \
-        || echo "{\"fs\":\"$fs\",\"shuffle_seed\":\"$SHUF_SEED\",\"round\":$round,\"position\":$position,\"probe\":\"clone/1\",\"mode\":\"$mode\",\"error\":\"$(head -c 120 "$err" | tr -d '\n"')\"}" >> "$OUT"
+        || echo "{\"fs\":\"$fs\",\"shuffle_seed\":\"$SHUF_SEED\",$STAMP_BODY,\"round\":$round,\"position\":$position,\"probe\":\"clone/1\",\"mode\":\"$mode\",\"error\":\"$(head -c 120 "$err" | tr -d '\n"\\')\"}" >> "$OUT"
       sync
     done
   done
