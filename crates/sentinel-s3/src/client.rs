@@ -95,6 +95,37 @@ fn etag(value: &str) -> String {
     value.trim().trim_matches('"').to_owned()
 }
 
+/// The slowest sustained upload the client waits for. Below it a part times out.
+pub const MIN_SEND_BYTES_PER_SEC: u64 = 4 << 20;
+
+/// Bytes one ranged read asks for. Each read has its own timeout budget, so the limit on an object's size is not the link speed times one timeout.
+pub const READ_CHUNK_BYTES: u64 = 32 << 20;
+
+/// `None` while the configured timeout already covers the body at the minimum rate.
+fn send_budget(len: u64, base: Duration) -> Option<Duration> {
+    let needed = Duration::from_secs(len.div_ceil(MIN_SEND_BYTES_PER_SEC));
+    (needed > base).then_some(needed)
+}
+
+/// A refusal that means the thing a delete or an abort targeted is already gone.
+/// Any other 404, such as a missing bucket or a proxy's bare answer, is not success.
+fn already_gone(result: Result<()>, expected: &str) -> Result<()> {
+    match result {
+        Err(Error::NotFound(code)) if !code.starts_with(expected) => {
+            Err(Error::Refused { status: 404, code })
+        }
+        Err(Error::NotFound(_)) | Ok(()) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `bytes a-b/total` from a `Content-Range` header.
+fn content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let (range, total) = value.trim().strip_prefix("bytes ")?.split_once('/')?;
+    let (a, b) = range.split_once('-')?;
+    Some((a.parse().ok()?, b.parse().ok()?, total.parse().ok()?))
+}
+
 impl Client {
     pub fn new(config: Config) -> Result<Client> {
         config.validate()?;
@@ -232,9 +263,17 @@ impl Client {
         let request = request
             .body(body)
             .map_err(|_| Error::Config("request shape".into()))?;
-        self.agent
-            .run(request)
-            .map_err(|e| Error::Transient(transport(&e)))
+        // The send budget is a total for the whole body, so a large part gets time in proportion to its size.
+        let response = match send_budget(body.len() as u64, self.config.read_timeout) {
+            Some(budget) => self.agent.run(
+                self.agent
+                    .configure_request(request)
+                    .timeout_send_body(Some(budget))
+                    .build(),
+            ),
+            None => self.agent.run(request),
+        };
+        response.map_err(|e| Error::Transient(transport(&e)))
     }
 
     fn refusal(status: u16, mut response: ureq::http::Response<ureq::Body>) -> Error {
@@ -403,10 +442,11 @@ impl Client {
     }
 
     pub fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()> {
-        match Self::ok(self.send("DELETE", Some(key), &[("uploadId", upload_id)], &[], &[])?) {
-            Ok(_) | Err(Error::NotFound(_)) => Ok(()),
-            Err(e) => Err(e),
-        }
+        already_gone(
+            Self::ok(self.send("DELETE", Some(key), &[("uploadId", upload_id)], &[], &[])?)
+                .map(|_| ()),
+            "NoSuchUpload",
+        )
     }
 
     pub fn list_parts(&self, key: &str, upload_id: &str) -> Result<Vec<Part>> {
@@ -534,10 +574,71 @@ impl Client {
     }
 
     pub fn delete_object(&self, key: &str) -> Result<()> {
-        match Self::ok(self.send("DELETE", Some(key), &[], &[], &[])?) {
-            Ok(_) | Err(Error::NotFound(_)) => Ok(()),
-            Err(e) => Err(e),
+        already_gone(
+            Self::ok(self.send("DELETE", Some(key), &[], &[], &[])?).map(|_| ()),
+            "NoSuchKey",
+        )
+    }
+
+    /// Streams the object into `out` in ranged reads of at most `chunk` bytes, each with its own timeout budget.
+    /// Returns the object's length. A server that ignores `Range` answers the first read with the whole body, which is accepted.
+    pub fn read_object(&self, key: &str, out: &mut dyn std::io::Write, chunk: u64) -> Result<u64> {
+        let chunk = chunk.max(1);
+        let mut offset = 0u64;
+        loop {
+            let last = offset.saturating_add(chunk - 1);
+            let (total, len, mut reader) = match self.get_range(key, offset, last) {
+                // An empty object has no satisfiable range; a plain read returns its empty body.
+                Err(Error::Refused { status: 416, .. }) if offset == 0 => {
+                    let (len, reader) = self.get_object(key, None)?;
+                    (len, len, Box::new(reader) as Box<dyn Read>)
+                }
+                other => {
+                    let (total, len, reader) = other?;
+                    (total, len, Box::new(reader) as Box<dyn Read>)
+                }
+            };
+            let copied = std::io::copy(&mut reader, out)
+                .map_err(|e| Error::Transient(format!("read: {}", e.kind())))?;
+            if copied != len {
+                return Err(Error::Transient("read ended short".into()));
+            }
+            offset = offset.saturating_add(len);
+            if offset >= total {
+                return Ok(offset);
+            }
+            if len == 0 {
+                return Err(Error::Protocol("range answered with no bytes".into()));
+            }
         }
+    }
+
+    /// One ranged read. Returns the object's total length, this answer's length and its body.
+    fn get_range(&self, key: &str, first: u64, last: u64) -> Result<(u64, u64, impl Read + use<>)> {
+        let header = format!("bytes={first}-{last}");
+        let response = Self::ok(self.send("GET", Some(key), &[], &[("range", &header)], &[])?)?;
+        let len: u64 = Self::header(&response, "content-length")
+            .and_then(|l| l.parse().ok())
+            .ok_or_else(|| Error::Protocol("GET without a length".into()))?;
+        let total = if response.status().as_u16() == 206 {
+            let (a, b, total) = Self::header(&response, "content-range")
+                .and_then(|v| content_range(&v))
+                .ok_or_else(|| Error::Protocol("range answered without a Content-Range".into()))?;
+            if a != first || range_len(a, b) != Some(len) || b >= total {
+                return Err(Error::Protocol("range answered with another span".into()));
+            }
+            total
+        } else if first == 0 {
+            len
+        } else {
+            return Err(Error::Protocol("range ignored past the first read".into()));
+        };
+        let reader = response
+            .into_body()
+            .into_with_config()
+            .limit(len.saturating_add(1))
+            .reader();
+        Ok((total, len, reader))
     }
 
     pub fn list_objects(&self, prefix: &str, continuation: Option<&str>) -> Result<ObjectPage> {
@@ -694,6 +795,56 @@ mod tests {
                 "{len} bytes"
             );
         }
+    }
+
+    #[test]
+    fn a_part_gets_send_time_in_proportion_to_its_size() {
+        let base = Duration::from_secs(60);
+        assert_eq!(send_budget(16 << 20, base), None, "the default part fits");
+        assert_eq!(send_budget(240 << 20, base), None, "exactly the base");
+        assert_eq!(
+            send_budget(512 << 20, base),
+            Some(Duration::from_secs(128)),
+            "the largest configurable part"
+        );
+        assert_eq!(send_budget(0, base), None);
+    }
+
+    #[test]
+    fn content_ranges_parse_and_refuse_anything_else() {
+        assert_eq!(content_range("bytes 0-99/1000"), Some((0, 99, 1000)));
+        assert_eq!(content_range(" bytes 5-5/6 "), Some((5, 5, 6)));
+        for bad in [
+            "bytes 0-99/*",
+            "items 0-1/2",
+            "bytes 0-1",
+            "bytes a-b/c",
+            "",
+        ] {
+            assert_eq!(content_range(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_named_missing_thing_counts_as_already_gone() {
+        let gone =
+            |code: &str, expected: &str| already_gone(Err(Error::NotFound(code.into())), expected);
+        assert!(gone("NoSuchKey (request AB12)", "NoSuchKey").is_ok());
+        assert!(gone("NoSuchUpload", "NoSuchUpload").is_ok());
+        for wrong in ["NoSuchBucket (request AB12)", "http_404", "NoSuchUpload"] {
+            assert!(
+                matches!(
+                    gone(wrong, "NoSuchKey"),
+                    Err(Error::Refused { status: 404, .. })
+                ),
+                "{wrong}"
+            );
+        }
+        assert!(already_gone(Ok(()), "NoSuchKey").is_ok());
+        assert!(matches!(
+            already_gone(Err(Error::Transient("x".into())), "NoSuchKey"),
+            Err(Error::Transient(_))
+        ));
     }
 
     #[test]
