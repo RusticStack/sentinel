@@ -12,15 +12,14 @@
 
 ## Next wave
 
-**Wave 0 — code-only completion.** Start a session with "Let's now fully implement Wave 0".
+**Wave 1 — verification gate.** Start a session with "Let's now fully implement Wave 1".
 
 | Wave | Needs | State |
 |---|---|---|
-| [0 Code-only completion](#wave-0--code-only-completion) | nothing external | **next** |
-| [1 Verification gate](#wave-1--verification-gate) | Wave 0; `reference-host` with the Podman account; `arm64-host` | waiting |
+| [1 Verification gate](#wave-1--verification-gate) | `reference-host` with the Podman account; `arm64-host` | **next** |
 | [2 Measurements](#wave-2--measurements-on-reference-host) | Wave 1; a quiet `reference-host` window | waiting |
 | [3 KVM host](#wave-3--kvm-host) | Wave 1; a `kvm-host` window with nftables privileges | waiting |
-| [4 Real fleet](#wave-4--real-fleet) | Waves 0, 1, 3; all three hosts; X4, X6 | waiting |
+| [4 Real fleet](#wave-4--real-fleet) | Waves 1, 3; all three hosts; X4, X6 | waiting |
 | [5 Pilots and Blacksmith](#wave-5--pilots-and-blacksmith) | Waves 2, 3, 4; X1 for B11 | waiting |
 | [6 Closure and release](#wave-6--closure-and-release) | all earlier waves | waiting |
 
@@ -51,93 +50,6 @@ What a session cannot supply. Ask early.
 | X6 | Approval and a separate disposable host for B09's destructive scenarios; an operator-owned DERP and a pinned Tailcat install for the relay scenario | Wave 4's destructive and relay scenarios | run the rest, record those as blocked |
 | X7 | Real MCP clients (X07), hosted S3 buckets (R03a), a GitLab TLS and a Forgejo SSH fixture (G08a), a desktop browser (O07, CLI login launch), a Resend key and domain, a registered GitHub OAuth app for real github.com sign-in, separate real networks for Tailcat NAT traversal | those checks only | list each as an unverified limit in V06 |
 | X8 | N00's order (Windows guests before the native executor); whether pre-rule evidence ("Parts 09–11 re-audit", WSL2 runs dated 2026-09-27) is re-run before Wave 1 | nothing in v0.1 | leave as recorded |
-
-## Wave 0 — code-only completion
-
-**Goal:**
-- Fix every finding that needs no host window, external access or decision.
-- Build every harness a later wave runs, so Waves 1–3 only run things.
-
-Targeted tests run on `reference-host`. Each review item ends with fixes plus failure-path tests, or with the finding moved to its wave with file and line.
-
-- [ ] **0.1 RW06 review.**
-  - Review against the code, in `sentinel-checks`, `sentinel-mail`, `sentinel-s3` and the store's retention and backup: decode-fault isolation, quarantine counting, re-arm timing, replicate ordering and the rerequest CAS fences.
-  - Check that the checks' `details_url` points at pages `sentinel-web` serves.
-  - R01 was closed on trust: check it against the code.
-  - Check which of R07's failure drills ([resilience](docs/resilience.md)) exist as tests.
-- [ ] **0.2 RW08 review.**
-  - The cache generation cap against small budgets.
-  - Duplicate constants.
-  - `unwrap`/`expect` in the touched code ([development](docs/development.md#panicking-calls-in-production-code)).
-- [ ] **0.3 RW10 review.**
-  - Inventory every figure in `docs/` that has no committed record. For each, schedule it in Wave 2, label it "no record" or remove it.
-  - Every bench record is stamped with build and host, and has `--source` and a shuffle seed.
-  - Scripts take the lock with `flock -o`.
-  - List the missing benches, and check B04's closure.
-- [ ] **0.4 RW05 review.**
-  - Check `manual_destinations` against RW05's manual-remote destination policy.
-  - Review credential discipline and process groups in `sentinel-git`, the `git_can_pin` cache, the GitHub membership walk and run provenance.
-- [ ] **0.5 RW04 review.**
-  - Does image tag resolution (K05) exist outside `pinned_images` (`crates/sentinel-store/src/runs.rs`)?
-  - Re-read against the code:
-    - Workspace and secret cleanup on every exit path.
-    - `identity()` recovery and the keepalive bound.
-    - `private_dir_all` and symlinks.
-    - Pull and cancel races.
-  - Does the storage guard count the job's `/tmp`, now a directory on the workspace disk under rootless Podman (Q12's remainder)?
-- [ ] **0.6 RW07 remainder.**
-  - Decide, then implement or document each of these:
-    - Service grants with no session provenance still use the timestamp-window fallback ([step-up](docs/step-up.md#service-credentials-minted-by-a-session)).
-    - The `usr_` id response difference is not equalized.
-    - Self-service slugs can be squatted for GitHub organizations that never installed the App ([admission](docs/admission.md)).
-    - Auto-join domains have no editing UI.
-  - Add the device page's oversized form to `every_route_class_enforces_its_own_body_limit`. It needs a signed-in session, and today answers `400` HTML, not `413`.
-  - Prove no host-local command lets a platform administrator add itself to a tenant.
-  - Check the route table row by row against [API](docs/api.md).
-  - Add the missing [compatibility](docs/compatibility.md) entries for later routes, authorization changes and migration 54. This is R05's code side.
-- [ ] **0.7 RW12 remainder.**
-  - Recheck in `web/src` these defects found in the removed Nuxt code:
-    - The setup wizard's resume across several refreshes (`web/test/setup.mjs` checks one).
-    - `forgot-password` suggesting `admin recover --username` for email-registered accounts.
-    - The invitations section when settings fail to load.
-    - The service-accounts toast on a GET.
-    - "Your session ended" from an in-flight 401 after a password change.
-    - Members added by typed username.
-  - Give the step-up dialog decision and the shown-once download revoke their own browser checks.
-  - Fix the flaky `an open run page through a busy controller` scenario (`web/test/ui.mjs`, fails about half the runs) at its cause.
-  - Settle the optional API fields.
-- [ ] **0.8 RW09 and RW03 remainder.**
-  - Review the keystore backends and the help text.
-  - Read the Tailcat diagnostics for credential leaks.
-  - Check whether a newer pinned Tailcat helper supports `--allow` reload. Today an allow-list change costs a connected worker 3.3–4.6 s.
-- [ ] **0.9 RW02: `LineSeek.exact`.**
-  - `seek_line` (`crates/sentinel-store/src/logs.rs`) misses late fills stored before its starting checkpoint. Report `exact` false when the log holds late fills, or record fills in the index, before D04 exposes `?line=`.
-  - `Objects::materialize` stays documented as unsafe for shared space.
-- [ ] **0.10 U18 and Q11's remainder: the worker enrollment page.**
-  - A platform-administrator page in `web/` over `POST /api/v1/admin/worker-enrollments` with:
-    - Pool, host ceilings, priority and step-up.
-    - The once-shown secret and Tailcat address.
-    - A copyable and downloadable bootstrap with its digest.
-    - Uninstall and rollback instructions.
-    - The `409`/`404`/`429` states shown plainly.
-  - No secret may reach `sentinel-web`'s logs or a URL.
-  - Add the automatic node-key hand-over for controllers without `api_url` ([worker bootstrap](docs/worker-bootstrap.md#not-built-yet)).
-  - The operator-supplied Tailcat helper is the default until X4 is decided.
-  - Gate: browser checks against a seeded controller, API tests for the step-up and single-use refusals, and a secret-leak canary like U17's.
-- [ ] **0.11 V02's remainder.** Add a `sentinel-web` service to the container and compose examples, and have `crates/sentinel/tests/examples.rs` parse it.
-- [ ] **0.12 U17's remainder.**
-  - A fake GitHub web origin answering `settings/apps/new` and `apps/<slug>/installations/new`, pointed at by the seed's `GithubAppSetup.web_url` and `SENTINEL_GITHUB_WEB_URL`.
-  - The browser flow through it.
-  - The activation-time log line in the secret canary.
-- [ ] **0.13 Harnesses for Waves 2–4.**
-  - Write the missing harness for the API-credential, Argon2id and session-validation timings (`docs/local-authentication.md`, A02/A03).
-  - Give every Wave 2 bench a contract, seed and lock path, plus a smoke run.
-  - Run the B05 matrix and B09 scripts end to end against a fake.
-
-**Gate:**
-- Locally: `cargo fmt-check` and `cargo lint`.
-- On `reference-host`: `cargo lint-linux`, the affected test binaries, `pnpm -C web typecheck` and `test:unit`, and the browser test for 0.7, 0.10 and 0.12.
-- `scripts/check-doc-links.sh`.
 
 ## Wave 1 — verification gate
 
@@ -356,3 +268,4 @@ One row per completed wave. Details go in the PR body.
 | Date | Wave | PR / commits | Evidence summary |
 |---|---|---|---|
 | 2026-10-29 | Part 24 reconciliation (pre-wave) | `edd1dec`, `5d0a9c9`, `70f8c80` | RW01 closed; code-fixable Part 24 findings fixed; history up to here in `git show 70f8c80:TODO.md` |
+| 2026-10-29 | 0 Code-only completion | branch `wave-0-code-only-completion` (migration 64, release 63 readable) | Reviews 0.1–0.6, 0.8, 0.9 fixed with failure-path tests; worker enrollment page, fake GitHub origin and the sentinel-web compose service built; Wave 2–4 harnesses written. Verified on `reference-host`: `cargo lint-linux`, targeted test binaries, `pnpm -C web typecheck` and `test:unit`, the real-browser test 331/331; locally `cargo fmt-check`, `cargo lint`, `scripts/check-doc-links.sh`. Findings that need a later wave moved there with their blockers. |
