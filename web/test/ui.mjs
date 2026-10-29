@@ -474,13 +474,24 @@ await scenario("live log through a lost connection", async () => {
 await scenario("an open run page through a busy controller", async () => {
   const { body: quiet } = await root("GET", `/api/v1/runs/${cfg.pr_run}/wait`);
   const spellEnds = Date.now() + 20000;
+  const parkUrl = (timeout) => `/api/v1/runs/${cfg.pr_run}/wait?since=${quiet.version}&timeout_ms=${timeout}`;
+  // A refused holder pauses briefly instead of spinning on the 429, and keeps asking until the spell ends.
   const hold = async () => {
     while (Date.now() < spellEnds - 100) {
-      await root("GET", `/api/v1/runs/${cfg.pr_run}/wait?since=${quiet.version}&timeout_ms=${Math.max(1, spellEnds - Date.now())}`);
+      const answer = await root("GET", parkUrl(Math.max(1, spellEnds - Date.now())));
+      if (answer.status === 429) await sleep(25);
     }
   };
   const held = Array.from({ length: cfg.subscribers_per_user }, hold);
-  await sleep(300);
+  // Ready when the share is full: a further park by the same user is refused. That proves every holder is parked,
+  // where a fixed pause only hoped so.
+  const ready = Date.now() + 5000;
+  for (;;) {
+    const probe = await root("GET", parkUrl(1));
+    if (probe.status === 429) break;
+    if (Date.now() > ready) throw new Error(`the subscriber share never filled (last answer ${probe.status})`);
+    await sleep(25);
+  }
   await go(page, PAGES.run[0], "document.querySelectorAll('.dag .node').length === 4");
   await page.waitFor("document.body.textContent.includes('Updates paused: controller busy')", Math.max(1000, spellEnds - Date.now() - 500), "busy notice");
   const alerts = await page.eval("[...document.querySelectorAll('[role=alert]')].map((a) => a.textContent.trim().slice(0, 120)).filter((t) => t)");
@@ -488,7 +499,10 @@ await scenario("an open run page through a busy controller", async () => {
   if (empty.length) console.log("note: empty alert elements during the busy spell", JSON.stringify(empty));
   check("a busy controller is said, not treated as an error", alerts.length === 0, alerts);
   await Promise.all(held);
-  await page.waitFor("document.body.textContent.includes('Live') && !document.body.textContent.includes('controller busy')", 40000, "live again");
+  const freed = Date.now();
+  // The relay retries at the delay the controller states (1 s) and calls the page live once a retry is parked.
+  await page.waitFor("document.body.textContent.includes('Live') && !document.body.textContent.includes('controller busy')", 12000, "live again");
+  metrics.busy_recovery_ms = Date.now() - freed;
   const rerun = await root("POST", `/api/v1/jobs/${cfg.jobs.zeta}/rerun`, {});
   check("zeta is re-run under the page", rerun.status === 200, rerun);
   await page.waitFor("[...document.querySelector('main table').querySelectorAll('tbody tr')].some((r) => r.textContent.startsWith('zeta') && !r.textContent.includes('skipped'))", 20000, "update after the spell");
