@@ -275,3 +275,41 @@ pub fn run(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jitter_stays_within_a_quarter_of_the_back_off_and_spreads_workers() {
+        for base in [BACKOFF_MIN, BACKOFF_MIN * 4, BACKOFF_MAX] {
+            let quarter = Duration::from_millis(base.as_millis() as u64 / 4);
+            let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+            let mut waits = std::collections::BTreeSet::new();
+            for _ in 0..200 {
+                let wait = jitter(base, &mut seed);
+                assert!(
+                    wait >= base - quarter && wait <= base + quarter,
+                    "{wait:?} outside ±25 % of {base:?}"
+                );
+                waits.insert(wait);
+            }
+            assert!(waits.len() > 50, "a reconnecting fleet would stampede");
+        }
+    }
+
+    #[test]
+    fn workers_with_different_streams_do_not_redial_in_step() {
+        let (mut a, mut b) = (0x9E37_79B9_7F4A_7C15_u64, 0xD1B5_4A32_D192_ED03_u64);
+        let apart = (0..20)
+            .filter(|_| jitter(BACKOFF_MIN, &mut a) != jitter(BACKOFF_MIN, &mut b))
+            .count();
+        assert!(apart >= 15, "{apart} of 20 waits differed");
+    }
+
+    #[test]
+    fn a_zero_back_off_has_no_jitter() {
+        let mut seed = 1;
+        assert_eq!(jitter(Duration::ZERO, &mut seed), Duration::ZERO);
+    }
+}

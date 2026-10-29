@@ -856,6 +856,77 @@ fn a_burst_spreads_over_identical_workers() {
 }
 
 #[test]
+fn a_controller_restart_reconnects_the_whole_fleet_and_leaves_live_leases_alone() {
+    let mut d = deployment();
+    let addr = d.controller().local_addr();
+    let (ids, recorders, processes) = identical_fleet(&d, 3);
+    let burst = d.runs(vec![(d.tenant_a, d.repo_a, noise_of(3))]);
+    d.controller().wake();
+    for (id, recorder) in ids.iter().zip(&recorders) {
+        eventually("an acknowledged hold on every worker", || {
+            let held = d.held(*id);
+            held.len() == 1 && held[0].acknowledged && recorder.offers.lock().unwrap().len() == 1
+        });
+    }
+    let before: Vec<(AttemptId, UnixMillis)> = ids
+        .iter()
+        .map(|id| {
+            let held = d.held(*id);
+            (held[0].attempt, held[0].lease_until)
+        })
+        .collect();
+
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
+    let identity = Identity::load(&d._identity_files.0, &d._identity_files.1).unwrap();
+    d.controller = Some(
+        Controller::start(
+            Arc::clone(&d.store),
+            Arc::clone(&d._logs),
+            Arc::clone(&d._objects),
+            identity,
+            addr,
+        )
+        .unwrap(),
+    );
+    for process in &processes {
+        process.wait_for("Connected", 2);
+    }
+    eventually("the fleet again", || d.controller().connected().len() == 3);
+    // Startup reconciliation settles only what lapsed while the controller was down: these leases still held.
+    for (id, (attempt, lease)) in ids.iter().zip(&before) {
+        eventually("the lease renewed by the reconnected worker", || {
+            d.held(*id)
+                .iter()
+                .any(|h| h.attempt == *attempt && h.acknowledged && h.lease_until > *lease)
+        });
+    }
+    for job in &burst[0] {
+        assert_eq!(d.state(d.tenant_a, *job), JobState::Leased);
+    }
+    for recorder in &recorders {
+        assert_eq!(
+            recorder.offers.lock().unwrap().len(),
+            1,
+            "nothing re-offered"
+        );
+    }
+    for process in processes {
+        process.stop().unwrap();
+    }
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
+}
+
+#[test]
 fn revoking_a_connected_worker_ends_its_session_and_fences_its_work() {
     let mut d = deployment();
     let (ids, recorders, mut processes) = identical_fleet(&d, 1);

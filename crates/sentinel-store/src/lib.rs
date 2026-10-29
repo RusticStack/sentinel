@@ -13,6 +13,7 @@ pub mod github_members;
 pub mod idempotency;
 pub mod intake;
 pub mod jobs;
+pub mod known_sources;
 pub mod local_auth;
 pub mod logs;
 pub mod lookup;

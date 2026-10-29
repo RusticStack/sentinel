@@ -900,6 +900,36 @@ fn an_older_worker_still_gets_a_hinted_cancel_on_its_next_heartbeat() {
 }
 
 #[test]
+fn a_worker_that_stops_cleanly_leaves_its_running_jobs_lease_in_place() {
+    let d = deployment();
+    let secret = d.enrollment(60_000);
+    let (recorder, offers) = Recorder::new();
+    let id = WorkerId::new();
+    let process = WorkerProcess::start(
+        &d,
+        Identity::generate("w").unwrap(),
+        id,
+        Some(secret),
+        Arc::clone(&recorder),
+    );
+    let (_, ids) = d.run(ONE_JOB);
+    let offer = offers.recv_timeout(Duration::from_secs(5)).unwrap().0;
+    eventually("attempt held and acknowledged", || {
+        d.store
+            .read(|c| dispatch::held_by(c, id))
+            .unwrap()
+            .iter()
+            .any(|h| h.attempt == offer.attempt && h.acknowledged)
+    });
+    process.stop().unwrap();
+    eventually("session gone", || d.controller().connected().is_empty());
+    // The attempt stays the worker's until its lease lapses: a clean stop reports nothing and releases nothing.
+    let held = d.store.read(|c| dispatch::held_by(c, id)).unwrap();
+    assert!(held.iter().any(|h| h.attempt == offer.attempt), "{held:?}");
+    assert_eq!(d.state(ids[0]), JobState::Leased);
+}
+
+#[test]
 fn a_declined_offer_returns_to_the_queue_and_is_reoffered_under_a_higher_fence() {
     let d = deployment();
     let secret = d.enrollment(60_000);

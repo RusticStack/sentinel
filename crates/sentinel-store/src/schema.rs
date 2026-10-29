@@ -160,6 +160,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         58,
         include_str!("migrations/058_delivery_authentication.sql"),
     ),
+    (59, include_str!("migrations/059_link_admission.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -228,6 +229,10 @@ mod tests {
         (
             56,
             "an older controller does not know the sealed GitHub App credentials, so it could not use or reseal the App registered through the manifest flow",
+        ),
+        (
+            59,
+            "an older binary is not offered to keep running on the link-admission tables: it neither maintains the known-source set nor counts refused enrollments, so its admission and audit bounds would not hold",
         ),
     ];
 

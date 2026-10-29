@@ -327,3 +327,237 @@ fn a_worker_is_known_by_fingerprint_bound_to_its_pool_and_revocable() {
     // Suspension drops placement, not enrollment: dedicated pool machines still authenticate.
     assert!(f.store.read(|c| workers::authenticate(c, &fp2)).is_ok());
 }
+
+fn refuse(f: &Fixture, peer: workers::Peer, now: UnixMillis) {
+    let refused = f
+        .store
+        .writer()
+        .write(move |tx| {
+            workers::redeem_from(
+                tx,
+                &Secret::generate(),
+                Presentation {
+                    worker: WorkerId::new(),
+                    fingerprint: fingerprint(),
+                    name: "guesser",
+                    negotiated: negotiated(),
+                },
+                now,
+                peer,
+            )
+        })
+        .unwrap();
+    assert!(refused.is_none());
+}
+
+fn refusal_rows(f: &Fixture) -> i64 {
+    f.store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM auth_audit WHERE event = 45",
+                [],
+                |r| r.get::<_, i64>(0),
+            )?)
+        })
+        .unwrap()
+}
+
+fn peer(n: u8) -> workers::Peer {
+    [n; 16]
+}
+
+#[test]
+fn refused_enrollments_write_a_bounded_number_of_audit_rows_and_are_counted() {
+    let f = fixture();
+    let hour = workers::REFUSAL_WINDOW_MS;
+    let start = 40 * hour;
+
+    // One peer: its first few refusals leave rows, every later one is only counted.
+    for n in 0..200 {
+        refuse(&f, peer(1), at(start + n));
+    }
+    assert_eq!(refusal_rows(&f), workers::REFUSAL_ROWS_PER_PEER);
+    let counts = f.store.read(workers::refusal_counts).unwrap();
+    assert_eq!(
+        counts,
+        (
+            workers::REFUSAL_ROWS_PER_PEER,
+            200 - workers::REFUSAL_ROWS_PER_PEER
+        )
+    );
+
+    // Many peers: the window as a whole stays under its allowance, and nothing is lost from the count.
+    for n in 0..500u16 {
+        refuse(
+            &f,
+            peer(2 + (n % 120) as u8),
+            at(start + 1_000 + i64::from(n)),
+        );
+    }
+    assert!(refusal_rows(&f) <= workers::REFUSAL_ROWS_PER_WINDOW);
+    let (recorded, suppressed) = f.store.read(workers::refusal_counts).unwrap();
+    assert_eq!(recorded, refusal_rows(&f));
+    assert_eq!(recorded + suppressed, 700);
+    let tracked: i64 = f
+        .store
+        .read(|c| {
+            Ok(
+                c.query_row("SELECT COUNT(*) FROM worker_enrollment_refusals", [], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .unwrap();
+    assert!(
+        tracked <= workers::REFUSAL_PEERS_PER_WINDOW + 1,
+        "{tracked} peer rows"
+    );
+
+    // The next hour starts with one summary row for what the last one only counted, then budgets anew.
+    let before = refusal_rows(&f);
+    refuse(&f, peer(1), at(start + hour + 5));
+    assert_eq!(
+        refusal_rows(&f),
+        before + 2,
+        "a summary row and the new refusal"
+    );
+    refuse(&f, peer(1), at(start + hour + 6));
+    assert_eq!(refusal_rows(&f), before + 3, "the summary is written once");
+    let details: Vec<String> = f
+        .store
+        .read(|c| {
+            let mut statement =
+                c.prepare("SELECT detail FROM auth_audit WHERE event = 45 AND detail IS NOT NULL")?;
+            Ok(statement
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(details.len(), 1);
+    assert!(details[0].starts_with("650 more refused"), "{details:?}");
+}
+
+#[test]
+fn refusal_windows_are_pruned_after_a_week() {
+    let f = fixture();
+    let hour = workers::REFUSAL_WINDOW_MS;
+    for n in 0..20 {
+        refuse(&f, peer(1), at(10 * hour + n));
+    }
+    refuse(&f, peer(1), at(10 * hour + 8 * 24 * hour));
+    let windows: i64 = f
+        .store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(DISTINCT window_ms) FROM worker_enrollment_refusals",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(windows, 1);
+}
+
+#[test]
+fn a_secret_that_would_redeem_is_visible_without_recording_anything() {
+    let f = fixture();
+    let pool = f.pool;
+    let issued = f
+        .store
+        .writer()
+        .write(move |tx| workers::issue_enrollment(tx, Authority::HostLocal, pool, 60_000, NOW))
+        .unwrap();
+    assert!(
+        f.store
+            .read(|c| workers::redeemable(c, &issued.secret, at(2_000)))
+            .unwrap()
+    );
+    assert!(
+        !f.store
+            .read(|c| workers::redeemable(c, &Secret::generate(), at(2_000)))
+            .unwrap()
+    );
+    assert!(
+        !f.store
+            .read(|c| workers::redeemable(c, &issued.secret, at(NOW.0 + 61_000)))
+            .unwrap()
+    );
+    assert_eq!(refusal_rows(&f), 0);
+    enroll(
+        &f,
+        &issued.secret,
+        WorkerId::new(),
+        fingerprint(),
+        at(3_000),
+    )
+    .unwrap();
+    assert!(
+        !f.store
+            .read(|c| workers::redeemable(c, &issued.secret, at(4_000)))
+            .unwrap(),
+        "a spent secret no longer redeems"
+    );
+}
+
+#[test]
+fn known_sources_are_stored_refreshed_expired_and_capped() {
+    use sentinel_store::known_sources::{self, MAX_SOURCES};
+    let f = fixture();
+    let day = 24 * 60 * 60 * 1000;
+    let record = |source: [u8; 16], now: i64| {
+        f.store
+            .writer()
+            .write(move |tx| known_sources::record(tx, source, now, day))
+            .unwrap()
+    };
+    record([1; 16], 1_000);
+    record([2; 16], 2_000);
+    let live = f
+        .store
+        .read(|c| known_sources::load(c, 3_000, day))
+        .unwrap();
+    assert_eq!(live, vec![([2; 16], 2_000), ([1; 16], 1_000)]);
+
+    // Refreshing keeps the newer time and never moves it back.
+    record([1; 16], 2_500);
+    record([1; 16], 500);
+    let live = f
+        .store
+        .read(|c| known_sources::load(c, 3_000, day))
+        .unwrap();
+    assert_eq!(live[0], ([1; 16], 2_500));
+
+    // A source past the day is not returned and is pruned by the next write.
+    let live = f
+        .store
+        .read(|c| known_sources::load(c, 1_000 + day + 1_600, day))
+        .unwrap();
+    assert!(live.iter().all(|(s, _)| *s != [2; 16]));
+    record([3; 16], 2_400 + day);
+    let rows: i64 = f
+        .store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM link_known_sources", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(rows, 2, "the source refreshed in time, and the new one");
+
+    // The table never holds more than its cap, keeping the newest.
+    f.store
+        .writer()
+        .write(move |tx| {
+            for n in 0..(MAX_SOURCES + 50) {
+                let mut source = [0u8; 16];
+                source[..8].copy_from_slice(&(n as u64 + 100).to_be_bytes());
+                tx.execute(
+                    "INSERT INTO link_known_sources(source, seen_ms) VALUES (?1, ?2)",
+                    rusqlite::params![source, 10_000 + n],
+                )?;
+            }
+            known_sources::record(tx, [9; 16], 10_000 + MAX_SOURCES + 50, day)
+        })
+        .unwrap();
+    let rows: i64 = f
+        .store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM link_known_sources", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(rows, MAX_SOURCES);
+}
