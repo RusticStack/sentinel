@@ -136,6 +136,8 @@ Benchmarks run only on the host class pinned by their contract. Set `SENTINEL_BE
 
 The `test-*` aliases use cargo-nextest with `--no-fail-fast`, running every test of every binary in parallel and in separate processes. The workspace has no doctests. `tests/browser.rs` supplies its own libtest-compatible entry point for nextest discovery and filtering.
 
+`bench/smoke.sh [--quick]` runs the benchmark harnesses once at tiny parameters (every Python unit test under `bench/`, the Q13 self-test, and `bench/micro-run.sh --smoke` for each contract whose binary is built) and counts passes, pending runs and missing binaries apart; it belongs on the Linux verification host, like every other test ([benchmarking](benchmarking.md#harness-smoke)).
+
 ## Panicking calls in production code
 
 `clippy::unwrap_used` and `clippy::expect_used` are **not** enabled in `[workspace.lints]`: a lint at `warn` fails `cargo lint` (which denies warnings) until every call outside test code is converted, and many are deliberate invariants (a fixed-size slice conversion, a `Mutex` poison, a value checked a line earlier) whose rewrite into error paths would add branches to hot paths for cases that cannot happen. Blanket `#[allow]`s would hide the real decisions. When touching a file, convert a site whose failure is reachable from input; justify each remaining one with `#[expect(clippy::expect_used, reason = "...")]`. List the sites with a search for `.unwrap(` and `.expect(` outside test modules.

@@ -87,7 +87,7 @@ Measured on `development-host` (i7-13700KF, Ubuntu 24.04 WSL2, ext4), release bu
 
 Verification dominates by design, and the three login outcomes cost the same order of magnitude, which is the point of the placeholder record. Session validation is what every authenticated request pays: one primary-key probe and one key join, guarded by a query-plan test that rejects table scans and temporary sort trees. Sliding an idle deadline is the only write a read-only request can trigger, and only after five minutes.
 
-No `bench/` record or harness holds these means, so their sample count and spread are unknown and they cannot be reproduced from what is committed. WSL2 is a development reference, not a production qualification.
+These are WSL2 development figures, taken before there was a harness, and they stay labelled that way. The harness now exists: [`bench/auth-cost.sh`](../bench/auth-cost.sh) (contract [`auth-cost`](../bench/contracts/micro/auth-cost.json), example `crates/sentinel-store/examples/auth-cost-bench.rs`) times Argon2id hash and verify, session validation on a held connection and through `Store::read`, the four login outcomes and API-credential validation and issuance, with a recorded seed, the operation order, the Argon2 parameters read from the stored hash, a sample count and the spread ([benchmarking](benchmarking.md#auth-and-credential-cost)). No record from it is committed yet, so none of the means above has a sample count or spread; a quiet reference-host record replaces them. WSL2 is a development reference, not a production qualification.
 
 ## Verification
 
