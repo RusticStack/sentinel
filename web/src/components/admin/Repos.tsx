@@ -59,7 +59,7 @@ function RepoCard({ slug, repo }: { slug: string; repo: { id: string; name: stri
 
   async function toggleSource() {
     if (source) { setSource(null); return; }
-    const s = await act(me, `Source of ${repo.name}`, () => api<Source>(`${base}/source`));
+    const s = await act(me, `Source of ${repo.name}`, () => api<Source>(`${base}/source`), false);
     if (s) setSource(s);
   }
   async function grant(e: React.FormEvent) {
