@@ -16,7 +16,8 @@ W="$D/wl"
 FX="$ROOT/bench/b05-fixtures"
 LOCKS="$D/locks"
 OUT="${OUT:-$ROOT/bench/b05-rebuild.jsonl}"
-LOCK=/srv/sentinel/runs/p14.lock
+# One lock for every benchmark and verification run on the host (qualify.sh takes the same file).
+LOCK="${SENTINEL_VERIFY_LOCK:-/var/tmp/sentinel-verify.lock}"
 REPS="${REPS:-3}"
 CUSTOM_COUNT="${CUSTOM_COUNT:-4096}"
 CUSTOM_BYTES="${CUSTOM_BYTES:-262144}"
@@ -25,19 +26,10 @@ export JAVA_HOME="$T/jdk"
 
 log() { printf 'b05 %s %s\n' "$(date +%T)" "$*" >&2; }
 
-B05_COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
-B05_DIRTY="$([ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ] && echo true || echo false)"
-B05_HOST="$(python3 - <<'PY'
-import json, os
-cpu = open("/proc/cpuinfo").read().splitlines()
-model = next((l.split(": ", 1)[1] for l in cpu if l.startswith("model name")), "")
-vcpus = sum(1 for l in cpu if l.startswith("processor"))
-mem = open("/proc/meminfo").readline().split(":")[1].strip()
-fs = os.popen("stat -f -c %T /srv").read().strip()
-print(json.dumps({"cpu": model, "vcpus": vcpus, "mem": mem, "kernel": os.uname().release, "fs": fs}))
-PY
-)"
-export B05_COMMIT B05_DIRTY B05_HOST
+# Every record carries the build and host stamp of bench/stamp.sh (SENTINEL_SRC names the checkout the
+# measured build came from, SENTINEL_BENCH_HOST_LABEL the host); b05-timed.sh splices it into each line.
+. "$(dirname "${BASH_SOURCE[0]}")/stamp.sh"
+stamped() { [ -n "${B05_STAMP:-}" ] || { stamp_init || exit 2; B05_STAMP="$STAMP_BODY"; export B05_STAMP; }; }
 
 fixture() { # lang file -> path of the committed file, else the generated one
     if [ -f "$FX/$1/$2" ]; then echo "$FX/$1/$2"; else echo "$LOCKS/$1/$2"; fi
@@ -171,15 +163,16 @@ report_trees() { # lang -> one line per entry directory: files, bytes, symlinks
     local lang="$1" p="$W/$1" dir
     for dir in "$p/e"/* "$p/src/node_modules"; do
         [ -d "$dir" ] || continue
-        printf '{"record":"b05-tree","workload":"%s","entry":"%s","files":%s,"symlinks":%s,"bytes":%s}\n' \
+        printf '{"record":"b05-tree","workload":"%s","entry":"%s","files":%s,"symlinks":%s,"bytes":%s,%s}\n' \
             "$lang" "$(basename "$(dirname "$dir")")/$(basename "$dir")" \
             "$(find "$dir" -type f | wc -l)" "$(find "$dir" -type l | wc -l)" \
-            "$(du -sb --apparent-size "$dir" | cut -f1)"
+            "$(du -sb --apparent-size "$dir" | cut -f1)" "$B05_STAMP"
     done >> "$OUT"
 }
 
 run() {
     local lang
+    stamped
     for lang in "$@"; do
         measure "$lang"
         report_trees "$lang"

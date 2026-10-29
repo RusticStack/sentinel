@@ -8,10 +8,19 @@ set -uo pipefail
 ROOT="${ROOT:-/srv/sentinel-p14-b05}"
 BIN="${BIN:-$ROOT/target/release/examples/b05-cache}"
 OUT="${OUT:-$ROOT/bench/b05-cache.jsonl}"
-LOCK=/srv/sentinel/runs/p14.lock
+# One lock for every benchmark and verification run on the host (qualify.sh takes the same file).
+LOCK="${SENTINEL_VERIFY_LOCK:-/var/tmp/sentinel-verify.lock}"
 W="$ROOT/data/wl"
-export B05_COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
-export B05_DIRTY="$([ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ] && echo true || echo false)"
+FAILED=0
+
+# Every record carries the build and host stamp of bench/stamp.sh: SENTINEL_SRC names the checkout the
+# measured driver came from (the driver binary is hashed), SENTINEL_BENCH_HOST_LABEL names the host.
+. "$(dirname "${BASH_SOURCE[0]}")/stamp.sh"
+stamped() {
+    SENTINEL_BIN="${SENTINEL_BIN:-$BIN}" stamp_init || exit 2
+    B05_STAMP="$STAMP_BODY"
+    export B05_STAMP
+}
 
 log() { printf 'b05-cache %s %s\n' "$(date +%T)" "$*" >&2; }
 
@@ -20,12 +29,13 @@ cell() { # workdir label shape [driver flags...]
     shift 3
     log "$label $shape"
     flock -x -o "$LOCK" ionice -c3 "$BIN" --work "$work/$shape" --shape "$shape" --label "$label" --out "$OUT" "$@" \
-        || log "cell $label/$shape failed"
+        || { log "cell $label/$shape failed"; FAILED=$((FAILED + 1)); }
     rm -rf "${work:?}/$shape"
 }
 
 synthetic() {
     local work="$1" label="$2"
+    stamped
     mkdir -p "$work"
     cell "$work" "$label" mid-20k-8k --small 20000 --small-bytes 8192 --samples 30 --cold-samples 5 --dirty 0,1,10,50 \
         --modes lifecycle,concurrency --threads 1,2,4,8,12 --rounds 8
@@ -36,6 +46,7 @@ synthetic() {
 
 real() {
     local work="$1" label="$2" dir name
+    stamped
     mkdir -p "$work"
     for dir in "$W"/*/e/* "$W"/js/src/node_modules; do
         [ -d "$dir" ] || continue
@@ -61,3 +72,9 @@ case "${1:-}" in
     reflink-down) reflink_down "$2" ;;
     *) echo "usage: $0 synthetic|real <workdir> <label> | reflink-up <image> <mnt> <GiB> | reflink-down <mnt>" >&2; exit 2 ;;
 esac
+rc=$?
+if [ "$FAILED" -gt 0 ]; then
+    log "$FAILED cell(s) failed; the matrix is incomplete"
+    exit 1
+fi
+exit "$rc"
