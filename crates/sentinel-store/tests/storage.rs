@@ -493,6 +493,58 @@ fn tenant_usage_tracks_objects_uploads_and_reclaims() {
     ));
 }
 
+// The 24 hours an unreferenced object is kept run from the moment something last wanted its bytes, not from their first creation.
+#[test]
+fn a_dedup_seal_of_an_aged_unreferenced_object_survives_the_next_reclaim() {
+    let mut fx = fixture();
+    let body = vec![b'd'; 64];
+    let digest = fx.put(&body);
+    let created: i64 = fx
+        .conn
+        .query_row("SELECT created_ms FROM objects", [], |r| r.get(0))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+
+    // The same bytes arrive through a resumable upload and are sealed: a dedup, so no new object row.
+    let now = UnixMillis::now();
+    let tx = fx.conn.transaction().unwrap();
+    let id = fx
+        .objects
+        .begin_upload(&tx, fx.tenant, 64, None, 60_000, now)
+        .unwrap();
+    tx.commit().unwrap();
+    let tx = fx.conn.transaction().unwrap();
+    fx.objects
+        .put_chunk(&tx, fx.tenant, id, 0, &body, now)
+        .unwrap();
+    tx.commit().unwrap();
+    let tx = fx.conn.transaction().unwrap();
+    assert_eq!(
+        fx.objects.seal_upload(&tx, fx.tenant, id, now).unwrap(),
+        digest
+    );
+    tx.commit().unwrap();
+
+    // A pass that runs when the object's first 24 hours have just passed must not take what the session now authorizes.
+    let first_grace_over = UnixMillis(created + objects::UNREFERENCED_GRACE_MS + 10);
+    let tx = fx.conn.transaction().unwrap();
+    assert_eq!(
+        fx.objects
+            .reclaim(&tx, first_grace_over, 256)
+            .unwrap()
+            .objects,
+        0
+    );
+    drop(tx);
+    fx.objects.meta(&fx.conn, fx.tenant, digest).unwrap();
+
+    // The grace was restarted, not lifted: 24 hours after the seal the unreferenced object goes, as a fresh one would.
+    let later = UnixMillis(UnixMillis::now().0 + objects::UNREFERENCED_GRACE_MS + 1);
+    let tx = fx.conn.transaction().unwrap();
+    assert_eq!(fx.objects.reclaim(&tx, later, 256).unwrap().objects, 1);
+    tx.commit().unwrap();
+}
+
 #[test]
 fn quota_refuses_uploads_and_commits_beyond_the_budget() {
     let mut fx = fixture();

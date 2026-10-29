@@ -84,6 +84,19 @@ impl Out {
     }
 }
 
+/// Objects the last successful backup recorded as missing or corrupt at the source; absent when no backup has succeeded since start.
+pub(crate) fn backup_objects_lost(status: &serde_json::Value) -> Option<u64> {
+    let last = status["last_backup"].as_object()?;
+    Some(
+        last.get("objects_corrupt")
+            .and_then(serde_json::Value::as_u64)?
+            .saturating_add(
+                last.get("objects_missing")
+                    .and_then(serde_json::Value::as_u64)?,
+            ),
+    )
+}
+
 fn label(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -457,6 +470,12 @@ pub(crate) fn render(state: &State) -> String {
             oldest,
         );
     }
+    out.one(
+        "sentinel_maintenance_rows_skipped_total",
+        "counter",
+        "Rows a maintenance batch passed over (an id that did not decode, or a manifest file that could not be read), since start; a row that stays damaged is counted every time a batch meets it.",
+        sentinel_store::skipped::total(),
+    );
     if let Some(b) = state.objects.backups() {
         let status = b.status();
         if let Some(at) = status["last_success_ms"].as_i64() {
@@ -473,6 +492,14 @@ pub(crate) fn render(state: &State) -> String {
             "The most recent backup attempt failed (1).",
             u8::from(!status["last_failure"].is_null()),
         );
+        if let Some(lost) = backup_objects_lost(&status) {
+            out.one(
+                "sentinel_backup_last_objects_lost",
+                "gauge",
+                "Objects the last successful backup recorded as missing or corrupt at the source.",
+                lost,
+            );
+        }
     }
 
     if let Ok((pending, refused, oldest)) = state.store.read(|c| {

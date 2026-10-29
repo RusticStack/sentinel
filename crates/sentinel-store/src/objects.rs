@@ -1815,7 +1815,18 @@ impl Objects {
         )?;
         let staged = plan.staged.as_ref().ok_or(Error::Corrupt("upload seal"))?;
         debug_assert_eq!(staged.len, plan.len);
-        self.commit(tx, staged)?;
+        if !self.commit(tx, staged)? {
+            // The bytes were already stored. If nothing references them their grace ran from their first creation and may be spent:
+            // restart it here, or the next pass could reclaim an object this committed session authorizes reads of.
+            tx.prepare_cached(
+                "UPDATE object_unreferenced SET created_ms = ?3 WHERE tenant_id = ?1 AND digest = ?2",
+            )?
+            .execute(params![
+                plan.tenant.as_bytes().as_slice(),
+                plan.digest.as_bytes().as_slice(),
+                UnixMillis::now().0
+            ])?;
+        }
         if plan.dedup {
             let _ = fs::remove_file(self.upload_path(plan.id));
         }
@@ -1903,6 +1914,8 @@ impl Objects {
                 .ok()
                 .and_then(|body| decode_manifest(&body).ok().map(|(_, _, e)| e));
             let Some(entries) = entries else {
+                // Its tenant stays unable to reclaim until the manifest reads again, so the skip is reported, not silent.
+                crate::skipped::note_blob("manifests", tenant.as_bytes());
                 continue;
             };
             {

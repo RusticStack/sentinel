@@ -24,7 +24,7 @@ use sentinel_store::{
     Store, artifacts, dispatch,
     logs::LogStore,
     objects::{self, Objects},
-    retention, workers,
+    retention, skipped, workers,
 };
 
 use crate::{
@@ -63,6 +63,8 @@ const SPEC_TRIES: u32 = 3;
 const STORAGE_BATCH: i64 = 256;
 const ORPHAN_SCAN_BUDGET: u32 = 4096;
 const LOG_STAMP_ROUNDS: u32 = 16;
+const LOG_EXPIRE_ROUNDS: u32 = 16;
+const STORAGE_ROUNDS: u32 = 16;
 const MAINTENANCE_TICK: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug)]
@@ -1402,23 +1404,42 @@ impl Inner {
         }
     }
 
-    fn storage_pass(&self, now: UnixMillis) {
+    /// Runs one maintenance pass; `false` when a backup or the replicator holds the maintenance lock and nothing ran.
+    fn storage_pass(&self, now: UnixMillis) -> bool {
         // A backup holds this for its whole run: nothing it snapshotted may be deleted before it is copied.
         let Some(_maintenance) = self.objects.try_maintenance() else {
-            return;
+            return false;
         };
-        let objects = Arc::clone(&self.objects);
-        if let Ok(doomed) = self.write(move |tx| {
-            objects.sweep_uploads(tx, now)?;
-            objects.sweep_leases(tx, now)?;
-            let mut doomed = artifacts::sweep_expired(tx, &objects, now, STORAGE_BATCH)?;
-            objects.index_refs(tx, STORAGE_BATCH)?;
-            doomed.extend(objects.reclaim(tx, now, STORAGE_BATCH)?.doomed);
-            Ok(doomed)
-        }) && !doomed.is_empty()
-        {
+        let skipped = skipped::total();
+        // A full batch means more is due: go on while the backlog lasts, a round at a time so the writer is free between them,
+        // and leave what is left to the next pass.
+        for _ in 0..STORAGE_ROUNDS {
             let objects = Arc::clone(&self.objects);
-            let _ = self.write(move |tx| objects.unlink(tx, &doomed));
+            let Ok((doomed, more)) = self.write(move |tx| {
+                let batch = STORAGE_BATCH as u32;
+                let uploads = objects.sweep_uploads(tx, now)?;
+                let leases = objects.sweep_leases(tx, now)?;
+                let (mut doomed, artifacts) =
+                    artifacts::sweep_expired_counted(tx, &objects, now, STORAGE_BATCH)?;
+                let indexed = objects.index_refs(tx, STORAGE_BATCH)?;
+                let reclaimed = objects.reclaim(tx, now, STORAGE_BATCH)?;
+                let more = uploads >= batch
+                    || leases >= batch
+                    || artifacts as i64 >= STORAGE_BATCH
+                    || indexed >= batch
+                    || i64::from(reclaimed.objects) >= STORAGE_BATCH;
+                doomed.extend(reclaimed.doomed);
+                Ok((doomed, more))
+            }) else {
+                break;
+            };
+            if !doomed.is_empty() {
+                let objects = Arc::clone(&self.objects);
+                let _ = self.write(move |tx| objects.unlink(tx, &doomed));
+            }
+            if !more {
+                break;
+            }
         }
         let objects = Arc::clone(&self.objects);
         if let Ok((doomed, _)) = self
@@ -1431,6 +1452,19 @@ impl Inner {
         }
         self.logs.close_idle(sentinel_store::logs::WRITER_IDLE);
         self.log_retention(now);
+        let passed_over = skipped::total() - skipped;
+        if passed_over > 0
+            && let Some(row) = skipped::last()
+        {
+            tracing::warn!(
+                event = "maintenance_rows_skipped",
+                rows = passed_over,
+                table = row.table,
+                key = %row.key,
+                "rows a maintenance batch could not read were passed over; the database or the named manifest needs inspection"
+            );
+        }
+        true
     }
 
     fn log_retention(&self, now: UnixMillis) {
@@ -1438,14 +1472,19 @@ impl Inner {
         if let Some(admission) = self.objects.admission() {
             admission.set_metadata_bytes(self.store.metadata_bytes());
         }
+        // A row passed over for a damaged id still filled a batch slot, so it counts toward "full".
+        let batch_full = |rows: usize, skipped: u64| {
+            rows as i64 + (skipped::total() - skipped) as i64 >= STORAGE_BATCH
+        };
         for _ in 0..LOG_STAMP_ROUNDS {
+            let skipped = skipped::total();
             let Ok(rows) = self
                 .store
                 .read(|c| retention::unstamped(c, STORAGE_BATCH as u32))
             else {
                 break;
             };
-            let full = rows.len() as i64 == STORAGE_BATCH;
+            let full = batch_full(rows.len(), skipped);
             if rows.is_empty() {
                 break;
             }
@@ -1464,14 +1503,26 @@ impl Inner {
                 break;
             }
         }
-        if let Ok(due) = self
-            .store
-            .read(|c| retention::expiring(c, now, STORAGE_BATCH as u32))
-            && !due.is_empty()
-            && let Ok(expired) = self.write(move |tx| retention::expire(tx, &due, now))
-        {
+        for _ in 0..LOG_EXPIRE_ROUNDS {
+            let skipped = skipped::total();
+            let Ok(due) = self
+                .store
+                .read(|c| retention::expiring(c, now, STORAGE_BATCH as u32))
+            else {
+                break;
+            };
+            let full = batch_full(due.len(), skipped);
+            if due.is_empty() {
+                break;
+            }
+            let Ok(expired) = self.write(move |tx| retention::expire(tx, &due, now)) else {
+                break;
+            };
             for log in expired {
                 let _ = self.logs.remove(log.run, log.job, log.attempt);
+            }
+            if !full {
+                break;
             }
         }
         let store = &self.store;
@@ -1480,8 +1531,14 @@ impl Inner {
                 .read(|c| retention::log_gone(c, attempt))
                 .unwrap_or(false)
         });
-        let _ =
-            self.write(move |tx| retention::purge_aborted_uploads(tx, now, STORAGE_BATCH as u32));
+        for _ in 0..LOG_EXPIRE_ROUNDS {
+            match self
+                .write(move |tx| retention::purge_aborted_uploads(tx, now, STORAGE_BATCH as u32))
+            {
+                Ok(purged) if i64::from(purged) >= STORAGE_BATCH => {}
+                _ => break,
+            }
+        }
     }
 
     fn maintenance_loop(&self) {
@@ -1500,9 +1557,11 @@ impl Inner {
                 continue;
             };
             let now = UnixMillis::now();
-            if now.0 - self.last_storage.load(Ordering::Relaxed) >= policy.interval_ms {
+            if now.0 - self.last_storage.load(Ordering::Relaxed) >= policy.interval_ms
+                // A pass a backup kept out did not happen: the next tick tries again instead of waiting a whole interval.
+                && self.storage_pass(now)
+            {
                 self.last_storage.store(now.0, Ordering::Relaxed);
-                self.storage_pass(now);
             }
         }
     }

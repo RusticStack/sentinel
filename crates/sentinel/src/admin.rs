@@ -418,8 +418,14 @@ fn backup(args: &crate::cli::BackupArgs) -> Result<(), Error> {
                     "log_bytes_copied": report.log_bytes_copied,
                     "config_files": report.config_files,
                     "key_ids": report.key_ids,
+                    "target_open_to_others": report.target_open_to_others,
                 })
             );
+            if report.target_open_to_others {
+                eprintln!(
+                    "the backup directory is open to other accounts and holds every tenant's objects and the sealed database; restrict it to its owner (chmod 700)"
+                );
+            }
             if !report.objects_corrupt.is_empty() || !report.objects_missing.is_empty() {
                 return Err(fail(
                     "some objects were missing or failed their digest and were not backed up; run admin objects verify",
@@ -551,6 +557,7 @@ fn restore(
             "config_files": restored.config_files,
             "key_checked": restored.key_checked,
             "objects_unavailable": restored.objects_unavailable,
+            "data_dir_open_to_others": restored.data_dir_open_to_others,
             "copy_ms": copied.as_millis() as u64,
             "total_ms": started.elapsed().as_millis() as u64,
             "recovery": {
@@ -561,6 +568,11 @@ fn restore(
             },
         })
     );
+    if restored.data_dir_open_to_others {
+        eprintln!(
+            "the data directory is open to other accounts; restrict it to its owner (chmod 700) before starting the controller"
+        );
+    }
     if !restored.objects_unavailable.is_empty() {
         eprintln!(
             "{} objects were already missing or corrupt when the backup was taken and are not restored; recovery names them",

@@ -1003,3 +1003,258 @@ fn backups_killed_at_staggered_points_leave_only_complete_ones() {
     );
     eprintln!("{survivors} complete backups were on disk after six kills");
 }
+
+// A backup holds every tenant's objects and the sealed database: nothing in it, or in a restored directory, may be open to
+// other accounts, not even for the instant between a copy and a chmod. The child runs under umask 022, the usual default.
+#[cfg(unix)]
+#[test]
+fn backup_and_restore_leave_nothing_readable_by_group_or_other() {
+    use std::os::unix::fs::PermissionsExt;
+    const CHILD: &str = "SENTINEL_BACKUP_MODE_CHILD";
+    const TEST: &str = "backup_and_restore_leave_nothing_readable_by_group_or_other";
+    if std::env::var_os(CHILD).is_some() {
+        let f = fixture();
+        let body: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let digest = f.put(&body);
+        f.manifest(digest, body.len() as u64);
+        f.log();
+        let report = f.backup();
+        assert!(
+            !report.target_open_to_others,
+            "a target made here is private"
+        );
+        let fresh = f.dir.path().join("restored").join("nested");
+        let restored = backup::restore(&f.target(), &report.id, &fresh, Some(&f.key)).unwrap();
+        assert!(!restored.data_dir_open_to_others);
+
+        let mut seen = 0;
+        for root in [f.target(), f.dir.path().join("restored")] {
+            let mut stack = vec![root];
+            while let Some(path) = stack.pop() {
+                let meta = fs::symlink_metadata(&path).unwrap();
+                let mode = meta.permissions().mode();
+                assert_eq!(
+                    mode & 0o077,
+                    0,
+                    "{} is open to group or other ({mode:o})",
+                    path.display()
+                );
+                seen += 1;
+                if meta.is_dir() {
+                    stack.extend(fs::read_dir(&path).unwrap().flatten().map(|e| e.path()));
+                }
+            }
+        }
+        for name in ["controller.key", "master.key", "metadata.sqlite"] {
+            assert!(fresh.join(name).is_file(), "{name} was restored");
+        }
+        assert!(seen > 20, "{seen} entries checked");
+
+        // A directory that already exists keeps its mode; the caller is told.
+        let open = f.dir.path().join("open");
+        fs::create_dir(&open).unwrap();
+        assert_ne!(fs::metadata(&open).unwrap().permissions().mode() & 0o077, 0);
+        let again = backup::create(&f.store, &f.objects, &f.data, &open, "test").unwrap();
+        assert!(again.target_open_to_others);
+        let into = f.dir.path().join("open-restore");
+        fs::create_dir(&into).unwrap();
+        let restored = backup::restore(&open, &again.id, &into, Some(&f.key)).unwrap();
+        assert!(restored.data_dir_open_to_others);
+        return;
+    }
+    let out = std::process::Command::new("sh")
+        .args([
+            "-c",
+            &format!("umask 022 && exec \"$0\" --exact {TEST} --nocapture"),
+        ])
+        .arg(std::env::current_exe().unwrap())
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn scheduler_every(f: &Fixture, interval: Duration) -> Arc<backup::Scheduler> {
+    backup::Scheduler::new(
+        Arc::clone(&f.store),
+        Arc::clone(&f.objects),
+        f.data.clone(),
+        f.target(),
+        interval,
+        8,
+        "test".into(),
+    )
+}
+
+/// Dates the newest backup as if it had been taken at `started_ms`.
+fn redate_newest(f: &Fixture, started_ms: i64) {
+    let id = backup::list(&f.target()).unwrap().pop().unwrap();
+    let path = f.target().join(id).join("backup.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["started_ms"] = started_ms.into();
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+}
+
+/// Starts the scheduler as a restarted controller would, and reports whether it took a backup within `wait`.
+fn takes_a_backup_within(scheduler: &Arc<backup::Scheduler>, wait: Duration) -> bool {
+    use backup::Control;
+    let handle = scheduler.start().unwrap();
+    let deadline = std::time::Instant::now() + wait;
+    let mut taken = false;
+    while std::time::Instant::now() < deadline {
+        if !scheduler.status()["last_success_ms"].is_null() {
+            taken = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    scheduler.stop();
+    handle.join().unwrap();
+    taken
+}
+
+// A controller restarted more often than its interval used to start the clock again each time and never take a backup.
+#[test]
+fn a_restarted_scheduler_takes_an_overdue_backup_at_once_and_waits_for_a_recent_one() {
+    let f = fixture();
+    f.backup();
+    let hour = Duration::from_secs(3_600);
+
+    // Overdue: the newest backup is two intervals old.
+    redate_newest(&f, UnixMillis::now().0 - 2 * 3_600_000);
+    let before = backup::list(&f.target()).unwrap().len();
+    assert!(
+        takes_a_backup_within(&scheduler_every(&f, hour), Duration::from_secs(30)),
+        "an overdue backup is taken without waiting a whole interval"
+    );
+    assert_eq!(backup::list(&f.target()).unwrap().len(), before + 1);
+
+    // Recent: the newest backup is seconds old, so nothing is due for most of an hour.
+    let before = backup::list(&f.target()).unwrap().len();
+    assert!(
+        !takes_a_backup_within(&scheduler_every(&f, hour), Duration::from_millis(800)),
+        "a recent backup is not repeated at once"
+    );
+    assert_eq!(backup::list(&f.target()).unwrap().len(), before);
+
+    // A newest backup dated in the future (clock skew) delays the next one by one interval at most.
+    redate_newest(&f, UnixMillis::now().0 + 10 * 86_400_000);
+    assert!(
+        takes_a_backup_within(
+            &scheduler_every(&f, Duration::from_millis(1_500)),
+            Duration::from_secs(30)
+        ),
+        "clock skew cannot postpone backups by more than one interval"
+    );
+
+    // No backups yet, or none that can be read: one is taken at once.
+    let fresh = fixture();
+    assert!(takes_a_backup_within(
+        &scheduler_every(&fresh, hour),
+        Duration::from_secs(30)
+    ));
+    let id = backup::list(&fresh.target()).unwrap().pop().unwrap();
+    fs::write(fresh.target().join(id).join("backup.json"), b"not json").unwrap();
+    assert!(takes_a_backup_within(
+        &scheduler_every(&fresh, hour),
+        Duration::from_secs(30)
+    ));
+}
+
+// R07: the database lands last, so a restore killed at any instant leaves a directory without one, never half of a controller.
+#[test]
+fn restores_killed_at_staggered_points_never_leave_a_database_and_a_rerun_succeeds() {
+    const CHILD: &str = "SENTINEL_R07_RESTORE_CHILD";
+    const FROM: &str = "SENTINEL_R07_RESTORE_FROM";
+    const ID: &str = "SENTINEL_R07_RESTORE_ID";
+    const KEY: &str = "SENTINEL_R07_RESTORE_KEY";
+    const OBJECTS: u64 = 120;
+    if let (Some(into), Some(from), Some(id), Some(key)) = (
+        std::env::var_os(CHILD),
+        std::env::var_os(FROM),
+        std::env::var_os(ID),
+        std::env::var_os(KEY),
+    ) {
+        let (into, from) = (
+            std::path::PathBuf::from(into),
+            std::path::PathBuf::from(from),
+        );
+        let (id, key) = (
+            id.to_string_lossy().into_owned(),
+            std::path::PathBuf::from(key),
+        );
+        // Each restore goes to a directory of its own, so a kill never lands in the middle of cleaning one up.
+        for n in 0u64.. {
+            let _ = backup::restore(&from, &id, &into.join(format!("r{n}")), Some(&key));
+        }
+        return;
+    }
+    let f = fixture();
+    for i in 0..OBJECTS {
+        let body: Vec<u8> = (0..4_096u32)
+            .map(|b| (b.wrapping_mul(i as u32 + 1) >> 2) as u8)
+            .collect();
+        let digest = f.put(&body);
+        if i == 0 {
+            f.manifest(digest, body.len() as u64);
+        }
+    }
+    f.log();
+    let report = f.backup();
+    let (target, key) = (f.target(), f.key.clone());
+    let into = f.dir.path().join("restores");
+    fs::create_dir_all(&into).unwrap();
+
+    let (mut interrupted, mut finished) = (0u32, 0u32);
+    for delay_ms in [30, 80, 150, 250, 400, 650] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "restores_killed_at_staggered_points_never_leave_a_database_and_a_rerun_succeeds",
+                "--nocapture",
+            ])
+            .env(CHILD, &into)
+            .env(FROM, &target)
+            .env(ID, &report.id)
+            .env(KEY, &key)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        for entry in fs::read_dir(&into).unwrap().flatten() {
+            let dir = entry.path();
+            if dir.join("metadata.sqlite").exists() {
+                // A database means the restore finished: everything it names is there.
+                finished += 1;
+            } else {
+                interrupted += 1;
+                let restored = backup::restore(&target, &report.id, &dir, Some(&key)).unwrap();
+                assert_eq!(restored.objects, OBJECTS, "{}", dir.display());
+            }
+            let store = Store::open(dir.join("metadata.sqlite"), Durability::Normal).unwrap();
+            let objects = Objects::open(&dir).unwrap();
+            let recovery = store.read(|c| objects.recover(c)).unwrap();
+            assert!(
+                recovery.missing.is_empty() && recovery.corrupt.is_empty(),
+                "a restore killed at {delay_ms} ms left {} unusable: {recovery:?}",
+                dir.display()
+            );
+            drop((store, objects));
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+    eprintln!(
+        "{interrupted} restores were cut short and rerun, {finished} had finished, over six kills"
+    );
+    assert!(interrupted > 0, "no kill landed inside a restore");
+}
