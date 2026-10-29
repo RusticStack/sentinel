@@ -1,0 +1,12 @@
+# Keep the build context to what `pnpm build` reads (examples/Containerfile.web).
+node_modules
+.output
+.tanstack
+.nitro
+dist
+bench
+test
+src/routeTree.gen.ts
+.env
+.env.*
+*.log
