@@ -1,6 +1,6 @@
 node_modules/
-.nuxt/
 .output/
-.data/
-.cache/
+.tanstack/
+.nitro/
 dist/
+src/routeTree.gen.ts

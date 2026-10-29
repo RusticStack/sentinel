@@ -92,7 +92,7 @@ pub(crate) fn page(state: &State, request: &mut Request, method: &str, query: &s
         };
         let github = state
             .github
-            .as_ref()
+            .get()
             .map(|g| (g.start_url.as_str(), here.as_str()));
         return Ok(html::sign_in_page(
             &state.oauth.login_url,

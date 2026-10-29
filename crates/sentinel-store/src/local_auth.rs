@@ -109,6 +109,8 @@ pub enum Event {
     TenantBackingChanged = 73,
     DomainAutoJoined = 74,
     MfaEnrollmentStarted = 75,
+    GithubAppCreated = 76,
+    GithubAppStateRefused = 77,
 }
 
 impl Event {
@@ -181,6 +183,8 @@ impl Event {
             Event::TenantBackingChanged => "tenant-backing-changed",
             Event::DomainAutoJoined => "domain-auto-joined",
             Event::MfaEnrollmentStarted => "mfa-enrollment-started",
+            Event::GithubAppCreated => "github-app-created",
+            Event::GithubAppStateRefused => "github-app-state-refused",
         }
     }
 
@@ -253,6 +257,8 @@ impl Event {
             73 => Event::TenantBackingChanged,
             74 => Event::DomainAutoJoined,
             75 => Event::MfaEnrollmentStarted,
+            76 => Event::GithubAppCreated,
+            77 => Event::GithubAppStateRefused,
             _ => return None,
         })
     }

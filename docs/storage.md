@@ -51,6 +51,8 @@ Version 15 ([executor](executor.md#steps)) adds `attempts.summary` (at most 32 K
 
 Version 16 ([cancellation](cancellation.md)) copies each job's execution timeout to `jobs.timeout_ms` for the controller's backstop and adds `attempts_held_by_lease` and `jobs_queued_since`, the partial indexes the expiry and queue-timeout sweeps walk.
 
+Version 56 ([GitHub App](github-app.md#what-is-stored-where)) adds `github_app`, one row holding the App registered through the manifest flow with its private key, client secret and webhook secret sealed under `master.key` (a trigger allows only a forward reseal; `reseal`, `stale`, `key_ids`, `verify_key` and `sealed_rows_exist` include the three columns), and `github_app_states`, digest-only one-time states bound to an account, a session and (for an installation) a tenant, spent once and purged by the maintenance tick through `github_app_states_by_expiry`. It is not declared readable by 55 ([compatibility](compatibility.md)).
+
 ## Writer and acknowledgement policy
 
 One thread owns the only write connection. `Writer::write` sends a closure over a bounded channel (256 slots), runs it inside `BEGIN IMMEDIATE`, commits, and only then replies. With `synchronous=FULL` the WAL is fsynced before `COMMIT` returns, so **a write is acknowledged to the caller only when it is on disk**. This is the contract worker acknowledgements, lease grants and cancel requests rely on. `Durability::Normal` exists for replayable data and tests; it is never used for transitions.

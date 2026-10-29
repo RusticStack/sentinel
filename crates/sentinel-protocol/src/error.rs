@@ -25,6 +25,8 @@ pub enum ErrorCode {
     QuotaExceeded = 12,
     /// Not retryable as is: repeating an unkeyed mutation can apply it twice.
     OutcomeUnknown = 13,
+    /// A third party (GitHub) refused or failed the call; its body is never echoed.
+    UpstreamFailed = 14,
     #[serde(other)]
     Unknown = 255,
 }
@@ -46,6 +48,7 @@ impl ErrorCode {
             Self::StorageFull => "storage_full",
             Self::QuotaExceeded => "quota_exceeded",
             Self::OutcomeUnknown => "outcome_unknown",
+            Self::UpstreamFailed => "upstream_failed",
             Self::Unknown => "unknown",
         }
     }
@@ -65,6 +68,7 @@ impl ErrorCode {
             Self::StorageFull => 507,
             Self::QuotaExceeded => 403,
             Self::OutcomeUnknown => 503,
+            Self::UpstreamFailed => 502,
         }
     }
 
@@ -184,6 +188,14 @@ mod tests {
         assert!(!ErrorCode::OutcomeUnknown.retryable());
         let json = serde_json::to_string(&ApiError::new(ErrorCode::OutcomeUnknown, "x")).unwrap();
         assert!(json.contains(r#""code":"outcome_unknown","message":"x","retryable":false"#));
+    }
+
+    #[test]
+    fn an_upstream_failure_is_a_bad_gateway_and_not_retryable_as_is() {
+        assert_eq!(ErrorCode::UpstreamFailed.http_status(), 502);
+        assert!(!ErrorCode::UpstreamFailed.retryable());
+        let json = serde_json::to_string(&ApiError::new(ErrorCode::UpstreamFailed, "x")).unwrap();
+        assert!(json.contains(r#""code":"upstream_failed","message":"x","retryable":false"#));
     }
 
     #[test]

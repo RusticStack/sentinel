@@ -197,6 +197,84 @@ pub fn load_sign_in(root: &Path) -> Result<Option<sentinel_api::GithubSignIn>, E
     }))
 }
 
+/// The GitHub App in force at start, from the files or else from the store (manifest flow).
+pub struct Github {
+    pub current: sentinel_github::app::Current,
+    pub source: Option<sentinel_api::AppSource>,
+    /// The base of a check's `details_url`: the file's `public_url`, or the controller's.
+    pub details_url: Option<String>,
+    pub members: sentinel_checks::members::Config,
+    pub webhook_secret: Option<Arc<[u8]>>,
+    pub sign_in: Option<sentinel_api::GithubSignIn>,
+    /// A stored manifest App was found but the files took precedence.
+    pub stored_ignored: bool,
+}
+
+/// Files win: when any of `github-app.json`, `github-webhook.json` and `github-sign-in.json`
+/// exists, the deployment is configured by files exactly as before and a stored App is not
+/// used. Otherwise a stored manifest App, opened with `master.key`, is put in force.
+pub fn load_github(
+    root: &Path,
+    store: &sentinel_store::Store,
+    key: Option<&sentinel_auth::sealed::Key>,
+    public_url: Option<&str>,
+) -> Result<Github, Error> {
+    let app = load_app(root).map_err(|_| fail("cannot load GitHub App configuration"))?;
+    let webhook_secret =
+        load_webhook_secret(root).map_err(|_| fail("cannot load the GitHub webhook secret"))?;
+    let sign_in = load_sign_in(root)?;
+    let stored = store
+        .read(sentinel_store::github_app::facts)
+        .map_err(|_| fail("cannot read the stored GitHub App"))?
+        .is_some();
+    if app.is_some() || webhook_secret.is_some() || sign_in.is_some() {
+        let (current, details_url, members) = match app {
+            Some(app) => (Some(app.app), app.public_url, app.members),
+            None => (None, None, sentinel_checks::members::Config::default()),
+        };
+        return Ok(Github {
+            current: current.into(),
+            source: Some(sentinel_api::AppSource::Files),
+            details_url,
+            members,
+            webhook_secret,
+            sign_in,
+            stored_ignored: stored,
+        });
+    }
+    let mut github = Github {
+        current: sentinel_github::app::Current::default(),
+        source: None,
+        details_url: public_url.map(str::to_owned),
+        members: sentinel_checks::members::Config::default(),
+        webhook_secret: None,
+        sign_in: None,
+        stored_ignored: false,
+    };
+    if !stored {
+        return Ok(github);
+    }
+    let key = key.ok_or_else(|| fail("the stored GitHub App needs master.key"))?;
+    let credentials = store
+        .read(|c| sentinel_store::github_app::load(c, key))
+        .map_err(|_| fail("master.key does not open the stored GitHub App"))?
+        .ok_or_else(|| fail("the stored GitHub App disappeared"))?;
+    let app = sentinel_github::app::App::new(credentials.facts.app_id, &credentials.pem)
+        .map_err(|_| fail("the stored GitHub App key is unusable"))?;
+    github.current.set(Arc::new(app));
+    github.webhook_secret = credentials
+        .webhook_secret
+        .as_deref()
+        .map(|secret| Arc::from(secret.as_bytes()));
+    github.sign_in = Some(sentinel_api::GithubSignIn {
+        client_id: credentials.facts.client_id.clone(),
+        client_secret: credentials.client_secret.clone(),
+        endpoints: sentinel_github::oauth::Endpoints::github(),
+    });
+    github.source = Some(sentinel_api::AppSource::Manifest);
+    Ok(github)
+}
+
 pub fn load_destinations(root: &Path) -> Result<Vec<String>, Error> {
     let path = root.join("source-destinations.json");
     if !path.exists() {

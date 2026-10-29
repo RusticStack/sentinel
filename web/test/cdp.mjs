@@ -111,8 +111,9 @@ export class Page {
   async goto(url) {
     await this.send("Page.navigate", { url });
     await this.waitFor("document.readyState === 'complete'", 15000);
-    // A form submitted before Vue takes over is submitted natively, so wait for hydration.
-    await this.waitFor("(() => { try { return typeof window.useNuxtApp !== 'function' || !window.useNuxtApp().isHydrating; } catch (e) { return true; } })()", 15000, "hydration");
+    // A form submitted before React takes over is submitted natively, so wait for the attribute the root sets once
+    // it has hydrated (pages that are not the interface's, such as the controller's own, have no data-app).
+    await this.waitFor("document.documentElement.dataset.app !== 'start' || document.documentElement.dataset.hydrated === '1'", 15000, "hydration");
   }
   async eval(expression) {
     const r = await this.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });

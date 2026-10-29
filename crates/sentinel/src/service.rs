@@ -1259,10 +1259,8 @@ enum Running {
         store: Arc<sentinel_store::Store>,
         lane: Box<sentinel_intake::Lane>,
         poll: Box<sentinel_intake::Poll>,
-        checks: Option<Box<sentinel_checks::Lane>>,
-        reconcile: Option<Box<sentinel_checks::Reconcile>>,
+        github_lanes: Arc<std::sync::Mutex<Option<GithubLanes>>>,
         mail: Option<Box<sentinel_mail::Lane>>,
-        members: Option<Box<sentinel_checks::Members>>,
         tailcat: Option<TailcatServer>,
         replicator: Option<sentinel::offload::Running>,
         backups: Option<(
@@ -1277,6 +1275,88 @@ enum Running {
         tailcat: Option<Arc<sentinel_link::tailcat::Forward>>,
         metrics: Arc<crate::worker_metrics::Metrics>,
     },
+}
+
+/// The lanes that act as the GitHub App: started at boot when an App is configured, or when a
+/// one-click setup puts one in force. Fields drop in declaration order: members, reconcile,
+/// then the check publisher.
+#[cfg(feature = "server")]
+struct GithubLanes {
+    _members: Box<sentinel_checks::Members>,
+    _reconcile: Box<sentinel_checks::Reconcile>,
+    _checks: Box<sentinel_checks::Lane>,
+}
+
+#[cfg(feature = "server")]
+impl GithubLanes {
+    fn start(
+        store: &Arc<sentinel_store::Store>,
+        app: Arc<sentinel_github::app::App>,
+        details_url: Option<String>,
+        members: sentinel_checks::members::Config,
+    ) -> GithubLanes {
+        let reconcile_dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let reconcile = Box::new(sentinel_checks::Reconcile::start(
+            Arc::clone(store),
+            Arc::clone(&app),
+            sentinel_checks::reconcile::Config::default(),
+            move |notice| {
+                tracing::dispatcher::with_default(&reconcile_dispatch, || {
+                    tracing::info!(
+                        event = "github_reconciled",
+                        kind = notice.kind,
+                        outcome = %notice.outcome
+                    );
+                });
+            },
+        ));
+        let members_dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let members = Box::new(sentinel_checks::Members::start(
+            Arc::clone(store),
+            Arc::clone(&app),
+            members,
+            move |notice| {
+                tracing::dispatcher::with_default(&members_dispatch, || {
+                    tracing::info!(event = "github_members_checked", outcome = %notice.outcome);
+                });
+            },
+        ));
+        let publisher =
+            sentinel_checks::github::GithubChecks::new(Arc::clone(store), app, details_url);
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let checks = Box::new(sentinel_checks::Lane::start(
+            Arc::clone(store),
+            Box::new(publisher),
+            sentinel_checks::lane::Config::default(),
+            move |batch| {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    if batch.refused > 0 {
+                        tracing::warn!(
+                            event = "checks_failed",
+                            refused = batch.refused,
+                            "publications were refused"
+                        );
+                    }
+                    if let Some(until) = batch.paused_until_ms {
+                        tracing::warn!(event = "checks_paused", until_ms = until);
+                    }
+                    for entry in &batch.entries {
+                        tracing::info!(
+                            event = "check_settled",
+                            check = %entry.id,
+                            name = %entry.name,
+                            outcome = %entry.outcome
+                        );
+                    }
+                });
+            },
+        ));
+        GithubLanes {
+            _members: members,
+            _reconcile: reconcile,
+            _checks: checks,
+        }
+    }
 }
 
 #[cfg(feature = "server")]
@@ -1480,8 +1560,9 @@ fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
     let wall = sentinel_core::UnixMillis::now();
     // Idempotency keys are stamped by the deadline clock, so their TTL is judged on it.
     let steady = sentinel_core::UnixMillis::steady();
-    let purges: [(&str, Purge, sentinel_core::UnixMillis); 8] = [
+    let purges: [(&str, Purge, sentinel_core::UnixMillis); 9] = [
         ("setup", sentinel_store::setup::purge, wall),
+        ("github_app_states", sentinel_store::github_app::purge, wall),
         ("oauth", sentinel_store::oauth::purge_expired, wall),
         ("api_tokens", sentinel_store::tokens::purge_expired, wall),
         ("sessions", sentinel_store::local_auth::purge_expired, wall),
@@ -1649,10 +1730,21 @@ fn start_server(
         .map_err(|_| Error::runtime("cannot load source destination policy"))?;
     let intake_destinations: Arc<[String]> = destinations.clone().into();
     controller.set_source_destinations(destinations);
-    let app = crate::source_admin::load_app(&config.data_dir)
-        .map_err(|_| Error::runtime("cannot load GitHub App configuration"))?;
-    if let Some(app) = &app {
-        controller.set_source_app(Arc::clone(&app.app));
+    let github = crate::source_admin::load_github(
+        &config.data_dir,
+        &store,
+        key.as_deref(),
+        public_url.as_deref(),
+    )
+    .map_err(|error| Error::runtime(error.message))?;
+    if github.stored_ignored {
+        tracing::warn!(
+            event = "github_app_stored_ignored",
+            "a GitHub App made with one-click setup is stored, but the GitHub files in the data directory take precedence"
+        );
+    }
+    if let Some(app) = github.current.get() {
+        controller.set_source_app(Arc::clone(app));
     }
     if let Some(key) = &key {
         controller.set_source_key(Arc::clone(key));
@@ -1660,7 +1752,7 @@ fn start_server(
     let resolver = sentinel_intake::Resolver::new(
         Arc::clone(&store),
         key.clone(),
-        app.as_ref().map(|app| Arc::clone(&app.app)),
+        github.current.clone(),
         Arc::clone(&intake_destinations),
         Arc::new(sentinel_intake::resolve::GitFetch),
         config.data_dir.join("intake-work"),
@@ -1707,7 +1799,7 @@ fn start_server(
     let poll = sentinel_intake::Poll::start(
         Arc::clone(&store),
         key.clone(),
-        app.as_ref().map(|app| Arc::clone(&app.app)),
+        github.current.clone(),
         intake_destinations,
         Arc::new(sentinel_intake::GitLister),
         config.data_dir.join("poll-work"),
@@ -1731,84 +1823,56 @@ fn start_server(
         },
     )
     .map_err(|_| Error::runtime("cannot prepare the poll work directory"))?;
-    let github_webhook_secret = crate::source_admin::load_webhook_secret(&config.data_dir)
-        .map_err(|_| Error::runtime("cannot load the GitHub webhook secret"))?;
+    let github_webhook_secret = github.webhook_secret.clone();
     if github_webhook_secret.is_some() {
         tracing::info!(event = "github_webhook_enabled");
     }
-    let mut reconcile = None;
-    let mut members = None;
-    let checks = match &app {
+    let github_lanes: Arc<std::sync::Mutex<Option<GithubLanes>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    match github.current.get() {
         Some(app) => {
             tracing::info!(
                 event = "checks_enabled",
-                endpoint = %app.app.endpoint(),
-                details_url = app.public_url.is_some()
+                endpoint = %app.endpoint(),
+                details_url = github.details_url.is_some()
             );
-            let reconcile_dispatch = tracing::dispatcher::get_default(Clone::clone);
-            reconcile = Some(Box::new(sentinel_checks::Reconcile::start(
-                Arc::clone(&store),
-                Arc::clone(&app.app),
-                sentinel_checks::reconcile::Config::default(),
-                move |notice| {
-                    tracing::dispatcher::with_default(&reconcile_dispatch, || {
-                        tracing::info!(
-                            event = "github_reconciled",
-                            kind = notice.kind,
-                            outcome = %notice.outcome
-                        );
-                    });
-                },
-            )));
-            let members_dispatch = tracing::dispatcher::get_default(Clone::clone);
-            members = Some(Box::new(sentinel_checks::Members::start(
-                Arc::clone(&store),
-                Arc::clone(&app.app),
-                app.members,
-                move |notice| {
-                    tracing::dispatcher::with_default(&members_dispatch, || {
-                        tracing::info!(event = "github_members_checked", outcome = %notice.outcome);
-                    });
-                },
-            )));
-            let publisher = sentinel_checks::github::GithubChecks::new(
-                Arc::clone(&store),
-                Arc::clone(&app.app),
-                app.public_url.clone(),
-            );
-            let dispatch = tracing::dispatcher::get_default(Clone::clone);
-            Some(Box::new(sentinel_checks::Lane::start(
-                Arc::clone(&store),
-                Box::new(publisher),
-                sentinel_checks::lane::Config::default(),
-                move |batch| {
-                    tracing::dispatcher::with_default(&dispatch, || {
-                        if batch.refused > 0 {
-                            tracing::warn!(
-                                event = "checks_failed",
-                                refused = batch.refused,
-                                "publications were refused"
-                            );
-                        }
-                        if let Some(until) = batch.paused_until_ms {
-                            tracing::warn!(event = "checks_paused", until_ms = until);
-                        }
-                        for entry in &batch.entries {
-                            tracing::info!(
-                                event = "check_settled",
-                                check = %entry.id,
-                                name = %entry.name,
-                                outcome = %entry.outcome
-                            );
-                        }
-                    });
-                },
-            )))
+            *github_lanes.lock().unwrap_or_else(|p| p.into_inner()) = Some(GithubLanes::start(
+                &store,
+                Arc::clone(app),
+                github.details_url.clone(),
+                github.members,
+            ));
         }
-        None => {
-            tracing::info!(event = "checks_disabled", "no GitHub App");
-            None
-        }
+        None => tracing::info!(event = "checks_disabled", "no GitHub App"),
+    }
+    let on_activate: sentinel_api::OnActivate = {
+        let (store, lanes, link) = (
+            Arc::clone(&store),
+            Arc::clone(&github_lanes),
+            controller.handle(),
+        );
+        let details_url = public_url.clone();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        Arc::new(move |activation: &sentinel_api::Activation| {
+            tracing::dispatcher::with_default(&dispatch, || {
+                link.set_source_app(Arc::clone(&activation.app));
+                let mut slot = lanes.lock().unwrap_or_else(|p| p.into_inner());
+                if slot.is_none() {
+                    *slot = Some(GithubLanes::start(
+                        &store,
+                        Arc::clone(&activation.app),
+                        details_url.clone(),
+                        sentinel_checks::members::Config::default(),
+                    ));
+                }
+                tracing::info!(
+                    event = "github_app_activated",
+                    app_id = activation.app_id,
+                    slug = %activation.slug,
+                    "the GitHub App made with one-click setup is in force; no restart needed"
+                );
+            });
+        })
     };
     tracing::info!(
         event = "link_listening",
@@ -1819,8 +1883,7 @@ fn start_server(
         orphaned = reconciled.orphaned,
         "workers pin this fingerprint with their enrollment"
     );
-    let github_sign_in = crate::source_admin::load_sign_in(&config.data_dir)
-        .map_err(|error| Error::runtime(error.message))?;
+    let github_sign_in = github.sign_in;
     if let Some(sign_in) = &github_sign_in {
         tracing::info!(event = "github_sign_in_enabled", client_id = %sign_in.client_id);
     }
@@ -1862,6 +1925,12 @@ fn start_server(
                 organization: rule.slug.clone(),
             })
             .collect(),
+        github_app: sentinel_api::GithubAppSetup {
+            current: github.current.clone(),
+            source: github.source,
+            on_activate: Some(on_activate),
+            ..sentinel_api::GithubAppSetup::default()
+        },
     };
     let api = sentinel_api::Server::start_with(
         sentinel_api::Config {
@@ -1897,10 +1966,8 @@ fn start_server(
         store,
         lane: Box::new(lane),
         poll: Box::new(poll),
-        checks,
-        reconcile,
+        github_lanes,
         mail,
-        members,
         tailcat,
         replicator,
         backups,
@@ -2770,10 +2837,8 @@ fn initialize_and_wait(
             store,
             lane,
             poll,
-            checks,
-            reconcile,
+            github_lanes,
             mail,
-            members,
             tailcat,
             replicator,
             backups,
@@ -2790,9 +2855,12 @@ fn initialize_and_wait(
             if let Some(tailcat) = tailcat {
                 tailcat.shutdown();
             }
-            drop(members);
-            drop(reconcile);
-            drop(checks);
+            drop(
+                github_lanes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take(),
+            );
             drop(mail);
             drop(poll);
             drop(lane);

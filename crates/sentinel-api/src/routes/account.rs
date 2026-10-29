@@ -120,7 +120,7 @@ fn security(state: &State, request: &mut Request) -> Route {
             "provider": identity.provider,
             "linked_ms": identity.linked.0,
         })).collect::<Vec<_>>(),
-        "github_link": state.github.is_some(),
+        "github_link": state.github.get().is_some(),
     }))
 }
 

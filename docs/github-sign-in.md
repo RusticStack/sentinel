@@ -20,6 +20,8 @@ Implemented in `sentinel-github` (bounded HTTPS client, authorization-code excha
 
 ## Browser routes
 
+Sign-in is configured by `github-sign-in.json` ([configuration](configuration.md)) or, with [one-click GitHub App setup](github-app.md), through the App's own OAuth client, whose callback the manifest registers as `{public_url}/auth/github/callback`.
+
 `sentinel-api` routes the flow above through the browser pages (`crates/sentinel-api/src/github.rs`), so an account that exists only through GitHub — admitted by an invitation bound to its GitHub account, with no password — can sign in on the OAuth consent page (`/oauth/authorize`), the device page (`/device`) and the web interface (`/login`, returning to `/`; [web interface](web-ui.md)). Each offers "Sign in with GitHub" as a plain `GET` link beside the password form, only when GitHub sign-in is configured ([configuration](configuration.md)).
 
 - **`GET /auth/github/start?return_to=<path>`** runs *Begin* and *Authorize*. `return_to` is the page to come back to, as an issuer-relative path: only `/`, `/oauth/authorize?…` or `/device[?…]`, only URL-safe characters (`A–Z a–z 0–9 - . _ ~ % / ? & = + : @ ! $ , * ( )`), at most 2048 bytes. Anything else — an absolute URL, `//host`, a backslash, another route, a fragment, quotes — is refused before any state exists, so a finished sign-in cannot be an open redirect. The route is rate-limited per client (burst 10, then one per 2 s; 20/s for the deployment), which also bounds the pending table: states live ten minutes, so it holds at most about 12,000 rows, and the maintenance tick purges spent and expired ones in batches of 1,000.
