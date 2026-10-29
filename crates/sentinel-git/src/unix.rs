@@ -134,12 +134,34 @@ impl Output {
     }
 
     pub fn stderr_excerpt(&self) -> String {
+        self.stderr_excerpt_redacted(&[])
+    }
+
+    /// Last non-empty stderr line with every secret replaced on the raw line,
+    /// before control characters are dropped and the line is cut to 200
+    /// characters, so a secret straddling the cut or holding a control
+    /// character cannot leave a prefix behind.
+    pub fn stderr_excerpt_redacted(&self, secrets: &[String]) -> String {
         let text = String::from_utf8_lossy(&self.stderr);
         let line = text
             .lines()
             .rev()
             .find(|l| !l.trim().is_empty())
             .unwrap_or("");
+        let redacted;
+        let line = if secrets
+            .iter()
+            .any(|s| !s.is_empty() && line.contains(s.as_str()))
+        {
+            let mut owned = line.to_owned();
+            for secret in secrets.iter().filter(|s| !s.is_empty()) {
+                owned = owned.replace(secret.as_str(), "[redacted]");
+            }
+            redacted = owned;
+            redacted.as_str()
+        } else {
+            line
+        };
         let mut out: String = line.chars().filter(|c| !c.is_control()).take(200).collect();
         if out.is_empty() {
             out.push_str("no diagnostic output");
@@ -326,10 +348,20 @@ pub(crate) fn run_capped(
             return Err(Error::Timeout(what));
         }
     };
+    // Join before reading the flag: a child that exits first may leave the
+    // overflowing chunk unread in the pipe until the drain thread sees it.
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if overflow
+        .as_ref()
+        .is_some_and(|o| o.exceeded.load(Ordering::Acquire))
+    {
+        return Err(Error::TooLarge(what));
+    }
     Ok(Output {
         code: status.code(),
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout,
+        stderr,
     })
 }
 
@@ -343,10 +375,7 @@ pub(crate) fn step(
     if output.success() {
         Ok(output)
     } else {
-        let mut excerpt = output.stderr_excerpt();
-        for secret in secrets {
-            excerpt = excerpt.replace(secret, "[redacted]");
-        }
+        let excerpt = output.stderr_excerpt_redacted(secrets);
         Err(Error::Preparation(format!("{what} failed: {excerpt}")))
     }
 }
@@ -890,10 +919,7 @@ pub fn is_ancestor(
     let output = run(fetch, deadline, "git fetch")?;
     drop(private);
     if !output.success() {
-        let mut excerpt = output.stderr_excerpt();
-        for secret in &secrets {
-            excerpt = excerpt.replace(secret, "[redacted]");
-        }
+        let excerpt = output.stderr_excerpt_redacted(&secrets);
         if excerpt.contains("not our ref") || excerpt.contains("couldn't find remote ref") {
             return Ok(false);
         }
@@ -943,10 +969,7 @@ pub fn ls_remote(
     let output = run_capped(cmd, deadline, "git ls-remote", Some(cap))?;
     drop(private);
     if !output.success() {
-        let mut excerpt = output.stderr_excerpt();
-        for secret in &secrets {
-            excerpt = excerpt.replace(secret, "[redacted]");
-        }
+        let excerpt = output.stderr_excerpt_redacted(&secrets);
         return Err(Error::Preparation(format!(
             "git ls-remote failed: {excerpt}"
         )));
@@ -1204,6 +1227,72 @@ mod tests {
             "held to the park bound"
         );
         child.wait().unwrap();
+    }
+
+    fn sh(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    fn soon() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(30)
+    }
+
+    #[test]
+    fn a_child_that_exits_after_overflowing_the_cap_is_too_large() {
+        // 40 000 bytes fit the pipe buffer, so the child exits 0 before the
+        // reader has stopped; the truncated read must still be refused.
+        for _ in 0..50 {
+            let result = super::run_capped(
+                sh("head -c 40000 /dev/zero"),
+                soon(),
+                "capped",
+                Some(16_384),
+            );
+            assert!(
+                matches!(result, Err(crate::Error::TooLarge("capped"))),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_exactly_at_the_cap_is_kept_whole() {
+        let out = super::run_capped(
+            sh("head -c 16384 /dev/zero"),
+            soon(),
+            "capped",
+            Some(16_384),
+        )
+        .unwrap();
+        assert_eq!(out.stdout.len(), 16_384);
+    }
+
+    fn failure_text(script: &str, secret: &str) -> String {
+        let err = super::step(sh(script), soon(), "git probe", &[secret.to_owned()])
+            .expect_err("the command fails");
+        err.to_string()
+    }
+
+    #[test]
+    fn a_secret_straddling_the_excerpt_cut_is_redacted_whole() {
+        let text = failure_text(
+            "{ printf '%190s' '' | tr ' ' x; echo SECRETTOKEN123; } >&2; exit 1",
+            "SECRETTOKEN123",
+        );
+        assert!(!text.contains("SECR"), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
+    }
+
+    #[test]
+    fn a_secret_holding_a_control_character_is_redacted() {
+        let text = failure_text(
+            "printf 'denied SECRET\\tTOKEN123\\n' >&2; exit 1",
+            "SECRET\tTOKEN123",
+        );
+        assert!(!text.contains("SECR"), "{text}");
+        assert!(text.contains("denied [redacted]"), "{text}");
     }
 
     #[test]
