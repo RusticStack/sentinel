@@ -31,7 +31,7 @@ import statistics
 import sys
 
 SCHEMA = "sentinel-bench/b09/1"
-SHAPE_KEYS = ("workers", "mode", "runs_per_repeat", "link", "link_shape", "disk", "job")
+SHAPE_KEYS = ("workers", "mode", "runs_per_repeat", "link", "link_shape", "disk", "job", "fleet")
 
 
 class GateError(Exception):
@@ -83,7 +83,7 @@ def compare(base, cand, max_regression, min_repeats):
     if base["handicap"]:
         return {**out, "verdict": "incomparable", "why": "the baseline carries an injected handicap"}
     if base["shape"] != cand["shape"]:
-        return {**out, "verdict": "incomparable", "why": "scenario shape differs (workers, mode, runs, link, disk or job)"}
+        return {**out, "verdict": "incomparable", "why": "scenario shape differs (workers, mode, runs, link, disk, job or fleet)"}
     if len(base["p95s"]) < min_repeats or len(cand["p95s"]) < min_repeats:
         return {**out, "verdict": "insufficient",
                 "why": f"needs {min_repeats} usable repeats on each side to estimate noise"}

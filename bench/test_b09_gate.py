@@ -77,6 +77,17 @@ class Gate(unittest.TestCase):
         cand = [repeat(100, sc=scenario(workers=3))] * 3
         self.assertEqual(self.run_gate([repeat(100)] * 3, cand)["verdict"], "incomparable")
 
+    def test_a_different_fleet_is_incomparable_and_the_same_fleet_compares(self):
+        fa = {"a": {"identities": 3, "per_identity_ceilings": {"cpu_millis": 1000}, "priority": 0, "arch": "x86_64"}}
+        fb = {"b": {"identities": 3, "per_identity_ceilings": {"cpu_millis": 1000}, "priority": 0, "arch": "x86_64"}}
+        base = [repeat(100, sc=scenario(workers=3, fleet=fa))] * 3
+        same = [repeat(100, sc=scenario(workers=3, fleet=fa))] * 3
+        other = [repeat(100, sc=scenario(workers=3, fleet=fb))] * 3
+        self.assertEqual(self.run_gate(base, same)["verdict"], "pass")
+        self.assertEqual(self.run_gate(base, other)["verdict"], "incomparable")
+        self.assertEqual(self.run_gate(base, [repeat(100, sc=scenario(workers=3))] * 3)["verdict"],
+                         "incomparable")
+
     def test_a_handicapped_baseline_is_refused(self):
         r = self.run_gate([handicapped(100, 5)] * 3, [repeat(100)] * 3)
         self.assertEqual(r["verdict"], "incomparable")
