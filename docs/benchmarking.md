@@ -139,6 +139,20 @@ Interpretation, limited to what was measured:
 
 Part 14 measures representative checks under frozen contracts. The runner's `--contract`, `--lane`, `--condition` and `--root` options measure a contract lane only when the host and inputs match the contract, and its `scoped` runtime gives a direct process the same CPU and memory caps a container gets. See [benchmark contracts](benchmark-contracts.md) for the contract, the conditions, the identical-isolation comparison and its results.
 
+## B09: reliability and performance scenarios, and the regression gate
+
+`bench/b09-harness.py` runs the B09 scenarios (bursts, 1/3/10 workers, slow or full disks, shaped links (the real Tailcat relay scenario is recorded as blocked), partitions, restarts, a noisy tenant) on one verification host with every worker in its own process and network namespace, and appends `sentinel-bench/b09/1` records: one per repeat for performance scenarios (`kind: perf`, with a `summary.overhead_ns` distribution of at least 20 runs) and one per scenario for reliability scenarios. `bench/b09-git.py` is its Git fixture. Its header lists the faults it injects and how it removes them. No B09 result record is committed yet, so no B09 number is claimed anywhere in these documents.
+
+**The gate.** `python3 bench/b09-gate.py BASELINE.jsonl CANDIDATE.jsonl` compares two such files and allows a 10% p95 overhead regression (`--max-regression`). Per scenario:
+
+- The unit is one repeat's p95 overhead. A side's figure is the **median** of its repeats' p95s and its noise is the **spread** (max minus min) of those same p95s, so noise is measured between repeats and one slow run or one slow repeat decides nothing. A repeat whose p95 is the maximum of fewer than 20 runs, or with no passed run, is not counted.
+- `pass`: the candidate median is within the baseline median plus 10%. `fail`: it is beyond that and the difference is larger than the larger of the two spreads. `inconclusive`: beyond 10% but inside the spread; take more repeats. `insufficient`: fewer than three usable repeats on either side (`--min-repeats`), or the scenario is missing from one file. `incomparable`: different workers, mode, runs, link, disk or job, or a baseline recorded with `--handicap-delay-ms`.
+- Exit status: 1 for any `fail`, else 2 for any `insufficient` or `incomparable` or unreadable input, else 3 for any `inconclusive`, else 0. Only 0 is a pass; a missing or noisy result is never one.
+
+**Sensitivity.** `--handicap-delay-ms N` on the harness adds N ms of delay each way to the link, recorded in the scenario as `injected_handicap`. `bench/test_b09_gate.py` encodes what that does to a run (overhead grows by 2N ms) and shows that, on a 100 ms baseline with a 4 ms spread, 6 ms each way fails the gate and 4 ms each way passes it. A real sensitivity run is the same candidate recorded twice on the same host, once with a handicap of the size the gate must resolve; it is part of the B09 result and has not been done. Run the unit tests with `python3 bench/test_b09_gate.py`.
+
+Limits: the workers share one host, so the 3- and 10-worker scenarios measure control-plane fan-out and not the capacity of that many machines, and the 10% rule can only resolve what the repeat spread allows; a noisy host yields `inconclusive`, not a pass. Failure behavior under the same faults is in [failure drills](resilience.md#b09-fault-scenarios).
+
 ## Reproducing
 
 1. Prepare rootless Podman for a non-root user per [Development](development.md#linux-executor-work) and pull the image by digest.

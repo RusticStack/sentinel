@@ -28,6 +28,16 @@ sentinel admin policy show --data-dir <PATH>
 sentinel admin policy set --data-dir <PATH> --registration approval-required
 ```
 
+## Host admission and placement (Q12)
+
+Everything above admits people. Admitting *work* onto a machine is a separate decision and belongs to the controller alone; the detail is in [worker link](worker-link.md#host-policy-is-the-controllers-q12) and the routes are in [API](api.md).
+
+- **Ceilings are approved, never claimed.** Per machine the controller stores a CPU, memory and disk ceiling (each optional) and an operator priority (-100..100). The worker only reports its size; the size the controller offers is the report under the ceilings, so a worker that claims more than its approval is offered the approval. Ceilings count once per physical host, across every worker identity on it, and a clone of a worker's identity does not add capacity.
+- **Order, not eligibility.** A job first passes hard admission per worker (pool and tenant access, architecture, OS, isolation, labels, secrets, disk, CPU and memory under the ceilings, drain). Only then are the eligible hosts ordered: by expected finish (`placement_order = "fastest"`, the default, see [configuration](configuration.md)) or by priority first and then expected finish (`"priority"`). Priority therefore never makes a host eligible for a job it could not hold, and it is separate from the tenant, repository and job fairness that decides whose job is next.
+- **Cap reductions apply to new admissions only.** Lowering a ceiling never evicts, cancels or re-places accepted attempts. The host is offered nothing until its accepted work fits under the new ceiling, and `over_cap` on `GET /admin/workers/{wrk}/policy` shows by how much it does not. Raising a ceiling takes effect at the next placement pass and never exceeds the worker's report.
+- **Admission is not a byte quota.** A ceiling and a job's declared disk are reservations used to decide placement. They do not bound what a running job writes: that depends on the runtime, and the container storage guard, the microVM scratch disk and the cases that remain unbounded are stated in [executor](executor.md). A reduction of the disk ceiling does not shrink a workspace that already exists, and CPU and memory ceilings are not a hard cgroup limit on the machine's other processes.
+- **Who may change it.** Only a platform administrator with a fresh step-up through a browser session (a bearer token never steps up); every change is audited as `worker-policy-changed`. Tenants see their pools' workers in `GET /workers` without the ceilings, the priority or the reason a machine is clamped.
+
 ## Pending, approved, rejected
 
 `users.status` is pending (0), approved (1) or rejected (2), and a database trigger enforces that only an approved account can be `active`. That matters more than it sounds: `active` is the predicate every authorization query in [authorization](authorization.md) already joins on, so a pending account holds no session, no tenant data and no worker access **by construction**, not because each query remembered to ask.

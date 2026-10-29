@@ -184,6 +184,8 @@ sentinel api --token-file ~/.sentinel/token undrain wrk_…
 
 Draining needs a platform-admin credential on the API; on the controller's own host the same change is `sentinel admin worker drain --id wrk_… --data-dir …` (and `undrain`), which acts on the store directly like the rest of `sentinel admin`.
 
+The tenant-facing `GET /workers` never shows ceilings, priority or why a machine is clamped; the approved-versus-reported view below (`host.approved`, `host.reported`, `host.effective`, `host.over_cap`) is the administrators' route for that.
+
 Host policy (Q12) is the controller's alone: the ceilings and priority a worker is approved for come from the enrollment and from these routes, never from the worker's hello.
 
 | Route | Who | Scope | Result |

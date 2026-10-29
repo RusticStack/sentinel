@@ -15,6 +15,10 @@ Each failure Sentinel is meant to survive, what Sentinel does about it, and the 
 
 A restored controller's workers reconcile what they held against it, as after any controller restart ([reconciliation](reconciliation.md)). Work written after the backup is lost from the database, and its files remain as orphans the storage pass collects ([backup](backup.md)).
 
+## B09 fault scenarios
+
+`bench/b09-harness.py` drives the reliability side of B09 on a real controller and real worker processes: slow and full disks (loop-mounted images, slow ones behind `dm-delay`), shaped links (`tc netem` on the harness's own veth pairs; the real Tailcat relay scenario is recorded as `blocked`), a partition and restarts of the harness's own processes by PID, and a noisy tenant beside a quiet one. Each reliability record carries its checks and their observed values. The faults are confined to b09-named loop devices, namespaces and veth pairs, which the `cleanup` command removes. The performance side and its regression gate (`bench/b09-gate.py`, 10% p95 overhead, noise from the spread between repeats) are in [benchmarking](benchmarking.md#b09-reliability-and-performance-scenarios-and-the-regression-gate). No B09 result is committed yet; until one is, these scenarios are a harness, not evidence.
+
 ## What is not covered
 
 - A power cut during a backup's snapshot is covered only by the rename protocol; no `dm-flakey` run has been done against it (the log path has had one, see [storage](storage.md)).
