@@ -194,6 +194,58 @@ fn a_worker_that_reports_more_than_approved_is_capped_however_often_it_says_so()
 }
 
 #[test]
+fn approved_ceilings_and_priority_survive_a_controller_restart() {
+    let f = fixture();
+    let worker = enroll(&f, policy());
+    report(&f, worker, 16_000, 64 * GIB, 500 * GIB);
+    let lowered = HostPolicy {
+        cpu_millis: Some(3_000),
+        memory_bytes: Some(6 * GIB),
+        disk_bytes: Some(40 * GIB),
+        priority: -7,
+    };
+    set(&f, worker, lowered);
+    let before = view(&f, worker);
+    assert_eq!(before.policy, lowered);
+
+    // Close the database and open the same file again, as a restarted controller does.
+    let Fixture { _dir, store, pool } = f;
+    drop(store);
+    let store = Store::open(_dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
+    let f = Fixture { _dir, store, pool };
+
+    let after = view(&f, worker);
+    assert_eq!(
+        after.policy, lowered,
+        "the approval is stored, not remembered by a session"
+    );
+    assert_eq!(after.effective_cpu_millis, 3_000);
+    assert_eq!(after.reported_cpu_millis, 16_000);
+    let approved = f.store.read(dispatch::approved_by_worker).unwrap();
+    assert_eq!(approved[&worker].priority, -7);
+    assert_eq!(
+        offered(&f, worker),
+        Capacity {
+            cpu_millis: 3_000,
+            memory_bytes: 6 * GIB,
+            disk_bytes: 40 * GIB
+        }
+    );
+
+    // The reconnecting worker states its whole machine again: still capped by the stored approval.
+    report(&f, worker, 64_000, 512 * GIB, 4_000 * GIB);
+    assert_eq!(
+        offered(&f, worker),
+        Capacity {
+            cpu_millis: 3_000,
+            memory_bytes: 6 * GIB,
+            disk_bytes: 40 * GIB
+        }
+    );
+    assert_eq!(view(&f, worker).policy, lowered);
+}
+
+#[test]
 fn a_policy_change_recomputes_the_offered_size_both_ways_without_a_new_report() {
     let f = fixture();
     let worker = enroll(&f, policy());
