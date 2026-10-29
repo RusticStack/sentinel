@@ -11,15 +11,24 @@ microvm / container - 1 on the p95 (the gate) and on the median.
 
 Exit status: 0 every compared series is within the gate, 1 at least one is over it, 2 a series is missing
 or holds fewer than --min-samples samples (development evidence, not a gate result), 3 bad input. Records of
-any other contract are refused, so revision-4 records are never mixed in.
+any other contract are refused, so revision-4 records are never mixed in. The contract pairs the two series by
+binary, host and day, so bad input also means: a record without build.commit, build.binary_sha256, host.hostname,
+host.cpu_model or cpu_pressure_avg60; a start pressure at or over 2 %; a container and a microvm series (or
+one series) that differ in commit, binary, host label, CPU model or UTC day. The message names the field,
+never its value.
 """
 import argparse
 import json
 import math
 import statistics
 import sys
+from datetime import datetime, timezone
 
 ID, REVISION = "pilots-ci-isolation", 1
+START_PRESSURE_LIMIT = 2.0  # percent, "some" avg60 at the start of each sample (the contract's pairing rule)
+# What the contract's pairing requires to be the same on both sides of a comparison: the binary (and the
+# commit it came from), the host and its CPU. The day comes from the job timestamps.
+PAIRED_FIELDS = (("build", "commit"), ("build", "binary_sha256"), ("host", "hostname"), ("host", "cpu_model"))
 
 
 def p95(values):
@@ -53,7 +62,23 @@ def load(paths):
                     raise ValueError(f"{path}:{n}: not a {ID} revision {REVISION} record (got {c.get('id')} {c.get('revision')})")
                 if r.get("warmup") or r.get("job_state") != "passed":
                     continue
-                s = series.setdefault((c["lane"], c["condition"], c["isolation"]), {"total": [], "start": [], "run": []})
+                where = f"{path}:{n}"
+                pressure = r.get("cpu_pressure_avg60")
+                if not isinstance(pressure, (int, float)) or isinstance(pressure, bool):
+                    raise ValueError(f"{where}: cpu_pressure_avg60 missing; the start condition is unverified")
+                if pressure >= START_PRESSURE_LIMIT:
+                    raise ValueError(f"{where}: cpu_pressure_avg60 is at or over the contract's {START_PRESSURE_LIMIT:g} % start limit")
+                s = series.setdefault((c["lane"], c["condition"], c["isolation"]),
+                                      {"total": [], "start": [], "run": [], "prov": {}, "days": set()})
+                for section, key in PAIRED_FIELDS:
+                    value = (r.get(section) or {}).get(key)
+                    if not value:
+                        raise ValueError(f"{where}: {section}.{key} missing; the record cannot be paired")
+                    s["prov"].setdefault(f"{section}.{key}", set()).add(value)
+                for j in r["jobs"]:
+                    queued = (j.get("timestamps") or {}).get("queued_ms")
+                    if queued is not None:
+                        s["days"].add(datetime.fromtimestamp(queued / 1000, timezone.utc).date().isoformat())
                 s["total"].append(r["intake_to_finished_ns"] / 1e9)
                 ph = phases(r["jobs"])
                 if ph:
@@ -62,9 +87,24 @@ def load(paths):
     return series
 
 
+def check_pairing(series):
+    """The contract compares a container series with a microvm series taken with the same binary, on the same host
+    and the same day. Raises ValueError naming the field (never the values) when the two sides differ, or when one
+    side mixes builds or hosts."""
+    for lane, condition in sorted({(k[0], k[1]) for k in series}):
+        sides = [series[k] for k in ((lane, condition, "container"), (lane, condition, "microvm")) if k in series]
+        for field in [f"{a}.{b}" for a, b in PAIRED_FIELDS]:
+            seen = set().union(*(s["prov"][field] for s in sides))
+            if len(seen) > 1:
+                raise ValueError(f"{lane} {condition}: the series differ in {field}; a comparison needs one binary, host and CPU")
+        days = set().union(*(s["days"] for s in sides))
+        if len(days) > 1:
+            raise ValueError(f"{lane} {condition}: the series were taken on different days; the contract pairs one day")
+
+
 def summarize(s):
     t = s["total"]
-    return {"n": len(t), "min": min(t), "median": statistics.median(t), "p95": p95(t), "max": max(t),
+    return {"n": len(t), "p95_is_max": len(t) < 20, "min": min(t), "median": statistics.median(t), "p95": p95(t), "max": max(t),
             "start_median": statistics.median(s["start"]) if s["start"] else None,
             "run_median": statistics.median(s["run"]) if s["run"] else None}
 
@@ -105,6 +145,8 @@ def render(rows, gate):
         start = f"{num(c and c['start_median'])}/{num(m and m['start_median'])}"
         out.append(f"{r['lane']:8} {r['condition']:10} {n:7} {num(c and c['p95']):>8} {num(m and m['p95']):>8} "
                    f"{pct(r.get('p95_overhead')):>8} {pct(r.get('median_overhead')):>8} {start:>12}  {r['verdict']}")
+    if any(side and side["p95_is_max"] for r in rows for side in (r["container"], r["microvm"])):
+        out.append("note: with fewer than 20 samples a series' p95 is its maximum (development evidence, see the contract)")
     return "\n".join(out)
 
 
@@ -117,6 +159,7 @@ def main(argv=None):
     a = p.parse_args(argv)
     try:
         series = load(a.records)
+        check_pairing(series)
     except (OSError, ValueError, KeyError) as e:
         print(e, file=sys.stderr)
         return 3
