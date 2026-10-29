@@ -1346,10 +1346,21 @@ fn guessing_is_rate_limited_per_address_and_the_audit_trail_stays_small() {
     let d = deployment(Some(true));
     let admin = administrator(&d);
     let mut statuses = Vec::new();
+    // Each request is a new connection from the trusted loopback proxy, so the client address is the forwarded
+    // one; without it every connection would be keyed alone.
     for _ in 0..8 {
         let secret = format!("sntl_{}", "ef".repeat(32));
-        statuses
-            .push(post_redeem(&d, &redeem_body(&secret, WorkerId::new(), PRINT_A, None)).status);
+        let body = redeem_body(&secret, WorkerId::new(), PRINT_A, None);
+        statuses.push(
+            send(
+                &d,
+                "POST",
+                "/api/v1/worker-enrollments/redeem",
+                Some(&body),
+                &[("x-forwarded-for", "198.51.100.7")],
+            )
+            .status,
+        );
     }
     assert!(statuses.iter().take(5).all(|s| *s == 403), "{statuses:?}");
     assert!(statuses.iter().skip(5).all(|s| *s == 429), "{statuses:?}");

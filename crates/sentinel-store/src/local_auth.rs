@@ -1174,9 +1174,9 @@ mod tests {
                 assert!(names.insert(event.name()), "name {} reused", event.name());
             }
         }
-        // 61 contiguous codes plus the 70.. block; a new event must be added to `from_code` too.
-        assert_eq!(known, 61 + 6, "an event is missing from from_code");
-        assert!(Event::from_code(0).is_none() && Event::from_code(62).is_none());
+        // 62 contiguous codes plus the 70..=77 and 90..=95 blocks; a new event must be added to `from_code` too.
+        assert_eq!(known, 62 + 8 + 6, "an event is missing from from_code");
+        assert!(Event::from_code(0).is_none() && Event::from_code(63).is_none());
     }
 
     #[test]

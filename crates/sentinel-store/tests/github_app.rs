@@ -39,6 +39,10 @@ fn key(dir: &std::path::Path) -> Key {
 }
 
 fn mint(f: &Fixture, purpose: Purpose, user: UserId, session: SessionId) -> Secret {
+    mint_at(f, purpose, user, session, 1_000)
+}
+
+fn mint_at(f: &Fixture, purpose: Purpose, user: UserId, session: SessionId, ms: i64) -> Secret {
     let tenant = (purpose == Purpose::Install).then(|| {
         f.store
             .read(|c| {
@@ -53,7 +57,7 @@ fn mint(f: &Fixture, purpose: Purpose, user: UserId, session: SessionId) -> Secr
     });
     f.store
         .writer()
-        .write(move |tx| github_app::mint(tx, purpose, user, session, tenant, at(1_000)))
+        .write(move |tx| github_app::mint(tx, purpose, user, session, tenant, at(ms)))
         .unwrap()
         .0
 }
@@ -200,9 +204,10 @@ fn refusals_are_audited_without_the_state_and_bounded_per_account() {
 fn one_account_holds_a_bounded_number_of_states_and_purging_removes_expired_ones() {
     let f = fixture();
     let session = SessionId::new();
-    let first = mint(&f, Purpose::Manifest, f.root, session);
-    for _ in 0..github_app::MAX_STATES_PER_USER {
-        mint(&f, Purpose::Manifest, f.root, session);
+    // A millisecond apart: states minted in the same millisecond have no defined oldest.
+    let first = mint_at(&f, Purpose::Manifest, f.root, session, 1_000);
+    for i in 1..=github_app::MAX_STATES_PER_USER {
+        mint_at(&f, Purpose::Manifest, f.root, session, 1_000 + i);
     }
     assert_eq!(
         spend(&f, Purpose::Manifest, &first, f.root, session, 2_000),

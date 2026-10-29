@@ -170,6 +170,7 @@ fn served() -> BTreeSet<String> {
         "src/routes/admin.rs",
         "src/routes/email.rs",
         "src/routes/setup.rs",
+        "src/routes/worker_enrollment.rs",
         "src/github.rs",
         "src/oauth/mod.rs",
     ] {
