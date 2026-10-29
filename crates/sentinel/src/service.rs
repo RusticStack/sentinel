@@ -1003,12 +1003,19 @@ pub fn run(role: &str, args: ServiceArgs) -> Result<(), Error> {
     let config = Config::load(role, &args, &io, &cpu)?;
     let configuration_ns = elapsed_ns(configuration_started);
     if args.check {
+        #[cfg_attr(not(feature = "worker"), allow(unused_mut))]
+        let mut description = config.describe();
+        #[cfg(feature = "worker")]
+        if let Role::Worker(link) = &config.role {
+            description.push_str("; ");
+            description.push_str(&worker_role::check_report(link.as_ref())?);
+        }
         sentinel::outln!(
             "{role} configuration valid; data_dir={}; log_format={:?}; log_level={:?}; {}",
             config.data_dir.display(),
             config.log_format,
             config.log_level,
-            config.describe()
+            description
         );
         return Ok(());
     }
@@ -2315,6 +2322,32 @@ mod worker_role {
         }
     }
 
+    /// The runtime record `worker --check` prints: what this host and configuration would state.
+    pub(super) fn check_report(link: Option<&WorkerLink>) -> Result<String, Error> {
+        let (preference, setup) = match link {
+            Some(link) => (
+                match link.isolation {
+                    IsolationSetting::Auto => sentinel_worker::host::Preference::Auto,
+                    IsolationSetting::Container => sentinel_worker::host::Preference::Container,
+                    IsolationSetting::Microvm => sentinel_worker::host::Preference::Microvm,
+                },
+                link.microvm
+                    .as_ref()
+                    .map(|m| sentinel_worker::microvm::Setup {
+                        firecracker: m.firecracker.clone(),
+                        kernel: m.kernel.clone(),
+                        agent: m.agent.clone(),
+                        snapshots: m.snapshots,
+                        guard: sentinel_worker::microvm::net::Guard { link: Vec::new() },
+                    }),
+            ),
+            None => (sentinel_worker::host::Preference::Auto, None),
+        };
+        let (_, absent) = sentinel_worker::host::detect();
+        let selection = runtime_selection(preference, setup.as_ref())?;
+        Ok(sentinel_worker::host::report(&selection, absent.as_ref()))
+    }
+
     /// Detects the host's virtualization and picks the default executor (plan 16.8, runtime selection).
     fn runtime_selection(
         preference: sentinel_worker::host::Preference,
@@ -2341,24 +2374,6 @@ mod worker_role {
             kvm_absent = absent.as_ref().map(|a| a.0.as_str())
         );
         Ok(selection)
-    }
-
-    /// What the worker states it can run; a job that states an OS or isolation is placed only where they match.
-    fn runtime_capabilities(
-        selection: &sentinel_worker::host::Selection,
-    ) -> sentinel_protocol::negotiate::Capabilities {
-        use sentinel_protocol::negotiate::Capabilities as C;
-        let mut bits = C::OS_LINUX.union(C::ISOLATION_CONTAINER);
-        if selection.virtualization.kvm {
-            bits = bits.union(C::KVM);
-        }
-        if selection.virtualization.nested {
-            bits = bits.union(C::KVM_NESTED);
-        }
-        if selection.microvm {
-            bits = bits.union(C::ISOLATION_MICROVM);
-        }
-        bits
     }
 
     fn capacity(link: &WorkerLink) -> Capacity {
@@ -2580,7 +2595,7 @@ mod worker_role {
             IsolationSetting::Microvm => sentinel_worker::host::Preference::Microvm,
         };
         let selection = runtime_selection(preference, setup.as_ref())?;
-        capabilities = capabilities.union(runtime_capabilities(&selection));
+        capabilities = capabilities.union(sentinel_worker::host::capabilities(&selection));
         let runtime = sentinel_worker::attempt::Runtime {
             default: Some(selection.default),
             microvm: setup.filter(|_| selection.microvm).map(Arc::new),

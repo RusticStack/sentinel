@@ -167,6 +167,41 @@ pub fn select(
     })
 }
 
+/// What the worker states it can run; a job that states an OS or isolation is placed only where they match.
+/// A Linux worker always offers containers; `kvm` and `kvm.nested` report the host, `isolation.microvm` only
+/// that the microVM executor can actually run here.
+pub fn capabilities(selection: &Selection) -> sentinel_protocol::negotiate::Capabilities {
+    use sentinel_protocol::negotiate::Capabilities as C;
+    let mut bits = C::OS_LINUX.union(C::ISOLATION_CONTAINER);
+    if selection.virtualization.kvm {
+        bits = bits.union(C::KVM);
+    }
+    if selection.virtualization.nested {
+        bits = bits.union(C::KVM_NESTED);
+    }
+    if selection.microvm {
+        bits = bits.union(C::ISOLATION_MICROVM);
+    }
+    bits
+}
+
+/// The one-line record `worker --check` prints for this host: detection, why KVM is absent when it is, the
+/// default executor and the capability bits the worker would state.
+pub fn report(selection: &Selection, absent: Option<&Absent>) -> String {
+    let bits = capabilities(selection).runtime_names();
+    let mut text = format!(
+        "runtime: kvm={} nested={} default={} capabilities={}",
+        selection.virtualization.kvm,
+        selection.virtualization.nested,
+        selection.default.as_str(),
+        bits.join(",")
+    );
+    if let Some(why) = absent {
+        text.push_str(&format!(" kvm_absent=\"{why}\""));
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +281,96 @@ mod tests {
         if !std::path::Path::new("/dev/kvm").exists() {
             assert!(!v.kvm);
         }
+    }
+
+    fn names(selection: &Selection) -> Vec<&'static str> {
+        capabilities(selection).runtime_names()
+    }
+
+    #[test]
+    fn capability_bits_follow_detection_and_selection() {
+        let nested = Virtualization {
+            kvm: true,
+            nested: true,
+        };
+        let s = select(Preference::Auto, KVM, None, Ok(())).unwrap();
+        assert_eq!(
+            names(&s),
+            [
+                "kvm",
+                "isolation.container",
+                "isolation.microvm",
+                "os.linux"
+            ]
+        );
+        let s = select(Preference::Auto, nested, None, Ok(())).unwrap();
+        assert_eq!(
+            names(&s),
+            [
+                "kvm",
+                "kvm.nested",
+                "isolation.container",
+                "isolation.microvm",
+                "os.linux"
+            ]
+        );
+        // KVM without a usable microVM executor: the host bit is stated, the isolation is not.
+        let s = select(Preference::Auto, KVM, None, Err("no guest kernel".into())).unwrap();
+        assert_eq!(names(&s), ["kvm", "isolation.container", "os.linux"]);
+        // No KVM: containers only, never a microVM bit.
+        let none = Absent("/dev/kvm: No such file or directory".into());
+        let s = select(
+            Preference::Auto,
+            Virtualization::default(),
+            Some(&none),
+            Ok(()),
+        )
+        .unwrap();
+        assert_eq!(names(&s), ["isolation.container", "os.linux"]);
+        assert!(!capabilities(&s).contains(sentinel_protocol::negotiate::Capabilities::KVM));
+        // The windows and native bits are never stated by a Linux worker.
+        for v in [KVM, nested, Virtualization::default()] {
+            let s = select(Preference::Auto, v, None, Ok(())).unwrap();
+            let bits = capabilities(&s);
+            assert!(!bits.contains(sentinel_protocol::negotiate::Capabilities::OS_WINDOWS));
+            assert!(!bits.contains(sentinel_protocol::negotiate::Capabilities::ISOLATION_NATIVE));
+        }
+    }
+
+    #[test]
+    fn a_container_override_still_offers_the_microvm_bit_where_one_can_run() {
+        // The override changes the default for jobs that state none, not what the host offers.
+        let s = select(Preference::Container, KVM, None, Ok(())).unwrap();
+        assert_eq!(s.default, Isolation::Container);
+        assert_eq!(
+            names(&s),
+            [
+                "kvm",
+                "isolation.container",
+                "isolation.microvm",
+                "os.linux"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_check_record_names_detection_default_and_bits() {
+        let s = select(Preference::Auto, KVM, None, Ok(())).unwrap();
+        assert_eq!(
+            report(&s, None),
+            "runtime: kvm=true nested=false default=microvm capabilities=kvm,isolation.container,isolation.microvm,os.linux"
+        );
+        let none = Absent("/dev/kvm: No such file or directory".into());
+        let s = select(
+            Preference::Auto,
+            Virtualization::default(),
+            Some(&none),
+            Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            report(&s, Some(&none)),
+            "runtime: kvm=false nested=false default=container capabilities=isolation.container,os.linux kvm_absent=\"/dev/kvm: No such file or directory\""
+        );
     }
 }

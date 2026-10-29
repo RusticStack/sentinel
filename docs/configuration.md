@@ -152,7 +152,7 @@ Optional on-disk controller state configures sources ([sources](sources.md)), ev
 
 Source credentials themselves are sealed with `<data_dir>/master.key` (`admin key create`), the same key-outside-database file second factors use. Repository hook secrets are digests and need no key. Resolution also uses `<data_dir>/intake-work/` as per-delivery scratch space for the repository fetches it makes; it is emptied at startup and never reused.
 
-`--check` validates syntax, effective path shape and currently inspectable filesystem metadata. It does not prove future write access, reserve the directory or validate networking/runtime prerequisites. Actual startup creates missing directories and reports initialization failures.
+`--check` validates syntax, effective path shape and currently inspectable filesystem metadata. It does not prove future write access, reserve the directory or validate networking/runtime prerequisites. The one exception is the worker role, which ends its `--check` line with a `runtime:` record of what the host would state (`kvm`, `nested`, the default executor and the capability bits such as `isolation.microvm`, plus the reason KVM is absent when it is); it opens `/dev/kvm` and creates and closes a throwaway VM to do so, starts nothing else and writes nothing. With no controller configured it describes the host with `isolation = "auto"` and no `[microvm]` section, so `isolation.microvm` appears only when a controller link and a usable `[microvm]` setup are configured. An `isolation = "microvm"` that cannot be met fails `--check` with the same error as startup. Actual startup creates missing directories and reports initialization failures.
 
 ### Optional Tailcat transport
 
