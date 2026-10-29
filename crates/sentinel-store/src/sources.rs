@@ -213,13 +213,21 @@ pub fn validate_source(
 
 // Manual runs carry no credential, so only an unauthenticated public https remote may be fetched.
 pub fn manual_remote_allowed(remote: &str) -> bool {
+    #[cfg(feature = "test-support")]
+    if LOCAL_MANUAL_SOURCES.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     sentinel_protocol::source::manual_destination_allowed(remote)
-        || LOCAL_MANUAL_SOURCES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[cfg(feature = "test-support")]
 static LOCAL_MANUAL_SOURCES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Switches the manual-destination policy off for the whole process. Only
+/// built with the `test-support` feature, which dev-dependencies enable and
+/// no shipped binary does.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn permit_any_manual_source_for_tests() {
     LOCAL_MANUAL_SOURCES.store(true, std::sync::atomic::Ordering::Relaxed);
