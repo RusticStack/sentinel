@@ -81,6 +81,10 @@ fn public_url(raw: &str) -> Result<String, Error> {
     {
         return Err(fail("invalid public URL"));
     }
+    // The web interface is served at the root of its origin, so a path would only make dead check links.
+    if !sentinel_github::manifest::is_origin(trimmed) {
+        return Err(fail("public URL must be an origin without a path"));
+    }
     Ok(trimmed.to_owned())
 }
 
@@ -638,5 +642,19 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         write(&path, r#"{"secret":"short"}"#, 0o600);
         assert!(load_webhook_secret(dir.path()).is_err());
+    }
+
+    #[test]
+    fn the_app_public_url_is_the_web_origin_with_no_path() {
+        assert_eq!(
+            public_url("https://ci.example.com/").map_err(|e| e.message),
+            Ok("https://ci.example.com".to_owned())
+        );
+        for bad in [
+            "https://ci.example.com/sentinel",
+            "https://ci.example.com/a/b/",
+        ] {
+            assert!(public_url(bad).is_err(), "{bad}");
+        }
     }
 }

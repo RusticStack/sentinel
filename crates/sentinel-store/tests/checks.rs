@@ -964,3 +964,53 @@ fn an_exhausted_final_status_is_rearmed_only_within_the_window() {
         "rows refused for other reasons are not re-armed"
     );
 }
+
+fn exhaust_final_status(f: &mut Fixture, check: &checks::Publication, at: i64) {
+    f.conn
+        .execute(
+            "UPDATE check_publications SET status = 'completed', conclusion = 'failure',
+                attempts = ?2 WHERE id = ?1",
+            rusqlite::params![check.id.as_bytes(), checks::MAX_TERMINAL_ATTEMPTS - 1],
+        )
+        .unwrap();
+    let tx = f.conn.transaction().unwrap();
+    assert_eq!(
+        checks::retry(&tx, check.id, check.seq, UnixMillis(at), 0).unwrap(),
+        checks::Retry::Exhausted
+    );
+    tx.commit().unwrap();
+}
+
+fn rearm(f: &mut Fixture, at: i64) -> usize {
+    let tx = f.conn.transaction().unwrap();
+    let rearmed = checks::rearm_exhausted(&tx, UnixMillis(at), checks::REARM_LIMIT).unwrap();
+    tx.commit().unwrap();
+    rearmed
+}
+
+#[test]
+fn a_final_status_that_exhausts_again_is_not_rearmed_beyond_the_window_of_its_run() {
+    let mut f = fixture();
+    let (run, jobs) = {
+        let repo = f.repo;
+        create_run(&mut f, repo, true)
+    };
+    let build = publication(&f, run, &jobs[0].to_string());
+    let window = checks::REARM_WINDOW_MS;
+
+    exhaust_final_status(&mut f, &build, NOW.0 + 3_600_000);
+    assert_eq!(rearm(&mut f, NOW.0 + 7_200_000), 1, "inside the window");
+    // Every exhaustion refreshes the row's settle time, but the window belongs to the run.
+    exhaust_final_status(&mut f, &build, NOW.0 + window - 3_600_000);
+    assert_eq!(rearm(&mut f, NOW.0 + window - 1_800_000), 1, "still inside");
+    exhaust_final_status(&mut f, &build, NOW.0 + window - 60_000);
+    assert_eq!(
+        rearm(&mut f, NOW.0 + window + 3_600_000),
+        0,
+        "a row that keeps failing is given up on once its run is older than the window"
+    );
+    assert_eq!(
+        publication(&f, run, &jobs[0].to_string()).state,
+        checks::State::Refused
+    );
+}

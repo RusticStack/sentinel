@@ -27,6 +27,36 @@ impl Drop for CachedToken {
     }
 }
 
+/// The installation token a publish holds for the length of its requests: it derefs to the secret text and
+/// is wiped when released, like the cache entry it was copied from.
+struct Secret(String);
+
+impl Secret {
+    fn wipe(&mut self) {
+        sentinel_auth::secret::wipe_string(&mut self.0);
+    }
+}
+
+impl std::ops::Deref for Secret {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(redacted)")
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
 pub struct GithubChecks {
     store: Arc<Store>,
     app: Arc<App>,
@@ -65,11 +95,11 @@ impl GithubChecks {
         forge_repo: u64,
         remote: &str,
         now: UnixMillis,
-    ) -> Result<String, Publish> {
+    ) -> Result<Secret, Publish> {
         if let Some(cached) = self.tokens.get(&repo)
             && cached.expires_ms > now.0 + TOKEN_MARGIN_MS
         {
-            return Ok(cached.secret.clone());
+            return Ok(Secret(cached.secret.clone()));
         }
         let mut token = self
             .app
@@ -101,7 +131,7 @@ impl GithubChecks {
                 secret: token.secret.clone(),
             },
         );
-        Ok(std::mem::take(&mut token.secret))
+        Ok(Secret(std::mem::take(&mut token.secret)))
     }
 
     fn check(&self, publication: &checks::Publication, now: UnixMillis) -> Result<Check, Publish> {
@@ -329,5 +359,22 @@ impl GithubChecks {
                 Publish::Refused { reason }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_held_token_is_wiped_and_never_printed() {
+        let mut secret = Secret("ghs_canary_token_value".to_owned());
+        assert_eq!(&*secret, "ghs_canary_token_value");
+        assert!(!format!("{secret:?}").contains("canary"));
+        secret.wipe();
+        assert!(
+            secret.is_empty(),
+            "the buffer is cleared before it is freed"
+        );
     }
 }
