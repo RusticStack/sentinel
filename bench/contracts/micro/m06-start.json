@@ -19,7 +19,8 @@
   },
   "record": {
     "schema": "sentinel-bench/m06/1",
-    "out": "bench/m06-start.jsonl"
+    "out": "bench/m06-start.jsonl",
+    "from_stdout": true
   },
   "notes": "Needs a KVM host with the worker's [microvm] setup; elsewhere the test skips and the runner reports pending. The cold series runs first and the restore series after it, back to back: the two paths are not interleaved. The smoke run boots 3 VMs per path."
 }

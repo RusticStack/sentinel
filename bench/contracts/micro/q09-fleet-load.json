@@ -19,7 +19,8 @@
   },
   "record": {
     "schema": "sentinel-bench/ignored-test/1",
-    "out": "bench/q09-fleet-load.jsonl"
+    "out": "bench/q09-fleet-load.jsonl",
+    "from_stdout": true
   },
   "notes": "One run of the 10k-job, 100-worker load test; its JSON report comes back under reports. The test seeds its own tenants and jobs, with no random choice."
 }

@@ -19,7 +19,8 @@
   },
   "record": {
     "schema": "sentinel-bench/ignored-test/1",
-    "out": "bench/tailcat-live.jsonl"
+    "out": "bench/tailcat-live.jsonl",
+    "from_stdout": true
   },
   "notes": "The live helper test against a pinned tailcat build (SENTINEL_TAILCAT_LIVE) and rootful Podman; a host without them skips, which the runner reports as pending. Further tailcat_live tests get their own contracts when they are measured."
 }

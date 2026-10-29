@@ -556,6 +556,12 @@ class MicroContracts(unittest.TestCase):
                 with open(wrapper, encoding="utf-8") as f:
                     self.assertIn("micro-run.sh", f.read(), f"{name}: the wrapper bypasses the runner (no lock, no quiet check)")
 
+    def test_a_script_that_prints_its_records_has_them_stamped_by_the_runner(self):
+        printers = {"bench/run-ignored.sh", "bench/m06-start.sh"}
+        for path, c in self.contracts():
+            if c["harness"].get("script") in printers:
+                self.assertIs(c["record"].get("from_stdout"), True, f"{path}: its records would reach no file")
+
     def test_a_shuffled_contract_names_the_seed_it_records(self):
         for path, c in self.contracts():
             if c["ordering"]["scheme"] == "shuffle":

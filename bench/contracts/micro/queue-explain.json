@@ -19,7 +19,8 @@
   },
   "record": {
     "schema": "sentinel-bench/ignored-test/1",
-    "out": "bench/queue-explain.jsonl"
+    "out": "bench/queue-explain.jsonl",
+    "from_stdout": true
   },
   "notes": "One run of the queue-listing test over 5,000 queued jobs; list_queue timings come back under reports."
 }

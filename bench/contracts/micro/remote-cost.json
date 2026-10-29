@@ -19,7 +19,8 @@
   },
   "record": {
     "schema": "sentinel-bench/ignored-test/1",
-    "out": "bench/remote-cost.jsonl"
+    "out": "bench/remote-cost.jsonl",
+    "from_stdout": true
   },
   "notes": "Offer and hydrate cost of a cache generation; SENTINEL_REMOTE_COST_DIR names the disk under test, SENTINEL_REMOTE_COST_RUNS the repeat count."
 }

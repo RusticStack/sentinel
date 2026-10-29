@@ -19,7 +19,8 @@
   },
   "record": {
     "schema": "sentinel-bench/ignored-test/1",
-    "out": "bench/backup-drill.jsonl"
+    "out": "bench/backup-drill.jsonl",
+    "from_stdout": true
   },
   "notes": "The backup and restore drill. SENTINEL_DRILL_DIR names the disk under test and SENTINEL_DRILL_BIG the object count; the 100 GiB objective (R04) needs three times that in free disk and is a Wave 2 run."
 }

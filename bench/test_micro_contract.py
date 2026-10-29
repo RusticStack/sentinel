@@ -228,6 +228,12 @@ class Runner(unittest.TestCase):
         self.assertIn("nothing was appended", r.stderr)
         self.assertEqual(self.lines(), [])
 
+    def test_a_bench_that_reports_it_measured_nothing_is_pending_and_appends_nothing(self):
+        r = self.run_runner(contract(), "--out", self.out, env=self.env(FAKE_RC="75"))
+        self.assertEqual(r.returncode, 75, r.stderr)
+        self.assertIn("pending", r.stderr)
+        self.assertEqual(self.lines(), [])
+
     def test_a_record_of_another_schema_is_not_appended(self):
         r = self.run_runner(contract(), "--out", self.out, env=self.env(FAKE_SCHEMA="sentinel-bench/other/1"))
         self.assertEqual(r.returncode, 1, r.stderr)
@@ -347,6 +353,25 @@ class Runner(unittest.TestCase):
             out, files, dirp = f.read().split()
         self.assertEqual((out, files), (self.out, "4"))
         self.assertIn("micro-smoke-fake-", dirp)
+
+    def test_a_script_that_prints_its_records_on_stdout_gets_them_stamped_and_appended(self):
+        script = os.path.join(self.d, "printer.sh")
+        with open(script, "w") as f:
+            f.write('#!/bin/sh\necho \'{"schema":"sentinel-bench/fake/1","from":"script"}\'\n')
+        os.chmod(script, 0o755)
+        c = contract(harness={"script": script})
+        c["record"]["from_stdout"] = True
+        r = self.run_runner(c, "--out", self.out, env=self.env())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rec = self.lines()[0]
+        self.assertEqual(rec["from"], "script")
+        self.assertIn("build", rec)
+        self.assertIn("lock", rec)
+        self.assertEqual(rec["contract"]["id"], "fake")
+        c["record"].pop("from_stdout")
+        r = self.run_runner(c, "--out", self.out + "2", env=self.env())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(self.out + "2"), "without from_stdout the script is its own writer and nothing is appended")
 
 
 if __name__ == "__main__":

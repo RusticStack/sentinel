@@ -16,7 +16,8 @@ A measured run, in this order, and nothing is measured when a step refuses:
   4. the shared verification lock is held (`SENTINEL_VERIFY_LOCK`, default /var/tmp/sentinel-verify.lock; a
      descriptor Python opens is not inherited by the bench or anything it leaves behind, the property a shell lock gets from its close-on-exec option);
   5. CPU pressure (avg60) is below `quiet_start.max_cpu_pressure_avg60`;
-  6. the bench runs (a contract with `record.own_stamp` true names a bench that stamps its own build and host, like
+  6. the bench runs (a script harness whose contract has `record.from_stdout` true prints its records on stdout like a binary, and the
+     runner stamps and appends them; any other script writes its own records and the runner only brackets it; a contract with `record.own_stamp` true names a bench that stamps its own build and host, like
      sentinel-bench, whose `build` the runner then leaves alone); only when it exits 0 and prints schema-matching JSON lines are they appended to the record
      file, each with `build`, `host`, `contract {id, revision, sha256}`, `ordering`, `conditions {start, end}` and
      `lock {path, waited_ns}`. The record file is appended to, never truncated.
@@ -341,10 +342,13 @@ def run_contract(args):
         cond_start = conditions()
         proc = subprocess.run(polite + cmd, env=env, stdout=subprocess.PIPE, text=True)
         cond_end = conditions()
+        if proc.returncode == PENDING:
+            # A script harness that skipped itself (a test that needs hardware this host lacks) measured nothing.
+            raise Refused("pending: the bench reported that it measured nothing (exit 75); nothing was appended", PENDING)
         if proc.returncode != 0:
             raise Refused(f"the bench exited {proc.returncode}; nothing was appended", proc.returncode if 0 < proc.returncode < 64 else 1)
-        if "script" in c["harness"]:
-            # A script writes its own stamped records; the runner adds the lock, the start check and the conditions.
+        if "script" in c["harness"] and not c["record"].get("from_stdout"):
+            # A script that writes its own stamped records (f07, k02): the runner adds the lock, the start check and the conditions.
             sys.stdout.write(proc.stdout)
             print(f"micro-run {c['id']}: script finished; start {cond_start}, end {cond_end}", file=sys.stderr)
             return 0
