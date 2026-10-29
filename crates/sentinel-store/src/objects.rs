@@ -2166,8 +2166,14 @@ impl Objects {
     /// Writes a manifest's entries below `dest`. On Unix the walk is descriptor-relative: `dest` is resolved once,
     /// and every component below it is created and opened relative to the directory descriptor before it without
     /// following a symlink, so a destination changed while the extract runs cannot redirect a write outside the
-    /// directories this call opened. Elsewhere the checks are path-based and `dest` must not be writable by
-    /// untrusted users.
+    /// directories this call opened. Elsewhere the checks are path-based.
+    ///
+    /// On every platform `dest` must be a private directory: mode 0700, owned by the caller and not under a shared
+    /// or world-writable directory. The walk defends only against a change made by someone who cannot already
+    /// write `dest`. It still follows symlinks in `dest`'s ancestors, opens `dest` itself without refusing a
+    /// symlink, enters a subdirectory another user pre-created, and creates directories 0777 and files 0666 (less
+    /// the umask) before the entry's mode is applied, which is skipped for mode 0. No controller path calls this;
+    /// a new caller creates `dest` itself.
     pub fn materialize(
         &self,
         conn: &Connection,
