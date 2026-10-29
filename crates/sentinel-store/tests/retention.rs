@@ -892,6 +892,7 @@ fn maintenance_reads_are_served_by_their_partial_indexes() {
         })
         .unwrap();
     f.store
+        .writer()
         .write(|tx| {
             assert_eq!(
                 retention::purge_aborted_uploads(tx, UnixMillis(i64::MAX), 256).unwrap(),
