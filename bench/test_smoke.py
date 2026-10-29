@@ -39,7 +39,11 @@ class Smoke(unittest.TestCase):
             json.dump(contract(name, script, **kw), f)
 
     def run_smoke(self, **env):
-        e = dict(os.environ, SMOKE_CONTRACTS=self.dir, SMOKE_SKIP_PY="1", TMPDIR=self.tmp, **env)
+        pressure = os.path.join(self.tmp, "pressure")
+        with open(pressure, "w") as f:
+            f.write("some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        e = dict(os.environ, SMOKE_CONTRACTS=self.dir, SMOKE_SKIP_PY="1", TMPDIR=self.tmp,
+                 SENTINEL_VERIFY_LOCK=os.path.join(self.tmp, "verify.lock"), SENTINEL_PRESSURE_FILE=pressure, **env)
         return subprocess.run(["bash", os.path.join(HERE, "smoke.sh")], capture_output=True, text=True, env=e)
 
     def test_the_four_outcomes_are_counted_apart_and_only_a_failure_is_red(self):
