@@ -1360,13 +1360,17 @@ pub fn hosts(
     let workers = rows
         .map(|row| row?.into_worker())
         .collect::<Result<Vec<_>>>()?;
-    workers
-        .into_iter()
-        .map(|worker| {
-            let view = host_view(conn, authority, worker.id)?;
-            Ok((worker, view))
-        })
-        .collect()
+    // The listing and each view are separate reads, so a worker revoked between them is no longer live: leave it out
+    // rather than failing the whole listing.
+    let mut live = Vec::with_capacity(workers.len());
+    for worker in workers {
+        match host_view(conn, authority, worker.id) {
+            Ok(view) => live.push((worker, view)),
+            Err(Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(live)
 }
 
 const fn arch_name(arch: Arch) -> &'static str {

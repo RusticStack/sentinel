@@ -424,18 +424,34 @@ jobs:
     )
     .unwrap();
     let run = RunId::new();
+    let delivery_sha = sha.clone();
     let ids = store
         .writer()
         .write(move |tx| {
             let ids = runs::create_run(tx, tenant, repo_id, run, &spec, UnixMillis::now())?;
+            // Secrets are released only to a run whose webhook delivery was authenticated at intake.
+            let delivery = sentinel_core::DeliveryId::new();
+            tx.execute(
+                "INSERT INTO webhook_deliveries(id, tenant_id, repo_id, provider, external_id,
+                    event, ref_name, old_sha, new_sha, state, received_ms, settled_ms, authentication)
+                 VALUES (?1, ?2, ?3, 'github', ?4, 'push', 'refs/heads/main', ?5, ?5, 2, ?6, ?6, 2)",
+                rusqlite::params![
+                    delivery.as_bytes(),
+                    tenant.as_bytes(),
+                    repo_id.as_bytes(),
+                    delivery.to_string(),
+                    delivery_sha,
+                    UnixMillis::now().0
+                ],
+            )?;
             sentinel_store::provenance::insert(
                 tx,
                 &sentinel_store::provenance::Provenance {
                     tenant,
                     repo: repo_id,
                     trigger: "push".into(),
-                    delivery: None,
-                    provider: None,
+                    delivery: Some(delivery),
+                    provider: Some("github".into()),
                     ref_name: Some("refs/heads/main".into()),
                     old_sha: None,
                     new_sha: None,
