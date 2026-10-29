@@ -30,16 +30,29 @@ pub const BUDGET_MAX: Duration = Duration::from_secs(5);
 pub const MAX_BUNDLE_BYTES: u64 = 64 << 30;
 pub const MAX_CHUNK_BYTES: usize = 1 << 20;
 /// One chunk per frame: a split chunk could not carry the running digest its pieces extend.
-const CHUNK_BYTES: usize = 48 << 10;
+const CHUNK_BYTES: usize = sentinel_protocol::limits::MAX_CACHE_CHUNK_BYTES;
 pub const OFFER_BUDGET: Duration = Duration::from_secs(30);
 const RATE_SAMPLE: Duration = Duration::from_millis(250);
 const STAGE_NAME: &str = "remote.stage";
 const PREFIX_NAME: &str = "prefix.part";
 const LEGACY_PART: &str = "remote.part";
 pub const MAX_RESUME_HASH: u64 = 1 << 30;
-pub const STORE_BUDGET_BYTES: u64 = 50 << 30;
+pub const STORE_BUDGET_BYTES: u64 = crate::gc::MAX_BUDGET_BYTES;
 pub const STALE_UPLOAD: Duration = Duration::from_secs(60 * 60);
-pub const STORE_FREE_RESERVE: u64 = 1 << 30;
+pub const STORE_FREE_RESERVE: u64 = publish::FREE_SPACE_RESERVE;
+
+/// The largest bundle a cache of `budget_bytes` takes or serves: the payload bound a publish enforces (a quarter
+/// of the budget) plus the largest prefix (head, manifest, listing), never past [`MAX_BUNDLE_BYTES`]. Applied
+/// before any byte moves, so a bundle its owner could not have published is refused at the offer or the grant.
+pub const fn max_bundle_bytes(budget_bytes: u64) -> u64 {
+    let prefix = STREAM_HEAD as u64 + MAX_MANIFEST_BYTES + MAX_FILES_BLOB_BYTES;
+    let cap = publish::max_generation_bytes(budget_bytes).saturating_add(prefix);
+    if cap < MAX_BUNDLE_BYTES {
+        cap
+    } else {
+        MAX_BUNDLE_BYTES
+    }
+}
 
 pub const OS_LINUX: u8 = 0;
 pub const ARCH_X86_64: u8 = 0;
@@ -256,6 +269,8 @@ pub struct Policy<'a> {
     pub attempt: [u8; 16],
     /// One deadline per job, so every cache restored by an attempt shares one hydration budget.
     pub deadline: Instant,
+    /// The worker's cache budget: a bundle past [`max_bundle_bytes`] of it is refused before it is staged.
+    pub budget_bytes: u64,
 }
 
 impl Policy<'_> {
@@ -311,7 +326,14 @@ pub(crate) fn hydrate(
         targets: attached.targets.len(),
     };
     let copies = env.backend == crate::clone::Backend::Copy;
-    let Ok(mut sink) = Stager::open(stage.clone(), request, copies, deadline, started) else {
+    let Ok(mut sink) = Stager::open(
+        stage.clone(),
+        request,
+        copies,
+        policy.budget_bytes,
+        deadline,
+        started,
+    ) else {
         return Hydro::Nothing;
     };
     let need = Need::of(
@@ -501,6 +523,8 @@ struct Stager {
     total: u64,
     grant: Option<Grant>,
     copies: bool,
+    /// The worker's cache budget; bounds the bundle and its payload.
+    budget_bytes: u64,
     deadline: Instant,
     started: Instant,
     received: u64,
@@ -512,6 +536,7 @@ impl Stager {
         dir: PathBuf,
         request: Req,
         copies: bool,
+        budget_bytes: u64,
         deadline: Instant,
         started: Instant,
     ) -> io::Result<Stager> {
@@ -525,6 +550,7 @@ impl Stager {
             total: 0,
             grant: None,
             copies,
+            budget_bytes,
             deadline,
             started,
             received: 0,
@@ -676,6 +702,14 @@ impl Stager {
                 return Err(Miss::Invalid);
             }
             payload = payload.checked_add(entry.size).ok_or(Miss::Corrupt)?;
+        }
+        // The manifest's byte count feeds the budget and the cost figures: it is believed only when it is the
+        // listing's own sum (the digests cover what the sealer wrote, not that it was honest).
+        if bytes != payload {
+            return Err(Miss::Corrupt);
+        }
+        if payload > publish::max_generation_bytes(self.budget_bytes) {
+            return Err(Miss::Invalid);
         }
         let prefix = STREAM_HEAD as u64 + manifest_raw.len() as u64 + files_raw.len() as u64;
         Ok(Layout {
@@ -849,7 +883,19 @@ fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
 
 impl Sink for Stager {
     fn plan(&mut self, grant: &Grant) -> Result<(), Refusal> {
-        if grant.total > MAX_BUNDLE_BYTES || grant.offset > grant.total {
+        if grant.offset > grant.total {
+            return Err(Refusal::TooLarge);
+        }
+        // Refused before a byte is staged, whatever the link could move inside the deadline. The stage is
+        // dropped with the refusal: a bundle that cannot be taken now has nothing to resume.
+        if grant.total > max_bundle_bytes(self.budget_bytes) {
+            self.halt = Some(Halt::Refused(Miss::Invalid));
+            return Err(Refusal::TooLarge);
+        }
+        let install = if self.copies { grant.total } else { 0 };
+        let written = (grant.total - grant.offset).saturating_add(install);
+        if publish::short_of_space(publish::free_bytes(&self.dir), written) {
+            self.halt = Some(Halt::Refused(Miss::Unavailable));
             return Err(Refusal::TooLarge);
         }
         if grant.offset > self.offset {
@@ -1182,10 +1228,7 @@ impl Read for BundleReader<'_> {
 
 fn hex32(id: &[u8; 32]) -> String {
     let mut out = String::with_capacity(64);
-    for byte in id {
-        out.push(char::from_digit((byte >> 4) as u32, 16).expect("nibble"));
-        out.push(char::from_digit((byte & 0x0F) as u32, 16).expect("nibble"));
-    }
+    scope::push_hex(&mut out, id);
     out
 }
 
@@ -1389,21 +1432,22 @@ impl Drop for Receiving {
 }
 
 impl Receiving {
-    pub fn begin(store_root: &Path, upload: &Upload) -> Result<Option<Receiving>, Refusal> {
+    /// `budget_bytes` is the store's own budget: a bundle past [`max_bundle_bytes`] of it is refused up front
+    /// rather than accepted and then evicted last-to-first with everything else.
+    pub fn begin(
+        store_root: &Path,
+        upload: &Upload,
+        budget_bytes: u64,
+    ) -> Result<Option<Receiving>, Refusal> {
         let entry = Entry::of_upload(upload).dir(store_root)?;
-        if upload.total > MAX_BUNDLE_BYTES {
+        if upload.total > max_bundle_bytes(budget_bytes) {
             return Err(Refusal::TooLarge);
         }
         let at_end = upload.digest == DIGEST_AT_END;
         if !at_end && bundle_path(&entry, &upload.digest).is_file() {
             return Ok(None);
         }
-        if let Some((free, total)) = store_space(store_root)
-            && free
-                < upload
-                    .total
-                    .saturating_add((total / 20).min(STORE_FREE_RESERVE))
-        {
+        if publish::short_of_space(publish::free_bytes(store_root), upload.total) {
             return Err(Refusal::TooLarge);
         }
         let Some(lock) =
@@ -1495,22 +1539,6 @@ impl Receiving {
     }
 }
 
-fn store_space(root: &Path) -> Option<(u64, u64)> {
-    #[cfg(target_os = "linux")]
-    {
-        let st = rustix::fs::statvfs(root).ok()?;
-        Some((
-            st.f_bavail.saturating_mul(st.f_frsize),
-            st.f_blocks.saturating_mul(st.f_frsize),
-        ))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = root;
-        None
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StoreSweep {
     pub entries: u64,
@@ -1549,9 +1577,13 @@ pub fn sweep_store(root: &Path, budget_bytes: u64, max_entries: u64, now_ms: i64
             }
         }
     }
-    let mut total: u64 = kept.iter().map(|(_, bytes, _)| bytes).sum();
+    let mut total = kept
+        .iter()
+        .fold(0u64, |sum, (_, bytes, _)| sum.saturating_add(*bytes));
     if total > budget_bytes {
-        kept.sort_unstable_by_key(|(used, _, _)| *used);
+        // An entry bigger than the whole budget goes first: kept for last it would outlive every entry that fits,
+        // and still be evicted, so the sweep would empty the store to no end.
+        kept.sort_unstable_by_key(|(used, bytes, _)| (*bytes <= budget_bytes, *used));
         for (_, bytes, entry) in kept {
             if total <= budget_bytes {
                 break;
@@ -1562,8 +1594,8 @@ pub fn sweep_store(root: &Path, budget_bytes: u64, max_entries: u64, now_ms: i64
             match fs::remove_dir_all(&entry) {
                 Ok(()) => {
                     out.entries_evicted += 1;
-                    out.bytes_freed += bytes;
-                    total -= bytes;
+                    out.bytes_freed = out.bytes_freed.saturating_add(bytes);
+                    total = total.saturating_sub(bytes);
                 }
                 Err(_) => out.errors += 1,
             }
@@ -1618,7 +1650,7 @@ fn sweep_entry(entry: &Path, now_ms: i64, out: &mut StoreSweep) -> Option<(i64, 
         match fs::remove_file(child.path()) {
             Ok(()) => {
                 out.bundles_removed += 1;
-                out.bytes_freed += meta.len();
+                out.bytes_freed = out.bytes_freed.saturating_add(meta.len());
             }
             Err(_) => out.errors += 1,
         }
@@ -1659,6 +1691,19 @@ mod tests {
         assert_eq!(u64_at(&head, 16), 1);
         assert_eq!(u64_at(&head, 24), 2);
         assert_eq!(u64_at(&head, 32), 3);
+    }
+
+    #[test]
+    fn bundle_ids_hex_encode_to_the_lower_case_names_the_store_uses() {
+        let mut id = [0u8; 32];
+        id[0] = 0x0f;
+        id[1] = 0xa5;
+        id[31] = 0xff;
+        let text = hex32(&id);
+        assert_eq!(text.len(), 64);
+        assert!(text.starts_with("0fa5000000"));
+        assert!(text.ends_with("00ff"));
+        assert_eq!(unhex32(&text), Some(id));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use sentinel_protocol::cache::{Class, Trust};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    attach::MAX_KEY_BYTES,
     outcome::{Hit, Miss, Outcome},
     scope::{Platform, Scope},
 };
@@ -18,7 +19,6 @@ pub const HEAD_BYTES: usize = 16;
 pub const MAX_MANIFEST_BYTES: u64 = 64 << 10;
 pub const MAX_FILES_BLOB_BYTES: u64 = 64 << 20;
 pub const MAX_FILE_ENTRIES: u32 = 1 << 20;
-const MAX_KEY_BYTES: usize = 1024;
 const MAX_FIELD_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +116,10 @@ impl Manifest {
         self.sealed_ms != 0
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "postcard encodes a derived plain struct into a Vec; only allocation failure errs"
+    )]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEAD_BYTES + 64);
         out.extend_from_slice(MAGIC);
@@ -148,6 +152,7 @@ impl Manifest {
             || self.key.is_empty()
             || self.key.len() > MAX_KEY_BYTES
             || self.files > MAX_FILE_ENTRIES
+            || self.sealed_ms > i64::MAX as u64
         {
             return Err(bad());
         }
@@ -284,6 +289,10 @@ pub fn lookup(generation_dir: &Path, want: &Request<'_>) -> Outcome {
 
 impl FilesBlob {
     /// Writers sort by path: the manifest pins the digest of this encoding, so it must be stable.
+    #[expect(
+        clippy::expect_used,
+        reason = "postcard encodes a derived plain struct into a Vec; only allocation failure errs"
+    )]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEAD_BYTES + 64);
         out.extend_from_slice(FILES_MAGIC);
@@ -438,6 +447,28 @@ mod tests {
         let mut long = manifest(&s, "deps-aa00", deps_compat());
         long.key = "k".repeat(MAX_KEY_BYTES + 1);
         assert_eq!(Manifest::decode(&long.encode()), Err(Miss::Invalid));
+    }
+
+    #[test]
+    fn the_key_bound_is_the_attach_bound_and_is_inclusive() {
+        let s = scope();
+        let mut at_bound = manifest(&s, "deps-aa00", deps_compat());
+        at_bound.key = "k".repeat(crate::attach::MAX_KEY_BYTES);
+        assert!(Manifest::decode(&at_bound.encode()).is_ok());
+        at_bound.key.push('k');
+        assert_eq!(Manifest::decode(&at_bound.encode()), Err(Miss::Invalid));
+    }
+
+    #[test]
+    fn a_seal_time_that_cannot_name_a_generation_is_invalid() {
+        let s = scope();
+        let mut m = manifest(&s, "deps-aa00", deps_compat());
+        m.sealed_ms = i64::MAX as u64;
+        assert!(Manifest::decode(&m.encode()).is_ok());
+        for beyond in [i64::MAX as u64 + 1, u64::MAX] {
+            m.sealed_ms = beyond;
+            assert_eq!(Manifest::decode(&m.encode()), Err(Miss::Invalid));
+        }
     }
 
     #[test]

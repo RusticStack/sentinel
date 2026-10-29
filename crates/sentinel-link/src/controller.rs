@@ -72,6 +72,12 @@ pub struct StoragePolicy {
     pub interval_ms: i64,
 }
 
+/// The remote store's budget when none is configured: a tenth of the data file system, from 1 GiB up to the
+/// maximum every storage budget shares.
+pub fn default_remote_cache_budget(total: u64) -> u64 {
+    (total / 10).clamp(1 << 30, sentinel_cache::gc::MAX_BUDGET_BYTES)
+}
+
 #[derive(Debug, Default)]
 pub struct Stats {
     pub admitted: AtomicU64,
@@ -2393,6 +2399,10 @@ impl SessionHandler for Inner {
         )
     }
 
+    fn cache_budget(&self) -> u64 {
+        self.remote_budget.load(Ordering::Relaxed)
+    }
+
     fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict {
         let (run, job) = match self.log_scope(worker, attempt) {
             Ok(Some(scope)) => scope,
@@ -3652,6 +3662,17 @@ mod tests {
             memory_bytes,
             disk_bytes,
         }
+    }
+
+    #[test]
+    fn the_default_store_budget_is_a_tenth_of_the_disk_within_the_shared_bounds() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(default_remote_cache_budget(0), GIB);
+        assert_eq!(default_remote_cache_budget(100 * GIB), 10 * GIB);
+        assert_eq!(
+            default_remote_cache_budget(u64::MAX),
+            sentinel_cache::gc::MAX_BUDGET_BYTES
+        );
     }
 
     #[test]

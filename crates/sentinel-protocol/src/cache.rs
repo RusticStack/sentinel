@@ -36,6 +36,15 @@ impl Class {
     }
 }
 
+// Per-class tables elsewhere are indexed by the class code, so `ALL` must list the classes in code order.
+const _: () = {
+    let mut i = 0;
+    while i < Class::ALL.len() {
+        assert!(Class::ALL[i].to_u8() as usize == i);
+        i += 1;
+    }
+};
+
 impl std::fmt::Display for Class {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())

@@ -872,6 +872,7 @@ fn restore_caches(
         source,
         attempt: *job.attempt.as_bytes(),
         deadline: sentinel_cache::remote::Policy::deadline_for(job_timeout),
+        budget_bytes: job.cache_budget_bytes,
     });
     let context = WorkerContext::new(&job.context, &job.spec, workspace);
     let cache_root = root.join(sentinel_cache::attach::ROOT_DIR);
@@ -1854,6 +1855,63 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    /// Grants a total and moves nothing: only the size gate in front of the transfer is under test.
+    struct Granting(u64);
+    impl sentinel_cache::remote::Remote for Granting {
+        fn fetch(
+            &self,
+            need: &sentinel_cache::remote::Need,
+            _: Instant,
+            sink: &mut dyn sentinel_cache::remote::Sink,
+        ) -> std::result::Result<(), sentinel_cache::remote::Refusal> {
+            sink.plan(&sentinel_cache::remote::Grant {
+                attempt: need.attempt,
+                total: self.0,
+                offset: 0,
+                prefix: [0; 32],
+                digest: [1; 32],
+            })
+        }
+        fn offer(
+            &self,
+            _: &sentinel_cache::remote::Upload,
+            _: Instant,
+            _: &mut dyn std::io::Read,
+        ) -> std::result::Result<[u8; 32], sentinel_cache::remote::Refusal> {
+            Err(sentinel_cache::remote::Refusal::Store)
+        }
+    }
+
+    #[test]
+    fn restore_refuses_a_bundle_past_the_attempt_cache_budget() {
+        const BUDGET: u64 = 64 << 20;
+
+        let offered = sentinel_cache::remote::max_bundle_bytes(BUDGET) + 1;
+        for (budget, want) in [
+            (
+                BUDGET,
+                sentinel_cache::Outcome::Miss(sentinel_cache::Miss::Invalid),
+            ),
+            // A roomier budget lets the same grant past the size gate; this fake then proves nothing.
+            (
+                sentinel_cache::gc::DEFAULT_BUDGET_BYTES,
+                sentinel_cache::Outcome::Miss(sentinel_cache::Miss::Corrupt),
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (root, ws) = (temp.path().join("worker"), temp.path().join("ws"));
+            fs::create_dir_all(&ws).unwrap();
+            fs::write(ws.join("f.lock"), b"locked").unwrap();
+            let mut job = job(spec());
+            job.cache_budget_bytes = budget;
+            let declared = job.spec.pipeline.jobs[0].spec.cache.clone();
+            let image = format!("example.test/i@{}", job.digest);
+            let source = Granting(offered);
+            restore_caches(&root, &mut job, &declared, &ws, &image, Some(&source));
+            assert_eq!(job.caches[0].outcome, want, "budget {budget}");
+        }
     }
 
     #[test]

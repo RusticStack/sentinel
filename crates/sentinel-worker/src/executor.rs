@@ -497,10 +497,11 @@ pub struct StorageBudgets {
 impl StorageBudgets {
     pub fn sized(total: u64) -> StorageBudgets {
         const GIB: u64 = 1 << 30;
+        const MAX: u64 = sentinel_cache::gc::MAX_BUDGET_BYTES;
         StorageBudgets {
-            cache_bytes: (total / 5).clamp(GIB, 50 * GIB),
-            mirror_bytes: (total / 10).clamp(GIB, 50 * GIB),
-            image_bytes: (total / 5).clamp(2 * GIB, 50 * GIB),
+            cache_bytes: (total / 5).clamp(GIB, MAX),
+            mirror_bytes: (total / 10).clamp(GIB, MAX),
+            image_bytes: (total / 5).clamp(2 * GIB, MAX),
         }
     }
 }
@@ -517,6 +518,7 @@ mod budget_tests {
             (big.cache_bytes, big.mirror_bytes, big.image_bytes),
             (50 * GIB, 50 * GIB, 50 * GIB)
         );
+        assert_eq!(big.cache_bytes, sentinel_cache::gc::MAX_BUDGET_BYTES);
         let small = StorageBudgets::sized(100 * GIB);
         assert_eq!(
             (small.cache_bytes, small.mirror_bytes, small.image_bytes),
