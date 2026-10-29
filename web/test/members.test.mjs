@@ -2,7 +2,7 @@
 // name is refused before any request with words that say what to do (the controller answers it as not_found).
 import assert from "node:assert/strict";
 import test from "node:test";
-import { memberTarget, USER_ID } from "../src/lib/members.ts";
+import { listComplete, memberTarget, USER_ID } from "../src/lib/members.ts";
 
 const ID = "usr_0b9c7a1e-3f52-4d6a-9a1e-7c2f1d5b8e40";
 const OTHER = "usr_5d1e8c34-62aa-4b0f-8e17-3a9c4f20b7d1";
@@ -31,4 +31,11 @@ test("nothing typed, or something that is only a near miss of an id, is not sent
   assert.ok(!USER_ID.test(ID.toUpperCase()), "ids are lower-case, as the controller parses them");
   assert.ok(!USER_ID.test(ID.replace("-4d6a-", "-1d6a-")), "version 4 only");
   assert.ok(USER_ID.test(ID));
+});
+
+test("a members read that failed or has another page is not a whole list, so a typed name goes to the controller", () => {
+  assert.equal(listComplete({ next: null }), true);
+  assert.equal(listComplete({ next: "cursor" }), false);
+  assert.equal(listComplete(null), false, "a failed read lists nobody, which is not the same as nobody being a member");
+  assert.deepEqual(memberTarget("rui", [], listComplete(null)), { path: "rui", unlisted: true });
 });

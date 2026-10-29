@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { Member, NamespaceSettings } from "../../lib/types";
 import { api, ApiError } from "../../lib/api.ts";
 import { act } from "../../lib/act.tsx";
-import { memberTarget } from "../../lib/members.ts";
+import { listComplete, memberTarget } from "../../lib/members.ts";
 import { refreshTenants, useSession } from "../../lib/session.ts";
 import { useOverride } from "../../lib/override.ts";
 import { attempt, useLoad, type Load } from "../../lib/loaded.ts";
@@ -38,7 +38,7 @@ export function Members({ slug, settings, initial }: { slug: string; settings: N
   async function add(e: React.FormEvent) {
     e.preventDefault();
     if (!ready()) return;
-    const target = memberTarget(who, data?.members ?? [], !data?.next);
+    const target = memberTarget(who, data?.members ?? [], listComplete(data));
     if ("problem" in target) { setWhoError(target.problem); return; }
     setWhoError("");
     const name = who.trim();

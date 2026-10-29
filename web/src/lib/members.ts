@@ -3,6 +3,9 @@
 // so the refusal can say what to do instead of "not found, or you no longer have access".
 export const USER_ID = /^usr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
+/** Whether the members read holds every member: a read that failed (null) or has a further page does not. */
+export const listComplete = (page: { next: string | null } | null): boolean => page !== null && !page.next;
+
 export type MemberTarget =
   | { path: string; unlisted?: boolean }
   | { problem: string };
