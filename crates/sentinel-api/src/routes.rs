@@ -41,6 +41,7 @@ pub(crate) mod account;
 mod admin;
 mod email;
 mod failure;
+mod history;
 mod setup;
 mod views;
 mod worker_enrollment;
@@ -527,6 +528,25 @@ pub(crate) fn route(
         ("GET", ["api", "v1", "tenants", slug, "repos", name, "runs"]) => {
             views::runs(state, request, slug, name, query)
         }
+        ("GET", ["api", "v1", "tenants", slug, "repos", name, "durations"]) => {
+            history::durations(state, request, slug, name, query)
+        }
+        ("GET", ["api", "v1", "tenants", slug, "repos", name, "compare"]) => {
+            history::compare(state, request, slug, name, query)
+        }
+        (
+            "GET",
+            [
+                "api",
+                "v1",
+                "tenants",
+                slug,
+                "repos",
+                name,
+                "logs",
+                "search",
+            ],
+        ) => history::log_search(state, request, slug, name, query),
         (
             _,
             [

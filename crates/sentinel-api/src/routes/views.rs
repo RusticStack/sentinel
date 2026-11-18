@@ -17,7 +17,10 @@ use serde_json::{Value, json};
 use super::{Route, err, id, identify, ok, query_param, store_error};
 use crate::{State, auth};
 
-fn decoded(query: &str, name: &str) -> Result<Option<String>, sentinel_protocol::error::ApiError> {
+pub(super) fn decoded(
+    query: &str,
+    name: &str,
+) -> Result<Option<String>, sentinel_protocol::error::ApiError> {
     let mut found = None;
     for (key, value) in form_urlencoded::parse(query.as_bytes()) {
         if key == name {
