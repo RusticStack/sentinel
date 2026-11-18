@@ -334,9 +334,50 @@ pub fn of_run(conn: &Connection, run: RunId) -> Result<Option<RunProvenance>> {
     }))
 }
 
-pub fn trigger_of(conn: &Connection, run: RunId) -> Result<Option<String>> {
-    Ok(conn
-        .prepare_cached("SELECT trigger FROM run_provenance WHERE run_id = ?1")?
-        .query_row([run.as_bytes()], |r| r.get::<_, String>(0))
-        .optional()?)
+/// The Sentinel user (or service account) that started a manual run. `display_name` is the account's name while it
+/// is still a member of the run's tenant, and `None` once it is not, so a former member's name is not handed out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunActor {
+    pub user: UserId,
+    pub display_name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Origin {
+    pub trigger: String,
+    /// `None` for every webhook run and for a manual run recorded before migration 64.
+    pub actor: Option<RunActor>,
+}
+
+/// What started a run, in one keyed probe of `run_provenance` (and of `memberships` and `users` by primary key
+/// for the actor's name). A run of another tenant is `None`, exactly as if it had no provenance.
+pub fn origin(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Option<Origin>> {
+    type Row = (String, Option<[u8; 16]>, Option<String>);
+    let row: Option<Row> = conn
+        .prepare_cached(
+            "SELECT p.trigger, p.actor_user_id, u.display_name
+             FROM run_provenance p
+             LEFT JOIN memberships m ON m.tenant_id = p.tenant_id AND m.user_id = p.actor_user_id
+             LEFT JOIN users u ON u.id = m.user_id
+             WHERE p.run_id = ?1 AND p.tenant_id = ?2",
+        )?
+        .query_row(params![run.as_bytes(), tenant.as_bytes()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?;
+    row.map(|(trigger, actor, display_name)| {
+        Ok(Origin {
+            trigger,
+            actor: actor
+                .map(|user| {
+                    Ok::<_, Error>(RunActor {
+                        user: UserId::from_bytes(user)
+                            .map_err(|_| Error::Corrupt("actor_user_id"))?,
+                        display_name,
+                    })
+                })
+                .transpose()?,
+        })
+    })
+    .transpose()
 }

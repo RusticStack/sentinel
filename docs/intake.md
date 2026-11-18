@@ -353,10 +353,17 @@ dispatch leaves neither, and a run without a row reads as a `manual` event. The
 worker only reads the facts (`provenance::event_facts`, carried in the worker
 protocol) when it builds its expression context; it never records them.
 
-Provenance records what triggered a run, not who. A manual run carries no
-caller, and a webhook's sender is not parsed; for a manual run the only trace
-of the calling principal is its `Idempotency-Key` record, when the caller sent
-one. The actor columns are a planned additive migration.
+Provenance records what triggered a run, and for a manual run also who: the
+Sentinel user or service account that called `POST …/runs` is stored in
+`run_provenance.actor_user_id` (migration 64, `provenance::insert_with_actor`).
+`GET /runs/{id}` (and the `run` of its wait) returns it as `actor`
+(`{user_id, display_name}`), read by `provenance::origin` in the same keyed probe
+that reads the trigger, scoped to the run's tenant, with the name resolved only
+while the account is a member of that tenant ([API](api.md)). A webhook's sender
+is not parsed and not stored as a principal: it is text its author chose, so a
+webhook run has `actor` `NULL`, the API omits the field and the web interface
+shows nothing, as it does for a manual run recorded before migration 64. The
+column is written once with the row.
 
 Settled rows are terminal — the store's trigger refuses reopening one — and
 each settlement is logged as `intake_settled` with its delivery and outcome,
