@@ -9,6 +9,7 @@
 
 use sentinel_auth::secret::Digest;
 use sentinel_core::{PoolId, TokenId, UnixMillis, WorkerId};
+use sentinel_link::controller::Ranked;
 use sentinel_protocol::error::{ApiError, ErrorCode};
 use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
 use sentinel_store::workers::{
@@ -425,12 +426,14 @@ fn view_json(view: &workers::HostView) -> Value {
     })
 }
 
-/// The order the next placement round uses for the free workers, and why each is ahead of the next.
-fn placement(state: &State, request: &Request) -> Route {
-    super::admin::platform(state, request, false)?;
-    let ranking = state.controller.placement_ranking();
-    let ranked: Vec<Value> = ranking
+/// The most hosts one placement answer names. The order is computed over the whole free fleet in one
+/// pass; only the answer is bounded, and `total` says how many hosts it holds.
+const MAX_PLACEMENT_HOSTS: usize = 500;
+
+fn placement_json(order: &str, ranking: &[Ranked]) -> Value {
+    let workers: Vec<Value> = ranking
         .iter()
+        .take(MAX_PLACEMENT_HOSTS)
         .enumerate()
         .map(|(position, r)| {
             json!({
@@ -442,10 +445,21 @@ fn placement(state: &State, request: &Request) -> Route {
             })
         })
         .collect();
-    ok(json!({
-        "order": state.controller.placement_order().as_str(),
-        "workers": ranked,
-    }))
+    json!({
+        "order": order,
+        "total": ranking.len(),
+        "truncated": ranking.len() > MAX_PLACEMENT_HOSTS,
+        "workers": workers,
+    })
+}
+
+/// The order the next placement round uses for the free workers, and why each is ahead of the next.
+fn placement(state: &State, request: &Request) -> Route {
+    super::admin::platform(state, request, false)?;
+    ok(placement_json(
+        state.controller.placement_order().as_str(),
+        &state.controller.placement_ranking(),
+    ))
 }
 
 fn host_policy(state: &State, request: &Request, worker: &str) -> Route {
@@ -752,4 +766,82 @@ fn redeem(state: &State, request: &mut Request) -> Route {
         }),
         vec![header("cache-control", "no-store")],
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use sentinel_link::controller::OrderFactor;
+
+    use super::*;
+
+    fn ranked(priority: i32, finish: i64, because: Option<OrderFactor>) -> Ranked {
+        Ranked {
+            worker: WorkerId::new(),
+            priority,
+            expected_finish_ns: finish,
+            ahead_because: because,
+        }
+    }
+
+    #[test]
+    fn the_listing_keeps_the_order_the_round_uses_and_names_the_deciding_factor() {
+        let fleet = [
+            ranked(10, 30, Some(OrderFactor::Priority)),
+            ranked(0, 10, Some(OrderFactor::ExpectedFinish)),
+            ranked(0, 20, Some(OrderFactor::BestFit)),
+            ranked(0, 20, Some(OrderFactor::Identity)),
+            ranked(-5, 20, None),
+        ];
+        let body = placement_json("priority", &fleet);
+        assert_eq!(body["order"], "priority");
+        assert_eq!(body["total"], 5);
+        assert_eq!(body["truncated"], false);
+        let listed = body["workers"].as_array().unwrap();
+        for (at, row) in listed.iter().enumerate() {
+            assert_eq!(row["position"], at + 1);
+            assert_eq!(row["worker"], fleet[at].worker.to_string());
+            assert_eq!(row["priority"], fleet[at].priority);
+            assert_eq!(row["expected_finish_ns"], fleet[at].expected_finish_ns);
+        }
+        let reasons: Vec<Value> = listed
+            .iter()
+            .map(|row| row["ahead_because"].clone())
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                json!("priority"),
+                json!("expected_finish"),
+                json!("best_fit"),
+                json!("identity"),
+                Value::Null
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_fleet_lists_nothing() {
+        let body = placement_json("fastest", &[]);
+        assert_eq!(body["workers"], json!([]));
+        assert_eq!(body["total"], 0);
+        assert_eq!(body["truncated"], false);
+    }
+
+    #[test]
+    fn the_listing_is_bounded_and_says_how_many_hosts_it_left_out() {
+        let fleet: Vec<Ranked> = (0..MAX_PLACEMENT_HOSTS + 7)
+            .map(|i| ranked(0, i as i64, Some(OrderFactor::ExpectedFinish)))
+            .collect();
+        let body = placement_json("fastest", &fleet);
+        let listed = body["workers"].as_array().unwrap();
+        assert_eq!(listed.len(), MAX_PLACEMENT_HOSTS);
+        assert_eq!(body["total"], MAX_PLACEMENT_HOSTS + 7);
+        assert_eq!(body["truncated"], true);
+        assert_eq!(listed[0]["expected_finish_ns"], 0);
+        assert_eq!(
+            listed[MAX_PLACEMENT_HOSTS - 1]["position"],
+            MAX_PLACEMENT_HOSTS,
+            "the first hosts in the round's order are the ones kept"
+        );
+    }
 }

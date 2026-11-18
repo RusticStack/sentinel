@@ -201,6 +201,16 @@ Every command below takes the [shared client flags](#the-shared-client). `--tena
 
 `sentinel pipeline validate|explain` stay offline and take `--output text|json` (`--json` is `--output json`; there is no list to stream, so no `ndjson`). In JSON mode `explain` prints `sentinel.explain/1` and `validate` prints `{"file", "valid": true, "jobs"}` (text `validate` prints nothing on success), each as one line; a failure is one `sentinel.error/1` line on stderr (`invalid_pipeline`, including a file over the 256 KiB limit, or `client_usage` for an unreadable file) with stdout empty, like the networked commands. The limit bounds the bytes read, not a reported size, so `validate /dev/zero` fails at 256 KiB.
 
+## Host-local worker policy
+
+`sentinel admin worker policy --data-dir DIR --id wrk_... [--cpu-millis N|none] [--memory-bytes N|none] [--disk-bytes N|none] [--priority N]` shows or changes the ceilings and priority the controller approves for one enrolled worker. It is a host-local `admin` command like `admin worker enroll`: no sign-in, authorized by access to the controller's data directory (an absolute `--data-dir`), and it opens the metadata database directly, so run it on the controller host, beside a stopped controller. The networked equivalent is `PUT /admin/workers/{wrk}/policy` ([API](api.md#routes)), which a platform administrator calls with a fresh second factor and which also wakes a running controller's placement loop; this command does not wake one.
+
+- **No flag** prints four lines (`approved`, `reported`, `effective`, `reserved`) and an `over-cap` line that is `no` or the amounts by which the machine's accepted work exceeds what is offered. Nothing is written.
+- **Only the flags given change**, unlike the API, which replaces the whole policy. A ceiling is a positive number (milli-cores, bytes) or `none`, which removes it so the machine's own report is the only limit; `--priority` is −100 to 100. The new view is printed and `policy of wrk_... replaced; running work keeps its resources` goes to stderr. A raise is capped by what the worker reported, and attempts the worker already holds are untouched ([worker link](worker-link.md#host-policy-is-the-controllers), [worker enrollment](worker-enrollment.md#change-a-machine)).
+- **Refusals exit 2** with the usual `admin` text: `expected a wrk_ worker identifier`, `--cpu-millis takes a positive number or `none`` (the same for `--memory-bytes` and `--disk-bytes`), `invalid host priority`, `no live worker with that identifier` (unknown or revoked).
+
+There is no separate inherit flag: `none` is the one way to clear a ceiling here, and an empty field is the way on the web page.
+
 ## Legacy `sentinel api`
 
 The `sentinel api` commands (`me`, `run`, `status`, `runs`, `cancel`, `rerun`, `logs`, `workers`, `queue`, `drain`, `undrain`; see [API](api.md#the-cli)) run on the shared client: `--token-file`, `--token` or `SENTINEL_TOKEN` may hold an `sntl_` credential or an `sntl_at_` access token, the server is taken as given (a trailing `/` dropped), and exits follow the table above — so `conflict` exits 5 and a busy or unreachable controller 6.
