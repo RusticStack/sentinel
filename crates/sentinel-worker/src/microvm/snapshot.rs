@@ -318,33 +318,49 @@ pub(super) fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
     let len = src.metadata()?.len();
     dst.set_len(len)?;
     let mut buf = vec![0u8; 1 << 20];
-    let mut at: i64 = 0;
-    while (at as u64) < len {
+    let mut at: u64 = 0;
+    while at < len {
         // SAFETY: lseek on an open descriptor.
-        let data = unsafe { libc::lseek(src.as_raw_fd(), at, libc::SEEK_DATA) };
+        let data = unsafe { libc::lseek(src.as_raw_fd(), at as i64, libc::SEEK_DATA) };
         if data < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENXIO) {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO) {
                 break;
             }
-            return Err(err);
+            // A file system that cannot say where the data starts (no `SEEK_DATA`) is copied whole from here: the
+            // clone still has to hold every byte, it just cannot skip the holes.
+            copy_extent(&src, &dst, at, len, &mut buf)?;
+            break;
         }
         // SAFETY: as above.
         let hole = unsafe { libc::lseek(src.as_raw_fd(), data, libc::SEEK_HOLE) };
-        if hole < 0 {
-            return Err(io::Error::last_os_error());
+        // A file system that cannot report holes copies the rest of the file as one extent.
+        let end = match hole {
+            hole if hole > data => hole as u64,
+            _ => len,
+        };
+        copy_extent(&src, &dst, data as u64, end, &mut buf)?;
+        at = end;
+    }
+    Ok(())
+}
+
+/// Writes `src[from..to]` into `dst` at the same offsets, in bounded reads.
+fn copy_extent(
+    src: &fs::File,
+    dst: &fs::File,
+    from: u64,
+    to: u64,
+    buf: &mut [u8],
+) -> io::Result<()> {
+    let mut pos = from;
+    while pos < to {
+        let want = buf.len().min((to - pos) as usize);
+        let n = src.read_at(&mut buf[..want], pos)?;
+        if n == 0 {
+            break;
         }
-        let (mut pos, end) = (data as u64, hole as u64);
-        while pos < end {
-            let want = buf.len().min((end - pos) as usize);
-            let n = src.read_at(&mut buf[..want], pos)?;
-            if n == 0 {
-                break;
-            }
-            dst.write_all_at(&buf[..n], pos)?;
-            pos += n as u64;
-        }
-        at = hole;
+        dst.write_all_at(&buf[..n], pos)?;
+        pos += n as u64;
     }
     Ok(())
 }
@@ -616,6 +632,14 @@ mod tests {
         assert!(open(root.path(), &current).is_some());
     }
 
+    /// Whether this file system can say where a sparse file's holes are. Without `SEEK_HOLE` a copy cannot skip
+    /// them, so the sparse assertion above only holds where the report exists.
+    fn holes_are_reported(path: &Path) -> bool {
+        let file = fs::File::open(path).unwrap();
+        // SAFETY: `file` is an open descriptor.
+        unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_HOLE) >= 0 }
+    }
+
     #[test]
     fn a_clone_has_the_bytes_and_only_the_data_extents() {
         let dir = tempfile::tempdir().unwrap();
@@ -631,12 +655,16 @@ mod tests {
         assert_eq!(fs::read(&from).unwrap(), fs::read(&to).unwrap());
         let meta = fs::metadata(&to).unwrap();
         assert_eq!(meta.len(), 64 << 20);
-        // Neither a reflink nor a hole-less copy: the clone is still sparse (or shares extents).
-        assert!(
-            meta.blocks() * 512 < 8 << 20,
-            "{} bytes allocated",
-            meta.blocks() * 512
-        );
+        // A reflink shares the extents and a hole-reporting file system is copied extent by extent, so either way
+        // the clone stays sparse. A file system that answers neither (`FICLONE` unsupported and no `SEEK_HOLE`,
+        // as ext4 without reflinks does) is copied whole, and holds the same bytes at the same offsets.
+        if holes_are_reported(&from) {
+            assert!(
+                meta.blocks() * 512 < 8 << 20,
+                "{} bytes allocated",
+                meta.blocks() * 512
+            );
+        }
         // The clone is a new file: it refuses to overwrite one.
         assert!(clone_file(&from, &to).is_err());
         fs::write(&to, b"changed").unwrap();
