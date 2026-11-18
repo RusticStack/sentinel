@@ -16,6 +16,12 @@ use std::{
 };
 
 use fixture::{Fixture, PASSWORD, TAILCAT_ADDRESS};
+use sentinel_core::{AttemptId, JobId, RunId, UnixMillis};
+use sentinel_protocol::{
+    logs::{Frame, Stream},
+    summary::{AttemptSummary, StepOutcome, StepRecord},
+};
+use sentinel_store::jobs;
 use serde_json::json;
 
 fn repo_root() -> std::path::PathBuf {
@@ -161,6 +167,119 @@ fn config(f: &Fixture, base: &str, web: &str, out: &std::path::Path) -> serde_js
     })
 }
 
+/// Three runs of one job in the `web` repository, for the history views: the middle one reran (two attempts, the newest
+/// counts), the oldest and the middle one logged `HISTORY_NEEDLE`, and the newest had its log removed by retention.
+const HISTORY_NEEDLE: &str = "needle-hist-91";
+
+fn seed_history(f: &Fixture) -> serde_json::Value {
+    const MS: u64 = 1_000_000;
+    let phases = |checkout: u64, pull: u64, start: u64, steps: u64, finalize: u64| AttemptSummary {
+        checkout_ns: Some(checkout * MS),
+        image_pull_ns: Some(pull * MS),
+        container_start_ns: Some(start * MS),
+        steps_ns: Some(steps * MS),
+        finalize_ns: Some(finalize * MS),
+        steps: vec![StepRecord {
+            index: 1,
+            id: "build".into(),
+            outcome: StepOutcome::Passed,
+            duration_ns: Some(steps * MS),
+        }],
+        ..AttemptSummary::default()
+    };
+    let (tenant, repo, now) = (f.acme, f.web, UnixMillis::now());
+    let hour = 3_600_000;
+    // (age in hours, attempts as (summary, logs the needle), the newest attempt's log expired)
+    let plan = [
+        (3, vec![(phases(400, 900, 100, 10_000, 200), true)], false),
+        (
+            2,
+            vec![
+                (phases(500, 1_200, 150, 15_000, 300), false),
+                (phases(450, 300, 120, 12_000, 250), true),
+            ],
+            false,
+        ),
+        (1, vec![(phases(420, 80, 150, 8_000, 200), false)], true),
+    ];
+    let mut runs = Vec::new();
+    let mut attempts = Vec::new();
+    for (age, tries, expired) in plan {
+        let (run, job) = (RunId::new(), JobId::new());
+        f.store
+            .writer()
+            .write(move |tx| {
+                jobs::insert_run(
+                    tx,
+                    tenant,
+                    repo,
+                    run,
+                    "abc1234",
+                    UnixMillis(now.0 - age * hour),
+                )?;
+                jobs::insert_job(tx, tenant, run, job, "build", 5, 0)
+            })
+            .unwrap();
+        for (fence, (summary, needle)) in (1i64..).zip(tries) {
+            let attempt = AttemptId::new();
+            let bytes = summary.encode().unwrap();
+            f.store
+                .writer()
+                .write(move |tx| {
+                    tx.execute(
+                        "INSERT INTO attempts(id, tenant_id, job_id, fence, worker_id, lease_until_ms, repo_id, summary)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+                        (
+                            attempt.as_bytes(),
+                            tenant.as_bytes(),
+                            job.as_bytes(),
+                            fence,
+                            [9u8; 16],
+                            repo.as_bytes(),
+                            bytes,
+                        ),
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            let lines = if needle {
+                format!("compiling widgets\nlinking release {HISTORY_NEEDLE} done\n")
+            } else {
+                "compiling widgets\nlinking release\n".to_owned()
+            };
+            f.logs
+                .append(
+                    run,
+                    job,
+                    attempt,
+                    &Frame {
+                        seq: 1,
+                        step: 1,
+                        stream: Stream::Stdout,
+                        bytes: lines.into_bytes(),
+                    },
+                )
+                .unwrap();
+            f.logs.finish(run, job, attempt, 1, &[]).unwrap();
+            attempts.push(attempt.to_string());
+            if expired && fence == 1 {
+                f.store
+                    .writer()
+                    .write(move |tx| {
+                        tx.execute(
+                            "UPDATE attempts SET log_expired_ms = 5 WHERE id = ?1",
+                            [attempt.as_bytes()],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+        runs.push(run.to_string());
+    }
+    json!({ "runs": runs, "attempts": attempts, "needle": HISTORY_NEEDLE })
+}
+
 fn deployment(bulk_mib: usize, relayed: bool) -> (Arc<Fixture>, Web, String, String) {
     let port = free_port();
     let web_addr = format!("http://127.0.0.1:{port}");
@@ -202,6 +321,7 @@ fn the_web_interface_in_a_real_browser() {
     std::fs::create_dir_all(&out).unwrap();
     let config_path = f.dir.path().join("ui.json");
     let mut cfg = config(&f, &origin, &web_addr, &out);
+    cfg["history"] = seed_history(&f);
     cfg["ivy"] = json!(seed.ivy.to_string());
     cfg["mia"] =
         json!({ "user": seed.mia.to_string(), "key": seed.mfa_key, "recovery": seed.recovery });

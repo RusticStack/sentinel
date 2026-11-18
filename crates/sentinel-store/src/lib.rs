@@ -11,6 +11,7 @@ pub mod email;
 pub mod github_app;
 pub mod github_events;
 pub mod github_members;
+pub mod history;
 pub mod idempotency;
 pub mod intake;
 pub mod jobs;

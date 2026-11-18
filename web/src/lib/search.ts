@@ -37,3 +37,4 @@ export const DIGITS = /^[1-9][0-9]{0,9}$/;
 export const HEX_PREFIX = /^[0-9a-f]{7,40}$/;
 export const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 export const CURSOR = /^[A-Za-z0-9_=:.-]+$/;
+export const ATTEMPT = /^att_[0-9a-f-]{36}$/;

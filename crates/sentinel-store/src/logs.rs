@@ -1137,6 +1137,8 @@ pub struct Search {
     pub next_after: Option<u64>,
     pub carry: Option<String>,
     pub complete: bool,
+    /// Payload bytes of the frames scanned past `after`, what a caller sharing one budget across logs subtracts.
+    pub scanned: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1264,6 +1266,7 @@ impl<'n> Scanner<'n> {
     fn finish(&mut self, complete: bool) -> Search {
         let mut out = std::mem::take(&mut self.out);
         out.complete = complete && out.next_after.is_none();
+        out.scanned = self.scanned;
         out
     }
 
