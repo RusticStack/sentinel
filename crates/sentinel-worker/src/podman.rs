@@ -111,8 +111,12 @@ fn private_dirs(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The runtime's own warnings would otherwise land in the job's stderr frames, where they read as the job's output
+/// (a host without a systemd user session makes podman warn about its cgroup manager on every invocation). Errors
+/// still print, and the worker's own diagnostics are read from the command it ran, never from the job's stream.
 fn podman() -> Command {
     let mut cmd = Command::new("podman");
+    cmd.arg("--log-level=error");
     cmd.env_remove("DOCKER_HOST");
     cmd.env_remove("REGISTRY_AUTH_FILE");
     cmd
@@ -187,6 +191,7 @@ fn podman_executable() -> Result<std::path::PathBuf> {
 fn podman_for_pull() -> Result<Command> {
     // Resolved before PATH is cleared: the credential-helper lookup uses PATH, so a host-wide helper could authorize a tenant's pull.
     let mut cmd = Command::new(podman_executable()?);
+    cmd.arg("--log-level=error");
     cmd.env_remove("DOCKER_HOST");
     cmd.env_remove("REGISTRY_AUTH_FILE");
     cmd.env_remove("DOCKER_CONFIG");
@@ -1066,6 +1071,20 @@ mod tests {
     }
 
     #[test]
+    fn a_runtime_warning_cannot_reach_the_jobs_log() {
+        let cmd = podman();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["--log-level=error".to_owned()],
+            "the global flag precedes every subcommand, so no invocation warns into the step's stream"
+        );
+    }
+
+    #[test]
     fn ordinary_podman_commands_remove_daemon_override() {
         let cmd = podman();
         let overrides: Vec<(String, Option<String>)> = cmd
@@ -1141,6 +1160,7 @@ mod tests {
         assert_eq!(
             exec,
             vec![
+                "--log-level=error".to_owned(),
                 "--root".to_owned(),
                 graph.display().to_string(),
                 "--runroot".to_owned(),
@@ -1149,7 +1169,11 @@ mod tests {
         );
         if let Ok(pull) = podman_pull_command("x@sha256:abc", Path::new("a.json"), &a) {
             let pull = args(&pull);
-            assert_eq!(&pull[..4], exec.as_slice(), "global flags precede `pull`");
+            assert_eq!(
+                &pull[..exec.len()],
+                exec.as_slice(),
+                "global flags precede `pull`"
+            );
         }
         let all = Store::all(temp.path());
         assert_eq!(all.len(), 3);
