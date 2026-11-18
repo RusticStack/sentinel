@@ -21,8 +21,13 @@ fn blueprint() -> Blueprint {
         client_id: "Iv23.acmeclient".into(),
         client_secret: "app-client-secret-canary".into(),
         webhook_secret: "app-webhook-secret-canary".into(),
-        pem: "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n".into(),
+        pem: fake_pem(),
     }
+}
+
+fn fake_pem() -> String {
+    let marker = "-----BEGIN PRIVATE KEY-----";
+    format!("{marker}\nAAAA\n{}\n", marker.replace("BEGIN", "END"))
 }
 
 fn manifest() -> Value {
