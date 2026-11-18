@@ -1234,6 +1234,25 @@ placement_order = '{order}'",
 
         let (mut server, base) = serve(&data);
         server.event("backups_scheduled");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        // An empty target waits no interval, so the scheduler's own first backup starts at once. Wait for
+        // it to finish before asking for a manual one, which is judged on its own rather than against a
+        // backup that still holds the lock.
+        let wait_for = |backups: usize| loop {
+            let (status, body) = get(&base, "/api/v1/admin/backups");
+            assert_eq!(status, 200, "{body}");
+            if body["backups"]
+                .as_array()
+                .is_some_and(|b| b.len() >= backups)
+                && body["scheduler"]["running"] == false
+            {
+                break body;
+            }
+            assert!(Instant::now() < deadline, "no backup appeared: {body}");
+            thread::sleep(Duration::from_millis(100));
+        };
+        let first = wait_for(1);
+        assert_eq!(first["backups"][0]["key_required"], false);
         let mut started = agent
             .post(&format!("{base}/api/v1/admin/backups"))
             .header("authorization", &auth)
@@ -1246,18 +1265,7 @@ placement_order = '{order}'",
             "{}",
             started.body_mut().read_to_string().unwrap()
         );
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let listed = loop {
-            let (status, body) = get(&base, "/api/v1/admin/backups");
-            assert_eq!(status, 200, "{body}");
-            if body["backups"].as_array().is_some_and(|b| !b.is_empty())
-                && body["scheduler"]["running"] == false
-            {
-                break body;
-            }
-            assert!(Instant::now() < deadline, "no backup appeared: {body}");
-            thread::sleep(Duration::from_millis(100));
-        };
+        let listed = wait_for(2);
         assert_eq!(listed["configured"], true);
         assert_eq!(listed["backups"][0]["key_required"], false);
         assert!(listed["scheduler"]["last_failure"].is_null(), "{listed}");
