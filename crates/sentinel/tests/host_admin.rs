@@ -296,3 +296,175 @@ fn host_policy_is_shown_changed_and_validated_through_the_admin_commands() {
     .unwrap();
     assert!(store.read(sentinel_store::workers::uninstalling).unwrap());
 }
+
+#[test]
+fn a_reduction_under_running_work_prints_the_over_cap_state_and_a_raise_stays_under_the_report() {
+    use sentinel_core::{
+        PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
+        auth::{Namespace, Permissions, Principal},
+    };
+    use sentinel_store::{
+        auth::{self, Authority, NamespaceKind, provisioning},
+        dispatch::{self, Capacity},
+        jobs, runs, tenancy, workers,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let controller_dir = root.path().join("controller");
+    let c = controller(&controller_dir);
+    c.ok(&["pool", "create", "--name", "shared"], PASSWORD);
+    let secret = c.ok(&["worker", "enroll", "--pool", "shared"], "").stdout;
+    let secret = sentinel_auth::token::parse(text(&secret).trim())
+        .expect("an enrollment secret on standard output");
+    let store = sentinel_store::Store::open(
+        controller_dir.join("metadata.sqlite"),
+        sentinel_store::Durability::Normal,
+    )
+    .unwrap();
+    let (worker, owner, repo, human) = (
+        WorkerId::new(),
+        TenantId::new(),
+        RepoId::new(),
+        UserId::new(),
+    );
+    let now = UnixMillis::now();
+    let enrolled = store
+        .writer()
+        .write(move |tx| {
+            workers::redeem_authorized(
+                tx,
+                &secret,
+                workers::Presentation {
+                    worker,
+                    fingerprint: sentinel_auth::secret::Secret::generate().digest(),
+                    name: "builder",
+                    negotiated: sentinel_protocol::negotiate::Negotiated {
+                        protocol: sentinel_protocol::negotiate::ProtocolVersion(1),
+                        capabilities: sentinel_protocol::negotiate::Capabilities::REQUIRED,
+                        arch: sentinel_protocol::negotiate::Arch::X86_64,
+                    },
+                },
+                now,
+            )
+        })
+        .unwrap()
+        .expect("the enrollment was redeemed");
+    let pool: PoolId = enrolled.pool;
+    let spec = sentinel_pipeline::RunSpec::new(
+        sentinel_pipeline::PinnedSource::new(
+            "https://github.com/o/r.git",
+            "0123456789abcdef0123456789abcdef01234567",
+            Some("main"),
+        )
+        .unwrap(),
+        sentinel_pipeline::compile_str(
+            "schema: 1\non: [push]\njobs:\n  build:\n    image: alpine:3\n    resources: { cpu: 2, memory: 2GiB }\n    steps: [{ id: s, run: 'true' }]\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    store
+        .writer()
+        .write(move |tx| {
+            provisioning::insert_human(tx, human, "Root", true, now)?;
+            auth::create_namespace(
+                tx,
+                Principal::new(human, Permissions::ALL, None, None),
+                owner,
+                Namespace::parse("owner").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )?;
+            jobs::insert_repo(tx, owner, repo, "app", now)?;
+            tenancy::grant_pool(tx, Authority::HostLocal, pool, owner, now)?;
+            for job in runs::create_run(tx, owner, repo, RunId::new(), &spec, now)? {
+                runs::resolve_image(
+                    tx,
+                    owner,
+                    job,
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "linux/amd64",
+                )?;
+            }
+            dispatch::report_capacity(
+                tx,
+                worker,
+                Capacity {
+                    cpu_millis: 16_000,
+                    memory_bytes: 64 << 30,
+                    disk_bytes: 0,
+                },
+            )
+        })
+        .unwrap();
+    store
+        .writer()
+        .write(move |tx| dispatch::place(tx, worker, pool, dispatch::DEFAULT_LEASE_MS, now))
+        .unwrap()
+        .expect("the job was placed on the worker");
+    drop(store);
+    let id = worker.to_string();
+
+    let shown = text(&c.ok(&["worker", "policy", "--id", &id], "").stdout);
+    assert!(
+        shown.contains("reserved  cpu_millis=2000 memory_bytes=2147483648"),
+        "{shown}"
+    );
+    assert!(shown.contains("over-cap  no"), "{shown}");
+
+    let reduced = c.ok(
+        &[
+            "worker",
+            "policy",
+            "--id",
+            &id,
+            "--cpu-millis",
+            "1000",
+            "--memory-bytes",
+            "1073741824",
+        ],
+        "",
+    );
+    let reduced = text(&reduced.stdout);
+    assert!(
+        reduced.contains("effective cpu_millis=1000 memory_bytes=1073741824"),
+        "{reduced}"
+    );
+    assert!(
+        reduced.contains("over-cap  cpu_millis=1000 memory_bytes=1073741824 disk_bytes=0"),
+        "{reduced}"
+    );
+
+    let raised = text(
+        &c.ok(
+            &[
+                "worker",
+                "policy",
+                "--id",
+                &id,
+                "--cpu-millis",
+                "64000",
+                "--memory-bytes",
+                "none",
+            ],
+            "",
+        )
+        .stdout,
+    );
+    assert!(raised.contains("approved  cpu_millis=64000"), "{raised}");
+    assert!(
+        raised.contains("effective cpu_millis=16000"),
+        "a raise never passes the report: {raised}"
+    );
+    assert!(raised.contains("over-cap  no"), "{raised}");
+
+    let revoked = c.ok(&["worker", "revoke", "--id", &id], "");
+    assert!(text(&revoked.stderr).contains("revoked"));
+    let gone = c.admin(&["worker", "policy", "--id", &id, "--priority", "3"], "");
+    assert_eq!(gone.status.code(), Some(2));
+    assert!(
+        text(&gone.stderr).contains("no live worker with that identifier"),
+        "{}",
+        text(&gone.stderr)
+    );
+}
