@@ -4,6 +4,7 @@ pub mod auto_join;
 pub mod backup;
 pub mod bundle;
 pub mod checks;
+pub mod classes;
 pub mod codec;
 pub mod dispatch;
 pub mod email;
