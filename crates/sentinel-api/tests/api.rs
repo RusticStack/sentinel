@@ -22,7 +22,7 @@ use sentinel_store::{
     intake, local_auth,
     logs::LogStore,
     objects::{Entry, Expect, Kind, Objects},
-    registration, runs,
+    provenance, registration, runs,
     sources::{self, Update},
     sources_forge,
     tenancy::{self, PoolKind},
@@ -4471,5 +4471,130 @@ fn the_serializers_always_emit_the_fields_the_web_types_mark_optional() {
             row["synced_ms"].is_number(),
             "a GitHub-derived member has a sync time and no other has: {row:?}"
         );
+    }
+}
+
+#[test]
+fn a_manual_runs_actor_is_returned_and_a_webhook_runs_has_none() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let (status, created) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&dispatch_body()),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201, "{created}");
+    let manual = created["id"].as_str().unwrap().to_owned();
+    let expected = serde_json::json!({ "user_id": d.root.to_string(), "display_name": "Root" });
+    assert_eq!(created["actor"], expected, "the answer to the dispatch");
+    let (status, view) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{manual}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, &view["actor"]), (200, &expected));
+    let (status, wait) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{manual}/wait?timeout_ms=1"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, &wait["run"]["actor"]), (200, &expected));
+
+    let (tenant, repo, push) = (d.tenant, d.repo, RunId::new());
+    let spec = RunSpec::new(
+        PinnedSource::new(
+            "https://github.com/o/r.git",
+            "0123456789abcdef0123456789abcdef01234567",
+            Some("refs/heads/main"),
+        )
+        .unwrap(),
+        compile_str(PIPELINE).unwrap(),
+    )
+    .unwrap();
+    d.store
+        .writer()
+        .write(move |tx| {
+            let now = UnixMillis::now();
+            runs::create_run(tx, tenant, repo, push, &spec, now)?;
+            provenance::insert(
+                tx,
+                &provenance::Provenance {
+                    tenant,
+                    repo,
+                    trigger: "push".into(),
+                    delivery: None,
+                    provider: None,
+                    ref_name: Some("refs/heads/main".into()),
+                    old_sha: None,
+                    new_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                    head_sha: None,
+                    base_sha: None,
+                    merge_sha: None,
+                    pipeline_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                    pipeline_path: None,
+                    pipeline_digest: [5; 16],
+                    pr_number: None,
+                },
+                push,
+                now,
+            )
+        })
+        .unwrap();
+    let (status, view) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{push}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, view["trigger"].as_str()), (200, Some("push")));
+    assert!(
+        view.get("actor").is_none(),
+        "a webhook run names no Sentinel account: {view}"
+    );
+
+    let (globex, _) = globex(&d);
+    let foreign = tokens::provision(
+        &d.store,
+        Grant {
+            user: d.root,
+            name: "globex-only",
+            permissions: P::ALL,
+            tenant: Some(globex),
+            repo: None,
+            lifetime_ms: 60_000,
+        },
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let foreign = format!("Bearer {}", sentinel_auth::token::format(&foreign.secret));
+    let (_, outsider_auth) = person(&d, "outsider", None, P::READ);
+    for who in [&foreign, &outsider_auth] {
+        for path in [
+            format!("/api/v1/runs/{manual}"),
+            format!("/api/v1/runs/{manual}/wait?timeout_ms=1"),
+        ] {
+            let (status, body) = call(&d, "GET", &path, None, Some(who), &[]);
+            assert_eq!(
+                (status, body["code"].as_str()),
+                (404, Some("not_found")),
+                "{path}"
+            );
+            let text = body.to_string();
+            assert!(
+                !text.contains(&d.root.to_string()) && !text.contains("Root"),
+                "the refusal names the actor: {text}"
+            );
+        }
     }
 }

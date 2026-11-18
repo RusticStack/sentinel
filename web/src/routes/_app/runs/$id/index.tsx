@@ -8,6 +8,7 @@ import { loadRepos, type RepoList } from "../../../../lib/repos.ts";
 import { useLoaded } from "../../../../lib/hooks.ts";
 import { useRunStream } from "../../../../lib/runStream.ts";
 import { fmtBytes, fmtNs, shortId, words } from "../../../../lib/format.ts";
+import { startedBy } from "../../../../lib/actor.ts";
 import { Page, rememberTenant } from "../../../../components/Page.tsx";
 import { StateBadge } from "../../../../components/StateBadge.tsx";
 import { RelTime } from "../../../../components/RelTime.tsx";
@@ -74,6 +75,7 @@ function RunView() {
     return () => { live = false; };
   }, [loaded.run]);
 
+  const started = startedBy(run);
   const finished = run.jobs.every((j) => j.terminal);
   const scale = Math.max(1, ...run.jobs.map((j) => phasesOf(j.timestamps, now).reduce((a, p) => a + p.ms, 0)));
   const failed = run.jobs.filter((j) => j.attempt && j.terminal && !["passed", "skipped", "canceled"].includes(j.state));
@@ -109,6 +111,7 @@ function RunView() {
         <dd>{slug && repoName ? <TextLink to={`/t/${slug}`} search={{ repo: repoName }} className="underline">{slug}/{repoName}</TextLink> : <span>{shortId(run.repo)}</span>}</dd>
         <dt className="text-muted">Created</dt><dd><RelTime ms={run.created_ms} /></dd>
       </dl>
+      {started ? <p id="started-by" className="text-sm">{started}</p> : null}
 
       <section aria-labelledby="jobs-h" className="space-y-3">
         <h2 id="jobs-h" className="text-base font-semibold text-strong">Jobs</h2>

@@ -911,7 +911,7 @@ fn run_state(state: RunState) -> &'static str {
 }
 
 fn run_json(view: &status::RunStatus) -> Value {
-    json!({
+    let mut run = json!({
         "id": view.id.to_string(),
         "tenant": view.tenant.to_string(),
         "repo": view.repo.to_string(),
@@ -939,7 +939,14 @@ fn run_json(view: &status::RunStatus) -> Value {
                 "terminal_ms": j.timestamps.terminal.map(|t| t.0),
             },
         })).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(actor) = &view.actor {
+        run["actor"] = json!({
+            "user_id": actor.user.to_string(),
+            "display_name": actor.display_name,
+        });
+    }
+    run
 }
 
 #[derive(Deserialize)]

@@ -151,6 +151,7 @@ fn config(f: &Fixture, base: &str, web: &str, out: &std::path::Path) -> serde_js
         "bulk_attempt": f.bulk_attempt.to_string(),
         "bulk_lines": f.bulk_lines,
         "pr_run": f.pr_run.to_string(),
+        "stuck_run": f.stuck_run.to_string(),
         "dana": f.dana.to_string(),
         "rui": f.rui.to_string(),
         "pat": f.pat.to_string(),

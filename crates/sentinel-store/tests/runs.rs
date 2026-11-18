@@ -1,9 +1,15 @@
 use sentinel_core::{
     Actor, Event, FailureClass, Fence, JobState, Outcome, RepoId, RunId, TenantId, UnixMillis,
-    WorkerId,
+    UserId, WorkerId,
 };
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
-use sentinel_store::{Durability, Error, Store, jobs, runs};
+use sentinel_store::{
+    Durability, Error, Store,
+    auth::provisioning,
+    jobs,
+    provenance::{self, Provenance, RunActor},
+    runs, status,
+};
 
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA: &str = "0c87e0181c794fe2bbfeb15dc34e7b6aae375d8b";
@@ -271,4 +277,102 @@ fn a_stored_run_spec_cannot_be_rewritten_even_by_raw_sql() {
         .read(|c| runs::get_run_spec(c, tenant, run))
         .unwrap();
     assert_eq!(stored, expected);
+}
+
+fn provenance_of(f: &Fx, trigger: &str) -> Provenance {
+    Provenance {
+        tenant: f.tenant,
+        repo: f.repo,
+        trigger: trigger.into(),
+        delivery: None,
+        provider: None,
+        ref_name: None,
+        old_sha: None,
+        new_sha: None,
+        head_sha: None,
+        base_sha: None,
+        merge_sha: None,
+        pipeline_sha: SHA.into(),
+        pipeline_path: None,
+        pipeline_digest: [3; 16],
+        pr_number: None,
+    }
+}
+
+#[test]
+fn a_manual_runs_actor_round_trips_and_a_webhook_runs_is_none() {
+    let f = fx();
+    let (tenant, alice, former) = (f.tenant, UserId::new(), UserId::new());
+    f.store
+        .writer()
+        .write(move |tx| {
+            provisioning::insert_human(tx, alice, "Alice Example", false, UnixMillis(1))?;
+            provisioning::insert_human(tx, former, "Former Member", false, UnixMillis(1))?;
+            tx.execute(
+                "INSERT INTO memberships(tenant_id, user_id, role) VALUES (?1, ?2, 2)",
+                rusqlite::params![tenant.as_bytes(), alice.as_bytes()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let [manual, former_run, webhook] = [RunId::new(), RunId::new(), RunId::new()];
+    let (repo, s) = (f.repo, spec());
+    for (run, trigger, actor) in [
+        (manual, "manual", Some(alice)),
+        (former_run, "manual", Some(former)),
+        (webhook, "push", None),
+    ] {
+        let (s, p) = (s.clone(), provenance_of(&f, trigger));
+        f.store
+            .writer()
+            .write(move |tx| {
+                runs::create_run(tx, tenant, repo, run, &s, UnixMillis(10))?;
+                provenance::insert_with_actor(tx, &p, run, UnixMillis(10), actor)
+            })
+            .unwrap();
+    }
+    let view = |run| f.store.read(|c| status::run(c, tenant, run)).unwrap();
+    assert_eq!(
+        view(manual).actor,
+        Some(RunActor {
+            user: alice,
+            display_name: Some("Alice Example".into())
+        })
+    );
+    assert_eq!(view(manual).trigger.as_deref(), Some("manual"));
+    assert_eq!(
+        view(former_run).actor,
+        Some(RunActor {
+            user: former,
+            display_name: None
+        }),
+        "an account that left the tenant keeps its id but not its name"
+    );
+    assert_eq!(view(webhook).actor, None);
+    assert_eq!(view(webhook).trigger.as_deref(), Some("push"));
+}
+
+#[test]
+fn another_tenant_reads_no_provenance_of_a_run() {
+    let f = fx();
+    let (tenant, repo, run, alice) = (f.tenant, f.repo, RunId::new(), UserId::new());
+    let (s, p) = (spec(), provenance_of(&f, "manual"));
+    f.store
+        .writer()
+        .write(move |tx| {
+            runs::create_run(tx, tenant, repo, run, &s, UnixMillis(10))?;
+            provenance::insert_with_actor(tx, &p, run, UnixMillis(10), Some(alice))
+        })
+        .unwrap();
+    let other = TenantId::new();
+    assert_eq!(
+        f.store.read(|c| provenance::origin(c, other, run)).unwrap(),
+        None
+    );
+    assert!(
+        f.store
+            .read(|c| provenance::origin(c, tenant, run))
+            .unwrap()
+            .is_some_and(|o| o.actor.is_some_and(|a| a.user == alice))
+    );
 }

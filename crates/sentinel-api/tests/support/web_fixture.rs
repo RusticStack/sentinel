@@ -156,6 +156,7 @@ fn create_run(
 ) -> (RunId, Vec<JobId>) {
     let spec = spec(pipeline_text, sha, ref_name);
     let images = runs::pinned_images(&spec).unwrap();
+    let actor = (trigger == "manual").then_some(root);
     let (sha, ref_name, trigger) = (sha.to_owned(), ref_name.to_owned(), trigger.to_owned());
     store
         .writer()
@@ -173,7 +174,7 @@ fn create_run(
             for (job, (digest, platform)) in jobs.iter().zip(&images) {
                 runs::resolve_image(tx, tenant, *job, digest, platform)?;
             }
-            provenance::insert(
+            provenance::insert_with_actor(
                 tx,
                 &provenance::Provenance {
                     tenant,
@@ -194,6 +195,7 @@ fn create_run(
                 },
                 run,
                 now,
+                actor,
             )?;
             checks::record_run(tx, tenant, run, now)?;
             Ok((run, jobs))
@@ -816,7 +818,7 @@ impl Fixture {
             STUCK,
             "5555555555555555555555555555555555555555",
             "refs/heads/main",
-            "push",
+            "manual",
             None,
         );
 

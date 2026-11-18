@@ -8,6 +8,7 @@ use crate::{
     Error, Result,
     codec::{decode_failure, decode_state},
     dispatch::LogState,
+    provenance::RunActor,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +34,7 @@ pub struct RunStatus {
     pub cancel_requested: bool,
     pub state: RunState,
     pub trigger: Option<String>,
+    pub actor: Option<RunActor>,
     pub jobs: Vec<JobStatus>,
 }
 
@@ -150,6 +152,10 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
         });
     }
     let state = aggregate(jobs.iter().map(|j| j.state));
+    let (trigger, actor) = match crate::provenance::origin(conn, tenant, run)? {
+        Some(origin) => (Some(origin.trigger), origin.actor),
+        None => (None, None),
+    };
     Ok(RunStatus {
         id: run,
         tenant,
@@ -158,7 +164,8 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
         created: UnixMillis(created),
         cancel_requested: cancel != 0,
         state,
-        trigger: crate::provenance::trigger_of(conn, run)?,
+        trigger,
+        actor,
         jobs,
     })
 }
