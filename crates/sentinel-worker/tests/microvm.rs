@@ -88,6 +88,16 @@ fn start(
     workspace: &std::path::Path,
     mounts: &[Mount],
 ) -> (AttemptId, Vm) {
+    start_with(root, setup, workspace, mounts, limits())
+}
+
+fn start_with(
+    root: &std::path::Path,
+    setup: &Setup,
+    workspace: &std::path::Path,
+    mounts: &[Mount],
+    limits: Limits,
+) -> (AttemptId, Vm) {
     let attempt = AttemptId::new();
     let vm = Vm::start(
         root,
@@ -95,7 +105,7 @@ fn start(
         WorkerId::new(),
         attempt,
         IMAGE,
-        limits(),
+        limits,
         workspace,
         mounts,
         &Store::Shared,
@@ -2073,6 +2083,53 @@ fn a_guest_cannot_write_past_its_declared_scratch_disk() {
                 "dd if=/dev/zero of=/workspace/big bs=1M count=1600 2>&1",
                 120,
             ),
+            &[],
+        )
+        .unwrap();
+    assert_ne!(exit.code, Some(0), "{}", text(&exit.stdout));
+    assert!(
+        text(&exit.stdout).contains("No space left on device"),
+        "{}",
+        text(&exit.stdout)
+    );
+    let _ = vm.destroy();
+}
+
+#[test]
+fn a_guest_tmp_is_sized_to_the_declared_disk_and_cannot_pass_it() {
+    let Some(setup) = setup() else { return };
+    pull();
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    // 2 GiB of disk and 3 GiB of memory: the old fixed 1 GiB /tmp would be half the disk the job declared. The
+    // tmpfs follows the scratch disk (a little less after ext4's own metadata) and cannot pass it, so the 2.5 GiB
+    // write below is refused by /tmp itself, before the memory limit is reached.
+    let (_, vm) = start_with(
+        root.path(),
+        &setup,
+        workspace.path(),
+        &[],
+        Limits {
+            memory_bytes: 3 << 30,
+            disk_bytes: 2 << 30,
+            ..limits()
+        },
+    );
+    let size = vm
+        .exec(
+            &sh("df -B1 /tmp | tail -n 1 | tr -s ' ' | cut -d' ' -f2", 60),
+            &[],
+        )
+        .unwrap();
+    let size: u64 = text(&size.stdout).parse().unwrap();
+    assert!(size > 3 << 29, "a fixed 1 GiB /tmp is back: {size}");
+    assert!(
+        size <= 2 << 30,
+        "/tmp is larger than the declared disk: {size}"
+    );
+    let exit = vm
+        .exec(
+            &sh("dd if=/dev/zero of=/tmp/big bs=1M count=2560 2>&1", 300),
             &[],
         )
         .unwrap();

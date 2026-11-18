@@ -144,6 +144,50 @@ fn set_memory_limit(bytes: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// The least a job's `/tmp` holds, whatever the scratch disk offers: a smaller one breaks ordinary tools (package
+/// managers, compilers, `mktemp`-heavy test suites). The worker never builds a scratch disk under 1 GiB, so
+/// only a guest whose disk reads smaller than it was declared meets the floor.
+const MIN_TMP_BYTES: u64 = 64 << 20;
+
+/// The size of the guest's `/tmp` tmpfs: the capacity of its scratch disk (the job's declared `resources.disk`,
+/// at least 1 GiB, less what ext4 keeps for itself), so `/tmp` is bounded by the same budget as the workspace
+/// instead of by a fixed figure; raised to [`MIN_TMP_BYTES`] when the disk is smaller than that; and never
+/// more than the guest's memory, which is what the tmpfs stores its bytes in: a size past it is a promise the
+/// guest cannot keep, and a job that believes it is OOM-killed instead of getting `ENOSPC`. The memory limit
+/// of the job's cgroup still applies to those bytes.
+fn tmp_size(scratch_bytes: u64, memory_bytes: u64) -> u64 {
+    scratch_bytes.max(MIN_TMP_BYTES).min(memory_bytes)
+}
+
+/// The size of the file system mounted at `path`, as a step could fill it.
+fn scratch_capacity(path: &str) -> io::Result<u64> {
+    let path = cstr(path)?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `path` is NUL-terminated and `stat` is a writable `statvfs`.
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `statvfs` returned 0, so it filled the structure.
+    let stat = unsafe { stat.assume_init() };
+    Ok(stat.f_blocks.saturating_mul(stat.f_frsize))
+}
+
+/// The memory the guest has.
+fn memory_capacity() -> io::Result<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::sysinfo>::zeroed();
+    // SAFETY: `info` is a writable `sysinfo`.
+    if unsafe { libc::sysinfo(info.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `sysinfo` returned 0, so it filled the structure.
+    let info = unsafe { info.assume_init() };
+    match info.totalram.saturating_mul(u64::from(info.mem_unit)) {
+        // A tmpfs of size 0 has no limit at all.
+        0 => Err(io::Error::other("the guest reports no memory")),
+        bytes => Ok(bytes),
+    }
+}
+
 fn boot() -> io::Result<()> {
     mount("proc", "/proc", "proc", 0, "")?;
     mount("sysfs", "/sys", "sysfs", 0, "")?;
@@ -177,7 +221,14 @@ fn boot() -> io::Result<()> {
         nodev,
         "mode=1777,size=64m",
     )?;
-    mount("tmpfs", "/job/tmp", "tmpfs", nodev, "mode=1777,size=1g")?;
+    let tmp = tmp_size(scratch_capacity("/scratch")?, memory_capacity()?);
+    mount(
+        "tmpfs",
+        "/job/tmp",
+        "tmpfs",
+        nodev,
+        &format!("mode=1777,size={tmp}"),
+    )?;
     // What a step is given as secrets lives in memory only, whatever the image does with /run.
     for dir in agent::SECRET_MOUNTS {
         mount(
@@ -1018,6 +1069,37 @@ fn reap(children: &Arc<Mutex<Children>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn tmp_follows_the_scratch_disk_not_a_fixed_figure() {
+        assert_eq!(tmp_size(3 * GIB, 8 * GIB), 3 * GIB);
+        assert_eq!(tmp_size(GIB - 30 * MIB, 8 * GIB), GIB - 30 * MIB);
+        assert_eq!(tmp_size(200 * GIB, 400 * GIB), 200 * GIB);
+    }
+
+    #[test]
+    fn tmp_is_never_more_than_the_guest_has_in_memory() {
+        assert_eq!(tmp_size(10 * GIB, 2 * GIB), 2 * GIB);
+        assert_eq!(tmp_size(GIB, 576 * MIB), 576 * MIB);
+    }
+
+    #[test]
+    fn a_disk_below_the_floor_gets_the_floor_unless_memory_is_smaller() {
+        assert_eq!(tmp_size(0, GIB), MIN_TMP_BYTES);
+        assert_eq!(tmp_size(MIN_TMP_BYTES - 1, GIB), MIN_TMP_BYTES);
+        assert_eq!(tmp_size(MIN_TMP_BYTES, GIB), MIN_TMP_BYTES);
+        assert_eq!(tmp_size(0, 32 * MIB), 32 * MIB);
+    }
+
+    #[test]
+    fn this_machines_scratch_and_memory_can_be_measured() {
+        assert!(scratch_capacity("/").unwrap() > 0);
+        assert!(memory_capacity().unwrap() > 0);
+        assert!(scratch_capacity("/does/not/exist").is_err());
+    }
 
     #[test]
     fn the_network_comes_from_the_command_line_or_is_absent() {
