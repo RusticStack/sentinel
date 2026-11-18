@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt, fs,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -1543,6 +1544,11 @@ impl Receiving {
 pub struct StoreSweep {
     pub entries: u64,
     pub bytes: u64,
+    /// What each repository's entries keep after the pass, for the tenant accounting; repositories whose directory is
+    /// not a repository id are left out. Only a `complete` walk makes these totals.
+    pub repos: Vec<(RepoId, u64)>,
+    /// The walk reached every directory of the store: false when it stopped at `max_entries` or could not read a directory.
+    pub complete: bool,
     pub bundles_removed: u64,
     pub parts_removed: u64,
     pub entries_evicted: u64,
@@ -1551,11 +1557,15 @@ pub struct StoreSweep {
 }
 
 pub fn sweep_store(root: &Path, budget_bytes: u64, max_entries: u64, now_ms: i64) -> StoreSweep {
-    let mut out = StoreSweep::default();
+    let mut out = StoreSweep {
+        complete: true,
+        ..StoreSweep::default()
+    };
     let mut kept: Vec<(i64, u64, PathBuf)> = Vec::new();
     let mut stack = vec![(root.to_path_buf(), 0u32)];
     while let Some((dir, depth)) = stack.pop() {
         if out.entries >= max_entries {
+            out.complete = false;
             break;
         }
         if depth == 7 {
@@ -1568,13 +1578,33 @@ pub fn sweep_store(root: &Path, budget_bytes: u64, max_entries: u64, now_ms: i64
             }
             continue;
         }
-        let Ok(children) = fs::read_dir(&dir) else {
-            continue;
+        let children = match fs::read_dir(&dir) {
+            Ok(children) => children,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                out.complete = false;
+                continue;
+            }
         };
         for child in children.flatten() {
             if child.file_type().is_ok_and(|t| t.is_dir()) {
                 stack.push((child.path(), depth + 1));
             }
+        }
+    }
+    let repo_of = |entry: &Path| {
+        entry
+            .strip_prefix(root)
+            .ok()
+            .and_then(|rel| rel.components().next())
+            .and_then(|first| first.as_os_str().to_str())
+            .and_then(|name| name.parse::<RepoId>().ok())
+    };
+    let mut per_repo: HashMap<RepoId, u64> = HashMap::new();
+    for (_, bytes, entry) in &kept {
+        if let Some(repo) = repo_of(entry) {
+            let held = per_repo.entry(repo).or_insert(0);
+            *held = held.saturating_add(*bytes);
         }
     }
     let mut total = kept
@@ -1596,12 +1626,16 @@ pub fn sweep_store(root: &Path, budget_bytes: u64, max_entries: u64, now_ms: i64
                     out.entries_evicted += 1;
                     out.bytes_freed = out.bytes_freed.saturating_add(bytes);
                     total = total.saturating_sub(bytes);
+                    if let Some(held) = repo_of(&entry).and_then(|repo| per_repo.get_mut(&repo)) {
+                        *held = held.saturating_sub(bytes);
+                    }
                 }
                 Err(_) => out.errors += 1,
             }
         }
     }
     out.bytes = total;
+    out.repos = per_repo.into_iter().collect();
     out
 }
 

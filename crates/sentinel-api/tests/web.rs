@@ -1529,3 +1529,79 @@ fn a_backup_that_recorded_lost_objects_is_reported_as_incomplete() {
     assert_eq!(lost_gauge(&none), None);
     assert!(!readiness(&none).contains(&"backup_incomplete".to_owned()));
 }
+
+#[test]
+fn the_maintenance_pass_snapshots_each_tenant_once_a_day_and_the_class_metrics_name_no_tenant() {
+    let f = Fixture::new(1);
+    let snapshots = |tenant| {
+        f.store
+            .read(|c| sentinel_store::classes::snapshots(c, tenant, 10))
+            .unwrap()
+    };
+    let beta = f.beta;
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT OR IGNORE INTO tenant_usage(tenant_id) VALUES (?1)",
+                [beta.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    f.controller
+        .set_storage_policy(sentinel_link::controller::StoragePolicy { interval_ms: 20 });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while snapshots(f.acme).is_empty() || snapshots(f.beta).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pass never took the day's snapshot"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    // Many more passes run before the date changes; the day is not taken again.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    for tenant in [f.acme, f.beta] {
+        let held = snapshots(tenant);
+        assert_eq!(held.len(), 1, "one row a day: {held:?}");
+        assert_eq!(
+            held[0].day,
+            sentinel_store::classes::day_of(sentinel_core::UnixMillis(held[0].taken_ms))
+        );
+    }
+
+    let (_, _, metrics) = call(
+        &f.base,
+        "GET",
+        "/metrics",
+        None,
+        &[("authorization", &f.auth)],
+    );
+    let metrics = metrics.as_str().unwrap();
+    for class in [
+        "artifacts",
+        "uploads",
+        "logs",
+        "remote_cache",
+        "actions_cache",
+        "worker_cache",
+    ] {
+        assert!(
+            metrics.contains(&format!(
+                "sentinel_storage_class_bytes{{class=\"{class}\"}} "
+            )),
+            "{class} is missing: {metrics}"
+        );
+    }
+    let family: Vec<&str> = metrics
+        .lines()
+        .filter(|l| l.starts_with("sentinel_storage_class_bytes"))
+        .collect();
+    assert_eq!(family.len(), 6, "a fixed number of series: {family:?}");
+    assert!(
+        family
+            .iter()
+            .all(|l| !l.contains("tenant") && !l.contains("acme") && !l.contains("beta")),
+        "no tenant is named: {family:?}"
+    );
+}

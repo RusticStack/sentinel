@@ -391,6 +391,20 @@ pub(crate) fn render(state: &State) -> String {
             stored,
         );
     }
+    if let Ok(classes) = state.store.read(sentinel_store::classes::deployment) {
+        out.family(
+            "sentinel_storage_class_bytes",
+            "gauge",
+            "Bytes every tenant stores, by class: artifacts, uploads and logs count toward quotas; remote_cache and worker_cache are reported; actions_cache is zero until runner mode.",
+        );
+        for (class, bytes) in classes.by_name() {
+            out.value(
+                "sentinel_storage_class_bytes",
+                &format!("class=\"{class}\""),
+                bytes,
+            );
+        }
+    }
     if let Some(r) = state.objects.replication() {
         out.one(
             "sentinel_s3_healthy",

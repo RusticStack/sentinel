@@ -1179,3 +1179,35 @@ fn the_store_refuses_a_bundle_past_its_budget_cap_and_sweeps_an_oversize_one_fir
     assert!(entry_of(&store, &small_b).exists());
     assert_eq!(swept.bytes, 6000);
 }
+
+#[test]
+fn a_complete_sweep_reports_what_each_repository_keeps_after_eviction() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("remote-cache");
+    let (a, b, big) = (
+        test_scope(Trust::Protected),
+        test_scope(Trust::Protected),
+        test_scope(Trust::Protected),
+    );
+    receive(&store, &a, &[1u8; 3000]);
+    receive(&store, &b, &[2u8; 2000]);
+    receive(&store, &big, &[3u8; 9000]);
+    let swept = remote::sweep_store(&store, 6000, 1000, UnixMillis::now().0);
+    assert!(swept.complete, "{swept:?}");
+    assert_eq!(swept.entries_evicted, 1, "{swept:?}");
+    let mut kept = swept.repos.clone();
+    kept.sort_unstable_by_key(|(repo, _)| *repo.as_bytes());
+    let mut expected = vec![(a.repo, 3000), (b.repo, 2000), (big.repo, 0)];
+    expected.sort_unstable_by_key(|(repo, _)| *repo.as_bytes());
+    assert_eq!(kept, expected, "the evicted bundle is not reported");
+    assert_eq!(
+        kept.iter().map(|(_, bytes)| bytes).sum::<u64>(),
+        swept.bytes
+    );
+
+    let partial = remote::sweep_store(&store, 6000, 1, UnixMillis::now().0);
+    assert!(
+        !partial.complete,
+        "a walk that stopped early must not pass for the whole store: {partial:?}"
+    );
+}
