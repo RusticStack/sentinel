@@ -456,8 +456,11 @@ impl Executor for Recorder {
     fn log_refused(&self, _: AttemptId) {}
 }
 
+/// Waits for a state the fleet reaches on its own. The deadline is a fail-fast bound against a hang, not a latency
+/// assertion: a host running the whole suite in parallel can starve these session threads for tens of seconds without
+/// anything being wrong, so it is generous enough that saturation never reads as a failure.
 fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while !predicate() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         thread::sleep(Duration::from_millis(10));
