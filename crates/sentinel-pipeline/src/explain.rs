@@ -91,12 +91,15 @@ const fn phase_name(p: Phase) -> &'static str {
 }
 
 fn trigger_kinds(on: &Triggers) -> Vec<&'static str> {
-    let mut kinds = Vec::with_capacity(4);
+    let mut kinds = Vec::with_capacity(5);
     if on.push.is_some() {
         kinds.push("push");
     }
     if on.pull_request.is_some() {
         kinds.push("pull_request");
+    }
+    if on.merge_group.is_some() {
+        kinds.push("merge_group");
     }
     if on.tag.is_some() {
         kinds.push("tag");
@@ -108,10 +111,11 @@ fn trigger_kinds(on: &Triggers) -> Vec<&'static str> {
 }
 
 fn trigger_filters(on: &Triggers) -> Vec<TriggerFilterExplanation> {
-    let mut out = Vec::with_capacity(3);
+    let mut out = Vec::with_capacity(4);
     for (kind, filter) in [
         ("push", &on.push),
         ("pull_request", &on.pull_request),
+        ("merge_group", &on.merge_group),
         ("tag", &on.tag),
     ] {
         if let Some(filter) = filter {

@@ -14,13 +14,37 @@ not GitHub is reachable.
 
 | Check | Name | When |
 |---|---|---|
-| Aggregate | `sentinel / ci` | Every event-driven run of a forge-associated repository (push, tag, pull request) |
+| Aggregate | `sentinel / ci` | Every event-driven run of a forge-associated repository (push, tag, pull request, merge group) |
 | Per job | `sentinel / <job>` | One per compiled job, from run creation to its terminal outcome |
 | Refused event | `sentinel / ci` | An event that was understood but produced no run |
 
 Names are stable on purpose: a repository protects `sentinel / ci` as a
 required check, and it must mean the same thing on every run. Per-job checks
 are namespaced so a required aggregate is never satisfied by a partial run.
+
+### Check identity for merge groups
+
+A merge queue asks for its required checks under its own event, so a merge-group
+run publishes the **same** names a pull request run does — `sentinel / ci` and
+`sentinel / <job>` — on the **group's head commit** (the queue branch's head,
+which is the commit GitHub gates the merge on). Nothing distinguishes the name:
+a repository that protects `sentinel / ci` protects the same check on a pull
+request and on a queued group, which is what makes the queue work. What tells the
+two apart is identity, not naming: the check run's `external_id` is
+`sentinel:<run id>:ci` / `sentinel:<run id>:<job id>` and its `details_url` names
+that run, exactly as for any other event-driven run.
+
+So a repository that also requires the check on its merge queue needs the
+pipeline to declare `on.merge_group`; without it the group settles
+`ignored:no_trigger` and publishes a completed `sentinel / ci` with the neutral
+conclusion ("not executed"), which tells the queue the check will not come
+rather than leaving it pending.
+
+A group's refused or destroyed deliveries publish at most one extra completed
+check of their own (`sentinel:dlv:<delivery id>`), with the neutral conclusion,
+so a queue waiting on a group that will not run is answered instead of timing
+out; the group's own run keeps its own publications and a cancel is a state
+change on them, not a new check.
 
 A **manual** run publishes nothing at all. Its inline pipeline is an
 operator's diagnostic, and a manual focused run must never satisfy the full
@@ -30,12 +54,13 @@ A **settled delivery** still owes an answer when the event was a real trigger
 but nothing could run: `failed:no_pipeline`, `failed:pipeline_invalid`,
 `failed:image_unpinned`, `failed:source_unavailable` and the other permanent
 outcomes publish a **completed** `sentinel / ci` so a required check does not
-stay pending forever. `ignored:no_trigger`, `ignored:fork_pr` and
-`ignored:merge_unavailable` publish a completed check with the **neutral**
-conclusion ("not executed", with the reason). `ignored:duplicate`,
-`ignored:superseded` and `ignored:ref_deleted` publish nothing: the transition
-already has a check (or no commit exists), and a second one would impersonate
-it.
+stay pending forever. `ignored:no_trigger`, `ignored:fork_pr`,
+`ignored:merge_unavailable`, `ignored:merge_group_merged`,
+`ignored:merge_group_destroyed` and `ignored:merge_group_repository` publish a
+completed check with the **neutral** conclusion ("not executed", with the
+reason). `ignored:duplicate`, `ignored:superseded`, `ignored:ref_deleted` and
+`ignored:merge_group_duplicate` publish nothing: the transition already has a
+check (or no commit exists), and a second one would impersonate it.
 
 Tag pushes publish from the peeled commit once a run exists; a tag *resolution
 failure* publishes nothing, because a tag object is not a commit a check can
@@ -99,7 +124,9 @@ rebuilt without touching the controller ([web interface](web-ui.md)):
 
 `cargo test -p sentinel-checks` covers the URL built for each kind (aggregate,
 job, refused delivery, unrecognised scope, no or empty base) and the lane's
-published bodies.
+published bodies. `crates/sentinel-intake/tests/dispatch.rs` (Linux) covers a
+merge group's published names at the group's head commit and a destroyed group
+whose cancellation is a state change on the run's own checks.
 
 Each check row has a stable id `sentinel:<run id>:<aggregate|job id>` (or
 `sentinel:dlv:<delivery id>`), and every create sends it suffixed with the

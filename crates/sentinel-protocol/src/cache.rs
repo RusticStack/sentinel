@@ -69,7 +69,9 @@ impl Trust {
 
     pub fn derive(event: &str, verified_intake: bool, protected_ref: bool) -> Trust {
         match event {
-            "pull_request" => Trust::PullRequest,
+            // A merge group runs the queue's merge of the pull requests, so it is
+            // as unmerged as a pull request's tested merge and no more trusted.
+            "pull_request" | "merge_group" => Trust::PullRequest,
             "push" | "tag" if verified_intake && protected_ref => Trust::Protected,
             _ => Trust::Unprotected,
         }

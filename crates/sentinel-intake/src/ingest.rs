@@ -79,6 +79,7 @@ pub fn generic(
             new_sha: &update.new_sha,
         },
         None,
+        None,
         now,
     )
 }
@@ -115,6 +116,7 @@ pub fn github(
         | "team" => return control(store, event, delivery_id, body, now),
         "push" => {}
         "pull_request" => return pull_request(store, delivery_id, body, now),
+        "merge_group" => return merge_group(store, delivery_id, body, now),
         _ => return Ok(Github::Ignored("unsupported_event")),
     }
     let push =
@@ -147,6 +149,7 @@ pub fn github(
             old_sha: &push.before,
             new_sha: &push.after,
         },
+        None,
         None,
         now,
     )
@@ -270,6 +273,76 @@ fn pull_request(
             new_sha: pr.merge_sha.as_deref().unwrap_or(&pr.head_sha),
         },
         Some(terms),
+        None,
+        now,
+    )
+    .map(Github::Ingested)
+}
+
+/// A merge-queue group. Its checks are the base branch's required checks, so the
+/// delivery is attributed to the base branch (ref name, policy and check
+/// identity) while the queue branch and head commit are kept as its own terms;
+/// `destroyed` is accepted too, because that action is what cancels the run.
+fn merge_group(
+    store: &Store,
+    delivery_id: &str,
+    body: &[u8],
+    now: UnixMillis,
+) -> Result<Github, Error> {
+    let group = sentinel_github::webhook::parse_merge_group(body)
+        .map_err(|_| Error::InvalidRequest("payload"))?;
+    if !matches!(group.action.as_str(), "checks_requested" | "destroyed") {
+        return Ok(Github::Ignored("merge_group_action"));
+    }
+    if !valid_sha(&group.head_sha) || !valid_sha(&group.base_sha) {
+        return Err(Error::InvalidRequest("payload object id"));
+    }
+    if !valid_ref(&group.head_ref) || !group.head_ref.starts_with("refs/heads/") {
+        return Err(Error::InvalidRequest("payload ref"));
+    }
+    // GitHub states the base branch as a full ref name here, where a pull request
+    // states a short one; either form names the same branch.
+    let base = group
+        .base_ref
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&group.base_ref);
+    let base_ref = format!("refs/heads/{base}");
+    if !valid_ref(&base_ref) || base.is_empty() || base.contains("refs/") {
+        return Err(Error::InvalidRequest("payload ref"));
+    }
+    let repository =
+        i64::try_from(group.repository).map_err(|_| Error::InvalidRequest("payload"))?;
+    let installation = group.installation.to_string();
+    let target = match store.read(|c| intake::github_target(c, &installation, repository)) {
+        Ok(target) => target,
+        Err(sentinel_store::Error::NotFound) => {
+            return Ok(Github::Ignored("unbound_repository"));
+        }
+        Err(e) => return Err(Error::from(e)),
+    };
+    let terms = intake::MergeTerms {
+        action: &group.action,
+        head_ref: &group.head_ref,
+        head_sha: &group.head_sha,
+        base_ref: base,
+        base_sha: &group.base_sha,
+        head_repo: group.repository,
+        reason: group.reason.as_deref(),
+    };
+    accept(
+        store,
+        target.1,
+        intake::NewDelivery {
+            authentication: intake::Authentication::SignedWebhook,
+            provider: "github",
+            external_id: delivery_id,
+            event: "merge_group",
+            ref_name: &base_ref,
+            old_sha: &group.base_sha,
+            new_sha: &group.head_sha,
+        },
+        None,
+        Some(terms),
         now,
     )
     .map(Github::Ingested)
@@ -280,6 +353,7 @@ fn accept(
     repo: RepoId,
     delivery: intake::NewDelivery<'_>,
     pr: Option<intake::PrTerms<'_>>,
+    merge: Option<intake::MergeTerms<'_>>,
     now: UnixMillis,
 ) -> Result<Ingested, Error> {
     let delivery = OwnedDelivery {
@@ -291,6 +365,15 @@ fn accept(
         old_sha: delivery.old_sha.to_owned(),
         new_sha: delivery.new_sha.to_owned(),
     };
+    let merge = merge.map(|merge| OwnedMerge {
+        action: merge.action.to_owned(),
+        head_ref: merge.head_ref.to_owned(),
+        head_sha: merge.head_sha.to_owned(),
+        base_ref: merge.base_ref.to_owned(),
+        base_sha: merge.base_sha.to_owned(),
+        head_repo: merge.head_repo,
+        reason: merge.reason.map(str::to_owned),
+    });
     let pr = pr.map(|pr| OwnedPr {
         number: pr.number,
         action: pr.action.to_owned(),
@@ -303,6 +386,15 @@ fn accept(
         merge_sha: pr.merge_sha.map(str::to_owned),
     });
     let accepted = store.writer().write(move |tx| {
+        let merge_terms = merge.as_ref().map(|merge| intake::MergeTerms {
+            action: &merge.action,
+            head_ref: &merge.head_ref,
+            head_sha: &merge.head_sha,
+            base_ref: &merge.base_ref,
+            base_sha: &merge.base_sha,
+            head_repo: merge.head_repo,
+            reason: merge.reason.as_deref(),
+        });
         let terms = pr.as_ref().map(|pr| intake::PrTerms {
             number: pr.number,
             action: &pr.action,
@@ -314,19 +406,21 @@ fn accept(
             base_sha: &pr.base_sha,
             merge_sha: pr.merge_sha.as_deref(),
         });
-        intake::accept(
+        let delivery = intake::NewDelivery {
+            authentication: delivery.authentication,
+            provider: &delivery.provider,
+            external_id: &delivery.external_id,
+            event: &delivery.event,
+            ref_name: &delivery.ref_name,
+            old_sha: &delivery.old_sha,
+            new_sha: &delivery.new_sha,
+        };
+        intake::accept_with_terms(
             tx,
             repo,
-            &intake::NewDelivery {
-                authentication: delivery.authentication,
-                provider: &delivery.provider,
-                external_id: &delivery.external_id,
-                event: &delivery.event,
-                ref_name: &delivery.ref_name,
-                old_sha: &delivery.old_sha,
-                new_sha: &delivery.new_sha,
-            },
+            &delivery,
             terms.as_ref(),
+            merge_terms.as_ref(),
             now,
         )
     })?;
@@ -346,6 +440,16 @@ struct OwnedPr {
     base_ref: String,
     base_sha: String,
     merge_sha: Option<String>,
+}
+
+struct OwnedMerge {
+    action: String,
+    head_ref: String,
+    head_sha: String,
+    base_ref: String,
+    base_sha: String,
+    head_repo: u64,
+    reason: Option<String>,
 }
 
 struct OwnedDelivery {

@@ -228,6 +228,7 @@ fn fleet() -> Fleet {
                             pipeline_path: None,
                             pipeline_digest: [0u8; 16],
                             pr_number: Some(1),
+                            group_ref: None,
                         },
                         run,
                         NOW,

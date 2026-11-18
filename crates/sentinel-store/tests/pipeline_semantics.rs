@@ -76,6 +76,7 @@ fn start(f: &Fx, spec: &RunSpec, ref_name: Option<&str>) -> (RunId, Vec<JobId>) 
                         pipeline_path: None,
                         pipeline_digest: [0; 16],
                         pr_number: None,
+                        group_ref: None,
                     },
                     run,
                     UnixMillis(10),

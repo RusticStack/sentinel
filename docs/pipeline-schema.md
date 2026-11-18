@@ -21,12 +21,13 @@ Anchors, aliases, tags, non-string keys and duplicate keys are errors with line 
 
 ```yaml
 schema: 1                       # required, exactly 1
-on: [push, pull_request, tag, manual]   # 1–4 distinct triggers
+on: [push, pull_request, merge_group, tag, manual]   # 1–5 distinct triggers
 # or the filtered form:
 # on:
 #   push: {branches: [main, "release/*"]}
 #   tag: {tags: ["v*"]}
 #   pull_request: {branches: [main]}
+#   merge_group: {branches: [main]}
 #   manual: true
 concurrency:                    # optional
   group: "${{ repo.id }}:${{ event.key }}"
@@ -56,6 +57,16 @@ jobs:                           # 1–64, names [a-z0-9][a-z0-9_-]{0,63}
 ```
 
 Unknown keys anywhere are rejected with their path, for example `jobs.test: unknown key `imgae``. Durations are `<int>s|m|h` sums such as `1h30m`. Sizes use binary units only, `MiB` or `GiB`. CPU is whole cores or a quoted decimal such as `"0.5"`, stored as millicores: plain digits only (no sign), at most three decimals, so `"+4"`, `"0.+5"` and `"0.5555"` are errors rather than being read or truncated. Paths are normalised relative paths with no `..`, `//`, leading `./` or trailing `/`; cache paths may also be absolute inside the container but never `/`. `concurrency.group` and cache `key` are templates; job and step `if` are expressions (see below).
+
+**`on.merge_group`.** A merge-queue group: `checks_requested` when GitHub builds a
+group out of queued pull requests and asks for its checks, and `destroyed` when it
+discards one. Its filter matches the **base branch** exactly as `on.pull_request`
+does, and the run is the commit GitHub merged into its queue branch, which the
+pipeline reads at that object id ([sources](sources.md#merge-groups)). A
+repository that requires `sentinel / ci` on its merge queue needs a pipeline with
+this trigger as well as `on.pull_request`, because GitHub asks for the checks
+under the `merge_group` event, not under the pull request's. `destroyed` never
+runs anything: it cancels the run the group produced ([intake](intake.md#merge-groups)).
 
 **`runs_on.os` and `runs_on.isolation`.** Unstated, a job is a Linux job run on whatever executor its worker uses by default (rootless Podman, or a microVM on a KVM host once that executor is set up; [plan 16.8](../plan.md#168-microvm-execution-on-kvm-hosts)), and any Linux worker may take it, including one that predates these fields. Stated, the job goes only to a worker that states it runs that OS and isolation; otherwise it waits with the reason `runtime_missing` ([API](api.md)). Linux jobs take `container` or `microvm`; Windows jobs take `microvm` (a Windows guest) or `native`, so `os: linux` with `native` and `os: windows` with `container` are errors. A spec with either field is stored as run spec format 7 ([compatibility](compatibility.md)).
 
@@ -145,12 +156,12 @@ The event paths are real values recorded as the run's immutable provenance
 
 | Path | Value |
 |---|---|
-| `event.name` | `push`, `tag`, `pull_request` or `manual` |
-| `event.sha` | the checked-out revision (the pushed commit, the peeled tag commit, the tested merge) |
-| `event.ref` | the pushed ref, the tag ref, or `refs/pull/<n>/merge` for a pull request |
-| `event.base_ref` | the pull request's base branch (`main`); `null` for anything else |
-| `event.pr_number` | the pull request number; `null` for anything else |
-| `event.key` | a short, stable key: the branch or tag name, `pr-<n>`, or `manual` |
+| `event.name` | `push`, `tag`, `pull_request`, `merge_group` or `manual` |
+| `event.sha` | the checked-out revision (the pushed commit, the peeled tag commit, the tested merge, or the merge group's head commit) |
+| `event.ref` | the pushed ref, the tag ref, `refs/pull/<n>/merge` for a pull request, or the queue branch for a merge group |
+| `event.base_ref` | the pull request's or merge group's base branch (`main`); `null` for anything else |
+| `event.pr_number` | the pull request number; `null` for anything else, including a merge group, which may hold several |
+| `event.key` | a short, stable key: the branch or tag name, `pr-<n>`, the queue branch's path for a merge group, or `manual` |
 
 Evaluation is phased. Each path and function has a minimum phase, and an expression evaluated earlier yields an `Unresolved` error rather than a default: `event`, `repo`, `run`, `job` and `cancelled()` at **dispatch**; `needs.*`, `success()`, `failure()`, `always()` at **schedule** (once every dependency is terminal); `hash_files` at **worker** (after the pinned checkout). The compiler enforces placement: `concurrency.group` may only use dispatch context; a job `if` may not use `hash_files` and may only name jobs in its own `needs`; step `if` and cache keys may use everything but also only name jobs in `needs`. A condition must be a boolean: the compiler types every `if` and rejects, with the path of the key, a comparison between types that can never match (`event.ref == 7`, `event.pr_number == 'x'`), a boolean operator or function over a value that is not always a boolean (`!event.ref`, `event.base_ref || true`), and a result that is not a boolean (`if: event.ref`). `null` compares with anything. A condition that compiled therefore cannot fail with a type error when it is evaluated. `success()` and `failure()` summarise dependency outcomes (`failure()` is true when any dependency did not succeed, `success()` when all passed or were skipped by their own condition); `always()` is true unless the run is cancelled.
 

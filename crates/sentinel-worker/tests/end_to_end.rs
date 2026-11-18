@@ -462,6 +462,7 @@ jobs:
                     pipeline_path: Some(".sentinel.yml".into()),
                     pipeline_digest: [0; 16],
                     pr_number: None,
+                    group_ref: None,
                 },
                 run,
                 UnixMillis::now(),

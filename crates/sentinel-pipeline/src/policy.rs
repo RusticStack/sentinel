@@ -8,6 +8,7 @@ pub const MAX_REF_PATTERN_BYTES: usize = 256;
 pub struct Triggers {
     pub push: Option<RefFilter>,
     pub pull_request: Option<RefFilter>,
+    pub merge_group: Option<RefFilter>,
     pub tag: Option<RefFilter>,
     pub manual: bool,
 }
@@ -30,7 +31,11 @@ impl RefFilter {
 
 impl Triggers {
     pub fn is_empty(&self) -> bool {
-        self.push.is_none() && self.pull_request.is_none() && self.tag.is_none() && !self.manual
+        self.push.is_none()
+            && self.pull_request.is_none()
+            && self.merge_group.is_none()
+            && self.tag.is_none()
+            && !self.manual
     }
 
     pub fn admits(&self, event: &Event<'_>) -> bool {
@@ -41,6 +46,12 @@ impl Triggers {
                 .is_some_and(|f| event.branch().is_some_and(|b| f.accepts_branch(b))),
             EventKind::PullRequest => self
                 .pull_request
+                .as_ref()
+                .is_some_and(|f| event.branch().is_some_and(|b| f.accepts_branch(b))),
+            // A merge group is matched by its base branch, the one whose required
+            // checks it is asked to satisfy, never by the queue's own branch name.
+            EventKind::MergeGroup => self
+                .merge_group
                 .as_ref()
                 .is_some_and(|f| event.branch().is_some_and(|b| f.accepts_branch(b))),
             EventKind::Tag => self
@@ -58,6 +69,7 @@ pub enum EventKind {
     PullRequest = 1,
     Tag = 2,
     Manual = 3,
+    MergeGroup = 4,
 }
 
 impl EventKind {
@@ -65,6 +77,7 @@ impl EventKind {
         match self {
             Self::Push => "push",
             Self::PullRequest => "pull_request",
+            Self::MergeGroup => "merge_group",
             Self::Tag => "tag",
             Self::Manual => "manual",
         }
@@ -74,6 +87,7 @@ impl EventKind {
         Some(match text {
             "push" => Self::Push,
             "pull_request" => Self::PullRequest,
+            "merge_group" => Self::MergeGroup,
             "tag" => Self::Tag,
             "manual" => Self::Manual,
             _ => return None,
@@ -81,7 +95,8 @@ impl EventKind {
     }
 }
 
-/// For pull requests this is the base branch, whose policy the change targets.
+/// For pull requests and merge groups this is the base branch, whose policy the
+/// change targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Event<'a> {
     pub kind: EventKind,
@@ -106,6 +121,13 @@ impl<'a> Event<'a> {
     pub const fn pull_request(base_ref: &'a str) -> Self {
         Self {
             kind: EventKind::PullRequest,
+            ref_name: base_ref,
+        }
+    }
+
+    pub const fn merge_group(base_ref: &'a str) -> Self {
+        Self {
+            kind: EventKind::MergeGroup,
             ref_name: base_ref,
         }
     }

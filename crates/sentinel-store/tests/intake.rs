@@ -156,6 +156,176 @@ fn count(f: &Fixture) -> i64 {
         .unwrap()
 }
 
+const QUEUE_A: &str = "refs/heads/gh-readonly-queue/main/pr-7-aaaaaaaa";
+const QUEUE_B: &str = "refs/heads/gh-readonly-queue/main/pr-8-bbbbbbbb";
+
+fn accept_merge(
+    f: &mut Fixture,
+    external_id: &str,
+    action: &str,
+    queue: &str,
+    head: &str,
+    base: &str,
+) -> Result<Accepted, Error> {
+    let tx = f.conn.transaction().unwrap();
+    let terms = intake::MergeTerms {
+        action,
+        head_ref: queue,
+        head_sha: head,
+        base_ref: "main",
+        base_sha: base,
+        head_repo: 91,
+        reason: (action == "destroyed").then_some("merged"),
+    };
+    let outcome = intake::accept_merge_group(
+        &tx,
+        f.repo,
+        &NewDelivery {
+            authentication: sentinel_store::intake::Authentication::SignedWebhook,
+            provider: "github",
+            external_id,
+            event: "merge_group",
+            ref_name: REF,
+            old_sha: base,
+            new_sha: head,
+        },
+        &terms,
+        NOW,
+    );
+    match outcome {
+        Ok(accepted) => {
+            tx.commit().unwrap();
+            Ok(accepted)
+        }
+        Err(error) => {
+            tx.rollback().unwrap();
+            Err(error)
+        }
+    }
+}
+
+#[test]
+fn merge_group_terms_are_bounded_immutable_and_follow_their_delivery() {
+    let mut f = fixture();
+    let accepted = accept_merge(&mut f, "mg-1", "checks_requested", QUEUE_A, SHA_A, SHA_B)
+        .unwrap()
+        .id();
+    let row = fetch(&f, accepted);
+    assert_eq!(row.event, "merge_group");
+    assert_eq!(row.provider, "github");
+    assert_eq!(row.ref_name.as_deref(), Some(REF));
+    assert_eq!(row.new_sha.as_deref(), Some(SHA_A));
+    let terms = intake::merge_for(&f.conn, accepted).unwrap().unwrap();
+    assert_eq!(terms.action, "checks_requested");
+    assert_eq!(terms.head_ref, QUEUE_A);
+    assert_eq!(terms.head_repo, 91);
+    assert_eq!(terms.reason, None);
+
+    // A redelivery of the same delivery ID is an acknowledgement, and the same ID
+    // with other terms is a conflict, exactly as for every other delivery.
+    assert_eq!(
+        accept_merge(&mut f, "mg-1", "checks_requested", QUEUE_A, SHA_A, SHA_B).unwrap(),
+        Accepted::Duplicate(accepted)
+    );
+    // The same delivery ID naming other commits is a conflict, as for any delivery.
+    assert!(matches!(
+        accept_merge(
+            &mut f,
+            "mg-1",
+            "checks_requested",
+            QUEUE_A,
+            SHA_A,
+            &"c".repeat(40)
+        ),
+        Err(Error::Conflict)
+    ));
+    // Terms are validated before anything is written.
+    for (action, queue, head) in [
+        ("", QUEUE_A, SHA_A),
+        ("checks_requested", "main", SHA_A),
+        ("checks_requested", QUEUE_A, "not a sha"),
+    ] {
+        assert!(
+            matches!(
+                accept_merge(&mut f, "mg-bad", action, queue, head, SHA_B),
+                Err(Error::InvalidInput(_))
+            ),
+            "{action} {queue} {head}"
+        );
+    }
+    assert_eq!(count(&f), 1);
+
+    // The terms are written once and leave with their delivery.
+    assert!(
+        f.conn
+            .execute(
+                "UPDATE merge_deliveries SET head_sha = ?1 WHERE delivery_id = ?2",
+                rusqlite::params![SHA_B, accepted.as_bytes()],
+            )
+            .is_err()
+    );
+    let tx = f.conn.transaction().unwrap();
+    tx.execute(
+        "DELETE FROM webhook_deliveries WHERE id = ?1",
+        [accepted.as_bytes()],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(
+        intake::merge_for(&f.conn, accepted).unwrap().is_none(),
+        "the terms left with the delivery"
+    );
+}
+
+#[test]
+fn a_groups_open_deliveries_see_each_other_as_duplicates_and_their_run() {
+    let mut f = fixture();
+    let first = accept_merge(&mut f, "mg-a", "checks_requested", QUEUE_A, SHA_A, SHA_B)
+        .unwrap()
+        .id();
+    let second = accept_merge(&mut f, "mg-b", "checks_requested", QUEUE_A, SHA_A, SHA_B)
+        .unwrap()
+        .id();
+    let other = accept_merge(&mut f, "mg-c", "checks_requested", QUEUE_B, SHA_A, SHA_B)
+        .unwrap()
+        .id();
+    let state = |f: &Fixture, id: DeliveryId| {
+        let row = fetch(f, id);
+        intake::merge_group_state(&f.conn, &row, QUEUE_A, SHA_B).unwrap()
+    };
+    // Two deliveries of one group accepted in the same millisecond are ordered by
+    // id, so exactly one stands for the group and the other is its duplicate,
+    // whichever reaches the lane first.
+    let (waiting, duplicate) = if state(&f, first).earlier_open {
+        (second, first)
+    } else {
+        (first, second)
+    };
+    assert!(!state(&f, waiting).earlier_open);
+    assert!(state(&f, duplicate).earlier_open);
+    assert_eq!(state(&f, first).run, None);
+    assert!(!state(&f, first).gone);
+    let other_row = fetch(&f, other);
+    let other_state =
+        intake::merge_group_state(&f.conn, &other_row, QUEUE_B, SHA_B).unwrap();
+    assert!(!other_state.earlier_open, "another group is another stream");
+
+    // A destroyed group with no run leaves the group gone, which settles a
+    // delivery of it that arrives afterwards.
+    let destroyed = accept_merge(&mut f, "mg-d", "destroyed", QUEUE_A, SHA_A, SHA_B)
+        .unwrap()
+        .id();
+    let row = fetch(&f, destroyed);
+    let tx = f.conn.unchecked_transaction().unwrap();
+    let reason = intake::destroy_merge_group(&tx, &row, QUEUE_A, SHA_B, NOW).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(reason, "merge_group_merged");
+    assert!(state(&f, waiting).gone);
+    assert_eq!(fetch(&f, waiting).state, State::Ignored);
+    assert_eq!(fetch(&f, duplicate).state, State::Ignored);
+    assert_eq!(fetch(&f, other).state, State::Pending, "nothing else closed");
+}
+
 #[test]
 fn acceptance_is_deduplicated_and_redelivery_is_an_acknowledgement() {
     let mut f = fixture();
@@ -679,6 +849,7 @@ fn dispatch_ready(
         pipeline_path: Some(".sentinel.yml".into()),
         pipeline_digest: run_spec.pipeline.digest.to_le_bytes(),
         pr_number: None,
+        group_ref: None,
     };
     let tx = f.conn.transaction().unwrap();
     intake::dispatch(&tx, &delivery, &run_spec, &images, &provenance, at).unwrap();
@@ -758,6 +929,7 @@ fn a_ready_delivery_dispatches_one_immutable_run_with_its_provenance() {
         pipeline_path: Some(".sentinel.yml".into()),
         pipeline_digest: run_spec.pipeline.digest.to_le_bytes(),
         pr_number: None,
+        group_ref: None,
     };
     let tx = f.conn.transaction().unwrap();
     let run = intake::dispatch(&tx, &delivery, &run_spec, &images, &provenance, NOW).unwrap();
@@ -917,6 +1089,7 @@ fn the_duplicate_and_reordered_policy_compares_within_one_stream() {
         pipeline_path: Some(".sentinel.yml".into()),
         pipeline_digest: run_spec.pipeline.digest.to_le_bytes(),
         pr_number: Some(7),
+        group_ref: None,
     };
     let tx = f.conn.transaction().unwrap();
     intake::dispatch(&tx, &delivery, &run_spec, &images, &provenance, NOW).unwrap();
@@ -1177,6 +1350,7 @@ fn the_controller_records_event_fact_provenance_in_the_transaction_that_creates_
         pipeline_path: Some(".sentinel.yml".into()),
         pipeline_digest: run_spec.pipeline.digest.to_le_bytes(),
         pr_number: None,
+        group_ref: None,
     };
     let count = |f: &Fixture| -> (i64, i64) {
         (

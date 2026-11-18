@@ -647,6 +647,7 @@ jobs:
                             pipeline_path: Some(".sentinel.yml".into()),
                             pipeline_digest: [0; 16],
                             pr_number: (trigger == "pull_request").then_some(7),
+                            group_ref: None,
                         },
                         run_id,
                         NOW,
