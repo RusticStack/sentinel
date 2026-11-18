@@ -286,7 +286,8 @@ fn a_404_on_a_delete_is_done_only_for_the_missing_key() {
     );
 }
 
-/// Accepts one request and drains its body at about 6 MB/s, then answers 200 with an ETag.
+/// Accepts one request and drains its body in bounded reads, slowly enough that a part larger than the base
+/// timeout takes longer than it, then answers 200 with an ETag.
 fn slow_sink() -> (u16, JoinHandle<u64>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -316,7 +317,7 @@ fn slow_sink() -> (u16, JoinHandle<u64>) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => seen += n as u64,
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(3));
         }
         let _ = stream.write_all(
             b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\netag: \"e1\"\r\nconnection: close\r\n\r\n",
@@ -328,9 +329,11 @@ fn slow_sink() -> (u16, JoinHandle<u64>) {
 
 #[test]
 fn a_part_slower_than_the_base_timeout_is_given_time_in_proportion_to_its_size() {
-    // 32 MiB at the 4 MiB/s floor is a budget of 8 s; the sink takes about 5 s, far beyond the 1 s base timeout.
-    // Kernel buffers hold part of the body, but not all of it, so the send itself is blocked for longer than 1 s.
-    let body = vec![7u8; 32 << 20];
+    // 64 MiB at the 4 MiB/s floor is a budget of 16 s; the sink reads in 64 KiB pieces with a 3 ms pause, so it
+    // takes about 3 s, far beyond the 1 s base timeout, and a loaded host has to slow it by five times over to
+    // reach the budget. Kernel buffers hold part of the body, but not all of it, so the send is blocked for
+    // longer than the base timeout.
+    let body = vec![7u8; 64 << 20];
     let (port, sink) = slow_sink();
     let client = client(port, Duration::from_secs(1));
 
@@ -340,7 +343,7 @@ fn a_part_slower_than_the_base_timeout_is_given_time_in_proportion_to_its_size()
         .expect("the budget scales with the part");
     assert_eq!(etag, "e1");
     assert!(
-        started.elapsed() > Duration::from_secs(2),
+        started.elapsed() > Duration::from_secs(1),
         "the transfer outlasted the base timeout, so the scaled budget is what let it finish"
     );
     assert_eq!(sink.join().unwrap(), body.len() as u64);
