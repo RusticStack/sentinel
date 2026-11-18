@@ -614,7 +614,12 @@ impl Client {
     }
 
     /// One ranged read. Returns the object's total length, this answer's length and its body.
-    fn get_range(&self, key: &str, first: u64, last: u64) -> Result<(u64, u64, impl Read + use<>)> {
+    pub fn get_range(
+        &self,
+        key: &str,
+        first: u64,
+        last: u64,
+    ) -> Result<(u64, u64, impl Read + use<>)> {
         let header = format!("bytes={first}-{last}");
         let response = Self::ok(self.send("GET", Some(key), &[], &[("range", &header)], &[])?)?;
         let len: u64 = Self::header(&response, "content-length")

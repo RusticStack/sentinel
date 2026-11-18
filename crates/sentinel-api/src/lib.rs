@@ -1,5 +1,6 @@
 //! TLS is the reverse proxy's job: the `__Host-` session cookie reaches a browser only over HTTPS or localhost.
 
+mod archive;
 pub mod auth;
 mod github;
 mod github_app;

@@ -295,6 +295,24 @@ impl Remote for Fetch {
             .get(key, out)
             .map_err(|e| Error::Io(std::io::Error::other(e.message)))
     }
+    fn read_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: u64,
+    ) -> sentinel_store::Result<Box<dyn std::io::Read + Send>> {
+        self.0
+            .up()
+            .map_err(|e| Error::Io(std::io::Error::other(e.message)))?;
+        let objects = self.0.objects.lock().unwrap();
+        let (body, _) = objects
+            .get(key)
+            .ok_or_else(|| Error::Io(std::io::Error::other("missing")))?;
+        let span = body
+            .get(offset as usize..(offset + len) as usize)
+            .ok_or_else(|| Error::Io(std::io::Error::other("range")))?;
+        Ok(Box::new(std::io::Cursor::new(span.to_vec())))
+    }
 }
 
 struct Fixture {

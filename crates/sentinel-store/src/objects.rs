@@ -404,7 +404,13 @@ pub struct Objects {
 
 pub trait Remote: Send + Sync {
     fn fetch(&self, key: &str, out: &mut dyn Write) -> Result<u64>;
+    /// One ranged read: a body of exactly `len` bytes starting at `offset` (`len` is at least 1), streamed from
+    /// the service. Nothing is buffered here and a body that ends short is the caller's read error.
+    fn read_range(&self, key: &str, offset: u64, len: u64) -> Result<Box<dyn Read + Send>>;
 }
+
+/// The span of one ranged request when an evicted object streams back (each gets its own timeout budget).
+pub const REMOTE_RANGE_BYTES: u64 = 32 << 20;
 
 pub fn manifest_relpath(tenant: TenantId, kind: u8, name: &[u8], version: u64) -> PathBuf {
     PathBuf::from(MANIFESTS_DIR)
@@ -1496,6 +1502,35 @@ impl Objects {
         ))
     }
 
+    /// Opens one manifest entry for streaming without a metadata round trip: the manifest already names the
+    /// object's digest and length. A local file is pinned like [`Objects::open_read`]'s; an object eviction
+    /// removed streams from the external copy in ranged reads instead of being placed back on disk first, so no
+    /// file is created and the first byte waits for one request, not for the whole object. The caller verifies the
+    /// bytes against `digest` and `len`; nothing here does.
+    pub fn open_entry(&self, tenant: TenantId, digest: Digest, len: u64) -> Result<EntryReader> {
+        match File::open(self.object_path(tenant, &digest)) {
+            Ok(file) => {
+                *lock_pins(&self.pins).entry((tenant, digest)).or_insert(0) += 1;
+                Ok(EntryReader::Local(Reader {
+                    file,
+                    key: (tenant, digest),
+                    pins: Arc::clone(&self.pins),
+                }))
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Error::Io(e)),
+            Err(_) => {
+                let remote = self.remote.get().ok_or(Error::Corrupt("object missing"))?;
+                Ok(EntryReader::Remote(RemoteReader {
+                    remote: Arc::clone(remote),
+                    key: remote_key(tenant, &digest),
+                    offset: 0,
+                    len,
+                    body: None,
+                }))
+            }
+        }
+    }
+
     pub fn reader_active(&self, tenant: TenantId, digest: Digest) -> bool {
         lock_pins(&self.pins).contains_key(&(tenant, digest))
     }
@@ -2370,6 +2405,69 @@ pub struct Reader {
 impl Read for Reader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.file.read(buf)
+    }
+}
+
+/// An entry's bytes: the pinned local file, or the external copy of an object eviction removed.
+pub enum EntryReader {
+    Local(Reader),
+    Remote(RemoteReader),
+}
+
+impl EntryReader {
+    pub fn is_remote(&self) -> bool {
+        matches!(self, EntryReader::Remote(_))
+    }
+}
+
+impl Read for EntryReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            EntryReader::Local(reader) => reader.read(buf),
+            EntryReader::Remote(reader) => reader.read(buf),
+        }
+    }
+}
+
+pub struct RemoteReader {
+    remote: Arc<dyn Remote>,
+    key: String,
+    offset: u64,
+    len: u64,
+    /// The current range's body and the bytes it still owes.
+    body: Option<(Box<dyn Read + Send>, u64)>,
+}
+
+impl Read for RemoteReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.offset >= self.len || buf.is_empty() {
+                return Ok(0);
+            }
+            let Some((body, left)) = self.body.as_mut() else {
+                let span = (self.len - self.offset).min(REMOTE_RANGE_BYTES);
+                let body = self
+                    .remote
+                    .read_range(&self.key, self.offset, span)
+                    .map_err(|_| std::io::Error::other("external copy unavailable"))?;
+                self.body = Some((body, span));
+                continue;
+            };
+            let want = buf.len().min(usize::try_from(*left).unwrap_or(usize::MAX));
+            let got = body.read(&mut buf[..want])?;
+            if got == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "external copy ended short",
+                ));
+            }
+            *left -= got as u64;
+            self.offset += got as u64;
+            if *left == 0 {
+                self.body = None;
+            }
+            return Ok(got);
+        }
     }
 }
 
