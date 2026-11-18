@@ -24,6 +24,12 @@ use sentinel_worker::{
 
 const SHIM: &str = r#"#!/bin/sh
 dir="$(dirname "$0")"
+# Global flags (`--log-level=error` and, for a private store, `--root` and `--runroot`) precede the subcommand, so
+# find it before relying on the positions below.
+while [ "$#" -gt 0 ]; do
+  case "$1" in ps|container|rm|stop|create|start) break ;; esac
+  shift
+done
 case "$1" in
   ps)
     id="${4##*=}"

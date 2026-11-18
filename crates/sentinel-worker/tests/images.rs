@@ -214,6 +214,12 @@ dir="${0%/*}"
 last=
 for a in "$@"; do last="$a"; done
 key="${last##*@}"
+# Global flags (`--log-level=error` and, for a private store, `--root` and `--runroot`) precede the subcommand, so
+# find it instead of assuming the first argument is it.
+while [ "$#" -gt 0 ]; do
+  case "$1" in image|pull) break ;; esac
+  shift
+done
 case "$1" in
   image)
     echo "exists $key" >> "$dir/calls"
