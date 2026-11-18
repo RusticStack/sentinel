@@ -102,6 +102,9 @@ export interface JobStatus {
   timestamps: JobTimestamps;
 }
 
+/** The Sentinel account that started a manual run; `display_name` is null once it left the tenant. */
+export interface RunActor { user_id: string; display_name: string | null }
+
 export interface Run {
   id: string;
   tenant: string;
@@ -111,6 +114,8 @@ export interface Run {
   cancel_requested: boolean;
   state: string;
   trigger: string | null;
+  /** Absent for a webhook run: the provider's sender is not a Sentinel principal. */
+  actor?: RunActor;
   jobs: JobStatus[];
 }
 

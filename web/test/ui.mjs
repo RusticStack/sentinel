@@ -159,6 +159,7 @@ current = page;
 const PAGES = {
   runs: ["/t/acme", "document.querySelectorAll('main table tbody tr').length >= 3"],
   run: [`/runs/${cfg.diamond}`, "document.querySelectorAll('.dag .node').length === 4 && document.body.textContent.includes('expected 200, got 500')"],
+  started: [`/runs/${cfg.stuck_run}`, "!!document.querySelector('#started-by')"],
   log: [`/runs/${cfg.diamond}/logs/${cfg.attempts.beta}`, "document.querySelectorAll('.log-row').length > 5"],
   queue: ["/t/acme/queue", "document.querySelectorAll('main table tbody tr').length >= 1"],
   workers: ["/t/acme/workers", "document.querySelectorAll('main table tbody tr').length >= 1"],
@@ -299,6 +300,15 @@ await scenario("hopping between live pages", async () => {
   await sleep(3000);
   const text = await page.eval("document.body.textContent");
   check("after hopping between live pages the run page is live, not busy", text.includes("Live") && !text.includes("controller busy"));
+});
+
+await scenario("who started a run", async () => {
+  await go(page, PAGES.started[0], PAGES.started[1]);
+  const started = await page.eval("document.querySelector('#started-by').textContent");
+  check("a manual run's page says who started it", started === "Started by Root Admin", started);
+  await go(page, PAGES.run[0], PAGES.run[1]);
+  const none = await page.eval("document.querySelector('#started-by') === null && !document.body.textContent.includes('Started by')");
+  check("a webhook run's page says nothing of who started it", none);
 });
 
 await scenario("contrast", async () => {
