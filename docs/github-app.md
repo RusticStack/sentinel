@@ -112,11 +112,23 @@ Exactly what the controller uses today ([CLAUDE.md](../CLAUDE.md): a feature tha
 | `contents` | read | source tokens for resolution, jobs and polling, and reconciliation ([intake](intake.md), [sources](sources.md)); also what `push` events need |
 | `metadata` | read | GitHub's mandatory baseline; the repository and collaborator-permission reads of membership derivation |
 | `pull_requests` | read | required to receive `pull_request` events (intake) |
+| `merge_queues` | read | **not requested by the manifest**: GitHub delivers `merge_group` events only to an App that holds it, and it is granted on GitHub to a deployment whose repositories use a merge queue (intake, [sources](sources.md#merge-groups)). A repository without a queue never emits the event, so nothing needs it until then ([CLAUDE.md](../CLAUDE.md): a feature that needs more asks for it only when a tenant turns it on) |
 | `members` (organization) | read | membership of GitHub-backed organizations ([GitHub sign-in](github-sign-in.md#github-backed-organizations)) and the owner proof when binding an organization's installation |
 
 Sign-in reads only the numeric account id (`GET /user`) and asks no scope or account permission; email is never an identity.
 
-Events: `push`, `pull_request` (intake), `check_run`, `check_suite` (rerequests), `repository` (renames, transfers, archival), `organization`, `membership`, `member`, `team` (membership). `installation` and `installation_repositories` reach every App without a subscription.
+Events the manifest subscribes to: `push`, `pull_request`, `check_run`, `check_suite`, `repository`, `organization`, `membership`, `member`, `team`. `installation` and `installation_repositories` reach every App without a subscription.
+
+`merge_group` is the one intake event the manifest does not ask for, because it
+needs the repository permission **Merge queues: read** and a repository that uses
+no merge queue never emits it. A deployment whose repositories do use one grants
+that permission to the App on GitHub (Settings → Developer settings → the App →
+Permissions) and subscribes to the event there; without both, GitHub delivers
+nothing for a queued group and the queue sees no Sentinel checks — the App's
+delivery log shows no `merge_group` deliveries, which is how to tell this apart
+from a refused delivery (`admin intake list` shows none). Existing installations
+get the permission with their next accepted permission change; GitHub does not
+deliver the event until an owner approves it.
 
 ## Failure modes and recovery
 

@@ -188,6 +188,40 @@ fn valid_branch_name(name: &str) -> bool {
             .any(|b| b <= 32 || b == 127 || b"~^:?*[\\".contains(&b))
 }
 
+/// A merge-queue delivery's terms: the pair of commits GitHub merged into its
+/// queue branch, and the branch the required checks belong to. The queue branch
+/// identifies the group — GitHub names it for the base commit it was built on —
+/// so a redelivery of the same group matches on both.
+#[derive(Debug)]
+pub struct MergeTerms<'a> {
+    pub action: &'a str,
+    pub head_ref: &'a str,
+    pub head_sha: &'a str,
+    pub base_ref: &'a str,
+    pub base_sha: &'a str,
+    pub head_repo: u64,
+    pub reason: Option<&'a str>,
+}
+
+fn check_merge(merge: &MergeTerms<'_>) -> Result<()> {
+    let invalid = merge.action.is_empty()
+        || merge.action.len() > 32
+        || !merge.head_ref.starts_with("refs/heads/")
+        || !valid_branch_name(merge.head_ref)
+        || !valid_branch_name(merge.base_ref)
+        || !sentinel_protocol::intake::valid_sha(merge.head_sha)
+        || !sentinel_protocol::intake::valid_sha(merge.base_sha)
+        || merge.head_repo == 0
+        || merge.head_repo > i64::MAX as u64
+        || merge
+            .reason
+            .is_some_and(|r| r.is_empty() || r.len() > 64 || r.bytes().any(|b| b < 32 || b == 127));
+    if invalid {
+        return Err(Error::InvalidInput("merge group"));
+    }
+    Ok(())
+}
+
 pub fn accept(
     tx: &Transaction<'_>,
     repo: RepoId,
@@ -195,9 +229,34 @@ pub fn accept(
     pr: Option<&PrTerms<'_>>,
     now: UnixMillis,
 ) -> Result<Accepted> {
+    accept_with_terms(tx, repo, delivery, pr, None, now)
+}
+
+pub fn accept_merge_group(
+    tx: &Transaction<'_>,
+    repo: RepoId,
+    delivery: &NewDelivery<'_>,
+    merge: &MergeTerms<'_>,
+    now: UnixMillis,
+) -> Result<Accepted> {
+    accept_with_terms(tx, repo, delivery, None, Some(merge), now)
+}
+
+/// One delivery with either its pull-request or its merge-group terms (never both).
+pub fn accept_with_terms(
+    tx: &Transaction<'_>,
+    repo: RepoId,
+    delivery: &NewDelivery<'_>,
+    pr: Option<&PrTerms<'_>>,
+    merge: Option<&MergeTerms<'_>>,
+    now: UnixMillis,
+) -> Result<Accepted> {
     check(delivery)?;
     if let Some(pr) = pr {
         check_pr(pr)?;
+    }
+    if let Some(merge) = merge {
+        check_merge(merge)?;
     }
     let tenant = sources::repo_tenant(tx, repo)?;
     let metadata = sources::load_metadata(tx, repo).map_err(|e| match e {
@@ -265,6 +324,25 @@ pub fn accept(
             ],
         )?;
     }
+    if let Some(merge) = merge {
+        tx.execute(
+            "INSERT INTO merge_deliveries(delivery_id, tenant_id, repo_id, action, head_ref,
+                head_sha, base_ref, base_sha, head_repo_id, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                id.as_bytes(),
+                tenant.as_bytes(),
+                repo.as_bytes(),
+                merge.action,
+                merge.head_ref,
+                merge.head_sha,
+                merge.base_ref,
+                merge.base_sha,
+                merge.head_repo as i64,
+                merge.reason
+            ],
+        )?;
+    }
     Ok(Accepted::Fresh(id))
 }
 
@@ -329,6 +407,180 @@ pub fn pr_for(conn: &Connection, delivery: DeliveryId) -> Result<Option<PrDelive
         base_sha,
         merge_sha,
     }))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeDelivery {
+    pub action: String,
+    pub head_ref: String,
+    pub head_sha: String,
+    pub base_ref: String,
+    pub base_sha: String,
+    pub head_repo: u64,
+    pub reason: Option<String>,
+}
+
+type MergeRow = (String, String, String, String, String, i64, Option<String>);
+
+const MERGE_COLUMNS: &str = "m.action, m.head_ref, m.head_sha, m.base_ref, m.base_sha, \
+    m.head_repo_id, m.reason";
+
+fn map_merge(r: &rusqlite::Row<'_>) -> rusqlite::Result<MergeRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+    ))
+}
+
+fn decode_merge(row: MergeRow) -> Result<MergeDelivery> {
+    let (action, head_ref, head_sha, base_ref, base_sha, head_repo, reason) = row;
+    Ok(MergeDelivery {
+        action,
+        head_ref,
+        head_sha,
+        base_ref,
+        base_sha,
+        head_repo: u64::try_from(head_repo).map_err(|_| Error::Corrupt("head repository"))?,
+        reason,
+    })
+}
+
+pub fn merge_for(conn: &Connection, delivery: DeliveryId) -> Result<Option<MergeDelivery>> {
+    let row: Option<MergeRow> = conn
+        .prepare_cached(&format!(
+            "SELECT {MERGE_COLUMNS} FROM merge_deliveries m WHERE m.delivery_id = ?1"
+        ))?
+        .query_row([delivery.as_bytes()], map_merge)
+        .optional()?;
+    row.map(decode_merge).transpose()
+}
+
+/// What a merge group's recorded deliveries say about one of them, in one
+/// statement: the run the group produced (one group produces one run, so this is
+/// both the answer to a redelivery and the run a destroyed action cancels),
+/// whether a delivery accepted before it is still waiting (this one is its
+/// duplicate, whoever reaches the lane first), and whether the group has already
+/// gone away without a run — a destroyed or merged action settles any delivery of
+/// it that arrives afterwards.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MergeGroupState {
+    pub run: Option<sentinel_core::RunId>,
+    pub earlier_open: bool,
+    pub gone: bool,
+}
+
+pub fn merge_group_state(
+    conn: &Connection,
+    delivery: &Delivery,
+    head_ref: &str,
+    base_sha: &str,
+) -> Result<MergeGroupState> {
+    let (tenant, repo, id) = (delivery.tenant, delivery.repo, delivery.id);
+    let run: Option<[u8; 16]> = conn
+        .prepare_cached(
+            "SELECT d.run_id FROM webhook_deliveries d
+             JOIN merge_deliveries m ON m.delivery_id = d.id
+             WHERE d.tenant_id = ?1 AND d.repo_id = ?2 AND m.head_ref = ?3 AND m.base_sha = ?4
+               AND d.state = 4
+             ORDER BY d.received_ms DESC, d.id DESC LIMIT 1",
+        )?
+        .query_row(
+            params![tenant.as_bytes(), repo.as_bytes(), head_ref, base_sha],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let (earlier_open, gone): (bool, bool) = conn
+        .prepare_cached(
+            "SELECT
+               EXISTS(SELECT 1 FROM webhook_deliveries d
+                      JOIN merge_deliveries m ON m.delivery_id = d.id
+                      WHERE d.tenant_id = ?1 AND d.repo_id = ?2 AND m.head_ref = ?3
+                        AND m.base_sha = ?4 AND d.state IN (0, 1) AND d.id <> ?5
+                        AND (d.received_ms < ?6 OR (d.received_ms = ?6 AND d.id < ?5))),
+               EXISTS(SELECT 1 FROM webhook_deliveries d
+                      JOIN merge_deliveries m ON m.delivery_id = d.id
+                      WHERE d.tenant_id = ?1 AND d.repo_id = ?2 AND m.head_ref = ?3
+                        AND m.base_sha = ?4 AND d.id <> ?5 AND d.reason IN ('merge_group_destroyed',
+                        'merge_group_merged'))",
+        )?
+        .query_row(
+            params![
+                tenant.as_bytes(),
+                repo.as_bytes(),
+                head_ref,
+                base_sha,
+                id.as_bytes(),
+                delivery.received.0
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+    Ok(MergeGroupState {
+        run: match run {
+            Some(bytes) => Some(
+                sentinel_core::RunId::from_bytes(bytes).map_err(|_| Error::Corrupt("run_id"))?,
+            ),
+            None => None,
+        },
+        earlier_open,
+        gone,
+    })
+}
+
+/// Close a merge group: cancel the run it produced, settle every delivery of it
+/// still waiting and settle this one, all in the caller's transaction, so a group
+/// cannot be cancelled and dispatched at the same time. Returns the reason this
+/// delivery settled with — `merge_group_destroyed` when a run had to be cancelled,
+/// `merge_group_merged` when the group went away before anything ran.
+pub fn destroy_merge_group(
+    tx: &Transaction<'_>,
+    delivery: &Delivery,
+    head_ref: &str,
+    base_sha: &str,
+    now: UnixMillis,
+) -> Result<&'static str> {
+    let state = merge_group_state(tx, delivery, head_ref, base_sha)?;
+    if let Some(run) = state.run {
+        crate::dispatch::cancel_run(tx, delivery.tenant, run, now)?;
+    }
+    let mut stmt = tx.prepare_cached(
+        "SELECT d.id FROM webhook_deliveries d
+         JOIN merge_deliveries m ON m.delivery_id = d.id
+         WHERE d.tenant_id = ?1 AND d.repo_id = ?2 AND m.head_ref = ?3 AND m.base_sha = ?4
+           AND d.state IN (0, 1) AND d.id <> ?5
+         ORDER BY d.received_ms, d.id LIMIT 64",
+    )?;
+    let open = stmt
+        .query_map(
+            params![
+                delivery.tenant.as_bytes(),
+                delivery.repo.as_bytes(),
+                head_ref,
+                base_sha,
+                delivery.id.as_bytes()
+            ],
+            |r| r.get::<_, [u8; 16]>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for bytes in open {
+        let open = DeliveryId::from_bytes(bytes).map_err(|_| Error::Corrupt("delivery id"))?;
+        match settle(tx, open, Resolution::Ignored("merge_group_merged"), now) {
+            Ok(()) | Err(Error::Conflict) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let reason = if state.run.is_some() {
+        "merge_group_destroyed"
+    } else {
+        "merge_group_merged"
+    };
+    settle(tx, delivery.id, Resolution::Ignored(reason), now)?;
+    Ok(reason)
 }
 
 fn find(
@@ -703,7 +955,10 @@ pub fn validate(conn: &Connection, delivery: &Delivery) -> Result<Resolution> {
     if sentinel_protocol::intake::is_zero_sha(new_sha) {
         return Ok(Resolution::Ignored("ref_deleted"));
     }
-    if !metadata.binding.allows(ref_name) {
+    // A merge group's ref is GitHub's own queue branch, which names the group and
+    // the base commit it was built on; no binding can list it, so the base branch it
+    // targets is what the binding gates (checked before this, as for any delivery).
+    if delivery.event != "merge_group" && !metadata.binding.allows(ref_name) {
         return Ok(Resolution::Failed("ref_not_allowed"));
     }
     Ok(Resolution::Ready)

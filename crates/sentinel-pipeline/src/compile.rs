@@ -362,12 +362,16 @@ fn digest_of(
     jobs: &[CompiledJob],
 ) -> Result<u128, CompileError> {
     let mut d = Digest::new();
-    d.str("sentinel.pipeline/4");
+    d.str("sentinel.pipeline/5");
     d.u64(u64::from(on.push.is_some()));
     d.u64(u64::from(on.pull_request.is_some()));
+    d.u64(u64::from(on.merge_group.is_some()));
     d.u64(u64::from(on.tag.is_some()));
     d.u64(u64::from(on.manual));
-    for filter in [&on.push, &on.pull_request, &on.tag].into_iter().flatten() {
+    for filter in [&on.push, &on.pull_request, &on.merge_group, &on.tag]
+        .into_iter()
+        .flatten()
+    {
         d.u64(filter.branches.len() as u64);
         for p in &filter.branches {
             d.str(p);

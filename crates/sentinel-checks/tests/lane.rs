@@ -145,6 +145,7 @@ fn event_run(f: &Fixture) -> RunId {
                     pipeline_path: Some(".sentinel.yml".into()),
                     pipeline_digest: spec.pipeline.digest.to_le_bytes(),
                     pr_number: None,
+                    group_ref: None,
                 },
                 run,
                 UnixMillis::now(),

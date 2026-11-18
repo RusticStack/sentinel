@@ -192,6 +192,7 @@ fn create_run(
                     pipeline_path: None,
                     pipeline_digest: spec.pipeline.digest.to_le_bytes(),
                     pr_number: pr,
+                    group_ref: None,
                 },
                 run,
                 now,

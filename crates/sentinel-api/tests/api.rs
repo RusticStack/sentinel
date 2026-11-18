@@ -4543,6 +4543,7 @@ fn a_manual_runs_actor_is_returned_and_a_webhook_runs_has_none() {
                     pipeline_path: None,
                     pipeline_digest: [5; 16],
                     pr_number: None,
+                    group_ref: None,
                 },
                 push,
                 now,

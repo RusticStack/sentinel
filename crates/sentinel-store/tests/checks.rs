@@ -166,6 +166,7 @@ fn create_run(f: &mut Fixture, repo: RepoId, event: bool) -> (RunId, Vec<JobId>)
                 pipeline_path: Some(".sentinel.yml".into()),
                 pipeline_digest: spec.pipeline.digest.to_le_bytes(),
                 pr_number: None,
+                group_ref: None,
             },
             run,
             NOW,

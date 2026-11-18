@@ -1349,6 +1349,7 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
                     pipeline_path: None,
                     pipeline_digest: digest,
                     pr_number: None,
+                    group_ref: None,
                 },
                 run,
                 now,

@@ -21,6 +21,10 @@ pub struct Provenance {
     pub pipeline_path: Option<String>,
     pub pipeline_digest: [u8; 16],
     pub pr_number: Option<u64>,
+    /// The merge queue branch a `merge_group` run was read from: the queue's own
+    /// ref, which identifies the group and proves nothing about a branch of the
+    /// repository.
+    pub group_ref: Option<String>,
 }
 
 impl Provenance {
@@ -37,6 +41,7 @@ impl Provenance {
             || (self.delivery.is_none()) != (self.provider.is_none())
             || !bounded(&self.provider, 32)
             || !bounded(&self.ref_name, 1024)
+            || !bounded(&self.group_ref, 1024)
             || !bounded(&self.pipeline_path, 1024)
             || self
                 .pr_number
@@ -79,8 +84,8 @@ pub fn insert_with_actor(
     tx.execute(
         "INSERT INTO run_provenance(run_id, tenant_id, repo_id, trigger, delivery_id, provider,
             ref_name, old_sha, new_sha, head_sha, base_sha, merge_sha, pipeline_sha,
-            pipeline_path, pipeline_digest, pr_number, created_ms, actor_user_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            pipeline_path, pipeline_digest, pr_number, created_ms, actor_user_id, group_ref)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             run.as_bytes(),
             provenance.tenant.as_bytes(),
@@ -99,7 +104,8 @@ pub fn insert_with_actor(
             provenance.pipeline_digest.as_slice(),
             provenance.pr_number.map(|n| n as i64),
             now.0,
-            actor.as_ref().map(UserId::as_bytes)
+            actor.as_ref().map(UserId::as_bytes),
+            provenance.group_ref
         ],
     )?;
     Ok(())
@@ -124,6 +130,7 @@ pub struct RunProvenance {
     pub pipeline_digest: [u8; 16],
     pub pr_number: Option<u64>,
     pub created: UnixMillis,
+    pub group_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,13 +143,34 @@ pub struct EventFacts {
 }
 
 impl EventFacts {
-    fn of(trigger: &str, ref_name: Option<&str>, pr_number: Option<u64>) -> EventFacts {
+    fn of(
+        trigger: &str,
+        ref_name: Option<&str>,
+        pr_number: Option<u64>,
+        group_ref: Option<&str>,
+    ) -> EventFacts {
         let ref_name = ref_name.unwrap_or_default().to_owned();
         let short = ref_name
             .strip_prefix("refs/heads/")
             .or_else(|| ref_name.strip_prefix("refs/tags/"))
             .map(str::to_owned);
         match trigger {
+            // The run was built from the queue branch, so that ref is what the
+            // pipeline sees — exactly as a pull request sees its merge ref — and
+            // the base branch is the one whose required checks it satisfies.
+            "merge_group" => {
+                let group = group_ref.unwrap_or_default().to_owned();
+                EventFacts {
+                    name: trigger.to_owned(),
+                    key: group
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(&group)
+                        .to_owned(),
+                    ref_name: group,
+                    base_ref: short,
+                    pr_number: None,
+                }
+            }
             "pull_request" => {
                 let number = pr_number;
                 EventFacts {
@@ -169,19 +197,23 @@ impl EventFacts {
 }
 
 pub fn event_facts(conn: &Connection, run: RunId) -> Result<EventFacts> {
-    let row: Option<(String, Option<String>, Option<i64>)> = conn
+    type Row = (String, Option<String>, Option<i64>, Option<String>);
+    let row: Option<Row> = conn
         .prepare_cached(
-            "SELECT trigger, ref_name, pr_number FROM run_provenance WHERE run_id = ?1",
+            "SELECT trigger, ref_name, pr_number, group_ref FROM run_provenance WHERE run_id = ?1",
         )?
-        .query_row([run.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .query_row([run.as_bytes()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
         .optional()?;
     Ok(match row {
-        Some((trigger, ref_name, number)) => EventFacts::of(
+        Some((trigger, ref_name, number, group_ref)) => EventFacts::of(
             &trigger,
             ref_name.as_deref(),
             number.and_then(|n| u64::try_from(n).ok()),
+            group_ref.as_deref(),
         ),
-        None => EventFacts::of("manual", None, None),
+        None => EventFacts::of("manual", None, None, None),
     })
 }
 
@@ -255,12 +287,13 @@ pub fn of_run(conn: &Connection, run: RunId) -> Result<Option<RunProvenance>> {
         Vec<u8>,
         Option<i64>,
         i64,
+        Option<String>,
     );
     let row: Option<Row> = conn
         .prepare_cached(
             "SELECT tenant_id, repo_id, trigger, delivery_id, provider, ref_name, old_sha,
                     new_sha, head_sha, base_sha, merge_sha, pipeline_sha, pipeline_path,
-                    pipeline_digest, pr_number, created_ms
+                    pipeline_digest, pr_number, created_ms, group_ref
              FROM run_provenance WHERE run_id = ?1",
         )?
         .query_row([run.as_bytes()], |r| {
@@ -281,6 +314,7 @@ pub fn of_run(conn: &Connection, run: RunId) -> Result<Option<RunProvenance>> {
                 r.get(13)?,
                 r.get(14)?,
                 r.get(15)?,
+                r.get(16)?,
             ))
         })
         .optional()?;
@@ -301,6 +335,7 @@ pub fn of_run(conn: &Connection, run: RunId) -> Result<Option<RunProvenance>> {
         digest,
         pr_number,
         created,
+        group_ref,
     )) = row
     else {
         return Ok(None);
@@ -331,6 +366,7 @@ pub fn of_run(conn: &Connection, run: RunId) -> Result<Option<RunProvenance>> {
         pipeline_digest: digest,
         pr_number: pr_number.and_then(|n| u64::try_from(n).ok()),
         created: UnixMillis(created),
+        group_ref,
     }))
 }
 

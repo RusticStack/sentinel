@@ -9,7 +9,7 @@ use sentinel_github::app::Current;
 use sentinel_pipeline::{Event, EventKind, PinnedSource, RunSpec};
 use sentinel_store::{
     Error as StoreError, Store,
-    intake::{self, Delivery, PrDelivery},
+    intake::{self, Delivery, MergeDelivery, PrDelivery},
     provenance::Provenance,
     runs,
 };
@@ -230,22 +230,43 @@ impl Resolver {
             );
         }
 
-        let pr: Option<PrDelivery> = self.store.read(|c| intake::pr_for(c, delivery.id))?;
-        let plan = match self.plan(delivery, pr.as_ref(), &binding) {
+        // One point read, and only for the event class that has terms to read.
+        let (pr, merge): (Option<PrDelivery>, Option<MergeDelivery>) = match delivery.event.as_str()
+        {
+            "pull_request" => (self.store.read(|c| intake::pr_for(c, delivery.id))?, None),
+            "merge_group" => (
+                None,
+                self.store.read(|c| intake::merge_for(c, delivery.id))?,
+            ),
+            _ => (None, None),
+        };
+        if let Some(merge) = merge.as_ref()
+            && let Some(outcome) = self.merge_group(delivery, merge, now)?
+        {
+            return Ok(outcome);
+        }
+        let plan = match self.plan(delivery, pr.as_ref(), merge.as_ref(), &binding) {
             Ok(plan) => plan,
             Err(outcome) => return self.settle(delivery, outcome, now),
         };
 
-        let stream = plan.policy_ref.clone();
-        let is_pr = plan.kind == EventKind::PullRequest;
-        let (tenant, repo) = (delivery.tenant, delivery.repo);
-        let previous = self
-            .store
-            .read(move |c| intake::last_dispatched(c, tenant, repo, &stream, is_pr))?;
-        let prove_stale = match order(delivery, previous.as_ref(), plan.kind) {
-            Order::Settle(outcome) => return self.settle(delivery, outcome, now),
-            Order::New => None,
-            Order::Prove { tip } => Some(tip),
+        // A merge group is its own stream: its ordering and duplication are the
+        // group's (above), never the base branch push stream's — the queue branch
+        // commit is not history of the base branch and must not be judged by it.
+        let prove_stale = if plan.kind == EventKind::MergeGroup {
+            None
+        } else {
+            let stream = plan.policy_ref.clone();
+            let is_pr = plan.kind == EventKind::PullRequest;
+            let (tenant, repo) = (delivery.tenant, delivery.repo);
+            let previous = self
+                .store
+                .read(move |c| intake::last_dispatched(c, tenant, repo, &stream, is_pr))?;
+            match order(delivery, previous.as_ref(), plan.kind) {
+                Order::Settle(outcome) => return self.settle(delivery, outcome, now),
+                Order::New => None,
+                Order::Prove { tip } => Some(tip),
+            }
         };
 
         let access = match source::issue(
@@ -488,6 +509,7 @@ impl Resolver {
         &self,
         delivery: &Delivery,
         pr: Option<&PrDelivery>,
+        merge: Option<&MergeDelivery>,
         binding: &source::Binding,
     ) -> Result<Plan, Outcome> {
         let (Some(ref_name), Some(new_sha)) = (&delivery.ref_name, &delivery.new_sha) else {
@@ -511,6 +533,7 @@ impl Resolver {
                     head_sha: None,
                     base_sha: None,
                     pr_number: None,
+                    group_ref: None,
                 })
             }
             "pull_request" => {
@@ -540,6 +563,39 @@ impl Resolver {
                     head_sha: Some(pr.head_sha.clone()),
                     base_sha: Some(pr.base_sha.clone()),
                     pr_number: Some(pr.number),
+                    group_ref: None,
+                })
+            }
+            "merge_group" => {
+                let Some(merge) = merge else {
+                    return Err(Outcome::Failed {
+                        reason: "merge_group_terms",
+                        detail: None,
+                    });
+                };
+                let Some(bound_repo) = binding.forge.as_ref().map(|f| f.repo) else {
+                    return Err(Outcome::Failed {
+                        reason: "no_forge_association",
+                        detail: None,
+                    });
+                };
+                // The group's commits are merged into this repository's own queue
+                // branch; a binding that now points at another repository cannot
+                // read them.
+                if merge.head_repo != bound_repo {
+                    return Err(Outcome::Ignored("merge_group_repository"));
+                }
+                Ok(Plan {
+                    kind: EventKind::MergeGroup,
+                    policy_ref: format!("refs/heads/{}", merge.base_ref),
+                    // GitHub states the head commit; it is read by that object id,
+                    // never by a branch name that may have moved since.
+                    source: Revision::Commit(merge.head_sha.clone()),
+                    checkout_ref: merge.head_ref.clone(),
+                    head_sha: Some(merge.head_sha.clone()),
+                    base_sha: Some(merge.base_sha.clone()),
+                    pr_number: None,
+                    group_ref: Some(merge.head_ref.clone()),
                 })
             }
             _ => Err(Outcome::Failed {
@@ -547,6 +603,40 @@ impl Resolver {
                 detail: Some(delivery.event.clone()),
             }),
         }
+    }
+
+    /// The decisions a merge group's own record makes before any remote work, so a
+    /// redelivery, a group that already went away and a destroyed group are all
+    /// settled without a fetch: `None` means the delivery should be resolved.
+    fn merge_group(
+        &self,
+        delivery: &Delivery,
+        merge: &MergeDelivery,
+        now: UnixMillis,
+    ) -> Result<Option<Outcome>, StoreError> {
+        if merge.action == "destroyed" {
+            let closed = delivery.clone();
+            let (head_ref, base_sha) = (merge.head_ref.clone(), merge.base_sha.clone());
+            let reason = match self.store.writer().write(move |tx| {
+                intake::destroy_merge_group(tx, &closed, &head_ref, &base_sha, now)
+            }) {
+                Ok(reason) => reason,
+                Err(StoreError::Conflict) => return Ok(Some(Outcome::Skipped)),
+                Err(e) => return Err(e),
+            };
+            return Ok(Some(Outcome::Ignored(reason)));
+        }
+        let state = self
+            .store
+            .read(|c| intake::merge_group_state(c, delivery, &merge.head_ref, &merge.base_sha))?;
+        let outcome = if state.run.is_some() || state.earlier_open {
+            Outcome::Ignored("merge_group_duplicate")
+        } else if state.gone {
+            Outcome::Ignored("merge_group_merged")
+        } else {
+            return Ok(None);
+        };
+        self.settle(delivery, outcome, now).map(Some)
     }
 
     fn settle(
@@ -650,6 +740,7 @@ struct Plan {
     head_sha: Option<String>,
     base_sha: Option<String>,
     pr_number: Option<u64>,
+    group_ref: Option<String>,
 }
 
 impl Plan {
@@ -658,6 +749,7 @@ impl Plan {
             EventKind::Push => Event::push(&self.policy_ref),
             EventKind::Tag => Event::tag(&self.policy_ref),
             EventKind::PullRequest => Event::pull_request(&self.policy_ref),
+            EventKind::MergeGroup => Event::merge_group(&self.policy_ref),
             EventKind::Manual => Event::manual(),
         }
     }
@@ -688,6 +780,8 @@ impl Plan {
             pipeline_path: Some(binding.metadata.binding.pipeline_path.clone()),
             pipeline_digest: spec.pipeline.digest.to_le_bytes(),
             pr_number: self.pr_number,
+            // The queue branch a merge group was read from; no other event has one.
+            group_ref: self.group_ref.clone(),
         }
     }
 }

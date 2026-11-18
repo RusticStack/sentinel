@@ -65,6 +65,7 @@ fn full_fixture_decodes_every_field() {
         Triggers {
             push: Some(RefFilter::default()),
             pull_request: Some(RefFilter::default()),
+            merge_group: None,
             tag: None,
             manual: true,
         }

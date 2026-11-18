@@ -472,6 +472,7 @@ fn enqueue(f: &Fixture, spec: &RunSpec) -> Result<(RunId, Instant, Duration), St
                     pipeline_path: Some(".sentinel.yml".into()),
                     pipeline_digest: spec.pipeline.digest.to_le_bytes(),
                     pr_number: None,
+                    group_ref: None,
                 },
                 run,
                 now,

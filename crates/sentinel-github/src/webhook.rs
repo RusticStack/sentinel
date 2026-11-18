@@ -168,6 +168,92 @@ pub fn parse_pull_request(body: &[u8]) -> Result<PullRequest> {
     })
 }
 
+/// A merge-queue group: the commits GitHub merged into its own queue branch. The
+/// queue branch names the group — GitHub builds it for the base commit it merged
+/// onto — so the pair identifies it for a redelivery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeGroup {
+    pub installation: u64,
+    pub repository: u64,
+    pub action: String,
+    pub head_ref: String,
+    pub head_sha: String,
+    pub base_ref: String,
+    pub base_sha: String,
+    /// Why GitHub destroyed the group (`merged`, `dequeued`, `invalidated`), if it said.
+    pub reason: Option<String>,
+}
+
+pub fn parse_merge_group(body: &[u8]) -> Result<MergeGroup> {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|_| Error::Response("payload is not JSON"))?;
+    let object = value
+        .as_object()
+        .filter(|o| o.len() <= MAX_BODY_FIELDS + 32)
+        .ok_or(Error::Response("payload shape"))?;
+    let map_number = |v: &serde_json::Map<String, Value>, key: &'static str| -> Result<u64> {
+        v.get(key)
+            .and_then(Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or(Error::Response(key))
+    };
+    let installation = map_number(
+        object
+            .get("installation")
+            .and_then(Value::as_object)
+            .ok_or(Error::Response("installation id"))?,
+        "id",
+    )?;
+    let repository = map_number(
+        object
+            .get("repository")
+            .and_then(Value::as_object)
+            .ok_or(Error::Response("repository id"))?,
+        "id",
+    )?;
+    let group = object
+        .get("merge_group")
+        .and_then(Value::as_object)
+        .ok_or(Error::Response("merge group"))?;
+    let text = |v: &serde_json::Map<String, Value>,
+                key: &'static str,
+                max: usize|
+     -> Result<String> {
+        v.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && s.len() <= max && !s.bytes().any(|b| b < 32 || b == 127))
+            .map(str::to_owned)
+            .ok_or(Error::Response(key))
+    };
+    let bounded = |v: Option<&Value>| -> Result<Option<String>> {
+        match v {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s))
+                if !s.is_empty() && s.len() <= 32 && !s.bytes().any(|b| b < 32 || b == 127) =>
+            {
+                Ok(Some(s.clone()))
+            }
+            Some(_) => Err(Error::Response("reason")),
+        }
+    };
+    // GitHub documents the reason beside the action; it has also been delivered
+    // inside the group, so either place counts and both are bounded.
+    let reason = match bounded(object.get("reason"))? {
+        Some(reason) => Some(reason),
+        None => bounded(group.get("reason"))?,
+    };
+    Ok(MergeGroup {
+        installation,
+        repository,
+        action: text(object, "action", 32)?,
+        head_ref: text(group, "head_ref", 512)?,
+        head_sha: text(group, "head_sha", 64)?,
+        base_ref: text(group, "base_ref", 512)?,
+        base_sha: text(group, "base_sha", 64)?,
+        reason,
+    })
+}
+
 fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 {
         return None;
@@ -476,6 +562,69 @@ mod tests {
 
     fn oversize_ref_rejected(body: &Value) -> bool {
         parse_push(&serde_json::to_vec(body).unwrap()).is_err()
+    }
+
+    #[test]
+    fn merge_group_payloads_name_the_queue_branch_and_the_commits_github_merged() {
+        let body = serde_json::json!({
+            "action": "checks_requested",
+            "merge_group": {
+                "head_ref": "refs/heads/gh-readonly-queue/main/pr-123-abc",
+                "head_sha": "a".repeat(40),
+                "base_ref": "refs/heads/main",
+                "base_sha": "b".repeat(40),
+                "head_commit": {"id": "a".repeat(40)},
+            },
+            "installation": {"id": 42},
+            "repository": {"id": 91, "full_name": "account/widget"},
+        });
+        let group = parse_merge_group(&serde_json::to_vec(&body).unwrap()).unwrap();
+        assert_eq!(group.installation, 42);
+        assert_eq!(group.repository, 91);
+        assert_eq!(group.action, "checks_requested");
+        assert_eq!(
+            group.head_ref,
+            "refs/heads/gh-readonly-queue/main/pr-123-abc"
+        );
+        assert_eq!(group.head_sha, "a".repeat(40));
+        assert_eq!(group.base_ref, "refs/heads/main");
+        assert_eq!(group.base_sha, "b".repeat(40));
+        assert_eq!(group.reason, None);
+
+        for placed in [true, false] {
+            let mut destroyed = body.clone();
+            destroyed["action"] = Value::from("destroyed");
+            if placed {
+                destroyed["reason"] = Value::from("merged");
+            } else {
+                destroyed["merge_group"]["reason"] = Value::from("invalidated");
+            }
+            let group = parse_merge_group(&serde_json::to_vec(&destroyed).unwrap()).unwrap();
+            assert_eq!(group.action, "destroyed");
+            assert_eq!(
+                group.reason.as_deref(),
+                Some(if placed { "merged" } else { "invalidated" })
+            );
+        }
+
+        for (path, value) in [
+            ("merge_group", Value::Null),
+            ("merge_group", Value::from("refs/heads/main")),
+        ] {
+            let mut broken = body.clone();
+            broken[path] = value;
+            assert!(parse_merge_group(&serde_json::to_vec(&broken).unwrap()).is_err());
+        }
+        let mut missing_base = body.clone();
+        missing_base["merge_group"]
+            .as_object_mut()
+            .unwrap()
+            .remove("base_sha");
+        assert!(parse_merge_group(&serde_json::to_vec(&missing_base).unwrap()).is_err());
+        let mut long_reason = body;
+        long_reason["action"] = Value::from("destroyed");
+        long_reason["reason"] = Value::String("x".repeat(64));
+        assert!(parse_merge_group(&serde_json::to_vec(&long_reason).unwrap()).is_err());
     }
 
     #[test]

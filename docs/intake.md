@@ -21,7 +21,7 @@ becomes a GitHub Check when the repository is forge-associated
 | Route | `POST /api/v1/intake/{repo}` | `POST /api/v1/hooks/github` |
 | Credential | per-repository hook secret (`Authorization: Bearer sentinel_hook_…`) | App webhook secret (HMAC-SHA256 over the raw body in `X-Hub-Signature-256`) |
 | Identity | the relay's own stable delivery ID | `X-GitHub-Delivery` |
-| Event | one ref transition (always `ref_update`) | `X-GitHub-Event` (`push`, `pull_request`; control events below) |
+| Event | one ref transition (always `ref_update`) | `X-GitHub-Event` (`push`, `pull_request`, `merge_group`; control events below) |
 | Body limit | 64 KiB | 4 MiB |
 | Enabled by | a bound source and an issued hook secret | `<data_dir>/github-webhook.json`; without it the route is `not_found` |
 
@@ -73,6 +73,44 @@ replays the recorded outcome; a changed body is a `conflict`), and answer
 `200 {"controlled": <outcome>}`. What they do — rerequest handling, revocation
 and the durable refresh lane — is the reconcile contract in
 [checks](checks.md#rerequests-and-lifecycle-reconciliation).
+
+### Merge groups
+
+`merge_group` events are intake for the two actions GitHub sends: `checks_requested`,
+when the merge queue builds a group out of queued pull requests and asks for its
+checks, and `destroyed`, when it discards one (`merged`, `dequeued` or
+`invalidated`, its reason recorded with the terms). Any other action is answered
+`200 {"ignored": "merge_group_action"}` without a stored row, and an unbound
+repository is `{"ignored": "unbound_repository"}` like any other event; a
+payload whose queue branch is not a `refs/heads/` ref, or whose commits are not
+object ids, is `400 invalid_request`. `destroyed` is accepted because it is what
+cancels the run the group produced.
+
+The delivery records the **base branch** as its ref (`refs/heads/<base.ref>`,
+whose required checks the group is asked to satisfy), with the base commit as
+its old revision and the group's head commit as its new one, and its terms
+(`merge_deliveries`, migration 66) beside it: the action, the queue branch, the
+head and base commits GitHub states, the head repository, and — for `destroyed` —
+GitHub's reason. The terms are immutable and leave with the delivery; they are
+what a redelivery, a cancellation and the run's provenance are decided from.
+
+Trust is decided from those facts:
+
+- the group's commits live in the binding's own repository, so a binding that now
+  points at another repository cannot read them: that is
+  `ignored:merge_group_repository`, and a binding without an App association is
+  `failed:no_forge_association`, exactly as for a pull request;
+- the run is read at the **head commit GitHub states**, never at a branch head,
+  and the pipeline comes from that same revision;
+- the binding's `allowed_refs` gate the base branch, not the queue branch: GitHub
+  names the queue and no operator should have to list it. Validation therefore
+  skips the ref check for exactly this event class and nothing else;
+- a head commit the repository does not have is a transient fetch fault like any
+  other, so it retries under the same bounded attempt budget and then settles
+  `failed:resolution_attempts` — with a completed check, so the queue is never
+  left waiting on a delivery that will not resolve;
+- a `destroyed` group cancels the run the group produced and closes every delivery
+  of it still waiting, in one transaction (below).
 
 ### Pull requests
 
@@ -301,11 +339,15 @@ The compiled `on:` policy decides whether the event is one this pipeline wants
 |---|---|
 | `dispatched:<run>` | One immutable run was created from the compiled pipeline at the exact revision. |
 | `ignored:duplicate` | This ref transition was already dispatched. |
+| `ignored:merge_group_duplicate` | The merge group already has its delivery (or a run): one group is one run, whichever copy resolves first. |
+| `ignored:merge_group_destroyed`, `ignored:merge_group_merged` | The group was destroyed: its run was cancelled, or it never ran. The destroyed delivery settles with the first and the deliveries it overtook with the second. |
+| `ignored:merge_group_repository` | The group's head repository is no longer the bound one. |
 | `ignored:superseded` | The repository already moved past this push: the newest dispatched transition starts where it ended, or (for a branch) its revision is in the newest dispatched revision's history. |
 | `failed:tenant_suspended`, `failed:binding_revoked`, `failed:access_removed` | The binding authorizes nothing any more: the tenant is suspended, the binding revoked (including a `repository` rename revoking an App binding), or the App installation suspended, deleted or without the permissions it needs. |
 | `failed:destination_refused` | The deployment's `source-destinations.json` no longer approves the binding's remote; nothing was fetched. |
 | `ignored:no_trigger` | The pipeline at that revision does not declare this event or ref. |
 | `ignored:fork_pr`, `ignored:merge_unavailable` | Pull-request trust refusals (above). |
+| `failed:merge_group_terms` | A `merge_group` delivery arrived without its recorded terms — it cannot be resolved and is refused rather than run. |
 | `failed:no_pipeline` | The bound pipeline path does not exist at the revision. |
 | `failed:pipeline_invalid` | It exists but does not load, decode or compile; the reason is logged. |
 | `failed:image_unpinned` | A job's image is not digest-pinned; execution admission does not resolve tags. |
@@ -318,7 +360,8 @@ The compiled `on:` policy decides whether the event is one this pipeline wants
 
 Duplicate and reordered events are compared per stream: the newest dispatched
 delivery for the same repository, ref and event class (ref updates and pull
-requests are separate streams even when they share a base branch). Arrival
+requests are separate streams even when they share a base branch, and merge
+groups are a third stream that is compared inside a group only). Arrival
 order is not push order — a relay replays its spool, GitHub documents
 out-of-order delivery — so the rule is anchored on what was dispatched and on
 commit history:
@@ -339,10 +382,36 @@ can cancel the tip's run. The in-order case never touches Git for this (rule
 2). Tags and pull requests stop at rule 3: a retagged tag is not history, and
 one base branch's stream holds unrelated pull requests.
 
+**A merge group is its own stream, and its own ordering.** Duplicate, reordered
+and overtaken deliveries inside one group are decided from the group's rows
+alone, in one statement per delivery:
+
+1. a delivery whose queue branch and base commit already produced a run is
+   `ignored:merge_group_duplicate`, and so is one whose earlier twin (accepted
+   before it: earlier receipt, then lower id) is still waiting — exactly one
+   delivery of a group stands for it, whichever reaches the lane first;
+2. a group that already went away without a run (`merge_group_merged` or
+   `merge_group_destroyed` recorded for another delivery of it) settles
+   `ignored:merge_group_merged`: a group that arrives after its branch is gone
+   never starts a run;
+3. `destroyed` cancels the newest run the group produced and settles every
+   delivery of the group still waiting as `ignored:merge_group_merged`, then
+   settles itself — the cancellation and every settlement in one writer
+   transaction, so nothing of the group can start or dispatch behind it;
+4. nothing about a group is judged against the base branch's push stream: the
+   queue commit is not history of the base branch, and a push that lands
+   meanwhile neither supersedes nor duplicates the group.
+
+A refused group publishes a completed check with the **neutral** conclusion, so
+GitHub's queue decides instead of waiting ([checks](checks.md#check-identity-for-merge-groups));
+`ignored:merge_group_duplicate` publishes nothing, because the group's own run
+already has its checks.
+
 Every dispatched run records immutable provenance (`run_provenance`, migration
 19): the trigger kind, the delivery and provider, the ref transition, the
-pull-request head/base/merge revisions and number, the pipeline path and the
-exact revision the pipeline was read at, and the compiled pipeline digest. The
+pull-request head/base/merge revisions and number, the merge group's queue branch
+(`group_ref`, migration 66), the pipeline path and the exact revision the
+pipeline was read at, and the compiled pipeline digest. The
 worker's expression context is filled from it, so `event.name`, `event.ref`,
 `event.key`, `event.base_ref` and `event.pr_number` are real values rather
 than unresolved fields (see the [pipeline schema](pipeline-schema.md)).
@@ -400,21 +469,24 @@ above, which supersedes a push the branch already moved past.
 ## Verification
 
 - `crates/sentinel-github` unit tests: raw-body HMAC exactness (a reformatted
-  body fails), malformed headers, wrong keys, bounded push parsing, and
+  body fails), malformed headers, wrong keys, bounded push parsing,
   pull-request parsing (null merge, fork head recorded, malformed pieces
-  refused).
+  refused), and merge-group parsing (the queue branch, both stated commits, the
+  destroyed reason in either place, malformed and oversized pieces refused).
 - `crates/sentinel-pipeline` tests and fixtures: the `on:` mapping form, ref
   pattern matching and its bounds, the digest changing with the policy.
 - `crates/sentinel-git` tests: one file at one revision, annotated-tag
   peeling, missing/oversized/unsafe paths, and access that must match the
   remote and its expiry.
 - `crates/sentinel-store/tests/intake.rs`: dedup and mismatch, malformed terms
-  (including pull-request terms), the admission bound, digest-only
-  rotatable/revocable secrets, GitHub targets through a bound installation
-  only, every validation outcome, retry backoff and attempt exhaustion,
-  retention purging settled history only, immutable terms and provenance
-  through raw SQL, dispatch creating one run with its images and provenance,
-  and the duplicate/superseded streams.
+  (including pull-request and merge-group terms), the admission bound,
+  digest-only rotatable/revocable secrets, GitHub targets through a bound
+  installation only, every validation outcome, retry backoff and attempt
+  exhaustion, retention purging settled history only, immutable terms and
+  provenance through raw SQL, dispatch creating one run with its images and
+  provenance, the duplicate/superseded streams, and a merge group's terms,
+  immutability, cascade with its delivery, its open deliveries seeing each other
+  as duplicates and the group going away after a destroy.
 - `crates/sentinel-intake/tests/dispatch.rs` (Linux, needs `git`, `python3`,
   `openssl`): resolution over a real repository served on loopback HTTPS — a
   push dispatching with exact provenance, duplicate and superseded refusals,
@@ -424,6 +496,15 @@ above, which supersedes a push the branch already moved past.
   dispatching at the tested merge through a stubbed App token flow, fork and
   unmergeable refusals, a generic binding refusing PR metadata, and a revoked
   binding.
+- `crates/sentinel-intake/tests/dispatch.rs` also, for merge groups: a
+  `checks_requested` delivery creating one run at the commit GitHub stated (the
+  fake asserts the object id it was asked for) with the queue branch in its
+  provenance, the `sentinel / ci` and `sentinel / build` names published at that
+  commit, a redelivery — before and after a push to the base branch — running
+  nothing, a `destroyed` group cancelling its own run and no other, the
+  deliveries it overtook closed unsettled, an unreadable head commit refused
+  under the attempt budget, a policy without the trigger ignored, and a generic
+  binding refused without a fetch.
 - `crates/sentinel-intake/tests/dispatch.rs` also: non-adjacent out-of-order
   pushes superseded through Git ancestry with `cancel_in_progress` never
   cancelling the tip, and a forced rewind still running.
@@ -438,8 +519,10 @@ above, which supersedes a push the branch already moved past.
   window, force-pushed tips, and unauthenticated fetches refusing `ssh`,
   `git://` and plain `http://`.
 - `crates/sentinel-intake/tests/flow.rs`: both ingest paths over a real store,
-  including signature/tamper refusals, pull-request terms, and lane resolution
-  on a wake and on the idle tick.
+  including signature/tamper refusals, pull-request terms, merge-group
+  acceptance with its terms, dedup and audit, a misplaced merge-group action, an
+  unbound repository and another installation's repository both answered and
+  neither stored, and lane resolution on a wake and on the idle tick.
 - `crates/sentinel-store/tests/poll.rs`: opt-in configuration under tenant
   authority and its bounds, the baseline-then-diff protocol, deterministic
   delivery identities across replays, creation/move/deletion transitions,

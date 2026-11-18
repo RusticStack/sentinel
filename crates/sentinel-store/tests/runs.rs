@@ -296,6 +296,7 @@ fn provenance_of(f: &Fx, trigger: &str) -> Provenance {
         pipeline_path: None,
         pipeline_digest: [3; 16],
         pr_number: None,
+        group_ref: None,
     }
 }
 

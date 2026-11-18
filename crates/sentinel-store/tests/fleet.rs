@@ -266,6 +266,7 @@ fn record_event(f: &Fixture, tenant: TenantId, repo: RepoId, run: RunId, trigger
         pipeline_path: None,
         pipeline_digest: [0u8; 16],
         pr_number: Some(7),
+        group_ref: None,
     };
     f.store
         .writer()

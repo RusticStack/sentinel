@@ -216,6 +216,34 @@ a store fault while issuing is transient (`retried:store_unavailable`);
 only a sealed credential that cannot be opened is a permanent
 `failed:source_unavailable`. Version and ciphertext are read in one statement.
 
+## Merge groups
+
+A GitHub **merge queue** does not run checks on a pull request's merge commit: it
+builds its own group branch (`refs/heads/gh-readonly-queue/<base>/pr-<n>-<sha>`)
+holding the queued pull requests merged onto the base branch tip, and asks for
+the required checks on that branch's head through a `merge_group` event. The
+same binding reads it — the group's commits live in the repository the binding
+points at, so no separate transport, credential or trust exists for a queue:
+
+- the **queue branch** and the head commit are what the run checks out, by that
+  object id, so a base branch that moves afterwards changes nothing about what
+  ran; the queue ref is recorded in the run's provenance, because no ref of the
+  repository proves where the commit came from and ref polling cannot
+  reconstruct it;
+- the **base branch** is the delivery's ref, the branch whose policy the change
+  targets and whose `allowed_refs` entry gates it — the queue branch never has
+  to be listed in a binding, and cannot be;
+- the binding must be an App association: a generic binding cannot prove a group
+  came from the repository it reads (`failed:no_forge_association`), and a group
+  whose head repository is no longer the bound one is refused
+  (`ignored:merge_group_repository`);
+- a `destroyed` action cancels the run the group produced rather than starting
+  one ([intake](intake.md#merge-groups), [cancellation](cancellation.md)).
+
+The worker needs nothing new: a merge-group run is an ordinary run of a pinned
+commit with a ref name for its expression context, and the App token minted for
+resolution is the same narrowed `contents: read` token a push uses.
+
 ## Commands
 
 These host-local commands are authorized by holding the database file, not by `--actor`, which is only the attribution recorded in the audit trail; adding an actor check expecting it to gate access would not change who can run them. The authenticated tenant-administrator path is the API route `POST /tenants/{slug}/repos`.
@@ -289,7 +317,9 @@ Sentinel stores and delivers them, and cannot make a write-capable token safe.
 Migration 017 adds `source_bindings` and `source_audit` and extends
 `installations`; migration 018 adds `source_intake_tokens` and
 `webhook_deliveries` ([intake](intake.md)); migration 019 adds the resolved
-delivery states and per-run provenance ([intake](intake.md)). Repositories
+delivery states and per-run provenance ([intake](intake.md)); migration 66 adds
+`merge_deliveries` and `run_provenance.group_ref` for merge-queue groups
+([merge groups](#merge-groups)). Repositories
 stay unbound until bound. Protocol 2 adds the `Source` message and protocol 3
 the event context; a worker below protocol 3 is served `NoSpec`. Intake uses
 `POST /api/v1/hooks/github` and `POST /api/v1/intake/{repo}`. See

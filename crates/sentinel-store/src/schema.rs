@@ -173,6 +173,10 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("migrations/064_provenance_actor_put_marks_and_check_head_index.sql"),
     ),
     (65, include_str!("migrations/065_storage_classes.sql")),
+    (
+        66,
+        include_str!("migrations/066_merge_group_deliveries.sql"),
+    ),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -263,6 +267,10 @@ mod tests {
         (
             63,
             "an older controller would write a capacity report without the reported-host columns and would redeem a Tailcat enrollment without the authorized node key",
+        ),
+        (
+            66,
+            "an older controller re-reads a queued merge-group delivery as failed:unsupported_event and completes a required check the merge queue is waiting on, and it reads no queue branch into provenance",
         ),
     ];
 

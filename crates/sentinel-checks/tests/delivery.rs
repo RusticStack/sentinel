@@ -542,6 +542,7 @@ fn event_run(f: &mut Fixture) -> (RunId, JobId) {
                     pipeline_path: Some(".sentinel.yml".into()),
                     pipeline_digest: run_spec.pipeline.digest.to_le_bytes(),
                     pr_number: None,
+                    group_ref: None,
                 },
                 run,
                 UnixMillis::now(),

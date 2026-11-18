@@ -116,8 +116,15 @@ impl Conclusion {
 
     fn of_reason(reason: &str) -> Option<Conclusion> {
         Some(match reason {
-            "ref_deleted" | "duplicate" | "superseded" => return None,
-            "no_trigger" | "fork_pr" | "merge_unavailable" => Conclusion::Neutral,
+            // Nothing ran and nothing is owed: the transition already has a check.
+            "ref_deleted" | "duplicate" | "superseded" | "merge_group_duplicate" => return None,
+            // Understood, deliberately not executed.
+            "no_trigger"
+            | "fork_pr"
+            | "merge_unavailable"
+            | "merge_group_merged"
+            | "merge_group_destroyed"
+            | "merge_group_repository" => Conclusion::Neutral,
             _ => Conclusion::Failure,
         })
     }
@@ -334,7 +341,10 @@ fn run_facts(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Option<R
     let Some((head_sha, repo, forge, trigger)) = row else {
         return Ok(None);
     };
-    let event_driven = matches!(trigger.as_deref(), Some("push" | "tag" | "pull_request"));
+    let event_driven = matches!(
+        trigger.as_deref(),
+        Some("push" | "tag" | "pull_request" | "merge_group")
+    );
     if forge == 0 || !event_driven {
         return Ok(None);
     }

@@ -227,6 +227,7 @@ fn create_run_as(
                         pipeline_path: (trigger != "manual").then(|| ".sentinel.yml".into()),
                         pipeline_digest: [0; 16],
                         pr_number: None,
+                        group_ref: None,
                     },
                     run,
                     now,

@@ -28,6 +28,11 @@ use sentinel_store::{
 };
 
 const REF: &str = "refs/heads/main";
+/// GitHub names a group's queue branch after the pull request and the merge it
+/// built, so a group is identified by that branch and the base commit.
+fn queue_ref(head: &str) -> String {
+    format!("refs/heads/gh-readonly-queue/main/pr-7-{}", &head[..16])
+}
 const GITHUB_REPO_ID: u64 = 91;
 const IMAGE: &str = "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
 
@@ -430,6 +435,68 @@ impl Fixture {
             .unwrap()
     }
 
+    fn accept_merge_group(
+        &self,
+        id: &str,
+        action: &str,
+        head_sha: &str,
+        base_sha: &str,
+    ) -> DeliveryId {
+        let (id, action) = (id.to_owned(), action.to_owned());
+        let (head_sha, base_sha) = (head_sha.to_owned(), base_sha.to_owned());
+        let repo = self.github_repo;
+        self.store
+            .writer()
+            .write(move |tx| {
+                let terms = intake::MergeTerms {
+                    action: &action,
+                    head_ref: &queue_ref(&head_sha),
+                    head_sha: &head_sha,
+                    base_ref: "main",
+                    base_sha: &base_sha,
+                    head_repo: GITHUB_REPO_ID,
+                    reason: (action == "destroyed").then_some("merged"),
+                };
+                intake::accept_merge_group(
+                    tx,
+                    repo,
+                    &NewDelivery {
+                        authentication: sentinel_store::intake::Authentication::SignedWebhook,
+                        provider: "github",
+                        external_id: &id,
+                        event: "merge_group",
+                        ref_name: "refs/heads/main",
+                        old_sha: &base_sha,
+                        new_sha: &head_sha,
+                    },
+                    &terms,
+                    UnixMillis::now(),
+                )
+                .map(|accepted| accepted.id())
+            })
+            .unwrap()
+    }
+
+    fn checks_of(&self, run: sentinel_core::RunId) -> Vec<(String, String, String)> {
+        self.store
+            .read(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT name, head_sha, status FROM check_publications WHERE run_id = ?1
+                     ORDER BY name",
+                )?;
+                let rows =
+                    stmt.query_map([run.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .unwrap()
+    }
+
+    fn runs(&self) -> i64 {
+        self.store
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))?))
+            .unwrap()
+    }
+
     fn validate(&self, id: DeliveryId) -> intake::Delivery {
         self.store
             .writer()
@@ -716,6 +783,57 @@ fn an_unreachable_remote_retries_within_the_attempt_budget() {
         assert!(attempts <= 10, "the budget must be bounded");
     }
     assert!(attempts >= 3, "it retried rather than failing at once");
+}
+
+/// A merge group is read at the commit GitHub states, which the fake records so a
+/// test can prove the run was never resolved from a branch head.
+struct MergeFetch {
+    pipeline: String,
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+impl MergeFetch {
+    fn new(pipeline: String) -> Arc<MergeFetch> {
+        Arc::new(MergeFetch {
+            pipeline,
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.seen.lock().unwrap().len()
+    }
+
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl Fetch for MergeFetch {
+    fn file_at(
+        &self,
+        request: sentinel_intake::resolve::FileRequest<'_>,
+    ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error> {
+        self.seen.lock().unwrap().push(request.sha.to_owned());
+        Ok(sentinel_git::FetchedFile {
+            commit: request.sha.to_owned(),
+            bytes: self.pipeline.as_bytes().to_vec(),
+        })
+    }
+
+    fn merge_at(
+        &self,
+        _: sentinel_intake::resolve::MergeRequest<'_>,
+    ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error> {
+        panic!("a merge group is a commit, not a pull request's merge ref");
+    }
+
+    fn is_ancestor(
+        &self,
+        _: sentinel_intake::resolve::AncestryRequest<'_>,
+    ) -> Result<bool, sentinel_git::Error> {
+        panic!("a merge group is its own stream, never an ancestry question");
+    }
 }
 
 struct FakeFetch {
@@ -1074,6 +1192,320 @@ fn a_generic_binding_without_an_app_association_cannot_claim_a_pull_request() {
         }
     );
     assert_eq!(row.reason.as_deref(), Some("no_forge_association"));
+}
+
+#[test]
+fn a_checks_requested_merge_group_dispatches_one_run_at_the_stated_commit() {
+    if !prerequisites() {
+        return;
+    }
+    let f = fixture();
+    let head = "e".repeat(40);
+    let base = "d".repeat(40);
+    let fetch = MergeFetch::new(pipeline("[merge_group, push]"));
+    let (resolver, _stub) = app_resolver(&f, "merge", Arc::clone(&fetch) as Arc<dyn Fetch>);
+    let accepted = f.accept_merge_group("mg-1", "checks_requested", &head, &base);
+    let _ = f.validate(accepted);
+    let (outcome, row) = f.resolve_with(&resolver, accepted);
+    let Outcome::Dispatched { run } = outcome else {
+        panic!("expected a merge-group dispatch, got {outcome:?}");
+    };
+    assert_eq!(
+        fetch.seen(),
+        vec![head.clone()],
+        "read at the stated commit"
+    );
+    assert_eq!(row.state, State::Dispatched);
+    let spec = f.spec_of(run);
+    assert_eq!(spec.source.sha, head);
+    assert_eq!(
+        spec.source.ref_name.as_deref(),
+        Some(queue_ref(&head).as_str())
+    );
+    let recorded = f.provenance_of(run);
+    assert_eq!(recorded.trigger, "merge_group");
+    assert_eq!(recorded.provider.as_deref(), Some("github"));
+    assert_eq!(recorded.head_sha.as_deref(), Some(head.as_str()));
+    assert_eq!(recorded.base_sha.as_deref(), Some(base.as_str()));
+    assert_eq!(
+        recorded.group_ref.as_deref(),
+        Some(queue_ref(&head).as_str())
+    );
+    assert_eq!(recorded.ref_name.as_deref(), Some("refs/heads/main"));
+    let facts = f
+        .store
+        .read(move |c| provenance::event_facts(c, run))
+        .unwrap();
+    assert_eq!(facts.name, "merge_group");
+    assert_eq!(facts.ref_name, queue_ref(&head));
+    assert_eq!(facts.base_ref.as_deref(), Some("main"));
+    assert_eq!(
+        facts.key,
+        queue_ref(&head)
+            .strip_prefix("refs/heads/")
+            .unwrap()
+            .to_owned()
+    );
+    // The required check names are the same ones a pull request publishes, on the
+    // commit the queue gates on.
+    let checks = f.checks_of(run);
+    assert_eq!(
+        checks,
+        vec![
+            (
+                "sentinel / build".to_owned(),
+                head.clone(),
+                "queued".to_owned()
+            ),
+            (
+                "sentinel / ci".to_owned(),
+                head.clone(),
+                "queued".to_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_redelivered_merge_group_runs_nothing_a_second_time() {
+    if !prerequisites() {
+        return;
+    }
+    let f = fixture();
+    let head = "e".repeat(40);
+    let base = "d".repeat(40);
+    let fetch = MergeFetch::new(pipeline("[merge_group, push]"));
+    let (resolver, _stub) = app_resolver(&f, "dup", Arc::clone(&fetch) as Arc<dyn Fetch>);
+    let first = f.accept_merge_group("mg-dup-1", "checks_requested", &head, &base);
+    let _ = f.validate(first);
+    let (outcome, _) = f.resolve_with(&resolver, first);
+    assert!(matches!(outcome, Outcome::Dispatched { .. }), "{outcome:?}");
+
+    // The same group delivered again under a new delivery ID — GitHub sends the
+    // action again and a relay may replay it — dispatches nothing.
+    let again = f.accept_merge_group("mg-dup-2", "checks_requested", &head, &base);
+    let _ = f.validate(again);
+    let (outcome, row) = f.resolve_with(&resolver, again);
+    assert_eq!(outcome, Outcome::Ignored("merge_group_duplicate"));
+    assert_eq!(row.reason.as_deref(), Some("merge_group_duplicate"));
+    assert_eq!(f.runs(), 1);
+    assert_eq!(fetch.calls(), 1);
+
+    // A push to the base branch between the two deliveries changes nothing about
+    // the group: its head commit is still the one GitHub stated.
+    let push = f.accept_push("mg-dup-push", REF, &f.commits[1], &f.commits[2]);
+    let _ = f.validate(push);
+    let (outcome, _) = f.resolve(push);
+    assert!(
+        matches!(outcome, Outcome::Dispatched { .. }),
+        "a push is its own stream: {outcome:?}"
+    );
+    let third = f.accept_merge_group("mg-dup-3", "checks_requested", &head, &base);
+    let _ = f.validate(third);
+    let (outcome, _) = f.resolve_with(&resolver, third);
+    assert_eq!(outcome, Outcome::Ignored("merge_group_duplicate"));
+    assert_eq!(f.runs(), 2, "the group ran once and the push ran once");
+}
+
+#[test]
+fn a_destroyed_merge_group_cancels_its_run_and_nothing_else() {
+    if !prerequisites() {
+        return;
+    }
+    let f = fixture();
+    let head = "e".repeat(40);
+    let base = "d".repeat(40);
+    let other_head = "f".repeat(40);
+    let fetch = MergeFetch::new(pipeline("[merge_group, push]"));
+    let (resolver, _stub) = app_resolver(&f, "destroy", Arc::clone(&fetch) as Arc<dyn Fetch>);
+    let kept = f.accept_merge_group("mg-keep", "checks_requested", &other_head, &base);
+    let _ = f.validate(kept);
+    let (kept_outcome, _) = f.resolve_with(&resolver, kept);
+    let Outcome::Dispatched { run: kept_run } = kept_outcome else {
+        panic!("{kept_outcome:?}");
+    };
+    let gone = f.accept_merge_group("mg-gone", "checks_requested", &head, &base);
+    let _ = f.validate(gone);
+    let (gone_outcome, _) = f.resolve_with(&resolver, gone);
+    let Outcome::Dispatched { run: gone_run } = gone_outcome else {
+        panic!("{gone_outcome:?}");
+    };
+    // A delivery of the group still waiting when the destroy lands is closed with
+    // it, so it cannot dispatch for a group that no longer exists.
+    let waiting = f.accept_merge_group("mg-waiting", "checks_requested", &head, &base);
+    let destroyed = f.accept_merge_group("mg-destroyed", "destroyed", &head, &base);
+    let _ = f.validate(destroyed);
+    let (outcome, row) = f.resolve_with(&resolver, destroyed);
+    assert_eq!(outcome, Outcome::Ignored("merge_group_destroyed"));
+    assert_eq!(row.reason.as_deref(), Some("merge_group_destroyed"));
+    let waiting_row = f.store.read(move |c| intake::get(c, waiting)).unwrap();
+    assert_eq!(waiting_row.state, State::Ignored);
+    assert_eq!(waiting_row.reason.as_deref(), Some("merge_group_merged"));
+    assert_eq!(f.runs(), 2, "the waiting delivery never dispatched");
+
+    let cancelled = f
+        .store
+        .read(move |c| status::run(c, f.tenant, gone_run))
+        .unwrap();
+    assert!(cancelled.cancel_requested);
+    assert!(
+        cancelled
+            .jobs
+            .iter()
+            .all(|job| job.state
+                == sentinel_core::JobState::Terminal(sentinel_core::Outcome::Canceled)),
+        "{:?}",
+        cancelled.jobs
+    );
+    let kept_status = f
+        .store
+        .read(move |c| status::run(c, f.tenant, kept_run))
+        .unwrap();
+    assert!(!kept_status.cancel_requested);
+
+    // A destroyed group whose group never ran settles without a run and without
+    // publishing a second check.
+    let late = f.accept_merge_group("mg-late", "destroyed", &"a".repeat(40), &base);
+    let _ = f.validate(late);
+    let (outcome, row) = f.resolve_with(&resolver, late);
+    assert_eq!(outcome, Outcome::Ignored("merge_group_merged"));
+    assert_eq!(row.state, State::Ignored);
+    assert_eq!(f.runs(), 2);
+}
+
+#[test]
+fn unreadable_and_unknown_merge_groups_are_refused_with_a_reason() {
+    if !prerequisites() {
+        return;
+    }
+    let f = fixture();
+    let head = "e".repeat(40);
+    let base = "d".repeat(40);
+    // A head commit the repository does not have: a transient answer until the
+    // bounded budget runs out, then a settled refusal — never an endless retry.
+    let (resolver, _stub) = app_resolver(&f, "unreadable", Arc::new(UnreadableHead));
+    let accepted = f.accept_merge_group("mg-unreadable", "checks_requested", &head, &base);
+    let _ = f.validate(accepted);
+    let mut attempts = 0;
+    loop {
+        let (outcome, row) = f.resolve_with(&resolver, accepted);
+        attempts += 1;
+        match outcome {
+            Outcome::Retried { .. } => {
+                assert_eq!(row.state, State::Ready);
+                assert!(attempts <= intake::MAX_ATTEMPTS, "the budget is bounded");
+            }
+            Outcome::Failed { reason, .. } => {
+                assert_eq!(reason, "resolution_attempts");
+                assert_eq!(row.state, State::Failed);
+                break;
+            }
+            other => panic!("expected a bounded refusal, got {other:?}"),
+        }
+    }
+    assert!(attempts >= 2, "it retried before refusing");
+    assert_eq!(f.runs(), 0);
+
+    // A policy that does not declare merge groups is ignored, not failed.
+    let fetch = MergeFetch::new(pipeline("[push]"));
+    let (resolver, _stub) = app_resolver(&f, "undeclared", Arc::clone(&fetch) as Arc<dyn Fetch>);
+    let accepted = f.accept_merge_group("mg-undeclared", "checks_requested", &head, &base);
+    let _ = f.validate(accepted);
+    let (outcome, row) = f.resolve_with(&resolver, accepted);
+    assert_eq!(outcome, Outcome::Ignored("no_trigger"));
+    assert_eq!(row.state, State::Ignored);
+    // The group was refused by policy, so a redelivery is not a duplicate run but a
+    // fresh refusal — and still runs nothing.
+    let again = f.accept_merge_group("mg-undeclared-2", "checks_requested", &head, &base);
+    let _ = f.validate(again);
+    let (outcome, _) = f.resolve_with(&resolver, again);
+    assert_eq!(outcome, Outcome::Ignored("no_trigger"));
+    assert_eq!(f.runs(), 0);
+}
+
+#[test]
+fn a_generic_binding_cannot_run_a_merge_group() {
+    if !prerequisites() {
+        return;
+    }
+    let f = fixture();
+    let head = "e".repeat(40);
+    let base = "d".repeat(40);
+    let fetch = MergeFetch::new(pipeline("[merge_group]"));
+    // The generic repository has no forge association, so a merge group cannot
+    // claim it: only an App-associated binding can prove where the group came from.
+    let repo = f.repo;
+    let id = f
+        .store
+        .writer()
+        .write(move |tx| {
+            let queue = queue_ref(&head);
+            let terms = intake::MergeTerms {
+                action: "checks_requested",
+                head_ref: &queue,
+                head_sha: &head,
+                base_ref: "main",
+                base_sha: &base,
+                head_repo: GITHUB_REPO_ID,
+                reason: None,
+            };
+            intake::accept_merge_group(
+                tx,
+                repo,
+                &NewDelivery {
+                    authentication: sentinel_store::intake::Authentication::SignedWebhook,
+                    provider: "github",
+                    external_id: "mg-generic",
+                    event: "merge_group",
+                    ref_name: "refs/heads/main",
+                    old_sha: &base,
+                    new_sha: &head,
+                },
+                &terms,
+                UnixMillis::now(),
+            )
+            .map(|accepted| accepted.id())
+        })
+        .unwrap();
+    let _ = f.validate(id);
+    let (outcome, row) = f.resolve_with(&f.resolver, id);
+    assert_eq!(
+        outcome,
+        Outcome::Failed {
+            reason: "no_forge_association",
+            detail: None
+        }
+    );
+    assert_eq!(row.reason.as_deref(), Some("no_forge_association"));
+    assert_eq!(fetch.calls(), 0);
+    assert_eq!(f.runs(), 0);
+}
+
+struct UnreadableHead;
+
+impl Fetch for UnreadableHead {
+    fn file_at(
+        &self,
+        _: sentinel_intake::resolve::FileRequest<'_>,
+    ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error> {
+        Err(sentinel_git::Error::Preparation(
+            "the remote does not have that commit".into(),
+        ))
+    }
+
+    fn merge_at(
+        &self,
+        _: sentinel_intake::resolve::MergeRequest<'_>,
+    ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error> {
+        panic!("a merge group is a commit");
+    }
+
+    fn is_ancestor(
+        &self,
+        _: sentinel_intake::resolve::AncestryRequest<'_>,
+    ) -> Result<bool, sentinel_git::Error> {
+        panic!("a merge group is its own stream");
+    }
 }
 
 #[test]

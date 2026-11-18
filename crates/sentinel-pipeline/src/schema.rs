@@ -392,6 +392,7 @@ fn string_list(path: &str, node: &Node, max: usize, item_max: usize) -> Result<V
 ///   push: {branches: [main, "release/*"]}
 ///   tag: {tags: ["v*"]}
 ///   pull_request: {branches: [main]}
+///   merge_group: {branches: [main]}
 ///   manual: true
 /// ```
 fn parse_triggers(path: &str, node: &Node) -> Result<Triggers> {
@@ -401,8 +402,8 @@ fn parse_triggers(path: &str, node: &Node) -> Result<Triggers> {
             if items.is_empty() {
                 return Err(err(path, SchemaErrorKind::Empty));
             }
-            if items.len() > 4 {
-                return Err(err(path, SchemaErrorKind::TooMany { limit: 4 }));
+            if items.len() > 5 {
+                return Err(err(path, SchemaErrorKind::TooMany { limit: 5 }));
             }
             for (i, item) in items.iter().enumerate() {
                 let p = format!("{path}[{i}]");
@@ -410,6 +411,7 @@ fn parse_triggers(path: &str, node: &Node) -> Result<Triggers> {
                 let kind = match kind {
                     "push" => &mut triggers.push,
                     "pull_request" => &mut triggers.pull_request,
+                    "merge_group" => &mut triggers.merge_group,
                     "tag" => &mut triggers.tag,
                     "manual" => {
                         if triggers.manual {
@@ -425,7 +427,7 @@ fn parse_triggers(path: &str, node: &Node) -> Result<Triggers> {
                         return Err(err(
                             &p,
                             SchemaErrorKind::Invalid(
-                                "expected push, pull_request, tag or manual".into(),
+                                "expected push, pull_request, merge_group, tag or manual".into(),
                             ),
                         ));
                     }
@@ -448,6 +450,10 @@ fn parse_triggers(path: &str, node: &Node) -> Result<Triggers> {
             if let Some(n) = map.take("pull_request") {
                 triggers.pull_request =
                     Some(ref_filter(&map.child("pull_request"), n, RefKind::Branch)?);
+            }
+            if let Some(n) = map.take("merge_group") {
+                triggers.merge_group =
+                    Some(ref_filter(&map.child("merge_group"), n, RefKind::Branch)?);
             }
             if let Some(n) = map.take("tag") {
                 triggers.tag = Some(ref_filter(&map.child("tag"), n, RefKind::Tag)?);

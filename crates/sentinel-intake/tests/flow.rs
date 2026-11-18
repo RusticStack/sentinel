@@ -202,6 +202,139 @@ fn sign(payload: serde_json::Value, delivery: Option<&str>) -> (Vec<u8>, String,
     (body, signature, delivery.map(str::to_owned))
 }
 
+fn signed_merge_group(
+    action: &str,
+    delivery: &str,
+    installation: u64,
+    repository: i64,
+) -> (Vec<u8>, String) {
+    let payload = serde_json::json!({
+        "action": action,
+        "merge_group": {
+            "head_ref": "refs/heads/gh-readonly-queue/main/pr-7-aaaaaaaa",
+            "head_sha": "e".repeat(40),
+            "base_ref": "refs/heads/main",
+            "base_sha": "d".repeat(40),
+            "head_commit": {"id": "e".repeat(40)},
+        },
+        "reason": if action == "destroyed" { Some("merged") } else { None },
+        "installation": {"id": installation},
+        "repository": {"id": repository, "full_name": "account/widget"},
+    });
+    let (body, signature, _) = sign(payload, Some(delivery));
+    (body, signature)
+}
+
+fn with_merge_group(
+    f: &Fixture,
+    delivery: &str,
+    body: &[u8],
+    signature: &str,
+) -> Result<Github, IngestError> {
+    let event = "merge_group";
+    ingest::github(
+        &f.store,
+        WEBHOOK_SECRET,
+        event,
+        Some(delivery),
+        Some(signature),
+        body,
+        UnixMillis::now(),
+    )
+}
+
+#[test]
+fn merge_group_deliveries_are_signed_deduplicated_and_keep_their_terms() {
+    let f = fixture();
+    let (body, signature) = signed_merge_group("checks_requested", "mg-1", 42, GITHUB_REPO_ID);
+    let mut tampered = body.clone();
+    tampered[12] ^= 1;
+    assert_eq!(
+        with_merge_group(&f, "mg-1", &tampered, &signature),
+        Err(IngestError::Unauthenticated)
+    );
+    let accepted = with_merge_group(&f, "mg-1", &body, &signature).unwrap();
+    let Github::Ingested(accepted) = accepted else {
+        panic!("a signed merge group must be ingested");
+    };
+    assert!(!accepted.duplicate);
+    assert_eq!(
+        with_merge_group(&f, "mg-1", &body, &signature).unwrap(),
+        Github::Ingested(sentinel_intake::Ingested {
+            duplicate: true,
+            ..accepted
+        })
+    );
+    assert_eq!(state(&f, f.github_repo), vec![State::Pending]);
+
+    let row = f.store.read(move |c| intake::get(c, accepted.id)).unwrap();
+    assert_eq!(row.event, "merge_group");
+    assert_eq!(row.ref_name.as_deref(), Some("refs/heads/main"));
+    assert_eq!(row.old_sha.as_deref(), Some("d".repeat(40).as_str()));
+    assert_eq!(row.new_sha.as_deref(), Some("e".repeat(40).as_str()));
+    let terms = f
+        .store
+        .read(move |c| intake::merge_for(c, accepted.id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(terms.action, "checks_requested");
+    assert_eq!(
+        terms.head_ref,
+        "refs/heads/gh-readonly-queue/main/pr-7-aaaaaaaa"
+    );
+    assert_eq!(terms.base_ref, "main");
+    assert_eq!(terms.head_repo, GITHUB_REPO_ID as u64);
+    assert_eq!(terms.reason, None);
+
+    let (destroyed, signature) = signed_merge_group("destroyed", "mg-2", 42, GITHUB_REPO_ID);
+    assert!(matches!(
+        with_merge_group(&f, "mg-2", &destroyed, &signature).unwrap(),
+        Github::Ingested(_)
+    ));
+
+    // A misplaced action and an unrelated ref shape are acknowledged, never stored.
+    let (closed, signature) = signed_merge_group("reopened", "mg-3", 42, GITHUB_REPO_ID);
+    assert_eq!(
+        with_merge_group(&f, "mg-3", &closed, &signature).unwrap(),
+        Github::Ignored("merge_group_action")
+    );
+    let (bad_ref, signature, _) = sign(
+        serde_json::json!({
+            "action": "checks_requested",
+            "merge_group": {
+                "head_ref": "refs/tags/not-a-queue-branch",
+                "head_sha": "e".repeat(40),
+                "base_ref": "refs/heads/main",
+                "base_sha": "d".repeat(40),
+            },
+            "installation": {"id": 42},
+            "repository": {"id": GITHUB_REPO_ID},
+        }),
+        Some("mg-4"),
+    );
+    assert_eq!(
+        with_merge_group(&f, "mg-4", &bad_ref, &signature),
+        Err(IngestError::InvalidRequest("payload ref"))
+    );
+    // An unbound repository, and one bound under another installation, are both
+    // answered so the sender stops retrying and neither reaches a stored row.
+    let (unbound, signature) = signed_merge_group("checks_requested", "mg-5", 42, 92);
+    assert_eq!(
+        with_merge_group(&f, "mg-5", &unbound, &signature).unwrap(),
+        Github::Ignored("unbound_repository")
+    );
+    let (foreign, signature) = signed_merge_group("checks_requested", "mg-6", 43, GITHUB_REPO_ID);
+    assert_eq!(
+        with_merge_group(&f, "mg-6", &foreign, &signature).unwrap(),
+        Github::Ignored("unbound_repository")
+    );
+    assert_eq!(
+        state(&f, f.github_repo),
+        vec![State::Pending, State::Pending],
+        "only the two bound deliveries are stored"
+    );
+}
+
 #[test]
 fn the_generic_path_authenticates_scopes_and_deduplicates() {
     let f = fixture();
