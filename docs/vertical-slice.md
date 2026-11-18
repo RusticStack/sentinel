@@ -18,6 +18,7 @@ The worker, link, executor and store are exercised together under the failures t
 | network loss under a running job | `slice.rs`: the controller drops the session (`Handle::disconnect`); the worker keeps the attempt, reconnects with back-off, resends its log from the cursor; the log has every frame once |
 | no duplicate healthy-session execution | `slice.rs`: every job's fence is 1 and the executor started exactly one attempt per job across the cancel, the loss and the restart |
 | no orphaned owned processes after recovery | `slice.rs` and `end_to_end.rs`: `podman::owned` empty, no workspace, spool or marker left |
+| a workspace tree another in-namespace user owns | counted by the storage guard and removed through `podman unshare` ([executor](executor.md#disk)): decisions in `workspace.rs` and `quota.rs` unit tests; the real tree is `crates/sentinel-worker/tests/podman.rs` `a_tree_another_in_namespace_user_owns_is_counted_by_the_guard_and_removed_with_the_workspace`, which needs rootless Podman (`SENTINEL_PODMAN_TESTS=1`) and has not run on a host; `slice.rs` does not reproduce it |
 
 ## Test hooks
 

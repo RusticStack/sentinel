@@ -748,3 +748,61 @@ fn a_job_tmp_counts_against_the_declared_disk_and_the_guard_stops_the_container(
     assert!(podman::owned(worker).unwrap().is_empty());
     ws.destroy().unwrap();
 }
+
+#[test]
+fn a_tree_another_in_namespace_user_owns_is_counted_by_the_guard_and_removed_with_the_workspace() {
+    if !enabled() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    // What a job running as another in-namespace user leaves: owned by a subordinate id on the host, sealed so
+    // the worker account can neither enter, chmod nor unlink it.
+    let made = std::process::Command::new("podman")
+        .args(["unshare", "sh", "-e", "-c"])
+        .arg(
+            "mkdir -p \"$1/foreign/inner\"; \
+             dd if=/dev/zero of=\"$1/foreign/inner/data\" bs=1M count=32 2>/dev/null; \
+             chown -R 1000:1000 \"$1/foreign\"; chmod 0700 \"$1/foreign\" \"$1/foreign/inner\"",
+        )
+        .arg("sh")
+        .arg(ws.path())
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    assert!(
+        fs::read_dir(ws.path().join("foreign")).is_err(),
+        "the worker must not be able to read it"
+    );
+
+    let limit: u64 = 16 << 20;
+    let stops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&stops);
+    let guard =
+        sentinel_worker::quota::Guard::start(vec![ws.path().to_path_buf()], limit, move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+    let started = std::time::Instant::now();
+    while guard.exceeded().is_none() && started.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let used = guard
+        .exceeded()
+        .expect("the 32 MiB behind the foreign directory passed the 16 MiB budget");
+    assert!(used >= 32 << 20, "{used}");
+    assert!(!guard.unreadable(), "the namespace count saw all of it");
+    drop(guard);
+    assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    ws.destroy().unwrap();
+    assert_eq!(
+        fs::read_dir(temp.path().join("workspaces"))
+            .unwrap()
+            .count(),
+        0
+    );
+}

@@ -192,7 +192,13 @@ impl Reroot {
 }
 
 /// The job controls the tree, so nothing may follow a link it plants: each step is relative to a held descriptor.
+/// What the worker account cannot remove itself, because another in-namespace user of the job owns it, is removed
+/// once from inside the user namespace ([`crate::podman::remove_in_namespace`]).
 pub fn remove_tree(path: &Path) -> Result<()> {
+    remove_tree_with(path, crate::podman::remove_in_namespace)
+}
+
+fn remove_tree_with(path: &Path, in_namespace: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     if let Ok(root) = std::ffi::CString::new(path.as_os_str().as_bytes())
         && let Some(root) = open_dir_nofollow(libc::AT_FDCWD, &root)
     {
@@ -201,6 +207,16 @@ pub fn remove_tree(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // Permission is the only refusal another owner explains; a missing runtime, a full disk or a file where a
+        // directory belongs would fail the same way inside the namespace.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            in_namespace(path).map_err(|inside| {
+                Error::Workspace(format!(
+                    "{}: {e}; removal in the user namespace: {inside}",
+                    path.display()
+                ))
+            })
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -362,6 +378,72 @@ mod tests {
         assert_eq!(mode, 0o500, "the link's target was chmodded");
         assert!(outside.join("keep").exists());
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// A tree the worker account cannot delete although it can make everything below it walkable: its parent
+    /// refuses the final `rmdir`, which fails with `EACCES` exactly as a directory another user owns does.
+    fn tree_under_a_sealed_parent(dir: &Path) -> (PathBuf, PathBuf) {
+        let parent = dir.join("parent");
+        let root = parent.join("ws");
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::write(root.join("a/file"), b"x").unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        (parent, root)
+    }
+
+    #[test]
+    fn a_tree_the_worker_cannot_delete_is_removed_once_from_inside_the_namespace() {
+        if crate::euid() == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, root) = tree_under_a_sealed_parent(dir.path());
+        let calls = std::cell::Cell::new(0);
+        remove_tree_with(&root, |path| {
+            calls.set(calls.get() + 1);
+            assert_eq!(path, root);
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
+            Ok(fs::remove_dir_all(path)?)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_failed_removal_in_the_namespace_is_reported_with_both_reasons_and_not_retried() {
+        if crate::euid() == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, root) = tree_under_a_sealed_parent(dir.path());
+        let calls = std::cell::Cell::new(0);
+        let error = remove_tree_with(&root, |_| {
+            calls.set(calls.get() + 1);
+            Err(Error::Timeout("namespace removal"))
+        })
+        .unwrap_err()
+        .to_string();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(calls.get(), 1, "one bounded attempt");
+        assert!(error.contains("Permission denied"), "{error}");
+        assert!(error.contains("namespace removal exceeded"), "{error}");
+        assert!(root.exists(), "what stayed behind is still there to reap");
+    }
+
+    #[test]
+    fn the_namespace_is_not_asked_when_nothing_was_refused_for_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let ask = |_: &Path| -> Result<()> { panic!("the namespace must not be asked") };
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(tree.join("a")).unwrap();
+        remove_tree_with(&tree, ask).unwrap();
+        assert!(!tree.exists());
+        remove_tree_with(&dir.path().join("absent"), ask).unwrap();
+        // A file where the tree belongs is not an ownership problem.
+        let file = dir.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        assert!(remove_tree_with(&file, ask).is_err());
     }
 
     #[test]
