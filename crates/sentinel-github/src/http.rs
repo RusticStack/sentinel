@@ -27,13 +27,14 @@ impl Client {
         if body.len() > MAX_BODY as usize {
             return Err(Error::Config("request size"));
         }
+        let authorization = bearer(token)?;
         let response = self
             .agent
             .post(url)
             .header("accept", "application/vnd.github+json")
             .header("content-type", "application/json")
             .header("x-github-api-version", "2022-11-28")
-            .header("authorization", &format!("Bearer {token}"))
+            .header("authorization", authorization)
             .send(body.as_slice())
             .map_err(transport)?;
         json(response)
@@ -64,12 +65,13 @@ impl Client {
     }
 
     pub fn get_authenticated(&self, url: &str, token: &str) -> Result<serde_json::Value> {
+        let authorization = bearer(token)?;
         let response = self
             .agent
             .get(url)
             .header("accept", "application/vnd.github+json")
             .header("x-github-api-version", "2022-11-28")
-            .header("authorization", &format!("Bearer {token}"))
+            .header("authorization", authorization)
             .call()
             .map_err(transport)?;
         json(response)
@@ -135,18 +137,64 @@ impl Client {
         if !matches!(method, "GET" | "POST" | "PATCH") {
             return Err(Error::Config("request method"));
         }
+        let authorization = bearer(token)?;
         let request = ureq::http::Request::builder()
             .method(method)
             .uri(url)
             .header("accept", "application/vnd.github+json")
             .header("content-type", "application/json")
             .header("x-github-api-version", "2022-11-28")
-            .header("authorization", &format!("Bearer {token}"))
+            .header("authorization", authorization)
             .body(encoded.unwrap_or_default())
             .map_err(|_| Error::Config("request"))?;
         let response = self.agent.run(request).map_err(transport)?;
         reply(response, max_body)
     }
+}
+
+/// The `authorization` header value, `Bearer <token>`, built into one exactly sized buffer that is
+/// overwritten with zeros when this guard drops, so the token's text never outlives the request build in a
+/// freed heap region the way a `format!` string would.
+///
+/// Not wiped, and out of this crate's reach: the `HeaderValue` the request owns (a copy the `http` crate
+/// makes and frees without clearing), the serialized request `ureq` keeps in its connection's reused output
+/// buffer, and the TLS record buffers. The value is marked sensitive so `Debug` output of a request never
+/// prints it, and nothing here logs it. See docs/github-app.md.
+struct BearerBuffer(Vec<u8>);
+
+impl BearerBuffer {
+    const SCHEME: &'static [u8] = b"Bearer ";
+
+    fn new(token: &str) -> Self {
+        let mut value = Vec::with_capacity(Self::SCHEME.len() + token.len());
+        value.extend_from_slice(Self::SCHEME);
+        value.extend_from_slice(token.as_bytes());
+        Self(value)
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn wipe(&mut self) {
+        sentinel_auth::secret::wipe(&mut self.0);
+    }
+}
+
+impl Drop for BearerBuffer {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+/// The header value for `token`; the buffer it was copied from is wiped before this returns. A token that
+/// is not a valid header value is refused without being echoed.
+fn bearer(token: &str) -> Result<ureq::http::HeaderValue> {
+    let buffer = BearerBuffer::new(token);
+    let mut value = ureq::http::HeaderValue::from_bytes(buffer.as_bytes())
+        .map_err(|_| Error::Config("authorization"))?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 pub struct Reply {
@@ -227,5 +275,40 @@ impl From<ureq::Error> for TransportKind {
             }
             .to_owned(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN: &str = "ghs_0123456789abcdefghijklmnopqrstuvwxyz";
+
+    #[test]
+    fn a_wiped_bearer_buffer_holds_no_token_byte() {
+        let mut buffer = BearerBuffer::new(TOKEN);
+        assert_eq!(buffer.as_bytes(), format!("Bearer {TOKEN}").as_bytes());
+        buffer.wipe();
+        assert_eq!(buffer.as_bytes().len(), "Bearer ".len() + TOKEN.len());
+        assert!(
+            buffer.as_bytes().iter().all(|&byte| byte == 0),
+            "every byte, the scheme and the token alike, is zero after the wipe"
+        );
+    }
+
+    #[test]
+    fn the_header_value_carries_the_token_marked_sensitive_and_never_debug_prints_it() {
+        let value = bearer(TOKEN).unwrap();
+        assert_eq!(value.as_bytes(), format!("Bearer {TOKEN}").as_bytes());
+        assert!(value.is_sensitive());
+        assert!(!format!("{value:?}").contains(TOKEN));
+    }
+
+    #[test]
+    fn a_token_that_is_not_a_header_value_is_refused_without_being_echoed() {
+        let token = "ghs_bad\nline";
+        let error = bearer(token).unwrap_err();
+        assert!(matches!(error, Error::Config("authorization")));
+        assert!(!format!("{error} {error:?}").contains("ghs_bad"));
     }
 }
