@@ -1,5 +1,5 @@
 use std::{
-    io::Write,
+    io::{Read, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -197,6 +197,27 @@ impl Remote for S3Bucket {
     fn fetch(&self, key: &str, out: &mut dyn Write) -> sentinel_store::Result<u64> {
         self.get(key, out)
             .map_err(|e| sentinel_store::Error::Io(std::io::Error::other(e.message)))
+    }
+    fn read_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: u64,
+    ) -> sentinel_store::Result<Box<dyn Read + Send>> {
+        let fault =
+            |message: &str| sentinel_store::Error::Io(std::io::Error::other(message.to_owned()));
+        let last = offset
+            .checked_add(len)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or_else(|| fault("invalid byte range"))?;
+        let (_, got, body) = self
+            .client
+            .get_range(&self.client.key(key), offset, last)
+            .map_err(|e| fault(&map(e).message))?;
+        if got < len {
+            return Err(fault("range answered short"));
+        }
+        Ok(Box::new(body.take(len)))
     }
 }
 

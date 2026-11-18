@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 
 use crate::{
     LOG_WAIT, MAX_UPLOAD_CHUNK, State, TRANSFERS,
+    archive::{Archive, Format},
     auth::{self, Identity, Refusal, Via},
 };
 
@@ -197,16 +198,13 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
             let _ = request.respond(response);
         }
         Reply::Stream(status, reader, len, headers) => {
-            let mut response = Response::new(
-                StatusCode(status),
-                vec![
-                    header("content-type", "application/octet-stream"),
-                    header("cache-control", "no-store"),
-                ],
-                reader,
-                Some(len as usize),
-                None,
-            );
+            // A body whose type the caller named (an archive) keeps it; everything else is opaque bytes.
+            let mut base = vec![header("cache-control", "no-store")];
+            if !headers.iter().any(|h| h.field.equiv("content-type")) {
+                base.push(header("content-type", "application/octet-stream"));
+            }
+            let mut response =
+                Response::new(StatusCode(status), base, reader, Some(len as usize), None);
             for h in headers {
                 response = response.with_header(h);
             }
@@ -732,6 +730,9 @@ pub(crate) fn route(
                 });
             }
             ok(body)
+        }
+        ("GET", ["api", "v1", "runs", run, "artifacts", art, "archive"]) => {
+            artifact_archive(state, request, run, art, query)
         }
         ("GET", ["api", "v1", "attempts", attempt, "logs"]) => {
             attempt_logs(state, request, attempt, query)
@@ -2098,6 +2099,111 @@ fn byte_range(spec: &str, len: u64) -> Result<(u64, u64), ApiError> {
         return Err(invalid());
     }
     Ok((start, end))
+}
+
+/// The whole artifact as one archive, generated from the stored manifest as the body streams: nothing is staged on
+/// disk, and the length is stated up front so a damaged entry truncates the body instead of completing it.
+fn artifact_archive(
+    state: &State,
+    request: &mut Request,
+    run: &str,
+    art: &str,
+    query: &str,
+) -> Route {
+    let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::ARTIFACTS_READ)?;
+    let format = match query_param(query, "format") {
+        None => Format::Tar,
+        Some(text) => Format::parse(text)
+            .ok_or_else(|| err(ErrorCode::InvalidRequest, "format is tar or zip"))?,
+    };
+    let (run, art): (RunId, ArtifactId) = (id(run, "run")?, id(art, "artifact")?);
+    let (tenant, row, manifest) = state
+        .store
+        .read(|c| {
+            let repo = lookup::run_repo(c, run)?;
+            let (tenant, _) = authz::require_repo_slug(c, who.principal, repo, Permissions::READ)?;
+            let row = artifacts::get(c, tenant, run, art)?;
+            // Retention is re-checked here and not only by the sweep: an artifact past its deadline is gone to the
+            // client from the moment it is due, whatever the maintenance pass has reached.
+            if row.retain_until_ms <= UnixMillis::now() {
+                return Err(StoreError::NotFound);
+            }
+            let Some(version) = row.manifest_version else {
+                return Err(StoreError::NotFound);
+            };
+            let manifest = state.objects.manifest(
+                c,
+                tenant,
+                sentinel_store::objects::Kind::Artifact,
+                &artifacts::manifest_name(row.job, &row.name),
+                Some(version),
+            )?;
+            Ok((tenant, row, manifest))
+        })
+        .map_err(store_error)?;
+    let objects = Arc::clone(&state.objects);
+    let mut archive = Archive::new(
+        format,
+        manifest.entries,
+        manifest.created_ms.0,
+        Box::new(move |entry| {
+            objects
+                .open_entry(tenant, entry.digest, entry.len)
+                .map(|reader| Box::new(reader) as Box<dyn Read + Send>)
+                .map_err(|_| std::io::Error::other("entry unavailable"))
+        }),
+    );
+    // The first entry opens here, so one that cannot be read at all is a response, not a truncated body.
+    archive
+        .prime()
+        .map_err(|_| err(ErrorCode::Internal, "controller fault"))?;
+    let len = archive.len();
+    let slot = slot(state)?;
+    let headers = vec![
+        header("content-type", format.content_type()),
+        header(
+            "content-disposition",
+            &format!(
+                "attachment; filename=\"{}\"",
+                archive_file_name(&row, format)
+            ),
+        ),
+        header("x-content-type-options", "nosniff"),
+    ];
+    Ok(Reply::Stream(
+        200,
+        Box::new(Held {
+            inner: archive,
+            _slot: slot,
+        }),
+        len,
+        headers,
+    ))
+}
+
+/// The download's file name: the job's and the artifact's own names, cut to what a manifest name may hold and
+/// stripped of anything that is not a plain file-name character.
+fn archive_file_name(row: &artifacts::Row, format: Format) -> String {
+    let mut name = String::with_capacity(row.job_name.len() + row.name.len() + 8);
+    for (at, part) in [row.job_name.as_str(), row.name.as_str()]
+        .into_iter()
+        .enumerate()
+    {
+        if at > 0 {
+            name.push('-');
+        }
+        for c in part.chars() {
+            name.push(match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => c,
+                _ => '_',
+            });
+        }
+    }
+    name.truncate(200);
+    name.push('.');
+    name.push_str(format.extension());
+    name
 }
 
 fn object_download(state: &State, request: &mut Request, slug: &str, digest: &str) -> Route {

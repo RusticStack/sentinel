@@ -1223,6 +1223,7 @@ name = "sentinel-api"
 version = "0.1.0-dev"
 dependencies = [
  "blake3",
+ "crc32fast",
  "form_urlencoded",
  "libc",
  "ring",
