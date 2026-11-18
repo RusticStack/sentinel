@@ -21,7 +21,7 @@ use sentinel_protocol::negotiate::{
     PROFILE_MIN, Profile,
 };
 use sentinel_store::{
-    Store, artifacts, dispatch,
+    Store, artifacts, classes, dispatch,
     logs::LogStore,
     objects::{self, Objects},
     retention, skipped, workers,
@@ -423,6 +423,9 @@ struct Inner {
     remote_budget: AtomicU64,
     order: AtomicU8,
     last_storage: AtomicI64,
+    /// The last UTC day whose per-tenant class snapshot is complete, and where an unfinished day's batches stop.
+    snapshot_done: AtomicI64,
+    snapshot_resume: Mutex<Option<(i64, [u8; 16])>>,
     maintenance: (Mutex<bool>, Condvar),
     remote_cache: Mutex<Option<std::path::PathBuf>>,
     config: Arc<rustls::ServerConfig>,
@@ -1458,6 +1461,7 @@ impl Inner {
         }
         self.logs.close_idle(sentinel_store::logs::WRITER_IDLE);
         self.log_retention(now);
+        self.class_snapshots(now);
         let passed_over = skipped::total() - skipped;
         if passed_over > 0
             && let Some(row) = skipped::last()
@@ -1471,6 +1475,44 @@ impl Inner {
             );
         }
         true
+    }
+
+    /// Writes each tenant's snapshot for the current UTC day, a batch per writer transaction and up to
+    /// `STORAGE_ROUNDS` batches a pass; a day larger than that resumes after its last key on the next pass, and a day
+    /// already complete costs nothing until the date changes. A snapshot already there is kept, so a restart repeats no work
+    /// that matters.
+    fn class_snapshots(&self, now: UnixMillis) {
+        let day = classes::day_of(now);
+        if self.snapshot_done.load(Ordering::Relaxed) >= day {
+            return;
+        }
+        let mut after = self
+            .snapshot_resume
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .filter(|(resumed, _)| *resumed == day)
+            .map(|(_, key)| key);
+        for _ in 0..STORAGE_ROUNDS {
+            let cursor = after;
+            let Ok((seen, last)) = self
+                .write(move |tx| classes::snapshot_day(tx, day, now, cursor, STORAGE_BATCH as u32))
+            else {
+                return;
+            };
+            if i64::from(seen) < STORAGE_BATCH {
+                self.snapshot_done.store(day, Ordering::Relaxed);
+                *self
+                    .snapshot_resume
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
+                return;
+            }
+            after = last;
+        }
+        *self
+            .snapshot_resume
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = after.map(|key| (day, key));
     }
 
     fn log_retention(&self, now: UnixMillis) {
@@ -3140,6 +3182,16 @@ impl Controller {
                             .stats
                             .remote_cache_bytes
                             .store(swept.bytes, Ordering::Relaxed);
+                        // A walk that stopped early saw only part of the store: its totals would understate every tenant.
+                        if swept.complete
+                            && let Err(e) = classes::report_remote_cache(&inner.store, &swept.repos)
+                        {
+                            tracing::warn!(
+                                event = "remote_cache_usage_unreported",
+                                error = %e,
+                                "the remote cache store's per-tenant totals were not written; the previous figures stay"
+                            );
+                        }
                     }
                     drop(inner);
                     thread::sleep(REMOTE_SWEEP_INTERVAL);
@@ -3206,6 +3258,8 @@ impl Controller {
             remote_budget: AtomicU64::new(sentinel_cache::remote::STORE_BUDGET_BYTES),
             order: AtomicU8::new(PlacementOrder::Fastest as u8),
             last_storage: AtomicI64::new(0),
+            snapshot_done: AtomicI64::new(-1),
+            snapshot_resume: Mutex::new(None),
             maintenance: (Mutex::new(false), Condvar::new()),
             remote_cache: Mutex::new(None),
             config,
