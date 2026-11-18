@@ -2,8 +2,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  digestVerdict, enrollmentError, identityCommand, installCommand, MAX_GIB, parseIdentityLine, parseTerms, rollbackCommand,
-  scrub, secretFileCommand, sha256Hex, statedDigest, uninstallCommand, workerName,
+  digestVerdict, enrollmentError, identityCommand, installCommand, MAX_GIB, overCapText, parseIdentityLine, parsePolicy, parseTerms, policyFields,
+  rollbackCommand, savePolicy, scrub, secretFileCommand, sha256Hex, sizeText, statedDigest, uninstallCommand, workerName,
 } from "../src/lib/enrollment.ts";
 
 const HEX = "0123456789abcdef".repeat(4);
@@ -147,4 +147,90 @@ test("the page prints only a digest the controller stated, never a null", () => 
   assert.equal(statedDigest([]), null);
   assert.equal(statedDigest([null, HEX]), HEX);
   assert.equal(statedDigest([HEX, "f".repeat(64)]), HEX);
+});
+
+const GIB = 2 ** 30;
+const approved = { cpu_millis: 4000, memory_bytes: 8 * GIB, disk_bytes: null, priority: 5 };
+const worker = "wrk_0b6d3f5a-1c2e-4a7b-9d8c-5e4f3a2b1c0d";
+const recorder = () => {
+  const sent = [];
+  return { sent, send: async (path, options) => (sent.push({ path, ...options }), { approved: options.body }) };
+};
+
+test("a policy edit reaches the API with exactly the numbers entered, as the whole policy", async () => {
+  const { sent, send } = recorder();
+  const saved = await savePolicy(send, worker, { cpu: "2.5", memoryGiB: "16", diskGiB: "200", priority: "-3" }, approved);
+  assert.equal(saved.ok, true);
+  assert.deepEqual(sent, [{
+    path: `/api/v1/admin/workers/${worker}/policy`, method: "PUT",
+    body: { cpu_millis: 2500, memory_bytes: 16 * GIB, disk_bytes: 200 * GIB, priority: -3 },
+  }]);
+  assert.deepEqual(saved.value, { approved: sent[0].body });
+});
+
+test("an emptied ceiling is sent as null, which removes it, and an untouched field keeps the approved value", async () => {
+  const { sent, send } = recorder();
+  await savePolicy(send, worker, { cpu: "", memoryGiB: "8", diskGiB: "", priority: "5" }, approved);
+  assert.deepEqual(sent[0].body, { cpu_millis: null, memory_bytes: 8 * GIB, disk_bytes: null, priority: 5 });
+  assert.deepEqual(policyFields(approved), { cpu: "4", memoryGiB: "8", diskGiB: "", priority: "5" });
+  const unchanged = await savePolicy(send, worker, policyFields(approved), approved);
+  assert.equal(unchanged.ok, true);
+  assert.deepEqual(sent[1].body, approved);
+});
+
+test("saving a priority change does not round a ceiling that is not a whole number of GiB or of cores", async () => {
+  const odd = { cpu_millis: 2250, memory_bytes: 1536 * 2 ** 20 + 1, disk_bytes: 500 * 2 ** 20, priority: 0 };
+  const fields = policyFields(odd);
+  assert.equal(fields.cpu, "2.25");
+  assert.equal(fields.diskGiB, "0.488");
+  const { sent, send } = recorder();
+  await savePolicy(send, worker, { ...fields, priority: "12" }, odd);
+  assert.deepEqual(sent[0].body, { ...odd, priority: 12 });
+  const edited = await savePolicy(send, worker, { ...fields, diskGiB: "0.5" }, odd);
+  assert.equal(edited.ok, false, "an edited ceiling follows the whole-GiB rule of the issue form");
+  assert.equal(edited.field, "diskGiB");
+  assert.equal(sent.length, 1);
+});
+
+test("a value the form refuses names its field and sends nothing", async () => {
+  const { sent, send } = recorder();
+  for (const [over, field] of [
+    [{ cpu: "0" }, "cpu"], [{ cpu: "-2" }, "cpu"], [{ cpu: "lots" }, "cpu"],
+    [{ memoryGiB: "0" }, "memoryGiB"], [{ memoryGiB: "1.5" }, "memoryGiB"],
+    [{ diskGiB: "-1" }, "diskGiB"],
+    [{ priority: "101" }, "priority"], [{ priority: "2.5" }, "priority"], [{ priority: "" }, null],
+  ]) {
+    const result = await savePolicy(send, worker, { ...policyFields(approved), ...over }, approved);
+    if (field === null) {
+      assert.equal(result.ok, true, "an empty priority is neutral, as on the API");
+      assert.equal(sent.pop().body.priority, 0);
+      continue;
+    }
+    assert.equal(result.ok, false, JSON.stringify(over));
+    assert.equal(result.field, field, JSON.stringify(over));
+  }
+  assert.equal(sent.length, 0);
+  assert.equal(parsePolicy({ cpu: "1", memoryGiB: "", diskGiB: "", priority: "-100" }, approved).value.priority, -100);
+});
+
+test("a refusal from the controller is shown in words, and a vanished worker says so", () => {
+  const refused = { status: 400, code: "invalid_request", message: "invalid host ceiling" };
+  assert.match(enrollmentError(refused, "policy").text, /refused the values: invalid host ceiling/);
+  assert.match(enrollmentError({ status: 404, code: "not_found", message: "not found" }, "policy").text, /not enrolled any more/);
+  assert.match(enrollmentError({ status: 403, code: "forbidden", message: "x", details: { step_up: true } }, "policy").text, /second factor/);
+  const limited = enrollmentError({ status: 429, code: "rate_limited", message: "x", details: { retry_after_ms: 6000 } }, "policy");
+  assert.equal(limited.retryMs, 6000);
+});
+
+test("the over-cap state is stated from the controller's numbers, and only when the work does not fit", () => {
+  assert.equal(overCapText(null), null);
+  assert.equal(overCapText({ over: false, cpu_millis: 0, memory_bytes: 0, disk_bytes: 0 }), null);
+  const text = overCapText({ over: true, cpu_millis: 1500, memory_bytes: GIB, disk_bytes: 0 });
+  assert.match(text, /1\.5 cores, 1\.0 GiB of memory/);
+  assert.doesNotMatch(text, /disk/);
+  assert.match(text, /keeps running/);
+  assert.equal(
+    sizeText({ cpu_millis: 16_000, memory_bytes: 64 * GIB, disk_bytes: 0 }),
+    "16 cores · 64 GiB memory · disk not stated",
+  );
 });

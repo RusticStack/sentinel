@@ -1,5 +1,6 @@
 // Pure helpers for the worker enrollment page (docs/web-ui.md, "Worker enrollment"). Nothing here touches the network or
 // keeps a secret: the page hands the issued secret to the shown-once dialog and keeps only the fields below.
+import { fmtBytes } from "./format.ts";
 
 export interface Ceilings { cpu: string; memoryGiB: string; diskGiB: string; priority: string; lifetimeHours: string }
 export type CeilingField = keyof Ceilings;
@@ -68,6 +69,87 @@ export function parseTerms(c: Ceilings): Parsed<Terms> {
   return { ok: true, value: terms };
 }
 
+/** What the controller approved for a host; `null` is no ceiling. */
+export interface HostPolicyValues { cpu_millis: number | null; memory_bytes: number | null; disk_bytes: number | null; priority: number }
+/** The body of PUT /api/v1/admin/workers/{wrk}/policy: the whole policy, an explicit `null` removing a ceiling. */
+export type PolicyBody = HostPolicyValues;
+export type PolicyFields = Pick<Ceilings, "cpu" | "memoryGiB" | "diskGiB" | "priority">;
+
+export const coresText = (millis: number) => {
+  const fraction = String(millis % 1000).padStart(3, "0").replace(/0+$/, "");
+  return fraction ? `${Math.floor(millis / 1000)}.${fraction}` : String(Math.floor(millis / 1000));
+};
+const gibText = (bytes: number) => (bytes % GIB === 0 ? String(bytes / GIB) : (bytes / GIB).toFixed(3).replace(/0+$/, ""));
+
+/** The fields as the edit form shows an approved policy. A ceiling that is not a whole number of GiB is shown to three decimals. */
+export function policyFields(policy: HostPolicyValues): PolicyFields {
+  return {
+    cpu: policy.cpu_millis === null ? "" : coresText(policy.cpu_millis),
+    memoryGiB: policy.memory_bytes === null ? "" : gibText(policy.memory_bytes),
+    diskGiB: policy.disk_bytes === null ? "" : gibText(policy.disk_bytes),
+    priority: String(policy.priority),
+  };
+}
+
+/**
+ * The policy the form asks for, in the units the controller takes. A field left as the form showed it keeps the approved
+ * value exactly (so saving a priority change does not round a ceiling that was not a whole number of GiB); an edited
+ * field is parsed by the issue form's rules, and blank removes the ceiling.
+ */
+export function parsePolicy(fields: PolicyFields, current: HostPolicyValues): Parsed<PolicyBody> {
+  const shown = policyFields(current);
+  const kept = (field: keyof PolicyFields) => fields[field].trim() === shown[field];
+  const terms = parseTerms({
+    cpu: kept("cpu") ? "" : fields.cpu,
+    memoryGiB: kept("memoryGiB") ? "" : fields.memoryGiB,
+    diskGiB: kept("diskGiB") ? "" : fields.diskGiB,
+    priority: kept("priority") ? "0" : fields.priority,
+    lifetimeHours: "1",
+  });
+  if (!terms.ok) return terms;
+  return {
+    ok: true,
+    value: {
+      cpu_millis: kept("cpu") ? current.cpu_millis : (terms.value.cpu_millis ?? null),
+      memory_bytes: kept("memoryGiB") ? current.memory_bytes : (terms.value.memory_bytes ?? null),
+      disk_bytes: kept("diskGiB") ? current.disk_bytes : (terms.value.disk_bytes ?? null),
+      priority: kept("priority") ? current.priority : terms.value.priority,
+    },
+  };
+}
+
+/** Validates the form, then sends the whole policy through `send`; nothing is sent for a value the form refuses. */
+export async function savePolicy<T>(
+  send: (path: string, options: { method: "PUT"; body: PolicyBody }) => Promise<T>,
+  worker: string, fields: PolicyFields, current: HostPolicyValues,
+): Promise<Parsed<T>> {
+  const parsed = parsePolicy(fields, current);
+  if (!parsed.ok) return parsed;
+  return { ok: true, value: await send(`/api/v1/admin/workers/${encodeURIComponent(worker)}/policy`, { method: "PUT", body: parsed.value }) };
+}
+
+/** One size as the policy panel states it; a zero is a size nobody stated (or, for a disk, one the controller does not enforce). */
+export const sizeText = (size: { cpu_millis: number; memory_bytes: number; disk_bytes: number }) =>
+  [
+    size.cpu_millis > 0 ? `${coresText(size.cpu_millis)} cores` : "cores not stated",
+    size.memory_bytes > 0 ? `${fmtBytes(size.memory_bytes)} memory` : "memory not stated",
+    size.disk_bytes > 0 ? `${fmtBytes(size.disk_bytes)} disk` : "disk not stated",
+  ].join(" · ");
+
+/** How far the accepted work exceeds what the controller now offers, per resource (all zero within the cap). */
+export interface OverCap { over: boolean; cpu_millis: number; memory_bytes: number; disk_bytes: number }
+
+/** The over-cap state in words, or null when the machine's accepted work fits. Quantities come from the controller, never from the form. */
+export function overCapText(over: OverCap | null | undefined): string | null {
+  if (!over?.over) return null;
+  const parts = [
+    over.cpu_millis > 0 ? `${coresText(over.cpu_millis)} cores` : null,
+    over.memory_bytes > 0 ? `${fmtBytes(over.memory_bytes)} of memory` : null,
+    over.disk_bytes > 0 ? `${fmtBytes(over.disk_bytes)} of disk` : null,
+  ].filter((part): part is string => part !== null);
+  return `The work this machine already accepted holds ${parts.join(", ")} more than the policy offers. It keeps running; nothing new is placed on the machine until the accepted work fits.`;
+}
+
 const NODE_KEY = /^nodekey:[0-9a-f]{64}$/;
 const WORKER = /^wrk_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -118,7 +200,7 @@ export const statedDigest = (stated: readonly (string | null | undefined)[]): st
 
 /** What a failed call told us, as the page needs it. `details` is the controller's, never the person's input. */
 export interface Failure { status: number; code: string; message: string; details?: Record<string, any> }
-export type Context = "issue" | "withdraw" | "node-key" | "download" | "uninstall" | "load";
+export type Context = "issue" | "withdraw" | "node-key" | "download" | "uninstall" | "policy" | "load";
 
 const SECRETISH = /sntl_[0-9a-fA-F]{64}|nodekey:[0-9a-fA-F]{64}|[0-9a-fA-F]{64}/g;
 /** A controller message with anything secret-shaped removed, so no sentence the page shows can repeat one. */
@@ -151,6 +233,7 @@ export function enrollmentError(f: Failure, context: Context): Sentence {
         case "node-key": return { text: "That enrollment does not exist any more. Issue a new one." };
         case "download": return { text: "That enrollment does not exist any more, so there is no script for it. Issue a new one." };
         case "uninstall": return { text: "That worker is not enrolled any more." };
+        case "policy": return { text: "That worker is not enrolled any more, so its policy cannot be read or changed." };
         default: return { text: "Not found, or you no longer have access to it." };
       }
     case "conflict":

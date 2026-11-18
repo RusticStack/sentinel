@@ -1,12 +1,13 @@
 // Worker enrollment (docs/web-ui.md, "Worker enrollment"). The enrollment secret and the Tailcat address exist only inside
 // the shown-once dialog: they are never put in loader data, router state, a URL, storage, a toast or an error sentence,
 // and the page keeps nothing but the fields in `Target`.
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
 import { api, apiBytes, ApiError } from "../../lib/api.ts";
 import { StepUpDeclined, useRetryWait, withStepUp } from "../../lib/act.tsx";
 import {
   type Ceilings, type CeilingField, digestCommand, digestVerdict, enrollmentError, fmtUtc, identityCommand, installCommand, parseIdentityLine, statedDigest,
-  parseTerms, rollbackCommand, SCRIPT_NAME, secretFileCommand, sha256Hex, uninstallCommand, type Context, type Verdict,
+  overCapText, parseTerms, policyFields, rollbackCommand, SCRIPT_NAME, savePolicy, secretFileCommand, sha256Hex, sizeText, uninstallCommand,
+  type Context, type HostPolicyValues, type OverCap, type PolicyFields, type Verdict,
 } from "../../lib/enrollment.ts";
 import { cpu as fmtCpu, fmtBytes } from "../../lib/format.ts";
 import { useLoaded } from "../../lib/hooks.ts";
@@ -23,9 +24,12 @@ export interface BootstrapOptions {
   transports?: { direct: TransportOptions; tailcat: TransportOptions };
 }
 interface PoolRow { id: string; name: string; kind: string; active: boolean }
-interface HostPolicy { cpu_millis: number | null; memory_bytes: number | null; disk_bytes: number | null; priority: number }
+type HostPolicy = HostPolicyValues;
+interface Size { cpu_millis: number; memory_bytes: number; disk_bytes: number }
+/** The host view the controller answers with: the approved policy, what the machine reported and what is offered. */
+interface HostView { approved: HostPolicy; reported: Size; effective: Size; reserved: Size; over_cap: OverCap }
 interface EnrollmentRow { id: string; pool: string; state: "pending" | "redeemed" | "revoked" | "expired"; transport: Transport; created_ms: number; expires_ms: number; host: HostPolicy }
-interface HostRow { id: string; pool: string; name: string; arch: string; connected: boolean; transport: Transport; last_seen_ms: number | null; uninstall_requested_ms: number | null; host: { approved: HostPolicy } }
+interface HostRow { id: string; pool: string; name: string; arch: string; connected: boolean; transport: Transport; last_seen_ms: number | null; uninstall_requested_ms: number | null; host: HostView }
 export interface WorkersPage { options: BootstrapOptions; pools: PoolRow[]; enrollments: EnrollmentRow[]; workers: HostRow[] }
 
 const readEnrollments = () => api<{ enrollments: EnrollmentRow[] }>("/api/v1/admin/worker-enrollments?limit=50");
@@ -113,6 +117,15 @@ export function Workers({ initial }: { initial: WorkersPage | null }) {
   const [keyNote, setKeyNote] = useState<{ ok: boolean; text: string } | null>(null);
   const [authorizing, setAuthorizing] = useState(false);
   const [listProblem, setListProblem] = useState("");
+
+  const [editing, setEditing] = useState<{ id: string; name: string; view: HostView | null } | null>(null);
+  const [policy, setPolicy] = useState<PolicyFields>({ cpu: "", memoryGiB: "", diskGiB: "", priority: "0" });
+  const [policyInvalid, setPolicyInvalid] = useState<{ field: keyof PolicyFields; message: string } | null>(null);
+  const [policyProblem, setPolicyProblem] = useState("");
+  const [policyNote, setPolicyNote] = useState("");
+  const [savingPolicy, setSavingPolicy] = useState(false);
+  const policyWait = useRetryWait();
+  const policyHeading = useRef<HTMLHeadingElement>(null);
 
   const setCeiling = (field: CeilingField, value: string) => {
     setCeilings((c) => ({ ...c, [field]: value }));
@@ -202,6 +215,61 @@ export function Workers({ initial }: { initial: WorkersPage | null }) {
       setListProblem(say("uninstall", x));
     }
     await refresh();
+  }
+
+  async function editPolicy(row: HostRow) {
+    setPolicyProblem("");
+    setPolicyNote("");
+    setPolicyInvalid(null);
+    setPolicy(policyFields(row.host.approved));
+    setEditing({ id: row.id, name: row.name, view: row.host });
+    requestAnimationFrame(() => policyHeading.current?.focus());
+    try {
+      const fresh = await api<HostView>(`/api/v1/admin/workers/${row.id}/policy`);
+      setEditing((now) => (now?.id === row.id ? { ...now, view: fresh } : now));
+      setPolicy(policyFields(fresh.approved));
+    } catch (x) {
+      setPolicyProblem(say("policy", x));
+    }
+  }
+
+  const setPolicyField = (field: keyof PolicyFields, value: string) => {
+    setPolicy((p) => ({ ...p, [field]: value }));
+    setPolicyInvalid(null);
+    setPolicyNote("");
+  };
+
+  async function submitPolicy(e: FormEvent) {
+    e.preventDefault();
+    if (!editing?.view || savingPolicy || policyWait.waiting) return;
+    setPolicyProblem("");
+    setPolicyNote("");
+    setSavingPolicy(true);
+    try {
+      const saved = await savePolicy((path, options) => withStepUp(() => api<HostView>(path, options), me), editing.id, policy, editing.view.approved);
+      if (!saved.ok) {
+        setPolicyInvalid({ field: saved.field as keyof PolicyFields, message: saved.message });
+        return;
+      }
+      setPolicyInvalid(null);
+      setEditing({ ...editing, view: saved.value });
+      setPolicy(policyFields(saved.value.approved));
+      setPolicyNote(`Policy of ${editing.name} saved.`);
+      toast({ title: `Policy of ${editing.name} saved`, color: "success", icon: "check" });
+      await refresh();
+    } catch (x) {
+      if (x instanceof StepUpDeclined) {
+        setPolicyNote("Confirmation cancelled. Nothing was changed.");
+        return;
+      }
+      const f = failure(x);
+      if (f.code === "unauthenticated") return;
+      const sentence = enrollmentError(f, "policy");
+      if (sentence.retryMs) policyWait.start(sentence.retryMs);
+      setPolicyProblem(sentence.text);
+    } finally {
+      setSavingPolicy(false);
+    }
   }
 
   function showSteps(row: EnrollmentRow) {
@@ -449,11 +517,19 @@ export function Workers({ initial }: { initial: WorkersPage | null }) {
                 <td><span className="font-medium text-strong">{w.name}</span> <span className="text-muted">{w.arch}</span></td>
                 <td>{poolName(w.pool)}</td>
                 <td>{w.transport === "tailcat" ? "Tailcat" : "Direct TLS"}</td>
-                <td>{w.uninstall_requested_ms ? <Badge color="warning">uninstalling</Badge> : w.connected ? <Badge color="success">connected</Badge> : <Badge>offline</Badge>}</td>
+                <td>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {w.uninstall_requested_ms ? <Badge color="warning">uninstalling</Badge> : w.connected ? <Badge color="success">connected</Badge> : <Badge>offline</Badge>}
+                    {w.host.over_cap.over ? <Badge color="warning" icon="triangle-alert" title="The work already accepted exceeds what the policy now offers">over cap</Badge> : null}
+                  </div>
+                </td>
                 <td className="text-muted">{policyText(w.host.approved)}</td>
                 <td>
                   {w.uninstall_requested_ms ? null : (
-                    <Button size="sm" color="error" variant="outline" label="Request uninstall" aria-label={`Request the uninstall of ${w.name}`} onClick={() => void uninstall(w)} />
+                    <div className="flex flex-wrap gap-2">
+                      <Button size="sm" color="neutral" variant="outline" label="Edit policy" aria-label={`Edit the policy of ${w.name}`} onClick={() => void editPolicy(w)} />
+                      <Button size="sm" color="error" variant="outline" label="Request uninstall" aria-label={`Request the uninstall of ${w.name}`} onClick={() => void uninstall(w)} />
+                    </div>
                   )}
                 </td>
               </tr>
@@ -461,6 +537,45 @@ export function Workers({ initial }: { initial: WorkersPage | null }) {
           </tbody>
         </Table>
       </section>
+
+      {editing ? (
+        <section aria-labelledby="w-policy-h" className="space-y-3 rounded-lg border border-line p-4">
+          <h2 id="w-policy-h" ref={policyHeading} tabIndex={-1} className="text-base font-semibold text-strong">Policy of {editing.name}</h2>
+          <p className="max-w-prose text-sm text-muted">
+            The ceilings and priority this controller approves for the machine; it can never raise them. A reduction stops new work at once and leaves running attempts alone; a raise is used by the next placement pass and never passes what the machine reports.
+            Saving replaces the whole policy, and an empty ceiling removes it.
+          </p>
+          {editing.view ? (
+            <dl className="grid max-w-3xl gap-x-4 gap-y-1 text-sm sm:grid-cols-[auto_1fr]">
+              <dt className="text-muted">Reported by the machine</dt><dd>{sizeText(editing.view.reported)}</dd>
+              <dt className="text-muted">Offered now</dt><dd>{sizeText(editing.view.effective)}</dd>
+              <dt className="text-muted">Held by accepted work</dt><dd>{sizeText(editing.view.reserved)}</dd>
+            </dl>
+          ) : null}
+          {editing.view && overCapText(editing.view.over_cap) ? <Alert color="warning" role="status" title="Over its cap" description={overCapText(editing.view.over_cap)} /> : null}
+          <form className="flex flex-wrap items-start gap-3" aria-label={`Change the policy of ${editing.name}`} onSubmit={submitPolicy} noValidate>
+            <Field label="CPU ceiling" htmlFor="w-pol-cpu" hint="cores" error={policyInvalid?.field === "cpu" ? policyInvalid.message : undefined}>
+              <Input id="w-pol-cpu" name="w-pol-cpu" inputMode="decimal" autoComplete="off" placeholder="no limit" value={policy.cpu} onChange={(e) => setPolicyField("cpu", e.target.value)} aria-invalid={policyInvalid?.field === "cpu" || undefined} disabled={!editing.view} className="w-28 max-w-full" />
+            </Field>
+            <Field label="Memory ceiling" htmlFor="w-pol-mem" hint="GiB" error={policyInvalid?.field === "memoryGiB" ? policyInvalid.message : undefined}>
+              <Input id="w-pol-mem" name="w-pol-mem" inputMode="numeric" autoComplete="off" placeholder="no limit" value={policy.memoryGiB} onChange={(e) => setPolicyField("memoryGiB", e.target.value)} aria-invalid={policyInvalid?.field === "memoryGiB" || undefined} disabled={!editing.view} className="w-28 max-w-full" />
+            </Field>
+            <Field label="Disk ceiling" htmlFor="w-pol-disk" hint="GiB" error={policyInvalid?.field === "diskGiB" ? policyInvalid.message : undefined}>
+              <Input id="w-pol-disk" name="w-pol-disk" inputMode="numeric" autoComplete="off" placeholder="no limit" value={policy.diskGiB} onChange={(e) => setPolicyField("diskGiB", e.target.value)} aria-invalid={policyInvalid?.field === "diskGiB" || undefined} disabled={!editing.view} className="w-28 max-w-full" />
+            </Field>
+            <Field label="Priority" htmlFor="w-pol-priority" hint="-100 to 100" error={policyInvalid?.field === "priority" ? policyInvalid.message : undefined}>
+              <Input id="w-pol-priority" name="w-pol-priority" inputMode="numeric" autoComplete="off" value={policy.priority} onChange={(e) => setPolicyField("priority", e.target.value)} aria-invalid={policyInvalid?.field === "priority" || undefined} disabled={!editing.view} className="w-28 max-w-full" />
+            </Field>
+            <div className="flex gap-2 self-end">
+              <Button type="submit" loading={savingPolicy} disabled={!editing.view || policyWait.waiting > 0}
+                label={policyWait.waiting > 0 ? `Try again in ${policyWait.waiting} s` : "Save policy"} />
+              <Button color="neutral" variant="outline" label="Close" onClick={() => setEditing(null)} />
+            </div>
+          </form>
+          {policyProblem ? <Alert color="error" role="alert" description={<span id="w-policy-error">{policyProblem}</span>} /> : null}
+          {policyNote ? <p role="status" className="text-sm text-muted">{policyNote}</p> : null}
+        </section>
+      ) : null}
 
       <section aria-labelledby="w-remove-h" className="space-y-3">
         <h2 id="w-remove-h" className="text-base font-semibold text-strong">Roll back or remove a machine</h2>
