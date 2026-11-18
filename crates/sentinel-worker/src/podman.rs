@@ -124,6 +124,38 @@ pub(crate) fn podman_in(store: &Store) -> Command {
     cmd
 }
 
+/// The longest one removal in the user namespace may run. A tree of millions of files takes well under this; a
+/// removal that does not finish is reported as timed out and left to the next reap pass, never retried here.
+pub(crate) const NAMESPACE_REMOVE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// `podman unshare`: the command runs as the root of the account's rootless user namespace, where the files that
+/// other in-namespace users of a job created (owned by subordinate ids on the host) belong to an id the worker
+/// controls. It gains nothing over those files and the worker's own; no ownership is changed.
+pub(crate) fn unshare_command() -> Command {
+    let mut cmd = podman();
+    cmd.arg("unshare");
+    cmd
+}
+
+/// Removes the tree at `path` from inside the user namespace, for the files the worker account itself cannot
+/// delete. One attempt under [`NAMESPACE_REMOVE_TIMEOUT`]; `rm` does not follow symbolic links.
+pub(crate) fn remove_in_namespace(path: &Path) -> Result<()> {
+    let mut cmd = unshare_command();
+    cmd.args(["rm", "-rf", "--"]).arg(path);
+    let removed = process::run(
+        cmd,
+        deadline(NAMESPACE_REMOVE_TIMEOUT),
+        "workspace removal in the user namespace",
+    )?;
+    if removed.success() {
+        return Ok(());
+    }
+    Err(Error::Runtime(format!(
+        "podman unshare rm: {}",
+        removed.stderr_excerpt()
+    )))
+}
+
 fn podman_executable() -> Result<std::path::PathBuf> {
     let Some(path) = std::env::var_os("PATH") else {
         return Err(Error::Preparation(

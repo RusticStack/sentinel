@@ -8,10 +8,14 @@
 //! between two samples: the interval follows the cost of a walk (an eighth of a core at most, 0.5 to 5 s), so a
 //! fast writer can pass the limit by its rate times that interval before the stop lands. It is a bounded
 //! overshoot, not a kernel byte quota; microVMs have a size-bound scratch disk instead and need no guard.
+//!
+//! A directory the worker account is refused (a rootless user namespace leaves trees that another in-namespace
+//! user owns) is not skipped: the walk sets it aside by path and, once per sample, one `podman unshare du`
+//! counts them all from inside the namespace, under its own time budget.
 
 use std::{
     collections::HashSet,
-    ffi::CString,
+    ffi::{CStr, CString, OsStr},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::ffi::{OsStrExt, OsStringExt},
@@ -38,6 +42,10 @@ pub(crate) const MAX_DEPTH: usize = 128;
 /// Hard-linked files remembered so each is charged once; beyond this each further link is charged again.
 const MAX_LINKS_TRACKED: usize = 1 << 20;
 const CHECK_TIME_EVERY: u64 = 512;
+/// Directories the walk could not enter that one in-namespace count takes at a time, and the path bytes it may
+/// carry (the command line's limit). Beyond either the rest is reported unreadable: a lower bound, never a hang.
+const MAX_FOREIGN: usize = 1024;
+const MAX_FOREIGN_PATH_BYTES: usize = 1 << 20;
 
 /// What one walk found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,8 +66,18 @@ pub struct Usage {
     pub unreadable: bool,
 }
 
+/// A directory the worker account was refused (another in-namespace user of the job owns it): its own blocks are
+/// charged, its contents are counted from inside the user namespace ([`namespace_usage`]).
+struct Foreign {
+    path: PathBuf,
+    /// What the walk already charged for the directory itself, which the in-namespace count includes again.
+    charged: u64,
+}
+
 struct Walk<'a> {
     abort: &'a AtomicBool,
+    foreign: &'a mut Vec<Foreign>,
+    foreign_path_bytes: usize,
     limit: u64,
     deadline: Instant,
     root_dev: u64,
@@ -89,7 +107,7 @@ impl Walk<'_> {
     }
 }
 
-fn fstatat(dir: &OwnedFd, name: &std::ffi::CStr) -> Option<libc::stat> {
+fn fstatat(dir: &OwnedFd, name: &CStr) -> std::io::Result<libc::stat> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
     // SAFETY: `dir` is an open descriptor, `name` is NUL-terminated and `stat` is a writable `stat`; the
     // call never follows a final symbolic link.
@@ -101,11 +119,14 @@ fn fstatat(dir: &OwnedFd, name: &std::ffi::CStr) -> Option<libc::stat> {
             libc::AT_SYMLINK_NOFOLLOW,
         )
     };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     // SAFETY: `fstatat` returned 0, so it filled the structure.
-    (status == 0).then(|| unsafe { stat.assume_init() })
+    Ok(unsafe { stat.assume_init() })
 }
 
-fn open_dir(parent: libc::c_int, name: &std::ffi::CStr) -> Option<OwnedFd> {
+fn open_dir(parent: libc::c_int, name: &CStr) -> std::io::Result<OwnedFd> {
     // SAFETY: `name` is NUL-terminated and `parent` is a live descriptor or `AT_FDCWD`; the flags only open an
     // existing directory and never follow a final symbolic link.
     let fd = unsafe {
@@ -115,8 +136,11 @@ fn open_dir(parent: libc::c_int, name: &std::ffi::CStr) -> Option<OwnedFd> {
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     // SAFETY: a non-negative `openat` result is a descriptor this call owns.
-    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 fn charge(walk: &mut Walk, stat: &libc::stat) {
@@ -130,6 +154,43 @@ fn charge(walk: &mut Walk, stat: &libc::stat) {
     walk.bytes = walk
         .bytes
         .saturating_add((stat.st_blocks as u64).saturating_mul(512));
+}
+
+fn is_denied(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+}
+
+fn blocks_of(dir: &OwnedFd) -> u64 {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `dir` is open and `stat` is a writable `stat`.
+    if unsafe { libc::fstat(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    // SAFETY: `fstat` returned 0, so it filled the structure.
+    (unsafe { stat.assume_init() }.st_blocks as u64).saturating_mul(512)
+}
+
+/// Sets aside the directory `name` of `parent` (`parent` itself without a name) for the in-namespace count. Its
+/// path is read back from the held descriptor, which no link the job planted can redirect. Only a directory
+/// the walk was refused reaches this, so the walk itself allocates nothing for it.
+fn refuse(walk: &mut Walk, parent: &OwnedFd, name: Option<&CStr>, charged: u64) {
+    let Ok(mut path) = std::fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd())) else {
+        walk.complete = false;
+        walk.unreadable = true;
+        return;
+    };
+    if let Some(name) = name {
+        path.push(OsStr::from_bytes(name.to_bytes()));
+    }
+    walk.foreign_path_bytes = walk
+        .foreign_path_bytes
+        .saturating_add(path.as_os_str().len());
+    if walk.foreign.len() >= MAX_FOREIGN || walk.foreign_path_bytes > MAX_FOREIGN_PATH_BYTES {
+        walk.complete = false;
+        walk.unreadable = true;
+        return;
+    }
+    walk.foreign.push(Foreign { path, charged });
 }
 
 fn descend(dir: &OwnedFd, depth: usize, walk: &mut Walk) {
@@ -151,9 +212,16 @@ fn descend(dir: &OwnedFd, depth: usize, walk: &mut Walk) {
         let Ok(name) = CString::new(entry.file_name().into_vec()) else {
             continue;
         };
-        let Some(stat) = fstatat(dir, &name) else {
+        let stat = match fstatat(dir, &name) {
+            Ok(stat) => stat,
+            // A directory that lists but cannot be searched: no entry of it can be stat'ed from here.
+            Err(error) if is_denied(&error) => {
+                let charged = blocks_of(dir);
+                refuse(walk, dir, None, charged);
+                return;
+            }
             // Gone between the listing and the stat: the job deleted it.
-            continue;
+            Err(_) => continue,
         };
         if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
             if stat.st_dev != walk.root_dev {
@@ -169,8 +237,12 @@ fn descend(dir: &OwnedFd, depth: usize, walk: &mut Walk) {
                 return;
             }
             match open_dir(dir.as_raw_fd(), &name) {
-                Some(child) => descend(&child, depth + 1, walk),
-                None => {
+                Ok(child) => descend(&child, depth + 1, walk),
+                Err(error) if is_denied(&error) => {
+                    let charged = (stat.st_blocks as u64).saturating_mul(512);
+                    refuse(walk, dir, Some(&name), charged);
+                }
+                Err(_) => {
                     walk.complete = false;
                     walk.unreadable = true;
                 }
@@ -186,16 +258,35 @@ fn descend(dir: &OwnedFd, depth: usize, walk: &mut Walk) {
 }
 
 /// Walks `root` and returns what it occupies. The walk stops as soon as the total passes `limit` (the caller
-/// only needs to know it did), `budget` runs out or `abort` is set.
+/// only needs to know it did), `budget` runs out or `abort` is set. A directory it was refused is not counted:
+/// the figure is then a lower bound ([`Usage::unreadable`]).
 pub fn measure(
     root: &Path,
     limit: u64,
     budget: Duration,
     abort: &AtomicBool,
 ) -> std::io::Result<Usage> {
+    let mut refused = Vec::new();
+    let mut usage = measure_into(root, limit, budget, abort, &mut refused)?;
+    if !refused.is_empty() {
+        usage.complete = false;
+        usage.unreadable = true;
+    }
+    Ok(usage)
+}
+
+/// [`measure`], leaving the directories the walk was refused in `refused` for the caller to count from inside
+/// the user namespace instead of marking the figure incomplete for them.
+fn measure_into(
+    root: &Path,
+    limit: u64,
+    budget: Duration,
+    abort: &AtomicBool,
+    refused: &mut Vec<Foreign>,
+) -> std::io::Result<Usage> {
     let path = CString::new(root.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let dir = open_dir(libc::AT_FDCWD, &path).ok_or_else(std::io::Error::last_os_error)?;
+    let dir = open_dir(libc::AT_FDCWD, &path)?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
     // SAFETY: `dir` is open and `stat` is a writable `stat`.
     if unsafe { libc::fstat(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
@@ -205,6 +296,8 @@ pub fn measure(
     let stat = unsafe { stat.assume_init() };
     let mut walk = Walk {
         abort,
+        foreign_path_bytes: refused.iter().map(|f| f.path.as_os_str().len()).sum(),
+        foreign: refused,
         limit,
         deadline: Instant::now() + budget,
         root_dev: stat.st_dev,
@@ -352,9 +445,77 @@ struct Sample {
     timed_out: bool,
 }
 
+/// What the in-namespace count of the directories the walk was refused found.
+struct Counted {
+    /// Bytes the directories and everything below them occupy.
+    bytes: u64,
+    /// False when the count reported an error (a directory vanished, one it could not read): a lower bound.
+    complete: bool,
+}
+
+/// `du` prints one line per argument, the bytes it occupies first. A line that does not begin with a number
+/// makes the whole answer unusable rather than short.
+fn parse_du(stdout: &[u8]) -> Option<u64> {
+    let mut total = 0u64;
+    let mut lines = 0;
+    for line in stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        let digits = line.iter().take_while(|b| b.is_ascii_digit()).count();
+        let bytes = std::str::from_utf8(&line[..digits])
+            .ok()?
+            .parse::<u64>()
+            .ok()?;
+        total = total.saturating_add(bytes);
+        lines += 1;
+    }
+    (lines > 0).then_some(total)
+}
+
+/// Counts the directories `refused` from inside the rootless user namespace (`podman unshare`), where the
+/// worker owns what other in-namespace users of the job made. `du` charges allocated blocks, once per hard link
+/// within the call, and crosses neither a mount nor a symbolic link, as the walk does. One process for all of
+/// them, bounded by `deadline` and `abort`.
+fn namespace_usage(
+    refused: &[Foreign],
+    deadline: Instant,
+    abort: &AtomicBool,
+) -> crate::Result<Counted> {
+    let mut command = crate::podman::unshare_command();
+    command.args(["du", "-s", "-B1", "-x", "--"]);
+    command.args(refused.iter().map(|f| f.path.as_os_str()));
+    let answer = crate::process::run_canceled(
+        command,
+        deadline,
+        "storage guard namespace count",
+        None,
+        Some(abort),
+    )?;
+    let counted = parse_du(&answer.stdout).ok_or_else(|| {
+        crate::Error::Runtime(format!(
+            "storage guard namespace count: {}",
+            answer.stderr_excerpt()
+        ))
+    })?;
+    let charged = refused
+        .iter()
+        .fold(0u64, |sum, f| sum.saturating_add(f.charged));
+    Ok(Counted {
+        bytes: counted.saturating_sub(charged),
+        complete: answer.success(),
+    })
+}
+
 /// The bytes `roots` occupy together, stopping once the total passes `limit` or a tree is too deep to follow. A
-/// root that cannot be opened is not over its limit: the steps are ending or it is already gone.
-fn measure_all(roots: &[PathBuf], limit: u64, abort: &AtomicBool) -> Sample {
+/// root that cannot be opened is not over its limit: the steps are ending or it is already gone. Directories the
+/// walk was refused are counted afterwards by `count_refused` in one call, under a time budget of its own, and only
+/// when the readable part has not already passed the limit; when that count fails the sample says its figures
+/// are a lower bound.
+fn measure_all(
+    roots: &[PathBuf],
+    limit: u64,
+    abort: &AtomicBool,
+    count_refused: impl FnOnce(&[Foreign], Instant, &AtomicBool) -> crate::Result<Counted>,
+) -> Sample {
+    let mut refused = Vec::new();
     let mut sample = Sample {
         bytes: 0,
         too_deep: false,
@@ -362,14 +523,33 @@ fn measure_all(roots: &[PathBuf], limit: u64, abort: &AtomicBool) -> Sample {
         timed_out: false,
     };
     for root in roots {
-        if let Ok(usage) = measure(root, limit.saturating_sub(sample.bytes), WALK_BUDGET, abort) {
+        if let Ok(usage) = measure_into(
+            root,
+            limit.saturating_sub(sample.bytes),
+            WALK_BUDGET,
+            abort,
+            &mut refused,
+        ) {
             sample.bytes = sample.bytes.saturating_add(usage.bytes);
             sample.too_deep |= usage.too_deep;
             sample.unreadable |= usage.unreadable;
             sample.timed_out |= usage.timed_out;
         }
         if sample.bytes > limit || sample.too_deep {
-            break;
+            return sample;
+        }
+    }
+    if refused.is_empty() {
+        return sample;
+    }
+    match count_refused(&refused, Instant::now() + WALK_BUDGET, abort) {
+        Ok(counted) => {
+            sample.bytes = sample.bytes.saturating_add(counted.bytes);
+            sample.unreadable |= !counted.complete;
+        }
+        Err(error) => {
+            sample.unreadable = true;
+            sample.timed_out |= matches!(error, crate::Error::Timeout(_));
         }
     }
     sample
@@ -382,7 +562,7 @@ fn watch(shared: &Shared, roots: &[PathBuf], limit: u64, stop: impl FnOnce()) {
             return;
         }
         let started = Instant::now();
-        let sample = measure_all(roots, limit, &shared.abort);
+        let sample = measure_all(roots, limit, &shared.abort, namespace_usage);
         if shared.abort.load(Ordering::Relaxed) {
             return;
         }
@@ -494,7 +674,7 @@ mod tests {
         let usage = measure(dir.path(), u64::MAX, BUDGET, &NO_ABORT).unwrap();
         fs::set_permissions(dir.path().join("sealed"), fs::Permissions::from_mode(0o700)).unwrap();
         // Running as root reads it anyway; otherwise the walk says it could not, and says why.
-        assert!(usage.complete || usage.bytes >= 1 << 20, "{usage:?}");
+        assert_eq!(usage.complete, usage.bytes >= 1 << 20, "{usage:?}");
         assert_eq!(usage.unreadable, !usage.complete, "{usage:?}");
         assert!(!usage.timed_out && !usage.too_deep, "{usage:?}");
     }
@@ -557,6 +737,186 @@ mod tests {
         let usage = measure(dir.path(), u64::MAX, BUDGET, &NO_ABORT).unwrap();
         assert!(usage.complete && !usage.timed_out, "{usage:?}");
         assert!(usage.entries >= 1500, "{usage:?}");
+    }
+
+    fn seal(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn counted(bytes: u64, complete: bool) -> crate::Result<Counted> {
+        Ok(Counted { bytes, complete })
+    }
+
+    /// A directory another user owns refuses `open`; running as root nothing is refused, so those tests stand aside.
+    fn running_as_root() -> bool {
+        crate::euid() == 0
+    }
+
+    #[test]
+    fn a_directory_the_walk_is_refused_is_set_aside_with_its_path_not_dropped() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = dir.path().join("a/sealed");
+        fs::create_dir_all(&sealed).unwrap();
+        fill(&sealed.join("hidden"), 1 << 20);
+        fill(&dir.path().join("a/visible"), 1 << 20);
+        seal(&sealed, 0o000);
+        let own = std::os::unix::fs::MetadataExt::blocks(&fs::metadata(&sealed).unwrap()) * 512;
+        let mut refused = Vec::new();
+        let usage = measure_into(dir.path(), u64::MAX, BUDGET, &NO_ABORT, &mut refused).unwrap();
+        seal(&sealed, 0o700);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].path, fs::canonicalize(&sealed).unwrap());
+        assert_eq!(
+            refused[0].charged, own,
+            "the directory's own blocks were charged"
+        );
+        assert!(usage.bytes >= 1 << 20 && usage.bytes < 2 << 20, "{usage:?}");
+        assert!(
+            usage.complete && !usage.unreadable,
+            "the caller counts what was set aside: {usage:?}"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_lists_but_cannot_be_searched_is_not_read_as_empty() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let listed = dir.path().join("listed");
+        fs::create_dir(&listed).unwrap();
+        fill(&listed.join("hidden"), 1 << 20);
+        // Readable but not searchable: every stat inside is refused, which is not "deleted by the job".
+        seal(&listed, 0o600);
+        let mut refused = Vec::new();
+        measure_into(dir.path(), u64::MAX, BUDGET, &NO_ABORT, &mut refused).unwrap();
+        seal(&listed, 0o700);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].path, fs::canonicalize(&listed).unwrap());
+    }
+
+    #[test]
+    fn a_job_that_hides_trees_behind_too_many_refused_directories_gets_a_lower_bound() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..MAX_FOREIGN + 5 {
+            let sealed = dir.path().join(format!("d{i}"));
+            fs::create_dir(&sealed).unwrap();
+            seal(&sealed, 0o000);
+        }
+        let mut refused = Vec::new();
+        let usage = measure_into(dir.path(), u64::MAX, BUDGET, &NO_ABORT, &mut refused).unwrap();
+        for i in 0..MAX_FOREIGN + 5 {
+            seal(&dir.path().join(format!("d{i}")), 0o700);
+        }
+        assert_eq!(refused.len(), MAX_FOREIGN);
+        assert!(usage.unreadable && !usage.complete, "{usage:?}");
+    }
+
+    #[test]
+    fn du_answers_are_summed_and_an_unreadable_answer_is_refused() {
+        assert_eq!(parse_du(b"4096\t/a\n8192\t/b c\n"), Some(12288));
+        assert_eq!(parse_du(b"0\t/a\n"), Some(0));
+        assert_eq!(parse_du(b""), None);
+        assert_eq!(parse_du(b"\n"), None);
+        assert_eq!(parse_du(b"du: cannot access '/a'\n"), None);
+        assert_eq!(parse_du(b"99999999999999999999999\t/a\n"), None);
+    }
+
+    fn sealed_tree(dir: &Path) -> PathBuf {
+        let root = dir.join("ws");
+        fs::create_dir_all(root.join("sealed")).unwrap();
+        fill(&root.join("visible"), 1 << 20);
+        seal(&root.join("sealed"), 0o000);
+        root
+    }
+
+    #[test]
+    fn bytes_inside_a_refused_directory_count_against_the_budget_once_the_namespace_reports_them() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = sealed_tree(dir.path());
+        let sample = measure_all(
+            std::slice::from_ref(&root),
+            4 << 20,
+            &NO_ABORT,
+            |refused, _, _| {
+                assert_eq!(refused.len(), 1);
+                let own = refused[0].charged;
+                // The in-namespace count includes the directory itself, which the walk already charged.
+                counted(own + (5 << 20), true)
+            },
+        );
+        seal(&root.join("sealed"), 0o700);
+        assert!(sample.bytes > 5 << 20, "{}", sample.bytes);
+        assert!(sample.bytes < 7 << 20, "{}", sample.bytes);
+        assert!(!sample.unreadable && !sample.timed_out && !sample.too_deep);
+    }
+
+    #[test]
+    fn a_namespace_count_that_fails_leaves_the_figure_a_reported_lower_bound() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = sealed_tree(dir.path());
+        let failed = measure_all(
+            std::slice::from_ref(&root),
+            u64::MAX,
+            &NO_ABORT,
+            |_, _, _| Err(crate::Error::Runtime("no podman".into())),
+        );
+        assert!(failed.unreadable && !failed.timed_out);
+        assert!(failed.bytes >= 1 << 20 && failed.bytes < 2 << 20);
+        let slow = measure_all(
+            std::slice::from_ref(&root),
+            u64::MAX,
+            &NO_ABORT,
+            |_, _, _| Err(crate::Error::Timeout("count")),
+        );
+        assert!(slow.unreadable && slow.timed_out);
+        let partial = measure_all(
+            std::slice::from_ref(&root),
+            u64::MAX,
+            &NO_ABORT,
+            |_, _, _| counted(1 << 20, false),
+        );
+        seal(&root.join("sealed"), 0o700);
+        assert!(partial.unreadable);
+    }
+
+    #[test]
+    fn the_namespace_is_asked_only_when_something_was_refused_and_the_limit_is_not_passed_already()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fill(&dir.path().join("data"), 1 << 20);
+        let sample = measure_all(
+            &[dir.path().to_path_buf()],
+            u64::MAX,
+            &NO_ABORT,
+            |_, _, _| panic!("nothing was refused"),
+        );
+        assert!(!sample.unreadable && sample.bytes >= 1 << 20);
+        if running_as_root() {
+            return;
+        }
+        let root = sealed_tree(dir.path());
+        let over = measure_all(
+            std::slice::from_ref(&root),
+            512 << 10,
+            &NO_ABORT,
+            |_, _, _| panic!("the readable part is already over the limit"),
+        );
+        seal(&root.join("sealed"), 0o700);
+        assert!(over.bytes > 512 << 10);
     }
 
     #[test]
