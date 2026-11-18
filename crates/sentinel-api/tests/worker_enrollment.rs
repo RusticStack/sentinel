@@ -852,8 +852,13 @@ fn an_administrator_reads_and_replaces_a_workers_host_policy_and_requests_its_un
     );
 }
 
-/// A tenant administrator with the strongest token the store allows it.
-fn tenant_administrator(d: &Deployment) -> String {
+/// A member of an organization of their own with a token holding `permissions`.
+fn organization_member(
+    d: &Deployment,
+    slug: &'static str,
+    role: sentinel_core::auth::Role,
+    permissions: Permissions,
+) -> String {
     let (root, tenant, user) = (d.root, TenantId::new(), UserId::new());
     let now = UnixMillis::now();
     d.store
@@ -864,25 +869,28 @@ fn tenant_administrator(d: &Deployment) -> String {
                 tx,
                 admin,
                 tenant,
-                Namespace::parse("acme").unwrap(),
+                Namespace::parse(slug).unwrap(),
                 NamespaceKind::Organization,
                 now,
             )?;
-            provisioning::insert_human(tx, user, "tenant-admin", false, now)?;
-            auth::set_membership(
-                tx,
-                admin,
-                tenant,
-                user,
-                sentinel_core::auth::Role::TenantAdmin,
-            )
+            provisioning::insert_human(tx, user, slug, false, now)?;
+            auth::set_membership(tx, admin, tenant, user, role)
         })
         .unwrap();
-    // The store refuses a platform-scoped token for anyone but a super administrator, so the
-    // strongest credential a tenant administrator can hold is every other permission.
-    let strongest = Permissions::REPOSITORY.union(Permissions::TENANT_ADMIN);
-    let granted = tokens::provision(&d.store, Grant::new(user, "tenant", strongest), now).unwrap();
+    let granted = tokens::provision(&d.store, Grant::new(user, slug, permissions), now).unwrap();
     format!("Bearer {}", sentinel_auth::token::format(&granted.secret))
+}
+
+/// A tenant administrator with the strongest token the store allows it. The store refuses a
+/// platform-scoped token for anyone but a super administrator, so the strongest credential a tenant
+/// administrator can hold is every other permission.
+fn tenant_administrator(d: &Deployment) -> String {
+    organization_member(
+        d,
+        "acme",
+        sentinel_core::auth::Role::TenantAdmin,
+        Permissions::REPOSITORY.union(Permissions::TENANT_ADMIN),
+    )
 }
 
 #[test]
@@ -1769,4 +1777,232 @@ fn no_credential_outlives_the_issuing_response() {
         }
     }
     assert!(files >= 1);
+}
+
+#[test]
+fn a_member_and_a_tenant_administrator_are_refused_the_policy_routes_and_a_platform_administrator_is_not()
+ {
+    let d = deployment(Some(false));
+    let admin = administrator(&d);
+    let issued = issue(
+        &d,
+        &admin,
+        json!({ "pool": d.pool.to_string(), "transport": "direct", "cpu_millis": 4000, "priority": 5 }),
+    );
+    assert_eq!(issued.status, 201, "{}", issued.text);
+    let worker = enroll_worker(&d, issued.json()["secret"].as_str().unwrap());
+    let path = format!("/api/v1/admin/workers/{worker}/policy");
+
+    let member = organization_member(
+        &d,
+        "team",
+        sentinel_core::auth::Role::Operator,
+        Permissions::REPOSITORY,
+    );
+    let tenant = tenant_administrator(&d);
+    let replacement = json!({ "cpu_millis": 100, "priority": 100 });
+    for (who, credential) in [("member", member), ("tenant administrator", tenant)] {
+        let bearer = [("authorization", credential.as_str())];
+        for (method, route, body) in [
+            ("GET", path.as_str(), None),
+            ("PUT", path.as_str(), Some(&replacement)),
+            ("GET", "/api/v1/admin/placement", None),
+        ] {
+            let refused = send(&d, method, route, body, &bearer);
+            assert_eq!(
+                refused.status, 403,
+                "{who} {method} {route}: {}",
+                refused.text
+            );
+        }
+    }
+
+    let unchanged = send(&d, "GET", &path, None, &admin.headers());
+    assert_eq!(unchanged.status, 200, "{}", unchanged.text);
+    assert_eq!(unchanged.json()["approved"]["cpu_millis"], 4000);
+    assert_eq!(unchanged.json()["approved"]["priority"], 5);
+    assert!(
+        !audit_events(&d, &admin).contains(&"worker-policy-changed".to_owned()),
+        "a refused change is not audited as a change"
+    );
+
+    let allowed = send(&d, "PUT", &path, Some(&replacement), &admin.headers());
+    assert_eq!(allowed.status, 200, "{}", allowed.text);
+    assert_eq!(allowed.json()["approved"]["priority"], 100);
+    assert_eq!(
+        send(&d, "GET", "/api/v1/admin/placement", None, &admin.headers()).status,
+        200
+    );
+}
+
+/// A two-core, two-gibibyte job accepted by `worker` through the store's own placement, so the host
+/// really holds the reservation.
+fn run_job_on(d: &Deployment, pool: PoolId, worker: WorkerId) {
+    use sentinel_core::RepoId;
+    let (tenant, repo, run, root) = (
+        TenantId::new(),
+        RepoId::new(),
+        sentinel_core::RunId::new(),
+        d.root,
+    );
+    let now = UnixMillis::now();
+    let spec = sentinel_pipeline::RunSpec::new(
+        sentinel_pipeline::PinnedSource::new(
+            "https://github.com/o/r.git",
+            "0123456789abcdef0123456789abcdef01234567",
+            Some("main"),
+        )
+        .unwrap(),
+        sentinel_pipeline::compile_str(
+            "schema: 1\non: [push]\njobs:\n  build:\n    image: alpine:3\n    resources: { cpu: 2, memory: 2GiB }\n    steps: [{ id: s, run: 'true' }]\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::create_namespace(
+                tx,
+                Principal::new(root, Permissions::ALL, None, None),
+                tenant,
+                Namespace::parse("owner").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )?;
+            sentinel_store::jobs::insert_repo(tx, tenant, repo, "app", now)?;
+            tenancy::grant_pool(tx, Authority::HostLocal, pool, tenant, now)?;
+            for job in sentinel_store::runs::create_run(tx, tenant, repo, run, &spec, now)? {
+                sentinel_store::runs::resolve_image(
+                    tx,
+                    tenant,
+                    job,
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "linux/amd64",
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    d.store
+        .writer()
+        .write(move |tx| {
+            sentinel_store::dispatch::place(
+                tx,
+                worker,
+                pool,
+                sentinel_store::dispatch::DEFAULT_LEASE_MS,
+                now,
+            )
+        })
+        .unwrap()
+        .expect("the job was placed on the worker");
+}
+
+#[test]
+fn a_reduction_under_running_work_shows_the_over_cap_state_and_a_raise_never_passes_the_report() {
+    let d = deployment(Some(false));
+    let admin = administrator(&d);
+    let issued = issue(
+        &d,
+        &admin,
+        json!({ "pool": d.pool.to_string(), "transport": "direct" }),
+    );
+    assert_eq!(issued.status, 201, "{}", issued.text);
+    let worker = enroll_worker(&d, issued.json()["secret"].as_str().unwrap());
+    run_job_on(&d, d.pool, worker);
+    let path = format!("/api/v1/admin/workers/{worker}/policy");
+
+    let before = send(&d, "GET", &path, None, &admin.headers()).json();
+    assert_eq!(before["reserved"]["cpu_millis"], 2000);
+    assert_eq!(before["reserved"]["memory_bytes"], 2u64 << 30);
+    assert_eq!(before["over_cap"]["over"], false);
+
+    // Half the CPU and memory the accepted job holds: the answer to the change itself says so.
+    let reduced = send(
+        &d,
+        "PUT",
+        &path,
+        Some(&json!({ "cpu_millis": 1000, "memory_bytes": 1u64 << 30 })),
+        &admin.headers(),
+    );
+    assert_eq!(reduced.status, 200, "{}", reduced.text);
+    let body = reduced.json();
+    assert_eq!(body["effective"]["cpu_millis"], 1000);
+    assert_eq!(body["effective"]["memory_bytes"], 1u64 << 30);
+    assert_eq!(
+        body["reserved"]["cpu_millis"], 2000,
+        "running work is untouched"
+    );
+    assert_eq!(body["over_cap"]["over"], true);
+    assert_eq!(body["over_cap"]["cpu_millis"], 1000);
+    assert_eq!(body["over_cap"]["memory_bytes"], 1u64 << 30);
+    assert_eq!(
+        body["over_cap"]["disk_bytes"], 0,
+        "a size the controller does not enforce is never over"
+    );
+    assert_eq!(
+        send(&d, "GET", &path, None, &admin.headers()).json(),
+        body,
+        "a later read shows the same state"
+    );
+
+    // A ceiling above what the host reported (16 cores, 64 GiB) offers the report, not the ceiling.
+    let raised = send(
+        &d,
+        "PUT",
+        &path,
+        Some(&json!({ "cpu_millis": 64_000, "memory_bytes": 1u64 << 40 })),
+        &admin.headers(),
+    );
+    assert_eq!(raised.status, 200, "{}", raised.text);
+    let body = raised.json();
+    assert_eq!(body["approved"]["cpu_millis"], 64_000);
+    assert_eq!(body["reported"]["cpu_millis"], 16_000);
+    assert_eq!(body["effective"]["cpu_millis"], 16_000);
+    assert_eq!(body["effective"]["memory_bytes"], 64u64 << 30);
+    assert_eq!(body["over_cap"]["over"], false);
+
+    // Removing the ceilings is also capped by the report.
+    let removed = send(&d, "PUT", &path, Some(&json!({})), &admin.headers());
+    assert_eq!(removed.status, 200, "{}", removed.text);
+    assert_eq!(removed.json()["approved"]["cpu_millis"], Value::Null);
+    assert_eq!(removed.json()["effective"]["cpu_millis"], 16_000);
+}
+
+#[test]
+fn an_unknown_or_revoked_worker_is_not_found_and_a_malformed_identifier_is_invalid() {
+    let d = deployment(Some(false));
+    let admin = administrator(&d);
+    let issued = issue(
+        &d,
+        &admin,
+        json!({ "pool": d.pool.to_string(), "transport": "direct" }),
+    );
+    let worker = enroll_worker(&d, issued.json()["secret"].as_str().unwrap());
+    d.store
+        .writer()
+        .write(move |tx| workers::revoke(tx, Authority::HostLocal, worker, UnixMillis::now()))
+        .unwrap();
+    let revoked = format!("/api/v1/admin/workers/{worker}/policy");
+    let unknown = format!("/api/v1/admin/workers/{}/policy", WorkerId::new());
+    for path in [&revoked, &unknown] {
+        for (method, body) in [("GET", None), ("PUT", Some(json!({ "cpu_millis": 1000 })))] {
+            let reply = send(&d, method, path, body.as_ref(), &admin.headers());
+            assert_eq!(reply.status, 404, "{method} {path}: {}", reply.text);
+            assert_eq!(reply.json()["code"], "not_found", "{}", reply.text);
+        }
+    }
+    assert!(
+        !audit_events(&d, &admin).contains(&"worker-policy-changed".to_owned()),
+        "a refused change is not audited as a change"
+    );
+    let malformed = send(
+        &d,
+        "PUT",
+        "/api/v1/admin/workers/not-a-worker/policy",
+        Some(&json!({})),
+        &admin.headers(),
+    );
+    assert_eq!(malformed.status, 400, "{}", malformed.text);
 }
