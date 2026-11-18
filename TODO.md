@@ -253,12 +253,10 @@ What a session cannot supply. Ask early.
 - [ ] **V05** release qualification with `scripts/qualify/qualify.sh` on a disposable fresh host ([qualification](docs/qualification.md)).
 - [ ] **V06** publish the support limits (every X7 item and anything unverified), the `pilots-ci` and B11 benchmarks, and the open blockers; update the [release notes](docs/release-notes.md); tag v0.1. The sub-minute claim stays unmet until B08 qualifies, and "2× Blacksmith" is never claimed before B11 passes.
 - [ ] **Wave 0 leftovers** to close or file (RW02–RW12):
-  - Provenance: a manual run's actor is stored (migration 64) but in no API answer yet; a webhook run's provider sender is not stored (text its author chose).
-  - Installation tokens held by the checks lane are wiped on drop, but the `Bearer` header strings in `sentinel-github/src/http.rs` are not, and `ureq` keeps its own copy.
-  - The 64 MiB cache budget floor is two literals (`sentinel_cache::gc::MIN_BUDGET_BYTES` and `crates/sentinel/src/service.rs`) until `sentinel` may depend on `sentinel-cache` in every build (dependency decision).
+  - A webhook run's provider sender is still not stored: the provider's own text, never a Sentinel principal ([intake](docs/intake.md)).
   - Run, job, attempt, run-spec and event rows have no retention, so backup and restore time grow with them ([retention](docs/retention.md); owner decision, default none).
   - A backup's object and manifest row reads fail closed on an undecodable id, by decision ([compatibility](docs/compatibility.md)).
-  - Web: the GitHub-only step-up state has no browser check (a session for it needs the GitHub sign-in round trip against the double); the "reconnecting" label after a 5xx is untested; the enrollment page does not edit a worker's policy after enrollment (`PUT /admin/workers/{id}/policy`, Q12 interface).
+  - Web: the GitHub-only step-up state has no browser check (a session for it needs the GitHub sign-in round trip against the double); the "reconnecting" label after a 5xx is untested; the enrollment page's policy editor has no browser scenario of its own.
   - Optional guard: a test that every `bench/<file>` a doc cites exists or sits in a paragraph that says "no record".
 
 ## Log
@@ -267,5 +265,6 @@ One row per completed wave. Details go in the PR body.
 
 | Date | Wave | PR / commits | Evidence summary |
 |---|---|---|---|
+| 2026-11-18 | Wave 1 slice, code only | `31ab681`, `0b35205`, `416a022`, `1587ef4`, `58a96af`, `0c7cf4a` (PRs #4–#9) | Token headers wiped and the cache budget floor collapsed to one constant; a manual run's actor returned and shown; the enrollment page edits an enrolled machine's policy and `/admin/placement` is bounded; RW04's foreign-UID workspace trees counted and removed and the guest `/tmp` sized to the job; a snapshot clone copies whole where the file system reports neither reflinks nor holes. `cargo test-linux` 2358 tests on a plain ext4 host, `cargo fmt-check` clean. The Wave 1 gate itself still needs the verification hosts (Podman, arm64, microVM, browser) |
 | 2026-10-29 | Part 24 reconciliation (pre-wave) | `edd1dec`, `5d0a9c9`, `70f8c80` | RW01 closed; code-fixable Part 24 findings fixed; history up to here in `git show 70f8c80:TODO.md` |
 | 2026-10-29 | 0 Code-only completion | branch `wave-0-code-only-completion` (migration 64, release 63 readable) | Reviews 0.1–0.6, 0.8, 0.9 fixed with failure-path tests; worker enrollment page, fake GitHub origin and the sentinel-web compose service built; Wave 2–4 harnesses written. Verified on `reference-host`: `cargo lint-linux`, targeted test binaries, `pnpm -C web typecheck` and `test:unit`, the real-browser test 331/331; locally `cargo fmt-check`, `cargo lint`, `scripts/check-doc-links.sh`. Findings that need a later wave moved there with their blockers. |
