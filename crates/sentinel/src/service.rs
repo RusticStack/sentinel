@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use sentinel_cache::gc::MIN_BUDGET_BYTES;
 use serde::Deserialize;
 
 use crate::cli::ServiceArgs;
@@ -62,10 +63,6 @@ impl Error {
         }
     }
 }
-
-/// The least a configured cache, mirror, image or remote-store budget may be (`sentinel_cache::gc::MIN_BUDGET_BYTES`
-/// is the same figure; this crate links no cache code in every build, so the two validations here share this copy).
-const MIN_BUDGET_BYTES: u64 = 64 << 20;
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -831,9 +828,10 @@ impl Config {
                     .unwrap_or(true),
                 remote_cache_budget: match file.remote_cache.as_ref().and_then(|r| r.budget_bytes) {
                     Some(bytes) if bytes < MIN_BUDGET_BYTES => {
-                        return Err(Error::config(
-                            "[remote_cache] budget_bytes must be at least 64 MiB when set",
-                        ));
+                        return Err(Error::config(format!(
+                            "[remote_cache] budget_bytes must be at least {} MiB when set",
+                            MIN_BUDGET_BYTES >> 20
+                        )));
                     }
                     budget => budget,
                 },
@@ -972,9 +970,10 @@ impl Config {
                     .flatten()
                     .any(|b| b < MIN_BUDGET_BYTES)
                     {
-                        return Err(Error::config(
-                            "cache_budget_bytes, mirror_budget_bytes and image_budget_bytes must be at least 64 MiB when set",
-                        ));
+                        return Err(Error::config(format!(
+                            "cache_budget_bytes, mirror_budget_bytes and image_budget_bytes must be at least {} MiB when set",
+                            MIN_BUDGET_BYTES >> 20
+                        )));
                     }
                     if file.spool_quota_bytes == Some(0) {
                         return Err(Error::config(
@@ -3976,6 +3975,75 @@ credentials_file = '/etc/sentinel/s3'
             .is_err(),
             "credentials are required"
         );
+    }
+
+    fn load_config(role: &str, text: &str) -> Result<Config, Error> {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("sentinel.toml");
+        fs::write(&config, text).unwrap();
+        let args = ServiceArgs {
+            config: Some(config),
+            data_dir: Some(dir.path().join("data")),
+            check: true,
+            log_format: None,
+            log_level: None,
+            manual_destinations: None,
+        };
+        let mut io = Executor::new(WorkClass::BlockingIo, 1).unwrap();
+        let mut cpu = Executor::new(WorkClass::Cpu, 1).unwrap();
+        let loaded = Config::load(role, &args, &io, &cpu);
+        io.shutdown(Duration::from_secs(1));
+        cpu.shutdown(Duration::from_secs(1));
+        loaded
+    }
+
+    #[test]
+    fn the_controllers_store_budget_floor_is_the_cache_crates_floor() {
+        let at = |bytes: u64| {
+            load_config(
+                "server",
+                &format!("[remote_cache]\nbudget_bytes = {bytes}\n"),
+            )
+        };
+        let refused = at(MIN_BUDGET_BYTES - 1)
+            .err()
+            .expect("one byte below the floor");
+        assert!(
+            refused.message.contains("budget_bytes"),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused
+                .message
+                .contains(&format!("{} MiB", MIN_BUDGET_BYTES >> 20)),
+            "the message states the shared floor: {}",
+            refused.message
+        );
+        assert!(at(MIN_BUDGET_BYTES).is_ok());
+    }
+
+    #[cfg(feature = "worker")]
+    #[test]
+    fn a_workers_cache_mirror_and_image_budgets_share_that_floor() {
+        let at = |key: &str, bytes: u64| {
+            let fingerprint = "ab".repeat(32);
+            load_config(
+                "worker",
+                &format!(
+                    "controller = '10.0.0.5:7443'\ncontroller_fingerprint = '{fingerprint}'\n{key} = {bytes}\n"
+                ),
+            )
+        };
+        for key in [
+            "cache_budget_bytes",
+            "mirror_budget_bytes",
+            "image_budget_bytes",
+        ] {
+            let refused = at(key, MIN_BUDGET_BYTES - 1).err().expect(key);
+            assert!(refused.message.contains(key), "{key}: {}", refused.message);
+            assert!(at(key, MIN_BUDGET_BYTES).is_ok(), "{key}");
+        }
     }
 
     #[test]

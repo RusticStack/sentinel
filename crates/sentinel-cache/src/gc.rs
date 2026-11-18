@@ -9,6 +9,9 @@ use std::{
 use crate::{lease, manifest, scope};
 
 /// The least a configured storage budget may be, for the worker cache and the controller's remote store alike.
+/// The one source of the figure: `sentinel`'s server and worker configuration checks (`cache_budget_bytes`,
+/// `mirror_budget_bytes`, `image_budget_bytes`, `[remote_cache] budget_bytes`) refuse a smaller value with
+/// this constant, and their messages state it.
 pub const MIN_BUDGET_BYTES: u64 = 64 << 20;
 
 /// The most a derived storage budget reaches, however large the disk.

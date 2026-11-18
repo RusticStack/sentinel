@@ -10,8 +10,8 @@ publish.workspace = true
 
 [features]
 default = []
-server = ["dep:sentinel-core", "dep:sentinel-store", "dep:sentinel-s3", "dep:sentinel-link", "sentinel-link/controller", "dep:sentinel-api", "dep:sentinel-github", "dep:sentinel-intake", "dep:sentinel-checks", "dep:sentinel-mail", "dep:ctrlc", "dep:toml", "dep:tracing", "dep:tracing-subscriber", "dep:uuid"]
-worker = ["dep:sentinel-core", "dep:sentinel-link", "dep:sentinel-worker", "dep:ctrlc", "dep:toml", "dep:tracing", "dep:tracing-subscriber", "dep:uuid"]
+server = ["dep:sentinel-core", "dep:sentinel-cache", "dep:sentinel-store", "dep:sentinel-s3", "dep:sentinel-link", "sentinel-link/controller", "dep:sentinel-api", "dep:sentinel-github", "dep:sentinel-intake", "dep:sentinel-checks", "dep:sentinel-mail", "dep:ctrlc", "dep:toml", "dep:tracing", "dep:tracing-subscriber", "dep:uuid"]
+worker = ["dep:sentinel-core", "dep:sentinel-cache", "dep:sentinel-link", "dep:sentinel-worker", "dep:ctrlc", "dep:toml", "dep:tracing", "dep:tracing-subscriber", "dep:uuid"]
 
 [dependencies]
 blake3 = "1.8"
@@ -37,6 +37,7 @@ sentinel-intake = { path = "../sentinel-intake", optional = true }
 sentinel-checks = { path = "../sentinel-checks", optional = true }
 sentinel-mail = { path = "../sentinel-mail", optional = true }
 sentinel-api = { path = "../sentinel-api", optional = true }
+sentinel-cache = { path = "../sentinel-cache", optional = true }
 sentinel-core = { path = "../sentinel-core", optional = true }
 sentinel-store = { path = "../sentinel-store", optional = true }
 sentinel-s3 = { path = "../sentinel-s3", optional = true }

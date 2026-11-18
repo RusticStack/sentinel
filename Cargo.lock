@@ -1185,6 +1185,7 @@ dependencies = [
  "rustix",
  "sentinel-api",
  "sentinel-auth",
+ "sentinel-cache",
  "sentinel-checks",
  "sentinel-core",
  "sentinel-github",
