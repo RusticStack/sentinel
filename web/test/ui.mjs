@@ -174,6 +174,9 @@ const PAGES = {
   settings: ["/t/acme/settings", "!!document.querySelector('#about-h') && !!document.querySelector('#members-h')"],
   invitations: ["/t/acme/admin/invitations", "!!document.querySelector('#invite-h')"],
   workers: ["/platform/workers", "!!document.querySelector('#w-add-h') && !!document.querySelector('#w-pool')"],
+  history: ["/t/acme/history?repo=web&job=build", "document.querySelectorAll('main table tbody tr').length >= 4"],
+  compare: [`/t/acme/history/compare?repo=web&base=${cfg.history.attempts[0]}&head=${cfg.history.attempts[2]}`, "document.querySelectorAll('main table tbody tr').length >= 8"],
+  historySearch: [`/t/acme/history/search?repo=web&q=${cfg.history.needle}`, "document.querySelectorAll('main table tbody tr').length >= 2 && document.body.textContent.includes('lines found')"],
   github: ["/setup/github", "document.querySelector('h1') && document.querySelector('h1').textContent === 'GitHub App' && document.querySelectorAll('main [role=status], main section').length >= 1"],
 };
 
@@ -431,6 +434,108 @@ await scenario("log search, gaps and deep links", async () => {
   const link = await page.eval("location.pathname + location.search");
   await go(page, link, "!!document.querySelector('.log-row.hl')");
   check("log: the deep link reopens at the same line", (await page.eval("document.querySelector('.log-row.hl').textContent")).includes("TestCheckout"), link);
+});
+
+await scenario("history: durations, comparison and log search", async () => {
+  const h = cfg.history;
+  const [first, rerunFirst, rerunNewest, expired] = h.attempts;
+  await go(page, ...PAGES.history);
+  const first_table = await page.eval(`(() => { const rows = [...document.querySelectorAll('main table')[0].querySelectorAll('tbody tr')].map((r) => [...r.children].map((c) => c.textContent.trim())); return { head: [...document.querySelectorAll('main table')[0].querySelectorAll('thead th')].map((c) => c.textContent.trim()), rows }; })()`);
+  check("history: the percentile table names the job, its attempts and p50 / p95 of the duration", first_table.rows.length === 1 && first_table.rows[0][0] === "build" && first_table.rows[0][1] === "3" && first_table.rows[0][2] === "11 s / 13 s", first_table);
+  check("history: a phase with no measured value shows a dash, never zero", first_table.rows[0].slice(3).some((c) => c.startsWith("—")) || first_table.rows[0].slice(3).every((c) => /\d/.test(c)), first_table.rows[0]);
+  const samples = await page.eval("[...document.querySelectorAll('main table')[1].querySelectorAll('tbody tr')].map((r) => r.querySelectorAll('input[type=radio]').length + ':' + r.children[5].textContent.trim())");
+  check("history: the job's samples are listed newest first with base and head choices", samples.join() === "2:8.8 s,2:13 s,2:11 s", samples);
+  const preset = await page.eval("[...document.querySelectorAll('input[name=base]')].findIndex((i) => i.checked) + ',' + [...document.querySelectorAll('input[name=head]')].findIndex((i) => i.checked)");
+  check("history: the newest attempt is the head and the one before it the base", preset === "1,0", preset);
+  await page.screenshot(join(cfg.out, "history-durations.png"));
+
+  await page.eval("document.querySelectorAll('input[name=head]')[1].click()");
+  await page.eval("document.querySelectorAll('input[name=base]')[2].click()");
+  await page.eval(clickText("a", "Compare phases"));
+  await page.waitFor("location.pathname === '/t/acme/history/compare' && document.querySelectorAll('main table tbody tr').length >= 8", 15000, "comparison");
+  const query = await page.eval("location.search");
+  check("history: choosing two attempts opens their comparison, by attempt id", query.includes("base=" + first) && query.includes("head=" + rerunNewest), query);
+  const row = (label) => `(() => { const r = [...document.querySelectorAll('main table tbody tr')].find((x) => x.querySelector('th').textContent.trim() === ${JSON.stringify(label)}); return r ? [...r.children].map((c) => c.textContent.replace(/\\s+/g, ' ').trim()) : null; })()`;
+  const steps = await page.eval(row("Steps"));
+  const pull = await page.eval(row("Image pull"));
+  const total = await page.eval(row("Duration"));
+  check("history: the comparison shows the change of a phase, with its share of the base", !!steps && steps[3] === "+2.0 s +20%", steps);
+  check("history: a faster phase is a decrease", !!pull && pull[3].startsWith("−600 ms"), pull);
+  check("history: the duration is compared too", !!total && total[1] === "11 s" && total[2] === "13 s", total);
+  const fetchRow = await page.eval(row("Checkout: fetch"));
+  check("history: a phase neither attempt measured shows dashes, not zero", !!fetchRow && fetchRow[1] === "—" && fetchRow[2] === "—" && fetchRow[3].startsWith("—"), fetchRow);
+  await page.screenshot(join(cfg.out, "history-compare.png"));
+  await page.eval(clickText("a", "Swap base and head"));
+  await page.waitFor("location.search.includes('base=" + rerunNewest + "')", 10000, "swapped");
+  await page.waitFor(`(() => { const r = [...document.querySelectorAll('main table tbody tr')].find((x) => x.querySelector('th').textContent.trim() === 'Steps'); return !!r && r.children[1].textContent.trim() === '12 s'; })()`, 10000, "swapped comparison");
+  const swapped = await page.eval(row("Steps"));
+  check("history: swapping base and head turns the change around", !!swapped && swapped[3].startsWith("−2.0 s"), swapped);
+
+  await go(page, "/t/acme/history/compare?repo=app&base=" + first + "&head=" + rerunNewest, "document.body.textContent.includes('Attempts not found')");
+  check("history: attempts of another repository are said to be not found", true);
+  await go(page, "/t/acme/history/compare?repo=web", "document.body.textContent.includes('Choose two attempts')");
+  check("history: a comparison without attempts asks for two", true);
+  await go(page, "/t/acme/history/compare?repo=web&base=nope&head=nope", "document.body.textContent.includes('Choose two attempts')");
+  check("history: a malformed attempt id in the link is ignored, not sent to the controller", true);
+
+  await go(page, ...PAGES.historySearch);
+  const found = await page.eval("[...document.querySelectorAll('main table tbody tr')].map((r) => r.textContent.replace(/\\s+/g, ' ').trim())");
+  check("history: the search finds each line with its job and step", found.length === 2 && found.every((t) => t.includes("build") && t.includes("step 1")), found);
+  check("history: the matched text is marked", (await page.eval("document.querySelectorAll('main table tbody mark').length")) === 2 && (await page.eval("document.querySelector('main table tbody mark').textContent")) === h.needle);
+  const note = await page.eval("document.querySelector('main [role=status]').textContent");
+  check("history: the search says what it read, and that retention removed a log", note.includes("1 log was removed by retention") && note.includes("whole window"), note);
+  check("history: a log removed by retention is shown as a notice", (await page.eval("document.querySelector('main').textContent")).includes("Retention removed some of these logs"));
+  await page.screenshot(join(cfg.out, "history-search.png"));
+  await page.click("main table tbody tr a[href*='/logs/']");
+  await page.waitFor("location.pathname.includes('/logs/') && !!document.querySelector('.log-row.hl')", 15000, "log viewer at the hit");
+  const hl = await page.eval("document.querySelector('.log-row.hl').textContent");
+  check("history: a hit opens the log viewer at its line, marked", hl.includes(h.needle) && (await page.eval("!!document.querySelector('.log-row.hl mark')")), hl);
+
+  await go(page, "/t/acme/history/search?repo=web&q=" + encodeURIComponent("no-such-text-anywhere"), "document.body.textContent.includes('0 lines found')");
+  check("history: a search without a match says so", (await page.eval("document.querySelector('main table tbody').textContent")).includes("No line matches"));
+
+  await go(page, "/t/acme/history/search?repo=app&q=" + encodeURIComponent("no-such-text-anywhere"), "document.body.textContent.includes('0 lines found')");
+  check("history: a search over a large log is cut at its budget and offers to go further back", await page.eval("document.body.textContent.includes('More of the window is left') && !!document.querySelector('main button')") , await page.eval("document.querySelector('main [role=status]').textContent"));
+  let clicks = 0;
+  for (; clicks < 60; clicks++) {
+    const more = await page.eval(`(() => { const b = [...document.querySelectorAll('main button')].find((x) => x.textContent.includes('Search further back')); return b ? (b.click(), true) : false; })()`);
+    if (!more) break;
+    await sleep(500);
+    await page.waitFor("![...document.querySelectorAll('main button')].some((x) => x.textContent.includes('Search further back') && x.disabled)", 20000, "the next step");
+  }
+  const end = await page.eval("document.querySelector('main [role=status]').textContent");
+  check("history: going further back reads on until the window is covered", clicks > 0 && clicks < 60 && end.includes("The search covered the whole window"), { clicks, end });
+});
+
+await scenario("history: keyboard", async () => {
+  await go(page, ...PAGES.history);
+  await page.eval("(() => { document.activeElement && document.activeElement.blur(); document.body.tabIndex = -1; document.body.focus(); document.body.removeAttribute('tabindex'); })()");
+  const stops = [];
+  for (let i = 0; i < 120; i++) {
+    await page.key("Tab");
+    const f = await page.eval(FOCUS_RING);
+    if (!f) break;
+    stops.push(f);
+  }
+  const labels = stops.map((s) => s.text);
+  check("history: the repository, window, nav links, radios and compare are keyboard reachable",
+    ["Durations", "Log search", "web", "Last", "Show durations", "Use the attempt of run", "Compare phases"].every((l) => labels.some((t) => t.includes(l))), labels.slice(0, 60));
+  const blind = stops.filter((s) => !s.ring || !s.visible);
+  check("history: every tab stop shows a focus indicator", blind.length === 0, blind.slice(0, 5));
+  await page.eval("document.querySelector('input[name=head]').focus()");
+  await page.key("ArrowDown");
+  check("history: the arrow keys move the head choice within its group", (await page.eval("document.activeElement.name + ':' + [...document.querySelectorAll('input[name=head]')].findIndex((i) => i.checked)")) === "head:1");
+
+  await go(page, ...PAGES.historySearch);
+  await page.eval("document.querySelector('#s-term').focus()");
+  await page.eval("document.querySelector('#s-term').select()");
+  await page.key("Backspace");
+  await page.eval("document.querySelector('#s-term').focus()");
+  await page.fill("#s-term", "linking release");
+  await page.key("Enter");
+  await page.waitFor("location.search.includes('q=linking')", 10000, "search by Enter");
+  await page.waitFor("document.body.textContent.includes('lines found for')", 10000, "results");
+  check("history: Enter in the text field runs the search and puts it in the address", true);
 });
 
 await scenario("large log bounds", async () => {

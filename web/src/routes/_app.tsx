@@ -43,6 +43,7 @@ function AppShell() {
 
   const main = active && tenants.some((t) => t.slug === active) ? [
     { label: "Runs", icon: "play", to: `/t/${active}`, exact: true },
+    { label: "History", icon: "history", to: `/t/${active}/history` },
     { label: "Queue", icon: "list-ordered", to: `/t/${active}/queue` },
     { label: "Workers", icon: "server", to: `/t/${active}/workers` },
     { label: "GitHub sync", icon: "refresh-cw", to: `/t/${active}/sync` },

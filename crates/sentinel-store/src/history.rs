@@ -224,7 +224,7 @@ pub fn durations(
         .into_iter()
         .map(|(job, mut acc)| {
             acc.samples
-                .sort_unstable_by(|a, b| (b.created_ms, b.run).cmp(&(a.created_ms, a.run)));
+                .sort_unstable_by_key(|s| (std::cmp::Reverse(s.created_ms), s.run));
             JobDurations {
                 job,
                 attempts: acc.attempts,
