@@ -677,6 +677,9 @@ fn a_seeded_walk_of_mixed_operations_never_leaves_a_class_off_the_recount_or_bel
     }
 }
 
+/// A database at the last schema before per-class accounting (64): the class
+/// objects are gone and so is every migration after them, so the upgrade has real
+/// work to do.
 fn database_at_latest_without_classes(path: &Path) {
     let db = Connection::open(path).unwrap();
     db.execute_batch(
@@ -692,7 +695,10 @@ fn database_at_latest_without_classes(path: &Path) {
          ALTER TABLE tenant_usage DROP COLUMN remote_cache_bytes;
          ALTER TABLE tenant_usage DROP COLUMN actions_cache_bytes;
          ALTER TABLE tenant_usage DROP COLUMN worker_cache_bytes;
-         DELETE FROM schema_migrations WHERE version = 65;",
+         DROP INDEX provenance_by_group_ref;
+         ALTER TABLE run_provenance DROP COLUMN group_ref;
+         DROP TABLE merge_deliveries;
+         DELETE FROM schema_migrations WHERE version >= 65;",
     )
     .unwrap();
 }

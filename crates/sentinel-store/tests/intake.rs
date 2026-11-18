@@ -306,8 +306,7 @@ fn a_groups_open_deliveries_see_each_other_as_duplicates_and_their_run() {
     assert_eq!(state(&f, first).run, None);
     assert!(!state(&f, first).gone);
     let other_row = fetch(&f, other);
-    let other_state =
-        intake::merge_group_state(&f.conn, &other_row, QUEUE_B, SHA_B).unwrap();
+    let other_state = intake::merge_group_state(&f.conn, &other_row, QUEUE_B, SHA_B).unwrap();
     assert!(!other_state.earlier_open, "another group is another stream");
 
     // A destroyed group with no run leaves the group gone, which settles a
@@ -323,7 +322,11 @@ fn a_groups_open_deliveries_see_each_other_as_duplicates_and_their_run() {
     assert!(state(&f, waiting).gone);
     assert_eq!(fetch(&f, waiting).state, State::Ignored);
     assert_eq!(fetch(&f, duplicate).state, State::Ignored);
-    assert_eq!(fetch(&f, other).state, State::Pending, "nothing else closed");
+    assert_eq!(
+        fetch(&f, other).state,
+        State::Pending,
+        "nothing else closed"
+    );
 }
 
 #[test]

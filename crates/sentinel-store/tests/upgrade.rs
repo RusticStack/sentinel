@@ -418,6 +418,9 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
             64 | 65 => [true, true, true, true, true, false],
             _ => unreachable!(),
         };
-        assert_eq!(ok, expected, "release {from} on schemas 53, 55, 58, 64, 65, 66");
+        assert_eq!(
+            ok, expected,
+            "release {from} on schemas 53, 55, 58, 64, 65, 66"
+        );
     }
 }
