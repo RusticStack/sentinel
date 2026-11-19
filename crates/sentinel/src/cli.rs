@@ -190,6 +190,8 @@ pub enum AdminCommand {
     Source(SourceArgs),
     /// Inspect and purge durable event intake records
     Intake(IntakeArgs),
+    /// Show or change a tenant's GitHub Actions runner-mode switch
+    RunnerMode(RunnerModeArgs),
     /// Reconcile or verify committed objects and manifests against the filesystem
     Objects(ObjectsArgs),
     /// Take, list, verify and prune backups of a stopped controller
@@ -394,6 +396,40 @@ pub struct IntakeArgs {
     pub data: DataDir,
     #[command(subcommand)]
     pub command: IntakeCommand,
+}
+
+#[derive(Args)]
+pub struct RunnerModeArgs {
+    #[command(subcommand)]
+    pub command: RunnerModeCommand,
+}
+
+#[derive(Subcommand)]
+pub enum RunnerModeCommand {
+    /// Print the switch, the classes this deployment serves and what the App still lacks
+    Show {
+        #[command(flatten)]
+        data: DataDir,
+        /// The tenant's slug or `tnt_` identifier
+        #[arg(long)]
+        tenant: String,
+    },
+    /// Turn runner mode on or off; enabling needs the App's installations to grant it
+    Set {
+        #[command(flatten)]
+        data: DataDir,
+        /// The tenant's slug or `tnt_` identifier
+        #[arg(long)]
+        tenant: String,
+        /// true or false
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            value_name = "true|false",
+            value_parser = clap::value_parser!(bool)
+        )]
+        enabled: bool,
+    },
 }
 
 #[derive(Subcommand)]
