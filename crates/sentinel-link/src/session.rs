@@ -4488,4 +4488,372 @@ mod tests {
         assert!(state.discarded.is_empty() && state.contexts.is_empty());
         assert_eq!(state.secret_bytes, 0);
     }
+    // What a peer may send, and what a session ends over (docs/worker-link.md#sessions). A frame length
+    // outside the bound, a second hello, a held list past its bound, a pong out of sequence and a push below
+    // its protocol or past its bound are protocol violations, so the tests drive the wire themselves: the
+    // Hello the worker would send, then what it never would.
+
+    const MAX: u16 = sentinel_protocol::negotiate::SUPPORTED_MAX.0;
+
+    fn hello_range(min: u16, max: u16) -> Hello {
+        Hello {
+            protocol_min: sentinel_protocol::negotiate::ProtocolVersion(min),
+            protocol_max: sentinel_protocol::negotiate::ProtocolVersion(max),
+            capabilities: sentinel_protocol::negotiate::Capabilities::REQUIRED,
+            arch: sentinel_protocol::negotiate::Arch::X86_64,
+            software: "boundary".into(),
+        }
+    }
+
+    fn worker_hello() -> ClientMessage {
+        ClientMessage::Hello {
+            hello: hello_range(1, MAX),
+            worker: *WorkerId::new().as_bytes(),
+            name: "boundary".into(),
+            enrollment: None,
+            capacity: Capacity {
+                cpu_millis: 1_000,
+                memory_bytes: 1 << 30,
+            },
+        }
+    }
+
+    /// A peer that writes the wire format itself, so a test can send a length no worker sends.
+    struct Raw {
+        conn: rustls::Connection,
+        sock: TcpStream,
+    }
+
+    impl Raw {
+        fn connect(addr: SocketAddr, config: Arc<rustls::ClientConfig>) -> Raw {
+            let sock = TcpStream::connect(addr).unwrap();
+            let mut conn = rustls::Connection::Client(
+                ClientConnection::new(config, ServerName::try_from("sentinel").unwrap()).unwrap(),
+            );
+            handshake(&mut conn, &sock, HEARTBEAT_DEADLINE, None).unwrap();
+            Raw { conn, sock }
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.conn.writer().write_all(bytes).unwrap();
+            while self.conn.wants_write() {
+                self.conn.write_tls(&mut self.sock).unwrap();
+            }
+        }
+
+        /// One frame whose declared length is `length`, whatever the body actually holds.
+        fn frame(&mut self, length: u32, body: &[u8]) {
+            self.write(&length.to_be_bytes());
+            self.write(body);
+        }
+
+        fn send<M: Serialize>(&mut self, message: &M) {
+            let body = postcard::to_allocvec(message).unwrap();
+            self.frame(body.len() as u32, &body);
+        }
+    }
+
+    #[derive(Default)]
+    struct Counted {
+        pings: AtomicUsize,
+    }
+
+    impl SessionHandler for Counted {
+        fn ping(&self, _: WorkerId, _: &[AttemptId]) -> Result<Beat> {
+            self.pings.fetch_add(1, Ordering::SeqCst);
+            Ok(Beat {
+                lease_until: UnixMillis(1),
+                stop: Vec::new(),
+                cancel: Vec::new(),
+            })
+        }
+        fn acknowledged(&self, _: WorkerId, _: AttemptId, _: Fence) {}
+        fn declined(&self, _: WorkerId, _: AttemptId, _: Fence) {}
+        fn reported(&self, _: WorkerId, _: AttemptId, _: Fence, _: Event, _: Option<Vec<u8>>) {}
+        fn spec(&self, _: WorkerId, _: AttemptId) -> Option<(JobContext, Vec<u8>)> {
+            None
+        }
+        fn log(&self, _: WorkerId, _: AttemptId, _: Frame) -> LogVerdict {
+            LogVerdict::Refused
+        }
+        fn abandoned(&self, _: WorkerId, _: AttemptId, _: Fence) {}
+    }
+
+    struct AllAdmitted;
+
+    impl Admission for AllAdmitted {
+        fn admit(
+            &self,
+            _: &Digest,
+            worker: WorkerId,
+            _: &str,
+            hello: &Hello,
+            _: Option<&Secret>,
+            _: Capacity,
+        ) -> std::result::Result<Admitted, Rejection> {
+            Ok(Admitted {
+                worker,
+                pool: sentinel_core::PoolId::new(),
+                negotiated: sentinel_protocol::negotiate::negotiate(hello)
+                    .map_err(Rejection::from)?,
+            })
+        }
+    }
+
+    /// One controller-side session served to a raw peer, and the error it ended on.
+    fn controller_side() -> (Raw, Arc<Counted>, thread::JoinHandle<Result<()>>) {
+        let identity = crate::identity::Identity::generate("boundary-controller").unwrap();
+        let pin = identity.fingerprint();
+        let server = crate::tls::server_config(identity).unwrap();
+        let client =
+            crate::tls::client_config(crate::identity::Identity::generate("raw").unwrap(), pin)
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counted = Arc::new(Counted::default());
+        let handler = Arc::clone(&counted);
+        let served = thread::spawn(move || {
+            let (socket, _) = listener.accept()?;
+            match accept(socket, server, &AllAdmitted)? {
+                Accepted::Control(mut session) => session.serve(&*handler),
+                Accepted::Bulk(_) => {
+                    Err(Error::Protocol("a bulk hello where a control one belongs"))
+                }
+            }
+        });
+        (Raw::connect(addr, client), counted, served)
+    }
+
+    #[test]
+    fn a_frame_length_outside_the_bound_ends_the_session_before_it_is_decoded() {
+        for length in [0u32, MAX_CONTROL_MESSAGE_BYTES as u32 + 1] {
+            let (mut raw, counted, served) = controller_side();
+            raw.send(&worker_hello());
+            // The body is a well-formed Ping: only the declared length is wrong.
+            let ping = postcard::to_allocvec(&ClientMessage::Ping {
+                seq: 1,
+                held: Vec::new(),
+            })
+            .unwrap();
+            raw.frame(length, &ping);
+            let ended = served.join().unwrap();
+            assert!(
+                matches!(&ended, Err(Error::Protocol(what)) if *what == "frame length"),
+                "length {length}: {ended:?}"
+            );
+            assert_eq!(
+                counted.pings.load(Ordering::SeqCst),
+                0,
+                "length {length}: a frame past the bound reached the store"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_hello_after_the_welcome_ends_the_session() {
+        let (mut raw, _, served) = controller_side();
+        raw.send(&worker_hello());
+        raw.send(&worker_hello());
+        let ended = served.join().unwrap();
+        assert!(
+            matches!(&ended, Err(Error::Protocol(what)) if *what == "second hello"),
+            "{ended:?}"
+        );
+    }
+
+    #[test]
+    fn a_held_list_past_the_bound_ends_the_session_and_the_bound_itself_is_served() {
+        let (mut raw, counted, served) = controller_side();
+        raw.send(&worker_hello());
+        raw.send(&ClientMessage::Ping {
+            seq: 1,
+            held: (0..MAX_LIST_ITEMS)
+                .map(|_| *AttemptId::new().as_bytes())
+                .collect(),
+        });
+        raw.send(&ClientMessage::Ping {
+            seq: 2,
+            held: (0..=MAX_LIST_ITEMS)
+                .map(|_| *AttemptId::new().as_bytes())
+                .collect(),
+        });
+        let ended = served.join().unwrap();
+        assert!(
+            matches!(&ended, Err(Error::Protocol(what)) if *what == "held list"),
+            "{ended:?}"
+        );
+        assert_eq!(
+            counted.pings.load(Ordering::SeqCst),
+            1,
+            "the bound itself is served and only the excess is refused"
+        );
+    }
+
+    #[derive(Default)]
+    struct Silent;
+
+    impl Executor for Silent {
+        fn offered(&self, _: &Offer) -> bool {
+            false
+        }
+        fn stop(&self, _: AttemptId) {}
+        fn cancel(&self, _: AttemptId) {}
+        fn held(&self) -> Vec<AttemptId> {
+            Vec::new()
+        }
+        fn renewed(&self, _: UnixMillis) {}
+        fn attached(&self, _: Reporter) {}
+        fn detached(&self) {}
+        fn spec(&self, _: AttemptId, _: JobContext, _: Vec<u8>) {}
+        fn no_spec(&self, _: AttemptId) {}
+        fn log_acked(&self, _: AttemptId, _: u64) {}
+        fn log_refused(&self, _: AttemptId) {}
+    }
+
+    /// A controller that welcomes a worker at `protocol` and then pushes `script`: what a broken one sends,
+    /// and what the worker must end the session over.
+    fn pushing_controller(
+        protocol: u16,
+        script: Vec<ServerMessage>,
+    ) -> (SocketAddr, Digest, thread::JoinHandle<()>) {
+        let identity = crate::identity::Identity::generate("pushing").unwrap();
+        let pin = identity.fingerprint();
+        let server = crate::tls::server_config(identity).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pushed = thread::spawn(move || {
+            let Ok((socket, _)) = listener.accept() else {
+                return;
+            };
+            let mut conn = rustls::Connection::Server(ServerConnection::new(server).unwrap());
+            if handshake(&mut conn, &socket, HEARTBEAT_DEADLINE, None).is_err() {
+                return;
+            }
+            let Ok((tx, mut rx)) = split(conn, socket) else {
+                return;
+            };
+            if rx.recv::<ClientMessage>(HEARTBEAT_DEADLINE).is_err() {
+                return;
+            }
+            let welcome = ServerMessage::Welcome {
+                worker: *WorkerId::new().as_bytes(),
+                negotiated: Negotiated {
+                    protocol: sentinel_protocol::negotiate::ProtocolVersion(protocol),
+                    capabilities: sentinel_protocol::negotiate::Capabilities::REQUIRED,
+                    arch: sentinel_protocol::negotiate::Arch::X86_64,
+                },
+                heartbeat_interval_ms: HEARTBEAT_INTERVAL.as_millis() as u32,
+            };
+            if tx.send(&welcome).is_err() {
+                return;
+            }
+            for message in script {
+                if tx.send(&message).is_err() {
+                    return;
+                }
+            }
+            // Hold the connection until the worker ends it, so a slow test peer cannot make the worker see a close.
+            while let Ok(Some(_)) = rx.recv_timeout::<ClientMessage>(HEARTBEAT_DEADLINE) {}
+        });
+        (addr, pin, pushed)
+    }
+
+    /// How one worker session against that controller ended.
+    fn worker_outcome(protocol: u16, script: Vec<ServerMessage>) -> Error {
+        let (addr, pin, pushed) = pushing_controller(protocol, script);
+        let client =
+            crate::tls::client_config(crate::identity::Identity::generate("w").unwrap(), pin)
+                .unwrap();
+        let outcome = match connect(
+            addr,
+            client,
+            WorkerId::new(),
+            "boundary",
+            hello_range(1, MAX),
+            None,
+            Capacity {
+                cpu_millis: 1_000,
+                memory_bytes: 1 << 30,
+            },
+        ) {
+            Ok(mut link) => link.run(&Silent, || false),
+            Err(error) => Err(error),
+        };
+        let _ = pushed.join();
+        outcome.expect_err("the worker ended the session over what it was sent")
+    }
+
+    #[test]
+    fn a_pong_out_of_sequence_ends_the_worker_session() {
+        let error = worker_outcome(
+            MAX,
+            vec![ServerMessage::Pong {
+                seq: u64::MAX,
+                lease_until_ms: 0,
+                stop: Vec::new(),
+                cancel: Vec::new(),
+            }],
+        );
+        assert!(
+            matches!(&error, Error::Protocol(what) if *what == "pong sequence"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_prefetch_below_its_protocol_or_past_the_bound_ends_the_worker_session() {
+        let hint = |count: usize| ServerMessage::Prefetch {
+            images: vec!["alpine@sha256:0".into(); count],
+        };
+        let below = worker_outcome(PREFETCH_MIN.0 - 1, vec![hint(1)]);
+        assert!(
+            matches!(&below, Error::Protocol(what) if *what == "prefetch needs protocol 9"),
+            "{below}"
+        );
+        let over = worker_outcome(MAX, vec![hint(MAX_PREFETCH_IMAGES + 1)]);
+        assert!(
+            matches!(&over, Error::Protocol(what) if *what == "prefetch hint"),
+            "{over}"
+        );
+        let long = worker_outcome(
+            MAX,
+            vec![ServerMessage::Prefetch {
+                images: vec!["a".repeat(MAX_PREFETCH_REFERENCE_BYTES + 1)],
+            }],
+        );
+        assert!(
+            matches!(&long, Error::Protocol(what) if *what == "prefetch hint"),
+            "{long}"
+        );
+    }
+
+    #[test]
+    fn an_empty_cancel_push_ends_the_worker_session() {
+        let error = worker_outcome(
+            MAX,
+            vec![ServerMessage::Cancel {
+                attempts: Vec::new(),
+            }],
+        );
+        assert!(
+            matches!(&error, Error::Protocol(what) if *what == "cancel push"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_runner_lease_below_its_protocol_ends_the_worker_session() {
+        let offer = ServerMessage::RunnerOffer(RunnerLeaseWire {
+            lease: [1; 16],
+            class: "linux".into(),
+            lease_until_ms: 0,
+            cpu_millis: 1_000,
+            memory_bytes: 1 << 30,
+        });
+        let error = worker_outcome(RUNNER_MIN.0 - 1, vec![offer]);
+        assert!(
+            matches!(&error, Error::Protocol(what) if *what == "runner offer needs protocol 13"),
+            "{error}"
+        );
+    }
 }
