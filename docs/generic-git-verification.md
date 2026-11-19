@@ -60,6 +60,37 @@ No record: observed once on 2026-09-15 on a pilot host; no raw timings or fixtur
   remote: 72/91/120 ms per pass; steady cadence ~32 s on a 30 s interval
   (interval + ≤¼ jitter).
 
+## Standing the fixtures up
+
+`bench/g08-forges.py` creates the matrix above from containers on one loopback, so a binding written here can be reproduced rather than remembered. It needs Podman (rootless preferred) or Docker, `openssl`, `ssh-keygen` and `git`; it refuses a fixture before pulling anything when the host cannot carry it.
+
+```
+python3 bench/g08-forges.py up bare        # or gitea, forgejo, gitlab, all
+python3 bench/g08-forges.py bind gitea https://sentinel.example/api/v1/intake/rep_... secret-file
+python3 bench/g08-forges.py converge gitea # the bindings a controller needs, as JSON
+python3 bench/g08-forges.py status
+python3 bench/g08-forges.py down
+```
+
+What each fixture is, and what it hands back:
+
+| Fixture | What it runs | Ports | Hands back |
+|---|---|---|---|
+| `gitea` | Gitea 1.27.3 over HTTPS with the fixture CA, its built-in SSH server, users and repositories `ci/app`, `ci/app2` | 3443, 3022 | CA path, a `read:repository` token file for the binding, a `write:repository` token file for the person pushing |
+| `forgejo` | Forgejo over HTTPS, same layout | 3444, 3024 | CA path, the two token files |
+| `gitlab` | GitLab CE; refused below 6 GiB of memory | 3445, 3023 | the SSH URL |
+| `bare` | A minimal sshd-with-git image built from `bench/g08/ssh-git.Containerfile`, serving `/git/app.git` | 2222 | the deploy key path |
+
+Two things the harness gets right that a hand-built fixture usually does not: every container runs with host networking, so a push's `post-receive` reaches a controller on the same loopback (a bridged container would need the forwarder the GitLab row used to); and `bind` writes the hook's environment beside every hook the fixture runs, owned by the forge's own user, with a spool directory that user may write — a hook that cannot spool fails a push instead of losing an event.
+
+The secret is read from a file, never from the command line, matching the hook's own rule that it reaches `curl` on stdin and never appears in `ps`.
+
+### What has been exercised from this harness
+
+- **bare repository over SSH**: fixture raised, a repository pushed to it twice, and both pushes delivered a signed `202`-answering POST to a loopback listener carrying `delivery_id`, `ref`, `old_sha` and `new_sha`.
+- **Gitea over HTTPS**: fixture raised with the local CA, the user, both repositories and both tokens created, the hook installed globally and into each repository, and the hook's delivery received by the same listener with the same body.
+- Not exercised from this harness: Forgejo, and GitLab (which needs more memory than the host this was written on). The rows in [What was exercised live](#what-was-exercised-live) above remain the record for those combinations, from the 2026-09-15 run.
+
 ## What is not covered
 
 - GitLab was exercised over SSH only; the fixture serves plain HTTP on its admin port and `sentinel_protocol::source::remote` accepts `https://` and `ssh://` only, so no GitLab HTTPS endpoint was stood up.
@@ -68,4 +99,6 @@ No record: observed once on 2026-09-15 on a pilot host; no raw timings or fixtur
 
 ## Verification
 
-Executed 2026-09-15 on a Linux verification host (Ubuntu 24.04, Docker, Podman 4.9.3, fixture `sshd`, Gitea 1.27.3, Forgejo, GitLab CE 18.3.2). The fixture scripts were local and are not in the repository.
+Executed 2026-09-15 on a Linux verification host (Ubuntu 24.04, Docker, Podman 4.9.3, fixture `sshd`, Gitea 1.27.3, Forgejo, GitLab CE 18.3.2). The fixture scripts of that run were local and are not in the repository; from 2026-11-19 the fixtures are [bench/g08-forges.py](../bench/g08-forges.py), and the two rows it has been exercised on since are listed above.
+
+`bench/test_g08_forges.py` covers the harness without a container: the bindings, the refusals, and its own self-test.
