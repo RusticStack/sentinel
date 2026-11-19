@@ -10,6 +10,7 @@ mod login_guard;
 mod mcp;
 mod metrics;
 mod oauth;
+mod preview;
 mod refresh;
 mod routes;
 mod secret_routes;

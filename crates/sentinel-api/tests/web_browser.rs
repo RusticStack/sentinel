@@ -164,6 +164,7 @@ fn config(f: &Fixture, base: &str, web: &str, out: &std::path::Path) -> serde_js
         "subscribers_per_user": sentinel_api::SUBSCRIBERS_PER_USER,
         "web_log": f.dir.path().join("web.log"),
         "tailcat_address": TAILCAT_ADDRESS,
+        "preview_needle": fixture::PREVIEW_NEEDLE,
     })
 }
 
@@ -311,6 +312,7 @@ fn deployment(bulk_mib: usize, relayed: bool) -> (Arc<Fixture>, Web, String, Str
 #[ignore = "needs Node, the built web interface and a Chromium-family browser"]
 fn the_web_interface_in_a_real_browser() {
     let (f, web, web_addr, origin) = deployment(64, true);
+    f.seed_artifacts();
     let seed = f.seed_step_up_users();
     let stop = Arc::new(AtomicBool::new(false));
     let writer = keep_writing(&f, &stop);

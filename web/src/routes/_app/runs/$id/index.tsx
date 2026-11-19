@@ -11,15 +11,17 @@ import { fmtBytes, fmtNs, shortId, words } from "../../../../lib/format.ts";
 import { startedBy } from "../../../../lib/actor.ts";
 import { Page, rememberTenant } from "../../../../components/Page.tsx";
 import { StateBadge } from "../../../../components/StateBadge.tsx";
-import { RelTime } from "../../../../components/RelTime.tsx";
+import { RelTime, Until } from "../../../../components/RelTime.tsx";
 import { JobGraph } from "../../../../components/run/JobGraph.tsx";
 import { PhaseBar, phasesOf } from "../../../../components/run/PhaseBar.tsx";
 import { FailureSummary } from "../../../../components/run/FailureSummary.tsx";
+import { ArtifactBrowser } from "../../../../components/run/ArtifactBrowser.tsx";
+import type { ArtifactDetail, ArtifactRow } from "../../../../lib/artifacts.ts";
 import { Alert, Badge, Button, ButtonLink, Table, TextLink } from "../../../../components/ui.tsx";
 
 const RUN_ID = /^run_[0-9a-f-]{36}$/;
 
-interface Artifacts { tenant: string; artifacts: any[] }
+interface Artifacts { tenant: string; artifacts: ArtifactRow[] }
 
 export const Route = createFileRoute("/_app/runs/$id/")({
   loader: async ({ params }) => {
@@ -53,7 +55,8 @@ function RunView() {
   const { status, refused } = useRunStream(id, loaded.run, setRun);
   const [now, setNow] = useState(loaded.now);
   const [caches, setCaches] = useState<CacheRow[] | null>(null);
-  const [manifests, setManifests] = useState<Record<string, any>>({});
+  const [files, setFiles] = useState<ArtifactDetail | null>(null);
+  const [opening, setOpening] = useState<string | null>(null);
   const slug = loaded.arts?.tenant ?? null;
   const repoName = loaded.repos?.repos.find((r) => r.id === run.repo)?.name ?? null;
 
@@ -83,10 +86,12 @@ function RunView() {
   const cancelRun = () => act(me, "Cancel run", () => api(`/api/v1/runs/${id}/cancel`, { method: "POST", body: {} }));
   const jobAction = (job: JobStatus) =>
     act(me, `${job.terminal ? "Rerun" : "Cancel"} ${job.name}`, () => api(`/api/v1/jobs/${job.id}/${job.terminal ? "rerun" : "cancel"}`, { method: "POST", body: {} }));
-  async function toggleManifest(a: any) {
-    if (manifests[a.id]) { const { [a.id]: _, ...rest } = manifests; setManifests(rest); return; }
-    const detail = await act(me, `Files of ${a.name}`, () => api<any>(`/api/v1/runs/${id}/artifacts/${a.id}`), false);
-    if (detail?.manifest) setManifests((m) => ({ ...m, [a.id]: detail }));
+  async function toggleFiles(a: ArtifactRow) {
+    if (files?.id === a.id) { setFiles(null); return; }
+    setOpening(a.id);
+    const detail = await act(me, `Files of ${a.name}`, () => api<ArtifactDetail>(`/api/v1/runs/${id}/artifacts/${a.id}`), false);
+    setOpening(null);
+    setFiles(detail?.manifest ? detail : null);
   }
 
   return (
@@ -168,34 +173,33 @@ function RunView() {
         <section aria-labelledby="artifacts-h" className="space-y-3">
           <h2 id="artifacts-h" className="text-base font-semibold text-strong">Artifacts</h2>
           <Table caption="Artifacts">
-            <thead><tr><th>Artifact</th><th>Job</th><th>State</th><th>Entries</th><th>Size</th><th>Kept until</th><th>Files</th></tr></thead>
+            <thead><tr><th>Artifact</th><th>Job</th><th>Class</th><th>State</th><th>Entries</th><th>Size</th><th>Kept until</th><th>Files</th></tr></thead>
             <tbody>
               {loaded.arts.artifacts.map((a) => (
                 <tr key={a.id}>
                   <td>{a.name}</td><td>{a.job_name}</td>
+                  <td title={`${a.charged_bytes} bytes counted against the repository's quota`}>{a.class}</td>
                   <td><StateBadge state={a.state === "captured" ? "passed" : a.state === "failed" ? "failed" : "skipped"} label={a.state} /></td>
-                  <td>{a.entries}</td><td>{fmtBytes(a.bytes)}</td><td><RelTime ms={a.retain_until_ms} /></td>
+                  <td>{a.entries}</td><td>{fmtBytes(a.bytes)}</td>
+                  <td><Until ms={a.retain_until_ms} />{a.pinned_ms ? <span className="text-xs text-muted"> pinned</span> : null}</td>
                   <td>
                     {a.state === "captured" ? (
-                      <div>
-                        <Button size="sm" color="neutral" variant="outline" aria-expanded={!!manifests[a.id]} aria-label={`Files of ${a.name}`} onClick={() => toggleManifest(a)}>Files</Button>
-                        {manifests[a.id] ? (
-                          <ul className="mt-2 space-y-1 text-xs">
-                            {manifests[a.id].manifest.entries.slice(0, 500).map((en: any) => (
-                              <li key={en.path}>
-                                <a href={`/api/v1/tenants/${manifests[a.id].tenant}/objects/${en.digest}`} download={en.path.split("/").pop()} className="text-primary underline">{en.path}</a>
-                                <span className="text-muted"> {fmtBytes(en.len)}</span>
-                              </li>
-                            ))}
-                          </ul>
-                        ) : null}
-                      </div>
+                      <Button size="sm" color="neutral" variant="outline" icon="folder-git-2" aria-expanded={files?.id === a.id}
+                        aria-label={`Browse the files of ${a.name}`} loading={opening === a.id} onClick={() => toggleFiles(a)}>Browse</Button>
                     ) : null}
                   </td>
                 </tr>
               ))}
             </tbody>
           </Table>
+          {files ? (
+            <div id="artifact-files" className="space-y-3 rounded-md border border-line p-3">
+              <h3 className="text-sm font-semibold text-strong">
+                Files of {files.name} <span className="font-normal text-muted">· {files.job_name} · class {files.class}</span>
+              </h3>
+              <ArtifactBrowser run={id} detail={files} />
+            </div>
+          ) : null}
         </section>
       ) : null}
     </Page>

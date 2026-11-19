@@ -30,6 +30,17 @@ export function fmtAgo(ms: number | null | undefined, now = Date.now()): string 
   return new Date(ms).toLocaleDateString();
 }
 
+/** A deadline ahead: "in 23 h", and "due now" once it has passed. Never a past-tense "just now" for a future time. */
+export function fmtUntil(ms: number | null | undefined, now = Date.now()): string {
+  if (ms === null || ms === undefined || !isFinite(ms)) return "—";
+  const d = ms - now;
+  if (d <= 0) return "due now";
+  if (d < 60e3) return `in ${Math.max(1, Math.round(d / 1e3))} s`;
+  if (d < 3600e3) return `in ${Math.round(d / 60e3)} min`;
+  if (d < 86400e3) return `in ${Math.round(d / 3600e3)} h`;
+  return `in ${Math.round(d / 86400e3)} days`;
+}
+
 export const shortId = (id: string | null | undefined) => (id ? id.replace(/^([a-z]+_)(.{8}).*$/, "$1$2") : "—");
 export const shortSha = (sha: string | null | undefined) => (sha ? sha.slice(0, 12) : "—");
 export const shortRef = (ref: string | null | undefined) => (ref ? ref.replace(/^refs\/(heads|tags)\//, "") : "—");

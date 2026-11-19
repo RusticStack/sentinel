@@ -731,6 +731,7 @@ pub(crate) fn route(
                         "digest": e.digest.to_string(),
                         "len": e.len,
                         "mode": e.mode,
+                        "preview": crate::preview::label(&e.path, e.len),
                     })).collect::<Vec<_>>(),
                 });
             }
@@ -738,6 +739,9 @@ pub(crate) fn route(
         }
         ("GET", ["api", "v1", "runs", run, "artifacts", art, "archive"]) => {
             artifact_archive(state, request, run, art, query)
+        }
+        ("GET", ["api", "v1", "runs", run, "artifacts", art, "preview"]) => {
+            crate::preview::entry(state, request, run, art, query)
         }
         ("POST", ["api", "v1", "runs", run, "artifacts", art, "link"]) => {
             artifact_link(state, request, run, art)
@@ -1419,7 +1423,7 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
     }
 }
 
-struct Slot(Arc<AtomicUsize>);
+pub(crate) struct Slot(Arc<AtomicUsize>);
 
 impl Drop for Slot {
     fn drop(&mut self) {
@@ -1440,7 +1444,7 @@ fn take_slot(counter: &Arc<AtomicUsize>, cap: usize) -> Option<Slot> {
     }
 }
 
-fn slot(state: &State) -> Result<Slot, ApiError> {
+pub(crate) fn slot(state: &State) -> Result<Slot, ApiError> {
     take_slot(&state.transfers, TRANSFERS)
         .ok_or_else(|| err(ErrorCode::RateLimited, "transfer slots exhausted; retry"))
 }
@@ -2550,9 +2554,9 @@ fn object_download(state: &State, request: &mut Request, slug: &str, digest: &st
     }
 }
 
-struct Held<R> {
-    inner: R,
-    _slot: Slot,
+pub(crate) struct Held<R> {
+    pub(crate) inner: R,
+    pub(crate) _slot: Slot,
 }
 
 impl<R: Read> Read for Held<R> {
