@@ -1826,7 +1826,7 @@ impl Inner {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .filter(|(_, peer)| peer.protocol >= RUNNER_MIN.0 && session::is_free(&peer.sender))
+            .filter(|(_, peer)| peer.protocol >= RUNNER_MIN.0 && peer.ranked())
             .map(|(worker, peer)| (*worker, Arc::clone(peer)))
             .collect();
         if peers.is_empty() {
