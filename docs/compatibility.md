@@ -23,7 +23,7 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | MCP Streamable HTTP protocol | revision `2025-11-25` | `sentinel-api::mcp` | Remote MCP clients at `/mcp` |
 | Explain output | `schema: "sentinel.explain/1"` | `sentinel-pipeline::explain` | CLI, agents |
 | Event cursor | text prefix `c1` | `sentinel-protocol::cursor` | API clients (`GET /attempts/{id}/logs` and `/failure` `next`/`cursor`) |
-| Worker protocol | `protocol_min..=protocol_max` in `Hello` (currently 1..=11) | `sentinel-protocol::negotiate` | workers |
+| Worker protocol | `protocol_min..=protocol_max` in `Hello` (currently 1..=12) | `sentinel-protocol::negotiate` | workers |
 | Log segment index | `SNLI` magic + format `u16` (currently 1) | `sentinel-store::logs` | controller |
 | Compressed log segment | `SNLZ` magic + format `u16` + codec `u8` (currently 1, zlib) | `sentinel-store::logs` | controller |
 | Log end marker | `SNLE` magic + format `u16` (currently 1) | `sentinel-store::logs` | controller |

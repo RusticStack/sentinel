@@ -333,8 +333,8 @@ struct InFlight {
     file: Option<OpenFile>,
     /// The offered entries the tenant already holds, accumulated across batches: the worker is answered once.
     held: Vec<u32>,
-    /// The offer closed; a later batch is refused rather than merged into a settled answer.
-    offered: bool,
+    /// The offer's last batch has been seen; a later batch is refused rather than merged into a settled answer.
+    offer_closed: bool,
     settled: bool,
 }
 
@@ -2631,7 +2631,7 @@ impl SessionHandler for Inner {
                 sending: 0,
                 last_path: String::new(),
                 file: None,
-                offered: false,
+                offer_closed: false,
                 settled: false,
             })),
         );
@@ -2655,7 +2655,7 @@ impl SessionHandler for Inner {
         if f.settled {
             return Verdict(ArtifactCode::Stale);
         }
-        if f.name != name || f.offered || f.file.is_some() {
+        if f.name != name || f.offer_closed || f.file.is_some() {
             return Verdict(self.artifact_fail(f, attempt, ArtifactCode::Invalid));
         }
         if session::Offered::invalid(entries, &f.last_path).is_some()
@@ -2712,7 +2712,7 @@ impl SessionHandler for Inner {
         if !last {
             return Held(Vec::new());
         }
-        f.offered = true;
+        f.offer_closed = true;
         f.next_pending();
         // The run budget is the artifact's logical size; only the bytes that will actually be staged need room.
         let fits = missing == 0
@@ -2764,7 +2764,7 @@ impl SessionHandler for Inner {
             return Some(self.artifact_fail(f, attempt, ArtifactCode::Invalid));
         }
         let mode = mode & crate::session::ARTIFACT_MODE_BITS;
-        if f.offered {
+        if f.offer_closed {
             // An offered artifact has promised exactly these entries in this order, and its size is charged.
             let matches = f.done.get(f.sending).is_some_and(|planned| {
                 planned.path == path
