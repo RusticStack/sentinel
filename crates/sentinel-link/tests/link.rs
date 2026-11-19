@@ -1696,9 +1696,10 @@ fn a_crashed_publication_gives_back_its_staged_bytes_and_its_run_budget() {
     eventually("the crashed attempt is expired", || {
         d.state(crashed.0).is_terminal()
     });
-    eventually("the staged bytes of the crashed publication are gone", || {
-        staged_bytes(&d) == 0
-    });
+    eventually(
+        "the staged bytes of the crashed publication are gone",
+        || staged_bytes(&d) == 0,
+    );
 
     // The other job of the run is untouched and publishes against the same budget the crashed attempt held.
     reporter.artifact_begin(survivor.1.attempt, "dist").unwrap();

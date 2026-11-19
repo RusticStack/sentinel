@@ -34,6 +34,7 @@ struct Api {
     admin: String,
     runner: String,
     reader: String,
+    foreign: String,
     tenant: TenantId,
     repo: RepoId,
     root: UserId,
@@ -111,6 +112,40 @@ fn deployment() -> Api {
         format!("Bearer {}", sentinel_auth::token::format(&granted.secret))
     };
     let admin = mint(root, Permissions::ALL, "admin");
+    let foreign = {
+        let (user, tenant, repo) = (UserId::new(), TenantId::new(), RepoId::new());
+        store
+            .writer()
+            .write(move |tx| {
+                provisioning::insert_human(tx, user, "Outsider", true, now)?;
+                let admin = Principal::new(user, Permissions::ALL, None, None);
+                auth::create_namespace(
+                    tx,
+                    admin,
+                    tenant,
+                    Namespace::parse("other").unwrap(),
+                    NamespaceKind::Organization,
+                    now,
+                )?;
+                auth::set_membership(tx, admin, tenant, user, Role::TenantAdmin)?;
+                auth::create_repo(tx, admin, tenant, repo, "other", now)
+            })
+            .unwrap();
+        let granted = tokens::provision(
+            &store,
+            Grant {
+                user,
+                name: "outsider",
+                permissions: Permissions::ALL,
+                tenant: None,
+                repo: None,
+                lifetime_ms: 3_600_000,
+            },
+            UnixMillis::now(),
+        )
+        .unwrap();
+        format!("Bearer {}", sentinel_auth::token::format(&granted.secret))
+    };
     // `run` implies every scope `runs:write` does, `artifacts:write` included; the live membership
     // is what decides whether the repository may be operated on.
     let runner = mint(operator, Permissions::RUN, "runner");
@@ -152,6 +187,7 @@ fn deployment() -> Api {
         admin,
         runner,
         reader,
+        foreign,
         tenant,
         repo,
         root,
@@ -658,4 +694,55 @@ fn a_runner_mode_artifact_is_recorded_under_its_github_run_and_job() {
         status, 404,
         "a reader of the repository cannot record its runner-mode artifacts: {refused}"
     );
+}
+
+/// A run-level artifact belongs to the run and tenant it names: another organization's member, who holds
+/// everything its own tenant grants, gets `not_found` for it, and so does its own tenant naming another run.
+#[test]
+fn a_run_level_artifact_is_scoped_by_its_run_and_its_tenant() {
+    let d = deployment();
+    let run = d.run();
+    let other_run = d.run();
+    let bytes = b"attached once, scoped to one run";
+    let digest = d.upload(bytes);
+    let body = d.attach_body("reports", &digest, bytes.len());
+    let (status, created) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/runs/{run}/artifacts"),
+        Some(&body),
+        &d.admin,
+    );
+    assert_eq!(status, 201, "{created}");
+    let art = created["id"].as_str().unwrap().to_owned();
+
+    for (who, credential) in [("another tenant", &d.foreign), ("another run", &d.admin)] {
+        let named = if who == "another run" { other_run } else { run };
+        for path in [
+            format!("/api/v1/runs/{named}/artifacts/{art}"),
+            format!("/api/v1/runs/{named}/artifacts/{art}/archive?format=tar"),
+        ] {
+            let (status, refused) = call(&d, "GET", &path, None, credential);
+            assert_eq!(status, 404, "{who} on {path}: {refused}");
+            assert_eq!(refused["code"], "not_found", "{who} on {path}");
+        }
+    }
+    // And the attachment is not reachable through an upload session's object route either.
+    let (status, refused) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/tenants/acme/objects/{digest}"),
+        None,
+        &d.foreign,
+    );
+    assert_eq!(status, 404, "{refused}");
+
+    let (status, detail) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run}/artifacts/{art}"),
+        None,
+        &d.admin,
+    );
+    assert_eq!(status, 200, "its own run still reads it: {detail}");
 }
