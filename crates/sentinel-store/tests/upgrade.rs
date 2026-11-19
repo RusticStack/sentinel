@@ -276,10 +276,30 @@ fn an_older_build_runs_on_a_newer_database_only_when_every_unknown_migration_all
             [future + 1],
         )
         .unwrap();
-    assert!(matches!(
-        Store::open(&path, Durability::Full),
-        Err(Error::Corrupt(_))
-    ));
+    let refused = match Store::open(&path, Durability::Full) {
+        Err(error) => error,
+        Ok(_) => panic!("a database that needs a newer schema is refused"),
+    };
+    let Error::SchemaNewer {
+        database,
+        binary,
+        needs,
+    } = &refused
+    else {
+        panic!("expected a schema refusal, got {refused:?}");
+    };
+    assert_eq!(
+        (*database, *binary, *needs),
+        (future + 1, schema::LATEST, future + 1),
+        "the refusal names the schema, the binary and what the database needs"
+    );
+    let message = refused.to_string();
+    assert!(
+        message.contains(&format!("at schema {}", future + 1))
+            && message.contains(&format!("reads {}", schema::LATEST))
+            && message.contains("restore the copy"),
+        "{message}"
+    );
     let report = upgrade::preflight(dir.path()).unwrap();
     assert!(!report.inspection.openable());
     assert_eq!(report.blocking.len(), 1, "{:?}", report.blocking);
@@ -300,6 +320,328 @@ fn the_preflight_reports_skew_room_and_the_key_without_changing_anything() {
     assert_eq!(report.needed_bytes, report.inspection.bytes * 2);
     assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
     assert_eq!(version(&path), schema::LATEST - 1);
+}
+
+/// A populated database at schema 72: a tenant, its sealed secret, an OAuth client with every child
+/// row, and two enrolled workers, one of them at a protocol this build does not serve. The copy is
+/// what the operator inspects before the upgrade and rolls back to after it.
+fn populated_at_72(path: &std::path::Path) -> [u8; 32] {
+    let (tenant, user, access) = (TenantId::new(), UserId::new(), [0x0b_u8; 32]);
+    drop(database_at(path, 72));
+    let mut conn = Connection::open(path).unwrap();
+    conn.execute(
+        "INSERT INTO tenants(id, slug, created_ms) VALUES(?1, 'acme', 1)",
+        [tenant.as_bytes().as_slice()],
+    )
+    .unwrap();
+    let secret = [0x01_u8; 16];
+    conn.execute(
+        "INSERT INTO secrets(id, tenant_id, name, current_version, created_ms, updated_ms)
+         VALUES(?1, ?2, 'TOKEN', 1, 1, 1)",
+        params![secret.as_slice(), tenant.as_bytes().as_slice()],
+    )
+    .unwrap();
+    let mut sealed = vec![0x02_u8; 64];
+    sealed[0] = 0x02;
+    conn.execute(
+        "INSERT INTO secret_versions(secret_id, version, sealed, created_ms)
+         VALUES(?1, 1, ?2, 1)",
+        params![secret.as_slice(), sealed],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO oauth_clients(client_id, name, first_party, loopback, redirect_path,
+             device, max_scopes, created_ms)
+         VALUES('legacy-cli', 'Legacy', 0, 1, '/cb', 1, 1023, 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO oauth_client_redirects(client_id, uri)
+         VALUES('legacy-cli', 'https://legacy.example/cb')",
+        [],
+    )
+    .unwrap();
+    let tx = conn.transaction().unwrap();
+    provisioning::insert_human(&tx, user, "Root", true, NOW).unwrap();
+    tx.commit().unwrap();
+    conn.execute(
+        "INSERT INTO oauth_grants(id, user_id, client_id, kind, scopes, audience, created_ms,
+             expires_ms, resource)
+         VALUES(?1, ?2, 'legacy-cli', 1, 1023, 1, 1, 2, 1)",
+        params![[0x0c_u8; 16].as_slice(), user.as_bytes().as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO oauth_access_tokens(token_digest, grant_id, generation, scopes,
+             created_ms, expires_ms)
+         VALUES(?1, ?2, 1, 1023, 1, 2)",
+        params![access.as_slice(), [0x0c_u8; 16].as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO pools(id, name, kind, created_ms) VALUES(?1, 'builders', 1, 1)",
+        [[0x0f_u8; 16].as_slice()],
+    )
+    .unwrap();
+    for (name, protocol, software, fingerprint) in [
+        ("old", 13, Some("sentinel-worker 0.1.0"), 0x21_u8),
+        ("next", 14, None, 0x22_u8),
+    ] {
+        conn.execute(
+            "INSERT INTO workers(id, pool_id, fingerprint, name, arch, capabilities, protocol,
+                 enrolled_ms, software)
+             VALUES(?1, ?2, ?3, ?4, 'x86_64', 15, ?5, 1, ?6)",
+            params![
+                [fingerprint; 16].as_slice(),
+                [0x0f_u8; 16].as_slice(),
+                [fingerprint; 32].as_slice(),
+                name,
+                protocol,
+                software
+            ],
+        )
+        .unwrap();
+    }
+    let _ = tenant;
+    access
+}
+
+#[test]
+fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.sqlite");
+    let access = populated_at_72(&path);
+    let before = std::fs::read(&path).unwrap();
+    let stored = {
+        let conn = Connection::open(&path).unwrap();
+        let rows = |table: &str| -> u64 {
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap() as u64
+        };
+        [
+            "oauth_clients",
+            "oauth_client_redirects",
+            "oauth_grants",
+            "oauth_access_tokens",
+        ]
+        .map(|table| (table, rows(table)))
+    };
+
+    let report = upgrade::preflight(dir.path()).unwrap();
+    assert_eq!(report.inspection.pending, vec![73, 74]);
+    assert!(report.inspection.openable() && report.inspection.integrity == "ok");
+    assert_eq!(
+        report.copy.as_deref(),
+        Some(upgrade::snapshot_path(&path, 72).as_path()),
+        "the copy the upgrade writes is the rollback point, named before it exists"
+    );
+    assert_eq!(report.needed_bytes, report.inspection.bytes * 2);
+
+    // What the upgrade does to the rows already stored: migration 73 rebuilds every OAuth table, and
+    // migration 74 adds runner-mode shape without visiting a row.
+    assert_eq!(
+        report
+            .steps
+            .iter()
+            .map(|step| step.version)
+            .collect::<Vec<_>>(),
+        vec![73, 74]
+    );
+    let rewrites = |step: usize| -> Vec<(String, u64)> {
+        report.steps[step]
+            .rewrites
+            .iter()
+            .map(|rewrite| (rewrite.table.clone(), rewrite.rows))
+            .collect()
+    };
+    let (oauth, runner) = (rewrites(0), rewrites(1));
+    for (table, rows) in stored {
+        assert!(rows > 0, "{table} is populated");
+        assert!(
+            oauth.contains(&(table.to_owned(), rows)),
+            "migration 73 rewrites {table}'s {rows} rows: {oauth:?}"
+        );
+    }
+    assert!(
+        runner.is_empty(),
+        "migration 74 only adds shape: {runner:?}"
+    );
+
+    // Every enrolled worker is listed with what it announces, and the one this build cannot serve is
+    // marked rather than silently dropped.
+    let workers: Vec<(&str, u16, Option<&str>, bool)> = report
+        .workers
+        .iter()
+        .map(|w| {
+            (
+                w.name.as_str(),
+                w.protocol,
+                w.software.as_deref(),
+                w.refused,
+            )
+        })
+        .collect();
+    assert_eq!(
+        workers,
+        vec![
+            ("next", 14, None, true),
+            ("old", 13, Some("sentinel-worker 0.1.0"), false)
+        ]
+    );
+
+    // A populated database with sealed values needs its key before it needs anything else.
+    assert!(report.sealed_values && !report.key_present);
+    assert_eq!(report.blocking.len(), 1, "{:?}", report.blocking);
+    assert!(
+        report.blocking[0].contains("master.key"),
+        "{:?}",
+        report.blocking
+    );
+    let key = dir.path().join(sentinel_store::MASTER_KEY_FILE);
+    std::fs::write(&key, [0x33_u8; 32]).unwrap();
+    let report = upgrade::preflight(dir.path()).unwrap();
+    assert!(
+        report.key_present && report.blocking.is_empty(),
+        "{:?}",
+        report.blocking
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+    assert_eq!(version(&path), 72);
+
+    // The upgrade takes the copy the preflight named, and everything it rewrote arrives intact.
+    let (store, copy) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
+    assert_eq!(copy, Some(upgrade::snapshot_path(&path, 72)));
+    assert_eq!(version(&path), schema::LATEST);
+    let survivors: (i64, Vec<u8>, i64) = store
+        .read(|c| {
+            Ok((
+                c.query_row("SELECT count(*) FROM oauth_clients", [], |r| r.get(0))?,
+                c.query_row("SELECT token_digest FROM oauth_access_tokens", [], |r| {
+                    r.get(0)
+                })?,
+                c.query_row("SELECT scopes FROM oauth_grants", [], |r| r.get(0))?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(survivors, (2, access.to_vec(), 1023));
+    drop(store);
+    let copy = upgrade::snapshot_path(&path, 72);
+    assert_eq!(version(&copy), 72);
+    let copied: i64 = Connection::open(&copy)
+        .unwrap()
+        .query_row("SELECT count(*) FROM oauth_access_tokens", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        copied, 1,
+        "the copy is the database as it was before the upgrade"
+    );
+}
+
+#[test]
+fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.sqlite");
+    let tenant = TenantId::new();
+    {
+        let conn = database_at(&path, 70);
+        conn.execute(
+            "INSERT INTO tenants(id, slug, created_ms) VALUES(?1, 'acme', 1)",
+            [tenant.as_bytes().as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO oauth_clients(client_id, name, first_party, loopback, redirect_path,
+                 device, max_scopes, created_ms)
+             VALUES('legacy-cli', 'Legacy', 0, 1, '/cb', 1, 1023, 1)",
+            [],
+        )
+        .unwrap();
+    }
+    let report = upgrade::preflight(dir.path()).unwrap();
+    assert_eq!(report.inspection.pending, vec![71, 72, 73, 74]);
+    assert_eq!(
+        report.copy.as_deref(),
+        Some(upgrade::snapshot_path(&path, 70).as_path())
+    );
+    assert_eq!(
+        report.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
+        vec![71, 72, 73, 74]
+    );
+    assert!(report.blocking.is_empty(), "{:?}", report.blocking);
+
+    let (store, copy) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
+    let copy = copy.expect("a pending migration takes the copy");
+    // What was written after the upgrade is what a restore loses.
+    store
+        .writer()
+        .write(move |tx| jobs::insert_tenant(tx, TenantId::new(), "after", NOW))
+        .unwrap();
+    drop(store);
+    assert_eq!(version(&path), schema::LATEST);
+
+    // The matrix: no release older than the current schema runs on the result, because migration 74 is
+    // readable by nothing below itself, so the copy (or a backup) is the only rollback.
+    let needs = |db: &std::path::Path, release: u32| -> u32 {
+        Connection::open(db)
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(MAX(readable_by), 0) FROM schema_migrations
+                 WHERE version > ?1 AND version <= ?2",
+                params![release, schema::LATEST],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    for release in [69, schema::LATEST - 2, schema::LATEST - 1] {
+        assert!(
+            needs(&path, release) > release,
+            "release {release} cannot run on the upgraded database"
+        );
+    }
+    // Restoring the copy is that rollback path, and release 69 runs on it as the matrix says.
+    std::fs::copy(&copy, &path).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        let mut stale = path.clone().into_os_string();
+        stale.push(suffix);
+        let stale = std::path::PathBuf::from(stale);
+        if stale.exists() {
+            std::fs::remove_file(stale).unwrap();
+        }
+    }
+    assert_eq!(version(&path), 70, "the copy is the old schema");
+    let restored = Connection::open(&path).unwrap();
+    let slugs: Vec<String> = restored
+        .prepare("SELECT slug FROM tenants ORDER BY slug")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(slugs, ["acme"], "the restore drops what the upgrade wrote");
+    assert_eq!(
+        needs(&path, 69),
+        69,
+        "migration 70 is readable by 69, so release 69 runs on the restored copy"
+    );
+    let clients: Vec<String> = restored
+        .prepare("SELECT client_id FROM oauth_clients ORDER BY client_id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(clients, ["legacy-cli", "sentinel-cli"]);
+    drop(restored);
+    // A second preflight over the restored copy reports the same upgrade, not a migration half done.
+    let again = upgrade::preflight(dir.path()).unwrap();
+    assert_eq!(again.inspection.pending, vec![71, 72, 73, 74]);
+    assert_eq!(
+        again.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
+        vec![71, 72, 73, 74]
+    );
 }
 
 #[test]

@@ -694,7 +694,11 @@ fn migration_preserves_v3_data_and_rejects_future_versions_and_inconsistent_owne
             drop(conn);
             assert!(matches!(
                 Store::open(path, Durability::Full),
-                Err(Error::Corrupt("unsupported database version"))
+                Err(Error::SchemaNewer {
+                    database: 999,
+                    needs: 999,
+                    ..
+                })
             ));
         }
     }

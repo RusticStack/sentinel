@@ -847,8 +847,12 @@ impl Rejection {
     /// What an operator reads on the worker when the controller refuses its hello.
     pub fn reason(&self) -> &'static str {
         match self {
-            Self::UnsupportedVersion { .. } => {
-                "the controller and this worker share no protocol version"
+            Self::UnsupportedVersion { upgrade_worker, .. } => {
+                if *upgrade_worker {
+                    "this worker speaks a protocol the controller no longer serves: upgrade the worker"
+                } else {
+                    "this controller speaks an older protocol range than the worker offers: upgrade the controller"
+                }
             }
             Self::MissingCapabilities(_) => {
                 "this worker lacks capabilities the controller requires"

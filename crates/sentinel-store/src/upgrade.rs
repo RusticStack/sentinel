@@ -186,6 +186,21 @@ pub struct WorkerVersion {
     pub refused: bool,
 }
 
+/// A table whose stored rows a pending migration writes, drops or rebuilds, with the rows it holds now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rewrite {
+    pub table: String,
+    pub rows: u64,
+}
+
+/// One pending migration: what applying it does to the rows a populated database already holds. Shape
+/// alone (a new table, an index, a column, a trigger) rewrites nothing and lists no table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub version: u32,
+    pub rewrites: Vec<Rewrite>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preflight {
     pub inspection: Inspection,
@@ -195,6 +210,145 @@ pub struct Preflight {
     pub key_present: bool,
     pub workers: Vec<WorkerVersion>,
     pub blocking: Vec<String>,
+    /// The file the upgrade writes the pre-migration copy to before it migrates: the rollback point,
+    /// absent when it has nothing to migrate or the database is newer than the binary.
+    pub copy: Option<PathBuf>,
+    /// One entry per pending migration, in order.
+    pub steps: Vec<Step>,
+}
+
+/// The text of the migration with comments and the contents of string literals blanked, so a keyword
+/// search sees statements rather than prose and a `;` inside either does not end one.
+fn plain(sql: &str) -> String {
+    let mut text = sql.as_bytes().to_vec();
+    let len = text.len();
+    let mut i = 0;
+    while i < len {
+        match text[i] {
+            b'-' if text.get(i + 1) == Some(&b'-') => {
+                while i < len && text[i] != b'\n' {
+                    text[i] = b' ';
+                    i += 1;
+                }
+            }
+            b'/' if text.get(i + 1) == Some(&b'*') => {
+                let end = sql[i..].find("*/").map_or(len, |at| i + at + 2);
+                text[i..end].fill(b' ');
+                i = end;
+            }
+            b'\'' => {
+                // A doubled quote closes and reopens the literal, so the body stays blanked either way.
+                text[i] = b' ';
+                i += 1;
+                while i < len {
+                    let closing = text[i] == b'\'';
+                    text[i] = b' ';
+                    i += 1;
+                    if closing {
+                        break;
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    String::from_utf8(text).expect("only ASCII bytes are blanked")
+}
+
+/// The tables whose rows a migration's own statements insert, update, delete or drop, in the order it
+/// names them and without duplicates. Statements inside a trigger it creates are skipped: they run when
+/// a later write fires them, not when the migration applies.
+fn rewritten(sql: &str) -> Vec<String> {
+    fn words(statement: &str) -> Vec<&str> {
+        statement
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| !word.is_empty())
+            .collect()
+    }
+    fn named<'a>(words: &[&'a str], ahead: &str) -> Option<&'a str> {
+        let at = words
+            .iter()
+            .position(|word| word.eq_ignore_ascii_case(ahead))?;
+        words.get(at + 1).copied()
+    }
+    let plain = plain(sql);
+    let bytes = plain.as_bytes();
+    let mut tables: Vec<String> = Vec::new();
+    let (mut start, mut i, mut body) = (0, 0, false);
+    while i < bytes.len() {
+        if bytes[i] != b';' {
+            i += 1;
+            continue;
+        }
+        let words = words(&plain[start..i]);
+        start = i + 1;
+        i += 1;
+        // A trigger's body runs later: it closes on the `END;` statement that ends it, and a nested
+        // `CASE … END` never stands alone as one.
+        if body {
+            body = !(words.len() == 1 && words[0].eq_ignore_ascii_case("END"));
+            continue;
+        }
+        let Some(head) = words.first() else {
+            continue;
+        };
+        if head.eq_ignore_ascii_case("CREATE")
+            && words
+                .iter()
+                .any(|word| word.eq_ignore_ascii_case("TRIGGER"))
+        {
+            body = true;
+            continue;
+        }
+        let table = if head.eq_ignore_ascii_case("INSERT") || head.eq_ignore_ascii_case("REPLACE") {
+            named(&words, "INTO")
+        } else if head.eq_ignore_ascii_case("UPDATE") {
+            // `UPDATE OR REPLACE t` names its table after the conflict clause.
+            match words.get(1) {
+                Some(word) if word.eq_ignore_ascii_case("OR") => words.get(3).copied(),
+                _ => words.get(1).copied(),
+            }
+        } else if head.eq_ignore_ascii_case("DELETE") {
+            named(&words, "FROM")
+        } else if head.eq_ignore_ascii_case("DROP") {
+            // `DROP TABLE [IF EXISTS] t`; a dropped trigger or index destroys no rows.
+            words
+                .iter()
+                .position(|word| word.eq_ignore_ascii_case("TABLE"))
+                .and_then(|at| {
+                    words[at + 1..].iter().copied().find(|word| {
+                        !word.eq_ignore_ascii_case("IF") && !word.eq_ignore_ascii_case("EXISTS")
+                    })
+                })
+        } else {
+            None
+        };
+        if let Some(table) = table
+            && !tables.iter().any(|seen| seen == table)
+        {
+            tables.push(table.to_owned());
+        }
+    }
+    tables
+}
+
+fn step(conn: &Connection, version: u32) -> Step {
+    let mut rewrites: Vec<Rewrite> = Vec::new();
+    let mut query = String::with_capacity(48);
+    for table in rewritten(schema::MIGRATIONS[version as usize - 1].1) {
+        query.clear();
+        query.push_str("SELECT COUNT(*) FROM \"");
+        query.push_str(&table);
+        query.push('"');
+        // A table the migration creates is not counted: it holds nothing to rewrite yet.
+        if let Ok(rows) = conn.query_row(&query, [], |r| r.get::<_, i64>(0)) {
+            rewrites.push(Rewrite {
+                table,
+                rows: rows.max(0) as u64,
+            });
+        }
+    }
+    Step { version, rewrites }
 }
 
 pub fn preflight(data_dir: &Path) -> Result<Preflight> {
@@ -205,12 +359,14 @@ pub fn preflight(data_dir: &Path) -> Result<Preflight> {
     let needed_bytes = inspection.bytes.saturating_mul(2);
     let mut sealed_values = false;
     let mut workers = Vec::new();
+    let mut steps = Vec::new();
     if !inspection.fresh {
         let conn = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         sealed_values = crate::reseal::sealed_rows_exist(&conn).unwrap_or(false);
+        steps = inspection.pending.iter().map(|&v| step(&conn, v)).collect();
         let with_software = conn.prepare("SELECT software FROM workers LIMIT 0").is_ok();
         let sql = if with_software {
             "SELECT name, protocol, software, last_seen_ms FROM workers WHERE revoked_ms IS NULL ORDER BY name"
@@ -239,6 +395,10 @@ pub fn preflight(data_dir: &Path) -> Result<Preflight> {
             }
         }
     }
+    // The copy is what an upgrade writes before its first migration, so it is the only rollback for a
+    // release older than the result (docs/upgrades.md).
+    let copy = (!inspection.fresh && !inspection.newer && !inspection.pending.is_empty())
+        .then(|| snapshot_path(&path, inspection.database));
     let key_present = data_dir.join(crate::MASTER_KEY_FILE).is_file();
     let mut blocking = Vec::new();
     if !inspection.openable() {
@@ -276,5 +436,66 @@ pub fn preflight(data_dir: &Path) -> Result<Preflight> {
         key_present,
         workers,
         blocking,
+        copy,
+        steps,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rewrite_names_only_the_tables_its_own_statements_write() {
+        // A trigger body runs when a later write fires it, not when the migration applies.
+        assert_eq!(
+            rewritten(
+                "CREATE TABLE fresh(id INTEGER);
+                 CREATE TRIGGER later AFTER INSERT ON fresh BEGIN
+                     UPDATE elsewhere SET x = 1;
+                     DELETE FROM gone;
+                 END;
+                 INSERT INTO kept VALUES (1);"
+            ),
+            ["kept"]
+        );
+        assert_eq!(
+            rewritten(
+                "-- UPDATE commented_out SET x = 1;
+                 /* DELETE FROM also_commented; */
+                 INSERT OR IGNORE INTO answers(id) VALUES (1);
+                 UPDATE OR REPLACE scored SET x = 1;
+                 DELETE FROM retired;
+                 DROP TABLE IF EXISTS rebuilt;
+                 DROP TRIGGER stale_trigger;
+                 DROP INDEX stale_index;
+                 ALTER TABLE shaped ADD COLUMN extra INTEGER NOT NULL DEFAULT 0;
+                 CREATE INDEX named ON answers(id);"
+            ),
+            ["answers", "scored", "retired", "rebuilt"]
+        );
+        // A semicolon or a doubled quote inside a literal does not end a statement.
+        assert_eq!(
+            rewritten("INSERT INTO texts(body) VALUES ('a;b''c'); UPDATE texts SET body = '';"),
+            ["texts"]
+        );
+    }
+
+    #[test]
+    fn the_pending_migrations_report_the_tables_they_rewrite() {
+        let sql = |version: u32| schema::MIGRATIONS[version as usize - 1].1;
+        // Runner-mode provisioning adds tables, indexes and triggers only.
+        assert!(rewritten(sql(schema::LATEST)).is_empty());
+        // The OAuth scope rebuild copies every row into a `_v73` table and drops the original.
+        let oauth = rewritten(sql(73));
+        for table in ["oauth_clients", "oauth_grants", "oauth_access_tokens"] {
+            assert!(
+                oauth.iter().any(|seen| seen == table),
+                "migration 73 rewrites {table}: {oauth:?}"
+            );
+        }
+        assert!(oauth.iter().any(|seen| seen.ends_with("_v73")), "{oauth:?}");
+        // The artifact rebuild is the one that visits stored rows; a trigger's own writes are not its.
+        assert_eq!(rewritten(sql(72)), ["artifacts_v71", "artifacts"]);
+    }
 }
