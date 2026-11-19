@@ -5,7 +5,7 @@ use sentinel_core::{UnixMillis, UserId};
 use crate::{
     Error, Result, Store,
     auth::Authority,
-    local_auth::{Event, Issued, Policy, Session, audit},
+    local_auth::{Event, Issued, Policy, audit},
 };
 
 pub const STATE_TTL_MS: i64 = 10 * 60 * 1000;
@@ -169,19 +169,20 @@ pub fn finish(
     }
 }
 
-// Linking needs recent proof of presence: a stolen cookie must not attach an attacker's account.
+// Linking needs recent proof of presence: a stolen cookie must not attach an attacker's account. The proof is
+// the session row itself, read in the transaction that links, so a session revoked or stamped out of its window
+// after the request was identified attaches nothing (`Authority::require_fresh`).
 pub fn link(
     store: &Store,
-    session: &Session,
-    policy: Policy,
+    authority: Authority,
     provider: &str,
     subject: &str,
     now: UnixMillis,
 ) -> Result<()> {
-    session.require_step_up(policy, now)?;
-    let user = session.user;
+    let user = authority.actor().ok_or(Error::Forbidden)?;
     let (provider, subject) = (provider.to_owned(), subject.to_owned());
     store.writer().write(move |tx| {
+        authority.require_fresh(tx)?;
         crate::auth::provisioning::link_verified_identity(tx, user, &provider, &subject, now)
             .map_err(|error| match error {
                 Error::Sqlite(rusqlite::Error::SqliteFailure(code, _))
