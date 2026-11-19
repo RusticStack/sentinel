@@ -33,7 +33,11 @@ pub(super) fn platform(
     Ok(who)
 }
 
-fn tenant_admin(state: &State, request: &Request, mutation: bool) -> Result<Identity, ApiError> {
+pub(super) fn tenant_admin(
+    state: &State,
+    request: &Request,
+    mutation: bool,
+) -> Result<Identity, ApiError> {
     let who = identify(state, request, mutation)?;
     auth::require_scope(&who, Scopes::TENANT_ADMIN)?;
     Ok(who)

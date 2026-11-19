@@ -41,6 +41,7 @@ use crate::{
 
 pub(crate) mod account;
 mod admin;
+mod ai;
 mod email;
 mod failure;
 mod history;
@@ -405,6 +406,9 @@ pub(crate) fn route(
         return reply;
     }
     if let Some(reply) = admin::route(state, request, method, &parts, query) {
+        return reply;
+    }
+    if let Some(reply) = ai::route(state, request, method, &parts) {
         return reply;
     }
     if let Some(reply) = worker_enrollment::route(state, request, method, &parts, query) {
