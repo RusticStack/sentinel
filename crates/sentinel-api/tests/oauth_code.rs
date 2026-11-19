@@ -459,7 +459,11 @@ fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
         &[version, session_header],
     );
     assert_eq!(tools.status, 200);
-    assert_eq!(tools.body["result"]["tools"].as_array().unwrap().len(), 14);
+    // The catalogue is the promise: a tool added to it is listed here without editing the count.
+    assert_eq!(
+        tools.body["result"]["tools"].as_array().unwrap().len(),
+        sentinel_protocol::mcp::tool_definitions().len()
+    );
 
     let denied = json!({
         "jsonrpc":"2.0","id":3,"method":"tools/call",
