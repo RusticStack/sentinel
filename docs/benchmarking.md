@@ -220,19 +220,19 @@ Record: [`bench/digest-transfer.jsonl`](../bench/digest-transfer.jsonl), 10 samp
 | Host | `capy-loopback-cloud`, AMD EPYC, 2 vCPUs, 7.8 GiB RAM, kernel `6.1.158`, Ubuntu 24.04 container |
 | Link | loopback only: the controller, the relay and both workers on one machine |
 | Workload | 48 files × 256 KiB = 12 MiB per artifact, the same content published five times into one tenant |
-| Build | `7cccd43`, release, `dirty: false` |
+| Build | `7d94824`, release, `dirty: false` |
 
 | Mode | Link bytes | median | min | max |
 |---|---|---|---|---|
-| `bodies` (protocol 11) | 12,617,473 | 53.1 ms | 38.8 ms | 71.7 ms |
-| `digest` (protocol 12) | 3,798 | 57.2 ms | 9.5 ms | 59.4 ms |
-| saved | 12,613,675 (99.97 %) | 7.2 ms slower (paired range −33.3 ms to +29.3 ms) | | |
+| `bodies` (protocol 11) | 12,617,473 | 69.8 ms | 65.0 ms | 82.2 ms |
+| `digest` (protocol 12) | 3,798 (one sample 3,844, a heartbeat inside the window) | 56.5 ms | 16.4 ms | 63.8 ms |
+| saved | 12,613,675 (99.97 %) | 14.0 ms | 7.5 ms | 48.6 ms |
 
 Interpretation, limited to what was measured:
 
-- **The bytes are the win.** A repeated 12 MiB artifact crosses the link as 3.8 KiB instead of 12.6 MB: the offer and the answer, and nothing else. That is what a link's capacity is spent on in the pilot case, and it is what a slower or shared link would feel.
-- **Time is not.** On loopback the transfer is not the dominant cost of a publication: the per-publication fixed work (the begin/grant, offer/held and end/verdict round trips, the artifact's writer transaction and its fsync) dominates at this size, and the paired differences sit inside the run-to-run noise of five rounds. Digest-first does move CPU work rather than remove it: the worker hashes each file once to offer it, and the controller hashes nothing it already holds. A larger artifact or a slower link is where the time saving would have to be measured, and neither was run.
-- The spread is wide in both modes (38.8–71.7 ms against 9.5–59.4 ms) and is not a distribution of the transfer; it is the fixed costs plus the scheduler of one shared 2-vCPU container. Read the medians, not an individual sample.
+- **The bytes are the win, and they are the whole point.** A repeated 12 MiB artifact crosses the link as 3.8 KiB instead of 12.6 MB: the offer and the answer, and nothing else. That is what a link's capacity is spent on in the pilot case, and it is what a slower or shared link would feel.
+- **The time saving is real here but modest and host-sensitive.** Every paired difference in this record is positive (7.5–48.6 ms, median 14.0 ms of a 69.8 ms bodies publication), but a first run of the same binary, discarded before this record, put the pairs in both directions (−33.3 ms to +29.3 ms). On loopback the transfer is not the dominant cost of a publication: the fixed work (the begin/grant, offer/held and end/verdict round trips, the artifact's writer transaction and its fsync) dominates at this size. Digest-first also moves CPU work rather than removing it: the worker hashes each file once to offer it, and the controller hashes nothing it already holds. A larger artifact or a slower link is where the time saving would have to be measured, and neither was run.
+- The spread is wide in both modes (65.0–82.2 ms against 16.4–63.8 ms) and is not a distribution of the transfer; it is the fixed costs plus the scheduler of one shared 2-vCPU container. Read the medians, not an individual sample.
 
 ## Micro-contract benches
 
