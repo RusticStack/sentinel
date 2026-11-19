@@ -2969,10 +2969,17 @@ impl SessionHandler for Inner {
         None
     }
 
-    fn artifact_end(&self, _worker: WorkerId, attempt: AttemptId, name: &str) -> ArtifactCode {
+    fn artifact_end(&self, worker: WorkerId, attempt: AttemptId, name: &str) -> ArtifactCode {
         let Some(publication) = self.publication(attempt) else {
             return ArtifactCode::Stale;
         };
+        // Checked once, at the commit, rather than on every chunk: an upload may begin within its attempt's lease
+        // and finish after the attempt was released by a cancel, a lease loss, an abandon or a revoked worker. The
+        // rows, objects and manifest it staged are nobody's artifact then, so it commits nothing.
+        if !self.holds(worker, attempt) {
+            let mut guard = publication.lock().unwrap_or_else(|p| p.into_inner());
+            return self.artifact_fail(&mut guard, attempt, ArtifactCode::Stale);
+        }
         let mut guard = publication.lock().unwrap_or_else(|p| p.into_inner());
         let f = &mut *guard;
         if f.settled {
@@ -3127,6 +3134,15 @@ impl SessionHandler for Inner {
         } else {
             artifacts::State::Failed
         };
+        // A row is a row: an attempt released since its publication began records neither an absent nor a failed
+        // artifact, and what it staged is discarded.
+        if !self.holds(worker, attempt) {
+            if let Some(publication) = self.publication(attempt) {
+                let mut guard = publication.lock().unwrap_or_else(|p| p.into_inner());
+                return self.artifact_fail(&mut guard, attempt, ArtifactCode::Stale);
+            }
+            return ArtifactCode::Stale;
+        }
         if let Some(publication) = self.publication(attempt) {
             let mut guard = publication.lock().unwrap_or_else(|p| p.into_inner());
             let f = &mut *guard;
@@ -3141,9 +3157,6 @@ impl SessionHandler for Inner {
                     ArtifactCode::CaptureFailed
                 };
             }
-        }
-        if !self.holds(worker, attempt) {
-            return ArtifactCode::Stale;
         }
         let scope = self.store.read(|c| {
             let tx = c.unchecked_transaction()?;

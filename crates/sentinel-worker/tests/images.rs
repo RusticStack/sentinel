@@ -158,7 +158,7 @@ fn the_pull_overlaps_the_checkout() {
         &mut job,
         &rec,
         Arc::new(NoOutput),
-        &NoSink,
+        std::sync::Arc::new(NoSink),
         &uncanceled(),
     );
     let seen = seen.lock().unwrap();

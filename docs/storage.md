@@ -145,7 +145,7 @@ The API exposes this as `POST /tenants/{slug}/uploads`, `GET|PUT|DELETE /uploads
 
 The `artifacts` table (migration 25) is the durable outcome of each declared artifact on an attempt: one row per `(attempt_id, name)` with the job and run for scoping, a terminal `state_code` (`captured`, `absent`, `failed`), entry and byte counts, the `manifests` version when captured, the retention deadline, the creation timestamp, and — since migration 68 — the artifact's `class`, its `charged_bytes` (its bytes times the class's quota weight, which is what its repository's quota counts) and `pinned_ms`, set while a tenant administrator holds the artifact past its deadline ([retention](retention.md#artifact-classes-and-pins)). `UNIQUE(attempt_id, name)` makes a redelivery a conflict rather than a duplicate; the state/identity columns sit behind the usual immutability triggers.
 
-A captured row and its manifest commit in **one writer transaction**: the controller stages each file body through `stage_begin`/`stage_write`/`stage_seal` (the streaming counterpart of `stage` — a `Staged` keeps the same rename-then-commit discipline and pin, and `Objects::discard` on the writer never removes a file another stage or committed row owns), commits the object references, commits the `{job_id}/{name}` manifest under `Kind::Artifact`, then inserts the artifact row. Absent and failed outcomes write only the row. A partial publication that never reaches `ArtifactEnd` leaves staged files that `recover` or the orphan sweep collects and in-flight byte accounting that the session drop releases; no artifact row exists for it, so nothing claims it. Each attempt's publication has its own lock: file writes, `fdatasync`s and renames happen under it, and the controller-wide artifact map is held only to find the publication and to charge the run budget.
+A captured row and its manifest commit in **one writer transaction**: the controller stages each file body through `stage_begin`/`stage_write`/`stage_seal` (the streaming counterpart of `stage` — a `Staged` keeps the same rename-then-commit discipline and pin, and `Objects::discard` on the writer never removes a file another stage or committed row owns), commits the object references, commits the `{job_id}/{name}` manifest under `Kind::Artifact`, then inserts the artifact row. That transaction runs only if the attempt is still held when `ArtifactEnd` arrives ([streaming publication](#streaming-publication)). Absent and failed outcomes write only the row. A partial publication that never reaches `ArtifactEnd` leaves staged files that `recover` or the orphan sweep collects and in-flight byte accounting that the session drop releases; no artifact row exists for it, so nothing claims it. Each attempt's publication has its own lock: file writes, `fdatasync`s and renames happen under it, and the controller-wide artifact map is held only to find the publication and to charge the run budget.
 
 The API lists a run's artifacts (`GET /runs/{run}/artifacts`) and shows one row's detail (`GET /runs/{run}/artifacts/{arf}`), the latter inlining the manifest's entry paths, digests, lengths and modes; entry bytes download through the existing `GET /tenants/{slug}/objects/{digest}` route.
 
@@ -167,6 +167,33 @@ object paths the authenticated routes use, including the transfer slot, the stat
 evicted entry streams back from the external copy exactly as it does there. A token may be redeemed repeatedly inside
 its window: nothing is consumed, because a redemption record would put a write on every anonymous download. The
 access-log line keeps a 16-hex digest of the token and never the text ([API](api.md#short-lived-download-links)).
+## Streaming publication
+
+An artifact declared `when: step:<id>` publishes at the end of that step, under the attempt's own lease, while the
+steps after it keep running ([pipeline schema](pipeline-schema.md#bindings-and-offline-validation)). The worker
+captures the declared paths on its own thread when the step completes and joins that thread before finalization, so
+the workspace it reads and the lease that fences it are the attempt's, and a required artifact's outcome is known
+before the attempt reports. One publication per attempt uploads at a time: the controller admits one, so the worker
+serializes them, and a later step's artifact waits for the earlier one only at the point it starts.
+
+Nothing about the row, the manifest or the object path changes. A step-triggered publication is an ordinary
+`captured` row written while the attempt is still running, so it is listed, charged and retained like any other, and
+`finish` finds it already there. Two rules keep that safe:
+
+- **The fence is the attempt's hold.** A publication is admitted only while the attempt is leased, acknowledged,
+  unreleased and its worker unrevoked (`dispatch::is_held`), and `ArtifactEnd` — the commit — re-checks it once, one
+  indexed lookup per artifact rather than one per chunk. An upload that began inside the lease and finished after a
+  cancel, a lease loss, an abandon or a worker revocation commits nothing: its staged objects are discarded and no
+  row, manifest or charge is written. `tests/link.rs` drives both windows.
+- **One row per `(attempt_id, name)`, unchanged.** `artifacts::exists` refuses a second begin with `duplicate`, so a
+  redelivery or a second publication of the same name is a conflict the worker reports, never a second record.
+
+Coverage at finalization is the same rule it was: a declaration due under the outcome must have a row and a
+`required` one must be `captured`. A step trigger is judged like `success`, because the step's own outcome is what
+decided whether it published — a passing attempt that never published a required artifact behind a step is
+`Failed(Publication)`, and a job that already failed on a step is not failed again for the artifact that step never
+reached.
+
 ## Digest-first publication
 
 On a protocol-12 session the worker states an artifact's content before any of its bytes travel: one offer per artifact carrying each entry's path, BLAKE3 digest, length and mode, answered once with the entries whose bytes this tenant already stores at exactly that length ([worker link](worker-link.md#dispatch)). The answer comes from `objects::holds`, one primary-key lookup per entry inside a single reader borrow (`SELECT … FROM objects WHERE tenant_id = ? AND digest = ? AND len = ?`), and it is tenant-scoped on purpose: an object another tenant stores is not a hold, so its body travels, the artifact gets its own object row, and nothing in the answer distinguishes "another tenant has it" from "nobody has it".
@@ -210,7 +237,7 @@ Each attempt owns `logs/<run>/<job>/<attempt>/`: `seg-NNNNNN` record segments se
 A job's terminal transition carries its data status in the same transaction — `finish` is also the finalization boundary:
 
 - **`attempts.log_state`** (migration 26) records the log's durable status: `pending` while live, `complete` once the `end` marker is on disk, `incomplete` when the job went terminal first. The `LogEnd` handler writes the marker, then the row, and only then answers `Acked`/`LogEndAck`; the writer-transaction commit means an acknowledgement is never sent for a status that is not durable. The recreated `attempt_update` trigger adds `NEW.log_state < OLD.log_state` to the forbidden moves — the column may heal `incomplete → complete` on a late retransmitted end, never regress.
-- **Artifact coverage is checked against the stored run spec**, not the worker's claim: for every declaration due under the outcome (`when`), a row must exist, and a *required* one must be `captured`. Due-but-missing declarations get `failed` rows so the loss is on record; a reported `Passed` standing over an uncaptured required artifact is applied as `Failed(Publication)` instead. Optional misses and not-due declarations change nothing but the row set.
+- **Artifact coverage is checked against the stored run spec**, not the worker's claim: for every declaration due under the outcome (`when`, where a `step:<id>` trigger is due exactly when the attempt passed), a row must exist, and a *required* one must be `captured`. Due-but-missing declarations get `failed` rows so the loss is on record; a reported `Passed` standing over an uncaptured required artifact is applied as `Failed(Publication)` instead. Optional misses and not-due declarations change nothing but the row set.
 - The same stamping runs on every terminal path — `report`, `expire`, `abandon`, `reconcile_startup` — all take the `LogStore` so the answer to "was the end marker durable at publication" is the marker itself, not a worker's claim. A caller without a log store (`None`) answers `incomplete`, never `complete`.
 
 Because log frames and `LogEnd` are accepted for an attempt the worker owns even after release (`attempt_log_scope`), a post-terminal retransmission can still land its marker and upgrade `incomplete → complete`; artifact publication stays held-only, since it is part of the verdict.

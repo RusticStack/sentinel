@@ -26,6 +26,8 @@ pub const MAX_ID_BYTES: usize = 64;
 pub const MAX_CLASS_NAME: usize = 32;
 pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 60 * 60;
+/// The `when` value that publishes an artifact behind a named step: `step:<id>`.
+pub const STEP_TRIGGER_PREFIX: &str = "step:";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pipeline {
@@ -186,6 +188,19 @@ pub enum ArtifactWhen {
     Success = 0,
     Failure = 1,
     Always = 2,
+    /// Publishes at the end of this step, by its index in the job, while later steps keep running. The loader
+    /// resolves the declared step id here, so an artifact can only name a step the job has.
+    Step(u8) = 3,
+}
+
+impl ArtifactWhen {
+    /// The step this artifact publishes behind, if it is not matched against the job's verdict.
+    pub const fn step(self) -> Option<u8> {
+        match self {
+            ArtifactWhen::Step(index) => Some(index),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -995,7 +1010,7 @@ fn cache(path: &str, node: &Node) -> Result<Cache> {
     })
 }
 
-fn artifact(path: &str, node: &Node) -> Result<Artifact> {
+fn artifact(path: &str, node: &Node, steps: &[Step]) -> Result<Artifact> {
     let mut map = Map::new(path, node)?;
     let name = map
         .take("name")
@@ -1017,17 +1032,37 @@ fn artifact(path: &str, node: &Node) -> Result<Artifact> {
     }
     let when = match map.take("when") {
         None => ArtifactWhen::Success,
-        Some(n) => match expect_str(&map.child("when"), n, 8)? {
-            "success" => ArtifactWhen::Success,
-            "failure" => ArtifactWhen::Failure,
-            "always" => ArtifactWhen::Always,
-            _ => {
-                return Err(err(
-                    &map.child("when"),
-                    SchemaErrorKind::Invalid("expected success, failure or always".into()),
-                ));
+        Some(n) => {
+            let child = map.child("when");
+            let value = expect_str(&child, n, MAX_ID_BYTES + STEP_TRIGGER_PREFIX.len())?;
+            match value {
+                "success" => ArtifactWhen::Success,
+                "failure" => ArtifactWhen::Failure,
+                "always" => ArtifactWhen::Always,
+                _ => match value.strip_prefix(STEP_TRIGGER_PREFIX) {
+                    // Resolved here, so a step trigger names a step the job has and the worker compares an index.
+                    Some(id) => match steps.iter().position(|step| step.id == id) {
+                        Some(index) => ArtifactWhen::Step(index as u8),
+                        None => {
+                            return Err(err(
+                                &child,
+                                SchemaErrorKind::Invalid(format!(
+                                    "names no step of this job: `{id}`"
+                                )),
+                            ));
+                        }
+                    },
+                    None => {
+                        return Err(err(
+                            &child,
+                            SchemaErrorKind::Invalid(
+                                "expected success, failure, always or step:<id>".into(),
+                            ),
+                        ));
+                    }
+                },
             }
-        },
+        }
     };
     let retain_secs = match map.take("retain") {
         None => 7 * 24 * 3600,
@@ -1315,7 +1350,7 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy) -> Result<Job> {
             expect_seq(&child, n, MAX_ARTIFACTS)?
                 .iter()
                 .enumerate()
-                .map(|(i, n)| artifact(&format!("{child}[{i}]"), n))
+                .map(|(i, n)| artifact(&format!("{child}[{i}]"), n, &steps))
                 .collect::<Result<Vec<_>>>()?
         }
     };

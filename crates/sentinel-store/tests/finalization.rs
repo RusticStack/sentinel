@@ -227,6 +227,101 @@ jobs:
       - { name: dist, paths: ['dist/**'], required: true }
 ";
 
+const STEP_ARTIFACT: &str = "schema: 1
+on: [push]
+jobs:
+  build:
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }, { id: later, run: 'true' }]
+    artifacts:
+      - { name: dist, paths: ['dist/**'], when: step:s, required: true }
+";
+
+fn capture(f: &Fixture, run: RunId, job: JobId, attempt: AttemptId, at: UnixMillis) -> u64 {
+    let (tenant, objects) = (f.tenant, Arc::clone(&f.objects));
+    f.store
+        .writer()
+        .write(move |tx| {
+            let version =
+                objects.commit_manifest(tx, tenant, objects::Kind::Artifact, "build/dist", &[])?;
+            artifacts::record(
+                tx,
+                tenant,
+                run,
+                job,
+                attempt,
+                "dist",
+                artifacts::State::Captured,
+                Some(version),
+                0,
+                0,
+                UnixMillis(at.0 + 86_400_000),
+                at,
+            )?;
+            Ok(version)
+        })
+        .unwrap()
+}
+
+/// A step-triggered artifact publishes while the attempt is still running: the store takes the row in that phase,
+/// and the reported verdict that follows neither replaces it nor adds a second one.
+#[test]
+fn a_step_triggered_artifact_published_mid_attempt_stands_at_finalization() {
+    let f = fixture();
+    let w = worker(&f, CAP);
+    let (run, _ids) = run(&f, STEP_ARTIFACT, at(2_000));
+    let (job, attempt, fence) = held(&f, w, at(2_100));
+    assert!(
+        f.store
+            .read(|c| dispatch::held_by(c, w))
+            .unwrap()
+            .iter()
+            .any(|h| h.attempt == attempt && h.acknowledged)
+    );
+    capture(&f, run, job, attempt, at(2_300));
+    let next = f
+        .store
+        .writer()
+        .write(move |tx| {
+            dispatch::report(tx, w, attempt, fence, Event::Passed, None, at(2_500), None)
+        })
+        .unwrap();
+    assert_eq!(next, JobState::Terminal(Outcome::Passed));
+    assert_eq!(
+        artifact_states(&f, run),
+        vec![("dist".to_string(), artifacts::State::Captured)]
+    );
+}
+
+/// The publication a step never reached is the only thing finalization can complain about, and it does: a required
+/// artifact declared behind a step fails a passing attempt exactly as `success` would.
+#[test]
+fn a_required_step_triggered_artifact_that_never_published_downgrades_the_report() {
+    let f = fixture();
+    let w = worker(&f, CAP);
+    let (run, _ids) = run(&f, STEP_ARTIFACT, at(2_000));
+    let (job, attempt, fence) = held(&f, w, at(2_100));
+    let next = f
+        .store
+        .writer()
+        .write(move |tx| {
+            dispatch::report(tx, w, attempt, fence, Event::Passed, None, at(2_500), None)
+        })
+        .unwrap();
+    assert_eq!(next, JobState::Terminal(Outcome::InfraFailed));
+    assert_eq!(
+        f.store
+            .read(|c| jobs::get_job(c, f.tenant, job))
+            .unwrap()
+            .failure_class,
+        Some(FailureClass::Publication)
+    );
+    assert_eq!(
+        artifact_states(&f, run),
+        vec![("dist".to_string(), artifacts::State::Failed)]
+    );
+}
+
 #[test]
 fn a_durable_log_end_records_complete_and_survives_terminal_stamping() {
     let f = fixture();

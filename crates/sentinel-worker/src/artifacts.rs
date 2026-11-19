@@ -9,6 +9,9 @@ use sentinel_protocol::limits::{
 
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// [`StepPublications`] tracks the started declarations in one `u16`.
+const _: () = assert!(sentinel_pipeline::schema::MAX_ARTIFACTS <= 16);
+
 pub trait Sink: Send + Sync {
     fn capable(&self) -> bool;
     /// Whether the peer may be offered digests before bodies; a sink that cannot still sends every body.
@@ -66,11 +69,114 @@ impl Sink for NoSink {
     }
 }
 
+/// Whether the job's verdict decides this declaration at finalization. A step trigger does not: it published, or
+/// did not, when its step ended, and only its required coverage is judged here.
 pub fn due(decl: &Artifact, passed: bool) -> bool {
     match decl.when {
         ArtifactWhen::Success => passed,
         ArtifactWhen::Failure => !passed,
         ArtifactWhen::Always => true,
+        ArtifactWhen::Step(_) => false,
+    }
+}
+
+/// The verdict text a required declaration that did not publish is reported with.
+pub fn required_missing(decl: &Artifact, outcome: Outcome) -> String {
+    match outcome {
+        Outcome::QuotaExceeded => format!(
+            "required artifact `{}` was refused at the tenant's storage limit; its record names the bytes stored, the threshold and the largest classes",
+            decl.name
+        ),
+        _ => format!("required artifact `{}` was not published", decl.name),
+    }
+}
+
+/// One attempt's step-triggered publications. At most one uploads at a time — the controller admits one
+/// publication per attempt — and each is joined before the attempt reports, so no upload outlives the workspace it
+/// reads or the lease that fences it.
+#[derive(Default)]
+pub struct StepPublications {
+    running: Option<std::thread::JoinHandle<(Outcome, Artifact)>>,
+    /// The declarations whose step reached its end, by declaration index.
+    started: u16,
+    failure: Option<String>,
+}
+
+impl StepPublications {
+    /// Starts `decl`'s publication now, on its own thread, so the steps after `step` run while it uploads. The
+    /// workspace must already hold the files: a microVM's are pulled out before this is called.
+    pub fn publish(
+        &mut self,
+        index: usize,
+        decl: &Artifact,
+        workspace: &Path,
+        sink: &std::sync::Arc<dyn Sink>,
+        attempt: AttemptId,
+    ) {
+        self.join();
+        self.started |= 1 << index;
+        let owned = decl.clone();
+        let dir = workspace.to_path_buf();
+        let moved = std::sync::Arc::clone(sink);
+        let spawned = std::thread::Builder::new()
+            .name(format!("sentinel-publish-{attempt}"))
+            .spawn(move || {
+                let outcome = capture(&dir, &owned, &*moved, attempt);
+                (outcome, owned)
+            });
+        match spawned {
+            Ok(handle) => self.running = Some(handle),
+            // No thread: the publication still happens, on this one. The attempt pays for it, not the data.
+            Err(_) => {
+                let outcome = capture(workspace, decl, &**sink, attempt);
+                self.record(decl, outcome);
+            }
+        }
+    }
+
+    /// Joins the publication still running and answers what the attempt must report: a required step-triggered
+    /// artifact that failed to publish, or one whose step never reached its end. `passed` gates the second — a job
+    /// already failing on a step is not failed again for the artifact that step never reached.
+    pub fn settle(
+        &mut self,
+        declared: &[Artifact],
+        steps: &[sentinel_pipeline::schema::Step],
+        passed: bool,
+    ) -> Option<String> {
+        self.join();
+        if passed {
+            for (index, decl) in declared.iter().enumerate() {
+                let Some(step) = decl.when.step() else {
+                    continue;
+                };
+                if self.started & (1 << index) == 0 && decl.required {
+                    let id = steps.get(usize::from(step)).map_or("", |s| s.id.as_str());
+                    self.failure.get_or_insert_with(|| {
+                        format!(
+                            "required artifact `{}` was not published: step `{id}` did not complete",
+                            decl.name
+                        )
+                    });
+                }
+            }
+        }
+        self.failure.take()
+    }
+
+    fn join(&mut self) {
+        let Some(handle) = self.running.take() else {
+            return;
+        };
+        if let Ok((outcome, decl)) = handle.join() {
+            self.record(&decl, outcome);
+        }
+    }
+
+    fn record(&mut self, decl: &Artifact, outcome: Outcome) {
+        if decl.required && outcome != Outcome::Published {
+            self.failure
+                .get_or_insert_with(|| required_missing(decl, outcome));
+        }
     }
 }
 

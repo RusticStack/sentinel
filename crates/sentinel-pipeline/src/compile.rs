@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     expr::{Phase, Template},
     policy::Triggers,
-    schema::{Job, Pipeline, Step},
+    schema::{ArtifactWhen, Job, Pipeline, Step},
 };
 
 pub const MAX_STEPS_TOTAL: usize = 1024;
@@ -446,7 +446,13 @@ fn digest_of(
             for p in &a.paths {
                 d.str(p);
             }
-            d.u64(a.when as u64);
+            // A step trigger folds its step index into the same field, so it never collides with a verdict.
+            d.u64(match a.when {
+                ArtifactWhen::Success => 0,
+                ArtifactWhen::Failure => 1,
+                ArtifactWhen::Always => 2,
+                ArtifactWhen::Step(step) => 3 + u64::from(step),
+            });
             d.u64(a.retain_secs);
             d.u64(u64::from(a.required));
             d.opt_str(a.class.as_deref());

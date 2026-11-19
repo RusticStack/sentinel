@@ -176,7 +176,7 @@ fn run_attempt(worker_dir: &Path, job: &mut Job) -> (Verdict, AttemptSummary, Ve
         job,
         &notes,
         Arc::new(NoOutput),
-        &NoSink,
+        std::sync::Arc::new(NoSink),
         &cancel,
     );
     (verdict, summary, notes.cache.lock().unwrap().clone())
@@ -299,7 +299,7 @@ fn publish_runs_with_the_container_stopped() {
         &mut job,
         &probe,
         Arc::new(NoOutput),
-        &NoSink,
+        std::sync::Arc::new(NoSink),
         &cancel,
     );
     assert_eq!(verdict, Verdict::Passed);
