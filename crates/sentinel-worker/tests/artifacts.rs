@@ -99,6 +99,7 @@ fn decl(name: &str, paths: &[&str], when: ArtifactWhen, required: bool) -> Artif
         when,
         retain_secs: 3600,
         required,
+        class: None,
     }
 }
 

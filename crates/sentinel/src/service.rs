@@ -411,6 +411,15 @@ fn valid_label(label: &str) -> bool {
 const EGRESS_LABEL: &str = "egress";
 const MAX_LABELS: usize = 16;
 
+/// One `[storage.classes.<name>]` table: a retention ceiling and a quota weight.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClassFile {
+    max_age_secs: u64,
+    weight: Option<u32>,
+}
+
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -425,15 +434,18 @@ struct StorageFile {
     run_artifact_bytes: Option<u64>,
     attempt_log_bytes: Option<u64>,
     sweep_interval_secs: Option<u64>,
+    artifact_default_class: Option<String>,
+    classes: Option<std::collections::BTreeMap<String, ClassFile>>,
 }
 
 #[cfg(feature = "server")]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Storage {
     reserve: Option<u64>,
     low: Option<u64>,
     high: Option<u64>,
     deployment: sentinel_store::retention::Deployment,
+    classes: sentinel_store::retention::Classes,
     attempt_log_bytes: u64,
     sweep_interval_ms: i64,
 }
@@ -505,10 +517,12 @@ impl StorageFile {
         {
             return Err(Error::config("storage quotas must fit in 63 bits"));
         }
+        let classes = self.resolve_classes(artifact_retention_secs)?;
         Ok(Storage {
             reserve: self.reserve_bytes,
             low: self.low_watermark_bytes,
             high: self.high_watermark_bytes,
+            classes,
             deployment: sentinel_store::retention::Deployment {
                 quota_bytes: self.quota_bytes.unwrap_or(0),
                 tenant_quota_bytes: self.tenant_quota_bytes.unwrap_or(0),
@@ -518,6 +532,63 @@ impl StorageFile {
             },
             attempt_log_bytes,
             sweep_interval_ms: (sweep_interval_secs * 1000) as i64,
+        })
+    }
+}
+
+#[cfg(feature = "server")]
+impl StorageFile {
+    /// `[storage.classes]` and its default, bounded like the other storage limits: a name, an age
+    /// inside the deployment's artifact retention, a weight, and a default the map defines.
+    fn resolve_classes(
+        &self,
+        artifact_retention_secs: u64,
+    ) -> Result<sentinel_store::retention::Classes, Error> {
+        let mut resolved = sentinel_store::retention::Classes::default();
+        let Some(map) = &self.classes else {
+            if let Some(name) = &self.artifact_default_class {
+                if !resolved.classes.iter().any(|c| c.name == *name) {
+                    return Err(Error::config(
+                        "storage artifact_default_class must name a class [storage.classes] defines",
+                    ));
+                }
+                resolved.default_class = name.clone();
+            }
+            return Ok(resolved);
+        };
+        if map.is_empty() {
+            return Err(Error::config(
+                "storage [classes] must define at least one class",
+            ));
+        }
+        let mut classes = Vec::with_capacity(map.len());
+        for (name, class) in map {
+            if !sentinel_pipeline::schema::valid_class_name(name)
+                || !(3_600..=artifact_retention_secs).contains(&class.max_age_secs)
+                || class.weight.is_some_and(|w| !(1..=100).contains(&w))
+            {
+                return Err(Error::config(
+                    "storage classes must be named [a-z][a-z0-9_-]{0,31} with max_age_secs 3600..=artifact_retention_secs and weight 1..=100",
+                ));
+            }
+            classes.push(sentinel_store::retention::Class {
+                name: name.clone(),
+                max_age_ms: (class.max_age_secs * 1000) as i64,
+                weight: class.weight.unwrap_or(1),
+            });
+        }
+        let default_class = self
+            .artifact_default_class
+            .clone()
+            .unwrap_or_else(|| resolved.default_class);
+        if !classes.iter().any(|c| c.name == default_class) {
+            return Err(Error::config(
+                "storage artifact_default_class must name a class [storage.classes] defines",
+            ));
+        }
+        Ok(sentinel_store::retention::Classes {
+            default_class,
+            classes,
         })
     }
 }
@@ -2146,10 +2217,30 @@ fn start_server(
     );
     admission.set_metadata_bytes(store.metadata_bytes());
     let deployment = config.storage.deployment;
-    store
+    let classes = config.storage.classes.clone();
+    let changed = store
         .writer()
-        .write(move |tx| sentinel_store::retention::install(tx, &deployment))
+        .write(move |tx| {
+            sentinel_store::retention::install(tx, &deployment)?;
+            sentinel_store::retention::install_classes(tx, &deployment, &classes)
+        })
         .map_err(|error| Error::runtime(format!("cannot record the storage policy: {error}")))?;
+    // A class whose ceiling or weight changed re-stamps its artifacts (and what it charges the
+    // repository) in bounded batches, one writer transaction each, before the controller serves.
+    if !changed.is_empty() {
+        let classes = store
+            .read(sentinel_store::retention::classes)
+            .map_err(|error| Error::runtime(format!("cannot read the storage classes: {error}")))?;
+        for name in &changed {
+            let Some(class) = classes.classes.iter().find(|c| c.name == *name) else {
+                continue;
+            };
+            sentinel_store::retention::finish_class_reapply(&store, &deployment, class).map_err(
+                |error| Error::runtime(format!("cannot re-apply the artifact class: {error}")),
+            )?;
+            tracing::info!(event = "artifact_class_reapplied", class = name.as_str());
+        }
+    }
     tracing::info!(
         event = "storage_configured",
         filesystem_bytes = total,
@@ -4049,6 +4140,21 @@ credentials_file = '/etc/sentinel/s3'
     #[test]
     fn storage_defaults_and_validation() {
         let resolved = resolve_ok(StorageFile::default());
+        assert_eq!(resolved.classes.default_class, "standard");
+        assert_eq!(
+            resolved
+                .classes
+                .classes
+                .iter()
+                .map(|c| (c.name.as_str(), c.max_age_ms, c.weight))
+                .collect::<Vec<_>>(),
+            [
+                ("debug", 7 * 86_400_000, 1),
+                ("standard", 30 * 86_400_000, 1),
+                ("evidence", 90 * 86_400_000, 1),
+                ("release", 90 * 86_400_000, 2),
+            ]
+        );
         let marks = marks_ok(&resolved, 64 << 30);
         assert_eq!(
             marks,
@@ -4128,6 +4234,40 @@ credentials_file = '/etc/sentinel/s3'
         ] {
             assert!(file.resolve().is_err());
         }
+        // A class map is bounded like the rest: a defined default, an age inside the deployment's
+        // artifact retention and a weight, and names a pipeline may state.
+        let classes =
+            |name: &str, max_age_secs: u64, weight: Option<u32>, default: Option<&str>| {
+                StorageFile {
+                    artifact_default_class: default.map(str::to_owned),
+                    classes: Some(std::collections::BTreeMap::from([(
+                        name.to_owned(),
+                        ClassFile {
+                            max_age_secs,
+                            weight,
+                        },
+                    )])),
+                    ..Default::default()
+                }
+            };
+        for file in [
+            classes("debug", 3_599, None, None),
+            classes("debug", 7 * 86_400 + 1, None, None),
+            classes("debug", 3_600, Some(0), None),
+            classes("debug", 3_600, Some(101), None),
+            classes("Debug", 3_600, None, None),
+            StorageFile {
+                classes: Some(std::collections::BTreeMap::new()),
+                ..Default::default()
+            },
+            StorageFile {
+                artifact_default_class: Some("fast".into()),
+                ..Default::default()
+            },
+            classes("debug", 3_600, None, Some("release")),
+        ] {
+            assert!(file.resolve().is_err(), "an out-of-bounds class map");
+        }
         let file = StorageFile {
             reserve_bytes: Some(1 << 30),
             low_watermark_bytes: Some(2 << 30),
@@ -4139,6 +4279,23 @@ credentials_file = '/etc/sentinel/s3'
             run_artifact_bytes: Some(1 << 30),
             attempt_log_bytes: Some(64 << 20),
             sweep_interval_secs: Some(60),
+            artifact_default_class: Some("release".into()),
+            classes: Some(std::collections::BTreeMap::from([
+                (
+                    "debug".to_owned(),
+                    ClassFile {
+                        max_age_secs: 3_600,
+                        weight: None,
+                    },
+                ),
+                (
+                    "release".to_owned(),
+                    ClassFile {
+                        max_age_secs: 86_400,
+                        weight: Some(3),
+                    },
+                ),
+            ])),
         };
         let resolved = resolve_ok(file);
         assert_eq!(marks_ok(&resolved, 1 << 50).high, 3 << 30);
@@ -4148,6 +4305,16 @@ credentials_file = '/etc/sentinel/s3'
         assert_eq!(resolved.deployment.artifact_retention_ms, 86_400_000);
         assert_eq!(resolved.deployment.run_artifact_bytes, 1 << 30);
         assert_eq!(resolved.attempt_log_bytes, 64 << 20);
+        assert_eq!(resolved.classes.default_class, "release");
+        assert_eq!(
+            resolved
+                .classes
+                .classes
+                .iter()
+                .map(|c| (c.name.as_str(), c.max_age_ms, c.weight))
+                .collect::<Vec<_>>(),
+            [("debug", 3_600_000, 1), ("release", 86_400_000, 3)]
+        );
     }
 
     fn settled(file: MailFile, env: &dyn Fn(&str) -> Option<String>) -> MailSettings {

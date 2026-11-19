@@ -440,6 +440,36 @@ impl Resolver {
         if !compiled.on.admits(&plan.event()) {
             return self.settle(delivery, Outcome::Ignored("no_trigger"), now);
         }
+        // A class the deployment does not define is refused before a run exists: the artifact could
+        // never be recorded, so running the pipeline would only spend the work to fail it.
+        let classes = match self.store.read(sentinel_store::retention::artifact_classes) {
+            Ok(classes) => classes,
+            Err(_) => {
+                return self.retry(
+                    delivery,
+                    "store_unavailable",
+                    None,
+                    intake::Resolution::Failed("resolution_attempts"),
+                    now,
+                );
+            }
+        };
+        if compiled.jobs.iter().any(|job| {
+            job.spec
+                .artifacts
+                .iter()
+                .filter_map(|a| a.class.as_deref())
+                .any(|name| !classes.iter().any(|known| known == name))
+        }) {
+            return self.settle(
+                delivery,
+                Outcome::Failed {
+                    reason: "artifact_class_unknown",
+                    detail: None,
+                },
+                now,
+            );
+        }
 
         let source = match PinnedSource::new(
             &binding.metadata.binding.remote,

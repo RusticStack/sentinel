@@ -48,7 +48,10 @@ pub struct Row {
     pub manifest_version: Option<u64>,
     pub entries: u64,
     pub bytes: u64,
+    pub class: String,
+    pub charged_bytes: u64,
     pub retain_until_ms: UnixMillis,
+    pub pinned_ms: Option<UnixMillis>,
     pub created_ms: UnixMillis,
 }
 
@@ -56,7 +59,6 @@ pub fn manifest_name(job: JobId, name: &str) -> String {
     format!("{job}/{name}")
 }
 
-// UNIQUE(attempt_id, name) turns a redelivered insert into a conflict, not a duplicate.
 #[allow(clippy::too_many_arguments)]
 pub fn record(
     tx: &Transaction<'_>,
@@ -72,17 +74,63 @@ pub fn record(
     retain_until: UnixMillis,
     now: UnixMillis,
 ) -> Result<ArtifactId> {
+    record_class(
+        tx,
+        tenant,
+        run,
+        job,
+        attempt,
+        name,
+        None,
+        state,
+        manifest_version,
+        entries,
+        bytes,
+        retain_until,
+        now,
+    )
+}
+
+/// [`record`], under the artifact's declared class: `None` takes the deployment's default class.
+// UNIQUE(attempt_id, name) turns a redelivered insert into a conflict, not a duplicate.
+#[allow(clippy::too_many_arguments)]
+pub fn record_class(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    run: RunId,
+    job: JobId,
+    attempt: AttemptId,
+    name: &str,
+    class: Option<&str>,
+    state: State,
+    manifest_version: Option<u64>,
+    entries: u64,
+    bytes: u64,
+    retain_until: UnixMillis,
+    now: UnixMillis,
+) -> Result<ArtifactId> {
     if name.is_empty() || name.len() > 64 {
         return Err(Error::InvalidInput("artifact name"));
     }
     if (state == State::Captured) != manifest_version.is_some() {
         return Err(Error::InvalidInput("artifact manifest"));
     }
+    // The class is resolved here, once, so the row carries the name, the charge and the ceiling
+    // the deployment defined when the artifact was captured.
+    let (class, weight): (String, i64) = tx
+        .prepare_cached(
+            "SELECT c.name, c.weight FROM artifact_classes c WHERE c.name = COALESCE(
+                 ?1, (SELECT default_class FROM storage_defaults WHERE id = 1), 'standard')",
+        )?
+        .query_row([class], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?
+        .ok_or(Error::InvalidInput("artifact class"))?;
     let id = ArtifactId::new();
     tx.execute(
-        "INSERT INTO artifacts(id, tenant_id, run_id, job_id, attempt_id, name,
-             state_code, manifest_version, entries, bytes, retain_until_ms, created_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO artifacts(id, tenant_id, run_id, job_id, attempt_id, name, class,
+             charged_bytes, state_code, manifest_version, entries, bytes, retain_until_ms,
+             created_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             id.as_bytes().as_slice(),
             tenant.as_bytes().as_slice(),
@@ -90,6 +138,8 @@ pub fn record(
             job.as_bytes().as_slice(),
             attempt.as_bytes().as_slice(),
             name,
+            class,
+            bytes.saturating_mul(weight as u64) as i64,
             state.code(),
             manifest_version.map(|v| v as i64),
             entries as i64,
@@ -167,7 +217,8 @@ pub fn run_bytes(conn: &Connection, tenant: TenantId, run: RunId) -> Result<u64>
 pub fn for_run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<Row>> {
     let mut stmt = conn.prepare_cached(
         "SELECT a.id, a.job_id, j.name, a.attempt_id, a.name, a.state_code,
-                a.manifest_version, a.entries, a.bytes, a.retain_until_ms, a.created_ms
+                a.manifest_version, a.entries, a.bytes, a.class, a.charged_bytes,
+                a.retain_until_ms, a.pinned_ms, a.created_ms
          FROM artifacts a JOIN jobs j ON j.id = a.job_id
          WHERE a.tenant_id = ?1 AND a.run_id = ?2
          ORDER BY j.created_seq, a.created_ms, a.name",
@@ -185,15 +236,32 @@ pub fn for_run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<Ro
                 r.get::<_, Option<i64>>(6)?,
                 r.get::<_, i64>(7)?,
                 r.get::<_, i64>(8)?,
-                r.get::<_, i64>(9)?,
+                r.get::<_, String>(9)?,
                 r.get::<_, i64>(10)?,
+                r.get::<_, i64>(11)?,
+                r.get::<_, Option<i64>>(12)?,
+                r.get::<_, i64>(13)?,
             ))
         },
     )?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, job, job_name, attempt, name, state, version, entries, bytes, retain, created) =
-            row?;
+        let (
+            id,
+            job,
+            job_name,
+            attempt,
+            name,
+            state,
+            version,
+            entries,
+            bytes,
+            class,
+            charged,
+            retain,
+            pinned,
+            created,
+        ) = row?;
         out.push(Row {
             id: ArtifactId::from_bytes(
                 <[u8; 16]>::try_from(id.as_slice()).map_err(|_| Error::Corrupt("artifact id"))?,
@@ -214,7 +282,10 @@ pub fn for_run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<Ro
             manifest_version: version.map(|v| v as u64),
             entries: entries as u64,
             bytes: bytes as u64,
+            class,
+            charged_bytes: charged as u64,
             retain_until_ms: UnixMillis(retain),
+            pinned_ms: pinned.map(UnixMillis),
             created_ms: UnixMillis(created),
         });
     }
@@ -226,7 +297,8 @@ pub fn get(conn: &Connection, tenant: TenantId, run: RunId, id: ArtifactId) -> R
     let row = conn
         .prepare_cached(
             "SELECT a.id, a.job_id, j.name, a.attempt_id, a.name, a.state_code,
-                    a.manifest_version, a.entries, a.bytes, a.retain_until_ms, a.created_ms
+                    a.manifest_version, a.entries, a.bytes, a.class, a.charged_bytes,
+                    a.retain_until_ms, a.pinned_ms, a.created_ms
              FROM artifacts a JOIN jobs j ON j.id = a.job_id
              WHERE a.tenant_id = ?1 AND a.run_id = ?2 AND a.id = ?3",
         )?
@@ -246,14 +318,31 @@ pub fn get(conn: &Connection, tenant: TenantId, run: RunId, id: ArtifactId) -> R
                     r.get::<_, Option<i64>>(6)?,
                     r.get::<_, i64>(7)?,
                     r.get::<_, i64>(8)?,
-                    r.get::<_, i64>(9)?,
+                    r.get::<_, String>(9)?,
                     r.get::<_, i64>(10)?,
+                    r.get::<_, i64>(11)?,
+                    r.get::<_, Option<i64>>(12)?,
+                    r.get::<_, i64>(13)?,
                 ))
             },
         )
         .optional()?
         .ok_or(Error::NotFound)?;
-    let (job, job_name, attempt, name, state, version, entries, bytes, retain, created) = row;
+    let (
+        job,
+        job_name,
+        attempt,
+        name,
+        state,
+        version,
+        entries,
+        bytes,
+        class,
+        charged,
+        retain,
+        pinned,
+        created,
+    ) = row;
     Ok(Row {
         id,
         job: JobId::from_bytes(
@@ -270,7 +359,10 @@ pub fn get(conn: &Connection, tenant: TenantId, run: RunId, id: ArtifactId) -> R
         manifest_version: version.map(|v| v as u64),
         entries: entries as u64,
         bytes: bytes as u64,
+        class,
+        charged_bytes: charged as u64,
         retain_until_ms: UnixMillis(retain),
+        pinned_ms: pinned.map(UnixMillis),
         created_ms: UnixMillis(created),
     })
 }
@@ -338,7 +430,8 @@ pub fn captured(
     let row = conn
         .prepare_cached(
             "SELECT a.id, a.job_id, j.name, a.attempt_id, a.name, a.state_code,
-                    a.manifest_version, a.entries, a.bytes, a.retain_until_ms, a.created_ms
+                    a.manifest_version, a.entries, a.bytes, a.class, a.charged_bytes,
+                    a.retain_until_ms, a.pinned_ms, a.created_ms
              FROM artifacts a JOIN jobs j ON j.id = a.job_id
              WHERE a.tenant_id = ?1 AND a.run_id = ?2 AND j.name = ?3 AND a.name = ?4
                AND a.state_code = 0
@@ -362,14 +455,32 @@ pub fn captured(
                     r.get::<_, Option<i64>>(6)?,
                     r.get::<_, i64>(7)?,
                     r.get::<_, i64>(8)?,
-                    r.get::<_, i64>(9)?,
+                    r.get::<_, String>(9)?,
                     r.get::<_, i64>(10)?,
+                    r.get::<_, i64>(11)?,
+                    r.get::<_, Option<i64>>(12)?,
+                    r.get::<_, i64>(13)?,
                 ))
             },
         )
         .optional()?
         .ok_or(Error::NotFound)?;
-    let (id, job, job_name, attempt, name, state, version, entries, bytes, retain, created) = row;
+    let (
+        id,
+        job,
+        job_name,
+        attempt,
+        name,
+        state,
+        version,
+        entries,
+        bytes,
+        class,
+        charged,
+        retain,
+        pinned,
+        created,
+    ) = row;
     Ok(Row {
         id: ArtifactId::from_bytes(
             <[u8; 16]>::try_from(id.as_slice()).map_err(|_| Error::Corrupt("artifact id"))?,
@@ -389,7 +500,10 @@ pub fn captured(
         manifest_version: version.map(|v| v as u64),
         entries: entries as u64,
         bytes: bytes as u64,
+        class,
+        charged_bytes: charged as u64,
         retain_until_ms: UnixMillis(retain),
+        pinned_ms: pinned.map(UnixMillis),
         created_ms: UnixMillis(created),
     })
 }
@@ -413,7 +527,7 @@ pub fn sweep_expired_counted(
     let due: Vec<Due> = tx
         .prepare(
             "SELECT id, tenant_id, job_id, name, manifest_version
-             FROM artifacts WHERE retain_until_ms <= ?1 LIMIT ?2",
+             FROM artifacts WHERE retain_until_ms <= ?1 AND pinned_ms IS NULL LIMIT ?2",
         )?
         .query_map(params![now.0, limit], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))

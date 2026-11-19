@@ -433,7 +433,7 @@ fn upgrade_sources() -> Vec<u32> {
 fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expects() {
     // docs/upgrades.md (tests/compat_doc.rs compares it with the code): a database at schema N
     // runs on release R only when no migration in (R, N] declares a readable_by above R. Rows
-    // are R, columns are N = 53, 55, 58, 64, 65, LATEST.
+    // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, LATEST.
     let readable = |db: &Connection, release: u32, newest: u32| -> bool {
         let needs: u32 = db
             .query_row(
@@ -446,11 +446,11 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        67,
+        68,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
-    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 63, 64, 65, 66]);
+    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 63, 64, 65, 66, 67]);
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.sqlite");
@@ -465,7 +465,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         drop(store);
         assert_eq!(version(&path), schema::LATEST, "from {from}");
         let db = Connection::open(&path).unwrap();
-        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67]
+        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68]
             .iter()
             .map(|&newest| from >= newest || readable(&db, from, newest))
             .collect();
@@ -477,20 +477,147 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         // where the storage-class migration says an older binary is safe. Migration 66 is readable by
         // nothing older — an older controller settles a merge-group delivery it re-reads as
         // failed:unsupported_event — so 63, 64 and 65 all stop at 65. Migration 67 (the AI policy)
-        // is readable by 66, so 66 runs on a database at 67 while 65 does not.
+        // is readable by 66, so 66 runs on a database at 67 while 65 does not. Migration 68
+        // (artifact classes) is readable by nothing older, so 67 stops at 67.
         let expected = match from {
-            44 | 47 | 48 => [false, false, false, false, false, false, false],
-            51 => [true, false, false, false, false, false, false],
-            56 => [true, true, false, false, false, false, false],
-            57 => [true, true, true, false, false, false, false],
-            63 => [true, true, true, true, false, false, false],
-            64 | 65 => [true, true, true, true, true, false, false],
-            66 => [true, true, true, true, true, true, true],
+            44 | 47 | 48 => [false, false, false, false, false, false, false, false],
+            51 => [true, false, false, false, false, false, false, false],
+            56 => [true, true, false, false, false, false, false, false],
+            57 => [true, true, true, false, false, false, false, false],
+            63 => [true, true, true, true, false, false, false, false],
+            64 | 65 => [true, true, true, true, true, false, false, false],
+            66 => [true, true, true, true, true, true, true, false],
+            67 => [true, true, true, true, true, true, true, false],
             _ => unreachable!(),
         };
         assert_eq!(
             ok, expected,
-            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67"
+            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68"
         );
     }
+}
+
+fn schema_objects(db: &Connection) -> Vec<(String, String)> {
+    let mut stmt = db
+        .prepare(
+            "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+/// Migration 67 gives every artifact a class, a charge weight and a pin column; the upgraded
+/// database has to equal a fresh one, and an artifact stored before it keeps its deadline.
+#[test]
+fn a_database_upgraded_from_066_equals_a_fresh_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.sqlite");
+    let (tenant, repo, run, job, attempt, artifact) = (
+        TenantId::new(),
+        RepoId::new(),
+        RunId::new(),
+        sentinel_core::JobId::new(),
+        sentinel_core::AttemptId::new(),
+        sentinel_core::ArtifactId::new(),
+    );
+    {
+        let conn = database_at(&path, 66);
+        let (t, r, ru, j, a, ar) = (
+            tenant.as_bytes().as_slice(),
+            repo.as_bytes().as_slice(),
+            run.as_bytes().as_slice(),
+            job.as_bytes().as_slice(),
+            attempt.as_bytes().as_slice(),
+            artifact.as_bytes().as_slice(),
+        );
+        let worker = [0x11u8; 16];
+        let sha = "0".repeat(40);
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute(
+            "INSERT INTO tenants(id, slug, created_ms) VALUES(?1, 'acme', 1)",
+            [t],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repos(id, tenant_id, name, created_ms) VALUES(?1, ?2, 'app', 1)",
+            params![r, t],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runs(id, tenant_id, repo_id, source_sha, created_ms)
+             VALUES(?1, ?2, ?3, ?4, 1)",
+            params![ru, t, r, sha],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs(id, tenant_id, run_id, name, state_code, priority, created_seq)
+             VALUES(?1, ?2, ?3, 'build', 5, 0, 0)",
+            params![j, t, ru],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attempts(id, tenant_id, job_id, fence, worker_id, lease_until_ms)
+             VALUES(?1, ?2, ?3, 1, ?4, 1)",
+            params![a, t, j, worker.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artifacts(id, tenant_id, run_id, job_id, attempt_id, name, state_code,
+                 manifest_version, entries, bytes, retain_until_ms, created_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, 'out', 1, NULL, 0, 0, 5000000000, 1)",
+            params![ar, t, ru, j, a],
+        )
+        .unwrap();
+        assert_eq!(version(&path), 66);
+    }
+    let (store, copy) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
+    assert!(copy.is_some(), "a pending migration takes a copy first");
+    let (class, charged, pinned, retain): (String, i64, Option<i64>, i64) = store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT class, charged_bytes, pinned_ms, retain_until_ms FROM artifacts",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(class, "standard", "an artifact stored before the migration");
+    assert_eq!(
+        charged, 0,
+        "the charge is its bytes times the default class's weight"
+    );
+    assert_eq!(pinned, None);
+    assert_eq!(retain, 5_000_000_000, "an upgrade re-stamps nothing");
+    let classes: Vec<(String, i64, i64)> = store
+        .read(|c| {
+            let mut stmt =
+                c.prepare("SELECT name, max_age_ms, weight FROM artifact_classes ORDER BY name")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<_, _>>()?;
+            Ok(rows)
+        })
+        .unwrap();
+    assert_eq!(
+        classes,
+        [
+            ("debug".to_owned(), 7 * 86_400_000, 1),
+            ("evidence".to_owned(), 90 * 86_400_000, 1),
+            ("release".to_owned(), 90 * 86_400_000, 2),
+            ("standard".to_owned(), 30 * 86_400_000, 1),
+        ]
+    );
+    let upgraded = store.read(|c| Ok(schema_objects(c))).unwrap();
+    drop(store);
+    let fresh = tempfile::tempdir().unwrap();
+    let fresh_store = Store::open(fresh.path().join("metadata.sqlite"), Durability::Full).unwrap();
+    assert_eq!(version(&path), schema::LATEST);
+    assert_eq!(
+        upgraded,
+        fresh_store.read(|c| Ok(schema_objects(c))).unwrap(),
+        "the upgraded database has the schema a fresh one has"
+    );
 }

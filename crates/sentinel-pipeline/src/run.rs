@@ -8,7 +8,9 @@ use crate::{
     compile::{CompiledJob, CompiledPipeline},
     expr::{Expr, Template},
     policy::Triggers,
-    schema::{Arch, Artifact, Cache, Concurrency, Job, Resources, RunsOn, Shell, Step},
+    schema::{
+        Arch, Artifact, ArtifactWhen, Cache, Concurrency, Job, Resources, RunsOn, Shell, Step,
+    },
 };
 
 /// `ref_name` is provenance only; fetches use the pinned `sha`.
@@ -146,9 +148,10 @@ pub enum SpecError {
     Decode,
 }
 
-/// Format 7 adds `runs_on.os` and `runs_on.isolation`. A spec that states neither is still written as format 6,
-/// byte for byte what earlier controllers wrote, so workers that predate format 7 keep running it.
-pub const SPEC_FORMAT: u8 = 7;
+/// Format 8 adds `artifacts[].class`; format 7 adds `runs_on.os` and `runs_on.isolation`. A spec whose
+/// artifacts state no class is written as format 7 or 6, byte for byte what earlier controllers wrote, so a
+/// worker that predates the newer fields keeps running it.
+pub const SPEC_FORMAT: u8 = 8;
 
 pub const SPEC_FORMAT_READ_MIN: u8 = 3;
 
@@ -168,15 +171,22 @@ impl RunSpec {
         })
     }
 
-    /// The format `encode` writes for this spec.
+    /// The format `encode` writes for this spec: the lowest one that carries everything it states.
     pub fn format(&self) -> u8 {
         if self
             .pipeline
             .jobs
             .iter()
-            .any(|j| j.spec.runs_on.states_runtime())
+            .any(|j| j.spec.artifacts.iter().any(|a| a.class.is_some()))
         {
             SPEC_FORMAT
+        } else if self
+            .pipeline
+            .jobs
+            .iter()
+            .any(|j| j.spec.runs_on.states_runtime())
+        {
+            7
         } else {
             6
         }
@@ -184,10 +194,18 @@ impl RunSpec {
 
     pub fn encode(&self) -> Result<Vec<u8>, SpecError> {
         let format = self.format();
-        let body = if format == 6 {
-            postcard::to_allocvec(&RunSpecV6::from(self))
-        } else {
-            postcard::to_allocvec(self)
+        let body = match format {
+            6 => postcard::to_allocvec(&RunSpecV6::from(self)),
+            7 => postcard::to_allocvec(&RunSpecV7::from(self)),
+            _ => postcard::to_allocvec(&RunSpecV8 {
+                base: RunSpecV7::from(self),
+                classes: self
+                    .pipeline
+                    .jobs
+                    .iter()
+                    .flat_map(|j| j.spec.artifacts.iter().map(|a| a.class.clone()))
+                    .collect(),
+            }),
         };
         body.map(|body| {
             let mut out = Vec::with_capacity(body.len() + 1);
@@ -206,7 +224,8 @@ impl RunSpec {
             }
         }
         match bytes.split_first() {
-            Some((&SPEC_FORMAT, body)) => whole(body),
+            Some((&SPEC_FORMAT, body)) => whole::<RunSpecV8>(body).map(RunSpec::from),
+            Some((&7, body)) => whole::<RunSpecV7>(body).map(RunSpec::from),
             Some((&6, body)) => whole::<RunSpecV6>(body).map(RunSpec::from),
             Some((&5, body)) => whole::<RunSpecV5>(body).map(RunSpec::from),
             Some((&4, body)) => whole::<RunSpecV4>(body).map(RunSpec::from),
@@ -254,7 +273,7 @@ struct JobV6 {
     workdir: Option<String>,
     steps: Vec<Step>,
     cache: Vec<Cache>,
-    artifacts: Vec<Artifact>,
+    artifacts: Vec<ArtifactV7>,
     secrets: Vec<String>,
     registry_auth: Option<String>,
 }
@@ -310,7 +329,7 @@ impl From<&RunSpec> for RunSpecV6 {
                             workdir: j.spec.workdir.clone(),
                             steps: j.spec.steps.clone(),
                             cache: j.spec.cache.clone(),
-                            artifacts: j.spec.artifacts.clone(),
+                            artifacts: j.spec.artifacts.iter().map(ArtifactV7::from).collect(),
                             secrets: j.spec.secrets.clone(),
                             registry_auth: j.spec.registry_auth.clone(),
                         },
@@ -348,7 +367,7 @@ impl From<RunSpecV6> for RunSpec {
                             workdir: j.spec.workdir,
                             steps: j.spec.steps,
                             cache: j.spec.cache,
-                            artifacts: j.spec.artifacts,
+                            artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
                             secrets: j.spec.secrets,
                             registry_auth: j.spec.registry_auth,
                         },
@@ -358,6 +377,177 @@ impl From<RunSpecV6> for RunSpec {
             },
             images: v6.images,
         }
+    }
+}
+
+/// The artifact layout of formats 3 to 7: everything a declaration stated before `class`.
+#[derive(Debug, Serialize, Deserialize)]
+struct ArtifactV7 {
+    name: String,
+    paths: Vec<String>,
+    when: ArtifactWhen,
+    retain_secs: u64,
+    required: bool,
+}
+
+impl From<ArtifactV7> for Artifact {
+    fn from(old: ArtifactV7) -> Artifact {
+        Artifact {
+            name: old.name,
+            paths: old.paths,
+            when: old.when,
+            retain_secs: old.retain_secs,
+            required: old.required,
+            class: None,
+        }
+    }
+}
+
+impl From<&Artifact> for ArtifactV7 {
+    fn from(new: &Artifact) -> ArtifactV7 {
+        ArtifactV7 {
+            name: new.name.clone(),
+            paths: new.paths.clone(),
+            when: new.when,
+            retain_secs: new.retain_secs,
+            required: new.required,
+        }
+    }
+}
+
+/// Format 7: the whole spec as it stood before artifacts carried a class.
+#[derive(Debug, Serialize, Deserialize)]
+struct JobV7 {
+    image: String,
+    needs: Vec<String>,
+    condition: Option<Expr>,
+    runs_on: RunsOn,
+    resources: Resources,
+    timeout_secs: u64,
+    env: Vec<(String, String)>,
+    workdir: Option<String>,
+    steps: Vec<Step>,
+    cache: Vec<Cache>,
+    artifacts: Vec<ArtifactV7>,
+    secrets: Vec<String>,
+    registry_auth: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompiledJobV7 {
+    name: String,
+    needs: Vec<u16>,
+    spec: JobV7,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompiledPipelineV7 {
+    on: Triggers,
+    concurrency: Option<Concurrency>,
+    jobs: Vec<CompiledJobV7>,
+    digest: u128,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSpecV7 {
+    source: PinnedSource,
+    pipeline: CompiledPipelineV7,
+    images: Vec<ImageRef>,
+}
+
+impl From<&RunSpec> for RunSpecV7 {
+    fn from(spec: &RunSpec) -> RunSpecV7 {
+        RunSpecV7 {
+            source: spec.source.clone(),
+            pipeline: CompiledPipelineV7 {
+                on: spec.pipeline.on.clone(),
+                concurrency: spec.pipeline.concurrency.clone(),
+                jobs: spec
+                    .pipeline
+                    .jobs
+                    .iter()
+                    .map(|j| CompiledJobV7 {
+                        name: j.name.clone(),
+                        needs: j.needs.clone(),
+                        spec: JobV7 {
+                            image: j.spec.image.clone(),
+                            needs: j.spec.needs.clone(),
+                            condition: j.spec.condition.clone(),
+                            runs_on: j.spec.runs_on.clone(),
+                            resources: j.spec.resources,
+                            timeout_secs: j.spec.timeout_secs,
+                            env: j.spec.env.clone(),
+                            workdir: j.spec.workdir.clone(),
+                            steps: j.spec.steps.clone(),
+                            cache: j.spec.cache.clone(),
+                            artifacts: j.spec.artifacts.iter().map(ArtifactV7::from).collect(),
+                            secrets: j.spec.secrets.clone(),
+                            registry_auth: j.spec.registry_auth.clone(),
+                        },
+                    })
+                    .collect(),
+                digest: spec.pipeline.digest,
+            },
+            images: spec.images.clone(),
+        }
+    }
+}
+
+impl From<RunSpecV7> for RunSpec {
+    fn from(v7: RunSpecV7) -> RunSpec {
+        RunSpec {
+            source: v7.source,
+            pipeline: CompiledPipeline {
+                on: v7.pipeline.on,
+                concurrency: v7.pipeline.concurrency,
+                jobs: v7
+                    .pipeline
+                    .jobs
+                    .into_iter()
+                    .map(|j| CompiledJob {
+                        name: j.name,
+                        needs: j.needs,
+                        spec: Job {
+                            image: j.spec.image,
+                            needs: j.spec.needs,
+                            condition: j.spec.condition,
+                            runs_on: j.spec.runs_on,
+                            resources: j.spec.resources,
+                            timeout_secs: j.spec.timeout_secs,
+                            env: j.spec.env,
+                            workdir: j.spec.workdir,
+                            steps: j.spec.steps,
+                            cache: j.spec.cache,
+                            artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
+                            secrets: j.spec.secrets,
+                            registry_auth: j.spec.registry_auth,
+                        },
+                    })
+                    .collect(),
+                digest: v7.pipeline.digest,
+            },
+            images: v7.images,
+        }
+    }
+}
+
+/// Format 8: the format-7 layout plus one class per artifact declaration, in order.
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSpecV8 {
+    base: RunSpecV7,
+    classes: Vec<Option<String>>,
+}
+
+impl From<RunSpecV8> for RunSpec {
+    fn from(v8: RunSpecV8) -> RunSpec {
+        let mut spec = RunSpec::from(v8.base);
+        let mut classes = v8.classes.into_iter();
+        for job in &mut spec.pipeline.jobs {
+            for artifact in &mut job.spec.artifacts {
+                artifact.class = classes.next().flatten();
+            }
+        }
+        spec
     }
 }
 
@@ -391,7 +581,7 @@ struct JobV4 {
     workdir: Option<String>,
     steps: Vec<StepV4>,
     cache: Vec<Cache>,
-    artifacts: Vec<Artifact>,
+    artifacts: Vec<ArtifactV7>,
     secrets: Vec<String>,
 }
 
@@ -429,7 +619,7 @@ struct JobV5 {
     workdir: Option<String>,
     steps: Vec<Step>,
     cache: Vec<Cache>,
-    artifacts: Vec<Artifact>,
+    artifacts: Vec<ArtifactV7>,
     secrets: Vec<String>,
 }
 
@@ -467,7 +657,7 @@ struct JobV3 {
     workdir: Option<String>,
     steps: Vec<StepV4>,
     cache: Vec<CacheV3>,
-    artifacts: Vec<Artifact>,
+    artifacts: Vec<ArtifactV7>,
     secrets: Vec<String>,
 }
 
@@ -515,7 +705,7 @@ impl From<JobV3> for Job {
                     paths: c.paths,
                 })
                 .collect(),
-            artifacts: v3.artifacts,
+            artifacts: v3.artifacts.into_iter().map(Artifact::from).collect(),
             secrets: v3.secrets,
             registry_auth: None,
         }
@@ -563,7 +753,7 @@ impl From<RunSpecV4> for RunSpec {
                             workdir: j.spec.workdir,
                             steps: j.spec.steps.into_iter().map(Step::from).collect(),
                             cache: j.spec.cache,
-                            artifacts: j.spec.artifacts,
+                            artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
                             secrets: j.spec.secrets,
                             registry_auth: None,
                         },
@@ -601,7 +791,7 @@ impl From<RunSpecV5> for RunSpec {
                             workdir: j.spec.workdir,
                             steps: j.spec.steps,
                             cache: j.spec.cache,
-                            artifacts: j.spec.artifacts,
+                            artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
                             secrets: j.spec.secrets,
                             registry_auth: None,
                         },
@@ -744,7 +934,7 @@ mod tests {
                                     paths: c.paths.clone(),
                                 })
                                 .collect(),
-                            artifacts: j.spec.artifacts.clone(),
+                            artifacts: j.spec.artifacts.iter().map(ArtifactV7::from).collect(),
                             secrets: j.spec.secrets.clone(),
                         },
                     })
@@ -785,7 +975,7 @@ mod tests {
                             workdir: j.spec.workdir.clone(),
                             steps: j.spec.steps.iter().map(old_step).collect(),
                             cache: j.spec.cache.clone(),
-                            artifacts: j.spec.artifacts.clone(),
+                            artifacts: j.spec.artifacts.iter().map(ArtifactV7::from).collect(),
                             secrets: j.spec.secrets.clone(),
                         },
                     })
@@ -826,7 +1016,7 @@ mod tests {
                             workdir: j.spec.workdir.clone(),
                             steps: j.spec.steps.clone(),
                             cache: j.spec.cache.clone(),
-                            artifacts: j.spec.artifacts.clone(),
+                            artifacts: j.spec.artifacts.iter().map(ArtifactV7::from).collect(),
                             secrets: j.spec.secrets.clone(),
                         },
                     })
@@ -837,6 +1027,17 @@ mod tests {
         let mut out = vec![5];
         out.extend(postcard::to_allocvec(&shadow).unwrap());
         out
+    }
+
+    /// The same spec as a format before 8 decodes it: the artifact classes are not in the blob.
+    fn without_classes(spec: &RunSpec) -> RunSpec {
+        let mut plain = spec.clone();
+        for job in &mut plain.pipeline.jobs {
+            for artifact in &mut job.spec.artifacts {
+                artifact.class = None;
+            }
+        }
+        plain
     }
 
     fn full_spec() -> RunSpec {
@@ -904,9 +1105,23 @@ mod tests {
         let spec = full_spec();
         let bytes = spec.encode().unwrap();
         assert_eq!(
-            bytes[0], 6,
-            "no OS or isolation stated: the format earlier workers read"
+            bytes[0], 8,
+            "the fixture's artifact states a class: the newest format"
         );
+        let plain = RunSpec::new(
+            PinnedSource::new("r", SHA, None).unwrap(),
+            compile_str(
+                "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    steps: [{id: s, run: 'true'}]\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let plain_bytes = plain.encode().unwrap();
+        assert_eq!(
+            plain_bytes[0], 6,
+            "no OS, isolation or artifact class stated: the format earlier workers read"
+        );
+        assert_eq!(RunSpec::decode(&plain_bytes).unwrap(), plain);
         assert_eq!(RunSpec::decode(&bytes).unwrap(), spec);
         for bad_format in [0u8, 1, 2, 9, 255] {
             assert_eq!(
@@ -951,8 +1166,11 @@ mod tests {
             for c in &job.spec.cache {
                 assert_eq!(c.class, Class::Dependencies);
             }
+            for a in &job.spec.artifacts {
+                assert_eq!(a.class, None, "a format-3 blob states no artifact class");
+            }
         }
-        assert_eq!(decoded, spec);
+        assert_eq!(decoded, without_classes(&spec));
         assert_eq!(RunSpec::decode(&v3[..v3.len() - 1]), Err(SpecError::Decode));
         assert_eq!(RunSpec::decode(&v3[..4]), Err(SpecError::Decode));
         let mut corrupt = v3.clone();
@@ -1010,7 +1228,7 @@ mod tests {
             compile_str(text).unwrap(),
         )
         .unwrap();
-        assert_eq!(spec.format(), SPEC_FORMAT);
+        assert_eq!(spec.format(), 7, "no artifact states a class");
         let bytes = spec.encode().unwrap();
         assert_eq!(bytes[0], 7);
         let decoded = RunSpec::decode(&bytes).unwrap();
@@ -1027,11 +1245,51 @@ mod tests {
     }
 
     #[test]
+    fn an_artifact_class_is_format_8_and_round_trips() {
+        let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    runs_on: {labels: [kvm], isolation: microvm}\n    artifacts:\n      - {name: log, paths: [out], class: debug}\n      - {name: plain, paths: [out]}\n    steps:\n      - id: s\n        run: echo hi\n";
+        let spec = RunSpec::new(
+            PinnedSource::new("r", SHA, None).unwrap(),
+            compile_str(text).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(spec.format(), SPEC_FORMAT);
+        let bytes = spec.encode().unwrap();
+        assert_eq!(bytes[0], 8);
+        let decoded = RunSpec::decode(&bytes).unwrap();
+        assert_eq!(decoded, spec);
+        assert_eq!(
+            decoded.pipeline.jobs[0]
+                .spec
+                .artifacts
+                .iter()
+                .map(|a| a.class.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("debug"), None]
+        );
+        assert_eq!(
+            decoded.pipeline.jobs[0].spec.runs_on.os, None,
+            "format 8 keeps what format 7 added"
+        );
+        assert_eq!(
+            decoded.pipeline.jobs[0].spec.runs_on.isolation,
+            Some(crate::schema::Isolation::Microvm)
+        );
+        assert_eq!(
+            RunSpec::decode(&bytes[..bytes.len() - 1]),
+            Err(SpecError::Decode)
+        );
+        let mut corrupt = bytes.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
+        let _ = RunSpec::decode(&corrupt);
+    }
+
+    #[test]
     fn run_spec_v4_decodes_with_empty_secret_targets() {
         let spec = full_spec();
         let v4 = encode_v4(&spec);
         assert_eq!(v4[0], 4);
-        assert_eq!(RunSpec::decode(&v4).unwrap(), spec);
+        assert_eq!(RunSpec::decode(&v4).unwrap(), without_classes(&spec));
         assert_eq!(RunSpec::decode(&v4[..v4.len() - 1]), Err(SpecError::Decode));
     }
 

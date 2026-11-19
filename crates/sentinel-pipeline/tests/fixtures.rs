@@ -93,6 +93,7 @@ fn full_fixture_decodes_every_field() {
     assert_eq!(build.spec.resources.disk_bytes, 10 << 30, "policy default");
     assert_eq!(build.spec.timeout_secs, 5400);
     assert_eq!(build.spec.artifacts[0].retain_secs, 7 * 86_400);
+    assert_eq!(build.spec.artifacts[0].class.as_deref(), Some("release"));
 }
 
 #[test]

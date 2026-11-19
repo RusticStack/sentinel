@@ -387,7 +387,10 @@ fn lowered_retention_applies_to_logs_and_artifacts_already_stored() {
             })
             .unwrap()
     };
-    assert_eq!(retained(), NOW.0 + d.artifact_retention_ms);
+    // Two ceilings apply at insert: the deployment's artifact retention and the class's maximum
+    // age. A declaration that names no class takes the deployment's default (`standard`, 30 days).
+    assert_eq!(retained(), NOW.0 + 30 * DAY);
+    assert!(NOW.0 + 30 * DAY < NOW.0 + d.artifact_retention_ms);
 
     f.set(
         Authority::HostLocal,
@@ -967,4 +970,363 @@ fn a_malformed_attempt_row_does_not_stop_stamping_or_expiry() {
         .write(move |tx| retention::expire(tx, &due, NOW))
         .unwrap();
     assert_eq!(expired.len(), 2);
+}
+
+/// A captured artifact of this repository, with `bytes` staged content, due at `retain_until`.
+fn capture(
+    f: &Fixture,
+    name: &str,
+    class: Option<&str>,
+    bytes: u64,
+    retain_until: UnixMillis,
+) -> Result<sentinel_core::ArtifactId, Error> {
+    let (run, job, attempt) = f.released_attempt(NOW);
+    let (tenant, name, class) = (f.tenant, name.to_owned(), class.map(str::to_owned));
+    f.store.writer().write(move |tx| {
+        artifacts::record_class(
+            tx,
+            tenant,
+            run,
+            job,
+            attempt,
+            &name,
+            class.as_deref(),
+            artifacts::State::Captured,
+            Some(1),
+            bytes,
+            bytes,
+            retain_until,
+            NOW,
+        )
+    })
+}
+
+impl Fixture {
+    fn retained(&self, artifact: sentinel_core::ArtifactId) -> (String, u64, i64, Option<i64>) {
+        self.store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT class, charged_bytes, retain_until_ms, pinned_ms FROM artifacts
+                     WHERE id = ?1",
+                    [artifact.as_bytes().as_slice()],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?.max(0) as u64,
+                            r.get(2)?,
+                            r.get(3)?,
+                        ))
+                    },
+                )?)
+            })
+            .unwrap()
+    }
+
+    fn swept(&self, now: UnixMillis) -> usize {
+        let objects = Arc::clone(&self.objects);
+        self.store
+            .writer()
+            .write(move |tx| Ok(artifacts::sweep_expired_counted(tx, &objects, now, 64)?.1))
+            .unwrap()
+    }
+}
+
+#[test]
+fn a_class_maximum_age_shortens_a_longer_retain_at_insert() {
+    let f = fixture();
+    let d = Deployment::default();
+    f.store
+        .writer()
+        .write(move |tx| retention::install(tx, &d))
+        .unwrap();
+    let year = UnixMillis(NOW.0 + 365 * DAY);
+    // A pipeline's `retain` is only a request: the class's maximum age caps it.
+    let debug = capture(&f, "debug-out", Some("debug"), 10, year).unwrap();
+    assert_eq!(f.retained(debug).0, "debug");
+    assert_eq!(f.retained(debug).2, NOW.0 + 7 * DAY);
+    // A declaration that names no class takes the deployment's default class.
+    let plain = capture(&f, "plain", None, 10, year).unwrap();
+    assert_eq!(f.retained(plain).0, "standard");
+    assert_eq!(f.retained(plain).2, NOW.0 + 30 * DAY);
+    // A class cannot outlive what the deployment keeps artifacts for.
+    let evidence = capture(&f, "evidence", Some("evidence"), 10, year).unwrap();
+    assert_eq!(f.retained(evidence).2, NOW.0 + d.artifact_retention_ms);
+    // The class weight counts the artifact's bytes against its repository quota.
+    let release = capture(&f, "release", Some("release"), 10, year).unwrap();
+    assert_eq!(f.retained(release).1, 2 * 10);
+    assert_eq!(
+        f.store
+            .read(|c| retention::repo_usage(c, f.tenant, f.repo))
+            .unwrap()
+            .total(),
+        10 + 10 + 10 + 20
+    );
+    // A class the deployment does not define is refused, whatever the pipeline asked for.
+    assert!(matches!(
+        capture(&f, "unknown", Some("gold"), 10, year),
+        Err(Error::InvalidInput("artifact class"))
+    ));
+}
+
+#[test]
+fn a_pin_survives_the_sweep_counts_against_the_quota_and_unpinning_restores_the_deadline() {
+    let f = fixture();
+    let tenant = f.tenant;
+    let artifact = capture(&f, "kept", Some("debug"), 500, UnixMillis(NOW.0 + DAY)).unwrap();
+    let (run, _, _) = f.released_attempt(NOW);
+    let _ = run;
+    let (run, artifact_id) = f
+        .store
+        .read(|c| {
+            let (run,): (Vec<u8>,) = c.query_row(
+                "SELECT run_id FROM artifacts WHERE id = ?1",
+                [artifact.as_bytes().as_slice()],
+                |r| Ok((r.get(0)?,)),
+            )?;
+            Ok((
+                sentinel_core::RunId::from_bytes(<[u8; 16]>::try_from(run.as_slice()).unwrap())
+                    .unwrap(),
+                artifact,
+            ))
+        })
+        .unwrap();
+    // Retention is the tenant administrator's decision, never an operator's.
+    assert!(matches!(
+        f.store.writer().write(move |tx| retention::pin(
+            tx,
+            &credential(f.dev),
+            tenant,
+            run,
+            artifact_id,
+            NOW
+        )),
+        Err(Error::Forbidden)
+    ));
+    let first = f
+        .store
+        .writer()
+        .write(move |tx| retention::pin(tx, &credential(f.admin), tenant, run, artifact_id, NOW))
+        .unwrap();
+    assert_eq!(first, NOW);
+    let again = f
+        .store
+        .writer()
+        .write(move |tx| {
+            retention::pin(
+                tx,
+                &credential(f.admin),
+                tenant,
+                run,
+                artifact_id,
+                UnixMillis(NOW.0 + DAY),
+            )
+        })
+        .unwrap();
+    assert_eq!(again, NOW, "a second pin keeps the first pin's time");
+    assert_eq!(f.retained(artifact).3, Some(NOW.0));
+    // Past its deadline the pinned artifact is still there, and so are its bytes.
+    assert_eq!(f.swept(UnixMillis(NOW.0 + 2 * DAY)), 0);
+    assert_eq!(f.retained(artifact).3, Some(NOW.0));
+    assert_eq!(
+        f.store
+            .read(|c| retention::repo_usage(c, tenant, f.repo))
+            .unwrap()
+            .total(),
+        500
+    );
+    // Unpinning puts the stored deadline back into effect: the next sweep collects it.
+    f.store
+        .writer()
+        .write(move |tx| retention::unpin(tx, &credential(f.admin), tenant, run, artifact_id))
+        .unwrap();
+    assert_eq!(f.retained(artifact).3, None);
+    assert_eq!(f.swept(UnixMillis(NOW.0 + 2 * DAY)), 1);
+    assert_eq!(
+        f.store
+            .read(|c| retention::repo_usage(c, tenant, f.repo))
+            .unwrap()
+            .total(),
+        0,
+        "the quota gets the bytes back with the row"
+    );
+    assert!(matches!(
+        f.store.writer().write(move |tx| retention::unpin(
+            tx,
+            &credential(f.admin),
+            tenant,
+            run,
+            artifact_id
+        )),
+        Err(Error::NotFound)
+    ));
+}
+
+#[test]
+fn a_class_change_reapplies_only_its_rows_and_keeps_its_plan_keyed() {
+    let f = fixture();
+    let d = Deployment::default();
+    f.store
+        .writer()
+        .write(move |tx| retention::install(tx, &d))
+        .unwrap();
+    let long = UnixMillis(NOW.0 + 365 * DAY);
+    let (one, two) = (
+        capture(&f, "one", Some("debug"), 100, long).unwrap(),
+        capture(&f, "two", Some("debug"), 100, long).unwrap(),
+    );
+    let other = capture(&f, "three", Some("release"), 100, long).unwrap();
+    let release_before = f.retained(other);
+    assert_eq!(f.retained(one).2, NOW.0 + 7 * DAY);
+
+    // The deployment shortens `debug` to a day and doubles its weight.
+    let classes = retention::Classes {
+        default_class: "standard".into(),
+        classes: vec![
+            retention::Class {
+                name: "debug".into(),
+                max_age_ms: DAY,
+                weight: 2,
+            },
+            retention::Class {
+                name: "standard".into(),
+                max_age_ms: 30 * DAY,
+                weight: 1,
+            },
+            retention::Class {
+                name: "evidence".into(),
+                max_age_ms: 90 * DAY,
+                weight: 1,
+            },
+            retention::Class {
+                name: "release".into(),
+                max_age_ms: 90 * DAY,
+                weight: 2,
+            },
+        ],
+    };
+    let changed = f
+        .store
+        .writer()
+        .write(move |tx| retention::install_classes(tx, &d, &classes))
+        .unwrap();
+    assert_eq!(changed, ["debug"]);
+    let debug = retention::Class {
+        name: "debug".into(),
+        max_age_ms: DAY,
+        weight: 2,
+    };
+
+    // The statements seek the class's own keyed index: no scan, no sort, one run probe a row.
+    let (bound, update) = retention::class_reapply_sql(retention::REAPPLY_BATCH);
+    for sql in [&bound, &update] {
+        let plan = f.store.read(|c| Ok(plan(c, sql))).unwrap();
+        assert!(
+            plan.iter().any(|p| p
+                .starts_with("SEARCH artifacts USING INDEX artifacts_class_reapply")
+                && p.contains("(class=? AND id>?")),
+            "{sql} does not range-seek the class index: {plan:?}"
+        );
+        for scanned in ["attempts", "artifacts", "runs"] {
+            assert!(
+                plan.iter()
+                    .all(|p| !p.starts_with(&format!("SCAN {scanned}"))),
+                "{sql} scans {scanned}: {plan:?}"
+            );
+        }
+        assert!(
+            plan.iter()
+                .all(|p| !p.contains("TEMP B-TREE") && !p.contains("LIST SUBQUERY")),
+            "{sql} sorts or builds a set per batch: {plan:?}"
+        );
+    }
+    let plan = f.store.read(|c| Ok(plan(c, &update))).unwrap();
+    assert_eq!(
+        plan.iter()
+            .filter(|p| p.starts_with("SEARCH runs USING PRIMARY KEY (id=?"))
+            .count(),
+        1,
+        "each re-applied artifact reads its own run by key: {plan:?}"
+    );
+
+    // One row per write: a two-row class takes two bounded steps.
+    let step = |at: retention::ClassReapply, batch: i64| {
+        let class = debug.clone();
+        f.store
+            .writer()
+            .write(move |tx| retention::class_reapply_step(tx, &class, &d, at, batch))
+            .unwrap()
+    };
+    let first = step(retention::ClassReapply::default(), 1);
+    assert!(!first.done());
+    let restamped = |f: &Fixture| {
+        [one, two]
+            .iter()
+            .filter(|a| f.retained(**a).2 == NOW.0 + DAY)
+            .count()
+    };
+    assert_eq!(restamped(&f), 1, "one row a step, in its own class");
+    assert_eq!(f.retained(one).2.max(f.retained(two).2), NOW.0 + 7 * DAY);
+    let mut at = first;
+    let mut steps = 1;
+    while !at.done() {
+        at = step(at, 1);
+        steps += 1;
+        assert!(steps < 8, "the cursor must advance");
+    }
+    assert!(steps >= 3, "two rows in batches of one take several writes");
+    for artifact in [one, two] {
+        assert_eq!(f.retained(artifact).2, NOW.0 + DAY);
+        assert_eq!(f.retained(artifact).1, 200, "the new weight is charged");
+    }
+    assert_eq!(
+        f.retained(other),
+        release_before,
+        "another class is untouched"
+    );
+}
+
+#[test]
+fn a_repository_narrowing_below_its_class_still_wins() {
+    let f = fixture();
+    let d = Deployment::default();
+    f.store
+        .writer()
+        .write(move |tx| retention::install(tx, &d))
+        .unwrap();
+    let artifact = capture(
+        &f,
+        "kept",
+        Some("evidence"),
+        10,
+        UnixMillis(NOW.0 + 365 * DAY),
+    )
+    .unwrap();
+    assert_eq!(f.retained(artifact).2, NOW.0 + d.artifact_retention_ms);
+    f.set(
+        Authority::HostLocal,
+        Some(f.repo),
+        Policy {
+            artifact_retention_ms: Some(3 * DAY),
+            ..Policy::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(f.retained(artifact).2, NOW.0 + 3 * DAY);
+    // Raising the repository back under the class's ceiling extends it again; the class still caps.
+    f.set(
+        Authority::HostLocal,
+        Some(f.repo),
+        Policy {
+            artifact_retention_ms: Some(200 * DAY),
+            ..Policy::default()
+        },
+    )
+    .expect_err("above the tenant's");
+    f.set(Authority::HostLocal, Some(f.repo), Policy::default())
+        .unwrap();
+    assert_eq!(
+        f.retained(artifact).2,
+        NOW.0 + 3 * DAY,
+        "an artifact's deadline never extends"
+    );
 }

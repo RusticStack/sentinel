@@ -40,3 +40,4 @@ jobs:
         paths: [target/release/app]
         when: success
         retain: 7d
+        class: release
