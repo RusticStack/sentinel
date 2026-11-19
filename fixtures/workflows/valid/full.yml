@@ -1,0 +1,94 @@
+# One workflow using every key the analyzer records, at both levels, so the inventory and
+# both tables are read whole.
+name: full
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths: ["src/**"]
+  pull_request:
+    paths-ignore: ["docs/**"]
+    types: [opened, synchronize]
+  merge_group: {}
+  workflow_dispatch:
+    inputs:
+      level:
+        description: verbosity
+        type: choice
+        options: [low, high]
+env:
+  CI: "true"
+  RUST_LOG: ${{ vars.RUST_LOG }}
+permissions:
+  contents: read
+concurrency:
+  group: full-${{ github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+    working-directory: ./repo
+jobs:
+  build:
+    name: build
+    needs: []
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      checks: write
+    concurrency:
+      group: build
+      cancel-in-progress: false
+    environment:
+      name: staging
+      url: https://example.invalid
+    outputs:
+      digest: ${{ steps.digest.outputs.value }}
+    env:
+      TOKEN: ${{ secrets.BUILD_TOKEN }}
+    defaults:
+      run:
+        shell: sh
+    continue-on-error: false
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        target: [a, b]
+    container: node:22
+    services:
+      redis:
+        image: redis:7
+    steps:
+      - id: digest
+        name: digest
+        uses: actions/checkout@v4
+      - name: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo
+          key: cache-${{ hashFiles('Cargo.lock') }}
+      - name: work
+        if: success()
+        run: echo hi
+        env:
+          STEP_TOKEN: ${{ secrets.STEP_TOKEN }}
+        shell: bash
+        working-directory: ./repo
+        continue-on-error: true
+        timeout-minutes: 5
+      - name: publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: out
+          path: out/
+  call:
+    uses: ./.github/workflows/reusable.yml
+    with:
+      level: high
+    secrets:
+      TOKEN: ${{ secrets.CALL_TOKEN }}

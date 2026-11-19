@@ -1,0 +1,11 @@
+# expect: expected scalar
+on: [push]
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - name: ubuntu
+    steps:
+      - run: echo hi

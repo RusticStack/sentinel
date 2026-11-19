@@ -1402,6 +1402,7 @@ dependencies = [
  "blake3",
  "postcard",
  "rustix",
+ "sentinel-core",
  "sentinel-protocol",
  "serde",
  "serde_json",
