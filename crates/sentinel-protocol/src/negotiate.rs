@@ -335,8 +335,8 @@ mod tests {
         let current = negotiate(&hello(1, SUPPORTED_MAX.0, Capabilities::REQUIRED)).unwrap();
         assert_eq!(current.protocol, SUPPORTED_MAX);
         assert!(current.protocol >= DIGEST_FIRST_MIN);
-        // A worker that can only speak 12 is refused by a controller that stops at 11, and told which side
-        // must move: it is never welcomed at a version whose messages it would send blind.
+        // A worker that offers nothing below 12 is met at 12, never at a version in between: the session a
+        // digest-first worker sends offers on is the one it asked for.
         assert_eq!(
             negotiate(&hello(
                 DIGEST_FIRST_MIN.0,
