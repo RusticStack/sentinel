@@ -1330,3 +1330,41 @@ fn a_repository_narrowing_below_its_class_still_wins() {
         "an artifact's deadline never extends"
     );
 }
+
+#[test]
+fn a_pipeline_class_is_checked_against_what_the_deployment_defines() {
+    let f = fixture();
+    let d = Deployment::default();
+    let classes = retention::Classes {
+        default_class: "standard".into(),
+        classes: vec![retention::Class {
+            name: "standard".into(),
+            max_age_ms: 30 * DAY,
+            weight: 1,
+        }],
+    };
+    f.store
+        .writer()
+        .write(move |tx| retention::install_classes(tx, &d, &classes))
+        .unwrap();
+    let defined = f.store.read(retention::artifact_classes).unwrap();
+    assert_eq!(
+        defined,
+        ["standard"],
+        "only the class the deployment defines"
+    );
+    assert_eq!(
+        retention::unknown_class(&defined, ["standard", "debug"].into_iter()),
+        Some("debug"),
+        "a pipeline naming a class the deployment does not define"
+    );
+    assert_eq!(
+        retention::unknown_class(&defined, ["standard"].into_iter()),
+        None
+    );
+    assert_eq!(
+        retention::unknown_class(&defined, std::iter::empty()),
+        None,
+        "a pipeline that names no class takes the default"
+    );
+}

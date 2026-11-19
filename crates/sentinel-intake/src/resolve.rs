@@ -454,13 +454,12 @@ impl Resolver {
                 );
             }
         };
-        if compiled.jobs.iter().any(|job| {
-            job.spec
-                .artifacts
-                .iter()
-                .filter_map(|a| a.class.as_deref())
-                .any(|name| !classes.iter().any(|known| known == name))
-        }) {
+        let declared = compiled
+            .jobs
+            .iter()
+            .flat_map(|job| job.spec.artifacts.iter())
+            .filter_map(|a| a.class.as_deref());
+        if sentinel_store::retention::unknown_class(&classes, declared).is_some() {
             return self.settle(
                 delivery,
                 Outcome::Failed {

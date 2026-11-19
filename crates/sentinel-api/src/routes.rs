@@ -1301,13 +1301,12 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
         .store
         .read(sentinel_store::retention::artifact_classes)
         .map_err(store_error)?;
-    if let Some(unknown) = compiled
+    let declared = compiled
         .jobs
         .iter()
         .flat_map(|job| job.spec.artifacts.iter())
-        .filter_map(|a| a.class.as_deref())
-        .find(|name| !classes.iter().any(|known| known == name))
-    {
+        .filter_map(|a| a.class.as_deref());
+    if let Some(unknown) = sentinel_store::retention::unknown_class(&classes, declared) {
         return Err(err(
             ErrorCode::InvalidRequest,
             format!("pipeline: artifact class `{unknown}` is not defined by this deployment"),

@@ -147,6 +147,17 @@ pub fn artifact_classes(conn: &Connection) -> Result<Vec<String>> {
         .collect::<std::result::Result<_, _>>()?)
 }
 
+/// The first class a pipeline declares that the deployment does not define, if any. `defined` is
+/// [`artifact_classes`]; the loader accepts any well-formed name and the deployment decides which exist.
+pub fn unknown_class<'a>(
+    defined: &[String],
+    declared: impl Iterator<Item = &'a str>,
+) -> Option<&'a str> {
+    declared
+        .into_iter()
+        .find(|name| !defined.iter().any(|known| known == name))
+}
+
 /// The default class and the weight and maximum age of every defined class.
 pub fn classes(conn: &Connection) -> Result<Classes> {
     let default_class = conn
