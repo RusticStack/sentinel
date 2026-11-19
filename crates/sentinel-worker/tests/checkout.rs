@@ -586,3 +586,46 @@ fn the_remaining_validity_caps_a_direct_checkout_deadline() {
     );
     ws.destroy().unwrap();
 }
+
+#[test]
+fn a_source_access_for_another_repository_or_another_ref_is_refused_before_any_io() {
+    let temp = tempfile::tempdir().unwrap();
+    let (listener, access) = silent_access();
+    let sha = "a".repeat(40);
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    // The same credential offered for a repository it was not bound to, and for a ref the binding excludes.
+    for source in [
+        PinnedSource::new("https://127.0.0.1:1/other/repo.git", &sha, None).unwrap(),
+        PinnedSource::new(&access.binding.remote, &sha, Some("refs/heads/other")).unwrap(),
+    ] {
+        let error = checkout::checkout_authorized(
+            ws.path(),
+            &source,
+            &access,
+            None,
+            Duration::from_secs(20),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, Error::Preparation(what) if what == "source access refused"),
+            "{error:?}"
+        );
+    }
+    assert!(!ws.path().join(".git").exists(), "no git state was created");
+    assert!(
+        matches!(
+            listener.accept(),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "a refused access opened a connection"
+    );
+    // The binding is what decides: the bound repository and an allowed ref get through to the remote.
+    let allowed = PinnedSource::new(&access.binding.remote, &sha, Some("refs/heads/main")).unwrap();
+    let _ =
+        checkout::checkout_authorized(ws.path(), &allowed, &access, None, Duration::from_secs(1));
+    assert!(
+        listener.accept().is_ok(),
+        "an allowed access never reached the remote"
+    );
+    ws.destroy().unwrap();
+}

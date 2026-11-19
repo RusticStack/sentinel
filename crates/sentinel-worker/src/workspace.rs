@@ -337,6 +337,27 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_a_finished_attempt_left_behind_is_never_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = AttemptId::new();
+        let ws = Workspace::create(dir.path(), attempt).unwrap();
+        fs::write(ws.path().join("from-the-earlier-run"), b"x").unwrap();
+        let path = ws.path().to_path_buf();
+        drop(ws);
+        // The directory is the attempt's: a second create for it is refused rather than emptied, so a new
+        // attempt never inherits another's checkout. The leftover is reconciliation's to remove.
+        assert!(matches!(
+            Workspace::create(dir.path(), attempt),
+            Err(Error::Workspace(_))
+        ));
+        assert!(path.join("from-the-earlier-run").exists());
+        remove_attempt_dirs(&path).unwrap();
+        let fresh = Workspace::create(dir.path(), attempt).unwrap();
+        assert!(fs::read_dir(fresh.path()).unwrap().next().is_none());
+        fresh.destroy().unwrap();
+    }
+
+    #[test]
     fn a_job_tmp_left_without_its_workspace_is_still_a_leftover() {
         let dir = tempfile::tempdir().unwrap();
         let attempt = AttemptId::new();
