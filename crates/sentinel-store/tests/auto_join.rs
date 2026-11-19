@@ -253,6 +253,37 @@ fn a_named_organization_is_used_and_an_existing_one_is_joined_not_replaced() {
 }
 
 #[test]
+fn joining_by_domain_moves_the_authorization_epoch() {
+    let f = fixture();
+    let acme = f.organization("acme");
+    assert!(f.rules("example.com=acme").is_empty());
+    let epoch = || {
+        f.store
+            .read(|c| sentinel_store::tenancy::epoch(c, acme))
+            .unwrap()
+    };
+    let before = epoch();
+
+    let first = f.verified("ana@example.com");
+    assert_eq!(f.role_in("acme", first), 1);
+    assert!(
+        epoch() > before,
+        "an automatic membership moves the epoch, as every other membership change does"
+    );
+
+    // The join happened once: a later sign-in re-runs nothing and moves nothing.
+    let joined = epoch();
+    f.sign_in("ana@example.com");
+    assert_eq!(
+        f.role_in("acme", first),
+        1,
+        "an existing membership keeps its role"
+    );
+    assert_eq!(epoch(), joined);
+    assert_eq!(f.count(Event::DomainAutoJoined), 1);
+}
+
+#[test]
 fn lookalike_domains_never_match() {
     let f = fixture();
     assert!(f.rules("example.com").is_empty());

@@ -130,8 +130,10 @@ fn a_linked_github_account_signs_in_end_to_end() {
     };
     sign_in::link(
         &f.store,
-        &session,
-        Policy::default(),
+        sentinel_store::auth::Authority::Credential {
+            principal: session.principal(),
+            stepped_up: true,
+        },
         PROVIDER,
         "4242",
         at(3),

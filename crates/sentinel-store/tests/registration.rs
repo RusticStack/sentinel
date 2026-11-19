@@ -425,15 +425,11 @@ fn closing_registration_refuses_everyone_new_and_locks_nobody_out() {
         stepped_up: Some(at(33)),
         ..session
     };
-    sign_in::link(
-        &f.store,
-        &session,
-        Policy::default(),
-        "github",
-        "4242",
-        at(33),
-    )
-    .unwrap();
+    let stepped = sentinel_store::auth::Authority::Credential {
+        principal: session.principal(),
+        stepped_up: true,
+    };
+    sign_in::link(&f.store, stepped, "github", "4242", at(33)).unwrap();
     assert!(matches!(
         sign_in::complete(&f.store, "github", "4242", Policy::default(), at(34)).unwrap(),
         sign_in::Outcome::SignedIn(_)
@@ -1025,4 +1021,46 @@ fn an_invitation_issued_through_a_credential_still_admits_a_platform_administrat
         registration::accept_invitation(&f.store, f.root, &invitation.secret, None, at(20))
             .unwrap();
     assert_eq!(outcome, registration::Accepted::Joined(f.tenant));
+}
+
+#[test]
+fn redeeming_an_invitation_moves_the_tenants_authorization_epoch() {
+    let f = fixture();
+    f.second_admin();
+    let epoch = || {
+        f.store
+            .read(|c| sentinel_store::tenancy::epoch(c, f.tenant))
+            .unwrap()
+    };
+    let start = epoch();
+
+    // An invitation to no tenant grants no membership, so it moves nothing.
+    let unwelcome = f.invite(Terms::default());
+    admitted(f.apply_local("nobody", Some(&unwelcome.secret)));
+    assert_eq!(epoch(), start, "a tenantless invitation changed no access");
+
+    let tenant = f.tenant;
+    let invitation = f.invite(Terms {
+        tenant: Some(tenant),
+        role: Some(Role::Reader),
+        ..Terms::default()
+    });
+    let member = admitted(f.apply_local("member", Some(&invitation.secret)));
+    assert!(
+        epoch() > start,
+        "a membership granted by redemption moves the epoch, as an administrator's grant does"
+    );
+
+    // Presenting another invitation while already a member joins nothing, so it moves nothing.
+    let joined = epoch();
+    let spare = f.invite(Terms {
+        tenant: Some(tenant),
+        role: Some(Role::Operator),
+        ..Terms::default()
+    });
+    assert_eq!(
+        registration::accept_invitation(&f.store, member, &spare.secret, None, at(30)).unwrap(),
+        registration::Accepted::AlreadyMember
+    );
+    assert_eq!(epoch(), joined);
 }

@@ -42,10 +42,10 @@ fn admitted(store: &Store) -> (UserId, local_auth::Session) {
     (user, session)
 }
 
-fn stepped(session: &local_auth::Session) -> local_auth::Session {
-    local_auth::Session {
-        stepped_up: Some(at(0)),
-        ..*session
+fn stepped(session: &local_auth::Session) -> Authority {
+    Authority::Credential {
+        principal: session.principal(),
+        stepped_up: true,
     }
 }
 
@@ -164,15 +164,7 @@ fn a_verified_identity_signs_in_only_after_it_has_been_linked() {
         .unwrap();
     assert_eq!(accounts, 1);
 
-    sign_in::link(
-        &store,
-        &stepped(&session),
-        Policy::default(),
-        GITHUB,
-        SUBJECT,
-        at(20),
-    )
-    .unwrap();
+    sign_in::link(&store, stepped(&session), GITHUB, SUBJECT, at(20)).unwrap();
     let issued =
         signed_in(sign_in::complete(&store, GITHUB, SUBJECT, Policy::default(), at(30)).unwrap());
     assert_eq!(issued.user, user);
@@ -194,15 +186,7 @@ fn a_verified_identity_signs_in_only_after_it_has_been_linked() {
 fn identity_is_the_immutable_subject_not_the_renameable_login() {
     let (_dir, store) = store();
     let (user, session) = admitted(&store);
-    sign_in::link(
-        &store,
-        &stepped(&session),
-        Policy::default(),
-        GITHUB,
-        SUBJECT,
-        at(20),
-    )
-    .unwrap();
+    sign_in::link(&store, stepped(&session), GITHUB, SUBJECT, at(20)).unwrap();
 
     assert!(matches!(
         sign_in::complete(&store, GITHUB, "9999", Policy::default(), at(30)).unwrap(),
@@ -221,15 +205,7 @@ fn identity_is_the_immutable_subject_not_the_renameable_login() {
 fn an_identity_belongs_to_one_account_and_is_never_silently_moved() {
     let (_dir, store) = store();
     let (_root, session) = admitted(&store);
-    sign_in::link(
-        &store,
-        &stepped(&session),
-        Policy::default(),
-        GITHUB,
-        SUBJECT,
-        at(20),
-    )
-    .unwrap();
+    sign_in::link(&store, stepped(&session), GITHUB, SUBJECT, at(20)).unwrap();
 
     let other = UserId::new();
     store
@@ -245,14 +221,7 @@ fn an_identity_belongs_to_one_account_and_is_never_silently_moved() {
         .unwrap();
 
     assert!(matches!(
-        sign_in::link(
-            &store,
-            &stepped(&other_session),
-            Policy::default(),
-            GITHUB,
-            SUBJECT,
-            at(24)
-        ),
+        sign_in::link(&store, stepped(&other_session), GITHUB, SUBJECT, at(24)),
         Err(Error::Conflict)
     ));
     assert_eq!(
@@ -260,17 +229,68 @@ fn an_identity_belongs_to_one_account_and_is_never_silently_moved() {
             .user,
         session.user
     );
-    assert!(
+    assert!(sign_in::link(&store, stepped(&session), GITHUB, SUBJECT, at(26)).is_err());
+}
+
+#[test]
+fn linking_judges_step_up_from_the_session_row_inside_the_linking_transaction() {
+    let (_dir, store) = store();
+    // The freshness probe judges against the clock, so this test uses it rather than a fixture time.
+    let now = UnixMillis::now();
+    let user = local_auth::bootstrap(&store, "root", "Root", b"an operator password", now).unwrap();
+    let issued = match local_auth::login(
+        &store,
+        "root",
+        b"an operator password",
+        Policy::default(),
+        now,
+    ) {
+        Ok(local_auth::Login::Accepted(issued)) => issued,
+        _ => panic!("local login"),
+    };
+    store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE sessions SET stepped_up_ms = ?2 WHERE user_id = ?1",
+                rusqlite::params![user.as_bytes(), now.0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let session = store
+        .read(|c| local_auth::authenticate(c, &issued.session, now))
+        .unwrap();
+    let authority = |session: &local_auth::Session| {
+        Authority::live_session(session, issued.session.digest(), Policy::default())
+    };
+
+    // The snapshot does not carry the stamp; the row does, so the proof is found where it was made.
+    sign_in::link(
+        &store,
+        authority(&session),
+        GITHUB,
+        SUBJECT,
+        UnixMillis::now(),
+    )
+    .unwrap();
+
+    // Revoked after the request was identified and before the write: nothing is attached.
+    local_auth::revoke_all_host_local(&store, user, UnixMillis::now()).unwrap();
+    assert!(matches!(
         sign_in::link(
             &store,
-            &stepped(&session),
-            Policy::default(),
+            authority(&session),
             GITHUB,
-            SUBJECT,
-            at(26)
-        )
-        .is_err()
-    );
+            "5150",
+            UnixMillis::now()
+        ),
+        Err(Error::StepUpRequired)
+    ));
+    assert!(matches!(
+        sign_in::complete(&store, GITHUB, "5150", Policy::default(), UnixMillis::now()).unwrap(),
+        Outcome::NoAccount
+    ));
 }
 
 #[test]
@@ -289,15 +309,7 @@ fn a_suspended_account_cannot_sign_in_through_its_provider() {
     let member_session = store
         .read(|conn| local_auth::authenticate(conn, &member_session.session, at(22)))
         .unwrap();
-    sign_in::link(
-        &store,
-        &stepped(&member_session),
-        Policy::default(),
-        GITHUB,
-        SUBJECT,
-        at(23),
-    )
-    .unwrap();
+    sign_in::link(&store, stepped(&member_session), GITHUB, SUBJECT, at(23)).unwrap();
 
     let admin = Principal::new(root, P::ALL, None, None);
     store
@@ -326,15 +338,7 @@ fn a_suspended_account_cannot_sign_in_through_its_provider() {
 fn linking_and_unlinking_are_audited_and_authorized() {
     let (_dir, store) = store();
     let (root, session) = admitted(&store);
-    sign_in::link(
-        &store,
-        &stepped(&session),
-        Policy::default(),
-        GITHUB,
-        SUBJECT,
-        at(20),
-    )
-    .unwrap();
+    sign_in::link(&store, stepped(&session), GITHUB, SUBJECT, at(20)).unwrap();
 
     let identities = store
         .read(|conn| sign_in::identities(conn, Authority::credential(session.principal()), root))
@@ -369,15 +373,7 @@ fn linking_and_unlinking_are_audited_and_authorized() {
         sign_in::complete(&store, GITHUB, SUBJECT, Policy::default(), at(24)).unwrap(),
         Outcome::NoAccount
     ));
-    sign_in::link(
-        &store,
-        &stepped(&session),
-        Policy::default(),
-        GITHUB,
-        SUBJECT,
-        at(25),
-    )
-    .unwrap();
+    sign_in::link(&store, stepped(&session), GITHUB, SUBJECT, at(25)).unwrap();
     sign_in::unlink_host_local(&store, root, GITHUB, at(26)).unwrap();
     assert!(matches!(
         sign_in::unlink_host_local(&store, root, GITHUB, at(27)),
@@ -420,15 +416,7 @@ fn a_federated_sign_in_is_recorded_whether_or_not_it_resolves() {
     let (_dir, store) = store();
     let (_root, session) = admitted(&store);
     sign_in::complete(&store, GITHUB, "1", Policy::default(), at(10)).unwrap();
-    sign_in::link(
-        &store,
-        &stepped(&session),
-        Policy::default(),
-        GITHUB,
-        SUBJECT,
-        at(20),
-    )
-    .unwrap();
+    sign_in::link(&store, stepped(&session), GITHUB, SUBJECT, at(20)).unwrap();
     sign_in::complete(&store, GITHUB, SUBJECT, Policy::default(), at(30)).unwrap();
 
     let audit = store

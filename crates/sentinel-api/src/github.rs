@@ -15,7 +15,10 @@ use sentinel_github::{
     http::Client,
     oauth::{self, App, Endpoints},
 };
-use sentinel_store::sign_in::{self, MAX_REDIRECT_BYTES, Outcome, STATE_TTL_MS};
+use sentinel_store::{
+    auth::Authority,
+    sign_in::{self, MAX_REDIRECT_BYTES, Outcome, STATE_TTL_MS},
+};
 
 use crate::{
     State,
@@ -492,27 +495,24 @@ fn finish_link(
     began_with: &sentinel_auth::secret::Digest,
 ) -> Reply {
     let now = UnixMillis::now();
-    let session = cookies
+    let presented = cookies
         .and_then(|header| cookie::read(cookie::SESSION_COOKIE, header))
-        .filter(|presented| digest_eq(&presented.digest(), began_with))
+        .filter(|presented| digest_eq(&presented.digest(), began_with));
+    let session = presented
+        .as_ref()
         .and_then(|presented| {
             state
                 .store
-                .read(|c| sentinel_store::local_auth::authenticate(c, &presented, now))
+                .read(|c| sentinel_store::local_auth::authenticate(c, presented, now))
                 .ok()
         })
         .filter(|session| session.user == user);
-    let Some(session) = session else {
+    let Some((session, presented)) = session.zip(presented) else {
         return ended(403, LINK_AGAIN);
     };
-    match sign_in::link(
-        &state.store,
-        &session,
-        state.sessions,
-        PROVIDER,
-        subject,
-        now,
-    ) {
+    // A live session authority, so the step-up is judged from its row inside the linking transaction.
+    let authority = Authority::live_session(&session, presented.digest(), state.sessions);
+    match sign_in::link(&state.store, authority, PROVIDER, subject, now) {
         Ok(()) => {}
         Err(sentinel_store::Error::StepUpRequired) => {
             return ended(

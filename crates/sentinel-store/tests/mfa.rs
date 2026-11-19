@@ -742,7 +742,7 @@ fn linking_an_identity_and_provisioning_a_password_are_authentication_changes() 
     let now = at(T0 + 10);
     let session = f.session(now);
     assert!(matches!(
-        sentinel_store::sign_in::link(&f.store, &session, Policy::default(), "github", "4242", now),
+        sentinel_store::sign_in::link(&f.store, f.authority(now), "github", "4242", now),
         Err(Error::StepUpRequired)
     ));
     let target = UserId::new();
@@ -770,8 +770,7 @@ fn linking_an_identity_and_provisioning_a_password_are_authentication_changes() 
         .unwrap()
     );
     let session = f.session(now);
-    sentinel_store::sign_in::link(&f.store, &session, Policy::default(), "github", "4242", now)
-        .unwrap();
+    sentinel_store::sign_in::link(&f.store, f.authority(now), "github", "4242", now).unwrap();
     f.store
         .writer()
         .write({

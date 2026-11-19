@@ -273,6 +273,7 @@ fn event_code(name: &str) -> i64 {
         "joined" => 70,
         "role-changed" => 71,
         "removed" => 72,
+        "grant-changed" => 39,
         other => panic!("unknown audit name {other}"),
     }
 }
@@ -536,6 +537,51 @@ fn repository_grants_follow_github_and_never_exceed_it() {
     )
     .unwrap();
     assert_eq!(f.epoch(), epoch, "a confirmation is not a change of access");
+}
+
+#[test]
+fn a_sync_that_moves_a_derived_grant_is_audited() {
+    let f = fixture();
+    f.back();
+    let bob = f.person("bob", Some("2002"));
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(2002), at(20)))
+        .unwrap();
+    assert_eq!(f.audit("grant-changed"), 0);
+
+    let app = f.app;
+    f.apply(
+        bob,
+        observed(
+            2002,
+            Membership::Active(OrgRole::Member),
+            vec![(app, RepoAccess::Known(P::READ))],
+        ),
+        false,
+        30,
+    )
+    .unwrap();
+    assert_eq!(
+        f.audit("grant-changed"),
+        1,
+        "a grant GitHub moved is audited as a grant change"
+    );
+
+    // A pass that only confirms the answer changes nothing, so it writes no row.
+    f.apply(
+        bob,
+        observed(
+            2002,
+            Membership::Active(OrgRole::Member),
+            vec![(app, RepoAccess::Known(P::READ))],
+        ),
+        false,
+        30 + HOUR,
+    )
+    .unwrap();
+    assert_eq!(f.audit("grant-changed"), 1);
 }
 
 #[test]

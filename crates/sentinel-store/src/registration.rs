@@ -547,11 +547,15 @@ pub(crate) fn redeem(
     }
     let joined = match (invitation.tenant, invitation.role) {
         (Some(tenant), Some(role)) => {
-            tx.execute(
+            // Both or neither, so a redemption that already held the membership moved no access.
+            let added = tx.execute(
                 "INSERT INTO memberships(tenant_id, user_id, role) VALUES (?1, ?2, ?3)
                  ON CONFLICT(tenant_id, user_id) DO NOTHING",
                 params![tenant.as_bytes(), user.as_bytes(), role as u8],
             )?;
+            if added == 1 {
+                crate::tenancy::bump_epoch(tx, tenant)?;
+            }
             Some(tenant)
         }
         _ => None,
