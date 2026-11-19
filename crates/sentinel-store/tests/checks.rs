@@ -228,6 +228,110 @@ fn settle(f: &mut Fixture, delivery: DeliveryId, resolution: intake::Resolution)
     tx.commit().unwrap();
 }
 
+// The job's transition and the checks row that accounts for it are one commit: a publication the outbox
+// cannot take fails the caller's transaction, so no state change can be committed without it, and the same
+// transition publishes once the fault is gone.
+#[test]
+fn a_transition_rolls_back_with_the_publication_it_could_not_write() {
+    let mut f = fixture();
+    let repo = f.repo;
+    let (run, jobs) = create_run(&mut f, repo, true);
+    let job = jobs[0];
+    let scope = job.to_string();
+    let before = publication(&f, run, &scope);
+    f.conn
+        .execute_batch(
+            "CREATE TRIGGER refuse_publication BEFORE INSERT ON check_publications
+             BEGIN SELECT RAISE(ABORT, 'publication lane down'); END;",
+        )
+        .unwrap();
+    let tx = f.conn.transaction().unwrap();
+    let refused = sentinel_store::jobs::transition(
+        &tx,
+        f.tenant,
+        job,
+        Actor::Controller,
+        Event::Leased(Fence(1)),
+        UnixMillis(NOW.0 + 1),
+    );
+    assert!(refused.is_err());
+    drop(tx);
+    let row = sentinel_store::jobs::get_job(&f.conn, f.tenant, job).unwrap();
+    assert_eq!(row.state, JobState::Queued, "the job did not move");
+    assert_eq!(row.fence, Fence::NONE, "the fence did not advance");
+    assert_eq!(row.timestamps.leased, None);
+    assert_eq!(
+        publication(&f, run, &scope),
+        before,
+        "the publication did not move with the refused transition"
+    );
+
+    f.conn
+        .execute_batch("DROP TRIGGER refuse_publication")
+        .unwrap();
+    assert_eq!(
+        step(&mut f, job, Event::Leased(Fence(1)), 2),
+        JobState::Leased
+    );
+    assert_ne!(
+        publication(&f, run, &scope),
+        before,
+        "the retried transition publishes"
+    );
+}
+
+// A worker's duplicate completion is absorbed by the terminal state: the job keeps its outcome, the checks
+// row keeps its sequence and nothing is published twice.
+#[test]
+fn a_duplicate_completion_publishes_once() {
+    let mut f = fixture();
+    let repo = f.repo;
+    let (run, jobs) = create_run(&mut f, repo, true);
+    let job = jobs[0];
+    let worker = Actor::Worker(Fence(1));
+    step(&mut f, job, Event::Leased(Fence(1)), 2);
+    let mut last = JobState::Leased;
+    for (ms, event) in [
+        (3, Event::PreparationStarted),
+        (4, Event::StepsStarted),
+        (5, Event::FinalizationStarted),
+        (6, Event::Passed),
+    ] {
+        last = step_as(&mut f, job, worker, event, ms);
+    }
+    assert_eq!(last, JobState::Terminal(sentinel_core::Outcome::Passed));
+    let scope = job.to_string();
+    let published = |f: &Fixture| -> checks::Publication {
+        checks::of_run(&f.conn, f.tenant, run)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.scope == scope)
+            .expect("one publication per job")
+    };
+    let once = published(&f);
+    assert_eq!(once.conclusion, Some(Conclusion::Success));
+    let tx = f.conn.transaction().unwrap();
+    assert!(matches!(
+        sentinel_store::jobs::transition(&tx, f.tenant, job, worker, Event::Passed, UnixMillis(7)),
+        Err(Error::Transition(
+            sentinel_core::TransitionError::AlreadyTerminal(_)
+        ))
+    ));
+    drop(tx);
+    let again = published(&f);
+    assert_eq!(again.seq, once.seq, "no second revision was queued");
+    assert_eq!(again.state, once.state);
+    assert_eq!(again.published_seq, once.published_seq);
+    assert_eq!(
+        checks::of_run(&f.conn, f.tenant, run)
+            .unwrap()
+            .iter()
+            .filter(|p| p.scope == scope)
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn a_run_gets_a_stable_aggregate_and_one_check_per_job() {
     let mut f = fixture();
