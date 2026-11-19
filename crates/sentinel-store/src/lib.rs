@@ -21,6 +21,7 @@ pub mod local_auth;
 pub mod logs;
 pub mod lookup;
 pub mod mfa;
+pub mod notices;
 pub mod oauth;
 pub mod objects;
 pub mod offload;

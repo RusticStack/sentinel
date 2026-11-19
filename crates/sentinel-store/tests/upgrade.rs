@@ -436,7 +436,7 @@ fn upgrade_sources() -> Vec<u32> {
 fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expects() {
     // docs/upgrades.md (tests/compat_doc.rs compares it with the code): a database at schema N
     // runs on release R only when no migration in (R, N] declares a readable_by above R. Rows
-    // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, 68, 69, LATEST.
+    // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, LATEST.
     let readable = |db: &Connection, release: u32, newest: u32| -> bool {
         let needs: u32 = db
             .query_row(
@@ -449,11 +449,11 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        70,
+        71,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
-    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 68, 69]);
+    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 70]);
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.sqlite");
@@ -468,7 +468,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         drop(store);
         assert_eq!(version(&path), schema::LATEST, "from {from}");
         let db = Connection::open(&path).unwrap();
-        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68, 69, 70]
+        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71]
             .iter()
             .map(|&newest| from >= newest || readable(&db, from, newest))
             .collect();
@@ -489,35 +489,41 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         // writes the new columns, its `storage_defaults` insert takes their defaults and a tenant
         // policy it writes leaves them NULL, which inherits; while an older controller runs on the
         // result it enforces the bare quota instead of the tenant's narrowed hard threshold.
+        // Migration 71 (the threshold notices) is readable by nothing older: an older controller
+        // neither writes nor reads the notice latch, so no crossing is told while it runs.
         let expected = match from {
             44 | 47 | 48 => [
-                false, false, false, false, false, false, false, false, false, false,
+                false, false, false, false, false, false, false, false, false, false, false,
             ],
             51 => [
-                true, false, false, false, false, false, false, false, false, false,
+                true, false, false, false, false, false, false, false, false, false, false,
             ],
             56 => [
-                true, true, false, false, false, false, false, false, false, false,
+                true, true, false, false, false, false, false, false, false, false, false,
             ],
             57 => [
-                true, true, true, false, false, false, false, false, false, false,
+                true, true, true, false, false, false, false, false, false, false, false,
             ],
             63 => [
-                true, true, true, true, false, false, false, false, false, false,
+                true, true, true, true, false, false, false, false, false, false, false,
             ],
             64 | 65 => [
-                true, true, true, true, true, false, false, false, false, false,
+                true, true, true, true, true, false, false, false, false, false, false,
             ],
             66 | 67 => [
-                true, true, true, true, true, true, true, false, false, false,
+                true, true, true, true, true, true, true, false, false, false, false,
             ],
-            68 => [true, true, true, true, true, true, true, true, false, false],
-            69 => [true, true, true, true, true, true, true, true, true, true],
+            68 => [
+                true, true, true, true, true, true, true, true, false, false, false,
+            ],
+            69 | 70 => [
+                true, true, true, true, true, true, true, true, true, true, false,
+            ],
             _ => unreachable!(),
         };
         assert_eq!(
             ok, expected,
-            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69, 70"
+            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71"
         );
     }
 }

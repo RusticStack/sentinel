@@ -39,6 +39,7 @@ const MAX_LOCAL_BYTES: usize = 64;
 pub enum Kind {
     Verification = 1,
     Invitation = 2,
+    StorageNotice = 3,
 }
 
 impl Kind {
@@ -46,6 +47,7 @@ impl Kind {
         match self {
             Kind::Verification => "verification",
             Kind::Invitation => "invitation",
+            Kind::StorageNotice => "storage-notice",
         }
     }
 
@@ -53,6 +55,7 @@ impl Kind {
         match code {
             1 => Some(Kind::Verification),
             2 => Some(Kind::Invitation),
+            3 => Some(Kind::StorageNotice),
             _ => None,
         }
     }
