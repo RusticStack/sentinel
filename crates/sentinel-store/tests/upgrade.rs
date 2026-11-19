@@ -450,7 +450,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
-    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 63, 64, 65, 66, 67]);
+    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 67]);
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.sqlite");

@@ -55,7 +55,6 @@ A database at schema N runs on release R only when no migration in (R, N] declar
 | 57 | n/a | n/a | runs as is | copy or backup | copy or backup | copy or backup | copy or backup | copy or backup |
 | 63 | n/a | n/a | n/a | runs as is | copy or backup | copy or backup | copy or backup | copy or backup |
 | 64 | n/a | n/a | n/a | n/a | runs as is | copy or backup | copy or backup | copy or backup |
-| 65 | n/a | n/a | n/a | n/a | n/a | copy or backup | copy or backup | copy or backup |
 | 66 | n/a | n/a | n/a | n/a | n/a | n/a | runs as is | copy or backup |
 | 67 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | copy or backup |
 

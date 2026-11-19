@@ -580,7 +580,7 @@ impl StorageFile {
         let default_class = self
             .artifact_default_class
             .clone()
-            .unwrap_or_else(|| resolved.default_class);
+            .unwrap_or(resolved.default_class);
         if !classes.iter().any(|c| c.name == default_class) {
             return Err(Error::config(
                 "storage artifact_default_class must name a class [storage.classes] defines",
