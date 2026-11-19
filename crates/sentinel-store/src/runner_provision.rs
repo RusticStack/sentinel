@@ -128,15 +128,23 @@ struct Candidate {
 /// Fresh demand for the pool, ranked the way the fair queue ranks jobs: the tenant holding the
 /// fewest runners first, then the oldest queued job. A pair whose queued jobs are already covered
 /// by live leases is not demand and is dropped by `HAVING`.
+///
+/// A job of a fork pull request is demand only for the hostile-fork pool, and that pool takes
+/// nothing else: `q.fork_pr = 0 OR (… ` keeps trusted demand off it, and the first clause keeps a
+/// fork job waiting until a pool is marked as one and its tenant opts in. A fork job nobody can
+/// serve stays queued at GitHub rather than running unconfined, which is the guarantee AR09 makes.
 const DEMAND_SQL: &str = "SELECT q.tenant_id, q.repo_id, q.class
      FROM runner_jobs q
      JOIN tenants t ON t.id = q.tenant_id AND t.active = 1 AND t.runner_mode = 1
+     JOIN pools p ON p.id = :pool AND p.active = 1
+       AND (p.owner_tenant_id = q.tenant_id
+            OR EXISTS(SELECT 1 FROM pool_grants g
+                      WHERE g.pool_id = p.id AND g.tenant_id = q.tenant_id))
      WHERE q.state_code = 0
-       AND EXISTS(SELECT 1 FROM pools p
-                  WHERE p.id = :pool AND p.active = 1
-                    AND (p.owner_tenant_id = q.tenant_id
-                         OR EXISTS(SELECT 1 FROM pool_grants g
-                                   WHERE g.pool_id = p.id AND g.tenant_id = q.tenant_id)))
+       AND CASE WHEN q.fork_pr = 1
+                THEN p.fork_prs = 1 AND t.runner_fork_prs = 1
+                ELSE p.fork_prs = 0
+           END
      GROUP BY q.tenant_id, q.repo_id, q.class
      HAVING COUNT(*) > (SELECT COUNT(*) FROM runner_leases l
                         WHERE l.tenant_id = q.tenant_id AND l.repo_id = q.repo_id

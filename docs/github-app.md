@@ -148,7 +148,9 @@ Runner mode needs two permissions the base App does not ([plan 16.10](../plan.md
 | Register a just-in-time runner | `organization_self_hosted_runners` write | `administration` write |
 
 They live in the one App's manifest, and the controller **verifies** them per installation, only
-for a tenant that turned runner mode on. Enabling is refused while any of the tenant's live
+for a tenant that turned runner mode on. Nothing here reads a secret: the delivery names the job and
+its pull requests, the registration call issues the runner's own configuration, and Sentinel never
+asks for an Actions secret ([runner mode](runner-mode.md#actions-secrets-are-githubs)). Enabling is refused while any of the tenant's live
 installations lacks one — every installation it administers, whether or not a repository is bound
 through it yet — and the answer names exactly what is missing:
 
@@ -159,7 +161,9 @@ through it yet — and the answer names exactly what is missing:
 ```
 
 `GET /tenants/{slug}/runner-mode` states the same thing before anyone tries: the classes this
-deployment serves ([configuration](configuration.md#runner-classes)) and the names still missing.
+deployment serves ([configuration](configuration.md#runner-classes)), the names still missing, and —
+once the switch is on — whether the tenant serves jobs of fork pull requests
+([runner mode](runner-mode.md#fork-pull-requests)).
 Granting a permission is a change on GitHub's side (the App's settings, then the installation's
 approval); the next installation snapshot the controller reads records it, and the switch is
 accepted. **Withdrawing** one is the same path in reverse and needs no restart: the snapshot drops

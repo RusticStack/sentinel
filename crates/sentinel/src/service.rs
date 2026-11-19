@@ -87,6 +87,7 @@ struct FileConfig {
     job_network: Option<String>,
     isolation: Option<String>,
     microvm: Option<MicrovmFile>,
+    runner: Option<RunnerFile>,
     disk_bytes: Option<u64>,
     spool_reserve_bytes: Option<u64>,
     spool_quota_bytes: Option<u64>,
@@ -103,6 +104,28 @@ struct FileConfig {
     mail: Option<MailFile>,
     worker_bootstrap: Option<WorkerBootstrapFile>,
     tailcat_address: Option<String>,
+}
+
+/// Whether `reference` is an image reference a runner may be started from, judged by the worker
+/// crate that will run it. A server-only build has no worker to ask and refuses every reference:
+/// the role check above has already refused `[runner]` there.
+#[cfg(feature = "worker")]
+fn pinned_image(reference: &str) -> bool {
+    sentinel_worker::runner::Image::parse(reference).is_some()
+}
+
+#[cfg(not(feature = "worker"))]
+fn pinned_image(_: &str) -> bool {
+    false
+}
+
+/// The runners this worker starts (plan 16.10, AR09): the image they run, pinned by digest.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerFile {
+    /// `registry/repository@sha256:<64 hex>`: a tag is refused, because the same tag is another
+    /// image tomorrow and this one runs the code a job's steps were written against.
+    image: String,
 }
 
 /// The microVM executor's setup (plan 16.8): Firecracker, the pinned guest kernel, the static guest agent.
@@ -685,6 +708,8 @@ struct WorkerLink {
     job_network: NetworkSetting,
     isolation: IsolationSetting,
     microvm: Option<MicrovmSetup>,
+    /// The runner image this worker starts from, pinned by digest; absent, it serves no runner.
+    runner_image: Option<String>,
     disk_bytes: Option<u64>,
     spool_reserve_bytes: Option<u64>,
     spool_quota_bytes: Option<u64>,
@@ -834,6 +859,7 @@ impl Config {
                 || file.job_network.is_some()
                 || file.isolation.is_some()
                 || file.microvm.is_some()
+                || file.runner.is_some()
                 || file.disk_bytes.is_some()
                 || file.spool_reserve_bytes.is_some()
                 || file.spool_quota_bytes.is_some()
@@ -844,7 +870,7 @@ impl Config {
                 || file.metrics_listen.is_some()
             {
                 return Err(Error::config(
-                    "controller, controller_fingerprint, controller_fingerprint_also, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, job_network, isolation, microvm, disk_bytes, spool_reserve_bytes, spool_quota_bytes, cache_budget_bytes, mirror_budget_bytes, image_budget_bytes, tailcat_address and metrics_listen apply to the worker role only",
+                    "controller, controller_fingerprint, controller_fingerprint_also, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, job_network, isolation, microvm, runner, disk_bytes, spool_reserve_bytes, spool_quota_bytes, cache_budget_bytes, mirror_budget_bytes, image_budget_bytes, tailcat_address and metrics_listen apply to the worker role only",
                 ));
             }
             let listen: SocketAddr = file
@@ -953,6 +979,7 @@ impl Config {
                         || file.job_network.is_some()
                         || file.isolation.is_some()
                         || file.microvm.is_some()
+                        || file.runner.is_some()
                         || file.disk_bytes.is_some()
                         || file.spool_reserve_bytes.is_some()
                         || file.spool_quota_bytes.is_some()
@@ -1046,6 +1073,19 @@ impl Config {
                     if file.disk_bytes == Some(0) {
                         return Err(Error::config("disk_bytes must be positive when set"));
                     }
+                    let runner_image = file
+                        .runner
+                        .as_ref()
+                        .map(|runner| {
+                            if pinned_image(&runner.image) {
+                                Ok(runner.image.clone())
+                            } else {
+                                Err(Error::config(
+                                    "runner.image must be pinned by digest, as in ghcr.io/owner/runner@sha256:<64 hex>",
+                                ))
+                            }
+                        })
+                        .transpose()?;
                     if [
                         file.cache_budget_bytes,
                         file.mirror_budget_bytes,
@@ -1105,6 +1145,7 @@ impl Config {
                         labels,
                         job_network,
                         isolation,
+                        runner_image,
                         microvm: file.microvm.map(|m| MicrovmSetup {
                             firecracker: m.firecracker,
                             kernel: m.kernel,
@@ -2860,6 +2901,7 @@ mod worker_role {
         budgets: [Option<u64>; 3],
         measured_disk: bool,
         network: sentinel_worker::podman::Network,
+        runner: sentinel_worker::runner::Policy,
         runtime: sentinel_worker::attempt::Runtime,
         metrics: Arc<crate::worker_metrics::Metrics>,
     ) -> Box<dyn LinkExecutor> {
@@ -2921,6 +2963,12 @@ mod worker_role {
                     sentinel_worker::executor::Notice::CleanupFailed { attempt, what, error } => {
                         tracing::warn!(event = "attempt_cleanup_failed", attempt = %attempt, what, error = %error, "a tree the attempt left could not be removed; the worker retries while it runs, and its disk stays held until it succeeds");
                     }
+                    sentinel_worker::executor::Notice::RunnerEnded { lease, code, canceled } => {
+                        tracing::info!(event = "runner_ended", lease = %lease, code = ?code, canceled);
+                    }
+                    sentinel_worker::executor::Notice::RunnerFailed { lease, error } => {
+                        tracing::warn!(event = "runner_failed", lease = %lease, error = %error, "a runner sandbox did not run to a clean end; the controller's idle bound ends its lease");
+                    }
                     sentinel_worker::executor::Notice::WorkspacesReaped(removed) => {
                         tracing::info!(event = "workspaces_reaped", removed);
                     }
@@ -2966,6 +3014,8 @@ mod worker_role {
                 executor.set_storage_budgets(budgets);
                 executor.set_measured_disk(measured_disk);
                 executor.set_job_network(network);
+                let runner_image = runner.image.as_ref().map(|image| image.as_str().to_owned());
+                executor.set_runner_policy(runner);
                 let microvm_egress = network == sentinel_worker::podman::Network::Egress
                     && runtime.microvm.is_some();
                 executor.set_runtime(runtime);
@@ -2973,6 +3023,14 @@ mod worker_role {
                     tracing::warn!(
                         event = "job_egress_enabled",
                         "job containers on this worker have outbound network (job_network = \"egress\")"
+                    );
+                }
+                if let Some(image) = runner_image {
+                    tracing::info!(
+                        event = "runner_mode_ready",
+                        image,
+                        egress = network == sentinel_worker::podman::Network::Egress,
+                        "this worker starts one ephemeral GitHub Actions runner per leased job"
                     );
                 }
                 if microvm_egress {
@@ -3404,6 +3462,21 @@ mod worker_role {
             link.budgets,
             link.disk_bytes.is_none(),
             network,
+            sentinel_worker::runner::Policy {
+                image: link
+                    .runner_image
+                    .as_deref()
+                    .and_then(sentinel_worker::runner::Image::parse),
+                // The same endpoints a guest granted egress may not reach: the address the worker
+                // dials (the Tailcat helper's local forward, when there is one) and the configured one.
+                guard: sentinel_worker::microvm::net::Guard {
+                    link: if controller == link.controller {
+                        vec![controller]
+                    } else {
+                        vec![controller, link.controller]
+                    },
+                },
+            },
             runtime,
             Arc::clone(&metrics),
         );

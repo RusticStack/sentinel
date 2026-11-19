@@ -216,6 +216,36 @@ impl Fixture {
         }
     }
 
+    /// The same job, but its commit belongs to a pull request from a fork of the repository.
+    fn accept_fork(
+        &self,
+        delivery: &str,
+        action: &str,
+        job: u64,
+        run: u64,
+        labels: &[&str],
+    ) -> DeliveryId {
+        let mut payload = self.payload(action, job, run, labels, None, None);
+        payload["workflow_job"]["pull_requests"] = serde_json::json!([
+            {"number": 7, "head": {"repo": {"id": GITHUB_REPO_ID + 1}}, "base": {"repo": {"id": GITHUB_REPO_ID}}}
+        ]);
+        match self.deliver(delivery, &payload).unwrap() {
+            Github::Ingested(accepted) => accepted.id,
+            other => panic!("a signed sentinel-labelled job must be ingested, got {other:?}"),
+        }
+    }
+
+    fn offer_fork_prs(&self) {
+        let tenant = self.tenant;
+        self.store
+            .writer()
+            .write(move |tx| {
+                runner::set_fork_prs(tx, Authority::HostLocal, tenant, true)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
     fn validate(&self, id: DeliveryId) -> intake::Delivery {
         self.store
             .writer()
@@ -480,6 +510,33 @@ fn runner_mode_off_refuses_a_queued_job_with_an_audit_row_and_no_job() {
         })
         .unwrap();
     assert_eq!(open, 0);
+}
+
+#[test]
+fn a_fork_pull_requests_job_is_refused_until_the_tenant_offers_them_and_then_waits_for_a_fork_pool()
+{
+    let f = fixture();
+    f.enable_runner_mode();
+    let refused = f.accept_fork("job-fork", "queued", 4300, 3300, &[CLASS]);
+    let (outcome, row) = f.run(refused);
+    assert_eq!(
+        outcome,
+        Outcome::Failed {
+            reason: "runner_fork_pr",
+            detail: None
+        }
+    );
+    assert_eq!(row.state, State::Failed);
+    assert_eq!(f.audited("runner_fork_pr"), 1);
+    assert_eq!(f.jobs(), 0, "a refused fork job is never demand");
+
+    // With the opt-in the job is recorded as demand, carrying the provenance placement reads.
+    f.offer_fork_prs();
+    let served = f.accept_fork("job-fork-2", "queued", 4301, 3301, &[CLASS]);
+    assert_eq!(f.run(served).0, Outcome::Ignored("runner_job"));
+    let job = f.job(4301).expect("the opted-in job is demand");
+    assert!(job.fork_pr);
+    assert!(f.job(4300).is_none(), "the refused job stayed refused");
 }
 
 #[test]

@@ -186,6 +186,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (73, include_str!("migrations/073_oauth_scope_bits.sql")),
     (74, include_str!("migrations/074_runner_provisioning.sql")),
     (75, include_str!("migrations/075_migration_permissions.sql")),
+    (76, include_str!("migrations/076_runner_fork_policy.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -310,6 +311,10 @@ mod tests {
         (
             75,
             "an older controller records no installation snapshot's migration permissions, so a permission withdrawn on GitHub while it runs leaves the bits a newer controller's write gate reads stale, and it holds no migration switch to turn off",
+        ),
+        (
+            76,
+            "an older controller records a fork pull request's job as demand and places a runner for it on any pool the tenant can use, because it reads neither the fork provenance nor the tenant's opt-in; it also cannot see a fork pool, so it would offer that pool's capacity to trusted jobs",
         ),
     ];
 

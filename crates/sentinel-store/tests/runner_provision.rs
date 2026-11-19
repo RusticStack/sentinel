@@ -13,6 +13,7 @@ use sentinel_store::{
     auth::{self, NamespaceKind, provisioning},
     dispatch::{self, Capacity},
     registration::Authority,
+    runner as runner_store,
     runner_provision::{self, DECLINED, IDLE, JOB_COMPLETED, LAPSED, LeaseState, SESSION_LOST},
     tenancy::{self, PoolKind},
     workers::{self, Presentation},
@@ -508,4 +509,202 @@ fn reconciliation_covers_every_bound_repository_of_a_runner_mode_tenant() {
         found.is_empty(),
         "a repository bound through no installation"
     );
+}
+
+fn fork_pool(f: &Fixture) -> PoolId {
+    let pool = PoolId::new();
+    let tx = f.conn.unchecked_transaction().unwrap();
+    tenancy::create_pool(
+        &tx,
+        Authority::HostLocal,
+        pool,
+        "forks",
+        PoolKind::Shared,
+        NOW,
+    )
+    .unwrap();
+    tenancy::grant_pool(&tx, Authority::HostLocal, pool, f.tenant, NOW).unwrap();
+    assert!(tenancy::set_pool_fork(&tx, Authority::HostLocal, pool, true).unwrap());
+    tx.commit().unwrap();
+    pool
+}
+
+fn opt_in(f: &Fixture) {
+    let tx = f.conn.unchecked_transaction().unwrap();
+    runner_store::set_fork_prs(&tx, Authority::HostLocal, f.tenant, true).unwrap();
+    tx.commit().unwrap();
+}
+
+fn queued_fork(f: &Fixture, job: u64, labels: &str) {
+    f.conn
+        .execute(
+            "INSERT INTO runner_jobs(tenant_id, repo_id, job_id, run_id, class, state_code,
+                runner, conclusion, queued_ms, started_ms, completed_ms, fork_pr)
+             VALUES (?1, ?2, ?3, ?3, ?4, 0, NULL, NULL, ?5, NULL, NULL, 1)",
+            rusqlite::params![
+                f.tenant.as_bytes(),
+                f.repo.as_bytes(),
+                job as i64,
+                labels,
+                NOW.0
+            ],
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_fork_pull_requests_job_is_never_placed_without_the_tenants_opt_in() {
+    let f = fixture();
+    let w = worker(&f, 16_000, 64 << 30, &[CLASS]);
+    queued_fork(&f, 1, CLASS);
+    assert!(
+        place(&f, w, NOW).is_none(),
+        "a fork job was leased on a tenant that does not serve fork pull requests"
+    );
+    // The trusted pool may not serve it either, even after the opt-in: it is not a fork pool.
+    opt_in(&f);
+    assert!(
+        place(&f, w, NOW).is_none(),
+        "a fork job was leased on a pool that is not the hostile-fork pool"
+    );
+    // With a pool marked for fork jobs the same demand is served.
+    let forks = fork_pool(&f);
+    let forked = worker_on_pool(&f, forks, &[CLASS]);
+    assert!(place(&f, forked, NOW).is_some());
+}
+
+#[test]
+fn the_hostile_fork_pool_serves_no_trusted_job() {
+    let f = fixture();
+    let forks = fork_pool(&f);
+    opt_in(&f);
+    let forked = worker_on_pool(&f, forks, &[CLASS]);
+    queued(&f, 1, CLASS);
+    assert!(
+        place(&f, forked, NOW).is_none(),
+        "a trusted job was leased on the hostile-fork pool"
+    );
+    queued_fork(&f, 2, CLASS);
+    let lease = place(&f, forked, NOW).expect("fork demand has a fork pool");
+    assert_eq!(lease.class, CLASS);
+}
+
+#[test]
+fn a_fork_pool_lease_is_refused_by_the_database_without_the_opt_in() {
+    let f = fixture();
+    let forks = fork_pool(&f);
+    let lease = sentinel_core::RunnerLeaseId::new();
+    let refused = f.conn.execute(
+        "INSERT INTO runner_leases(id, tenant_id, repo_id, class, pool_id, worker_id, fence,
+            state_code, cpu_millis, memory_bytes, runner_name, offered_ms, lease_until_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, 4000, 8589934592, 'sentinel-fork-1', ?7, ?8)",
+        rusqlite::params![
+            lease.as_bytes(),
+            f.tenant.as_bytes(),
+            f.repo.as_bytes(),
+            CLASS,
+            forks.as_bytes(),
+            WorkerId::new().as_bytes(),
+            NOW.0,
+            NOW.0 + 60_000
+        ],
+    );
+    let error = refused.expect_err("a fork pool took a lease without the tenant's opt-in");
+    assert!(
+        error.to_string().contains("fork pool"),
+        "unexpected refusal: {error}"
+    );
+}
+
+#[test]
+fn offering_fork_jobs_is_refused_without_runner_mode() {
+    let f = fixture();
+    f.conn
+        .execute(
+            "UPDATE tenants SET runner_mode = 0 WHERE id = ?1",
+            [f.tenant.as_bytes()],
+        )
+        .unwrap();
+    let tx = f.conn.unchecked_transaction().unwrap();
+    assert_eq!(
+        runner_store::set_fork_prs(&tx, Authority::HostLocal, f.tenant, true).unwrap(),
+        sentinel_store::switch::Switch::NoRunnerMode
+    );
+    tx.commit().unwrap();
+    assert!(
+        !runner_store::fork_prs(&f.conn, f.tenant).unwrap(),
+        "nothing was written"
+    );
+}
+
+#[test]
+fn the_fork_pull_request_opt_in_is_audited() {
+    let f = fixture();
+    opt_in(&f);
+    let tx = f.conn.unchecked_transaction().unwrap();
+    assert_eq!(
+        runner_store::set_fork_prs(&tx, Authority::HostLocal, f.tenant, true).unwrap(),
+        sentinel_store::switch::Switch::Unchanged
+    );
+    tx.commit().unwrap();
+    // Audit event 101 is `runner-fork-prs-changed`; the detail says which way the switch went.
+    let rows: Vec<Option<String>> = f
+        .conn
+        .prepare("SELECT detail FROM auth_audit WHERE event = 101 ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(rows, [Some("enabled".to_owned())]);
+}
+
+fn worker_on_pool(f: &Fixture, pool: PoolId, labels: &[&str]) -> WorkerId {
+    let id = WorkerId::new();
+    let fingerprint = Secret::generate().digest();
+    let labels: Vec<String> = labels.iter().map(|l| (*l).to_owned()).collect();
+    let tx = f.conn.unchecked_transaction().unwrap();
+    let issued = workers::issue_enrollment(&tx, Authority::HostLocal, pool, 60_000, NOW).unwrap();
+    let mut text = String::new();
+    issued.secret.expose(&mut text);
+    workers::enroll(
+        &tx,
+        &Secret::parse(&text).unwrap(),
+        Presentation {
+            worker: id,
+            fingerprint,
+            name: "w",
+            negotiated: Negotiated {
+                protocol: ProtocolVersion(12),
+                capabilities: Capabilities::REQUIRED,
+                arch: Arch::X86_64,
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    dispatch::report_capacity(
+        &tx,
+        id,
+        Capacity {
+            cpu_millis: 16_000,
+            memory_bytes: 64 << 30,
+            disk_bytes: 100 << 30,
+        },
+    )
+    .unwrap();
+    dispatch::report_profile(
+        &tx,
+        id,
+        &dispatch::ReportedProfile {
+            labels: labels.as_slice(),
+            host_id: None,
+            avail_images: &[],
+            cache_bytes: Some(0),
+            load_ns: Some(0),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    id
 }

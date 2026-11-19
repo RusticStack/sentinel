@@ -430,6 +430,22 @@ pub enum RunnerModeCommand {
         )]
         enabled: bool,
     },
+    /// Serve jobs of fork pull requests, or stop serving them; it needs runner mode on
+    ForkPrs {
+        #[command(flatten)]
+        data: DataDir,
+        /// The tenant's slug or `tnt_` identifier
+        #[arg(long)]
+        tenant: String,
+        /// true or false
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            value_name = "true|false",
+            value_parser = clap::value_parser!(bool)
+        )]
+        enabled: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -833,6 +849,21 @@ pub enum PoolCommand {
         data: DataDir,
         #[arg(long, value_name = "SLUG")]
         tenant: String,
+    },
+    /// Mark a pool as the hostile-fork pool (fork pull-request jobs only), or take the mark back
+    Fork {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        pool: String,
+        /// true or false
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            value_name = "true|false",
+            value_parser = clap::value_parser!(bool)
+        )]
+        enabled: bool,
     },
 }
 

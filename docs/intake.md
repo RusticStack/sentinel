@@ -182,6 +182,10 @@ label set names two classes (`failed:runner_labels_conflict`). Only a `queued`
 job is judged by the tenant's switch and permissions: `in_progress` and
 `completed` record what GitHub did with a job Sentinel already has.
 
+A job of a fork pull request is judged before any of that: without the tenant's opt-in it is refused
+`failed:runner_fork_pr`, and with it the job is demand only for a pool marked as the hostile-fork pool
+([runner mode](runner-mode.md#fork-pull-requests)), so it is never placed beside trusted work.
+
 A delivery that produced a job settles **`ignored:runner_job`**: GitHub runs
 that job itself, so the delivery dispatches no run of Sentinel's own —
 `dispatched` means having one, which the store's check enforces — and nothing is

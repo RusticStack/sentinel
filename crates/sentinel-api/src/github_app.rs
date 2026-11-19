@@ -255,18 +255,22 @@ fn runner_mode(state: &State, request: &mut Request, slug: &str) -> Route {
     crate::auth::require_scope(&who, Scopes::RUNS_READ)?;
     let slug = slug.to_owned();
     let principal = who.principal;
-    let (enabled, missing) = state
+    let (enabled, fork_prs, missing) = state
         .store
         .read(move |c| {
             let tenant = authz::member_tenant_by_slug(c, principal, &slug)?;
             Ok((
                 stored_runner::mode(c, tenant)?,
+                stored_runner::fork_prs(c, tenant)?,
                 stored_runner::missing(c, tenant)?,
             ))
         })
         .map_err(store_error)?;
     ok(json!({
         "enabled": enabled,
+        // Whether a job of a fork pull request is served at all; a runner for it is only leased on
+        // a pool marked as the hostile-fork pool (`admin pool fork`).
+        "fork_prs": fork_prs,
         "classes": state.runner_classes.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "missing": missing,
     }))
@@ -300,6 +304,11 @@ fn set_runner_mode(state: &State, request: &mut Request, slug: &str) -> Route {
             "the tenant has no GitHub App installation to register a runner through",
         )
         .with_detail("reason", "not_configured")),
+        Switch::NoRunnerMode => Err(err(
+            ErrorCode::Conflict,
+            "fork pull requests need runner mode on",
+        )
+        .with_detail("reason", "runner_mode_off")),
     }
 }
 
@@ -351,6 +360,13 @@ fn set_tenant_migration(state: &State, request: &mut Request, slug: &str) -> Rou
             "the tenant has no GitHub App installation to write through",
         )
         .with_detail("reason", "not_configured")),
+        // Migration writes do not depend on runner mode, so this answer cannot arrive here; the two
+        // switches share one vocabulary and this arm keeps that sharing honest.
+        Switch::NoRunnerMode => Err(err(
+            ErrorCode::Conflict,
+            "the tenant's runner mode is off",
+        )
+        .with_detail("reason", "runner_mode_off")),
     }
 }
 

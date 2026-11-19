@@ -36,13 +36,12 @@ pub const PREFIX: u8 = 30;
 pub const DNS: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 53);
 pub const GUEST_MAC: &str = "06:00:0a:d3:00:02";
 
-/// What a guest may never reach, whatever the operator grants: the unspecified, loopback, link-local (which
-/// holds the cloud metadata endpoints 169.254.169.254 and 169.254.170.2), Alibaba Cloud's metadata address,
-/// the IETF protocol block (192.0.0.192 is a metadata address on some clouds), multicast, reserved and
-/// broadcast ranges, and the VM's own link.
-const ALWAYS_DENIED: [(Ipv4Addr, u8); 8] = [
+/// What a sandbox granted egress may never reach, whatever the operator grants: the unspecified, loopback,
+/// link-local (which holds the cloud metadata endpoints 169.254.169.254 and 169.254.170.2), Alibaba Cloud's
+/// metadata address, the IETF protocol block (192.0.0.192 is a metadata address on some clouds), multicast,
+/// reserved and broadcast ranges. A runner container shares this list; only a guest adds its own link below.
+pub(crate) const ALWAYS_DENIED: [(Ipv4Addr, u8); 7] = [
     (Ipv4Addr::new(0, 0, 0, 0), 8),
-    (Ipv4Addr::new(10, 211, 0, 0), 30),
     (Ipv4Addr::new(127, 0, 0, 0), 8),
     (Ipv4Addr::new(169, 254, 0, 0), 16),
     (Ipv4Addr::new(100, 100, 100, 200), 32),
@@ -50,6 +49,43 @@ const ALWAYS_DENIED: [(Ipv4Addr, u8); 8] = [
     (Ipv4Addr::new(224, 0, 0, 0), 4),
     (Ipv4Addr::new(240, 0, 0, 0), 4),
 ];
+
+/// The tap's own network: the guest shares it with nothing, and it is refused inside that VM only.
+const VM_NET: (Ipv4Addr, u8) = (Ipv4Addr::new(10, 211, 0, 0), 30);
+
+/// A set of refused networks: the built-in ones, every address of the host itself (`/32`, because a sandbox
+/// reaching one reaches a service of the host) and whatever the caller adds, with an interval inside a wider
+/// refusal dropped because the set refuses overlapping intervals.
+pub(crate) fn denied_nets(
+    host_addresses: &[Ipv4Addr],
+    extra: impl IntoIterator<Item = (Ipv4Addr, u8)>,
+) -> BTreeSet<(u32, u8)> {
+    let mut nets: BTreeSet<(u32, u8)> = ALWAYS_DENIED
+        .iter()
+        .chain(extra.into_iter().collect::<Vec<_>>().iter())
+        .map(|(addr, prefix)| (u32::from(*addr), *prefix))
+        .collect();
+    nets.extend(host_addresses.iter().map(|addr| (u32::from(*addr), 32)));
+    let all: Vec<(u32, u8)> = nets.iter().copied().collect();
+    nets.retain(|&(addr, prefix)| {
+        !all.iter()
+            .any(|&(other, wider)| wider < prefix && addr & mask(wider) == other & mask(wider))
+    });
+    nets
+}
+
+/// The endpoints of `guard` a sandbox's sockets are refused by address and port; an IPv6 endpoint needs no
+/// rule because a sandbox this build makes has no IPv6.
+pub(crate) fn denied_endpoints(guard: &Guard) -> BTreeSet<(u32, u16)> {
+    guard
+        .link
+        .iter()
+        .filter_map(|endpoint| match endpoint {
+            SocketAddr::V4(v4) => Some((u32::from(*v4.ip()), v4.port())),
+            SocketAddr::V6(_) => None,
+        })
+        .collect()
+}
 
 /// The worker's own endpoints a guest must not reach, supplied by the operator's configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -71,26 +107,10 @@ impl Policy {
     /// The built-in refusals, every address the host itself holds (a guest reaching one would reach a service
     /// of the host through the worker account's sockets) and the worker's guarded endpoints.
     pub fn new(host_addresses: &[Ipv4Addr], guard: &Guard) -> Policy {
-        let mut nets: BTreeSet<(u32, u8)> = ALWAYS_DENIED
-            .iter()
-            .map(|(addr, prefix)| (u32::from(*addr), *prefix))
-            .collect();
-        nets.extend(host_addresses.iter().map(|addr| (u32::from(*addr), 32)));
-        // An interval set refuses overlapping intervals, so a network inside another one is dropped.
-        let all: Vec<(u32, u8)> = nets.iter().copied().collect();
-        nets.retain(|&(addr, prefix)| {
-            !all.iter()
-                .any(|&(other, wider)| wider < prefix && addr & mask(wider) == other & mask(wider))
-        });
-        let endpoints = guard
-            .link
-            .iter()
-            .filter_map(|endpoint| match endpoint {
-                SocketAddr::V4(v4) => Some((u32::from(*v4.ip()), v4.port())),
-                SocketAddr::V6(_) => None,
-            })
-            .collect();
-        Policy { nets, endpoints }
+        Policy {
+            nets: denied_nets(host_addresses, [VM_NET]),
+            endpoints: denied_endpoints(guard),
+        }
     }
 
     /// The nftables script the VM's namespace loads before the VMM starts: the guest's connections go outward

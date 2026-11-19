@@ -745,6 +745,8 @@ fn database_at_latest_without_classes(path: &Path) {
          DROP TABLE runner_leases;
          DROP TABLE runner_deliveries; DROP TABLE runner_jobs;
          ALTER TABLE installations DROP COLUMN runner_permissions;
+         ALTER TABLE pools DROP COLUMN fork_prs;
+         ALTER TABLE tenants DROP COLUMN runner_fork_prs;
          ALTER TABLE tenants DROP COLUMN runner_mode;
          ALTER TABLE installations DROP COLUMN migration_permissions;
          ALTER TABLE tenants DROP COLUMN migration_mode;
