@@ -1,10 +1,13 @@
 //! GitHub's App manifest flow: the manifest Sentinel asks GitHub to register, and the one-time
 //! conversion of the code GitHub hands back into the App's identity and credentials.
 //!
-//! The App carries every permission the controller can use, runner mode's included, so a
-//! deployment stays one App, one click and one binding ([plan 16.10](../../../plan.md#1610-github-actions-runner-mode)).
-//! What is conditional is the check, not the manifest: runner mode's two are verified only
-//! for a tenant that turns it on, and setup is refused naming what is missing until then.
+//! The App carries every permission the controller can use, runner mode's and guided migration's
+//! included, so a deployment stays one App, one click and one binding
+//! ([plan 16.10](../../../plan.md#1610-github-actions-runner-mode),
+//! [plan 16.5](../../../plan.md#165-guided-github-actions-migration)). What is conditional is the
+//! check, not the manifest: runner mode's two are verified only for a tenant that turns it on,
+//! and guided migration's three only for a tenant that starts one, and setup is refused naming
+//! what is missing until then.
 
 use std::{fmt, net::IpAddr};
 
@@ -16,23 +19,29 @@ use crate::{
     http::Client,
 };
 
-/// What each permission is for: `checks` publishes check runs, `contents` reads a repository
-/// at a revision (source tokens, reconciliation), `metadata` is GitHub's mandatory baseline and
-/// what the per-repository collaborator read needs, `pull_requests` is required to receive
-/// `pull_request` events, and the organization permission `members` reads membership for
-/// GitHub-backed organizations. Runner mode adds `actions` read (it delivers `workflow_job`)
-/// and `organization_self_hosted_runners` write, or `administration` write inside a personal
-/// namespace, which has no organization to register a runner in. Sign-in reads only the
-/// account's numeric id and asks no scope.
-pub const PERMISSIONS: [(&str, &str); 8] = [
+/// What each permission is for: `checks` publishes check runs, `contents` reads a repository at
+/// a revision (source tokens, reconciliation) and writes a migration branch, `metadata` is
+/// GitHub's mandatory baseline and what the per-repository collaborator read needs,
+/// `pull_requests` delivers `pull_request` events and carries the migration's pull request, and
+/// the organization permission `members` reads membership for GitHub-backed organizations.
+/// Runner mode adds `actions` read (it delivers `workflow_job`) and
+/// `organization_self_hosted_runners` write, or `administration` write inside a personal
+/// namespace, which has no organization to register a runner in. Guided migration adds
+/// `workflows` write, GitHub's separate grant for a commit under `.github/workflows/`, and needs
+/// `contents` and `pull_requests` at write. Every one of these is in the manifest because the
+/// deployment is one App, and what is conditional is the check: a read path mints the narrowed
+/// `contents: read` token it always did, and the write bits are verified only for a tenant that
+/// started a migration. Sign-in reads only the account's numeric id and asks no scope.
+pub const PERMISSIONS: [(&str, &str); 9] = [
     ("actions", "read"),
     ("administration", "write"),
     ("checks", "write"),
-    ("contents", "read"),
+    ("contents", "write"),
     ("metadata", "read"),
     ("organization_self_hosted_runners", "write"),
-    ("pull_requests", "read"),
+    ("pull_requests", "write"),
     ("members", "read"),
+    ("workflows", "write"),
 ];
 
 /// The events the webhook route acts on. `installation` and `installation_repositories` are
@@ -493,9 +502,9 @@ mod tests {
         assert_eq!(v["setup_on_update"], true);
         assert_eq!(
             v["default_permissions"],
-            json!({"actions":"read","administration":"write","checks":"write","contents":"read",
+            json!({"actions":"read","administration":"write","checks":"write","contents":"write",
                    "metadata":"read","organization_self_hosted_runners":"write",
-                   "pull_requests":"read","members":"read"})
+                   "pull_requests":"write","members":"read","workflows":"write"})
         );
         assert_eq!(v["default_events"].as_array().unwrap().len(), EVENTS.len());
         let inactive: Value = serde_json::from_str(&manifest(&Request {

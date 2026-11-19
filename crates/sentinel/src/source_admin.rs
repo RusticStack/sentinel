@@ -564,6 +564,11 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                                 snapshot.actions_read,
                                 snapshot.registers_runners,
                             ),
+                            migration: sentinel_core::MigrationPermissions::grants(
+                                snapshot.contents_write,
+                                snapshot.pull_requests_write,
+                                snapshot.workflows_write,
+                            ),
                             expected,
                         },
                         now,

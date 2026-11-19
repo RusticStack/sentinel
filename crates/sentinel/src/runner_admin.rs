@@ -4,11 +4,7 @@
 use std::fmt::Write as _;
 
 use sentinel_core::TenantId;
-use sentinel_store::{
-    Store, lookup,
-    registration::Authority,
-    runner::{self, Switch},
-};
+use sentinel_store::{Store, lookup, registration::Authority, runner, switch::Switch};
 
 use crate::{
     admin::{self, Error, fail},

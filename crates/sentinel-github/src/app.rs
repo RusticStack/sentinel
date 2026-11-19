@@ -122,6 +122,12 @@ pub struct Installation {
     /// self-hosted runners write, or repository administration write inside a personal
     /// namespace, which has no organization to register one in.
     pub registers_runners: bool,
+    /// Contents write: a guided migration may commit to a `sentinel/migrate` branch.
+    pub contents_write: bool,
+    /// Pull requests write: it may open and update the migration's pull request.
+    pub pull_requests_write: bool,
+    /// Workflows write: it may commit a change under `.github/workflows/`.
+    pub workflows_write: bool,
 }
 
 pub struct Token {
@@ -698,6 +704,9 @@ fn parse_installation(v: &Value, app: u64, id: u64) -> Result<Installation> {
         } else {
             v["permissions"]["organization_self_hosted_runners"].as_str() == Some("write")
         },
+        contents_write: v["permissions"]["contents"].as_str() == Some("write"),
+        pull_requests_write: v["permissions"]["pull_requests"].as_str() == Some("write"),
+        workflows_write: v["permissions"]["workflows"].as_str() == Some("write"),
     })
 }
 
@@ -774,6 +783,27 @@ mod tests {
         v["permissions"].as_object_mut().unwrap().remove("actions");
         let without = parse_installation(&v, 2, 4).unwrap();
         assert!(!without.actions_read && without.registers_runners);
+    }
+
+    #[test]
+    fn migration_writes_are_read_from_the_same_snapshot_in_both_namespaces() {
+        let mut v = json!({"id":4,"app_id":2,"account":{"id":9,"login":"sample","type":"Organization"},"suspended_at":null,"permissions":{"contents":"write","checks":"write","pull_requests":"write","workflows":"write"}});
+        let org = parse_installation(&v, 2, 4).unwrap();
+        assert!(org.contents_write && org.pull_requests_write && org.workflows_write);
+        // A personal namespace is asked for the same three: they are repository permissions.
+        v["account"]["type"] = json!("User");
+        let personal = parse_installation(&v, 2, 4).unwrap();
+        assert!(personal.personal && personal.contents_write);
+        v["permissions"]["contents"] = json!("read");
+        v["permissions"]["pull_requests"] = json!("read");
+        let base = parse_installation(&v, 2, 4).unwrap();
+        assert!(base.permissions_valid && !base.contents_write && !base.pull_requests_write);
+        assert!(base.workflows_write, "each grant is read on its own");
+        v["permissions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("workflows");
+        assert!(!parse_installation(&v, 2, 4).unwrap().workflows_write);
     }
     #[test]
     fn token_is_read_only_short_lived_and_debug_redacted() {

@@ -276,6 +276,38 @@ what makes its jobs attributable, and its `job_network = "egress"` pools are wha
 serve them once provisioning exists — a runner talks to GitHub by nature
 ([intake](intake.md#runner-mode-jobs)).
 
+## Migration writes
+
+A guided migration ([plan 16.5](../plan.md#165-guided-github-actions-migration),
+[GitHub App](github-app.md#migration-permissions)) is the one thing Sentinel does that
+writes to a tenant's repository: a `sentinel/migrate` branch and the pull request
+that changes `runs-on:`. The binding is still what authorizes it, and the
+permissions it needs are held by the same installation:
+
+- the **app association** is the write authority, exactly as it is the read one: the
+  repository must be bound through a live installation (`revoked = 0`,
+  `suspended = 0`, `permissions_valid = 1`), and a repository bound through no
+  installation at all has nothing to write with;
+- what that installation grants is the **last snapshot** the controller read
+  (`installations.migration_permissions`, migration 75), not a fresh call to GitHub:
+  `sentinel_store::migration::authorize` reads it with the tenant's switch in one
+  statement, so a permission withdrawn on GitHub refuses the next write with no
+  restart, and so does the switch turned off;
+- every write path asks that gate **before** it contacts GitHub, and a refusal is
+  recorded in the repository's source audit trail (`migration_permissions` when an
+  installation no longer grants one, `migration_off` when the tenant stopped the
+  migration), so a write that was attempted without the grant is visible rather than
+  silently absent;
+- a tenant that has not started a migration keeps reading with what it had: the
+  three bits are recorded and reported, never required by a base path, and the tokens
+  this page's read paths mint stay narrowed to `contents: read`
+  ([GitHub App](github-app.md#migration-permissions)).
+
+The permission change itself travels the existing route: an `installation` delivery
+queues a refresh, the reconciliation pass re-reads the installation and applies the
+snapshot, and `deleted` or `suspend` clears the bits with the installation's
+suspension ([intake](intake.md)).
+
 ## Commands
 
 These host-local commands are authorized by holding the database file, not by `--actor`, which is only the attribution recorded in the audit trail; adding an actor check expecting it to gate access would not change who can run them. The authenticated tenant-administrator path is the API route `POST /tenants/{slug}/repos`.

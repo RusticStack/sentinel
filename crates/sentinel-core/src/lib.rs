@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod id;
+pub mod migration;
 pub mod process;
 pub mod runner;
 pub mod state;
@@ -10,6 +11,7 @@ pub use id::{
     InvitationId, JobId, MailId, PoolId, RepoId, RunId, RunnerLeaseId, SecretId, SessionId,
     StepIndex, TenantId, TokenId, UploadId, UserId, WorkerId,
 };
+pub use migration::MigrationPermissions;
 pub use runner::{Labelled, RunnerClass, RunnerOs, RunnerPermissions};
 pub use state::{
     Actor, DependencyPolicy, Event, FailureClass, JobControl, JobState, Outcome, RunState,

@@ -107,18 +107,19 @@ An unreachable controller can still create the App: everything outbound works �
 The App is one App, as the plan decided (16.10): the permissions every feature can need are in its
 manifest, so a deployment stays one click and one binding, and what is conditional is the **check**,
 not the request — runner mode's two are verified only for a tenant that turns it on
-([runner mode](#runner-mode-permissions)). Guided migration's writes join them the same way when it
-lands.
+([runner mode](#runner-mode-permissions)), and guided migration's three only for a tenant that
+starts a migration ([migration](#migration-permissions)).
 
 | Permission | Access | Why |
 |---|---|---|
 | `actions` | read | required to receive `workflow_job` events, which is how a runner-mode job arrives ([intake](intake.md#runner-mode-jobs)); verified only for a tenant with runner mode on |
 | `administration` | write | register a just-in-time self-hosted runner in a **personal** namespace, which has no organization ([runner mode](#runner-mode-permissions)); verified only with runner mode on |
 | `checks` | write | publish check runs and suites ([checks](checks.md)); also what `check_run`/`check_suite` events need |
-| `contents` | read | source tokens for resolution, jobs and polling, and reconciliation ([intake](intake.md), [sources](sources.md)); also what `push` events need |
+| `contents` | write | source tokens for resolution, jobs and polling, and reconciliation ([intake](intake.md), [sources](sources.md)), which are minted narrowed to `contents: read`; also what `push` events need. Write is the migration branch ([migration](#migration-permissions)), verified only with a migration on |
 | `metadata` | read | GitHub's mandatory baseline; the repository and collaborator-permission reads of membership derivation |
 | `organization_self_hosted_runners` (organization) | write | register a just-in-time self-hosted runner in an organization ([runner mode](#runner-mode-permissions)); verified only with runner mode on |
-| `pull_requests` | read | required to receive `pull_request` events (intake) |
+| `pull_requests` | write | required to receive `pull_request` events (intake); write is the migration's pull request ([migration](#migration-permissions)), verified only with a migration on |
+| `workflows` | write | commit a change under `.github/workflows/`, which GitHub grants separately from `contents` ([migration](#migration-permissions)); verified only with a migration on |
 | `merge_queues` | read | **not requested by the manifest**: GitHub delivers `merge_group` events only to an App that holds it, and it is granted on GitHub to a deployment whose repositories use a merge queue (intake, [sources](sources.md#merge-groups)). A repository without a queue never emits the event, so nothing needs it until then ([CLAUDE.md](../CLAUDE.md): a feature that needs more asks for it only when a tenant turns it on) |
 | `members` (organization) | read | membership of GitHub-backed organizations ([GitHub sign-in](github-sign-in.md#github-backed-organizations)) and the owner proof when binding an organization's installation |
 
@@ -192,6 +193,64 @@ configuration is never stored in plaintext and never logged: it is sealed at res
 controller's master key with a context that binds the tenant, the repository and the lease, and
 delivered once over worker protocol 13 ([worker link](worker-link.md#protocol-13-runner-leases)).
 
+## Migration permissions
+
+Guided migration ([plan 16.5](../plan.md#165-guided-github-actions-migration)) writes to the
+tenant's repositories: it commits a `sentinel/migrate` branch and opens the pull request that
+swaps the `runs-on:` labels. That needs three permissions the base App only reads with:
+
+| Need | Organization namespace | Personal namespace |
+|---|---|---|
+| Commit the migration branch | `contents` write | `contents` write |
+| Open and update the pull request | `pull_requests` write | `pull_requests` write |
+| Commit under `.github/workflows/` | `workflows` write | `workflows` write |
+
+All three are repository permissions, so a personal namespace's installation is asked for exactly
+what an organization's is — unlike runner mode, whose runner registration differs by account kind.
+A person can therefore migrate their own repositories, which Blacksmith's wizard cannot.
+
+They are in the one App's manifest: an installation created after this release holds them from
+the start, and one created before it keeps the base set until its owner approves the change on
+GitHub (the App's settings, then the installation). The controller **verifies** them per
+installation, only for a tenant that starts a migration. Starting one is refused while any of the
+tenant's live installations lacks one — every installation it administers, whether or not a
+repository is bound through it yet — and the answer names exactly what is missing:
+
+```json
+{"schema": "sentinel.error/1", "code": "conflict", "retryable": false,
+ "message": "the GitHub App's installations do not grant what a migration writes with",
+ "details": {"missing": ["contents", "pull_requests", "workflows"]}}
+```
+
+`GET /tenants/{slug}/migration` states the same thing before anyone tries: the switch and the
+names still missing. The switch is `tenants.migration_mode` (migration **75**) and it is off until
+a tenant administrator turns it on; `POST /tenants/{slug}/migration` does that and audits
+`migration-mode-changed`. Both routes require `tenant:admin`, because both are about writing to
+the tenant's repositories.
+
+A tenant that never starts a migration keeps the base permissions exactly as before: its
+installations are not asked to approve anything, every read path mints the same narrowed
+`contents: read` token it always did ([sources](sources.md#github-app-association)), and no
+base route consults the three bits. The manifest asks for the union because one App serves every
+tenant, which is the rule runner mode's two already follow.
+
+**What a write path does.** Every migration write calls `sentinel_store::migration::authorize`
+before it contacts GitHub. That reads the tenant's switch and the installation the repository is
+bound through in one statement (`installations.migration_permissions`, what the last snapshot
+said) and answers `permitted`, `off`, `missing(["workflows"])` or `unbound`; a refusal is written
+to the repository's source audit trail as `migration_off` or `migration_permissions`. A
+permission withdrawn on GitHub refuses the very next write — the snapshot that drops the bit is
+the one the gate reads, with no restart and no cache — and turning the switch off does the same in
+the transaction that writes it. The gate is the whole of the write surface this item adds: the
+pull request it guards is H04's.
+
+**The lifecycle is the existing one.** A permission change arrives as an `installation` delivery,
+which queues a refresh; the reconciliation pass reads the installation again and applies the
+snapshot (`github_events::apply_installation`), which is where the three bits are recorded. A
+`deleted` or `suspend` event suspends the installation and clears them in the same transaction,
+and the gate then answers `unbound`. Removing the App is therefore the strongest withdrawal: the
+repositories it authorized are no longer delivery targets either ([sources](sources.md)).
+
 ## Failure modes and recovery
 
 | What happened | What the person sees | Recovery |
@@ -225,7 +284,9 @@ GitHub sends the browser back to `/setup/github/created` and `/setup/github/inst
 
 ## Verification
 
-- `crates/sentinel-github/src/manifest.rs` unit tests: reachability for every reason, the manifest's exact permissions, events and URLs (active and inactive webhook), name length and state encoding, a conversion that never prints its secrets and refuses malformed ones.
+- `crates/sentinel-github/src/manifest.rs` unit tests: reachability for every reason, the manifest's exact permissions (runner mode's two and guided migration's three included), events and URLs (active and inactive webhook), name length and state encoding, a conversion that never prints its secrets and refuses malformed ones. `app.rs` unit tests read runner mode's and migration's bits from one installation snapshot in both account kinds, and keep `permissions_valid` about the base set.
+- `crates/sentinel-store/tests/migration.rs`: starting a migration refused naming exactly what the installations lack and accepted once every bit is there; the same three permissions in a personal namespace; an installation with the base set alone, where nothing base is refused and only the switch is off; a permission withdrawn through the installation webhook's own refresh path (`github_events::apply_installation`) closing the write gate at once with a `migration_permissions` audit row, and the switch closing it with `migration_off`; the App removed leaving the gate `unbound` and the switch unmovable; a non-administrator refused.
+- `crates/sentinel-api/tests/migration.rs`: the two routes over loopback — what installations still lack, the `409` naming all three, acceptance once granted, idempotence and one `migration-mode-changed` audit row per change, a withdrawn permission visible through the route and refused by the gate at once, a personal namespace asked for the same three, a tenant with no installation refused `not_configured`, and a `runs:read` credential refused both routes.
 - `crates/sentinel-store/tests/github_app.rs`: states single-use, expiring and bound to account, session and purpose; refusals audited and flood-bounded; the per-account bound and the purge; the App stored once, sealed (the canaries absent from the database file), opening only under its own column context; immutability triggers; rotation, `stale`, `reseal_all` and key ids; binding rules (organization installation never into a personal namespace, bound elsewhere refused, same tenant idempotent, non-administrator refused).
 - `crates/sentinel-github/tests/fake_web.rs` (feature `fake`): the double's GitHub web pages in isolation — a posted manifest renders its confirm page, the confirm click returns to the manifest's `redirect_url` with a code and the state, the code converts once, a malformed, incomplete or oversized manifest is refused, an unknown confirm token is refused, the install page registers an installation or only requests one, and one idle connection never stalls another request.
 - `crates/sentinel-api/tests/web_browser.rs` `the_github_app_setup_in_a_real_browser` (ignored by default; with `web/test/github.mjs`): the whole flow in a real browser against the double's web pages, which listen on `localhost` and so are another site than the `127.0.0.1` controller, as github.com is: step-up, the manifest posted to the organization's page, the confirm click, the return signed in (through the refresh above), the per-namespace install and binding, a request to install, another session's state refused, a replayed return refused, and a control showing the cookie is withheld from a cross-site navigation. Afterwards the App is in force in the controller process (the activation hook ran once, a webhook signed with the App's secret is accepted and one signed with another is not), the manifest the double received has exactly the permissions of the table above, and no canary is in the web process's output, any page, script or answer the browser received, its DOM, storage or cookies, an audit row or a database file. It does not cover expiry (the API test above does, without faking the clock), a state bound to another user or tenant (also API level), or anything about the real github.com.

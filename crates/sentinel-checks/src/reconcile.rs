@@ -305,6 +305,11 @@ impl Worker {
                 installed.actions_read,
                 installed.registers_runners,
             ),
+            migration: sentinel_core::MigrationPermissions::grants(
+                installed.contents_write,
+                installed.pull_requests_write,
+                installed.workflows_write,
+            ),
             expected: target.expected,
         };
         let login = std::mem::take(&mut installed.login);

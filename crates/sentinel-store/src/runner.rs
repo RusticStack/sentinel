@@ -12,6 +12,7 @@ use crate::{
     auth::Authority,
     intake::{self, Accepted, Delivery},
     local_auth::{Event, audit},
+    switch::Switch,
 };
 
 /// The GitHub event this module accepts. It carries no ref: the job names its own commit.
@@ -432,20 +433,6 @@ pub fn missing(conn: &Connection, tenant: TenantId) -> Result<Vec<&'static str>>
     Ok(missing)
 }
 
-/// What turning the switch asked for did.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Switch {
-    /// The tenant now reads what was asked for, and the change is audited.
-    Set,
-    /// It already read that; nothing changed and nothing was written.
-    Unchanged,
-    /// Refused: the installations the tenant's repositories are bound through do not grant
-    /// these, named as GitHub's App settings name them.
-    Missing(Vec<&'static str>),
-    /// Refused: the tenant has no live GitHub installation to register a runner through.
-    NoInstallation,
-}
-
 /// Turn runner mode on or off. Enabling is refused while the installations the tenant's
 /// repositories are bound through do not grant what runner mode needs; disabling never is.
 pub fn set_mode(
@@ -459,7 +446,7 @@ pub fn set_mode(
     }
     let current = mode(tx, tenant)?;
     if enabled && !current {
-        if !has_installation(tx, tenant)? {
+        if !crate::sources_forge::live_installation(tx, tenant)? {
             return Ok(Switch::NoInstallation);
         }
         let missing = missing(tx, tenant)?;
@@ -486,14 +473,6 @@ pub fn set_mode(
         Some(if enabled { "enabled" } else { "disabled" }),
     )?;
     Ok(Switch::Set)
-}
-
-fn has_installation(conn: &Connection, tenant: TenantId) -> Result<bool> {
-    Ok(conn
-        .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM installations WHERE tenant_id = ?1 AND suspended = 0)",
-        )?
-        .query_row([tenant.as_bytes()], |r| r.get(0))?)
 }
 
 /// How far a GitHub job has got, which only ever moves forward.

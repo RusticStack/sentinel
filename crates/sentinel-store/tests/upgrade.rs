@@ -431,7 +431,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     };
 
     let report = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(report.inspection.pending, vec![73, 74]);
+    assert_eq!(report.inspection.pending, vec![73, 74, 75]);
     assert!(report.inspection.openable() && report.inspection.integrity == "ok");
     assert_eq!(
         report.copy.as_deref(),
@@ -441,14 +441,14 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     assert_eq!(report.needed_bytes, report.inspection.bytes * 2);
 
     // What the upgrade does to the rows already stored: migration 73 rebuilds every OAuth table, and
-    // migration 74 adds runner-mode shape without visiting a row.
+    // migrations 74 and 75 add runner-mode and guided-migration shape without visiting a row.
     assert_eq!(
         report
             .steps
             .iter()
             .map(|step| step.version)
             .collect::<Vec<_>>(),
-        vec![73, 74]
+        vec![73, 74, 75]
     );
     let rewrites = |step: usize| -> Vec<(String, u64)> {
         report.steps[step]
@@ -457,7 +457,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
             .map(|rewrite| (rewrite.table.clone(), rewrite.rows))
             .collect()
     };
-    let (oauth, runner) = (rewrites(0), rewrites(1));
+    let (oauth, runner, migration) = (rewrites(0), rewrites(1), rewrites(2));
     for (table, rows) in stored {
         assert!(rows > 0, "{table} is populated");
         assert!(
@@ -468,6 +468,10 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     assert!(
         runner.is_empty(),
         "migration 74 only adds shape: {runner:?}"
+    );
+    assert!(
+        migration.is_empty(),
+        "migration 75 only adds shape: {migration:?}"
     );
 
     // Every enrolled worker is listed with what it announces, and the one this build cannot serve is
@@ -561,14 +565,14 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
         .unwrap();
     }
     let report = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(report.inspection.pending, vec![71, 72, 73, 74]);
+    assert_eq!(report.inspection.pending, vec![71, 72, 73, 74, 75]);
     assert_eq!(
         report.copy.as_deref(),
         Some(upgrade::snapshot_path(&path, 70).as_path())
     );
     assert_eq!(
         report.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74]
+        vec![71, 72, 73, 74, 75]
     );
     assert!(report.blocking.is_empty(), "{:?}", report.blocking);
 
@@ -637,10 +641,10 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     drop(restored);
     // A second preflight over the restored copy reports the same upgrade, not a migration half done.
     let again = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(again.inspection.pending, vec![71, 72, 73, 74]);
+    assert_eq!(again.inspection.pending, vec![71, 72, 73, 74, 75]);
     assert_eq!(
         again.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74]
+        vec![71, 72, 73, 74, 75]
     );
 }
 
@@ -778,7 +782,7 @@ fn upgrade_sources() -> Vec<u32> {
 fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expects() {
     // docs/upgrades.md (tests/compat_doc.rs compares it with the code): a database at schema N
     // runs on release R only when no migration in (R, N] declares a readable_by above R. Rows
-    // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, LATEST.
+    // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, LATEST.
     let readable = |db: &Connection, release: u32, newest: u32| -> bool {
         let needs: u32 = db
             .query_row(
@@ -791,13 +795,13 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        74,
+        75,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
     assert_eq!(
         sources,
-        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 72, 73]
+        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 73, 74]
     );
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
@@ -813,7 +817,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         drop(store);
         assert_eq!(version(&path), schema::LATEST, "from {from}");
         let db = Connection::open(&path).unwrap();
-        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74]
+        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75]
             .iter()
             .map(|&newest| from >= newest || readable(&db, from, newest))
             .collect();
@@ -840,59 +844,64 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         // CLI's seeded cap, so 72 stops at 72. Migration 74 (runner-mode leases) is readable by
         // nothing older either: a schema-73 controller records demand it can never place and can
         // neither deliver a JIT configuration nor de-register the runners this one registered.
+        // Migration 75 (the migration switch and the write permissions of each installation
+        // snapshot) is readable by nothing older either: a schema-74 controller records no
+        // snapshot's migration permissions, so the bits the new write gate reads go stale where a
+        // permission is withdrawn on GitHub, and it holds no switch to turn off.
         let expected = match from {
             44 | 47 | 48 => [
                 false, false, false, false, false, false, false, false, false, false, false, false,
-                false, false,
+                false, false, false,
             ],
             51 => [
                 true, false, false, false, false, false, false, false, false, false, false, false,
-                false, false,
+                false, false, false,
             ],
             56 => [
                 true, true, false, false, false, false, false, false, false, false, false, false,
-                false, false,
+                false, false, false,
             ],
             57 => [
                 true, true, true, false, false, false, false, false, false, false, false, false,
-                false, false,
+                false, false, false,
             ],
             63 => [
                 true, true, true, true, false, false, false, false, false, false, false, false,
-                false, false,
+                false, false, false,
             ],
             64 | 65 => [
                 true, true, true, true, true, false, false, false, false, false, false, false,
-                false, false,
+                false, false, false,
             ],
             66 | 67 => [
                 true, true, true, true, true, true, true, false, false, false, false, false, false,
-                false,
+                false, false,
             ],
             68 => [
                 true, true, true, true, true, true, true, true, false, false, false, false, false,
-                false,
+                false, false,
             ],
             69 | 70 => [
                 true, true, true, true, true, true, true, true, true, true, false, false, false,
-                false,
+                false, false,
             ],
             71 => [
                 true, true, true, true, true, true, true, true, true, true, true, false, false,
-                false,
-            ],
-            72 => [
-                true, true, true, true, true, true, true, true, true, true, true, true, false,
-                false,
+                false, false,
             ],
             73 => [
-                true, true, true, true, true, true, true, true, true, true, true, true, true, false,
+                true, true, true, true, true, true, true, true, true, true, true, true, true,
+                false, false,
+            ],
+            74 => [
+                true, true, true, true, true, true, true, true, true, true, true, true, true, true,
+                false,
             ],
             _ => unreachable!(),
         };
         assert_eq!(
             ok, expected,
-            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74"
+            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75"
         );
     }
 }

@@ -11,7 +11,9 @@ use std::{
 };
 
 use sentinel_auth::secret::Secret;
-use sentinel_core::{RunnerPermissions, SessionId, TenantId, UnixMillis, UserId, auth::Scopes};
+use sentinel_core::{
+    MigrationPermissions, RunnerPermissions, SessionId, TenantId, UnixMillis, UserId, auth::Scopes,
+};
 use sentinel_github::{
     app::{Answer, App, Current, Described, OrgRole},
     http::Client,
@@ -22,7 +24,8 @@ use sentinel_protocol::error::{ApiError, ErrorCode};
 use sentinel_store::{
     Error as StoreError, auth as authz,
     github_app::{self as stored, Purpose, Refusal},
-    runner::{self as stored_runner, Switch},
+    migration as stored_migration, runner as stored_runner,
+    switch::Switch,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -228,13 +231,19 @@ pub(crate) fn route(
         ("POST", ["api", "v1", "tenants", slug, "runner-mode"]) => {
             set_runner_mode(state, request, slug)
         }
+        ("GET", ["api", "v1", "tenants", slug, "migration"]) => {
+            tenant_migration(state, request, slug)
+        }
+        ("POST", ["api", "v1", "tenants", slug, "migration"]) => {
+            set_tenant_migration(state, request, slug)
+        }
         _ => return None,
     })
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunnerModeBody {
+struct SwitchBody {
     enabled: bool,
 }
 
@@ -268,7 +277,7 @@ fn runner_mode(state: &State, request: &mut Request, slug: &str) -> Route {
 fn set_runner_mode(state: &State, request: &mut Request, slug: &str) -> Route {
     let who = identify(state, request, true)?;
     crate::auth::require_scope(&who, Scopes::TENANT_ADMIN)?;
-    let body: RunnerModeBody = parse(&body_limit(request, MAX_BODY_BYTES)?)?;
+    let body: SwitchBody = parse(&body_limit(request, MAX_BODY_BYTES)?)?;
     let authority = who.authority();
     let slug = slug.to_owned();
     let switch = state
@@ -289,6 +298,57 @@ fn set_runner_mode(state: &State, request: &mut Request, slug: &str) -> Route {
         Switch::NoInstallation => Err(err(
             ErrorCode::Conflict,
             "the tenant has no GitHub App installation to register a runner through",
+        )
+        .with_detail("reason", "not_configured")),
+    }
+}
+
+/// What guided migration reads: the tenant's switch and what the App's installations still lack,
+/// so an administrator sees why starting a migration would be refused before trying.
+fn tenant_migration(state: &State, request: &mut Request, slug: &str) -> Route {
+    let who = identify(state, request, false)?;
+    crate::auth::require_scope(&who, Scopes::TENANT_ADMIN)?;
+    let slug = slug.to_owned();
+    let principal = who.principal;
+    let (enabled, missing) = state
+        .store
+        .read(move |c| {
+            let tenant = authz::member_tenant_by_slug(c, principal, &slug)?;
+            Ok((
+                stored_migration::mode(c, tenant)?,
+                stored_migration::missing(c, tenant)?,
+            ))
+        })
+        .map_err(store_error)?;
+    ok(json!({ "enabled": enabled, "missing": missing }))
+}
+
+/// Starting a migration is refused while the App's installations do not grant what it writes
+/// with, naming exactly what is missing; stopping one never is, and it stops every write path.
+fn set_tenant_migration(state: &State, request: &mut Request, slug: &str) -> Route {
+    let who = identify(state, request, true)?;
+    crate::auth::require_scope(&who, Scopes::TENANT_ADMIN)?;
+    let body: SwitchBody = parse(&body_limit(request, MAX_BODY_BYTES)?)?;
+    let authority = who.authority();
+    let slug = slug.to_owned();
+    let switch = state
+        .store
+        .writer()
+        .write(move |tx| {
+            let tenant = authz::member_tenant_by_slug(tx, who.principal, &slug)?;
+            stored_migration::set_mode(tx, authority, tenant, body.enabled)
+        })
+        .map_err(store_error)?;
+    match switch {
+        Switch::Set | Switch::Unchanged => ok(json!({ "enabled": body.enabled })),
+        Switch::Missing(missing) => Err(err(
+            ErrorCode::Conflict,
+            "the GitHub App's installations do not grant what a migration writes with",
+        )
+        .with_detail("missing", missing)),
+        Switch::NoInstallation => Err(err(
+            ErrorCode::Conflict,
+            "the tenant has no GitHub App installation to write through",
         )
         .with_detail("reason", "not_configured")),
     }
@@ -741,6 +801,11 @@ fn install(state: &State, request: &mut Request) -> Route {
             installed.suspended,
             installed.permissions_valid,
             RunnerPermissions::grants(installed.actions_read, installed.registers_runners),
+            MigrationPermissions::grants(
+                installed.contents_write,
+                installed.pull_requests_write,
+                installed.workflows_write,
+            ),
         ),
     );
     let slug = state
@@ -759,6 +824,7 @@ fn install(state: &State, request: &mut Request) -> Route {
                     suspended: observed.4,
                     permissions_valid: observed.5,
                     runner: observed.6,
+                    migration: observed.7,
                 },
                 now,
             )?;

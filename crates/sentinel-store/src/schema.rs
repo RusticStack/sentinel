@@ -185,6 +185,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (72, include_str!("migrations/072_run_artifacts.sql")),
     (73, include_str!("migrations/073_oauth_scope_bits.sql")),
     (74, include_str!("migrations/074_runner_provisioning.sql")),
+    (75, include_str!("migrations/075_migration_permissions.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -305,6 +306,10 @@ mod tests {
         (
             74,
             "an older controller records runner-mode demand it never places: it can neither generate a JIT configuration, deliver one, nor de-register the runners this one registered, so it leaves them registered and unaccounted while the tenant's switch still reads on, and it never counts the capacity a runner lease holds",
+        ),
+        (
+            75,
+            "an older controller records no installation snapshot's migration permissions, so a permission withdrawn on GitHub while it runs leaves the bits a newer controller's write gate reads stale, and it holds no migration switch to turn off",
         ),
     ];
 
