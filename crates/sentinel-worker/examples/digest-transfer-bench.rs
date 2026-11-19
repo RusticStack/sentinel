@@ -287,6 +287,7 @@ impl Executor for Publisher {
                 when: ArtifactWhen::Always,
                 retain_secs: 3_600,
                 required: true,
+                class: None,
             };
             let outcome = artifacts::capture(&this.workspace, &decl, &*this, attempt);
             let elapsed = started.elapsed().as_nanos() as u64;
