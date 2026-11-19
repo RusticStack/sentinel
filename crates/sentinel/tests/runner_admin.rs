@@ -308,3 +308,71 @@ fn an_unknown_tenant_and_an_unreadable_class_policy_are_refused_by_name() {
         );
     }
 }
+
+#[test]
+fn the_fork_opt_in_and_the_fork_pool_are_switched_and_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path());
+    let tenant = c.tenant();
+
+    // Offering fork jobs needs runner mode: a tenant that serves no runner has nothing to serve
+    // them from, and the command says so instead of storing a setting nothing reads.
+    let refused = c.admin(
+        &[
+            "runner-mode",
+            "fork-prs",
+            "--tenant",
+            "acme",
+            "--enabled",
+            "true",
+        ],
+        PASSWORD,
+    );
+    assert!(!refused.status.success());
+    assert!(
+        text(&refused.stderr).contains("fork pull requests need runner mode on"),
+        "{}",
+        text(&refused.stderr)
+    );
+
+    c.installation(tenant, sentinel_core::RunnerPermissions::ALL);
+    c.ok(&[
+        "runner-mode",
+        "set",
+        "--tenant",
+        "acme",
+        "--enabled",
+        "true",
+    ]);
+    let served = c.ok(&[
+        "runner-mode",
+        "fork-prs",
+        "--tenant",
+        "acme",
+        "--enabled",
+        "true",
+    ]);
+    assert!(
+        text(&served.stdout).contains("leased only on a pool marked"),
+        "{}",
+        text(&served.stdout)
+    );
+    let shown = text(&c.ok(&["runner-mode", "show", "--tenant", "acme"]).stdout);
+    assert!(shown.contains("fork pull requests: served"), "{shown}");
+
+    // A pool is marked as the hostile-fork pool and listed with the mark, and the mark is taken
+    // back the same way.
+    c.ok(&["pool", "create", "--name", "forks"]);
+    c.ok(&["pool", "grant", "--pool", "forks", "--tenant", "acme"]);
+    let marked = c.ok(&["pool", "fork", "--pool", "forks", "--enabled", "true"]);
+    assert!(
+        text(&marked.stderr).contains("fork pull requests only"),
+        "{}",
+        text(&marked.stderr)
+    );
+    let listed = text(&c.ok(&["pool", "list", "--tenant", "acme"]).stdout);
+    assert!(listed.contains("forks shared fork"), "{listed}");
+    c.ok(&["pool", "fork", "--pool", "forks", "--enabled", "false"]);
+    let listed = text(&c.ok(&["pool", "list", "--tenant", "acme"]).stdout);
+    assert!(!listed.contains("shared fork"), "{listed}");
+}

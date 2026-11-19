@@ -575,6 +575,13 @@ impl Resolver {
             if !access.enabled {
                 return self.refuse(delivery, "runner_mode_off", now);
             }
+            // A fork pull request's commit is code the tenant has not merged, so it is served only
+            // by the hostile-fork pool and only when the tenant asked for it; otherwise the job is
+            // refused and stays queued at GitHub, which is where a runner someone else provides
+            // would take it. Placement is what confines an opted-in job to that pool (AR09).
+            if terms.fork_pr && !access.fork_prs {
+                return self.refuse(delivery, "runner_fork_pr", now);
+            }
             if !access.permissions.missing(access.personal).is_empty() {
                 return self.refuse(delivery, "runner_permissions", now);
             }

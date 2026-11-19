@@ -1826,6 +1826,31 @@ fn pool(args: &PoolArgs, now: UnixMillis) -> Result<(), Error> {
                 if grant { "granted" } else { "revoked" }
             );
         }
+        PoolCommand::Fork {
+            data,
+            pool,
+            enabled,
+        } => {
+            let store = open(data, true)?;
+            let owned = pool.clone();
+            let pool = store
+                .read(move |conn| lookup::pool_by_name(conn, &owned))
+                .map_err(|_| fail("no pool with that name"))?;
+            let fork = *enabled;
+            let changed = store
+                .writer()
+                .write(move |tx| tenancy::set_pool_fork(tx, Authority::HostLocal, pool, fork))
+                .map_err(|error| fail(format!("cannot change the pool: {error}")))?;
+            eprintln!(
+                "{} {pool}: {}",
+                if changed { "marked" } else { "already marked" },
+                if fork {
+                    "fork pull requests only"
+                } else {
+                    "trusted jobs"
+                }
+            );
+        }
         PoolCommand::List { data, tenant } => {
             let store = open(data, true)?;
             let (tenant, _) = resolve_target(&store, Some(tenant), None)?;
@@ -1835,14 +1860,15 @@ fn pool(args: &PoolArgs, now: UnixMillis) -> Result<(), Error> {
                 .map_err(|error| fail(format!("cannot list pools: {error}")))?;
             for record in pools {
                 sentinel::outln!(
-                    "{} {} {}{}",
+                    "{} {} {}{}{}",
                     record.id,
                     record.name,
                     match record.kind {
                         PoolKind::Dedicated(_) => "dedicated",
                         PoolKind::Shared => "shared",
                     },
-                    if record.active { "" } else { " inactive" }
+                    if record.active { "" } else { " inactive" },
+                    if record.fork { " fork" } else { "" }
                 );
             }
         }

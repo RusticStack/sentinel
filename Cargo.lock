@@ -1380,6 +1380,7 @@ dependencies = [
  "tempfile",
  "time",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

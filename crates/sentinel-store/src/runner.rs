@@ -38,6 +38,8 @@ pub struct NewRunner<'a> {
     pub labels: &'a str,
     pub runner: Option<&'a str>,
     pub conclusion: Option<&'a str>,
+    /// Whether any pull request the delivery names comes from a fork of this repository.
+    pub fork_pr: bool,
 }
 
 fn printable(text: &str, max: usize) -> bool {
@@ -87,6 +89,7 @@ pub fn accept(
                 && row.labels == delivery.labels
                 && row.runner.as_deref() == delivery.runner
                 && row.conclusion.as_deref() == delivery.conclusion
+                && row.fork_pr == delivery.fork_pr
         });
         return if same {
             Ok(Accepted::Duplicate(id))
@@ -120,8 +123,8 @@ pub fn accept(
     )?;
     tx.execute(
         "INSERT INTO runner_deliveries(delivery_id, tenant_id, repo_id, action, job_id, run_id,
-            labels, runner, conclusion)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            labels, runner, conclusion, fork_pr)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             id.as_bytes(),
             tenant.as_bytes(),
@@ -131,7 +134,8 @@ pub fn accept(
             delivery.run as i64,
             delivery.labels,
             delivery.runner,
-            delivery.conclusion
+            delivery.conclusion,
+            delivery.fork_pr
         ],
     )?;
     Ok(Accepted::Fresh(id))
@@ -146,6 +150,7 @@ type LookupRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<i64>,
 );
 
 /// The stored runner delivery with this identity, if there is one.
@@ -158,7 +163,7 @@ fn find(
 ) -> Result<Option<(DeliveryId, Option<Terms>)>> {
     let row: Option<LookupRow> = conn
         .prepare_cached(
-            "SELECT d.id, r.action, r.job_id, r.run_id, r.labels, r.runner, r.conclusion
+            "SELECT d.id, r.action, r.job_id, r.run_id, r.labels, r.runner, r.conclusion, r.fork_pr
              FROM webhook_deliveries d
              LEFT JOIN runner_deliveries r ON r.delivery_id = d.id
              WHERE d.tenant_id = ?1 AND d.repo_id = ?2 AND d.provider = ?3 AND d.external_id = ?4",
@@ -174,11 +179,12 @@ fn find(
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
+                    r.get(7)?,
                 ))
             },
         )
         .optional()?;
-    let Some((id, action, job, run, labels, runner, conclusion)) = row else {
+    let Some((id, action, job, run, labels, runner, conclusion, fork)) = row else {
         return Ok(None);
     };
     let id = DeliveryId::from_bytes(id).map_err(|_| Error::Corrupt("delivery id"))?;
@@ -190,6 +196,7 @@ fn find(
             labels,
             runner,
             conclusion,
+            fork_pr: fork.is_some_and(|f| f != 0),
         }),
         // The identity was used by another event class: this delivery is a conflict, never a duplicate.
         _ => None,
@@ -206,6 +213,8 @@ pub struct Terms {
     pub labels: String,
     pub runner: Option<String>,
     pub conclusion: Option<String>,
+    /// The delivery's commit is a fork pull request's: a pool of the hostile-fork class only.
+    pub fork_pr: bool,
 }
 
 impl Terms {
@@ -215,12 +224,20 @@ impl Terms {
     }
 }
 
-type TermsRow = (String, i64, i64, String, Option<String>, Option<String>);
+type TermsRow = (
+    String,
+    i64,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+);
 
 pub fn terms_for(conn: &Connection, delivery: DeliveryId) -> Result<Option<Terms>> {
     let row: Option<TermsRow> = conn
         .prepare_cached(
-            "SELECT action, job_id, run_id, labels, runner, conclusion
+            "SELECT action, job_id, run_id, labels, runner, conclusion, fork_pr
              FROM runner_deliveries WHERE delivery_id = ?1",
         )?
         .query_row([delivery.as_bytes()], |r| {
@@ -231,10 +248,11 @@ pub fn terms_for(conn: &Connection, delivery: DeliveryId) -> Result<Option<Terms
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
+                r.get(6)?,
             ))
         })
         .optional()?;
-    row.map(|(action, job, run, labels, runner, conclusion)| {
+    row.map(|(action, job, run, labels, runner, conclusion, fork)| {
         Ok(Terms {
             action,
             job: u64::try_from(job).map_err(|_| Error::Corrupt("runner job"))?,
@@ -242,6 +260,7 @@ pub fn terms_for(conn: &Connection, delivery: DeliveryId) -> Result<Option<Terms
             labels,
             runner,
             conclusion,
+            fork_pr: fork != 0,
         })
     })
     .transpose()
@@ -251,6 +270,8 @@ pub fn terms_for(conn: &Connection, delivery: DeliveryId) -> Result<Option<Terms
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Access {
     pub enabled: bool,
+    /// Whether the tenant serves jobs of fork pull requests at all; the pool decides where.
+    pub fork_prs: bool,
     pub permissions: RunnerPermissions,
     /// The installation's account is a personal namespace, which asks for
     /// repository administration write instead of the organization grant.
@@ -259,9 +280,9 @@ pub struct Access {
 
 /// `NotFound` when the repository is bound through no live installation at all.
 pub fn access(conn: &Connection, tenant: TenantId, repo: RepoId) -> Result<Access> {
-    let row: Option<(i64, i64, i64)> = conn
+    let row: Option<(i64, i64, i64, i64)> = conn
         .prepare_cached(
-            "SELECT t.runner_mode, i.runner_permissions, i.account_personal
+            "SELECT t.runner_mode, i.runner_permissions, i.account_personal, t.runner_fork_prs
              FROM source_bindings b
              JOIN installations i ON i.id = b.installation_id AND i.tenant_id = b.tenant_id
                  AND i.suspended = 0 AND i.permissions_valid = 1
@@ -269,15 +290,16 @@ pub fn access(conn: &Connection, tenant: TenantId, repo: RepoId) -> Result<Acces
              WHERE b.repo_id = ?1 AND b.tenant_id = ?2 AND b.revoked = 0",
         )?
         .query_row(params![repo.as_bytes(), tenant.as_bytes()], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })
         .optional()?;
-    let Some((enabled, permissions, personal)) = row else {
+    let Some((enabled, permissions, personal, fork_prs)) = row else {
         return Err(Error::NotFound);
     };
     let bits = u8::try_from(permissions).map_err(|_| Error::Corrupt("runner permissions"))?;
     Ok(Access {
         enabled: enabled == 1,
+        fork_prs: fork_prs == 1,
         permissions: RunnerPermissions::from_bits(bits)
             .ok_or(Error::Corrupt("runner permissions"))?,
         personal: personal == 1,
@@ -307,8 +329,8 @@ pub fn record(
     let changed = if state == 0 {
         tx.execute(
             "INSERT INTO runner_jobs(tenant_id, repo_id, job_id, run_id, class, state_code,
-                runner, conclusion, queued_ms, started_ms, completed_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL, ?6, NULL, NULL)
+                runner, conclusion, queued_ms, started_ms, completed_ms, fork_pr)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL, ?6, NULL, NULL, ?7)
              ON CONFLICT(tenant_id, repo_id, job_id) DO NOTHING",
             params![
                 tenant.as_bytes(),
@@ -316,14 +338,15 @@ pub fn record(
                 job,
                 run,
                 class.to_string(),
-                delivery.received.0
+                delivery.received.0,
+                terms.fork_pr
             ],
         )?
     } else if state == 1 {
         tx.execute(
             "INSERT INTO runner_jobs(tenant_id, repo_id, job_id, run_id, class, state_code,
-                runner, conclusion, queued_ms, started_ms, completed_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, NULL, ?7, ?7, NULL)
+                runner, conclusion, queued_ms, started_ms, completed_ms, fork_pr)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, NULL, ?7, ?7, NULL, ?8)
              ON CONFLICT(tenant_id, repo_id, job_id) DO UPDATE SET
                 state_code = 1, runner = COALESCE(excluded.runner, runner_jobs.runner),
                 started_ms = ?7
@@ -335,14 +358,15 @@ pub fn record(
                 run,
                 class.to_string(),
                 terms.runner,
-                now.0
+                now.0,
+                terms.fork_pr
             ],
         )?
     } else {
         tx.execute(
             "INSERT INTO runner_jobs(tenant_id, repo_id, job_id, run_id, class, state_code,
-                runner, conclusion, queued_ms, started_ms, completed_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, 2, ?6, ?7, ?8, NULL, ?8)
+                runner, conclusion, queued_ms, started_ms, completed_ms, fork_pr)
+             VALUES (?1, ?2, ?3, ?4, ?5, 2, ?6, ?7, ?8, NULL, ?8, ?9)
              ON CONFLICT(tenant_id, repo_id, job_id) DO UPDATE SET
                 state_code = 2, conclusion = excluded.conclusion,
                 runner = COALESCE(excluded.runner, runner_jobs.runner),
@@ -356,7 +380,8 @@ pub fn record(
                 class.to_string(),
                 terms.runner,
                 terms.conclusion,
-                now.0
+                now.0,
+                terms.fork_pr
             ],
         )?
     };
@@ -475,6 +500,65 @@ pub fn set_mode(
     Ok(Switch::Set)
 }
 
+/// Whether the tenant serves jobs of fork pull requests, as a reader sees it.
+pub fn fork_prs(conn: &Connection, tenant: TenantId) -> Result<bool> {
+    let enabled: i64 = conn
+        .prepare_cached("SELECT runner_fork_prs FROM tenants WHERE id = ?1 AND active = 1")?
+        .query_row([tenant.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    Ok(enabled == 1)
+}
+
+/// Turn the fork-pull-request opt-in on or off. It is refused without runner mode: a tenant with no
+/// runners has nothing to serve fork jobs from, and the flag would only be a setting nobody reads.
+/// This is the only writer of the column, and it is where that rule lives: a trigger on the column
+/// would have to name the switch, and a database downgraded by dropping that column could then not
+/// be rewritten at all.
+/// Opting in is not a guarantee that a runner starts — placement still needs the hostile-fork pool,
+/// and until a pool is marked as one the demand waits ([runner mode](../../../docs/runner-mode.md#fork-pull-requests)).
+pub fn set_fork_prs(
+    tx: &Transaction<'_>,
+    authority: Authority,
+    tenant: TenantId,
+    enabled: bool,
+) -> Result<Switch> {
+    if let Some(principal) = authority.principal() {
+        crate::auth::require_tenant_admin(tx, principal, tenant)?;
+    }
+    let (current, mode) = {
+        let row: Option<(i64, i64)> = tx
+            .prepare_cached(
+                "SELECT runner_fork_prs, runner_mode FROM tenants WHERE id = ?1 AND active = 1",
+            )?
+            .query_row([tenant.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        row.ok_or(Error::NotFound)?
+    };
+    if enabled && mode == 0 {
+        return Ok(Switch::NoRunnerMode);
+    }
+    if (current == 1) == enabled {
+        return Ok(Switch::Unchanged);
+    }
+    let changed = tx.execute(
+        "UPDATE tenants SET runner_fork_prs = ?2 WHERE id = ?1 AND active = 1 AND runner_fork_prs = ?3",
+        params![tenant.as_bytes(), enabled, current],
+    )?;
+    if changed != 1 {
+        return Err(Error::Conflict);
+    }
+    audit(
+        tx,
+        Event::RunnerForkPrsChanged,
+        authority.actor(),
+        None,
+        authority.host_local(),
+        Some(if enabled { "enabled" } else { "disabled" }),
+    )?;
+    Ok(Switch::Set)
+}
+
 /// How far a GitHub job has got, which only ever moves forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobState {
@@ -499,6 +583,8 @@ pub struct RunnerJob {
     pub job: u64,
     pub run: u64,
     pub class: String,
+    /// The job's commit is a fork pull request's: only the hostile-fork pool serves it.
+    pub fork_pr: bool,
     pub state: JobState,
     pub runner: Option<String>,
     pub conclusion: Option<String>,
@@ -517,6 +603,7 @@ type JobRow = (
     i64,
     Option<i64>,
     Option<i64>,
+    i64,
 );
 
 pub fn job(
@@ -528,7 +615,7 @@ pub fn job(
     let row: Option<JobRow> = conn
         .prepare_cached(
             "SELECT job_id, run_id, class, state_code, runner, conclusion, queued_ms,
-                    started_ms, completed_ms
+                    started_ms, completed_ms, fork_pr
              FROM runner_jobs WHERE tenant_id = ?1 AND repo_id = ?2 AND job_id = ?3",
         )?
         .query_row(
@@ -544,11 +631,13 @@ pub fn job(
                     r.get(6)?,
                     r.get(7)?,
                     r.get(8)?,
+                    r.get(9)?,
                 ))
             },
         )
         .optional()?;
-    let Some((job, run, class, state, runner, conclusion, queued, started, completed)) = row else {
+    let Some((job, run, class, state, runner, conclusion, queued, started, completed, fork)) = row
+    else {
         return Ok(None);
     };
     let state = match state {
@@ -561,6 +650,7 @@ pub fn job(
         job: u64::try_from(job).map_err(|_| Error::Corrupt("runner job"))?,
         run: u64::try_from(run).map_err(|_| Error::Corrupt("runner run"))?,
         class,
+        fork_pr: fork != 0,
         state,
         runner,
         conclusion,

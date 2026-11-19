@@ -303,6 +303,30 @@ SENTINEL_AUTO_JOIN_DOMAINS="example.com=engineering, example.org, bücher.exampl
   the class names; the reservation is what stops a worker being handed more runners than it has
   room for ([intake](intake.md#demand-provisioning-and-reconciliation)).
 
+### Runner image
+
+A worker serves runner mode only when it states the image it starts runners from, under `[runner]` in
+its own configuration:
+
+```toml
+[runner]
+image = "ghcr.io/rusticstack/sentinel-runner@sha256:0f2c…"
+```
+
+- **The reference must be pinned by digest.** A tag — even one that looks immutable — is refused with
+  `runner.image must be pinned by digest, as in ghcr.io/owner/runner@sha256:<64 hex>`, because this
+  image is the code a job's steps run under and the same tag is a different image tomorrow. The image
+  itself, its `actions/runner` version and its toolchains, are AR05's.
+- **A worker without the section starts no runner**: it declines every runner offer, so the controller
+  places none on it and the class's demand waits for a worker that states one. That is the default, and
+  the honest one — a worker that cannot start a runner should not be holding its capacity.
+- The image carries the entry point at `/usr/local/bin/sentinel-runner`, which reads one line of the
+  job's just-in-time configuration from standard input and execs the runner with `--jitconfig`. The
+  configuration is never an argument, an environment value or a file on the host
+  ([runner mode](runner-mode.md#the-configuration-is-a-credential)).
+- This key applies to the worker role only; `[runner]` beside the server role's configuration is
+  refused. An older worker refuses the key as unknown rather than ignoring it.
+
 ### Remote cache
 
 `[remote_cache] enabled = true` (the default) makes the two halves line up: the controller keeps objects workers offer under `<data_dir>/remote-cache`, and a worker fetches, offers and resumes objects over its bulk connection. Set it to `false` on either side to make every remote lookup a local miss — a worker then never asks and never offers, and a controller without the section serves nothing (`denied`). A local cache hit never touches the link in any configuration.

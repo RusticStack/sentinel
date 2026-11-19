@@ -60,6 +60,8 @@ struct Github {
 
 #[derive(Default)]
 struct Scripted {
+    /// What the fake GitHub puts in the configuration it issues, when set.
+    canary: Option<String>,
     requests: Vec<(String, String, String)>,
     queued_runs: Vec<serde_json::Value>,
     queued_jobs: Vec<serde_json::Value>,
@@ -110,6 +112,16 @@ impl Github {
 
     fn removed(&self) -> usize {
         self.data.lock().unwrap().removed.load(Ordering::SeqCst)
+    }
+
+    /// Every request the fake GitHub was asked, in order.
+    fn requests(&self) -> Vec<(String, String, String)> {
+        self.data.lock().unwrap().requests.clone()
+    }
+
+    /// Issues a configuration containing `canary`, the way a real one carries a token.
+    fn with_canary(&self, canary: &str) {
+        self.data.lock().unwrap().canary = Some(canary.to_owned());
     }
 
     fn queue(&self, runs: Vec<serde_json::Value>, jobs: Vec<serde_json::Value>) {
@@ -201,7 +213,10 @@ fn answer(data: &Arc<Mutex<Scripted>>, method: &str, path: &str) -> (u16, serde_
             201,
             serde_json::json!({
                 "runner": {"id": 90 + serial},
-                "encoded_jit_config": format!("jit-config-{serial}"),
+                "encoded_jit_config": match &data.canary {
+                    Some(canary) => canary.clone(),
+                    None => format!("jit-config-{serial}"),
+                },
             }),
         );
     }
@@ -459,6 +474,8 @@ struct Runners {
     configs: Mutex<Vec<([u8; 16], Vec<u8>)>>,
     stopped: Mutex<Vec<[u8; 16]>>,
     held: Mutex<Vec<[u8; 16]>>,
+    /// Any pipeline-secret bundle that reached this worker, which runner mode never sends.
+    bundles: AtomicUsize,
     reporter: Mutex<Option<session::Reporter>>,
 }
 
@@ -469,6 +486,7 @@ impl Runners {
             configs: Mutex::new(Vec::new()),
             stopped: Mutex::new(Vec::new()),
             held: Mutex::new(Vec::new()),
+            bundles: AtomicUsize::new(0),
             reporter: Mutex::new(None),
         })
     }
@@ -483,6 +501,10 @@ impl Runners {
 
     fn stopped(&self) -> Vec<[u8; 16]> {
         self.stopped.lock().unwrap().clone()
+    }
+
+    fn bundles(&self) -> usize {
+        self.bundles.load(Ordering::SeqCst)
     }
 }
 
@@ -518,6 +540,17 @@ impl Executor for Runners {
         self.reporter.lock().unwrap().take();
     }
     fn spec(&self, _: AttemptId, _: session::JobContext, _: Vec<u8>) {}
+    fn spec_with_secrets(
+        &self,
+        _: AttemptId,
+        _: session::JobContext,
+        _: Vec<u8>,
+        secrets: sentinel_protocol::secrets::DeliveryBundle,
+    ) {
+        if !secrets.is_empty() {
+            self.bundles.fetch_add(1, Ordering::SeqCst);
+        }
+    }
     fn no_spec(&self, _: AttemptId) {}
     fn log_acked(&self, _: AttemptId, _: u64) {}
     fn log_refused(&self, _: AttemptId) {}
@@ -863,6 +896,186 @@ fn demand_source_numbers() {
         reads.len(),
         percentile(&mut reads.clone(), 0.5),
         percentile(&mut reads.clone(), 0.95),
+    );
+    process.stop();
+}
+
+// ---------------------------------------------------------------- the canary
+
+/// A log sink that keeps every event this process emits, at every level.
+struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+    type Writer = LogWriter;
+    fn make_writer(&'a self) -> LogWriter {
+        LogWriter(Arc::clone(&self.0))
+    }
+}
+
+impl LogSink {
+    /// The process's only subscriber, so every thread's events land here. One test per process
+    /// (nextest), so nothing else has installed one.
+    fn install() -> LogSink {
+        let sink = LogSink(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(LogSink(Arc::clone(&sink.0)))
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("the log sink is this test process's subscriber");
+        sink
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+/// Every file under `dir`, as paths.
+fn files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => files(&path, out),
+            Ok(_) => out.push(path),
+            Err(_) => {}
+        }
+    }
+}
+
+fn contains(haystack: &[u8], needle: &str) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+}
+
+/// AR09's first gate: the just-in-time configuration never appears in a log, a bundle, a record, an
+/// environment listing or a workspace. The worker that holds the lease is given it, once, on the
+/// frame that exists for it; every other sink this deployment has is walked here.
+#[test]
+fn the_just_in_time_configuration_reaches_no_log_a_record_a_bundle_or_a_workspace() {
+    const CANARY: &str = "sentinel-canary-9f4c1e7a2b6d31";
+    let logs = LogSink::install();
+    // A marker of this test's own: it proves the sink is live, so "the canary is absent" is a fact
+    // about the deployment's logging and not about an empty buffer.
+    tracing::info!(
+        marker = "canary-sink-live",
+        "the log sink of the canary test is recording"
+    );
+    let github = Github::start();
+    github.with_canary(CANARY);
+    let d = deployment(github);
+    d.serve(120_000, 60_000);
+    let runners = Runners::new();
+    let process = WorkerProcess::start(&d, Arc::clone(&runners), &[CLASS]);
+    d.queued(1);
+    eventually(
+        "the configuration is delivered to the lease's worker",
+        || runners.configs().len() == 1,
+    );
+    let (lease, config) = runners.configs().first().cloned().expect("delivered");
+    // The credential exists and travelled: this is the one place the test lets it appear.
+    assert!(
+        contains(&config, CANARY),
+        "the delivered frame is the configuration GitHub issued"
+    );
+
+    // 1. A log: every event of this process at TRACE, from the controller and from the link.
+    let logged = logs.text();
+    assert!(
+        logged.contains("canary-sink-live"),
+        "the sink captured nothing to judge:\n{logged}"
+    );
+    assert!(
+        !logged.contains(CANARY),
+        "the configuration reached a log:\n{logged}"
+    );
+
+    // 2. A bundle: runner mode sends no pipeline secret, so no delivery bundle exists to carry it.
+    assert_eq!(
+        runners.bundles(),
+        0,
+        "a secret bundle reached the worker for a runner lease"
+    );
+
+    // 6. Actions secrets: a provisioning and delivery pass asks GitHub for a runner configuration
+    // and, on release, its removal — never for a secret.
+    let requests = d.github.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|(_, path, _)| path.ends_with("/actions/runners/generate-jitconfig")),
+        "the pass made the registration call: {requests:?}"
+    );
+    for (method, path, _) in &requests {
+        assert!(
+            !path.contains("secret"),
+            "a runner-mode pass asked GitHub for a secret ({method} {path})"
+        );
+    }
+
+    // 3. An environment listing: what a controller can ask this worker to list holds lease ids and
+    // classes, never a configuration; and the only copy the worker holds is the frame above.
+    assert_eq!(runners.runner_held(), vec![lease]);
+    // The configuration is delivered once: a moment later there is still exactly one copy.
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        runners.configs().len(),
+        1,
+        "the configuration was delivered more than once"
+    );
+
+    // 4. A record: every byte the deployment keeps — the database, the logs, the object store — and
+    // the row the store wrote. The configuration is sealed at rest and cleared by its one delivery.
+    let (present, taken): (i64, i64) = d
+        .store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT count(sealed_jit), count(taken_ms) FROM runner_leases",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!((present, taken), (0, 1), "the configuration is single-use");
+    let mut paths = Vec::new();
+    files(d._dir.path(), &mut paths);
+    assert!(
+        paths.len() > 1,
+        "the deployment has files to judge: {paths:?}"
+    );
+    for path in &paths {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        assert!(
+            !contains(&bytes, CANARY),
+            "the configuration reached {}",
+            path.display()
+        );
+    }
+
+    // 5. A workspace: runner mode has none on this side. The deployment's every file is walked
+    // above — the database, the logs and the object store — and the worker's own sandbox keeps the
+    // configuration out of its one scratch directory too, where the sandbox tests hold it to the
+    // tmpfs inside the container (`the_runner_takes_one_job_and_its_configuration_is_not_on_the_command_line`).
+    assert!(
+        !d._dir.path().join("workspaces").exists(),
+        "a runner-mode job left a workspace on the controller"
     );
     process.stop();
 }

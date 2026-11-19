@@ -288,12 +288,49 @@ pub fn require_pool_access(conn: &Connection, tenant: TenantId, pool: PoolId) ->
     }
 }
 
+/// Mark a pool as the hostile-fork pool or take the mark back. Only that pool serves fork jobs, and
+/// it serves nothing else ([runner mode](../../../docs/runner-mode.md#fork-pull-requests)), so a tenant's
+/// fork demand waits while no pool is marked.
+pub fn set_pool_fork(
+    tx: &Transaction<'_>,
+    authority: Authority,
+    pool: PoolId,
+    fork: bool,
+) -> Result<bool> {
+    authority.require_platform(tx)?;
+    let name: Option<String> = tx
+        .prepare_cached("SELECT name FROM pools WHERE id = ?1")?
+        .query_row([pool.as_bytes()], |r| r.get(0))
+        .optional()?;
+    let Some(name) = name else {
+        return Err(Error::NotFound);
+    };
+    let changed = tx.execute(
+        "UPDATE pools SET fork_prs = ?2 WHERE id = ?1 AND fork_prs != ?2",
+        params![pool.as_bytes(), fork],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    audit(
+        tx,
+        Event::PoolForkChanged,
+        authority.actor(),
+        None,
+        authority.host_local(),
+        Some(&format!("{} {name}", if fork { "fork" } else { "trusted" })),
+    )?;
+    Ok(true)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct PoolRecord {
     pub id: PoolId,
     pub name: String,
     pub kind: PoolKind,
     pub active: bool,
+    /// This pool takes jobs of fork pull requests and nothing else: the hostile-fork pool (M09).
+    pub fork: bool,
 }
 
 pub fn pools_for_tenant(
@@ -306,7 +343,7 @@ pub fn pools_for_tenant(
         crate::auth::get_namespace_by_id(conn, principal, tenant).map_err(|_| Error::NotFound)?;
     }
     let mut stmt = conn.prepare_cached(
-        "SELECT p.id, p.name, p.kind, p.owner_tenant_id, p.active FROM pools p
+        "SELECT p.id, p.name, p.kind, p.owner_tenant_id, p.active, p.fork_prs FROM pools p
          LEFT JOIN pool_grants g ON g.pool_id = p.id AND g.tenant_id = ?1
          WHERE p.owner_tenant_id = ?1 OR g.tenant_id IS NOT NULL
          ORDER BY p.name",
@@ -318,6 +355,7 @@ pub fn pools_for_tenant(
             r.get::<_, i64>(2)?,
             r.get::<_, Option<[u8; 16]>>(3)?,
             r.get::<_, bool>(4)?,
+            r.get::<_, bool>(5)?,
         ))
     })?;
     rows.map(|row| {
@@ -333,6 +371,7 @@ pub fn pools_for_tenant(
                 _ => return Err(Error::Corrupt("pools.kind")),
             },
             active: row.4,
+            fork: row.5,
         })
     })
     .collect()

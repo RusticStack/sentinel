@@ -145,14 +145,43 @@ fn kill_group(child: &mut std::process::Child) {
 }
 
 pub fn run_canceled(
-    mut command: Command,
+    command: Command,
     deadline: Instant,
     what: &'static str,
     sink: Option<Sink>,
     cancel: Option<&AtomicBool>,
 ) -> Result<Output> {
+    run_inner(command, deadline, what, sink, cancel, None)
+}
+
+/// Like [`run_canceled`], with `input` written to the child's standard input and the pipe closed
+/// after it. A credential that must not appear on a command line or in an environment listing is
+/// handed over this way; the child's standard input is drained on its own thread, so an input the
+/// child never reads cannot block the wait.
+pub fn run_canceled_input(
+    command: Command,
+    deadline: Instant,
+    what: &'static str,
+    input: &[u8],
+    cancel: Option<&AtomicBool>,
+) -> Result<Output> {
+    run_inner(command, deadline, what, None, cancel, Some(input))
+}
+
+fn run_inner(
+    mut command: Command,
+    deadline: Instant,
+    what: &'static str,
+    sink: Option<Sink>,
+    cancel: Option<&AtomicBool>,
+    input: Option<&[u8]>,
+) -> Result<Output> {
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -174,6 +203,21 @@ pub fn run_canceled(
             return Err(e.into());
         }
     };
+    if let Some(input) = input {
+        use std::io::Write as _;
+        let mut stdin = child.stdin.take().expect("piped");
+        let mut buffer = Vec::with_capacity(input.len() + 1);
+        buffer.extend_from_slice(input);
+        buffer.push(b'\n');
+        // The pipe is bounded: writing on its own thread cannot wait on the child reading.
+        let writer = thread::spawn(move || {
+            let written = stdin.write_all(&buffer).is_ok();
+            buffer.fill(0);
+            drop(stdin);
+            written
+        });
+        drop(writer);
+    }
     let watch = sentinel_git::ExitWatch::of(&child);
     let status = loop {
         match sentinel_git::wait_step(&mut child, &watch, deadline) {
@@ -226,6 +270,22 @@ mod tests {
         short.push(b"abc");
         short.push(b"def");
         assert_eq!(short.into_bytes(), b"abcdef");
+    }
+
+    #[test]
+    fn input_reaches_the_child_on_its_standard_input_and_nowhere_else() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 10; echo >&2 done"]);
+        let out = run_canceled_input(
+            cmd,
+            Instant::now() + Duration::from_secs(10),
+            "stdin",
+            b"credential",
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.stdout, b"credential");
+        assert!(!out.stderr.is_empty());
     }
 
     #[test]

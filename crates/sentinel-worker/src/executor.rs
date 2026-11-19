@@ -83,6 +83,18 @@ pub enum Notice {
     },
     /// Workspaces that finished attempts left behind were removed while the worker ran.
     WorkspacesReaped(usize),
+    /// One runner's sandbox ended: the container is gone and nothing writable of it survives.
+    RunnerEnded {
+        lease: sentinel_core::RunnerLeaseId,
+        code: Option<i32>,
+        canceled: bool,
+    },
+    /// A runner could not be started or ended badly. The lease is the controller's to end, and its
+    /// idle bound does that when no `in_progress` delivery ever names the runner.
+    RunnerFailed {
+        lease: sentinel_core::RunnerLeaseId,
+        error: String,
+    },
     /// The storage guard did not see all of an attempt's storage, so the figures it acted on were lower bounds.
     StorageUnmeasured {
         attempt: AttemptId,
@@ -418,18 +430,15 @@ struct State {
     runners: HashMap<[u8; 16], HeldRunner>,
 }
 
-/// One ephemeral runner this worker has been given capacity for. The configuration is a credential:
-/// it lives here only until the runner that uses it starts, and it is wiped when it goes.
+/// One ephemeral runner this worker has been given capacity for: the class reservation its offer
+/// stated, and — once its configuration arrives — the sandbox it runs in. The configuration itself
+/// is never kept here: it goes straight into the start, which hands it to the runner on its
+/// standard input and wipes it afterwards.
 struct HeldRunner {
-    config: Option<Vec<u8>>,
-}
-
-impl Drop for HeldRunner {
-    fn drop(&mut self) {
-        if let Some(config) = &mut self.config {
-            wipe(config);
-        }
-    }
+    cpu_millis: u64,
+    memory_bytes: u64,
+    /// Set while the sandbox runs: stopping the lease stops it.
+    running: Option<Arc<AtomicBool>>,
 }
 
 /// The most runner leases one worker holds at once.
@@ -518,6 +527,8 @@ pub struct Inner {
     admission_floor: std::sync::atomic::AtomicU64,
     measured_disk: std::sync::atomic::AtomicBool,
     refusal_noted: Mutex<Option<Instant>>,
+    /// What this worker states about runner mode, set once at start (no image: no runners at all).
+    runner_policy: std::sync::OnceLock<crate::runner::Policy>,
     state: Mutex<State>,
     gc_lock: Mutex<sentinel_cache::gc::Cursor>,
     cache_bytes: std::sync::atomic::AtomicU64,
@@ -745,6 +756,7 @@ impl Executor {
             admission_floor: std::sync::atomic::AtomicU64::new(floor),
             measured_disk: std::sync::atomic::AtomicBool::new(false),
             refusal_noted: Mutex::new(None),
+            runner_policy: std::sync::OnceLock::new(),
             notify,
             gc_lock: Mutex::new(sentinel_cache::gc::Cursor::default()),
             cache_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -777,6 +789,11 @@ impl Executor {
     }
 
     pub fn shutdown(&self, grace: Duration) {
+        for held in self.state().runners.values() {
+            if let Some(cancel) = &held.running {
+                cancel.store(true, Ordering::Release);
+            }
+        }
         let (waiting, live, reporter) = {
             let mut state = self.state();
             state.draining = true;
@@ -841,6 +858,12 @@ impl Executor {
 
     pub fn set_job_network(&self, network: podman::Network) {
         self.state().network = network;
+    }
+
+    /// What this worker states about the runners it starts: the image, pinned by digest, and the
+    /// endpoints of its own a granted sandbox must not reach. Set once; absent, no offer is accepted.
+    pub fn set_runner_policy(&self, policy: crate::runner::Policy) {
+        let _ = self.runner_policy.set(policy);
     }
 
     /// The default executor and, where microVMs can run, their setup (plan 16.8 runtime selection).
@@ -1109,6 +1132,38 @@ impl Executor {
 }
 
 impl Inner {
+    /// Runs one runner sandbox to its end and removes it, whatever the outcome. The configuration
+    /// is handed over on the runner's standard input and wiped before this returns; the sandbox
+    /// goes whether the runner finished, was canceled or failed to start.
+    fn run_sandbox(
+        &self,
+        lease: sentinel_core::RunnerLeaseId,
+        plan: crate::runner::Plan,
+        mut config: Vec<u8>,
+        cancel: Arc<AtomicBool>,
+    ) {
+        let outcome = plan.start(&config, &cancel);
+        wipe(&mut config);
+        let removed = plan.destroy();
+        match (outcome, removed) {
+            (Ok(exit), _) => (self.notify)(Notice::RunnerEnded {
+                lease,
+                code: exit.code,
+                canceled: exit.canceled,
+            }),
+            (Err(error), Err(remove)) => (self.notify)(Notice::RunnerFailed {
+                lease,
+                error: format!("{error}; and its sandbox: {remove}"),
+            }),
+            (Err(error), Ok(())) => (self.notify)(Notice::RunnerFailed {
+                lease,
+                error: error.to_string(),
+            }),
+        }
+        // The lease stays held until the controller stops it: the `completed` delivery ends it, and
+        // the idle bound covers a runner nobody handed a job to.
+    }
+
     /// The measured cache costs the costly-hit rule reads; a cold-rebuild measurement is recorded here.
     pub fn costs(&self) -> &sentinel_cache::CostBook {
         &self.costs
@@ -1772,29 +1827,113 @@ impl LinkExecutor for Executor {
         self.prefetch.hint(images);
     }
 
+    /// A worker that states no runner image, or one the class's reservation does not fit, declines
+    /// the offer: nothing is registered at GitHub until the answer is written, so declining costs
+    /// nothing and a runner lease never lands on a machine that cannot start it.
     fn runner_offered(&self, lease: &sentinel_link::session::RunnerLeaseWire) -> bool {
+        let Some(policy) = self.runner_policy.get() else {
+            return false;
+        };
+        if !policy.admits(lease.cpu_millis, lease.memory_bytes) {
+            return false;
+        }
         let mut state = self.state();
         if state.draining || state.runners.len() >= MAX_RUNNERS || state.reporter.is_none() {
             return false;
         }
-        state
-            .runners
-            .insert(lease.lease, HeldRunner { config: None });
+        state.runners.insert(
+            lease.lease,
+            HeldRunner {
+                cpu_millis: lease.cpu_millis,
+                memory_bytes: lease.memory_bytes,
+                running: None,
+            },
+        );
         true
     }
 
+    /// The one configuration a lease gets. It is spent immediately: the sandbox is built from what
+    /// the offer stated, started on its own thread with the configuration on the runner's standard
+    /// input, and the bytes are wiped when the runner ends. A configuration this worker cannot use
+    /// is wiped here and the lease is dropped, so nothing can start later from it.
     fn runner_config(&self, lease: [u8; 16], mut config: Vec<u8>) {
+        let (image, guard) = match self.runner_policy.get() {
+            Some(policy) => match &policy.image {
+                Some(image) => (image.clone(), policy.guard.clone()),
+                None => {
+                    wipe(&mut config);
+                    return;
+                }
+            },
+            None => {
+                wipe(&mut config);
+                return;
+            }
+        };
+        let id = match sentinel_core::RunnerLeaseId::from_bytes(lease) {
+            Ok(id) => id,
+            Err(_) => {
+                wipe(&mut config);
+                return;
+            }
+        };
         let mut state = self.state();
-        match state.runners.get_mut(&lease) {
-            Some(held) => held.config = Some(std::mem::take(&mut config)),
+        let network = state.network;
+        let Some(held) = state.runners.get_mut(&lease) else {
             // A lease this worker no longer holds is not asked about: the configuration is a
             // credential, and one it cannot use is dropped rather than kept.
-            None => wipe(&mut config),
+            drop(state);
+            wipe(&mut config);
+            return;
+        };
+        if held.running.is_some() {
+            drop(state);
+            wipe(&mut config);
+            return;
+        }
+        let limits = podman::Limits {
+            cpu_millis: u32::try_from(held.cpu_millis).unwrap_or(u32::MAX),
+            memory_bytes: held.memory_bytes,
+            pids: crate::runner::PIDS,
+            disk_bytes: 0,
+            lifetime_secs: 0,
+        };
+        let plan =
+            crate::runner::Plan::new(&self.root, self.worker, id, &image, limits, network, &guard);
+        match plan {
+            Ok(plan) => {
+                let cancel = Arc::new(AtomicBool::new(false));
+                held.running = Some(Arc::clone(&cancel));
+                let inner = Arc::clone(&self.0);
+                drop(state);
+                let spawned = thread::Builder::new()
+                    .name(plan.name().to_owned())
+                    .spawn(move || inner.run_sandbox(id, plan, config, cancel));
+                if spawned.is_err() {
+                    // No thread, no runner: the configuration is wiped and the lease is dropped, so
+                    // the controller's idle bound retires it rather than leaving it live.
+                    (self.notify)(Notice::RunnerFailed {
+                        lease: id,
+                        error: "the worker could not start a thread for the runner".to_owned(),
+                    });
+                    self.state().runners.remove(&lease);
+                }
+            }
+            // A sandbox this worker cannot build is a lease it cannot serve: the configuration is
+            // wiped and the lease dropped, so nothing can start from it later.
+            Err(_) => {
+                drop(state);
+                wipe(&mut config);
+                self.state().runners.remove(&lease);
+            }
         }
     }
 
     fn runner_stopped(&self, lease: [u8; 16]) {
-        self.state().runners.remove(&lease);
+        let held = self.state().runners.remove(&lease);
+        if let Some(cancel) = held.and_then(|h| h.running) {
+            cancel.store(true, Ordering::Release);
+        }
     }
 
     fn runner_held(&self) -> Vec<[u8; 16]> {

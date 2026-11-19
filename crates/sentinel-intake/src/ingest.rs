@@ -394,6 +394,7 @@ fn accept_runner(
     let action = job.action.clone();
     let runner_name = job.runner.clone();
     let conclusion = job.conclusion.clone();
+    let fork_pr = job.fork_pr;
     let (job_id, run_id) = (job.job, job.run);
     let accepted = store.writer().write(move |tx| {
         runner::accept(
@@ -409,6 +410,7 @@ fn accept_runner(
                 labels: &labels,
                 runner: runner_name.as_deref(),
                 conclusion: conclusion.as_deref(),
+                fork_pr,
             },
             now,
         )

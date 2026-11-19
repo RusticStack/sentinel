@@ -13,4 +13,7 @@ pub enum Switch {
     Missing(Vec<&'static str>),
     /// Refused: the tenant has no live GitHub installation to act through.
     NoInstallation,
+    /// Refused: the tenant's runner-mode switch is off, so it serves no runner jobs at all and a
+    /// setting that only feeds them would be one nobody reads.
+    NoRunnerMode,
 }

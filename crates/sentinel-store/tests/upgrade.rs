@@ -431,7 +431,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     };
 
     let report = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(report.inspection.pending, vec![73, 74, 75]);
+    assert_eq!(report.inspection.pending, vec![73, 74, 75, 76]);
     assert!(report.inspection.openable() && report.inspection.integrity == "ok");
     assert_eq!(
         report.copy.as_deref(),
@@ -448,7 +448,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
             .iter()
             .map(|step| step.version)
             .collect::<Vec<_>>(),
-        vec![73, 74, 75]
+        vec![73, 74, 75, 76]
     );
     let rewrites = |step: usize| -> Vec<(String, u64)> {
         report.steps[step]
@@ -457,7 +457,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
             .map(|rewrite| (rewrite.table.clone(), rewrite.rows))
             .collect()
     };
-    let (oauth, runner, migration) = (rewrites(0), rewrites(1), rewrites(2));
+    let (oauth, runner, migration, fork) = (rewrites(0), rewrites(1), rewrites(2), rewrites(3));
     for (table, rows) in stored {
         assert!(rows > 0, "{table} is populated");
         assert!(
@@ -473,6 +473,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
         migration.is_empty(),
         "migration 75 only adds shape: {migration:?}"
     );
+    assert!(fork.is_empty(), "migration 76 only adds shape: {fork:?}");
 
     // Every enrolled worker is listed with what it announces, and the one this build cannot serve is
     // marked rather than silently dropped.
@@ -565,14 +566,14 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
         .unwrap();
     }
     let report = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(report.inspection.pending, vec![71, 72, 73, 74, 75]);
+    assert_eq!(report.inspection.pending, vec![71, 72, 73, 74, 75, 76]);
     assert_eq!(
         report.copy.as_deref(),
         Some(upgrade::snapshot_path(&path, 70).as_path())
     );
     assert_eq!(
         report.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75]
+        vec![71, 72, 73, 74, 75, 76]
     );
     assert!(report.blocking.is_empty(), "{:?}", report.blocking);
 
@@ -641,10 +642,10 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     drop(restored);
     // A second preflight over the restored copy reports the same upgrade, not a migration half done.
     let again = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(again.inspection.pending, vec![71, 72, 73, 74, 75]);
+    assert_eq!(again.inspection.pending, vec![71, 72, 73, 74, 75, 76]);
     assert_eq!(
         again.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75]
+        vec![71, 72, 73, 74, 75, 76]
     );
 }
 
@@ -782,7 +783,7 @@ fn upgrade_sources() -> Vec<u32> {
 fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expects() {
     // docs/upgrades.md (tests/compat_doc.rs compares it with the code): a database at schema N
     // runs on release R only when no migration in (R, N] declares a readable_by above R. Rows
-    // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, LATEST.
+    // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, LATEST.
     let readable = |db: &Connection, release: u32, newest: u32| -> bool {
         let needs: u32 = db
             .query_row(
@@ -795,13 +796,13 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        75,
+        76,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
     assert_eq!(
         sources,
-        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 73, 74]
+        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 74, 75]
     );
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
@@ -821,6 +822,16 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
             .iter()
             .map(|&newest| from >= newest || readable(&db, from, newest))
             .collect();
+        // Schema 75 is readable by nothing below itself (fork provenance is what placement reads),
+        // and every release here is below it.
+        // The columns are fixed up to 75, and the newest migration is checked from the schema itself,
+        // so this table does not have to grow a column every time one is added: nothing below LATEST
+        // may run on a database at LATEST.
+        assert!(
+            !readable(&db, from, schema::LATEST),
+            "release {from} runs on a database at {LATEST}",
+            LATEST = schema::LATEST
+        );
         // 44, 47 and 48 cannot run on schema 53 (migrations 46, 49 and 50 need 46, 48 and 50); 51 can
         // (52 and 53 are readable by 51) but not on 55 (54 needs 54); 56 and 57 are the targets of
         // migrations 57 and 58, so 57 runs on a database at 58 and 56 does not (58 needs 57); nothing
@@ -897,11 +908,18 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
                 true, true, true, true, true, true, true, true, true, true, true, true, true, true,
                 false,
             ],
+            // The newest release in the list runs on every column it is listed against.
+            75 => [
+                true, true, true, true, true, true, true, true, true, true, true, true, true, true,
+                true,
+            ],
             _ => unreachable!(),
         };
         assert_eq!(
-            ok, expected,
-            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75"
+            ok,
+            expected,
+            "release {from} on the schemas the matrix lists below {LATEST}",
+            LATEST = schema::LATEST
         );
     }
 }

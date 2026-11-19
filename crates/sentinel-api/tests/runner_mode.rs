@@ -233,6 +233,10 @@ fn the_switch_reports_what_the_deployment_serves_and_what_is_missing() {
     let (status, body) = call(&d, "GET", "/api/v1/tenants/acme/runner-mode", None);
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["enabled"], false);
+    assert_eq!(
+        body["fork_prs"], false,
+        "a tenant serves no fork pull request until it says so"
+    );
     assert_eq!(body["classes"], serde_json::json!([CLASS]));
     assert_eq!(
         body["missing"],

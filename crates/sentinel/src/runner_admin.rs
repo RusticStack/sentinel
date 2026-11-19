@@ -19,6 +19,9 @@ pub fn run(args: &RunnerModeArgs) -> Result<(), Error> {
             let enabled = store
                 .read(move |c| runner::mode(c, tenant))
                 .map_err(|error| fail(format!("cannot read the runner-mode switch: {error}")))?;
+            let fork_prs = store
+                .read(move |c| runner::fork_prs(c, tenant))
+                .map_err(|error| fail(format!("cannot read the fork opt-in: {error}")))?;
             let missing = store
                 .read(move |c| runner::missing(c, tenant))
                 .map_err(|error| fail(format!("cannot read the runner permissions: {error}")))?;
@@ -26,6 +29,10 @@ pub fn run(args: &RunnerModeArgs) -> Result<(), Error> {
                 .map_err(|_| fail("cannot load the runner class policy"))?;
             sentinel::outln!("tenant: {}", tenant);
             sentinel::outln!("runner mode: {}", if enabled { "on" } else { "off" });
+            sentinel::outln!(
+                "fork pull requests: {}",
+                if fork_prs { "served" } else { "not served" }
+            );
             sentinel::outln!("{}", joined("classes", &classes));
             sentinel::outln!("{}", joined("missing", &missing));
         }
@@ -62,6 +69,38 @@ pub fn run(args: &RunnerModeArgs) -> Result<(), Error> {
                     return Err(fail(
                         "the tenant has no GitHub App installation to register a runner through",
                     ));
+                }
+                Switch::NoRunnerMode => {
+                    return Err(fail("fork pull requests need runner mode on"));
+                }
+            }
+        }
+        RunnerModeCommand::ForkPrs {
+            data,
+            tenant,
+            enabled,
+        } => {
+            let store = admin::open(data, true)?;
+            let tenant = resolve(&store, tenant)?;
+            let enabled = *enabled;
+            match store
+                .writer()
+                .write(move |tx| runner::set_fork_prs(tx, Authority::HostLocal, tenant, enabled))
+                .map_err(|error| fail(format!("cannot change the fork opt-in: {error}")))?
+            {
+                Switch::Set => sentinel::outln!(
+                    "fork pull requests {} for {} (a runner is leased only on a pool marked `admin pool fork`)",
+                    if enabled { "served" } else { "not served" },
+                    tenant
+                ),
+                Switch::Unchanged => sentinel::outln!(
+                    "fork pull requests {} for {} was already so",
+                    if enabled { "served" } else { "not served" },
+                    tenant
+                ),
+                Switch::NoRunnerMode => return Err(fail("fork pull requests need runner mode on")),
+                Switch::Missing(_) | Switch::NoInstallation => {
+                    return Err(fail("fork pull requests need runner mode on"));
                 }
             }
         }

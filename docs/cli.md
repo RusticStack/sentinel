@@ -222,12 +222,22 @@ beside a stopped controller. The networked equivalent is `GET`/`POST /tenants/{s
   settings name them, or `none`. Nothing is written.
 - **`set`** writes the switch and prints `runner mode on|off for tnt_...`, or the same line ending
   `was already so` when it already read that; the change is audited (`runner-mode-changed`).
+- **`fork-prs`** sets whether the tenant serves jobs of fork pull requests at all
+  (`--enabled true|false`), prints `fork pull requests served|not served for tnt_...` and names the
+  pool that still has to be marked, and is refused `fork pull requests need runner mode on` while
+  the switch is off. Opting in is half the policy: a runner for a fork job is leased only on a pool
+  marked with `admin pool fork` ([runner mode](runner-mode.md#fork-pull-requests)).
 - **Refusals exit 2** with the usual `admin` text: `no active tenant with that slug` (or `... with
   that identifier`), `runner mode needs the GitHub App to grant actions,
   organization_self_hosted_runners; an owner approves the permission change on GitHub and the next
   installation snapshot records it`, `the tenant has no GitHub App installation to register a
-  runner through`, `cannot load the runner class policy` (a `runner-classes.json` that does not
-  parse), and `cannot change the runner-mode switch: ...` for a store fault.
+  runner through`, `fork pull requests need runner mode on`, `cannot load the runner class policy`
+  (a `runner-classes.json` that does not parse), and `cannot change the runner-mode switch: ...` for
+  a store fault.
+- **`admin pool fork --data-dir DIR --pool NAME --enabled true|false`** marks a pool as the
+  hostile-fork pool or takes the mark back, printing `marked`/`already marked` and the pool's
+  purpose; `admin pool list` adds `fork` to a marked pool's line. Only that pool serves fork jobs,
+  and it serves nothing else ([runner mode](runner-mode.md#fork-pull-requests)).
 
 ## Host-local worker policy
 

@@ -32,6 +32,7 @@ pub use process::Sink as OutputSink;
 #[cfg(target_os = "linux")]
 pub mod recovery;
 pub mod redact;
+pub mod runner;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
 pub mod spool;

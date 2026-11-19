@@ -270,10 +270,17 @@ pub struct WorkflowJob {
     pub runner: Option<String>,
     /// GitHub's conclusion for a completed job.
     pub conclusion: Option<String>,
+    /// Whether any pull request this commit belongs to comes from a fork of the repository the
+    /// delivery names. A pull request entry this build cannot read counts as a fork: what cannot
+    /// be shown to be this repository's own code is hostile code.
+    pub fork_pr: bool,
 }
 
 /// At most this many labels are read from one job; GitHub's own limit is far smaller.
 const MAX_JOB_LABELS: usize = 32;
+/// At most this many pull requests are read from one job. A commit belongs to few; a payload that
+/// claims more is not one this build reads.
+const MAX_JOB_PULL_REQUESTS: usize = 16;
 /// The longest single label this build keeps.
 const MAX_LABEL_LEN: usize = 128;
 /// A job's labels together with their separators, which is what intake stores.
@@ -369,7 +376,38 @@ pub fn parse_workflow_job(body: &[u8]) -> Result<WorkflowJob> {
         labels,
         runner: bounded(job.get("runner_name"), "runner", 128)?,
         conclusion: bounded(job.get("conclusion"), "conclusion", 32)?,
+        fork_pr: fork_pull_requests(job.get("pull_requests"), repository)?,
     })
+}
+
+/// Whether a job's commit is a fork pull request's: a pull request whose head repository is not the
+/// repository the delivery names. A job of no pull request is the repository's own push. An entry
+/// whose head repository this build cannot read is counted as a fork, and a malformed list is a
+/// payload this build refuses.
+fn fork_pull_requests(value: Option<&Value>, repository: u64) -> Result<bool> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(false);
+    };
+    let list = value
+        .as_array()
+        .filter(|l| l.len() <= MAX_JOB_PULL_REQUESTS)
+        .ok_or(Error::Response("pull_requests"))?;
+    for entry in list {
+        let head = entry
+            .as_object()
+            .and_then(|e| e.get("head"))
+            .and_then(|h| h.as_object())
+            .and_then(|h| h.get("repo"))
+            .and_then(|r| r.as_object());
+        match head.and_then(|r| r.get("id")).and_then(Value::as_u64) {
+            Some(head) if head != repository => return Ok(true),
+            Some(_) => {}
+            // No head repository at all is a pull request whose source is gone, or one this build
+            // cannot read: neither can be shown to be this repository's.
+            None => return Ok(true),
+        }
+    }
+    Ok(false)
 }
 
 fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
@@ -789,6 +827,43 @@ mod tests {
         finished["workflow_job"]["conclusion"] = Value::from("success");
         let job = parse_workflow_job(&serde_json::to_vec(&finished).unwrap()).unwrap();
         assert_eq!(job.conclusion.as_deref(), Some("success"));
+
+        // A job of no pull request is the repository's own push; a fork's is a fork's.
+        let fork_of = |head: serde_json::Value| {
+            let mut body = body.clone();
+            body["workflow_job"]["pull_requests"] = head;
+            parse_workflow_job(&serde_json::to_vec(&body).unwrap())
+        };
+        let own = fork_of(serde_json::json!([
+            {"number": 7, "head": {"repo": {"id": 91}}, "base": {"repo": {"id": 91}}}
+        ]))
+        .unwrap();
+        assert!(!own.fork_pr);
+        let fork = fork_of(serde_json::json!([
+            {"number": 8, "head": {"repo": {"id": 5}}, "base": {"repo": {"id": 91}}}
+        ]))
+        .unwrap();
+        assert!(fork.fork_pr);
+        // One fork among several is enough, and a pull request whose source this build cannot read
+        // is hostile until it is shown otherwise.
+        assert!(
+            fork_of(serde_json::json!([
+                {"number": 1, "head": {"repo": {"id": 91}}},
+                {"number": 2, "head": {"repo": {"id": 5}}}
+            ]))
+            .unwrap()
+            .fork_pr
+        );
+        assert!(
+            fork_of(serde_json::json!([{"number": 3}])).unwrap().fork_pr,
+            "a pull request with no head repository is not this repository's"
+        );
+        assert!(!fork_of(serde_json::json!([])).unwrap().fork_pr);
+        assert!(
+            !fork_of(serde_json::json!(null)).unwrap().fork_pr,
+            "a job with no pull requests is a push of this repository"
+        );
+        assert!(fork_of(serde_json::json!("nonsense")).is_err());
 
         let without = |path: &str| {
             let mut body = body.clone();
