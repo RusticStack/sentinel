@@ -405,6 +405,23 @@ pub(crate) fn render(state: &State) -> String {
             );
         }
     }
+    if let Ok(states) = state
+        .store
+        .read(|c| sentinel_store::retention::states(c, &state.objects.deployment()))
+    {
+        out.family(
+            "sentinel_storage_tenants",
+            "gauge",
+            "Tenants by how their stored bytes stand against their own thresholds: ok, soft (warned, nothing refused) and hard (caches evicted, artifacts refused). Three fixed series, no tenant label.",
+        );
+        for (class, count) in ["ok", "soft", "hard"].into_iter().zip(states) {
+            out.value(
+                "sentinel_storage_tenants",
+                &format!("state=\"{class}\""),
+                count,
+            );
+        }
+    }
     if let Some(r) = state.objects.replication() {
         out.one(
             "sentinel_s3_healthy",

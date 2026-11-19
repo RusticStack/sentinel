@@ -1626,3 +1626,214 @@ fn protocol6_context_carries_the_tenant_and_derived_cache_trust() {
     assert_eq!(context.job, offer.job);
     process.stop().unwrap();
 }
+
+fn tenant_thresholds(d: &Deployment, quota: u64, soft: u8, hard: u8) {
+    d.objects
+        .set_deployment(sentinel_store::retention::Deployment {
+            tenant_quota_bytes: quota,
+            soft_percent: soft,
+            hard_percent: hard,
+            ..sentinel_store::retention::Deployment::default()
+        });
+}
+
+fn publish(reporter: &session::Reporter, attempt: AttemptId, name: &str, path: &str, bytes: &[u8]) {
+    reporter.artifact_begin(attempt, name).unwrap();
+    reporter
+        .artifact_file(attempt, path, bytes.len() as u64, 0o644)
+        .unwrap();
+    reporter.artifact_data(attempt, 0, bytes).unwrap();
+    reporter.artifact_end(attempt, name).unwrap();
+}
+
+#[test]
+fn an_artifact_past_the_tenant_hard_threshold_is_refused_and_its_row_names_why() {
+    let d = deployment();
+    tenant_thresholds(&d, 1_000, 50, 80);
+    let (process, recorder, reporter, attempt, run) = artifact_attempt(&d);
+    let (tenant, repo) = (d.tenant, d.repo);
+
+    // 799 bytes is past the soft threshold of 500 and inside the hard one of 800.
+    publish(&reporter, attempt, "dist", "out/a.bin", &[b'a'; 799]);
+    eventually("first stored", || {
+        verdict_seen(&recorder, attempt, "dist", session::ArtifactCode::Stored)
+    });
+    // Two more bytes would pass the hard threshold, which the begin check cannot know yet.
+    publish(&reporter, attempt, "cov", "coverage/c.bin", &[b'c'; 2]);
+    eventually("refused at commit", || {
+        verdict_seen(
+            &recorder,
+            attempt,
+            "cov",
+            session::ArtifactCode::QuotaExceeded,
+        )
+    });
+    let rows = d
+        .store
+        .read(move |c| sentinel_store::artifacts::for_run(c, tenant, run))
+        .unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].state, sentinel_store::artifacts::State::Captured);
+    assert_eq!(rows[0].failure, None);
+    let refusal = rows[1].failure.clone().expect("the refusal is recorded");
+    assert_eq!(rows[1].state, sentinel_store::artifacts::State::Failed);
+    assert_eq!(rows[1].bytes, 0, "a refused artifact holds no bytes");
+    for part in [
+        "quota_exceeded",
+        "799 bytes stored",
+        "800 byte hard threshold",
+        "80%",
+        "largest classes artifacts=799",
+    ] {
+        assert!(refusal.contains(part), "{part} in {refusal}");
+    }
+
+    // The refusal discarded what it staged: the tenant and the repository hold the 799 bytes it had.
+    let held = d
+        .store
+        .read(move |c| sentinel_store::retention::tenant_usage(c, tenant))
+        .unwrap();
+    assert_eq!(held.total(), 799);
+    let usage = d
+        .store
+        .read(move |c| sentinel_store::retention::repo_usage(c, tenant, repo))
+        .unwrap();
+    assert_eq!(usage.artifact_bytes, 799);
+    process.stop().unwrap();
+}
+
+#[test]
+fn a_job_at_the_tenant_hard_threshold_keeps_logging_and_finishes() {
+    let d = deployment();
+    tenant_thresholds(&d, 8, 50, 100);
+    let (process, recorder, reporter, attempt, run) = artifact_attempt(&d);
+    let tenant = d.tenant;
+    publish(&reporter, attempt, "dist", "out/a.bin", &[b'a'; 8]);
+    eventually("at the threshold", || {
+        verdict_seen(&recorder, attempt, "dist", session::ArtifactCode::Stored)
+    });
+
+    // The next artifact is refused at the begin, before a byte streams.
+    reporter.artifact_begin(attempt, "cov").unwrap();
+    eventually("refused at begin", || {
+        verdict_seen(
+            &recorder,
+            attempt,
+            "cov",
+            session::ArtifactCode::QuotaExceeded,
+        )
+    });
+    assert!(!granted(&recorder, attempt, "cov"));
+
+    // Logs are counted and never refused, and the job still runs to its verdict.
+    let frame = |seq: u64, s: &str| Frame {
+        seq,
+        step: 0,
+        stream: Stream::Stdout,
+        bytes: s.as_bytes().to_vec(),
+    };
+    reporter.log(attempt, &frame(1, "still running\n")).unwrap();
+    eventually("log acked at the limit", || {
+        recorder.log_acks.lock().unwrap().last() == Some(&(attempt, 1))
+    });
+    reporter.log_end(attempt, 1, &[]).unwrap();
+    reporter.log_end(attempt, 1, &[]).unwrap();
+    assert!(
+        recorder.log_refusals.lock().unwrap().is_empty(),
+        "a log end is not refused at the tenant's limit"
+    );
+    // The attempt is still the worker's and its reports are still taken: a tenant at its limit loses artifacts,
+    // never its running work.
+    assert!(recorder.held().contains(&attempt));
+    reporter
+        .report(attempt, Fence(0), Event::StepsStarted)
+        .unwrap();
+    reporter.report(attempt, Fence(0), Event::Passed).unwrap();
+    let held = d
+        .store
+        .read(move |c| sentinel_store::retention::tenant_usage(c, tenant))
+        .unwrap();
+    assert_eq!(held.object_bytes, 8);
+    // The frames are on the attempt's log, not only acknowledged over the wire.
+    let job = d
+        .store
+        .read(move |c| sentinel_store::jobs::for_run(c, tenant, run))
+        .unwrap()[0]
+        .0;
+    let tail = d.logs.tail(run, job, attempt, 0, 10, None).unwrap();
+    assert_eq!(tail.frames.len(), 1, "the log line stored at the limit");
+    process.stop().unwrap();
+}
+
+#[test]
+fn the_tenant_cache_gives_way_before_the_artifact_is_refused() {
+    use sentinel_cache::{
+        remote::{Receiving, STORE_BUDGET_BYTES, Upload},
+        scope::{Os, Platform, Scope},
+    };
+    use sentinel_protocol::cache::{Class, Trust};
+
+    let d = deployment();
+    tenant_thresholds(&d, 8, 50, 100);
+    let store_root = d._dir.path().join("remote-cache");
+    let scope = |repo, name: &str| {
+        Scope::new(
+            d.tenant,
+            repo,
+            Class::Dependencies,
+            Trust::Protected,
+            Platform {
+                os: Os::Linux,
+                arch: Arch::X86_64,
+            },
+            Scope::toolchain_digest(b"eviction at the tenant limit"),
+            name,
+        )
+        .unwrap()
+    };
+    let ours = scope(d.repo, "deps");
+    let elsewhere = scope(RepoId::new(), "deps");
+    let stream = vec![7u8; 4096];
+    for entry in [&ours, &elsewhere] {
+        let upload = Upload::of(
+            *AttemptId::new().as_bytes(),
+            entry,
+            "deps-key",
+            stream.len() as u64,
+            *blake3::hash(&stream).as_bytes(),
+        );
+        let mut receiving = Receiving::begin(&store_root, &upload, STORE_BUDGET_BYTES)
+            .unwrap()
+            .expect("not stored yet");
+        receiving.push(0, &stream).unwrap();
+        receiving.end(upload.digest).unwrap();
+    }
+    let entry_of = |scope: &Scope| scope.entry_dir(&store_root, "deps-key");
+    assert!(entry_of(&ours).exists() && entry_of(&elsewhere).exists());
+    d.controller().set_remote_cache(store_root.clone());
+
+    let (process, recorder, reporter, attempt, _) = artifact_attempt(&d);
+    publish(&reporter, attempt, "dist", "out/a.bin", &[b'a'; 8]);
+    eventually("at the threshold", || {
+        verdict_seen(&recorder, attempt, "dist", session::ArtifactCode::Stored)
+    });
+    // The refusal evicts the tenant's cache first: its own repository gives up its bundle, nothing else does.
+    reporter.artifact_begin(attempt, "cov").unwrap();
+    eventually("refused at begin", || {
+        verdict_seen(
+            &recorder,
+            attempt,
+            "cov",
+            session::ArtifactCode::QuotaExceeded,
+        )
+    });
+    assert!(
+        !entry_of(&ours).exists(),
+        "the tenant's bundle gave way to its artifacts"
+    );
+    assert!(
+        entry_of(&elsewhere).exists(),
+        "another tenant's bundle is not this tenant's to give up"
+    );
+    process.stop().unwrap();
+}

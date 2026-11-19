@@ -53,6 +53,8 @@ pub struct Row {
     pub retain_until_ms: UnixMillis,
     pub pinned_ms: Option<UnixMillis>,
     pub created_ms: UnixMillis,
+    /// Why a failed artifact is missing (a controller's refusal), on the row an operator reads; absent otherwise.
+    pub failure: Option<String>,
 }
 
 pub fn manifest_name(job: JobId, name: &str) -> String {
@@ -91,6 +93,45 @@ pub fn record(
     )
 }
 
+/// A failed artifact with the controller's reason, for a publication the tenant's hard threshold refused: the
+/// row is what tells an operator why the artifact is missing, so the refusal is recorded where it is read.
+#[allow(clippy::too_many_arguments)]
+pub fn record_refused(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    run: RunId,
+    job: JobId,
+    attempt: AttemptId,
+    name: &str,
+    class: Option<&str>,
+    failure: &str,
+    retain_until: UnixMillis,
+    now: UnixMillis,
+) -> Result<ArtifactId> {
+    if failure.is_empty() || failure.len() > MAX_FAILURE_BYTES {
+        return Err(Error::InvalidInput("artifact failure"));
+    }
+    write(
+        tx,
+        tenant,
+        run,
+        job,
+        attempt,
+        name,
+        class,
+        State::Failed,
+        None,
+        0,
+        0,
+        retain_until,
+        now,
+        Some(failure),
+    )
+}
+
+/// The bound the `artifacts.failure` column keeps and the trigger that follows it repeats.
+pub const MAX_FAILURE_BYTES: usize = 512;
+
 /// [`record`], under the artifact's declared class: `None` takes the deployment's default class.
 // UNIQUE(attempt_id, name) turns a redelivered insert into a conflict, not a duplicate.
 #[allow(clippy::too_many_arguments)]
@@ -108,6 +149,41 @@ pub fn record_class(
     bytes: u64,
     retain_until: UnixMillis,
     now: UnixMillis,
+) -> Result<ArtifactId> {
+    write(
+        tx,
+        tenant,
+        run,
+        job,
+        attempt,
+        name,
+        class,
+        state,
+        manifest_version,
+        entries,
+        bytes,
+        retain_until,
+        now,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    run: RunId,
+    job: JobId,
+    attempt: AttemptId,
+    name: &str,
+    class: Option<&str>,
+    state: State,
+    manifest_version: Option<u64>,
+    entries: u64,
+    bytes: u64,
+    retain_until: UnixMillis,
+    now: UnixMillis,
+    failure: Option<&str>,
 ) -> Result<ArtifactId> {
     if name.is_empty() || name.len() > 64 {
         return Err(Error::InvalidInput("artifact name"));
@@ -129,8 +205,8 @@ pub fn record_class(
     tx.execute(
         "INSERT INTO artifacts(id, tenant_id, run_id, job_id, attempt_id, name, class,
              charged_bytes, state_code, manifest_version, entries, bytes, retain_until_ms,
-             created_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             created_ms, failure)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             id.as_bytes().as_slice(),
             tenant.as_bytes().as_slice(),
@@ -146,6 +222,7 @@ pub fn record_class(
             bytes as i64,
             retain_until.0,
             now.0,
+            failure,
         ],
     )?;
     Ok(id)
@@ -218,7 +295,7 @@ pub fn for_run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<Ro
     let mut stmt = conn.prepare_cached(
         "SELECT a.id, a.job_id, j.name, a.attempt_id, a.name, a.state_code,
                 a.manifest_version, a.entries, a.bytes, a.class, a.charged_bytes,
-                a.retain_until_ms, a.pinned_ms, a.created_ms
+                a.retain_until_ms, a.pinned_ms, a.created_ms, a.failure
          FROM artifacts a JOIN jobs j ON j.id = a.job_id
          WHERE a.tenant_id = ?1 AND a.run_id = ?2
          ORDER BY j.created_seq, a.created_ms, a.name",
@@ -241,6 +318,7 @@ pub fn for_run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<Ro
                 r.get::<_, i64>(11)?,
                 r.get::<_, Option<i64>>(12)?,
                 r.get::<_, i64>(13)?,
+                r.get::<_, Option<String>>(14)?,
             ))
         },
     )?;
@@ -261,6 +339,7 @@ pub fn for_run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<Ro
             retain,
             pinned,
             created,
+            failure,
         ) = row?;
         out.push(Row {
             id: ArtifactId::from_bytes(
@@ -287,6 +366,7 @@ pub fn for_run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<Ro
             retain_until_ms: UnixMillis(retain),
             pinned_ms: pinned.map(UnixMillis),
             created_ms: UnixMillis(created),
+            failure,
         });
     }
     Ok(out)
@@ -298,7 +378,7 @@ pub fn get(conn: &Connection, tenant: TenantId, run: RunId, id: ArtifactId) -> R
         .prepare_cached(
             "SELECT a.id, a.job_id, j.name, a.attempt_id, a.name, a.state_code,
                     a.manifest_version, a.entries, a.bytes, a.class, a.charged_bytes,
-                    a.retain_until_ms, a.pinned_ms, a.created_ms
+                    a.retain_until_ms, a.pinned_ms, a.created_ms, a.failure
              FROM artifacts a JOIN jobs j ON j.id = a.job_id
              WHERE a.tenant_id = ?1 AND a.run_id = ?2 AND a.id = ?3",
         )?
@@ -323,6 +403,7 @@ pub fn get(conn: &Connection, tenant: TenantId, run: RunId, id: ArtifactId) -> R
                     r.get::<_, i64>(11)?,
                     r.get::<_, Option<i64>>(12)?,
                     r.get::<_, i64>(13)?,
+                    r.get::<_, Option<String>>(14)?,
                 ))
             },
         )
@@ -342,6 +423,7 @@ pub fn get(conn: &Connection, tenant: TenantId, run: RunId, id: ArtifactId) -> R
         retain,
         pinned,
         created,
+        failure,
     ) = row;
     Ok(Row {
         id,
@@ -364,6 +446,7 @@ pub fn get(conn: &Connection, tenant: TenantId, run: RunId, id: ArtifactId) -> R
         retain_until_ms: UnixMillis(retain),
         pinned_ms: pinned.map(UnixMillis),
         created_ms: UnixMillis(created),
+        failure,
     })
 }
 
@@ -374,7 +457,7 @@ pub fn for_link(conn: &Connection, tenant: TenantId, id: ArtifactId) -> Result<R
         .prepare_cached(
             "SELECT a.job_id, j.name, a.attempt_id, a.name, a.state_code,
                     a.manifest_version, a.entries, a.bytes, a.class, a.charged_bytes,
-                    a.retain_until_ms, a.pinned_ms, a.created_ms
+                    a.retain_until_ms, a.pinned_ms, a.created_ms, a.failure
              FROM artifacts a
              JOIN jobs j ON j.id = a.job_id
              JOIN tenants t ON t.id = a.tenant_id AND t.active = 1
@@ -397,6 +480,7 @@ pub fn for_link(conn: &Connection, tenant: TenantId, id: ArtifactId) -> Result<R
                     r.get::<_, i64>(10)?,
                     r.get::<_, Option<i64>>(11)?,
                     r.get::<_, i64>(12)?,
+                    r.get::<_, Option<String>>(13)?,
                 ))
             },
         )
@@ -416,6 +500,7 @@ pub fn for_link(conn: &Connection, tenant: TenantId, id: ArtifactId) -> Result<R
         retain,
         pinned,
         created,
+        failure,
     ) = row;
     Ok(Row {
         id,
@@ -438,6 +523,7 @@ pub fn for_link(conn: &Connection, tenant: TenantId, id: ArtifactId) -> Result<R
         retain_until_ms: UnixMillis(retain),
         pinned_ms: pinned.map(UnixMillis),
         created_ms: UnixMillis(created),
+        failure,
     })
 }
 
@@ -452,7 +538,7 @@ pub fn captured(
         .prepare_cached(
             "SELECT a.id, a.job_id, j.name, a.attempt_id, a.name, a.state_code,
                     a.manifest_version, a.entries, a.bytes, a.class, a.charged_bytes,
-                    a.retain_until_ms, a.pinned_ms, a.created_ms
+                    a.retain_until_ms, a.pinned_ms, a.created_ms, a.failure
              FROM artifacts a JOIN jobs j ON j.id = a.job_id
              WHERE a.tenant_id = ?1 AND a.run_id = ?2 AND j.name = ?3 AND a.name = ?4
                AND a.state_code = 0
@@ -481,6 +567,7 @@ pub fn captured(
                     r.get::<_, i64>(11)?,
                     r.get::<_, Option<i64>>(12)?,
                     r.get::<_, i64>(13)?,
+                    r.get::<_, Option<String>>(14)?,
                 ))
             },
         )
@@ -501,6 +588,7 @@ pub fn captured(
         retain,
         pinned,
         created,
+        _failure,
     ) = row;
     Ok(Row {
         id: ArtifactId::from_bytes(
@@ -526,6 +614,8 @@ pub fn captured(
         retain_until_ms: UnixMillis(retain),
         pinned_ms: pinned.map(UnixMillis),
         created_ms: UnixMillis(created),
+        // A captured artifact is never refused, so it carries no failure.
+        failure: None,
     })
 }
 pub fn sweep_expired(

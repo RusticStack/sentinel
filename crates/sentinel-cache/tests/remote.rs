@@ -1211,3 +1211,118 @@ fn a_complete_sweep_reports_what_each_repository_keeps_after_eviction() {
         "a walk that stopped early must not pass for the whole store: {partial:?}"
     );
 }
+
+fn tenant_scope(tenant: TenantId, repo: RepoId, name: &str) -> Scope {
+    Scope::new(
+        tenant,
+        repo,
+        Class::Dependencies,
+        Trust::Protected,
+        Platform {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        },
+        Scope::toolchain_digest(b"tenant eviction test"),
+        name,
+    )
+    .unwrap()
+}
+
+/// The serve order the store records: every serve touches the entry's `current`.
+fn served_ago(entry: &Path, ago: Duration) {
+    let at = std::time::SystemTime::now() - ago;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(entry.join(scope::CURRENT_NAME))
+        .unwrap()
+        .set_modified(at)
+        .unwrap();
+}
+
+#[test]
+fn a_tenant_eviction_takes_the_least_recently_served_first_and_only_its_own_repositories() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("remote-cache");
+    let (tenant, repo) = (TenantId::new(), RepoId::new());
+    let (cold, warm, hot) = (
+        tenant_scope(tenant, repo, "cold"),
+        tenant_scope(tenant, repo, "warm"),
+        tenant_scope(tenant, repo, "hot"),
+    );
+    // Another repository in the same store is outside the pass's scope, whatever its age.
+    let outsider = test_scope(Trust::Protected);
+    for (scope, byte) in [(&cold, 1u8), (&warm, 2), (&hot, 3), (&outsider, 4)] {
+        receive(&store, scope, &[byte; 3000]);
+    }
+    served_ago(&entry_of(&store, &cold), Duration::from_secs(3600));
+    served_ago(&entry_of(&store, &warm), Duration::from_secs(600));
+    served_ago(&entry_of(&store, &hot), Duration::from_secs(60));
+    served_ago(&entry_of(&store, &outsider), Duration::from_secs(7200));
+
+    // Keep one entry's worth: the two that answered longest ago go, in that order.
+    let evicted = remote::evict_repos(&store, &[repo], 3000, 1000, UnixMillis::now().0);
+    assert!(evicted.complete, "{evicted:?}");
+    assert_eq!(evicted.entries, 2, "{evicted:?}");
+    assert_eq!(evicted.bytes, 6000);
+    assert!(
+        !entry_of(&store, &cold).exists(),
+        "the entry served first went"
+    );
+    assert!(!entry_of(&store, &warm).exists());
+    assert!(
+        entry_of(&store, &hot).exists(),
+        "the bundle served last survives a keep target that fits it"
+    );
+    assert!(
+        entry_of(&store, &outsider).exists(),
+        "another repository's bundle is not this tenant's to give up"
+    );
+
+    let partial = remote::evict_repos(&store, &[repo], 0, 1, UnixMillis::now().0);
+    assert!(
+        !partial.complete,
+        "a walk that stopped at its bound does not pass for the whole tenant: {partial:?}"
+    );
+}
+
+#[test]
+fn a_tenant_eviction_never_removes_a_bundle_a_transfer_is_using() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("remote-cache");
+    let (tenant, repo) = (TenantId::new(), RepoId::new());
+    let (in_use, other) = (
+        tenant_scope(tenant, repo, "in-use"),
+        tenant_scope(tenant, repo, "other"),
+    );
+    receive(&store, &in_use, &[1u8; 3000]);
+    receive(&store, &other, &[2u8; 3000]);
+    served_ago(&entry_of(&store, &in_use), Duration::from_secs(3600));
+    served_ago(&entry_of(&store, &other), Duration::from_secs(60));
+
+    // A transfer into the oldest entry holds its writer lock: the bundle is in use and the pass must skip it,
+    // even as the least recently served of the tenant's entries.
+    let stream = vec![5u8; 4000];
+    let upload = upload_for(&in_use, &stream);
+    let mut uploading = remote::Receiving::begin(&store, &upload, remote::STORE_BUDGET_BYTES)
+        .unwrap()
+        .expect("not stored yet");
+    uploading.push(0, &stream[..1000]).unwrap();
+
+    let evicted = remote::evict_repos(&store, &[repo], 0, 1000, UnixMillis::now().0);
+    assert_eq!(evicted.entries, 1, "{evicted:?}");
+    assert!(!entry_of(&store, &other).exists());
+    assert!(
+        entry_of(&store, &in_use).exists(),
+        "a bundle a transfer holds survives the pass"
+    );
+    assert_eq!(
+        bundles(&entry_of(&store, &in_use)).len(),
+        1,
+        "its bundle is whole"
+    );
+    // Once the transfer has let go the entry is evictable again.
+    drop(uploading);
+    let evicted = remote::evict_repos(&store, &[repo], 0, 1000, UnixMillis::now().0);
+    assert_eq!(evicted.entries, 1, "{evicted:?}");
+    assert!(!entry_of(&store, &in_use).exists());
+}

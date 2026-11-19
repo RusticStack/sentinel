@@ -27,7 +27,7 @@ const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 struct Fixture {
     dir: tempfile::TempDir,
-    store: Store,
+    store: Arc<Store>,
     objects: Arc<Objects>,
     root: UserId,
     dev: UserId,
@@ -39,7 +39,8 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
+    let store =
+        Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
     let objects = Arc::new(Objects::open(dir.path()).unwrap());
     let (root, dev, admin) = (UserId::new(), UserId::new(), UserId::new());
     let (tenant, repo, pool) = (TenantId::new(), RepoId::new(), PoolId::new());
@@ -97,6 +98,30 @@ impl Fixture {
             .writer()
             .write(move |tx| retention::set(tx, &authority, &d, tenant, repo, policy, NOW))?;
         retention::finish_reapply(&self.store, &d, tenant, repo, rest)
+    }
+
+    fn set_with(&self, d: Deployment, policy: Policy, repo: Option<RepoId>) -> Result<(), Error> {
+        let tenant = self.tenant;
+        let rest = self.store.writer().write(move |tx| {
+            retention::set(tx, &Authority::HostLocal, &d, tenant, repo, policy, NOW)
+        })?;
+        retention::finish_reapply(&self.store, &d, tenant, repo, rest)
+    }
+
+    fn upload(&self, len: u64) -> Result<(), Error> {
+        let (tenant, objects) = (self.tenant, Arc::clone(&self.objects));
+        self.store.writer().write(move |tx| {
+            objects
+                .begin_upload(tx, tenant, len, None, 60_000, UnixMillis::now())
+                .map(|_| ())
+        })
+    }
+
+    fn standing(&self, d: Deployment) -> retention::Standing {
+        let tenant = self.tenant;
+        self.store
+            .read(|c| retention::standing(c, &d, tenant))
+            .unwrap()
     }
 
     fn released_attempt(&self, released: UnixMillis) -> (RunId, JobId, AttemptId) {
@@ -190,6 +215,8 @@ fn a_tenant_policy_is_platform_administration_and_a_repository_only_narrows_it()
         quota_bytes: Some(1_000),
         log_retention_ms: Some(10 * DAY),
         artifact_retention_ms: Some(20 * DAY),
+        soft_percent: None,
+        hard_percent: None,
     };
     for user in [f.dev, f.admin] {
         assert!(matches!(
@@ -203,6 +230,8 @@ fn a_tenant_policy_is_platform_administration_and_a_repository_only_narrows_it()
         quota_bytes: Some(400),
         log_retention_ms: Some(5 * DAY),
         artifact_retention_ms: None,
+        soft_percent: None,
+        hard_percent: None,
     };
     assert!(matches!(
         f.set(credential(f.dev), Some(f.repo), narrow),
@@ -1031,6 +1060,14 @@ impl Fixture {
     }
 }
 
+fn thresholds(soft: Option<u8>, hard: Option<u8>) -> Policy {
+    Policy {
+        soft_percent: soft,
+        hard_percent: hard,
+        ..Policy::default()
+    }
+}
+
 #[test]
 fn a_class_maximum_age_shortens_a_longer_retain_at_insert() {
     let f = fixture();
@@ -1366,5 +1403,164 @@ fn a_pipeline_class_is_checked_against_what_the_deployment_defines() {
         retention::unknown_class(&defined, std::iter::empty()),
         None,
         "a pipeline that names no class takes the default"
+    );
+}
+
+#[test]
+fn a_tenant_narrows_the_deployment_thresholds_and_never_widens_them() {
+    let f = fixture();
+    let d = Deployment {
+        tenant_quota_bytes: 1_000_000,
+        soft_percent: 70,
+        hard_percent: 90,
+        ..Deployment::default()
+    };
+    assert_eq!(Deployment::default().soft_percent, 80);
+    assert_eq!(Deployment::default().hard_percent, 100);
+
+    // Exactly the deployment's own values are allowed; anything above them is refused.
+    f.set_with(d, thresholds(Some(70), Some(90)), None).unwrap();
+    assert!(matches!(
+        f.set_with(d, thresholds(Some(71), None), None),
+        Err(Error::InvalidInput("threshold above the deployment's"))
+    ));
+    assert!(matches!(
+        f.set_with(d, thresholds(None, Some(91)), None),
+        Err(Error::InvalidInput("threshold above the deployment's"))
+    ));
+    for bad in [thresholds(Some(0), None), thresholds(None, Some(101))] {
+        assert!(matches!(
+            f.set_with(d, bad, None),
+            Err(Error::InvalidInput("threshold"))
+        ));
+    }
+    assert!(
+        matches!(
+            f.set_with(d, thresholds(Some(80), Some(70)), None),
+            Err(Error::InvalidInput("threshold"))
+        ),
+        "soft above hard is not a threshold pair"
+    );
+    // A threshold is the tenant's: a repository row never carries one.
+    assert!(matches!(
+        f.set_with(d, thresholds(Some(40), None), Some(f.repo)),
+        Err(Error::InvalidInput("a threshold is the tenant's"))
+    ));
+
+    // An unset pair inherits the deployment's, a narrowed one replaces it.
+    f.set_with(d, Policy::default(), None).unwrap();
+    let own = f
+        .store
+        .read(|c| retention::policy(c, f.tenant, None))
+        .unwrap();
+    assert_eq!((own.soft_percent, own.hard_percent), (None, None));
+    let e = f
+        .store
+        .read(|c| retention::effective(c, &d, f.tenant, None))
+        .unwrap();
+    assert_eq!((e.soft_percent, e.hard_percent), (70, 90));
+    f.set_with(d, thresholds(Some(60), Some(80)), None).unwrap();
+    let narrowed = f.standing(d);
+    assert_eq!((narrowed.soft_percent, narrowed.hard_percent), (60, 80));
+    assert_eq!(narrowed.soft_bytes, 600_000);
+    assert_eq!(narrowed.hard_bytes, 800_000);
+    assert_eq!(narrowed.quota_bytes, 1_000_000);
+    assert_eq!(narrowed.state, retention::State::Ok);
+
+    // Lowering the deployment's later tightens a tenant that never set its own.
+    let tighter = Deployment {
+        soft_percent: 40,
+        hard_percent: 50,
+        ..d
+    };
+    f.set_with(tighter, Policy::default(), None).unwrap();
+    let e = f
+        .store
+        .read(|c| retention::effective(c, &tighter, f.tenant, None))
+        .unwrap();
+    assert_eq!((e.soft_percent, e.hard_percent), (40, 50));
+}
+
+#[test]
+fn the_hard_threshold_refuses_an_upload_and_the_soft_one_only_reports() {
+    let f = fixture();
+    let d = Deployment {
+        tenant_quota_bytes: 1_000_000,
+        soft_percent: 50,
+        hard_percent: 80,
+        ..Deployment::default()
+    };
+    f.objects.set_deployment(d);
+    f.upload(400_000).unwrap();
+    assert_eq!(f.standing(d).state, retention::State::Ok);
+
+    // Over the soft threshold nothing is refused: it is a state, not a gate.
+    f.upload(200_000).unwrap();
+    let soft = f.standing(d);
+    assert_eq!(soft.state, retention::State::Soft);
+    assert_eq!(soft.used, 600_000);
+    assert_eq!(soft.soft_bytes, 500_000);
+    assert_eq!(soft.hard_bytes, 800_000);
+    f.upload(199_999).unwrap();
+
+    // The hard threshold is the enforced bound: 800 000 bytes, not the quota itself.
+    f.upload(1).unwrap();
+    let held = f.standing(d);
+    assert_eq!(held.state, retention::State::Hard);
+    assert_eq!(held.used, held.hard_bytes);
+    assert!(matches!(f.upload(1), Err(Error::QuotaExceeded)));
+
+    // A log is counted, never refused: the evidence of what ran is not held back at the limit.
+    let (_, _, attempt) = f.released_attempt(NOW);
+    assert_eq!(f.stamp(d, 5_000), 1);
+    let after = f.standing(d);
+    assert_eq!(after.state, retention::State::Hard);
+    assert_eq!(after.used, held.used + 5_000);
+    assert!(after.used > after.hard_bytes);
+    assert!(f.expires(attempt).is_some());
+}
+
+#[test]
+fn concurrent_uploads_at_the_boundary_exceed_the_limit_by_at_most_one_charge() {
+    let f = fixture();
+    let d = Deployment {
+        tenant_quota_bytes: 1_000_000,
+        ..Deployment::default()
+    };
+    f.objects.set_deployment(d);
+    let charge = 300_000;
+    let start = Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let (store, objects, tenant, start) = (
+            Arc::clone(&f.store),
+            Arc::clone(&f.objects),
+            f.tenant,
+            Arc::clone(&start),
+        );
+        handles.push(std::thread::spawn(move || {
+            start.wait();
+            store
+                .writer()
+                .write(move |tx| {
+                    objects
+                        .begin_upload(tx, tenant, charge, None, 60_000, UnixMillis::now())
+                        .map(|_| ())
+                })
+                .is_ok()
+        }));
+    }
+    let accepted = handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .filter(|ok| *ok)
+        .count();
+    // Three charges fit in the quota and the fourth would not, whatever order the writer served them in.
+    assert_eq!(accepted, 3);
+    let used = f.standing(d).used;
+    assert!(used <= d.tenant_quota_bytes, "{used}");
+    assert!(
+        used + charge > d.tenant_quota_bytes,
+        "the boundary was reached, not passed: {used}"
     );
 }

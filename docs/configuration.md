@@ -124,6 +124,8 @@ low_watermark_bytes = 33554432000  # discretionary writes refuse when free space
 high_watermark_bytes = 67108864000 # …and admit again above this (≥ low); default twice low
 quota_bytes = 0                    # cap on what every tenant stores together (objects, uploads, logs); 0 = unlimited (default)
 tenant_quota_bytes = 0             # default cap per tenant, the same kinds of bytes; 0 = unlimited (default; one upload still declares at most 4 GiB)
+soft_percent = 80                  # percent of that cap where a tenant is warned, nothing refused (1..=100); a tenant may lower it
+hard_percent = 100                 # percent where its caches are evicted and its artifacts refused (1..=100, at least soft_percent); a tenant may lower it
 log_retention_secs = 1209600       # finished attempt logs kept this long unless a tenant or repository says otherwise (1 h .. 366 d, default 14 d)
 artifact_retention_secs = 7776000  # longest a pipeline's `retain` may keep an artifact; longer is shortened to it (1 h .. 366 d, default 90 d)
 run_artifact_bytes = 17179869184   # artifact bytes one run may store (1 MiB .. 1 TiB, default 16 GiB)

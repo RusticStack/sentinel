@@ -436,7 +436,7 @@ fn upgrade_sources() -> Vec<u32> {
 fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expects() {
     // docs/upgrades.md (tests/compat_doc.rs compares it with the code): a database at schema N
     // runs on release R only when no migration in (R, N] declares a readable_by above R. Rows
-    // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, 68, LATEST.
+    // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, 68, 69, LATEST.
     let readable = |db: &Connection, release: u32, newest: u32| -> bool {
         let needs: u32 = db
             .query_row(
@@ -449,11 +449,11 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        69,
+        70,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
-    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 67, 68]);
+    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 68, 69]);
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.sqlite");
@@ -468,7 +468,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         drop(store);
         assert_eq!(version(&path), schema::LATEST, "from {from}");
         let db = Connection::open(&path).unwrap();
-        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68, 69]
+        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68, 69, 70]
             .iter()
             .map(|&newest| from >= newest || readable(&db, from, newest))
             .collect();
@@ -485,25 +485,57 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         // (runner mode) is readable by nothing either: an older controller re-reads a queued
         // workflow_job delivery as failed:unsupported_event and completes a check runner mode never
         // publishes, and it knows neither the tenant's switch nor the installation's permissions.
+        // Migration 70 (the storage thresholds) is readable by 69: no schema-69 statement reads or
+        // writes the new columns, its `storage_defaults` insert takes their defaults and a tenant
+        // policy it writes leaves them NULL, which inherits; while an older controller runs on the
+        // result it enforces the bare quota instead of the tenant's narrowed hard threshold.
         let expected = match from {
             44 | 47 | 48 => [
-                false, false, false, false, false, false, false, false, false,
+                false, false, false, false, false, false, false, false, false, false,
             ],
-            51 => [true, false, false, false, false, false, false, false, false],
-            56 => [true, true, false, false, false, false, false, false, false],
-            57 => [true, true, true, false, false, false, false, false, false],
-            63 => [true, true, true, true, false, false, false, false, false],
-            64 | 65 => [true, true, true, true, true, false, false, false, false],
-            66 => [true, true, true, true, true, true, true, false, false],
-            67 => [true, true, true, true, true, true, true, false, false],
-            68 => [true, true, true, true, true, true, true, true, false],
+            51 => [
+                true, false, false, false, false, false, false, false, false, false,
+            ],
+            56 => [
+                true, true, false, false, false, false, false, false, false, false,
+            ],
+            57 => [
+                true, true, true, false, false, false, false, false, false, false,
+            ],
+            63 => [
+                true, true, true, true, false, false, false, false, false, false,
+            ],
+            64 | 65 => [
+                true, true, true, true, true, false, false, false, false, false,
+            ],
+            66 | 67 => [
+                true, true, true, true, true, true, true, false, false, false,
+            ],
+            68 => [true, true, true, true, true, true, true, true, false, false],
+            69 => [true, true, true, true, true, true, true, true, true, true],
             _ => unreachable!(),
         };
         assert_eq!(
             ok, expected,
-            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69"
+            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69, 70"
         );
     }
+}
+
+/// Every object SQLite holds, so two databases can be compared as schemas rather than by whatever a test
+/// happened to look for. `schema_migrations` is skipped: whatever opens the database first (the store, or a
+/// fixture with its own literal) writes its text, so it is not the migrations' to compare.
+fn schema_sql(db: &Connection) -> Vec<(String, String, String)> {
+    let mut stmt = db
+        .prepare(
+            "SELECT type, name, COALESCE(sql, '') FROM sqlite_master
+             WHERE name != 'schema_migrations' ORDER BY type, name",
+        )
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
 }
 
 fn schema_objects(db: &Connection) -> Vec<(String, String)> {
@@ -629,4 +661,77 @@ fn a_database_upgraded_from_066_equals_a_fresh_one() {
         fresh_store.read(|c| Ok(schema_objects(c))).unwrap(),
         "the upgraded database has the schema a fresh one has"
     );
+}
+
+#[test]
+fn a_database_upgraded_from_066_has_the_thresholds_a_fresh_one_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let upgraded = dir.path().join("upgraded.sqlite");
+    let tenant = TenantId::new();
+    let id = tenant.as_bytes().to_vec();
+    let seed = database_at(&upgraded, 66);
+    seed.execute(
+        "INSERT INTO tenants(id, slug, created_ms) VALUES (?1, 'acme', 1)",
+        params![id.as_slice()],
+    )
+    .unwrap();
+    seed.execute(
+        "INSERT INTO tenant_usage(tenant_id, bytes) VALUES (?1, 500)",
+        params![id.as_slice()],
+    )
+    .unwrap();
+    seed.execute(
+        "INSERT INTO storage_policies(tenant_id, repo_id, quota_bytes, updated_ms)
+         VALUES (?1, X'', 1000, 1)",
+        params![id.as_slice()],
+    )
+    .unwrap();
+    drop(seed);
+
+    let (store, copy) = upgrade::open_upgrading(&upgraded, Durability::Full).unwrap();
+    assert!(copy.is_some(), "a pending migration takes a copy first");
+    // The row the tenant already had keeps its quota and inherits both thresholds; the deployment's
+    // defaults are the ones the migration wrote.
+    let (d, policy, effective) = store
+        .read(|c| {
+            let d = sentinel_store::retention::installed(c)?;
+            Ok((
+                d,
+                sentinel_store::retention::policy(c, tenant, None)?,
+                sentinel_store::retention::effective(c, &d, tenant, None)?,
+            ))
+        })
+        .unwrap();
+    assert_eq!((d.soft_percent, d.hard_percent), (80, 100));
+    assert_eq!(policy.quota_bytes, Some(1000));
+    assert_eq!((policy.soft_percent, policy.hard_percent), (None, None));
+    assert_eq!((effective.soft_percent, effective.hard_percent), (80, 100));
+    let standing = store
+        .read(|c| sentinel_store::retention::standing(c, &d, tenant))
+        .unwrap();
+    assert_eq!(standing.used, 500);
+    assert_eq!((standing.soft_bytes, standing.hard_bytes), (800, 1000));
+    let upgraded_schema = store.read(|c| Ok(schema_sql(c))).unwrap();
+    drop(store);
+
+    let fresh = dir.path().join("fresh.sqlite");
+    drop(Store::open(&fresh, Durability::Full).unwrap());
+    let fresh_schema = schema_sql(&Connection::open(&fresh).unwrap());
+    let differing: Vec<_> = upgraded_schema
+        .iter()
+        .filter_map(|row| {
+            let fresh = fresh_schema
+                .iter()
+                .find(|f| (f.0.as_str(), f.1.as_str()) == (row.0.as_str(), row.1.as_str()));
+            match fresh {
+                Some(fresh) if fresh.2 == row.2 => None,
+                other => Some((row.clone(), other.cloned())),
+            }
+        })
+        .collect();
+    assert!(
+        differing.is_empty(),
+        "an upgraded database has the schema a fresh one has: {differing:?}"
+    );
+    assert_eq!(upgraded_schema.len(), fresh_schema.len());
 }

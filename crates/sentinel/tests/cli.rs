@@ -1632,7 +1632,59 @@ fn admin_tenant_storage_shows_sets_and_inherits() {
     ]));
     assert_eq!(all["policy"]["log_retention_ms"], serde_json::Value::Null);
 
+    // Thresholds narrow from the deployment's 80 % and 100 % and inherit again with the rest.
+    assert_eq!(shown["effective"]["soft_percent"], 80);
+    assert_eq!(shown["effective"]["hard_percent"], 100);
+    let narrowed = json(admin(&[
+        "tenant",
+        "storage",
+        "--tenant",
+        "acme",
+        "--soft-percent",
+        "60",
+        "--hard-percent",
+        "90",
+    ]));
+    assert_eq!(narrowed["policy"]["soft_percent"], 60);
+    assert_eq!(narrowed["effective"]["hard_percent"], 90);
+    let inherited = json(admin(&[
+        "tenant",
+        "storage",
+        "--tenant",
+        "acme",
+        "--inherit",
+        "thresholds",
+    ]));
+    assert_eq!(inherited["policy"]["soft_percent"], serde_json::Value::Null);
+    assert_eq!(inherited["effective"]["soft_percent"], 80);
+
     for refused in [
+        vec![
+            "tenant",
+            "storage",
+            "--tenant",
+            "acme",
+            "--soft-percent",
+            "90",
+        ],
+        vec![
+            "tenant",
+            "storage",
+            "--tenant",
+            "acme",
+            "--hard-percent",
+            "101",
+        ],
+        vec![
+            "tenant",
+            "storage",
+            "--tenant",
+            "acme",
+            "--soft-percent",
+            "70",
+            "--hard-percent",
+            "60",
+        ],
         vec!["tenant", "storage", "--tenant", "acme", "--inherit", "logs"],
         vec![
             "tenant",
