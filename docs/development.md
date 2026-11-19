@@ -136,7 +136,7 @@ Run from a disposable checkout on the verification host. Do not use a production
 
 Benchmarks run only on the host class pinned by their contract. Set `SENTINEL_BENCH_HOST_LABEL` and, when an account label is needed, `SENTINEL_BENCH_USER_LABEL` to stable anonymized values for public records; the harnesses do not capture machine or account names. Record load and CPU pressure with every sample, and never combine measurements from different hosts into one series. A contended host is not a baseline.
 
-The `test-*` aliases use cargo-nextest with `--no-fail-fast`, running every test of every binary in parallel and in separate processes. The workspace has no doctests. `tests/browser.rs` supplies its own libtest-compatible entry point for nextest discovery and filtering.
+The `test-*` aliases use cargo-nextest with `--no-fail-fast`, running every test of every binary in parallel and in separate processes. The workspace has no doctests. `tests/browser.rs` supplies its own libtest-compatible entry point for nextest discovery and filtering. The `sentinel-link` fleet binaries are the exception: they drive real controller and worker sessions and several of them assert on placement order and throughput, which a shared CPU distorts, so `.config/nextest.toml` runs `fleet` and `fleet_sessions` one test at a time.
 
 `bench/smoke.sh [--quick]` runs the benchmark harnesses once at tiny parameters (every Python unit test under `bench/`, the Q13 self-test, and `bench/micro-run.sh --smoke` for each contract whose binary is built) and counts passes, pending runs and missing binaries apart; it belongs on the Linux verification host, like every other test ([benchmarking](benchmarking.md#harness-smoke)).
 

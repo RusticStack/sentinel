@@ -1,0 +1,9 @@
+# The fleet tests drive a real controller and real worker sessions over sockets, and several of them
+# assert on placement and throughput, which other tests sharing the CPU distort. They run one at a
+# time; everything else keeps the default parallelism.
+[test-groups.fleet]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "package(sentinel-link) and (binary(fleet) or binary(fleet_sessions))"
+test-group = "fleet"
