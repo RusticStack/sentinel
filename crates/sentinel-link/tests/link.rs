@@ -662,6 +662,93 @@ fn wrong_fingerprint_unsupported_version_and_expired_enrollment_are_refused_in_p
     assert!(matches!(failure, Error::Rejected(Rejection::Enrollment)));
 }
 
+/// A controller and a worker from different releases meet at the highest protocol both speak. A pair
+/// with nothing in common is refused as a value, the refusal says which side has to move, and the
+/// enrolled worker keeps the protocol it last negotiated: a refused hello renegotiates nothing.
+#[test]
+fn a_worker_from_another_release_is_refused_and_told_which_side_must_move() {
+    let d = deployment();
+    let secret = d.enrollment(60_000);
+    let worker = WorkerId::new();
+    let identity = Identity::generate("w").unwrap();
+    let fingerprint = identity.fingerprint();
+    drop(d.connect(identity, worker, Some(&secret)).unwrap());
+    let stored = || {
+        d.store
+            .read(move |c| Ok(workers::authenticate(c, &fingerprint)?.negotiated.protocol))
+            .unwrap()
+    };
+    assert_eq!(stored(), ProtocolVersion(hello().protocol_max.0));
+
+    let offer = |min: u16, max: u16| -> Error {
+        let config = tls::client_config(
+            Identity::generate("other").unwrap(),
+            d.controller().fingerprint(),
+        )
+        .unwrap();
+        session::connect(
+            d.controller().local_addr(),
+            config,
+            worker,
+            "worker-1",
+            Hello {
+                protocol_min: ProtocolVersion(min),
+                protocol_max: ProtocolVersion(max),
+                ..hello()
+            },
+            None,
+            CAPACITY,
+        )
+        .unwrap_err()
+    };
+
+    // Older than anything this controller serves: the worker is the one to upgrade.
+    let behind = offer(0, 0);
+    let Error::Rejected(why) = &behind else {
+        panic!("expected a refusal, got {behind}");
+    };
+    assert_eq!(
+        *why,
+        Rejection::UnsupportedVersion {
+            supported_min: sentinel_protocol::negotiate::SUPPORTED_MIN.0,
+            supported_max: sentinel_protocol::negotiate::SUPPORTED_MAX.0,
+            upgrade_worker: true,
+        }
+    );
+    assert!(
+        why.reason().contains("upgrade the worker"),
+        "{}",
+        why.reason()
+    );
+
+    // Newer than anything this controller serves (a rolled-back controller): it is the one to upgrade.
+    let ahead = offer(
+        sentinel_protocol::negotiate::SUPPORTED_MAX.0 + 1,
+        sentinel_protocol::negotiate::SUPPORTED_MAX.0 + 2,
+    );
+    let Error::Rejected(why) = &ahead else {
+        panic!("expected a refusal, got {ahead}");
+    };
+    assert!(
+        matches!(
+            why,
+            Rejection::UnsupportedVersion {
+                upgrade_worker: false,
+                ..
+            }
+        ),
+        "{why:?}"
+    );
+    assert!(
+        why.reason().contains("upgrade the controller"),
+        "{}",
+        why.reason()
+    );
+
+    // Neither refusal renegotiated anything: the enrolled worker keeps the version it last spoke.
+    assert_eq!(stored(), ProtocolVersion(hello().protocol_max.0));
+}
+
 const PIPELINE: &str = "schema: 1
 on: [push]
 jobs:

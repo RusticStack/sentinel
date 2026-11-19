@@ -94,6 +94,13 @@ pub enum Error {
         snapshot: Option<String>,
         cause: String,
     },
+    /// The database was migrated by a newer release and every migration this binary does not know
+    /// declares it cannot read the result.
+    SchemaNewer {
+        database: u32,
+        binary: u32,
+        needs: u32,
+    },
 }
 
 impl fmt::Display for Error {
@@ -139,6 +146,14 @@ impl fmt::Display for Error {
                     None => f.write_str("; restore the last backup to roll back"),
                 }
             }
+            Self::SchemaNewer {
+                database,
+                binary,
+                needs,
+            } => write!(
+                f,
+                "the database is at schema {database} and this build reads {binary}: it needs schema {needs} to run; start that release, or restore the copy taken before its upgrade (metadata.sqlite.vNNN) or a backup"
+            ),
         }
     }
 }
@@ -194,6 +209,7 @@ impl Error {
             Self::IdempotencyMismatch => "idempotency_mismatch",
             Self::Io(_) => "io",
             Self::MigrationFailed { .. } => "migration_failed",
+            Self::SchemaNewer { .. } => "schema_newer",
         }
     }
 }
@@ -275,7 +291,11 @@ pub fn migrate(conn: &mut Connection) -> Result<u32> {
             .flatten();
         return match needs {
             Some(needs) if needs <= schema::LATEST => Ok(current),
-            _ => Err(Error::Corrupt("unsupported database version")),
+            _ => Err(Error::SchemaNewer {
+                database: current,
+                binary: schema::LATEST,
+                needs: needs.unwrap_or(current),
+            }),
         };
     }
     for &(version, sql) in schema::MIGRATIONS {

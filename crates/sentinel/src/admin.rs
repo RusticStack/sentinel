@@ -344,6 +344,14 @@ fn upgrade_check(data: &DataDir) -> Result<(), Error> {
             "database_bytes": i.bytes,
             "free_bytes": report.free_bytes,
             "needed_bytes": report.needed_bytes,
+            "copy": report.copy.as_ref().map(|p| p.display().to_string()),
+            "steps": report.steps.iter().map(|s| serde_json::json!({
+                "migration": s.version,
+                "rewrites": s.rewrites.iter().map(|r| serde_json::json!({
+                    "table": r.table,
+                    "rows": r.rows,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
             "sealed_values": report.sealed_values,
             "key_present": report.key_present,
             "worker_protocol": {
