@@ -118,6 +118,8 @@ pub enum Event {
     WorkerEnrollmentRevoked = 93,
     WorkerPolicyChanged = 94,
     WorkerNodeKeyAuthorized = 95,
+    AiPolicyChanged = 96,
+    TenantAiPolicyChanged = 97,
 }
 
 impl Event {
@@ -199,6 +201,8 @@ impl Event {
             Event::WorkerEnrollmentRevoked => "worker-enrollment-revoked",
             Event::WorkerPolicyChanged => "worker-policy-changed",
             Event::WorkerNodeKeyAuthorized => "worker-node-key-authorized",
+            Event::AiPolicyChanged => "ai-policy-changed",
+            Event::TenantAiPolicyChanged => "tenant-ai-policy-changed",
         }
     }
 
@@ -280,6 +284,8 @@ impl Event {
             93 => Event::WorkerEnrollmentRevoked,
             94 => Event::WorkerPolicyChanged,
             95 => Event::WorkerNodeKeyAuthorized,
+            96 => Event::AiPolicyChanged,
+            97 => Event::TenantAiPolicyChanged,
             _ => return None,
         })
     }
@@ -1174,8 +1180,8 @@ mod tests {
                 assert!(names.insert(event.name()), "name {} reused", event.name());
             }
         }
-        // 62 contiguous codes plus the 70..=77 and 90..=95 blocks; a new event must be added to `from_code` too.
-        assert_eq!(known, 62 + 8 + 6, "an event is missing from from_code");
+        // 62 contiguous codes plus the 70..=77 and 90..=97 blocks; a new event must be added to `from_code` too.
+        assert_eq!(known, 62 + 8 + 8, "an event is missing from from_code");
         assert!(Event::from_code(0).is_none() && Event::from_code(63).is_none());
     }
 

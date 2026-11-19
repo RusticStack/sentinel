@@ -177,6 +177,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         66,
         include_str!("migrations/066_merge_group_deliveries.sql"),
     ),
+    (67, include_str!("migrations/067_ai_policy.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -192,6 +193,7 @@ pub const READABLE_BY: &[(u32, u32)] = &[
     (58, 57),
     (64, 63),
     (65, 64),
+    (67, 66),
 ];
 
 pub fn readable_by(version: u32) -> u32 {

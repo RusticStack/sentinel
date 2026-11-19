@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod artifacts;
 pub mod auth;
 pub mod auto_join;

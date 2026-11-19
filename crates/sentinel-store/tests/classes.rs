@@ -698,6 +698,9 @@ fn database_at_latest_without_classes(path: &Path) {
          DROP INDEX provenance_by_group_ref;
          ALTER TABLE run_provenance DROP COLUMN group_ref;
          DROP TABLE merge_deliveries;
+         DROP TABLE tenant_ai;
+         ALTER TABLE deployment_policy DROP COLUMN ai_providers;
+         ALTER TABLE deployment_policy DROP COLUMN ai_enabled;
          DELETE FROM schema_migrations WHERE version >= 65;",
     )
     .unwrap();
