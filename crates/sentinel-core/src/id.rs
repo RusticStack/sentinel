@@ -96,6 +96,7 @@ identifier!(CheckId, "chk");
 identifier!(UploadId, "upl");
 identifier!(ArtifactId, "arf");
 identifier!(GrantId, "grt");
+identifier!(RunnerLeaseId, "rsl");
 
 /// Steps are referenced by index; `u16` caps a job at 65,536 steps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

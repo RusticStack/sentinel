@@ -361,6 +361,23 @@ pub fn record(
     };
     // Zero means the job was already at or past this activity: the delivery is still settled.
     let _ = changed;
+    // The runner GitHub assigned is the name the lease was registered under, so this delivery is
+    // what binds a job to the runner Sentinel started — and `completed` is what ends its lease.
+    match terms.action.as_str() {
+        IN_PROGRESS => {
+            if let Some(runner) = terms.runner.as_deref() {
+                crate::runner_provision::bind(tx, tenant, repo, runner, terms.job, now)?;
+            }
+        }
+        COMPLETED => {
+            let reason = match terms.conclusion.as_deref() {
+                Some("cancelled") => crate::runner_provision::CANCELLED,
+                _ => crate::runner_provision::JOB_COMPLETED,
+            };
+            crate::runner_provision::complete(tx, tenant, repo, terms.job, reason, now)?;
+        }
+        _ => {}
+    }
     intake::settle_runner(tx, delivery.id, now)
 }
 

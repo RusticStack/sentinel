@@ -191,6 +191,92 @@ purging are the same as for every other delivery; the job rows are not, because
 they are what provisioning works from ([sources](sources.md#workflow-jobs),
 [GitHub App](github-app.md#runner-mode-permissions)).
 
+### Demand, provisioning and reconciliation
+
+A queued job is a unit of **demand**, not a job waiting for one machine. GitHub
+assigns it to whichever idle runner matches its labels, so Sentinel counts what
+is queued per label set and leases capacity for each unit that no live runner
+already covers (`runner_jobs_queued` and `runner_leases_live`, one partial index
+probe each). A lease is placed for the label set, never for the job that caused
+it; the `in_progress` delivery names the runner Sentinel registered, and that is
+what binds a job to its lease — `completed` ends it.
+
+A worker is leased capacity for **one** ephemeral runner of a class it serves,
+and it serves a class only by naming that class's label in its profile: what a
+machine can run is the machine's statement, never the controller's guess. A
+lease holds the class's CPU and memory (`dispatch::free_capacity` subtracts it
+beside the attempts), so a runner and a pipeline job never both claim the same
+room. Placement runs in rounds across the free workers of the pool, so a burst
+of queued jobs spreads over the fleet before any machine takes a second one, and
+a deployment of one worker still fills that worker's room within the same pass.
+
+At lease the controller asks the App for the runner's just-in-time
+configuration — `generate-jitconfig` against the organization, in the runner
+group the deployment states, or against the repository for a personal namespace
+— and stores it sealed under a context that binds the tenant, the repository and
+the lease. It is delivered once: the frame is the worker protocol's sensitive
+class (its encode buffer is wiped after the write), and the same statement that
+returns the bytes to the delivery clears them, so a second reader, a retried
+frame or a copy of the database finds nothing. Nothing logs it and nothing puts
+it in a row that a reader could unseal without the master key.
+
+Three sweeps make the fleet self-correcting, and each is bounded by a setting:
+
+- **offer lapsed** — no answer within five seconds; the capacity returns to the
+  queue and the worker is told to stop the lease it may have kept.
+- **idle bound** (`idle_ms`, 120 s by default) — a runner no job took by then is
+  released, its registration removed at GitHub (`DELETE .../actions/runners/{id}`,
+  where "already gone" is the state we wanted, because an ephemeral runner
+  de-registers itself after its job) and its worker told to stop.
+- **session lost or worker revoked** — every lease that worker held is released
+  at once, and the registrations go through the same removal sweep.
+
+**Reconciliation** covers what events cannot. Every `reconcile_ms` (60 s by
+default) the controller reads GitHub's own queue for the repositories whose
+bindings have runner mode on — `GET .../actions/runs?status=queued` and each
+run's `jobs?filter=queued` — and records as demand any queued job whose labels
+name a class the deployment serves and that no delivery announced. The pass is
+bounded to 8 repositories per interval and 5 runs of each, in a stable order
+that continues after the last repository it read, so a larger deployment is
+covered over successive passes rather than by one unbounded burst of requests.
+A lost event is therefore recovered within the interval plus one pass.
+
+**Why webhooks plus reconciliation, and not GitHub's scale-set protocol.**
+Decided by measurement on 2026-11-19 (recording host: this deployment's build
+machine, x86_64, debug build; GitHub is the recorded fake on loopback, one
+worker, one repository, 50 and 20 samples):
+
+| Path | Measure | Result |
+|---|---|---|
+| `queued` delivery → offer in a worker's hands | p50, p95, max over 50 events | 1.19 ms, 597 ms, 991 ms (bounded above by the one-second provisioning pass) |
+| lost `queued` event → recorded as demand | p50, p95, max over 20 events, `reconcile_ms` = 1 s | 1.05 s, 1.14 s, 1.22 s (the interval plus 50–220 ms of pass) |
+| one repository's queue read (the pass's GitHub calls) | p50, p95 over 20 reads | 88 ms, 92 ms |
+
+The webhook path already answers in single-digit milliseconds at the median, and
+the only thing reconciliation adds to a *lost* event is the interval an operator
+chose: at the shipped defaults one repository's read is well under a second of a
+sixty-second budget. The scale-set protocol would need a new authenticated HTTP
+surface and its own session loop, plus a registration round trip per queued job,
+to remove that wait — which is what GitHub's own guidance reserves for volumes
+where webhooks alone cannot keep up. Sentinel's own gate is a bounded recovery,
+not a tight one, so it takes the smaller surface and says the bound out loud. The
+measurement harness is `demand_source_numbers` in
+`crates/sentinel-link/tests/runner_mode.rs` (`--ignored`), so the numbers can be
+re-taken on a verification host rather than trusted from this table.
+
+What this path does not do is decide a *class*: `runner-classes.json` states the
+classes the deployment serves, and a job of any other class is refused at intake
+before it becomes demand ([configuration](configuration.md#runner-classes)).
+
+The gate this work is held to, as tests in
+`crates/sentinel-link/tests/runner_mode.rs` and
+`crates/sentinel-store/tests/runner_provision.rs`: a burst of queued jobs gets
+one runner each (`a_burst_of_queued_jobs_gets_one_runner_each`, and the store's
+`one_burst_spreads_over_the_fleet_before_any_machine_takes_two`); a lost event is
+recovered within the reconciliation bound
+(`a_lost_queued_event_is_recovered_by_reconciliation`); no runner outlives its
+bound idle (`an_idle_runner_is_stopped_and_de_registered_at_its_bound`).
+
 ## Hook secrets
 
 One active secret per repository, digest-only in `source_intake_tokens`

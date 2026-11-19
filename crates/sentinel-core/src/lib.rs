@@ -7,8 +7,8 @@ pub mod time;
 
 pub use id::{
     ArtifactId, AttemptId, CheckId, DeliveryId, Fence, GrantId, InstallationId, InvalidId,
-    InvitationId, JobId, MailId, PoolId, RepoId, RunId, SecretId, SessionId, StepIndex, TenantId,
-    TokenId, UploadId, UserId, WorkerId,
+    InvitationId, JobId, MailId, PoolId, RepoId, RunId, RunnerLeaseId, SecretId, SessionId,
+    StepIndex, TenantId, TokenId, UploadId, UserId, WorkerId,
 };
 pub use runner::{Labelled, RunnerClass, RunnerOs, RunnerPermissions};
 pub use state::{

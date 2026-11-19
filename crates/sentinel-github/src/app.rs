@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 pub struct App {
     id: u64,
     key: RsaKeyPair,
-    http: Client,
-    endpoint: String,
+    pub(crate) http: Client,
+    pub(crate) endpoint: String,
 }
 
 /// The App in force, shared by every component that acts as it. It is set at most once — at
@@ -597,7 +597,7 @@ impl App {
         )
     }
 
-    fn repository_token(
+    pub(crate) fn repository_token(
         &self,
         installation: u64,
         account: u64,
@@ -606,27 +606,10 @@ impl App {
         now_ms: i64,
         permissions: &[(&str, &str)],
     ) -> Result<Token> {
-        let installed = self.installation(installation, now_ms)?;
-        if installed.suspended
-            || !installed.permissions_valid
-            || installed.account_id != account
-            || repo == 0
-        {
+        if repo == 0 {
             return Err(Error::Response("installation access refused"));
         }
-        let granted: serde_json::Map<String, Value> = permissions
-            .iter()
-            .map(|(key, value)| ((*key).to_owned(), Value::from(*value)))
-            .collect();
-        let value = self.http.post_authenticated(
-            &format!(
-                "{}/app/installations/{installation}/access_tokens",
-                self.endpoint
-            ),
-            &self.jwt(now_ms)?,
-            &json!({"repository_ids":[repo],"permissions":granted}),
-        )?;
-        let token = parse_token(&value, now_ms, permissions)?;
+        let token = self.scoped_token(installation, account, Some(repo), now_ms, permissions)?;
         let repository = self.http.get_authenticated(
             &format!("{}/repositories/{repo}", self.endpoint),
             &token.secret,
@@ -638,6 +621,40 @@ impl App {
             return Err(Error::Response("repository identity or remote changed"));
         }
         Ok(token)
+    }
+
+    /// An installation token scoped to one repository, or — with no repository — to everything the
+    /// installation covers. Organization-scope runner registration names no repository, because
+    /// the runner it registers belongs to the organization, not to one of its repositories.
+    pub(crate) fn scoped_token(
+        &self,
+        installation: u64,
+        account: u64,
+        repository: Option<u64>,
+        now_ms: i64,
+        permissions: &[(&str, &str)],
+    ) -> Result<Token> {
+        let installed = self.installation(installation, now_ms)?;
+        if installed.suspended || !installed.permissions_valid || installed.account_id != account {
+            return Err(Error::Response("installation access refused"));
+        }
+        let granted: serde_json::Map<String, Value> = permissions
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), Value::from(*value)))
+            .collect();
+        let body = match repository {
+            Some(repo) => json!({"repository_ids":[repo],"permissions":granted}),
+            None => json!({"permissions":granted}),
+        };
+        let value = self.http.post_authenticated(
+            &format!(
+                "{}/app/installations/{installation}/access_tokens",
+                self.endpoint
+            ),
+            &self.jwt(now_ms)?,
+            &body,
+        )?;
+        parse_token(&value, now_ms, permissions)
     }
 }
 

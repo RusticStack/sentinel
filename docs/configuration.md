@@ -267,7 +267,12 @@ SENTINEL_AUTO_JOIN_DOMAINS="example.com=engineering, example.org, bücher.exampl
 ([plan 16.10](../plan.md#1610-github-actions-runner-mode), [sources](sources.md#workflow-jobs)):
 
 ```json
-{"classes": ["sentinel-4vcpu-ubuntu-2404", "sentinel-16vcpu-ubuntu-2404-arm"]}
+{
+  "classes": ["sentinel-4vcpu-ubuntu-2404", "sentinel-16vcpu-ubuntu-2404-arm"],
+  "runner_group_id": 1,
+  "idle_ms": 120000,
+  "reconcile_ms": 60000
+}
 ```
 
 - Each entry is a **label**, exactly as a workflow's `runs-on:` names it:
@@ -283,6 +288,20 @@ SENTINEL_AUTO_JOIN_DOMAINS="example.com=engineering, example.org, bücher.exampl
   placed somewhere else.
 - The classes are read at start and reported by `GET /tenants/{slug}/runner-mode`, which is where a
   tenant reads what its workflows may name ([API](api.md#routes)).
+- `runner_group_id` is the runner group an organization's runners register in (GitHub's default
+  group is `1`); a repository registration, which is what a personal namespace uses, has none.
+  `idle_ms` is how long a runner may sit without a job before it is de-registered and its sandbox
+  destroyed (1 s to 24 h), and `reconcile_ms` is how often the pass reads GitHub's own queue for
+  lost `queued` deliveries (5 s to 24 h). All three are optional and default to the values above, so
+  a file written before they existed loads unchanged.
+- **A worker serves a class only by naming its label** among its profile labels (`labels` in the
+  worker's configuration, e.g. `sentinel-4vcpu-ubuntu-2404`). The deployment states what it can
+  serve; each machine states what it can run, and a runner is never offered to a worker that did
+  not claim the class ([worker link](worker-link.md#protocol-13-runner-leases)).
+- Every class reserves 1,000 millicores of CPU and 2 GiB of memory per vCPU when the scheduler
+  leases a worker's capacity. The sandbox itself gets what
+  the class names; the reservation is what stops a worker being handed more runners than it has
+  room for ([intake](intake.md#demand-provisioning-and-reconciliation)).
 
 ### Remote cache
 

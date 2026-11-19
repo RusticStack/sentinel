@@ -8,6 +8,7 @@ pub mod fake;
 pub mod http;
 pub mod manifest;
 pub mod oauth;
+pub mod runner;
 pub mod webhook;
 
 use std::fmt;

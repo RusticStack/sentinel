@@ -413,6 +413,33 @@ struct State {
     recovering: HashMap<AttemptId, Arc<LogPipe>>,
     artifact_waits: HashMap<AttemptId, Arc<Watch>>,
     draining: bool,
+    /// Runner-mode leases this worker holds, with the configuration once the controller delivers it.
+    /// AR03 starts the runner with it; nothing here writes it anywhere.
+    runners: HashMap<[u8; 16], HeldRunner>,
+}
+
+/// One ephemeral runner this worker has been given capacity for. The configuration is a credential:
+/// it lives here only until the runner that uses it starts, and it is wiped when it goes.
+struct HeldRunner {
+    config: Option<Vec<u8>>,
+}
+
+impl Drop for HeldRunner {
+    fn drop(&mut self) {
+        if let Some(config) = &mut self.config {
+            wipe(config);
+        }
+    }
+}
+
+/// The most runner leases one worker holds at once.
+const MAX_RUNNERS: usize = 16;
+
+/// Overwrite a credential in place and keep the store from being optimised away.
+fn wipe(bytes: &mut Vec<u8>) {
+    bytes.fill(0);
+    core::hint::black_box(&mut *bytes);
+    bytes.clear();
 }
 
 /// The gate makes each frame's check-and-send atomic against a verdict closing the artifact.
@@ -713,6 +740,7 @@ impl Executor {
                 recovering: HashMap::new(),
                 artifact_waits: HashMap::new(),
                 draining: false,
+                runners: HashMap::new(),
             }),
             admission_floor: std::sync::atomic::AtomicU64::new(floor),
             measured_disk: std::sync::atomic::AtomicBool::new(false),
@@ -1742,6 +1770,35 @@ impl LinkExecutor for Executor {
 
     fn prefetch(&self, images: &[String]) {
         self.prefetch.hint(images);
+    }
+
+    fn runner_offered(&self, lease: &sentinel_link::session::RunnerLeaseWire) -> bool {
+        let mut state = self.state();
+        if state.draining || state.runners.len() >= MAX_RUNNERS || state.reporter.is_none() {
+            return false;
+        }
+        state
+            .runners
+            .insert(lease.lease, HeldRunner { config: None });
+        true
+    }
+
+    fn runner_config(&self, lease: [u8; 16], mut config: Vec<u8>) {
+        let mut state = self.state();
+        match state.runners.get_mut(&lease) {
+            Some(held) => held.config = Some(std::mem::take(&mut config)),
+            // A lease this worker no longer holds is not asked about: the configuration is a
+            // credential, and one it cannot use is dropped rather than kept.
+            None => wipe(&mut config),
+        }
+    }
+
+    fn runner_stopped(&self, lease: [u8; 16]) {
+        self.state().runners.remove(&lease);
+    }
+
+    fn runner_held(&self) -> Vec<[u8; 16]> {
+        self.state().runners.keys().copied().collect()
     }
 
     fn offered(&self, offer: &Offer) -> bool {

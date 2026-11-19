@@ -449,13 +449,13 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        73,
+        74,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
     assert_eq!(
         sources,
-        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 71, 72]
+        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 72, 73]
     );
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
@@ -471,7 +471,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         drop(store);
         assert_eq!(version(&path), schema::LATEST, "from {from}");
         let db = Connection::open(&path).unwrap();
-        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]
+        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74]
             .iter()
             .map(|&newest| from >= newest || readable(&db, from, newest))
             .collect();
@@ -495,52 +495,62 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         // Migration 72 (run-level and runner-mode artifacts) rebuilds the artifact table with a
         // nullable job and attempt and two origins an older controller cannot explain, so 70 and 71
         // stop at 70. Migration 73 (the OAuth scope bound) changes a constraint and rewrites the
-        // CLI's seeded cap, so 72 stops at 72.
+        // CLI's seeded cap, so 72 stops at 72. Migration 74 (runner-mode leases) is readable by
+        // nothing older either: a schema-73 controller records demand it can never place and can
+        // neither deliver a JIT configuration nor de-register the runners this one registered.
         let expected = match from {
             44 | 47 | 48 => [
                 false, false, false, false, false, false, false, false, false, false, false, false,
-                false,
+                false, false,
             ],
             51 => [
                 true, false, false, false, false, false, false, false, false, false, false, false,
-                false,
+                false, false,
             ],
             56 => [
                 true, true, false, false, false, false, false, false, false, false, false, false,
-                false,
+                false, false,
             ],
             57 => [
                 true, true, true, false, false, false, false, false, false, false, false, false,
-                false,
+                false, false,
             ],
             63 => [
                 true, true, true, true, false, false, false, false, false, false, false, false,
-                false,
+                false, false,
             ],
             64 | 65 => [
                 true, true, true, true, true, false, false, false, false, false, false, false,
-                false,
+                false, false,
             ],
             66 | 67 => [
                 true, true, true, true, true, true, true, false, false, false, false, false, false,
+                false,
             ],
             68 => [
                 true, true, true, true, true, true, true, true, false, false, false, false, false,
+                false,
             ],
             69 | 70 => [
                 true, true, true, true, true, true, true, true, true, true, false, false, false,
+                false,
             ],
             71 => [
                 true, true, true, true, true, true, true, true, true, true, true, false, false,
+                false,
             ],
             72 => [
                 true, true, true, true, true, true, true, true, true, true, true, true, false,
+                false,
+            ],
+            73 => [
+                true, true, true, true, true, true, true, true, true, true, true, true, true, false,
             ],
             _ => unreachable!(),
         };
         assert_eq!(
             ok, expected,
-            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73"
+            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74"
         );
     }
 }
