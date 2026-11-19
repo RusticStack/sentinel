@@ -9,6 +9,7 @@ mod http;
 mod login_guard;
 mod mcp;
 mod metrics;
+mod migration;
 mod notices;
 mod oauth;
 mod preview;

@@ -56,6 +56,17 @@ impl KeepReason {
             Self::NoClass => "no_class",
         }
     }
+
+    /// The same reason as a sentence, for a preview that lists the jobs staying behind.
+    pub const fn note(self) -> &'static str {
+        match self {
+            Self::MacOs => "Sentinel has no macOS class",
+            Self::Gpu => "Sentinel has no GPU class",
+            Self::Docker => "the job needs a Docker daemon no class of this deployment provides",
+            Self::Expression => "a `${{ }}` label the analyzer cannot resolve to a label set",
+            Self::NoClass => "no Sentinel class matches the label set",
+        }
+    }
 }
 
 /// What a job's `runs-on:` declares, before the table resolves it.

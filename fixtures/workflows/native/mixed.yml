@@ -1,0 +1,48 @@
+# A workflow the native path serves only in part: a matrix whose cells name different
+# classes (a single `runs-on:` value cannot), a Windows job with no image given, a job with
+# an `if` the inventory does not carry, a GPU job and an `include` matrix. Each keeps its
+# job on GitHub's runners with its own reason.
+name: mixed
+on:
+  push:
+    branches: [main]
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test
+  cross:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test
+  only-on-main:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make deploy
+  gpu:
+    runs-on: blacksmith-8vcpu-ubuntu-2404-gpu
+    steps:
+      - run: nvidia-smi
+  with-include:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        include:
+          - os: ubuntu-latest
+            extra: yes
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test

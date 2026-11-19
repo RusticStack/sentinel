@@ -1,0 +1,17 @@
+# A label set written as a block sequence: the label table serves the job, so the diff
+# replaces the whole value with one class and the file shrinks by a line. Nothing else in
+# the file may move.
+name: block
+on: [push]
+jobs:
+  build:
+    runs-on:
+      - ubuntu-latest
+      - self-hosted
+    steps:
+      - run: make build
+  mac:
+    runs-on:
+      - macos-15
+    steps:
+      - run: make test
