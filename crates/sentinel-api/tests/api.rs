@@ -4185,8 +4185,9 @@ fn mcp_artifact_tools_ask_every_http_session_for_artifacts_read() {
             ],
         )
     };
-    // A registered MCP client may hold no scope outside `Scopes::MCP`, so every artifact tool is refused over this
-    // transport with the challenge that names what it needs; the stdio transport reaches them with a CLI profile.
+    // A registered MCP client may hold no scope outside `Scopes::MCP`, which now carries `artifacts:read`: the widest
+    // session reaches every artifact tool, and a session narrowed to the MCP default is refused each of them with the
+    // challenge that names what it needs.
     let widest = mcp_session(&d, "artifact-mcp-widest", Scopes::MCP);
     let (status, _, body) = mcp_post(
         &d,
@@ -4213,6 +4214,7 @@ fn mcp_artifact_tools_ask_every_http_session_for_artifacts_read() {
         assert_eq!(listed["annotations"]["readOnlyHint"], true, "{listed}");
         assert_eq!(listed["annotations"]["destructiveHint"], false, "{listed}");
     }
+    let narrow = mcp_session(&d, "artifact-mcp-narrow", Scopes::MCP_DEFAULT);
     for (name, arguments) in [
         ("list_artifacts", serde_json::json!({"run": run})),
         (
@@ -4228,7 +4230,10 @@ fn mcp_artifact_tools_ask_every_http_session_for_artifacts_read() {
             serde_json::json!({"run": run, "artifact": captured}),
         ),
     ] {
-        let (status, headers, body) = tool(&widest, name, arguments);
+        let (status, _, body) = tool(&widest, name, arguments.clone());
+        assert_eq!(status, 200, "{name}: {body}");
+        assert_eq!(body["result"]["isError"], false, "{name}: {body}");
+        let (status, headers, body) = tool(&narrow, name, arguments);
         assert_eq!(status, 403, "{name}: {body}");
         let challenge = headers
             .iter()
