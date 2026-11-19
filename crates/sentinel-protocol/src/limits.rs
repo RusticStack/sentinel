@@ -23,6 +23,9 @@ pub const MAX_RUN_ARTIFACT_BYTES: u64 = 16 << 30;
 pub const MAX_OAUTH_FORM_BYTES: usize = 8 << 10;
 pub const MAX_ARTIFACT_NAME_BYTES: usize = 64;
 pub const MAX_ARTIFACT_PATH_BYTES: usize = 1024;
+/// The text one artifact entry may hand to an MCP client. A longer entry is refused with the bound named rather
+/// than cut, because half a report reads as evidence: the entry downloads whole through a short-lived link.
+pub const MAX_ARTIFACT_TEXT_BYTES: usize = 1 << 20;
 /// Entries in one offer message. A batch holds a path, a 32-byte digest, a length and a mode per entry, which the
 /// assert below keeps inside one control frame: the widest entry is MAX_ARTIFACT_PATH_BYTES plus room for the
 /// length prefix and the three numbers. A larger artifact is offered in batches, answered once at the last.

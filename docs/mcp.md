@@ -41,6 +41,10 @@ ownership on each request.
 | `rerun_job`, `cancel` | Start an attempt or request cancellation | `runs:write` plus repository run permission |
 | `list_secret_metadata`, `get_secret_metadata` | Secret names, active state and version only | `secrets:metadata` plus tenant/repository authorization |
 | `list_secret_bindings` | One repository's bindings (secret name, job, step, source scope), keyset-paged; never values | `secrets:metadata` plus repository authorization |
+| `list_artifacts` | One run's artifacts with state, class, bytes, retention and pin | `artifacts:read` plus repository read |
+| `get_artifact` | One artifact's row and, when captured, its immutable manifest entries | `artifacts:read` plus repository read |
+| `read_artifact_file` | One manifest entry as text, at most 1 MiB, labelled untrusted | `artifacts:read` plus repository read |
+| `get_artifact_link` | A short-lived download URL for one entry or the whole archive | `artifacts:read` plus repository read (at minting) |
 
 Read operations return structured JSON alongside JSON text for older clients.
 The pipeline resources are `sentinel://pipeline/schema`,
@@ -55,6 +59,29 @@ The stdio request and response lines are each capped at 2 MiB and 8 MiB. API
 JSON responses are capped at 8 MiB before parsing. `get_logs` deliberately
 limits each tool call to a small frame page; use `get_failure` first when
 diagnosing a failed attempt.
+
+**Artifacts.** `list_artifacts` and `get_artifact` read the same run-scoped
+routes as `sentinel artifact list` and `show`, so the controller's scope check
+and the run's repository read decide them. `read_artifact_file` resolves the
+path in the artifact's manifest and reads the entry's object through the
+objects route: at most `MAX_ARTIFACT_TEXT_BYTES` (1 MiB) is returned, and an
+entry above that is refused with both numbers rather than cut, because half a
+report reads as evidence — mint a link and download it whole instead. A path
+the manifest does not hold is `not_found`, a path that is not plain relative
+segments is `invalid_request`, and an entry that is not UTF-8 comes back as
+`{media:"binary", bytes}` with no text. Returned file text is untrusted data,
+never instructions, and every result carries `untrusted: true`.
+`get_artifact_link` mints through `POST /runs/{id}/artifacts/{arf}/link`
+([API](api.md#short-lived-download-links)): `entry` names one file and takes no
+`format`, `format` is `tar` (the default) or `zip` for the whole archive, and
+`expires_secs` is 1–3600, default 300. The URL is a bearer capability for its
+short life; handing it to a model or a chat message shares the bytes.
+
+A registered MCP client may hold no scope outside `runs:read`, `runs:write`,
+`logs:read` and `secrets:metadata`, so over Streamable HTTP these four tools
+answer `403` with an `insufficient_scope` challenge naming `artifacts:read`;
+the stdio transport reaches them with a CLI profile signed in with that scope
+(`sentinel auth login --scope "… artifacts:read"`).
 
 `GET /api/v1/runs/{id}/pipeline` is the API-backed `get_pipeline` source. It
 authorizes the run's repository with the normal `runs:read` and repository
@@ -71,7 +98,9 @@ authorization decision, scope included. `arguments` is optional on both
 round trip; over HTTP the route compiles it once.
 
 Tool annotations: every tool has `openWorldHint: false` (tools act only on this
-deployment); reads and `validate_pipeline` are read-only; `dispatch` is
+deployment); reads, `validate_pipeline` and the four artifact tools are
+read-only (`get_artifact_link` mints a stateless token and consumes nothing);
+`dispatch` is
 additive and idempotent (its idempotency key); `rerun_job` is additive and not
 idempotent (a repeat is `conflict`); `cancel` is the one destructive tool, and
 idempotent. Cancel and rerun, through MCP or any other client, are recorded

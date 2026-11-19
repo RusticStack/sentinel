@@ -211,19 +211,36 @@ pub enum ArtifactCommand {
     List { run: String },
     /// One artifact and its manifest
     Show { run: String, artifact: String },
-    /// Download one manifest entry, checking its length and digest
+    /// Download one manifest entry, or every entry, checking each one's length and digest
     Download {
         run: String,
         artifact: String,
         /// The entry's path inside the artifact
+        #[arg(long, conflicts_with = "all")]
+        path: Option<String>,
+        /// Every entry of the artifact, written under --out DIR at its manifest path
         #[arg(long)]
-        path: String,
-        /// Where to write it; replaced only once the bytes verify
-        #[arg(long, value_name = "FILE")]
+        all: bool,
+        /// Where to write: one file with --path, a directory with --all
+        #[arg(long, value_name = "PATH")]
         out: std::path::PathBuf,
         /// Tenant slug that owns the run (default: the one the server names)
         #[arg(long, value_name = "SLUG")]
         tenant: Option<String>,
+    },
+    /// Mint a short-lived download URL for one entry or the whole artifact archive
+    Link {
+        run: String,
+        artifact: String,
+        /// The entry's path inside the artifact; omit for a whole archive
+        #[arg(long, conflicts_with = "format")]
+        entry: Option<String>,
+        /// Whole-artifact archive format: tar (default) or zip
+        #[arg(long, value_name = "FORMAT")]
+        format: Option<String>,
+        /// Link lifetime in seconds (1 to 3600)
+        #[arg(long, value_name = "SECS", default_value_t = 300)]
+        expires: u64,
     },
 }
 
@@ -504,9 +521,35 @@ pub fn run(invocation: Invocation) -> Result<(), client::Error> {
                     run,
                     artifact,
                     path,
+                    all,
                     out,
                     tenant,
-                } => artifacts::download(&client, output, &run, &artifact, &path, &out, tenant),
+                } => match (path, all) {
+                    (Some(path), _) => {
+                        artifacts::download(&client, output, &run, &artifact, &path, &out, tenant)
+                    }
+                    (None, true) => {
+                        artifacts::download_all(&client, output, &run, &artifact, &out, tenant)
+                    }
+                    (None, false) => Err(Error::usage(
+                        "give --path ENTRY to download one entry, or --all with --out DIR for every entry",
+                    )),
+                },
+                ArtifactCommand::Link {
+                    run,
+                    artifact,
+                    entry,
+                    format,
+                    expires,
+                } => artifacts::link(
+                    &client,
+                    output,
+                    &run,
+                    &artifact,
+                    entry.as_deref(),
+                    format.as_deref(),
+                    expires,
+                ),
             }
         }
         Invocation::Cache(args) => {

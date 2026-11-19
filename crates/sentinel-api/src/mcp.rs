@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    io::Read,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -423,6 +424,9 @@ fn call_tool(
         "list_secret_metadata" | "get_secret_metadata" | "list_secret_bindings" => {
             Scopes::SECRETS_METADATA
         }
+        "list_artifacts" | "get_artifact" | "read_artifact_file" | "get_artifact_link" => {
+            Scopes::ARTIFACTS_READ
+        }
         "validate_pipeline" => Scopes::NONE,
         _ => Scopes::RUNS_READ,
     };
@@ -539,6 +543,111 @@ impl Backend for ApiBackend<'_, '_> {
                 Err(value)
             }
         }
+    }
+
+    /// The manifest through the routed API (so a scope refusal is lifted to the HTTP challenge), then the entry's
+    /// bytes through the objects route, read through a bound one byte past the limit so a larger object is refused.
+    fn read_artifact_file(
+        &mut self,
+        run: &str,
+        artifact: &str,
+        entry: &str,
+    ) -> Result<Value, Value> {
+        let view = self.call_api(ApiCall {
+            method: "GET",
+            path: format!("/api/v1/runs/{run}/artifacts/{artifact}"),
+            body: Value::Null,
+            idempotency_key: None,
+            carries_pipeline: false,
+        })?;
+        let found = view["manifest"]["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|candidate| candidate["path"] == entry)
+            .ok_or_else(|| {
+                api_error_value(
+                    ErrorCode::NotFound,
+                    "the artifact has no entry at that path",
+                )
+            })?;
+        let digest = found["digest"]
+            .as_str()
+            .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| api_error_value(ErrorCode::Internal, "the entry has no digest"))?
+            .to_owned();
+        let len = found["len"]
+            .as_u64()
+            .ok_or_else(|| api_error_value(ErrorCode::Internal, "the entry has no length"))?;
+        let bound = sentinel_protocol::limits::MAX_ARTIFACT_TEXT_BYTES as u64;
+        if len > bound {
+            return Err(api_error_value(
+                ErrorCode::InvalidRequest,
+                &format!(
+                    "the entry is {len} bytes, above the {bound}-byte text bound; mint a link to download it"
+                ),
+            ));
+        }
+        let tenant = view["tenant"].as_str().unwrap_or_default();
+        let text = |bytes: Vec<u8>| match String::from_utf8(bytes) {
+            Ok(text) => Ok(json!({
+                "artifact": artifact,
+                "path": entry,
+                "digest": digest,
+                "bytes": len,
+                "media": "text",
+                "untrusted": true,
+                "text": text,
+            })),
+            Err(binary) => Ok(json!({
+                "artifact": artifact,
+                "path": entry,
+                "digest": digest,
+                "bytes": binary.as_bytes().len(),
+                "media": "binary",
+                "untrusted": true,
+            })),
+        };
+        if len == 0 {
+            return text(Vec::new());
+        }
+        let path = format!("/api/v1/tenants/{tenant}/objects/{digest}");
+        let (state, identity) = (self.state, self.identity);
+        let mut child = self.request.internal(
+            "GET".to_owned(),
+            path.clone(),
+            Vec::new(),
+            Vec::new(),
+            identity,
+        );
+        let body = match routes::route(state, &mut child, "GET", &path, "") {
+            Ok(Reply::Stream(_, body, _, _)) => body,
+            Ok(_) => {
+                return Err(api_error_value(
+                    ErrorCode::Internal,
+                    "unexpected API response",
+                ));
+            }
+            Err(error) => {
+                let value = serde_json::to_value(&error)
+                    .unwrap_or_else(|_| api_error_value(ErrorCode::Internal, "controller fault"));
+                if error.code == ErrorCode::Forbidden {
+                    self.scope_denied = Some(error);
+                }
+                return Err(value);
+            }
+        };
+        let mut bytes = Vec::with_capacity(len as usize);
+        body.take(bound + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| api_error_value(ErrorCode::Internal, "the object stream failed"))?;
+        if bytes.len() as u64 != len {
+            return Err(api_error_value(
+                ErrorCode::Internal,
+                "the object ended short of the entry's length",
+            ));
+        }
+        text(bytes)
     }
 
     fn validate_pipeline(&mut self, pipeline: &str) -> Result<Value, Value> {
