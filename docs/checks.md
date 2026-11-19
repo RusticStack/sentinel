@@ -432,7 +432,9 @@ holds at most 1024 repository tokens, evicting the earliest expiry at capacity.
   ID with the durable `create_started` mark — a lost answer to a create made
   already `completed` adopted with exactly one POST, adoption past a first
   page larger than 64 KiB, a rate-limit
-  pause and successful retry for both 403 and 429, a 401 token refresh, a permanent 422 refusal
+  pause and successful retry for both 403 and 429, a 429 with no timing headers parking the
+  installation for a minute without spending an attempt, an unreadable adoption lookup refused as
+  `lookup: …` instead of a second create, a 401 token refresh, a permanent 422 refusal
   (recorded and not retried), a revoked binding refusing without a request, a
   settled delivery's completed check, and a prompt lane stop.
 - `crates/sentinel-store/tests/github_events.rs`: receipt replay and
