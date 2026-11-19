@@ -173,8 +173,9 @@ pub(crate) fn mint(tx: &Transaction<'_>, grant: GrantId, scopes: Scopes, now: Un
 pub struct Authenticated { pub grant: GrantId, pub principal: Principal, pub scopes: Scopes, pub expires: UnixMillis }
 pub fn authenticate_access(conn: &Connection, presented: &Secret, audience: Audience, now: UnixMillis) -> Result<Authenticated>
 #[derive(Debug)] pub enum RefreshError { Invalid, Replay, InvalidScope, Store(Error) }
-pub fn refresh(store: &Store, client_id: &str, presented: &Secret, narrow: Option<Scopes>, now: UnixMillis)
-    -> std::result::Result<Minted, RefreshError>
+pub fn refresh(store: &Store, client_id: &str, presented: &Secret, narrow: Option<Scopes>,
+  resource: Option<Audience>, now: UnixMillis) -> std::result::Result<Minted, RefreshError>
+    // resource is the request's `resource`; an MCP grant only refreshes under its own audience
 pub fn revoke_presented(store: &Store, client_id: &str, token_text: &str, now: UnixMillis) -> Result<()> // unknown => Ok
 pub(crate) fn revoke_row(tx: &Transaction<'_>, grant: GrantId, reason: u8, now: UnixMillis) -> Result<bool> // was live
 pub fn revoke_grant(tx: &Transaction<'_>, authority: Authority, grant: GrantId, now: UnixMillis) -> Result<()>
@@ -219,8 +220,9 @@ pub fn decide(store: &Store, user_code: &str, user: UserId, d: Decision, now: Un
 #[derive(Debug)] pub enum Poll { Pending, Denied, Expired, Issued(Minted) }
 pub fn poll(store: &Store, client_id: &str, device: &Secret, now: UnixMillis) -> Result<Poll>
 // oauth/service.rs
-pub fn issue_service_grant(tx: &Transaction<'_>, principal: Principal, tenant: TenantId, account: UserId, name: &str,
-  scopes: Scopes, repo: Option<RepoId>, lifetime_ms: i64, now: UnixMillis) -> Result<(GrantId, Secret, UnixMillis)>
+pub fn issue_service_grant(tx: &Transaction<'_>, authority: Authority, tenant: TenantId, account: UserId,
+  name: &str, scopes: Scopes, repo: Option<RepoId>, lifetime_ms: i64, reason: Option<&str>,
+  now: UnixMillis) -> Result<(GrantId, Secret, UnixMillis)>
 pub fn service_grants(conn: &Connection, principal: Principal, tenant: TenantId, account: UserId) -> Result<Vec<GrantRecord>>
 pub fn allow_repo(tx: &Transaction<'_>, authority: Authority, tenant: TenantId, account: UserId, repo: RepoId,
   permissions: Permissions, reason: Option<&str>) -> Result<()> // NONE withdraws; step-up and reason as for issuing
@@ -326,7 +328,7 @@ Grants of any kind:
 
 After revocation the grant's access tokens are `401` and its refresh tokens `invalid_grant`. Tenant suspension revokes every service grant of the tenant (reason 6).
 
-Store API (`sentinel_store::oauth::service`): `issue_service_grant(tx, principal, tenant, account, name, scopes, repo, lifetime_ms, now) -> (GrantId, Secret, UnixMillis)` (`Forbidden` not an administrator; `NotFound` account or repository; `InvalidInput` scope, lifetime or name), `service_grants(conn, principal, tenant, account)` (`Forbidden`, `NotFound`), and `allow_repo(tx, principal, tenant, account, repo, permissions)`, which confines `auth::set_repo_grant` to a service principal and repository of that tenant. Revocation is `oauth::revoke_grant`.
+Store API (`sentinel_store::oauth::service`): `issue_service_grant(tx, authority, tenant, account, name, scopes, repo, lifetime_ms, reason, now) -> (GrantId, Secret, UnixMillis)` (`Forbidden` not an administrator; `NotFound` account or repository; `InvalidInput` scope, lifetime or name), `service_grants(conn, principal, tenant, account)` (`Forbidden`, `NotFound`), and `allow_repo(tx, authority, tenant, account, repo, permissions, reason)`, which confines `auth::set_repo_grant` to a service principal and repository of that tenant. Both writes re-check the authority in the transaction they make (`Authority::require_tenant_access_change`), which is what enforces the step-up; `reason` is the platform override the audit records. Revocation is `oauth::revoke_grant`.
 
 The CLI is `sentinel service-account create|allow|grant|grants|revoke` ([CLI](cli.md#service-accounts)).
 

@@ -1827,6 +1827,89 @@ fn doctor_passes_every_check_for_a_working_profile_and_names_each_fix() {
     assert_eq!(error["schema"], "sentinel.error/1");
 }
 
+// A canary no token shape could produce on its own, so finding it in a report means the value was
+// echoed rather than merely resembling a credential.
+const STORED_CANARY: &str = "5ec4e7ca5ec4e7ca5ec4e7ca5ec4e7ca5ec4e7ca5ec4e7ca5ec4e7ca5ec4e7ca";
+
+fn assert_no_canary(what: &str, text: &str) {
+    assert!(
+        !text.contains(STORED_CANARY),
+        "doctor echoed a stored token in {what}: {text}"
+    );
+}
+
+#[test]
+fn doctor_never_prints_the_stored_credential() {
+    let d = deployment();
+    let m = Machine::new();
+    browser_login(&d, &m, "dev", "p");
+    let now = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let forged = |access_expires: u64, refresh_expires: u64| {
+        serde_json::json!({
+            "refresh": format!("sntl_rt_{STORED_CANARY}"),
+            "access": format!("sntl_at_{STORED_CANARY}"),
+            "access_expires_ms": access_expires,
+            "refresh_expires_ms": refresh_expires,
+        })
+    };
+    // A token the controller does not know: the access check is refused and the refresh check is
+    // `invalid_grant`, so both read the stored value while reporting.
+    m.write_credentials("p", &forged(1, now + 60 * 60 * 1000));
+    for args in [
+        &["doctor", "--json"][..],
+        &["doctor"][..],
+        &["doctor", "--output", "ndjson"][..],
+    ] {
+        let out = m.run(args);
+        assert_eq!(out.code, 3, "{args:?}: {out:?}");
+        assert_no_canary("stdout", &out.stdout);
+        assert_no_canary("stderr", &out.stderr);
+    }
+    let (out, doc) = doctor(&m, &[]);
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(check(&doc, "access_token")["ok"], false);
+    assert_eq!(check(&doc, "refresh")["ok"], false);
+    assert!(
+        check(&doc, "refresh")["fix"]
+            .as_str()
+            .unwrap()
+            .contains("auth login")
+    );
+
+    // An expired sign-in is refused without asking the controller.
+    m.write_credentials("p", &forged(1, 1));
+    let (out, doc) = doctor(&m, &[]);
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(check(&doc, "credential_store")["ok"], false);
+    assert_no_canary("stdout", &out.stdout);
+    assert_no_canary("stderr", &out.stderr);
+
+    // A damaged blob is reported as damaged: the bytes read from the store are never the detail.
+    let path = m.config().join("credentials").join("p.json");
+    std::fs::write(&path, format!("{{\"refresh\":\"sntl_rt_{STORED_CANARY}\"")).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let (out, doc) = doctor(&m, &[]);
+    assert_eq!(out.code, 2, "{out:?}");
+    let store = check(&doc, "credential_store");
+    assert_eq!(store["ok"], false);
+    assert!(
+        store["detail"].as_str().unwrap().contains("damaged"),
+        "{store}"
+    );
+    assert_no_canary("stdout", &out.stdout);
+    assert_no_canary("stderr", &out.stderr);
+    let text = m.run(&["doctor"]);
+    assert_no_canary("stdout", &text.stdout);
+    assert_no_canary("stderr", &text.stderr);
+}
+
 #[test]
 fn doctor_refuses_a_configuration_directory_inside_a_git_work_tree() {
     let m = Machine::new();
