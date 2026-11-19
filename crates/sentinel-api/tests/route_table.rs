@@ -291,7 +291,9 @@ fn documented() -> BTreeSet<String> {
         };
         let path = cell[slash + 1..].split('?').next().unwrap_or_default();
         let mut segments: Vec<&str> = path.trim_matches('/').split('/').collect();
-        if !["oauth", ".well-known", "device", "mcp", "auth"].contains(&segments[0]) {
+        // `dl` is served outside `/api/v1` on purpose: a download link is handed to a browser or a tool, not called
+        // as part of the authenticated API surface.
+        if !["oauth", ".well-known", "device", "mcp", "auth", "dl"].contains(&segments[0]) {
             segments.splice(0..0, ["api", "v1"]);
         }
         let alternatives: Vec<Vec<String>> = segments

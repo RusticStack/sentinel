@@ -36,6 +36,7 @@ use crate::{
     LOG_WAIT, MAX_UPLOAD_CHUNK, State, TRANSFERS,
     archive::{Archive, Format},
     auth::{self, Identity, Refusal, Via},
+    download_link,
 };
 
 pub(crate) mod account;
@@ -734,6 +735,10 @@ pub(crate) fn route(
         ("GET", ["api", "v1", "runs", run, "artifacts", art, "archive"]) => {
             artifact_archive(state, request, run, art, query)
         }
+        ("POST", ["api", "v1", "runs", run, "artifacts", art, "link"]) => {
+            artifact_link(state, request, run, art)
+        }
+        ("GET", ["dl", token]) => redeem_link(state, token),
         ("GET", ["api", "v1", "attempts", attempt, "logs"]) => {
             attempt_logs(state, request, attempt, query)
         }
@@ -2143,6 +2148,17 @@ fn artifact_archive(
             Ok((tenant, row, manifest))
         })
         .map_err(store_error)?;
+    archive_reply(state, tenant, &row, manifest, format)
+}
+
+/// Streams one artifact's archive, from the manifest alone.
+fn archive_reply(
+    state: &State,
+    tenant: sentinel_core::TenantId,
+    row: &artifacts::Row,
+    manifest: sentinel_store::objects::Manifest,
+    format: Format,
+) -> Route {
     let objects = Arc::clone(&state.objects);
     let mut archive = Archive::new(
         format,
@@ -2167,7 +2183,7 @@ fn artifact_archive(
             "content-disposition",
             &format!(
                 "attachment; filename=\"{}\"",
-                archive_file_name(&row, format)
+                archive_file_name(row, format)
             ),
         ),
         header("x-content-type-options", "nosniff"),
@@ -2205,6 +2221,218 @@ fn archive_file_name(row: &artifacts::Row, format: Format) -> String {
     name.push('.');
     name.push_str(format.extension());
     name
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinkBody {
+    #[serde(default)]
+    entry: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    expires_secs: Option<u64>,
+}
+
+/// Mints a short-lived link for one artifact — a whole archive or one entry of it — for a caller who could download
+/// it now. The response is the only place the token appears.
+fn artifact_link(state: &State, request: &mut Request, run: &str, art: &str) -> Route {
+    let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::ARTIFACTS_READ)?;
+    let Some(key) = state.secret_key.as_deref() else {
+        return Err(err(
+            ErrorCode::Forbidden,
+            "download links require sealed secret storage",
+        ));
+    };
+    let (run, art): (RunId, ArtifactId) = (id(run, "run")?, id(art, "artifact")?);
+    let body: LinkBody = parse(&body(request)?)?;
+    let secs = body.expires_secs.unwrap_or(download_link::DEFAULT_SECS);
+    if !(1..=download_link::MAX_SECS).contains(&secs) {
+        return Err(err(
+            ErrorCode::InvalidRequest,
+            "expires_secs is from 1 to 3600",
+        ));
+    }
+    let target = match (body.entry, body.format) {
+        (Some(_), Some(_)) => {
+            return Err(err(
+                ErrorCode::InvalidRequest,
+                "an entry link takes no format",
+            ));
+        }
+        (Some(path), None) if path.is_empty() || path.len() > download_link::MAX_PATH => {
+            return Err(err(ErrorCode::InvalidRequest, "invalid entry path"));
+        }
+        (Some(path), None) => download_link::Target::Entry(path),
+        (None, Some(format)) => download_link::Target::Archive(
+            Format::parse(&format)
+                .ok_or_else(|| err(ErrorCode::InvalidRequest, "format is tar or zip"))?,
+        ),
+        (None, None) => download_link::Target::Archive(Format::Tar),
+    };
+    let tenant = state
+        .store
+        .read(|c| {
+            let repo = lookup::run_repo(c, run)?;
+            let (tenant, _) = authz::require_repo_slug(c, who.principal, repo, Permissions::READ)?;
+            let row = artifacts::get(c, tenant, run, art)?;
+            // A link is minted only while the artifact is downloadable: past its deadline, or with no manifest,
+            // there is nothing it could redeem to.
+            if row.retain_until_ms <= UnixMillis::now() {
+                return Err(StoreError::NotFound);
+            }
+            let Some(version) = row.manifest_version else {
+                return Err(StoreError::NotFound);
+            };
+            if let download_link::Target::Entry(path) = &target {
+                let manifest = state.objects.manifest(
+                    c,
+                    tenant,
+                    sentinel_store::objects::Kind::Artifact,
+                    &artifacts::manifest_name(row.job, &row.name),
+                    Some(version),
+                )?;
+                if !manifest.entries.iter().any(|entry| entry.path == *path) {
+                    return Err(StoreError::NotFound);
+                }
+            }
+            Ok(tenant)
+        })
+        .map_err(store_error)?;
+    let link = download_link::Link {
+        tenant,
+        artifact: art,
+        target,
+        expires_ms: UnixMillis::now().0 + i64::try_from(secs * 1_000).unwrap_or(i64::MAX),
+    };
+    let token = download_link::mint(key, &link, key.active_id());
+    ok(json!({
+        "url": format!("{}/dl/{token}", state.oauth.issuer),
+        "expires_ms": link.expires_ms,
+    }))
+}
+
+/// Redeems a link. Every refusal — a forged, expired, old-epoch, cross-tenant or retired-artifact token — is the same
+/// `not_found`, and the access log keeps a digest of the token rather than the token.
+fn redeem_link(state: &State, token: &str) -> Route {
+    let now = UnixMillis::now();
+    let link = state
+        .secret_key
+        .as_deref()
+        .and_then(|key| download_link::verify(key, token, now, key.active_id()));
+    let Some(link) = link else {
+        log_link(token, None, "refused");
+        return Err(err(ErrorCode::NotFound, "not found"));
+    };
+    let (row, manifest) = match state.store.read(|c| {
+        let row = artifacts::for_link(c, link.tenant, link.artifact)?;
+        // Retention and tenant status are re-checked at redemption: minting authorized a caller once, and this is what
+        // makes a link worthless from the moment its artifact is due, whatever happens to the minting session.
+        if row.retain_until_ms <= now {
+            return Err(StoreError::NotFound);
+        }
+        let Some(version) = row.manifest_version else {
+            return Err(StoreError::NotFound);
+        };
+        let manifest = state.objects.manifest(
+            c,
+            link.tenant,
+            sentinel_store::objects::Kind::Artifact,
+            &artifacts::manifest_name(row.job, &row.name),
+            Some(version),
+        )?;
+        Ok((row, manifest))
+    }) {
+        Ok(found) => found,
+        Err(error) => {
+            log_link(token, Some(link.target.label()), "refused");
+            return Err(store_error(error));
+        }
+    };
+    let reply = match &link.target {
+        download_link::Target::Archive(format) => {
+            archive_reply(state, link.tenant, &row, manifest, *format)
+        }
+        download_link::Target::Entry(path) => {
+            let Some(entry) = manifest.entries.iter().find(|entry| entry.path == *path) else {
+                log_link(token, Some(link.target.label()), "refused");
+                return Err(err(ErrorCode::NotFound, "not found"));
+            };
+            entry_reply(state, link.tenant, entry)
+        }
+    };
+    log_link(
+        token,
+        Some(link.target.label()),
+        if reply.is_ok() { "served" } else { "refused" },
+    );
+    reply
+}
+
+/// One entry's bytes, verified while they stream exactly as a whole-object download is.
+fn entry_reply(
+    state: &State,
+    tenant: sentinel_core::TenantId,
+    entry: &sentinel_store::objects::Entry,
+) -> Route {
+    let reader = state
+        .objects
+        .open_entry(tenant, entry.digest, entry.len)
+        .map_err(|_| err(ErrorCode::Internal, "controller fault"))?;
+    let slot = slot(state)?;
+    let headers = vec![
+        header(
+            "content-disposition",
+            &format!("attachment; filename=\"{}\"", entry_file_name(&entry.path)),
+        ),
+        header("x-content-type-options", "nosniff"),
+    ];
+    Ok(Reply::Stream(
+        200,
+        Box::new(Verified {
+            inner: Box::new(reader) as Box<dyn Read + Send>,
+            left: entry.len,
+            hasher: blake3::Hasher::new(),
+            digest: entry.digest,
+            _slot: slot,
+        }),
+        entry.len,
+        headers,
+    ))
+}
+
+/// An entry's file name: its last path component, stripped of anything that is not a plain file-name character.
+fn entry_file_name(path: &str) -> String {
+    let base = path
+        .rmatch_indices('/')
+        .next()
+        .map_or(path, |(at, _)| &path[at + 1..]);
+    let mut name: String = base
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect();
+    name.truncate(200);
+    if name.is_empty() {
+        name.push_str("entry");
+    }
+    name
+}
+
+/// One access-log record per redemption attempt, accepted or refused. The token never enters it: the digest
+/// correlates a mint with its redemption and cannot be spent.
+fn log_link(token: &str, target: Option<&'static str>, outcome: &'static str) {
+    let digest = download_link::digest(token);
+    tracing::info!(
+        event = "download_link",
+        token_digest = digest.as_str(),
+        target = target.unwrap_or("-"),
+        outcome,
+        "short-lived download link"
+    );
 }
 
 fn object_download(state: &State, request: &mut Request, slug: &str, digest: &str) -> Route {
@@ -2273,15 +2501,15 @@ impl<R: Read> Read for Held<R> {
     }
 }
 
-struct Verified {
-    inner: sentinel_store::objects::Reader,
+struct Verified<R> {
+    inner: R,
     left: u64,
     hasher: blake3::Hasher,
     digest: Digest,
     _slot: Slot,
 }
 
-impl Read for Verified {
+impl<R: Read> Read for Verified<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.left == 0 || buf.is_empty() {
             return Ok(0);

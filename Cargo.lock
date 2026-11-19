@@ -1222,6 +1222,7 @@ dependencies = [
 name = "sentinel-api"
 version = "0.1.0-dev"
 dependencies = [
+ "base64",
  "blake3",
  "crc32fast",
  "form_urlencoded",
@@ -1239,6 +1240,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
  "ureq",
  "url",
 ]

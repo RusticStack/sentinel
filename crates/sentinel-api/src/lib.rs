@@ -2,6 +2,7 @@
 
 mod archive;
 pub mod auth;
+mod download_link;
 mod github;
 mod github_app;
 mod http;

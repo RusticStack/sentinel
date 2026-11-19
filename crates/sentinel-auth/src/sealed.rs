@@ -17,6 +17,7 @@ const MAX_KEYS: usize = 32;
 const MAX_KEY_FILE: usize = 13 + MAX_KEYS * 36;
 const TAG_LEN: usize = 16;
 const FINGERPRINT_CONTEXT: &str = "sentinel 2026-09-26 stored request fingerprint v1";
+const LINK_CONTEXT: &str = "sentinel 2026-11-19 short-lived download link v1";
 
 pub fn secret_context(
     tenant: &[u8; 16],
@@ -64,6 +65,7 @@ pub struct Key {
     active: u32,
     keys: Vec<(u32, chacha20poly1305::Key)>,
     fingerprint_key: [u8; 32],
+    link_key: [u8; 32],
 }
 
 impl core::fmt::Debug for Key {
@@ -78,6 +80,7 @@ impl Drop for Key {
             key.as_mut_slice().zeroize();
         }
         self.fingerprint_key.zeroize();
+        self.link_key.zeroize();
     }
 }
 
@@ -121,11 +124,13 @@ impl Key {
         let mut material = [0u8; KEY_LEN];
         material.copy_from_slice(active_key.as_slice());
         let fingerprint_key = blake3::derive_key(FINGERPRINT_CONTEXT, &material);
+        let link_key = blake3::derive_key(LINK_CONTEXT, &material);
         material.zeroize();
         Self {
             active,
             keys,
             fingerprint_key,
+            link_key,
         }
     }
 
@@ -266,6 +271,12 @@ impl Key {
 
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    /// Signs short-lived download links. Derived from the active key alone, so rotating the key retires every link a
+    /// previous epoch minted, and the epoch in a token names the key that has to verify it.
+    pub fn link_key(&self) -> &[u8; 32] {
+        &self.link_key
     }
 
     pub fn fingerprinter(&self) -> Fingerprinter {
@@ -455,6 +466,32 @@ mod tests {
         let other = Key::load(&other).unwrap();
         assert_eq!(other.open(b"usr_a", &sealed), Err(SealError::Unsealable));
         assert!(!format!("{key:?}").contains("Key(["));
+    }
+
+    #[test]
+    fn the_link_key_follows_the_active_epoch_and_no_other_subkey() {
+        let dir = scratch();
+        let path = dir.path().join("master.key");
+        let other_path = dir.path().join("other.key");
+        Key::create(&path).unwrap();
+        Key::create(&other_path).unwrap();
+        let key = Key::load(&path).unwrap();
+        let first = *key.link_key();
+        // Not the master key itself, and not any value a fingerprint of "link" would produce.
+        let mut fingerprinter = key.fingerprinter();
+        fingerprinter.update(b"link");
+        let fingerprint = fingerprinter.finish().to_le_bytes();
+        assert_ne!(&first[..16], &fingerprint[..]);
+        assert_eq!(first, *Key::load(&path).unwrap().link_key());
+        assert_ne!(first, *Key::load(&other_path).unwrap().link_key());
+        let epoch = key.active_id();
+        assert_eq!(
+            Key::rotate(&path, &dir.path().join("backup")).unwrap(),
+            epoch + 1
+        );
+        let rotated = Key::load(&path).unwrap();
+        assert_eq!(rotated.active_id(), epoch + 1);
+        assert_ne!(first, *rotated.link_key());
     }
 
     #[test]
