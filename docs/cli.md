@@ -306,7 +306,7 @@ Text mode prints one `ok`/`FAIL`/`skip` line per check and a `fix:` line under e
 - logout revokes on the server (old access token `401`, refresh token `invalid_grant`, local credential gone, later commands exit 3 with the login hint), and offline logout deletes locally and exits 1;
 - a service grant imported with `--grant-file` runs commands with stdin closed;
 - a missing scope names the login that asks for it;
-- `doctor`: all seven checks pass for a working profile (and rotate the refresh token once), a removed credential exits 3, a stopped controller exits 6 with local checks still run, no profile exits 3, and a configuration directory inside a Git work tree exits 2 without creating anything.
+- `doctor`: all seven checks pass for a working profile (and rotate the refresh token once), a removed credential exits 3, a stopped controller exits 6 with local checks still run, no profile exits 3, a configuration directory inside a Git work tree exits 2 without creating anything, and a canary refresh and access token planted in the credential store appears in no report, in text, JSON or NDJSON, whether the controller refuses them, the sign-in has expired or the blob is damaged;
 
 `crates/sentinel/tests/cli.rs` (Linux, `--features server`) runs the legacy commands against a real `sentinel server` process, and one real-server `auth login --device` approved on that server's `/device` page, followed by `auth status`, `doctor` (all checks pass) and `auth logout`. The sign-in flow itself is exercised through `--no-browser`.
 
