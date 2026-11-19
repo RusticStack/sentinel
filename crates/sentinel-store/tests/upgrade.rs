@@ -518,7 +518,7 @@ fn schema_objects(db: &Connection) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Migration 67 gives every artifact a class, a charge weight and a pin column; the upgraded
+/// Migration 68 gives every artifact a class, a charge weight and a pin column; the upgraded
 /// database has to equal a fresh one, and an artifact stored before it keeps its deadline.
 #[test]
 fn a_database_upgraded_from_066_equals_a_fresh_one() {
