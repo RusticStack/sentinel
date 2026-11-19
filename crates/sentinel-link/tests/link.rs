@@ -532,6 +532,11 @@ fn a_certificate_or_worker_identifier_that_belongs_to_another_worker_is_refused(
     let load = || Identity::load(&cert, &key).unwrap();
     let secret = d.enrollment(60_000);
     drop(d.connect(load(), first, Some(&secret)).unwrap());
+    // The controller counts an admission in its own accept task, so the count is sampled only once
+    // that first session is counted; read earlier, it would rise under the refusals below.
+    eventually("the first admission", || {
+        d.controller().stats().admitted.load(Ordering::SeqCst) == 1
+    });
     let before = d.controller().stats().admitted.load(Ordering::SeqCst);
 
     // The same certificate under another worker identifier: a copy of the identity, not a reconnect.
