@@ -10,7 +10,9 @@ use std::{
 };
 
 use sentinel_core::{AttemptId, Event, Fence, UnixMillis};
-use sentinel_link::session::{ArtifactCode, Executor as LinkExecutor, JobContext, Offer, Reporter};
+use sentinel_link::session::{
+    ArtifactCode, Executor as LinkExecutor, JobContext, Offer, Offered, Reporter,
+};
 use sentinel_pipeline::RunSpec;
 use sentinel_protocol::limits::MAX_LIST_ITEMS;
 
@@ -421,10 +423,12 @@ struct Watch {
     gate: Mutex<()>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Reply {
     Granted,
     Done(ArtifactCode),
+    /// The offered entries this tenant already holds, index into the offer.
+    Held(Vec<u32>),
 }
 
 impl Watch {
@@ -433,7 +437,7 @@ impl Watch {
         self.cv.notify_all();
     }
     fn peek(&self) -> Option<Reply> {
-        *self.reply.lock().unwrap_or_else(|p| p.into_inner())
+        self.reply.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
     fn wait_reply(&self, timeout: Duration) -> Option<Reply> {
         let slot = self.reply.lock().unwrap_or_else(|p| p.into_inner());
@@ -444,14 +448,14 @@ impl Watch {
         if waited.timed_out() {
             return None;
         }
-        *slot
+        slot.clone()
     }
     fn wait_done(&self, timeout: Duration) -> Option<ArtifactCode> {
         let deadline = Instant::now() + timeout;
         let mut slot = self.reply.lock().unwrap_or_else(|p| p.into_inner());
         loop {
-            if let Some(Reply::Done(code)) = *slot {
-                return Some(code);
+            if let Some(Reply::Done(code)) = &*slot {
+                return Some(*code);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1583,6 +1587,37 @@ impl artifacts::Sink for Inner {
         }
     }
 
+    fn digests(&self) -> bool {
+        self.state()
+            .reporter
+            .as_ref()
+            .is_some_and(Reporter::digests)
+    }
+
+    fn offer(&self, attempt: AttemptId, name: &str, entries: &[Offered], last: bool) -> bool {
+        self.stream(attempt, |reporter| {
+            reporter.artifact_offer(attempt, name, entries, last)
+        })
+    }
+
+    fn held(&self, attempt: AttemptId, _name: &str) -> Option<Vec<u32>> {
+        let watch = self.state().artifact_waits.get(&attempt).cloned()?;
+        match watch.wait_reply(REPLY_TIMEOUT) {
+            Some(Reply::Held(held)) => Some(held),
+            Some(Reply::Done(_)) => {
+                self.state().artifact_waits.remove(&attempt);
+                None
+            }
+            Some(Reply::Granted) | None => {
+                if watch.peek().is_none() {
+                    // No answer inside the reply window: the artifact is settled as a store fault.
+                    watch.resolve(Reply::Done(ArtifactCode::Store));
+                }
+                None
+            }
+        }
+    }
+
     fn file(&self, attempt: AttemptId, path: &str, len: u64, mode: u32) -> bool {
         self.stream(attempt, |reporter| {
             reporter.artifact_file(attempt, path, len, mode)
@@ -1974,6 +2009,13 @@ impl LinkExecutor for Executor {
         if let Some(watch) = watch {
             let _gate = watch.gate.lock().unwrap_or_else(|p| p.into_inner());
             watch.resolve(Reply::Granted);
+        }
+    }
+
+    fn artifact_held(&self, attempt: AttemptId, _name: &str, held: &[u32]) {
+        let watch = self.state().artifact_waits.get(&attempt).cloned();
+        if let Some(watch) = watch {
+            watch.resolve(Reply::Held(held.to_vec()));
         }
     }
 

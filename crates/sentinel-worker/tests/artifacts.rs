@@ -3,17 +3,32 @@
 use std::{fs, os::unix::fs::PermissionsExt, sync::Mutex};
 
 use sentinel_core::AttemptId;
-use sentinel_link::session::ArtifactCode;
+use sentinel_link::session::{ArtifactCode, Offered};
 use sentinel_pipeline::schema::{Artifact, ArtifactWhen};
 use sentinel_worker::artifacts::{self, Outcome, Sink};
 
 #[derive(Debug)]
 enum Call {
     Begin(String),
-    File { path: String, len: u64, mode: u32 },
-    Data { seq: u32, bytes: Vec<u8> },
+    Offer {
+        entries: Vec<(String, [u8; 32], u64)>,
+        last: bool,
+    },
+    Held,
+    File {
+        path: String,
+        len: u64,
+        mode: u32,
+    },
+    Data {
+        seq: u32,
+        bytes: Vec<u8>,
+    },
     End(String),
-    Absent { name: String, reason: u8 },
+    Absent {
+        name: String,
+        reason: u8,
+    },
     Settle(String),
 }
 
@@ -22,6 +37,10 @@ struct Scripted {
     verdict: ArtifactCode,
     capable: bool,
     data_fail_at: Option<u32>,
+    /// `None` keeps the bodies-only path every protocol below 12 uses.
+    digest_first: Option<Vec<u32>>,
+    offer_refused: bool,
+    held_missing: bool,
     calls: Mutex<Vec<Call>>,
 }
 
@@ -32,7 +51,16 @@ impl Scripted {
             verdict: ArtifactCode::Stored,
             capable: true,
             data_fail_at: None,
+            digest_first: None,
+            offer_refused: false,
+            held_missing: false,
             calls: Mutex::new(Vec::new()),
+        }
+    }
+    fn digests(held: Vec<u32>) -> Scripted {
+        Scripted {
+            digest_first: Some(held),
+            ..Scripted::stored()
         }
     }
     fn calls(&self) -> Vec<Call> {
@@ -50,6 +78,26 @@ impl Sink for Scripted {
             .unwrap()
             .push(Call::Begin(name.to_owned()));
         self.grant
+    }
+    fn digests(&self) -> bool {
+        self.digest_first.is_some()
+    }
+    fn offer(&self, _a: AttemptId, _name: &str, entries: &[Offered], last: bool) -> bool {
+        self.calls.lock().unwrap().push(Call::Offer {
+            entries: entries
+                .iter()
+                .map(|e| (e.path.clone(), e.digest, e.len))
+                .collect(),
+            last,
+        });
+        !self.offer_refused
+    }
+    fn held(&self, _a: AttemptId, _name: &str) -> Option<Vec<u32>> {
+        self.calls.lock().unwrap().push(Call::Held);
+        if self.held_missing {
+            return None;
+        }
+        self.digest_first.clone()
     }
     fn file(&self, _a: AttemptId, path: &str, len: u64, mode: u32) -> bool {
         self.calls.lock().unwrap().push(Call::File {
@@ -357,4 +405,94 @@ fn required_artifacts_gate_the_verdict_optional_ones_do_not() {
         None
     );
     assert!(sink.calls().is_empty());
+}
+
+#[test]
+fn capture_offers_every_file_by_content_and_sends_only_the_missing_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("out")).unwrap();
+    fs::write(dir.path().join("out/a.txt"), "alpha").unwrap();
+    fs::write(dir.path().join("out/m.txt"), "middle").unwrap();
+    fs::write(dir.path().join("out/z.txt"), "zeta").unwrap();
+
+    let sink = Scripted::digests(vec![1]);
+    let outcome = artifacts::capture(
+        dir.path(),
+        &decl("dist", &["out/**"], ArtifactWhen::Always, false),
+        &sink,
+        attempt_id(),
+    );
+    assert_eq!(outcome, Outcome::Published);
+
+    let calls = sink.calls();
+    match &calls[1] {
+        Call::Offer { entries, last } => {
+            assert!(*last);
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|(path, digest, len)| { (path.as_str(), *digest, *len) })
+                    .collect::<Vec<_>>(),
+                [
+                    ("out/a.txt", *blake3::hash(b"alpha").as_bytes(), 5),
+                    ("out/m.txt", *blake3::hash(b"middle").as_bytes(), 6),
+                    ("out/z.txt", *blake3::hash(b"zeta").as_bytes(), 4),
+                ]
+            );
+        }
+        other => panic!("the offer came second: {other:?}"),
+    }
+    assert!(matches!(calls[2], Call::Held));
+    let paths: Vec<&str> = calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::File { path, .. } => Some(path.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(paths, ["out/a.txt", "out/z.txt"]);
+    // Everything else is the body path protocol 11 already used.
+    assert!(matches!(calls.last(), Some(Call::End(name)) if name == "dist"));
+}
+
+#[test]
+fn capture_fails_when_the_offer_or_its_answer_does_not_come() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.txt"), "a").unwrap();
+
+    let refused = Scripted {
+        offer_refused: true,
+        ..Scripted::digests(Vec::new())
+    };
+    assert_eq!(
+        artifacts::capture(
+            dir.path(),
+            &decl("dist", &["a.txt"], ArtifactWhen::Always, false),
+            &refused,
+            attempt_id(),
+        ),
+        Outcome::Failed
+    );
+    // A refused offer settles the artifact instead of leaving it in flight on the controller.
+    assert!(matches!(refused.calls().last(), Some(Call::Settle(_))));
+
+    let silent = Scripted {
+        held_missing: true,
+        ..Scripted::digests(Vec::new())
+    };
+    assert_eq!(
+        artifacts::capture(
+            dir.path(),
+            &decl("dist", &["a.txt"], ArtifactWhen::Always, false),
+            &silent,
+            attempt_id(),
+        ),
+        Outcome::Failed
+    );
+    assert!(
+        !silent
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::File { .. }))
+    );
 }

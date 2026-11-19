@@ -5,7 +5,11 @@ use serde::{Deserialize, Serialize};
 pub struct ProtocolVersion(pub u16);
 
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(11);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(12);
+
+/// Digest-first artifact transfer: the worker offers every file's digest and length before a body travels and
+/// the controller answers the ones the tenant already holds. A session below this version has no offer at all.
+pub const DIGEST_FIRST_MIN: ProtocolVersion = ProtocolVersion(12);
 
 pub const DIGEST_AT_END_MIN: ProtocolVersion = ProtocolVersion(9);
 
@@ -232,7 +236,7 @@ mod tests {
         let future_bit = Capabilities(1 << 40);
         let h = hello(
             1,
-            11,
+            SUPPORTED_MAX.0,
             Capabilities::REQUIRED
                 .union(Capabilities::REFLINK)
                 .union(future_bit),
@@ -319,6 +323,29 @@ mod tests {
         assert_eq!(
             negotiate(&hello(2, 1, Capabilities::REQUIRED)),
             Err(Rejected::InvalidRange)
+        );
+    }
+
+    #[test]
+    fn digest_first_is_negotiated_and_never_assumed() {
+        // A peer that stops at 11 is welcomed at 11, and its session has no offer: the version is the promise.
+        let old = negotiate(&hello(1, 11, Capabilities::REQUIRED)).unwrap();
+        assert_eq!(old.protocol, ProtocolVersion(11));
+        assert!(old.protocol < DIGEST_FIRST_MIN);
+        let current = negotiate(&hello(1, SUPPORTED_MAX.0, Capabilities::REQUIRED)).unwrap();
+        assert_eq!(current.protocol, SUPPORTED_MAX);
+        assert!(current.protocol >= DIGEST_FIRST_MIN);
+        // A worker that can only speak 12 is refused by a controller that stops at 11, and told which side
+        // must move: it is never welcomed at a version whose messages it would send blind.
+        assert_eq!(
+            negotiate(&hello(
+                DIGEST_FIRST_MIN.0,
+                DIGEST_FIRST_MIN.0,
+                Capabilities::REQUIRED
+            ))
+            .unwrap()
+            .protocol,
+            DIGEST_FIRST_MIN
         );
     }
 

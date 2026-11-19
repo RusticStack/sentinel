@@ -65,6 +65,7 @@ Enforced from declared lengths before any body is read; exceeding one is `payloa
 | Names and labels | 128 bytes |
 | Items in any list field | 64 |
 | Artifact data frame payload (`ArtifactData`) | 48 KiB |
+| Files in one artifact offer message (`ArtifactOffer`) | 32 (`MAX_ARTIFACT_OFFER_ENTRIES`; a larger artifact offers in batches) |
 | Files in one artifact | 4,096 |
 | One artifact's bytes | 4 GiB |
 | All artifact bytes of one run | 16 GiB |
@@ -78,7 +79,7 @@ Invariants between limits are compile-time assertions. Raise a limit only with a
 
 ## Worker negotiation
 
-A session opens with `Hello { protocol_min, protocol_max, capabilities, arch, software }`. The controller supports protocol versions in an inclusive range (currently 1 to 10) and answers with the highest version both sides share and the worker's capability bits it recognises. Capabilities are a `u64` bit set so storing, comparing and intersecting is one instruction; bits the controller does not know are masked, never rejected, so newer workers stay compatible.
+A session opens with `Hello { protocol_min, protocol_max, capabilities, arch, software }`. The controller supports protocol versions in an inclusive range (currently 1 to 12) and answers with the highest version both sides share and the worker's capability bits it recognises. Capabilities are a `u64` bit set so storing, comparing and intersecting is one instruction; bits the controller does not know are masked, never rejected, so newer workers stay compatible.
 
 | Bit | Capability |
 |---|---|
@@ -128,10 +129,14 @@ Protocol 10 appends `SecretBegin { attempt, fence, length }` and `SecretChunk { 
 
 Protocol 11 appends `Cancel { attempts }`, at most 1,024 attempt ids (`MAX_CANCEL_PUSH`). The controller pushes it on the dispatch pass that follows a committed cancel, to every protocol-11 session holding an affected attempt, from one indexed read per session (`dispatch::cancel_pending`). It is an early copy of what the next `Pong.cancel` carries, not a replacement: a worker treats each id as a heartbeat cancel, and an id it no longer holds is ignored. A session below protocol 11 never receives it and rejects one as a protocol error.
 
+## Protocol 12 digest-first artifact transfer
+
+Protocol 12 appends `ArtifactOffer { attempt, name, entries, last }` (worker → controller) and `ArtifactHeld { attempt, name, held }` (controller → worker). The offer states each file's path, BLAKE3 digest, length and mode before a body travels; the answer names the indexes of the entries this tenant already holds. Bodies for the rest follow as protocol 4's `ArtifactFile`/`ArtifactData`, and the controller verifies each sealed body against the digest its offer promised. `DIGEST_FIRST_MIN` is 12, so a session that negotiated 11 has no offer at all and publishes bodies exactly as it did: the version, not a capability bit, is the promise that both sides understand the messages. An offer on a below-12 session is a protocol error on either side, never a message that is dropped in silence. See [worker link](worker-link.md#dispatch) and [storage](storage.md#digest-first-publication).
+
 ## Versioning policy
 
 The protocol version bumps on any incompatible change to messages, framing or semantics. A new message *variant* is additive; a new or changed *struct field* — optional or not — bumps the protocol, because postcard decodes exactly the field list its reader knows and `#[serde(default)]` never fires (see [Protocol 7 additions](#protocol-7-additions)). Error schema, cursor version byte and protocol version are independent so each can move alone. The JSON shapes of `ApiError`, `Hello` and `Rejected` are pinned by tests.
 
 ## Verification
 
-Unit tests: error wire shape and foreign-schema rejection, status and retry mapping, idempotency key bounds and size, fingerprint stability, decision table, cursor round trip with tenant binding and malformed/uppercase/version/kind rejection, sequence saturation, page-size clamping, declared-length checks, version selection with unknown-bit masking, mismatch direction, missing-capability naming, and `Hello`/`Rejected` JSON stability, plus the protocol-7 profile's bounds (`Profile::invalid`) and its postcard round trip (with `serde(default)` on the JSON shape).
+Unit tests: version selection at the 11/12 boundary with and without digest-first (a peer that stops at 11 negotiates 11 and never offers), offer frame bounds, error wire shape and foreign-schema rejection, status and retry mapping, idempotency key bounds and size, fingerprint stability, decision table, cursor round trip with tenant binding and malformed/uppercase/version/kind rejection, sequence saturation, page-size clamping, declared-length checks, version selection with unknown-bit masking, mismatch direction, missing-capability naming, and `Hello`/`Rejected` JSON stability, plus the protocol-7 profile's bounds (`Profile::invalid`) and its postcard round trip (with `serde(default)` on the JSON shape).

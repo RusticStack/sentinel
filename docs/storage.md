@@ -167,6 +167,13 @@ object paths the authenticated routes use, including the transfer slot, the stat
 evicted entry streams back from the external copy exactly as it does there. A token may be redeemed repeatedly inside
 its window: nothing is consumed, because a redemption record would put a write on every anonymous download. The
 access-log line keeps a 16-hex digest of the token and never the text ([API](api.md#short-lived-download-links)).
+## Digest-first publication
+
+On a protocol-12 session the worker states an artifact's content before any of its bytes travel: one offer per artifact carrying each entry's path, BLAKE3 digest, length and mode, answered once with the entries whose bytes this tenant already stores at exactly that length ([worker link](worker-link.md#dispatch)). The answer comes from `objects::holds`, one primary-key lookup per entry inside a single reader borrow (`SELECT … FROM objects WHERE tenant_id = ? AND digest = ? AND len = ?`), and it is tenant-scoped on purpose: an object another tenant stores is not a hold, so its body travels, the artifact gets its own object row, and nothing in the answer distinguishes "another tenant has it" from "nobody has it".
+
+A held entry needs no bytes and no disk: nothing is staged, `admission` is asked only for the entries whose bodies will actually arrive, and the manifest references the existing object. An entry whose body does arrive is staged exactly as protocol 11 stages it, and the sealed object is compared with the digest the offer promised before its row may commit — a mismatch fails the artifact (`invalid`) instead of publishing bytes no digest named. The artifact row still records its logical size in `entries` and `bytes`, and the run budget is charged that size when the offer closes, so dedup changes what travels and what is stored, not what the artifact is; the tenant and repository quotas count the objects as before, one row per distinct byte string.
+
+What this does not do: a repeated file *inside one artifact* travels twice, because the held question is asked before any of that artifact's bodies are committed; an S3-evicted object counts as held (its row is the hold; reading it later streams it back), and a worker still reads each file twice when the tenant does not hold it — once to hash it for the offer, once to send it.
 
 ## Whole-artifact archives
 
