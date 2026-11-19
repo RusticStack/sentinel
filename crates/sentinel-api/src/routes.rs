@@ -78,6 +78,18 @@ pub(crate) fn err(code: ErrorCode, message: impl Into<String>) -> ApiError {
     ApiError::new(code, message)
 }
 
+/// A line or wall-clock lookup is promised for the segmented store only: a legacy flat log has no index and no
+/// checkpoints to seek, so the client is told the log it asked cannot answer instead of a position that is not one.
+fn seek_error(e: StoreError) -> ApiError {
+    match e {
+        StoreError::NotFound => err(
+            ErrorCode::InvalidRequest,
+            "line and at need a segmented log; page this attempt by after",
+        ),
+        e => store_error(e),
+    }
+}
+
 pub(crate) fn store_error(e: StoreError) -> ApiError {
     match e {
         StoreError::NotFound => err(ErrorCode::NotFound, "not found"),
@@ -1601,6 +1613,20 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
         })
         .transpose()?;
     let wait = query_param(query, "wait").is_some_and(|v| v == "1" || v == "true");
+    let line: Option<u64> = query_param(query, "line")
+        .map(|v| {
+            v.parse()
+                .ok()
+                .filter(|n: &u64| *n > 0)
+                .ok_or_else(|| err(ErrorCode::InvalidRequest, "malformed line"))
+        })
+        .transpose()?;
+    let at: Option<u64> = query_param(query, "at")
+        .map(|v| {
+            v.parse()
+                .map_err(|_| err(ErrorCode::InvalidRequest, "malformed at"))
+        })
+        .transpose()?;
     let (tenant, run, job) = attempt_log(state, who.principal, attempt)?;
     if let Some(expired) = state
         .store
@@ -1617,22 +1643,70 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
             "expired_ms": expired.0,
         }));
     }
-    let after = match (after, query_param(query, "cursor")) {
-        (Some(_), Some(_)) => {
-            return Err(err(
-                ErrorCode::InvalidRequest,
-                "after and cursor are exclusive",
-            ));
+    if line.is_some() && at.is_some() {
+        return Err(err(ErrorCode::InvalidRequest, "line and at are exclusive"));
+    }
+    // The line and wall-clock lookups answer a plain sequence position that `read_page` continues from, so the
+    // page, the cursor and every other bound of the route stay exactly what they are.
+    let (seek_after, seek) = match (line, at) {
+        (Some(line), _) => {
+            let seek = state
+                .logs
+                .seek_line(run, job, attempt, line)
+                .map_err(seek_error)?;
+            (
+                seek.after,
+                json!({
+                    "line": line,
+                    "after": seek.after,
+                    "found": seek.found,
+                    "exact": seek.exact,
+                    "complete": seek.complete,
+                }),
+            )
         }
-        (Some(after), None) => after,
-        (None, Some(text)) => {
-            let cursor = Cursor::parse(text, tenant)
-                .ok()
-                .filter(|c| c.kind == StreamKind::AttemptLog && c.stream == *attempt.as_bytes())
-                .ok_or_else(|| err(ErrorCode::InvalidCursor, "invalid cursor"))?;
-            cursor.seq.0
+        (None, Some(at)) => {
+            let seek = state
+                .logs
+                .seek_time(run, job, attempt, UnixMillis(at as i64))
+                .map_err(seek_error)?;
+            (
+                seek.after,
+                json!({
+                    "at_ms": at,
+                    "after": seek.after,
+                    "until": seek.until,
+                    "complete": seek.complete,
+                }),
+            )
         }
-        (None, None) => 0,
+        (None, None) => (0, Value::Null),
+    };
+    let after = if seek.is_null() {
+        match (after, query_param(query, "cursor")) {
+            (Some(_), Some(_)) => {
+                return Err(err(
+                    ErrorCode::InvalidRequest,
+                    "after and cursor are exclusive",
+                ));
+            }
+            (Some(after), None) => after,
+            (None, Some(text)) => {
+                let cursor = Cursor::parse(text, tenant)
+                    .ok()
+                    .filter(|c| c.kind == StreamKind::AttemptLog && c.stream == *attempt.as_bytes())
+                    .ok_or_else(|| err(ErrorCode::InvalidCursor, "invalid cursor"))?;
+                cursor.seq.0
+            }
+            (None, None) => 0,
+        }
+    } else if after.is_some() || query_param(query, "cursor").is_some() {
+        return Err(err(
+            ErrorCode::InvalidRequest,
+            "line and at are exclusive with after and cursor",
+        ));
+    } else {
+        seek_after
     };
     let page = logs::Page {
         limit,
@@ -1701,7 +1775,7 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
         stream: *attempt.as_bytes(),
         seq: Seq(position),
     };
-    ok(json!({
+    let mut body = json!({
         "attempt": attempt.to_string(),
         "complete": tail.complete,
         "gaps": tail.gaps,
@@ -1713,7 +1787,11 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
             "stream": stream_name(f.stream),
             "text": String::from_utf8_lossy(&f.bytes),
         })).collect::<Vec<_>>(),
-    }))
+    });
+    if let Some(object) = body.as_object_mut() {
+        object.insert("seek".into(), seek);
+    }
+    ok(body)
 }
 
 fn ready(state: &State) -> Route {
