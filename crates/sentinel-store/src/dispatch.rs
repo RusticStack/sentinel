@@ -1130,11 +1130,22 @@ impl Placement<'_, '_> {
             let mut after = (i64::MIN, i64::MIN, i64::MIN);
             for _ in 0..MAX_PAGES {
                 let (found, full) = self.scan_page(stream, far, &mut after)?;
-                if let Some(pick) = found {
-                    return self.lease(pick, lease_ms).map(Some);
-                }
-                if !full {
+                let Some(pick) = found else {
+                    if full {
+                        continue;
+                    }
                     break;
+                };
+                let job = pick.job;
+                match self.lease(pick, lease_ms) {
+                    Ok(offer) => return Ok(Some(offer)),
+                    // A row this store itself wrote is either leaseable or damaged. Failing the pass on a
+                    // damaged one would leave it at the head of every later query, stalling the queue behind
+                    // it, so it is passed over, counted and named, and the scan resumes past it.
+                    Err(e) if e.is_row_specific() => {
+                        crate::skipped::note_blob("jobs", job.as_bytes())
+                    }
+                    Err(e) => return Err(e),
                 }
             }
         }
