@@ -292,11 +292,28 @@ struct Peer {
 }
 
 struct OpenFile {
-    path: String,
-    mode: u32,
     declared: u64,
     next_seq: u32,
     staging: objects::Staging,
+}
+
+/// One file of an in-flight artifact: its declared shape, the digest the worker offered when it offered one, and
+/// where its bytes came from.
+struct Planned {
+    path: String,
+    mode: u32,
+    len: u64,
+    digest: Option<objects::Digest>,
+    body: Captured,
+}
+
+enum Captured {
+    /// Offered, body not arrived yet.
+    Pending,
+    /// The tenant already held these bytes: no body travelled and nothing was staged.
+    Held,
+    /// Staged here from the body the worker sent.
+    Sent(objects::Staged),
 }
 
 struct InFlight {
@@ -306,11 +323,30 @@ struct InFlight {
     name: String,
     retain_secs: u64,
     class: Option<String>,
-    done: Vec<(String, u32, objects::Staged)>,
+    done: Vec<Planned>,
     accounted: u64,
+    /// Bytes the worker has offered, held ones included: its artifacts' logical size.
+    offered_bytes: u64,
+    /// The entry the next `ArtifactFile` belongs to.
+    sending: usize,
     last_path: String,
     file: Option<OpenFile>,
+    /// The offered entries the tenant already holds, accumulated across batches: the worker is answered once.
+    held: Vec<u32>,
+    /// The offer's last batch has been seen; a later batch is refused rather than merged into a settled answer.
+    offer_closed: bool,
     settled: bool,
+}
+
+impl InFlight {
+    /// The next entry whose body is still to arrive.
+    fn next_pending(&mut self) {
+        while self.sending < self.done.len()
+            && !matches!(self.done[self.sending].body, Captured::Pending)
+        {
+            self.sending += 1;
+        }
+    }
 }
 
 type Publication = Arc<Mutex<InFlight>>;
@@ -1851,7 +1887,7 @@ impl Inner {
         let captured = state == artifacts::State::Captured;
         let entries = if captured { f.done.len() as u64 } else { 0 };
         let bytes = if captured {
-            f.done.iter().map(|(_, _, s)| s.len()).sum::<u64>()
+            f.done.iter().map(|p| p.len).sum::<u64>()
         } else {
             0
         };
@@ -1918,14 +1954,16 @@ impl Inner {
         code
     }
 
-    fn discard(&self, done: Vec<(String, u32, objects::Staged)>) {
+    fn discard(&self, done: Vec<Planned>) {
         if done.is_empty() {
             return;
         }
         let objects = Arc::clone(&self.objects);
         let _ = self.write(move |tx| {
-            for (_, _, staged) in done {
-                objects.discard(tx, staged)?;
+            for planned in done {
+                if let Captured::Sent(staged) = planned.body {
+                    objects.discard(tx, staged)?;
+                }
             }
             Ok(())
         });
@@ -2588,12 +2626,122 @@ impl SessionHandler for Inner {
                 class: decl.class.clone(),
                 done: Vec::new(),
                 accounted: 0,
+                offered_bytes: 0,
+                held: Vec::new(),
+                sending: 0,
                 last_path: String::new(),
                 file: None,
+                offer_closed: false,
                 settled: false,
             })),
         );
         ArtifactReply::Grant
+    }
+
+    fn artifact_offer(
+        &self,
+        _worker: WorkerId,
+        attempt: AttemptId,
+        name: &str,
+        entries: &[session::Offered],
+        last: bool,
+    ) -> session::ArtifactOfferReply {
+        use session::ArtifactOfferReply::{Held, Verdict};
+        let Some(publication) = self.publication(attempt) else {
+            return Verdict(ArtifactCode::Stale);
+        };
+        let mut guard = publication.lock().unwrap_or_else(|p| p.into_inner());
+        let f = &mut *guard;
+        if f.settled {
+            return Verdict(ArtifactCode::Stale);
+        }
+        if f.name != name || f.offer_closed || f.file.is_some() {
+            return Verdict(self.artifact_fail(f, attempt, ArtifactCode::Invalid));
+        }
+        if session::Offered::invalid(entries, &f.last_path).is_some()
+            || f.done.len().saturating_add(entries.len()) > MAX_ARTIFACT_ENTRIES
+        {
+            return Verdict(self.artifact_fail(f, attempt, ArtifactCode::Invalid));
+        }
+        let offered = f
+            .offered_bytes
+            .saturating_add(entries.iter().map(|e| e.len).sum::<u64>());
+        if offered > MAX_ARTIFACT_BYTES {
+            return Verdict(self.artifact_fail(f, attempt, ArtifactCode::TooLarge));
+        }
+        // Tenant-scoped on purpose: another tenant's copy of these bytes is not this artifact's, so its body
+        // travels and the answer says nothing about it.
+        let tenant = f.tenant;
+        let held = self.store.read(|c| {
+            let mut held = Vec::new();
+            for (index, entry) in entries.iter().enumerate() {
+                let digest = objects::Digest::from_bytes(entry.digest);
+                if objects::Objects::holds(c, tenant, digest, entry.len)? {
+                    held.push(index as u32);
+                }
+            }
+            Ok(held)
+        });
+        let Ok(held) = held else {
+            return Verdict(self.artifact_fail(f, attempt, ArtifactCode::Store));
+        };
+        let base = f.done.len() as u32;
+        let missing: u64 = entries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| held.binary_search(&(*index as u32)).is_err())
+            .map(|(_, entry)| entry.len)
+            .sum();
+        for (index, entry) in entries.iter().enumerate() {
+            let body = if held.binary_search(&(index as u32)).is_ok() {
+                Captured::Held
+            } else {
+                Captured::Pending
+            };
+            f.done.push(Planned {
+                path: entry.path.clone(),
+                mode: entry.mode & crate::session::ARTIFACT_MODE_BITS,
+                len: entry.len,
+                digest: Some(objects::Digest::from_bytes(entry.digest)),
+                body,
+            });
+        }
+        f.last_path = entries.last().map(|e| e.path.clone()).unwrap_or_default();
+        f.offered_bytes = offered;
+        f.held.extend(held.iter().map(|index| base + index));
+        if !last {
+            return Held(Vec::new());
+        }
+        f.offer_closed = true;
+        f.next_pending();
+        // The run budget is the artifact's logical size; only the bytes that will actually be staged need room.
+        let fits = missing == 0
+            || self
+                .objects
+                .admission()
+                .is_none_or(|a| a.check(missing).is_ok());
+        if !fits {
+            return Verdict(self.artifact_fail(f, attempt, ArtifactCode::TooLarge));
+        }
+        let run = f.run;
+        let charged = f.offered_bytes;
+        let committed = self
+            .store
+            .read(|c| artifacts::run_bytes(c, f.tenant, run))
+            .unwrap_or(u64::MAX);
+        {
+            let mut state = self.artifacts.lock().unwrap_or_else(|p| p.into_inner());
+            let held_for_run = state.runs.entry(run).or_default();
+            let total = committed
+                .saturating_add(*held_for_run)
+                .saturating_add(charged);
+            if total > self.objects.deployment().run_artifact_bytes {
+                return Verdict(self.artifact_fail(f, attempt, ArtifactCode::TooLarge));
+            }
+            *held_for_run += charged;
+        }
+        f.accounted += charged;
+        Held(std::mem::take(&mut f.held))
     }
 
     fn artifact_file(
@@ -2612,51 +2760,75 @@ impl SessionHandler for Inner {
         if f.settled {
             return Some(ArtifactCode::Stale);
         }
-        if f.file.is_some()
-            || !objects::valid_entry_path(path)
-            || f.done.len() >= MAX_ARTIFACT_ENTRIES
-            || (!f.last_path.is_empty() && path <= f.last_path.as_str())
-        {
+        if f.file.is_some() || !objects::valid_entry_path(path) {
             return Some(self.artifact_fail(f, attempt, ArtifactCode::Invalid));
         }
-        let committed = self
-            .store
-            .read(|c| artifacts::run_bytes(c, f.tenant, f.run))
-            .unwrap_or(u64::MAX);
-        let fits = f.accounted.saturating_add(len) <= MAX_ARTIFACT_BYTES
-            && self
-                .objects
-                .admission()
-                .is_none_or(|a| a.check(len).is_ok())
-            && {
-                let mut state = self.artifacts.lock().unwrap_or_else(|p| p.into_inner());
-                let charged = state.runs.entry(f.run).or_default();
-                let fits = committed.saturating_add(*charged).saturating_add(len)
-                    <= self.objects.deployment().run_artifact_bytes;
-                if fits {
-                    *charged += len;
-                }
-                fits
-            };
-        if !fits {
-            return Some(self.artifact_fail(f, attempt, ArtifactCode::TooLarge));
+        let mode = mode & crate::session::ARTIFACT_MODE_BITS;
+        if f.offer_closed {
+            // An offered artifact has promised exactly these entries in this order, and its size is charged.
+            let matches = f.done.get(f.sending).is_some_and(|planned| {
+                planned.path == path
+                    && planned.len == len
+                    && planned.mode == mode
+                    && matches!(planned.body, Captured::Pending)
+            });
+            if !matches {
+                return Some(self.artifact_fail(f, attempt, ArtifactCode::Invalid));
+            }
+        } else {
+            if f.done.len() >= MAX_ARTIFACT_ENTRIES
+                || (!f.last_path.is_empty() && path <= f.last_path.as_str())
+            {
+                return Some(self.artifact_fail(f, attempt, ArtifactCode::Invalid));
+            }
+            let committed = self
+                .store
+                .read(|c| artifacts::run_bytes(c, f.tenant, f.run))
+                .unwrap_or(u64::MAX);
+            let fits = f.accounted.saturating_add(len) <= MAX_ARTIFACT_BYTES
+                && self
+                    .objects
+                    .admission()
+                    .is_none_or(|a| a.check(len).is_ok())
+                && {
+                    let mut state = self.artifacts.lock().unwrap_or_else(|p| p.into_inner());
+                    let charged = state.runs.entry(f.run).or_default();
+                    let fits = committed.saturating_add(*charged).saturating_add(len)
+                        <= self.objects.deployment().run_artifact_bytes;
+                    if fits {
+                        *charged += len;
+                    }
+                    fits
+                };
+            if !fits {
+                return Some(self.artifact_fail(f, attempt, ArtifactCode::TooLarge));
+            }
+            f.accounted += len;
+            f.last_path = path.to_string();
+            f.done.push(Planned {
+                path: path.to_string(),
+                mode,
+                len,
+                digest: None,
+                body: Captured::Pending,
+            });
+            f.sending = f.done.len() - 1;
         }
-        f.accounted += len;
-        f.last_path = path.to_string();
         let staging = match self.objects.stage_begin(f.tenant, len) {
             Ok(staging) => staging,
             Err(_) => return Some(self.artifact_fail(f, attempt, ArtifactCode::Store)),
         };
         let file = OpenFile {
-            path: path.to_string(),
-            mode: mode & crate::session::ARTIFACT_MODE_BITS,
             declared: len,
             next_seq: 0,
             staging,
         };
         if len == 0 {
             match self.objects.stage_seal(f.tenant, file.staging, 0) {
-                Ok(staged) => f.done.push((file.path, file.mode, staged)),
+                Ok(staged) => {
+                    f.done[f.sending].body = Captured::Sent(staged);
+                    f.next_pending();
+                }
                 Err(_) => return Some(self.artifact_fail(f, attempt, ArtifactCode::Store)),
             }
         } else {
@@ -2694,13 +2866,25 @@ impl SessionHandler for Inner {
         file.next_seq += 1;
         if file.staging.written() == file.declared {
             let file = f.file.take().expect("open file checked");
-            match self
+            let staged = match self
                 .objects
                 .stage_seal(f.tenant, file.staging, file.declared)
             {
-                Ok(staged) => f.done.push((file.path, file.mode, staged)),
+                Ok(staged) => staged,
                 Err(_) => return Some(self.artifact_fail(f, attempt, ArtifactCode::Store)),
+            };
+            let index = f.sending;
+            // The digest is verified against the offer, so a body that is not what the worker promised is
+            // refused before any manifest can reference it.
+            if f.done[index]
+                .digest
+                .is_some_and(|digest| staged.digest() != digest)
+            {
+                f.done[index].body = Captured::Sent(staged);
+                return Some(self.artifact_fail(f, attempt, ArtifactCode::Invalid));
             }
+            f.done[index].body = Captured::Sent(staged);
+            f.next_pending();
         }
         None
     }
@@ -2717,6 +2901,10 @@ impl SessionHandler for Inner {
         if f.name != name || f.file.is_some() {
             return self.artifact_fail(f, attempt, ArtifactCode::Invalid);
         }
+        // An offered body that never arrived is an incomplete artifact, not a short one.
+        if f.done.iter().any(|p| matches!(p.body, Captured::Pending)) {
+            return self.artifact_fail(f, attempt, ArtifactCode::Invalid);
+        }
         self.settle(attempt, f);
         let done = std::mem::take(&mut f.done);
         let (tenant, run, job, retain_secs) = (f.tenant, f.run, f.job, f.retain_secs);
@@ -2725,11 +2913,16 @@ impl SessionHandler for Inner {
         drop(guard);
         let entries: Vec<objects::Entry> = done
             .iter()
-            .map(|(path, mode, staged)| objects::Entry {
-                path: path.clone(),
-                digest: staged.digest(),
-                len: staged.len(),
-                mode: *mode,
+            .map(|planned| objects::Entry {
+                path: planned.path.clone(),
+                digest: match &planned.body {
+                    Captured::Sent(staged) => staged.digest(),
+                    _ => planned
+                        .digest
+                        .expect("a held entry carries the digest it was offered with"),
+                },
+                len: planned.len,
+                mode: planned.mode,
             })
             .collect();
         let manifest = artifacts::manifest_name(job, &artifact_name);
@@ -2738,7 +2931,13 @@ impl SessionHandler for Inner {
                 .0
                 .saturating_add(retain_secs.saturating_mul(1000) as i64),
         );
-        let staged: Vec<objects::Staged> = done.into_iter().map(|(_, _, s)| s).collect();
+        let staged: Vec<objects::Staged> = done
+            .into_iter()
+            .filter_map(|planned| match planned.body {
+                Captured::Sent(staged) => Some(staged),
+                _ => None,
+            })
+            .collect();
         let objects = Arc::clone(&self.objects);
         let bytes = entries.iter().map(|e| e.len).sum::<u64>();
         let count = entries.len() as u64;

@@ -24,14 +24,15 @@ use sentinel_core::{
 use sentinel_protocol::{
     cache::Trust,
     limits::{
-        MAX_API_BODY_BYTES, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_CHUNK_BYTES, MAX_ARTIFACT_NAME_BYTES,
-        MAX_ARTIFACT_PATH_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_LIST_ITEMS, MAX_LOG_FRAME_BYTES,
+        MAX_API_BODY_BYTES, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_CHUNK_BYTES, MAX_ARTIFACT_ENTRIES,
+        MAX_ARTIFACT_NAME_BYTES, MAX_ARTIFACT_OFFER_ENTRIES, MAX_ARTIFACT_PATH_BYTES,
+        MAX_CONTROL_MESSAGE_BYTES, MAX_LIST_ITEMS, MAX_LOG_FRAME_BYTES,
     },
     logs::{Frame, MAX_GAPS, Stream},
     negotiate::{
-        CACHE_CANCEL_MIN, CANCEL_PUSH_MIN, DIGEST_AT_END_MIN, Hello, MAX_CANCEL_PUSH,
-        MAX_PREFETCH_IMAGES, MAX_PREFETCH_REFERENCE_BYTES, Negotiated, PREFETCH_MIN, PROFILE_MIN,
-        Profile, Rejected,
+        CACHE_CANCEL_MIN, CANCEL_PUSH_MIN, DIGEST_AT_END_MIN, DIGEST_FIRST_MIN, Hello,
+        MAX_CANCEL_PUSH, MAX_PREFETCH_IMAGES, MAX_PREFETCH_REFERENCE_BYTES, Negotiated,
+        PREFETCH_MIN, PROFILE_MIN, Profile, Rejected,
     },
     summary::MAX_SUMMARY_BYTES,
 };
@@ -168,6 +169,14 @@ pub enum ClientMessage {
     CachePushEnd(End),
     CacheCancel {
         attempt: [u8; 16],
+    },
+    /// Protocol 12, appended last so every earlier variant keeps its index: what an artifact will carry, by
+    /// content, before any body travels.
+    ArtifactOffer {
+        attempt: [u8; 16],
+        name: String,
+        entries: Vec<Offered>,
+        last: bool,
     },
 }
 
@@ -363,6 +372,12 @@ pub enum ServerMessage {
     Cancel {
         attempts: Vec<[u8; 16]>,
     },
+    /// Protocol 12: the offered entries whose bytes this tenant already holds, by index into the offer.
+    ArtifactHeld {
+        attempt: [u8; 16],
+        name: String,
+        held: Vec<u32>,
+    },
 }
 
 pub(crate) trait SensitiveFrame {
@@ -437,6 +452,47 @@ impl ArtifactCode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArtifactReply {
     Grant,
+    Verdict(ArtifactCode),
+}
+
+/// One file an artifact will carry, identified by its content: what a worker offers before a body travels.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Offered {
+    pub path: String,
+    pub digest: [u8; 32],
+    pub len: u64,
+    pub mode: u32,
+}
+
+impl Offered {
+    /// The first thing wrong with a batch offered after `after` (the last path already accepted, empty for none).
+    /// Paths are strictly increasing because the worker walks them sorted, and a repeated path would make the
+    /// manifest ambiguous.
+    pub fn invalid<'a>(entries: &'a [Offered], after: &'a str) -> Option<&'static str> {
+        if entries.len() > MAX_ARTIFACT_OFFER_ENTRIES {
+            return Some("offer entries");
+        }
+        let mut last = after;
+        for entry in entries {
+            if entry.path.is_empty() || entry.path.len() > MAX_ARTIFACT_PATH_BYTES {
+                return Some("offer path");
+            }
+            if entry.path.as_str() <= last {
+                return Some("offer path order");
+            }
+            if entry.len > MAX_ARTIFACT_BYTES {
+                return Some("offer length");
+            }
+            last = entry.path.as_str();
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArtifactOfferReply {
+    /// Accepted: the offered entries of the whole offer whose bytes this tenant already holds, by index.
+    Held(Vec<u32>),
     Verdict(ArtifactCode),
 }
 
@@ -865,6 +921,18 @@ pub trait SessionHandler: Send + Sync {
     fn abandoned(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
     fn artifact_begin(&self, _worker: WorkerId, _attempt: AttemptId, _name: &str) -> ArtifactReply {
         ArtifactReply::Verdict(ArtifactCode::Stale)
+    }
+    /// A batch of one artifact's offer. Only the batch that says `last` is answered, with the held set of the
+    /// whole offer, so a large artifact costs one round trip.
+    fn artifact_offer(
+        &self,
+        _worker: WorkerId,
+        _attempt: AttemptId,
+        _name: &str,
+        _entries: &[Offered],
+        _last: bool,
+    ) -> ArtifactOfferReply {
+        ArtifactOfferReply::Verdict(ArtifactCode::Stale)
     }
     fn artifact_file(
         &self,
@@ -2330,6 +2398,42 @@ fn serve_connection(
                     code: code.to_u8(),
                 })?;
             }
+            ClientMessage::ArtifactOffer {
+                attempt,
+                name,
+                entries,
+                last,
+            } => {
+                if protocol < DIGEST_FIRST_MIN.0 {
+                    return Err(Error::Protocol("artifact offer needs protocol 12"));
+                }
+                let id = attempt_id(attempt)?;
+                if artifacts.get(&id) != Some(&name) {
+                    return Err(Error::Protocol("artifact offer of another"));
+                }
+                if let Some(what) = Offered::invalid(&entries, "") {
+                    return Err(Error::Protocol(what));
+                }
+                match handler.artifact_offer(worker, id, &name, &entries, last) {
+                    ArtifactOfferReply::Verdict(code) => {
+                        artifacts.remove(&id);
+                        tx.send(&ServerMessage::ArtifactVerdict {
+                            attempt,
+                            name,
+                            code: code.to_u8(),
+                        })?;
+                    }
+                    ArtifactOfferReply::Held(held) if last => {
+                        tx.send(&ServerMessage::ArtifactHeld {
+                            attempt,
+                            name,
+                            held,
+                        })?;
+                    }
+                    // Only the batch that closes an offer is answered; earlier ones are acknowledged by silence.
+                    ArtifactOfferReply::Held(_) => {}
+                }
+            }
             ClientMessage::Profile(profile) => {
                 if !control {
                     return Err(Error::Protocol("control message on bulk"));
@@ -2739,6 +2843,7 @@ pub fn connect(
         | ServerMessage::LogEndAck { .. }
         | ServerMessage::ArtifactGrant { .. }
         | ServerMessage::ArtifactVerdict { .. }
+        | ServerMessage::ArtifactHeld { .. }
         | ServerMessage::CacheGrant(_)
         | ServerMessage::CacheChunk(_)
         | ServerMessage::CacheEnd(_)
@@ -2873,6 +2978,11 @@ impl Reporter {
         self.protocol >= 4
     }
 
+    /// Whether this session may offer digests before bodies; a body below protocol 12 is the only way to publish.
+    pub fn digests(&self) -> bool {
+        self.protocol >= DIGEST_FIRST_MIN.0
+    }
+
     pub fn artifact_begin(&self, attempt: AttemptId, name: &str) -> Result<()> {
         if self.protocol < 4 {
             return Err(Error::Protocol("artifact needs protocol 4"));
@@ -2883,6 +2993,32 @@ impl Reporter {
         self.bulk_class(&ClientMessage::ArtifactBegin {
             attempt: *attempt.as_bytes(),
             name: name.to_string(),
+        })
+    }
+
+    /// One batch of an artifact's offer; `last` closes it and prompts the answer. Callers send the entries in
+    /// path order, which the controller checks before answering.
+    pub fn artifact_offer(
+        &self,
+        attempt: AttemptId,
+        name: &str,
+        entries: &[Offered],
+        last: bool,
+    ) -> Result<()> {
+        if self.protocol < DIGEST_FIRST_MIN.0 {
+            return Err(Error::Protocol("artifact offer needs protocol 12"));
+        }
+        if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
+            return Err(Error::Protocol("artifact name"));
+        }
+        if let Some(what) = Offered::invalid(entries, "") {
+            return Err(Error::Protocol(what));
+        }
+        self.bulk_class(&ClientMessage::ArtifactOffer {
+            attempt: *attempt.as_bytes(),
+            name: name.to_string(),
+            entries: entries.to_vec(),
+            last,
         })
     }
 
@@ -2964,6 +3100,7 @@ pub trait Executor: Send + Sync {
     fn log_ended(&self, _attempt: AttemptId) {}
     fn artifact_granted(&self, _attempt: AttemptId, _name: &str) {}
     fn artifact_verdict(&self, _attempt: AttemptId, _name: &str, _code: ArtifactCode) {}
+    fn artifact_held(&self, _attempt: AttemptId, _name: &str, _held: &[u32]) {}
     fn availability(&self) -> Option<(u64, sentinel_protocol::negotiate::Availability)> {
         None
     }
@@ -3429,6 +3566,17 @@ fn handle_bulk_message(
         } => {
             let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
             executor.artifact_verdict(attempt, &name, ArtifactCode::from_u8(code));
+        }
+        ServerMessage::ArtifactHeld {
+            attempt,
+            name,
+            held,
+        } => {
+            let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+            if held.len() > MAX_ARTIFACT_ENTRIES {
+                return Err(Error::Protocol("artifact held list"));
+            }
+            executor.artifact_held(attempt, &name, &held);
         }
         ServerMessage::NoSpec { attempt } => {
             let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;

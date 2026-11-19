@@ -1080,6 +1080,24 @@ impl Objects {
         .ok_or(Error::NotFound)
     }
 
+    /// Whether this tenant already holds exactly these bytes: the question digest-first publication asks before a
+    /// body travels. The lookup is tenant-scoped, so another tenant's object answers `false` and neither a body
+    /// nor the answer says anything about it.
+    pub fn holds(conn: &Connection, tenant: TenantId, digest: Digest, len: u64) -> Result<bool> {
+        Ok(conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM objects WHERE tenant_id = ?1 AND digest = ?2 AND len = ?3)",
+            )?
+            .query_row(
+                (
+                    tenant.as_bytes().as_slice(),
+                    digest.as_bytes().as_slice(),
+                    len as i64,
+                ),
+                |r| r.get::<_, bool>(0),
+            )?)
+    }
+
     pub fn open_object(&self, conn: &Connection, tenant: TenantId, digest: Digest) -> Result<File> {
         self.meta(conn, tenant, digest)?;
         File::open(self.object_path(tenant, &digest)).map_err(|e| match e.kind() {

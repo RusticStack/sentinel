@@ -139,6 +139,27 @@ fn same_content_commits_once_and_is_scoped_per_tenant() {
 }
 
 #[test]
+fn holds_answers_only_for_the_tenant_that_holds_the_bytes() {
+    let mut fx = fixture();
+    let body = b"shared bytes";
+    let digest = fx.put(fx.tenant, body);
+    assert!(Objects::holds(&fx.conn, fx.tenant, digest, body.len() as u64).unwrap());
+    // Another tenant's object is not this tenant's: the publication path reads that as "send the body".
+    assert!(!Objects::holds(&fx.conn, fx.other, digest, body.len() as u64).unwrap());
+    // A length that disagrees with the stored object is not a hold either: a digest alone does not name bytes.
+    assert!(!Objects::holds(&fx.conn, fx.tenant, digest, body.len() as u64 + 1).unwrap());
+    assert!(
+        !Objects::holds(
+            &fx.conn,
+            fx.tenant,
+            Digest::from_bytes([7; 32]),
+            body.len() as u64
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn declared_length_or_digest_mismatch_stages_nothing() {
     let fx = fixture();
     for expect in [
