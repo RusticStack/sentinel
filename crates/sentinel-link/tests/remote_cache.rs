@@ -443,6 +443,28 @@ fn an_offer_after_the_terminal_report_is_stored_and_serves_the_next_attempt() {
             .load(std::sync::atomic::Ordering::Relaxed)
             > denied_before
     );
+    // The gate binds a need to the attempt the asking worker holds, so a bundle another tenant's attempt
+    // owns is never even opened for it, whichever side asked first.
+    let opened_before = d
+        .controller
+        .stats()
+        .cache_denied
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        intruder.fetch(
+            &need(&offered, second),
+            Instant::now() + Duration::from_secs(10),
+            &mut Collect::default()
+        ),
+        Err(Refusal::Denied)
+    );
+    assert!(
+        d.controller
+            .stats()
+            .cache_denied
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > opened_before
+    );
 
     assert!(remote.digest_at_end());
     let restream: Vec<u8> = (0..300_000u32).map(|i| (i % 239) as u8).collect();

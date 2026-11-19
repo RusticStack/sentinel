@@ -162,6 +162,13 @@ impl Fake {
             .cloned()
     }
 
+    fn truncate_bundle(&self, scope: &Scope, keep: usize) {
+        let id = entry_id(*scope.repo.as_bytes(), &scope.name, KEY);
+        let mut bundles = self.bundles.lock().unwrap_or_else(|p| p.into_inner());
+        let stream = bundles.get_mut(&id).expect("stored bundle");
+        stream.truncate(keep);
+    }
+
     fn move_bundle(&self, from: &Scope, to: &Scope) {
         let from = entry_id(*from.repo.as_bytes(), &from.name, KEY);
         let to = entry_id(*to.repo.as_bytes(), &to.name, KEY);
@@ -518,6 +525,110 @@ fn a_corrupt_chunk_is_a_miss_and_never_serves() {
             .exists()
     );
     assert!(fake.fetches.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn a_truncated_bundle_is_refused_whole_and_the_entry_still_takes_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let (root_a, root_b) = (temp.path().join("a"), temp.path().join("b"));
+    let ws = temp.path().join("ws");
+    let scope = test_scope(Trust::Protected);
+    fs::create_dir_all(&root_b).unwrap();
+
+    let generation = seal_generation(
+        &root_a,
+        &scope,
+        &[("first", &[5u8; 6 * 1024]), ("second", &[9u8; 4 * 1024])],
+        "gen-1500000-0000abd4",
+    );
+    let fake = Fake::default();
+    offer(&fake, &root_a, &scope, &generation);
+    let whole = fake.stored(&scope).expect("stored bundle").len();
+    let entry = entry_of(&root_b, &scope);
+    let stage = entry.join(scope::WRITING_NAME).join("remote.stage");
+
+    // Cut inside the head: the stream stops before the prefix names its own length.
+    fake.truncate_bundle(&scope, 20);
+    let headless = hydrate(&root_b, &ws, &scope, &fake);
+    assert_eq!(
+        headless.outcome,
+        Outcome::Miss(Miss::Corrupt),
+        "{:?}",
+        headless.outcome
+    );
+    assert!(!stage.exists(), "nothing of the transfer is kept");
+    assert!(!entry.join(scope::CURRENT_NAME).exists());
+    assert!(!ws.join("vendor/first").exists() && !ws.join("vendor/second").exists());
+
+    // Cut inside the payload: the head is whole, the bytes it promised are not.
+    offer(&fake, &root_a, &scope, &generation);
+    fake.truncate_bundle(&scope, whole - 1);
+    let short = hydrate(&root_b, &ws, &scope, &fake);
+    assert_eq!(
+        short.outcome,
+        Outcome::Miss(Miss::Corrupt),
+        "{:?}",
+        short.outcome
+    );
+    assert!(!stage.exists(), "a refused bundle leaves no partial");
+    assert!(!entry.join(scope::CURRENT_NAME).exists());
+    assert!(!ws.join("vendor/first").exists() && !ws.join("vendor/second").exists());
+
+    // The entry is not wedged by the refusals: a whole bundle hydrates and serves.
+    offer(&fake, &root_a, &scope, &generation);
+    let served = hydrate(&root_b, &ws, &scope, &fake);
+    assert!(served.outcome.is_hit(), "{:?}", served.outcome);
+    assert_eq!(
+        fs::read(ws.join("vendor/second")).unwrap(),
+        vec![9u8; 4 * 1024]
+    );
+    assert!(entry.join(scope::CURRENT_NAME).exists());
+}
+
+#[test]
+fn a_bundle_sealed_for_another_tenant_never_serves() {
+    let temp = tempfile::tempdir().unwrap();
+    let (root_a, root_b) = (temp.path().join("a"), temp.path().join("b"));
+    let ws = temp.path().join("ws");
+    let scope = test_scope(Trust::Protected);
+    let mut foreign = test_scope(Trust::Protected);
+    foreign.tenant = TenantId::new();
+    foreign.repo = scope.repo;
+    fs::create_dir_all(&root_b).unwrap();
+
+    let foreign_generation = seal_generation(
+        &root_a,
+        &foreign,
+        &[("blob", &[2u8; 64 * 1024])],
+        "gen-1500000-0000abd6",
+    );
+    let fake = Fake::default();
+    offer(&fake, &root_a, &foreign, &foreign_generation);
+    fake.move_bundle(&foreign, &scope);
+
+    let refused = hydrate(&root_b, &ws, &scope, &fake);
+    assert_eq!(
+        refused.outcome,
+        Outcome::Miss(Miss::WrongTenant),
+        "{:?}",
+        refused.outcome
+    );
+    let transfers = fake.transfers.lock().unwrap().clone();
+    assert_eq!(transfers.len(), 1);
+    assert!(
+        transfers[0].1 < CHUNK as u64,
+        "only the chunk carrying the prefix was accepted, not {} bytes",
+        transfers[0].1
+    );
+    assert!(!ws.join("vendor/blob").exists());
+    let entry = entry_of(&root_b, &scope);
+    assert!(!entry.join(scope::CURRENT_NAME).exists());
+    assert!(
+        !entry
+            .join(scope::WRITING_NAME)
+            .join("remote.stage")
+            .exists()
+    );
 }
 
 #[test]
