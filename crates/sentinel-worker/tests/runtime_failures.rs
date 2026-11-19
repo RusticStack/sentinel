@@ -27,10 +27,14 @@ dir="$(dirname "$0")"
 # Global flags (`--log-level=error` and, for a private store, `--root` and `--runroot`) precede the subcommand, so
 # find it before relying on the positions below.
 while [ "$#" -gt 0 ]; do
-  case "$1" in ps|container|rm|stop|create|start) break ;; esac
+  case "$1" in ps|container|rm|stop|create|start|info) break ;; esac
   shift
 done
 case "$1" in
+  info)
+    if [ -e "$dir/info-error" ]; then echo "Error: cannot connect to the Podman socket" >&2; exit 125; fi
+    cat "$dir/info" 2>/dev/null
+    exit 0 ;;
   ps)
     id="${4##*=}"
     if [ -e "$dir/fail-ps-$id" ]; then echo "Error: cannot list containers" >&2; exit 1; fi
@@ -254,4 +258,61 @@ fn recovery_fails_when_a_leftover_container_cannot_be_removed() {
     let (recovered, _) = recovery::recover(root.path(), worker).unwrap();
     assert_eq!(recovered.containers_removed, 1);
     assert!(removed().contains(&name));
+}
+
+/// One `podman info` answer at a time: the shim reads a single file, so the probe tests take turns.
+static INFO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// What the shim answers for `podman info`: the five fields the probe reads, or `None` for a runtime that
+/// cannot be reached at all.
+fn probe_with(answer: Option<&str>) -> std::result::Result<podman::Runtime, String> {
+    let _turn = INFO.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = shim();
+    let error = dir.join("info-error");
+    let info = dir.join("info");
+    let _ = fs::remove_file(&error);
+    let _ = fs::remove_file(&info);
+    match answer {
+        Some(fields) => fs::write(&info, fields).unwrap(),
+        None => fs::write(&error, "").unwrap(),
+    }
+    let outcome = podman::probe().map_err(|e| e.to_string());
+    let _ = fs::remove_file(&error);
+    let _ = fs::remove_file(&info);
+    outcome
+}
+
+#[test]
+fn a_runtime_that_is_not_rootless_on_cgroup_v2_is_refused_with_the_reason() {
+    let rootless_refused = probe_with(Some("false v2 runc systemd 5.0.0")).unwrap_err();
+    assert!(
+        rootless_refused.to_string().contains("not rootless"),
+        "{rootless_refused}"
+    );
+    let cgroup_refused = probe_with(Some("true v1 runc systemd 5.0.0")).unwrap_err();
+    assert!(
+        cgroup_refused
+            .to_string()
+            .contains("cgroup v1 is not supported"),
+        "{cgroup_refused}"
+    );
+    let probed = probe_with(Some("true v2 crun cgroupfs 5.1.0")).unwrap();
+    assert_eq!(probed.version, "5.1.0");
+    assert_eq!(probed.oci_runtime, "crun");
+    assert_eq!(probed.cgroup_manager, "cgroupfs");
+    assert_eq!(probed.cgroup_version, "v2");
+}
+
+#[test]
+fn a_runtime_that_cannot_be_asked_is_a_failure_never_a_permissive_default() {
+    let error = probe_with(None).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("podman info:"), "{text}");
+    assert!(
+        text.contains("cannot connect to the Podman socket"),
+        "{text}"
+    );
+    // An answer missing the fields the probe decides on is refused, not read as rootless.
+    assert!(probe_with(Some("")).is_err());
+    assert!(probe_with(Some("true")).is_err());
 }
