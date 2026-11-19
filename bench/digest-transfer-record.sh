@@ -15,11 +15,16 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 out="${OUT:-$here/digest-transfer.jsonl}"
 samples="$(mktemp "${TMPDIR:-/tmp}/digest-transfer.XXXXXX")"
 trap 'rm -f "$samples"' EXIT
+# The canonical path is bench/micro-run.sh, which holds the verification lock. A host that cannot prove a
+# quiet start still records the run: it holds the shared lock when the environment names one, and the
+# record states which, so a reader can tell an exclusive run from an unqualified one.
+lock="${SENTINEL_VERIFY_LOCK:-}"
 stamp="$(bash "$here/stamp.sh")"
 start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-"$SENTINEL_BIN" --files "${FILES:-48}" --file-bytes "${FILE_BYTES:-262144}" --rounds "${ROUNDS:-5}" > "$samples"
+run="$SENTINEL_BIN --files ${FILES:-48} --file-bytes ${FILE_BYTES:-262144} --rounds ${ROUNDS:-5}"
+if [ -n "$lock" ]; then flock -x -o "$lock" $run > "$samples"; else $run > "$samples"; fi
 end="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-python3 - "$stamp" "$start" "$end" "$samples" "$out" "$here/contracts/micro/digest-transfer.json" <<'PY'
+python3 - "$stamp" "$start" "$end" "$samples" "$out" "$here/contracts/micro/digest-transfer.json" "${lock:-}" <<'PY'
 import hashlib, json, sys
 stamp, start, end, samples, out, contract = sys.argv[1:]
 with open(contract, "rb") as f:
@@ -31,6 +36,7 @@ envelope = {
     "contract": {"id": "digest-transfer", "revision": 1, "sha256": sha},
     "ordering": {"scheme": "abba", "seed": None},
     "conditions": {"start": start, "end": end},
+    "lock": lock or None,
 }
 lines = []
 with open(samples) as f:
