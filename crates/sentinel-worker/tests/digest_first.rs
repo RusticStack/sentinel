@@ -258,6 +258,7 @@ impl Executor for Publisher {
             let decl = Artifact {
                 name: "dist".into(),
                 paths: vec!["out/**".into()],
+                class: None,
                 when: ArtifactWhen::Always,
                 retain_secs: 3_600,
                 required: true,
