@@ -678,6 +678,21 @@ fn keep_an_admin(tx: &Transaction<'_>, tenant: TenantId, user: UserId) -> Result
     Ok(())
 }
 
+/// A personal namespace's owner membership is the namespace's identity, so no administrator removes it or
+/// changes its role. The database trigger is the last line of that defense; this is the answer, so the
+/// refusal is a refusal and not a constraint violation surfacing as an internal fault.
+fn keep_the_owner(tx: &Transaction<'_>, tenant: TenantId, user: UserId) -> Result<()> {
+    let owned: bool = tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM tenants WHERE id = ?1 AND owner_user_id = ?2)",
+        )?
+        .query_row(params![tenant.as_bytes(), user.as_bytes()], |r| r.get(0))?;
+    if owned {
+        return Err(Error::Forbidden);
+    }
+    Ok(())
+}
+
 pub fn resolve_member(conn: &Connection, tenant: TenantId, text: &str) -> Result<UserId> {
     if let Ok(user) = text.parse::<UserId>() {
         return Ok(user);
@@ -729,6 +744,7 @@ fn apply_membership(
     crate::github_members::require_app_managed(tx, tenant, Some(user))?;
     if role != Role::TenantAdmin {
         keep_an_admin(tx, tenant, user)?;
+        keep_the_owner(tx, tenant, user)?;
     }
     let was_member: bool = tx
         .prepare_cached(
@@ -780,6 +796,7 @@ pub fn remove_membership(
     require_tenant_admin(tx, principal, tenant)?;
     crate::github_members::require_app_managed(tx, tenant, Some(user))?;
     keep_an_admin(tx, tenant, user)?;
+    keep_the_owner(tx, tenant, user)?;
     let removed = tx.execute(
         "DELETE FROM memberships WHERE tenant_id = ?1 AND user_id = ?2",
         params![tenant.as_bytes(), user.as_bytes()],
@@ -970,6 +987,8 @@ pub fn create_service_account(
         "INSERT INTO memberships(tenant_id, user_id, role) VALUES (?1, ?2, ?3)",
         params![tenant.as_bytes(), user.as_bytes(), role as u8],
     )?;
+    // A membership exists: the tenant's authorization epoch moves with it, as every other grant does.
+    crate::tenancy::bump_epoch(tx, tenant)?;
     crate::local_auth::audit(
         tx,
         crate::local_auth::Event::ServiceAccountCreated,

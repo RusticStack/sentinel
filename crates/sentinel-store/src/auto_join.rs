@@ -309,6 +309,8 @@ pub(crate) fn apply(
                     JOINED_ROLE as u8
                 ])?;
             if added == 1 {
+                // A membership was granted: the epoch moves with it, as an administrator's grant does.
+                crate::tenancy::bump_epoch(tx, tenant)?;
                 audit(
                     tx,
                     Event::DomainAutoJoined,

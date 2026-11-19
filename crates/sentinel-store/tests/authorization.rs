@@ -364,6 +364,89 @@ fn namespace_identity_and_bounded_lists_do_not_leak_other_tenants() {
 }
 
 #[test]
+fn a_personal_namespaces_owner_membership_is_refused_not_broken() {
+    let (_dir, store, i) = fixture();
+    // A second administrator, so the refusal cannot be the last-admin conflict.
+    store
+        .writer()
+        .write(move |tx| {
+            auth::set_membership(tx, principal(i.root), i.personal, i.root, Role::TenantAdmin)
+        })
+        .unwrap();
+    for refused in [
+        store.writer().write(move |tx| {
+            auth::remove_membership(tx, principal(i.root), i.personal, i.alice, NOW)
+        }),
+        store.writer().write(move |tx| {
+            auth::set_membership(tx, principal(i.root), i.personal, i.alice, Role::Operator)
+        }),
+    ] {
+        assert!(
+            matches!(refused, Err(Error::Forbidden)),
+            "the namespace's identity is refused, not reported as a storage fault: {refused:?}"
+        );
+    }
+    store
+        .read(|c| {
+            let role = c.query_row(
+                "SELECT role FROM memberships WHERE tenant_id = ?1 AND user_id = ?2",
+                params![i.personal.as_bytes(), i.alice.as_bytes()],
+                |r| r.get::<_, i64>(0),
+            )?;
+            assert_eq!(role, 3, "the owner still administers their own namespace");
+            Ok(())
+        })
+        .unwrap();
+    // Re-stating the same role is not a change, so it stays allowed.
+    store
+        .writer()
+        .write(move |tx| {
+            auth::set_membership(
+                tx,
+                principal(i.root),
+                i.personal,
+                i.alice,
+                Role::TenantAdmin,
+            )
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_service_account_moves_the_authorization_epoch() {
+    let (_dir, store, i) = fixture();
+    let epoch = || {
+        store
+            .read(|c| sentinel_store::tenancy::epoch(c, i.a))
+            .unwrap()
+    };
+    let before = epoch();
+    let bot = UserId::new();
+    store
+        .writer()
+        .write({
+            let authority = stepped(i.alice);
+            move |tx| {
+                auth::create_service_account(
+                    tx,
+                    authority,
+                    i.a,
+                    bot,
+                    "deploy",
+                    Role::Operator,
+                    None,
+                    NOW,
+                )
+            }
+        })
+        .unwrap();
+    assert!(
+        epoch() > before,
+        "a new member, human or service, moves the tenant's authorization epoch"
+    );
+}
+
+#[test]
 fn identity_linking_uses_immutable_provider_subject_not_display_name() {
     let (_dir, store, i) = fixture();
     store
