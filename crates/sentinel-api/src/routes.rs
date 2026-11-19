@@ -576,6 +576,19 @@ pub(crate) fn route(
         ("POST", ["api", "v1", "tenants", slug, "repos", name, "runs"]) => {
             dispatch_run(state, request, slug, name)
         }
+        (
+            "POST",
+            [
+                "api",
+                "v1",
+                "tenants",
+                slug,
+                "repos",
+                name,
+                "migration",
+                "preview",
+            ],
+        ) => crate::migration::preview(state, request, slug, name),
         ("GET", ["api", "v1", "runs", run, "wait"]) => run_wait(state, request, run, query),
         ("GET", ["api", "v1", "runs", run, "pipeline"]) => {
             let who = identify(state, request, false)?;

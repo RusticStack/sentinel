@@ -1,0 +1,67 @@
+# Sentinel native pipeline, generated from .github/workflows/ci.yml at 0c87e0181c794fe2bbfeb15dc34e7b6aae375d8b.
+# Every `run:` step is a stub under scripts/ci/: its commands are not part of the
+# workflow analysis, which records names and never values.
+schema: 1
+on:
+  push:
+    branches: [main, release/*]
+  pull_request:
+    branches: [main]
+  merge_group:
+  manual: true
+concurrency:
+  group: 'ci-${{ event.ref }}'
+  cancel_in_progress: true
+jobs:
+  build-stable:
+    image: docker.io/library/ubuntu:24.04@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+    runs_on:
+      labels: [sentinel-4vcpu-ubuntu-2404]
+    timeout: 30m
+    cache:
+      - name: cache-1
+        key: 'cargo-${{ hash_files(''Cargo.lock'') }}'
+        paths: [~/.cargo/registry, target]
+    steps:
+      - id: step-3
+        run: sh scripts/ci/ci/build/03.sh
+        shell: bash
+        workdir: crates
+      - id: step-4
+        run: sh scripts/ci/ci/build/04.sh
+        shell: bash
+        workdir: crates
+        timeout: 10m
+  build-1-99:
+    image: docker.io/library/ubuntu:24.04@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+    runs_on:
+      labels: [sentinel-4vcpu-ubuntu-2404]
+    timeout: 30m
+    cache:
+      - name: cache-1
+        key: 'cargo-${{ hash_files(''Cargo.lock'') }}'
+        paths: [~/.cargo/registry, target]
+    steps:
+      - id: step-3
+        run: sh scripts/ci/ci/build/03.sh
+        shell: bash
+        workdir: crates
+      - id: step-4
+        run: sh scripts/ci/ci/build/04.sh
+        shell: bash
+        workdir: crates
+        timeout: 10m
+  publish:
+    image: docker.io/library/ubuntu:24.04@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+    needs: [build-stable, build-1-99]
+    runs_on:
+      labels: [sentinel-4vcpu-ubuntu-2404]
+    artifacts:
+      - name: release-notes
+        paths: [target/notes.txt]
+    secrets: [CRATES_IO_TOKEN]
+    steps:
+      - id: step-3
+        run: sh scripts/ci/ci/publish/03.sh
+        shell: bash
+        workdir: crates

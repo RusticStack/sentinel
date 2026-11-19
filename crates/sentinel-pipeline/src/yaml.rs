@@ -293,9 +293,342 @@ pub fn load(text: &str) -> Result<Node, YamlError> {
     }
 }
 
+/// Where one value sits in the source text.
+///
+/// A rewrite that changes only labels needs the bytes of a value, not its content: the
+/// analyzer's inventory holds names and keys and never a script or a value, so the one
+/// place a migration edits is found by the parser's own positions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValueSpan {
+    /// Keys and sequence indices from the document root, `.`-separated:
+    /// `jobs.build.runs-on`, `jobs.test.strategy.matrix.os.0`.
+    pub path: String,
+    /// Byte offset of the value's first byte. Exact for a scalar; for a block mapping the
+    /// parser's mark sits on the first `:` of its first entry, so a rewrite replaces from
+    /// the key's colon through to `end` rather than from here.
+    pub start: usize,
+    /// Byte offset one past its last byte: the closing quote or bracket, or the end of a
+    /// block's last line (which includes that line's newline).
+    pub end: usize,
+    /// Byte offset of the key that introduced the value, for a mapping's value.
+    pub key: Option<usize>,
+}
+
+enum LocateFrame {
+    Map {
+        path: String,
+        /// The key whose value comes next, with the key token's first byte.
+        pending: Option<(String, usize)>,
+        start: usize,
+    },
+    Seq {
+        path: String,
+        index: usize,
+        start: usize,
+    },
+}
+
+struct Locator<'a> {
+    text: &'a str,
+    stack: Vec<LocateFrame>,
+    /// The key each open collection is the value of, for the span it produces when it closes.
+    keys: Vec<Option<usize>>,
+    spans: Vec<ValueSpan>,
+}
+
+impl Locator<'_> {
+    /// The segment a value takes in its container, consuming a mapping's pending key or a
+    /// sequence's next index.
+    fn segment(&mut self) -> Option<(String, Option<usize>)> {
+        match self.stack.last_mut()? {
+            LocateFrame::Map { pending, .. } => {
+                let (key, start) = pending.take()?;
+                Some((key, Some(start)))
+            }
+            LocateFrame::Seq { index, .. } => {
+                let current = *index;
+                *index += 1;
+                Some((current.to_string(), None))
+            }
+        }
+    }
+
+    fn parent(&self) -> &str {
+        match self.stack.last() {
+            Some(LocateFrame::Map { path, .. } | LocateFrame::Seq { path, .. }) => path,
+            None => "",
+        }
+    }
+
+    /// The indentation of the key a value hangs from, which is where a block scalar's
+    /// content stops being part of it.
+    fn key_indent(&self) -> usize {
+        match self.stack.last() {
+            Some(LocateFrame::Map {
+                pending: Some((_, start)),
+                ..
+            }) => line_indent(self.text, *start),
+            _ => 0,
+        }
+    }
+}
+
+fn join(parent: &str, segment: &str) -> String {
+    if parent.is_empty() {
+        segment.to_owned()
+    } else {
+        let mut out = String::with_capacity(parent.len() + 1 + segment.len());
+        out.push_str(parent);
+        out.push('.');
+        out.push_str(segment);
+        out
+    }
+}
+
+/// The indentation width of the line `at` sits on.
+fn line_indent(text: &str, at: usize) -> usize {
+    let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    text[line_start..at]
+        .bytes()
+        .take_while(|b| *b == b' ')
+        .count()
+}
+
+impl MarkedEventReceiver for Locator<'_> {
+    fn on_event(&mut self, event: Event, mark: Marker) {
+        match event {
+            Event::Scalar(value, style, _, _) => {
+                // A scalar in a mapping is its next key, until a value takes that slot.
+                if let Some(LocateFrame::Map { pending, .. }) = self.stack.last_mut()
+                    && pending.is_none()
+                {
+                    *pending = Some((value, mark.index()));
+                    return;
+                }
+                let indent = self.key_indent();
+                let (path, key) = match self.segment() {
+                    Some((segment, key)) => (join(self.parent(), &segment), key),
+                    None => (String::new(), None),
+                };
+                let start = mark.index();
+                let end = scalar_end(self.text, start, style, indent);
+                self.spans.push(ValueSpan {
+                    path,
+                    start,
+                    end,
+                    key,
+                });
+            }
+            Event::SequenceStart(..) | Event::MappingStart(..) => {
+                let start = mark.index();
+                let (path, key) = match self.segment() {
+                    Some((segment, key)) => (join(self.parent(), &segment), key),
+                    None => (String::new(), None),
+                };
+                let frame = match event {
+                    Event::SequenceStart(..) => LocateFrame::Seq {
+                        path,
+                        index: 0,
+                        start,
+                    },
+                    _ => LocateFrame::Map {
+                        path,
+                        pending: None,
+                        start,
+                    },
+                };
+                self.stack.push(frame);
+                self.keys.push(key);
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                let Some(frame) = self.stack.pop() else {
+                    return;
+                };
+                let key = self.keys.pop().flatten();
+                let (path, start) = match frame {
+                    LocateFrame::Seq { path, start, .. } => (path, start),
+                    LocateFrame::Map { path, start, .. } => (path, start),
+                };
+                let end = collection_end(self.text, start, mark.index());
+                self.spans.push(ValueSpan {
+                    path,
+                    start,
+                    end,
+                    key,
+                });
+            }
+            Event::Nothing
+            | Event::StreamStart
+            | Event::StreamEnd
+            | Event::DocumentStart
+            | Event::DocumentEnd
+            | Event::Alias(_) => {}
+        }
+    }
+}
+
+/// One past the last byte of a collection, from the mark that closes it.
+///
+/// A flow collection's mark sits on its closing bracket, which the span keeps. A block
+/// collection's sits on the first token after it, already past that line's indentation, so
+/// the span ends where the block's last line does instead.
+fn collection_end(text: &str, start: usize, end: usize) -> usize {
+    match text.as_bytes().get(start) {
+        Some(b'[') | Some(b'{') => match text.as_bytes().get(end) {
+            Some(b']') | Some(b'}') => end + 1,
+            _ => end,
+        },
+        _ if !text[..end].ends_with('\n') => text[..end].rfind('\n').map_or(end, |nl| nl + 1),
+        _ => end,
+    }
+}
+
+/// One past the last byte of the scalar that starts at `start`.
+///
+/// A plain or quoted scalar ends within its line(s); a block scalar ends where its
+/// indentation returns to the key's, so the span covers the whole block.
+fn scalar_end(text: &str, start: usize, style: TScalarStyle, indent: usize) -> usize {
+    let bytes = text.as_bytes();
+    match style {
+        TScalarStyle::SingleQuoted | TScalarStyle::DoubleQuoted => {
+            let quote = bytes.get(start).copied().unwrap_or(b'\'');
+            let mut i = start + 1;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if style == TScalarStyle::DoubleQuoted && b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == quote {
+                    if style == TScalarStyle::SingleQuoted && bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    return i + 1;
+                }
+                i += 1;
+            }
+            bytes.len()
+        }
+        TScalarStyle::Literal | TScalarStyle::Folded => {
+            // The block's lines are indented past the key; the first line back at or
+            // before it ends the span.
+            let mut line = text[start..]
+                .find('\n')
+                .map_or(text.len(), |i| start + i + 1);
+            while line < text.len() {
+                let end = text[line..].find('\n').map_or(text.len(), |i| line + i + 1);
+                let content = &text[line..end];
+                let blank = content.trim().is_empty();
+                let width = content.len() - content.trim_start_matches(' ').len();
+                if !blank && width <= indent {
+                    return line;
+                }
+                line = end;
+            }
+            text.len()
+        }
+        TScalarStyle::Plain => {
+            let line_end = text[start..].find('\n').map_or(text.len(), |i| start + i);
+            let line = &text[start..line_end];
+            let mut end = line.len();
+            // A comment starts at ` #`; the space before it is not part of the value.
+            let mut at = 0;
+            let b = line.as_bytes();
+            while at < b.len() {
+                if b[at] == b'#' && (at == 0 || b[at - 1] == b' ' || b[at - 1] == b'\t') {
+                    end = at;
+                    break;
+                }
+                at += 1;
+            }
+            let trimmed = line[..end].trim_end().len();
+            start + trimmed
+        }
+    }
+}
+
+/// The byte spans of every value in a document, by key path.
+pub fn spans(text: &str) -> Result<Vec<ValueSpan>, YamlError> {
+    if text.len() > MAX_PIPELINE_FILE_BYTES {
+        return Err(YamlError {
+            line: 1,
+            col: 1,
+            kind: YamlErrorKind::TooLarge {
+                bytes: text.len(),
+                limit: MAX_PIPELINE_FILE_BYTES,
+            },
+        });
+    }
+    let mut locator = Locator {
+        text,
+        stack: Vec::with_capacity(8),
+        keys: Vec::with_capacity(8),
+        spans: Vec::new(),
+    };
+    let mut parser = Parser::new_from_str(text);
+    if let Err(scan) = parser.load(&mut locator, true) {
+        return Err(YamlError {
+            line: scan.marker().line(),
+            col: scan.marker().col() + 1,
+            kind: YamlErrorKind::Syntax(scan.info().to_owned()),
+        });
+    }
+    Ok(locator.spans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn span<'a>(spans: &'a [ValueSpan], path: &str) -> &'a ValueSpan {
+        spans
+            .iter()
+            .find(|s| s.path == path)
+            .unwrap_or_else(|| panic!("no span for {path}"))
+    }
+
+    #[test]
+    fn spans_point_at_scalars_flow_and_block_values() {
+        let text =
+            "a: ubuntu-latest\nb: [x, y]\nc:\n  - p\n  - q\nd: 'q, uoted'\ne: \"dq \\\" x\"\n";
+        let spans = spans(text).unwrap();
+        let a = span(&spans, "a");
+        assert_eq!(&text[a.start..a.end], "ubuntu-latest");
+        let b = span(&spans, "b");
+        assert_eq!(&text[b.start..b.end], "[x, y]");
+        let c = span(&spans, "c");
+        assert_eq!(&text[c.start..c.end], "- p\n  - q\n");
+        let d = span(&spans, "d");
+        assert_eq!(&text[d.start..d.end], "'q, uoted'");
+        let e = span(&spans, "e");
+        assert_eq!(&text[e.start..e.end], "\"dq \\\" x\"");
+    }
+
+    #[test]
+    fn a_value_span_keeps_a_trailing_comment_and_names_its_key() {
+        let text = "jobs:\n  build:\n    runs-on: ubuntu-latest # linux\n";
+        let spans = spans(text).unwrap();
+        let runs_on = span(&spans, "jobs.build.runs-on");
+        assert_eq!(&text[runs_on.start..runs_on.end], "ubuntu-latest");
+        let key = runs_on.key.unwrap();
+        assert_eq!(&text[key..key + "runs-on".len()], "runs-on");
+        // A block collection's end mark is where it stops, which is what a rewrite keeps.
+        let build = span(&spans, "jobs.build");
+        assert_eq!(build.end, text.len());
+        assert!(build.start < runs_on.start);
+    }
+
+    #[test]
+    fn a_block_scalar_ends_where_its_indentation_does() {
+        let text = "a:\n  run: |\n    echo one\n    echo two\n  b: 1\n";
+        let spans = spans(text).unwrap();
+        let run = span(&spans, "a.run");
+        // libyaml marks a block scalar at its content, so the span stops at the dedent.
+        assert_eq!(&text[run.start..run.end], "echo one\n    echo two\n");
+        let b = span(&spans, "a.b");
+        assert_eq!(&text[b.start..b.end], "1");
+    }
 
     fn kind(text: &str) -> YamlErrorKind {
         load(text).unwrap_err().kind

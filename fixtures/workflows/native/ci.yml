@@ -1,0 +1,58 @@
+# A workflow the native path serves whole: branch filters, a manual trigger with an input,
+# workflow concurrency, workflow env and defaults, a two-cell matrix that resolves to one
+# class, a cache, an artifact, a step env naming a repository secret, a step timeout and a
+# job that needs another.
+name: ci
+on:
+  push:
+    branches: [main, "release/*"]
+  pull_request:
+    branches: [main]
+  merge_group: {}
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: keep the workspace
+        type: boolean
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+    working-directory: crates
+jobs:
+  build:
+    strategy:
+      matrix:
+        toolchain: [stable, "1.99"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+      - run: cargo build --locked
+      - run: cargo test --locked
+        timeout-minutes: 10
+  publish:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: target/notes.txt
+      - name: Publish
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}

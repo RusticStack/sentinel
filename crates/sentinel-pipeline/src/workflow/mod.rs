@@ -14,11 +14,20 @@ use std::fmt;
 
 use crate::yaml::{self, Node, YamlError};
 
+mod change;
 mod labels;
+mod native;
 mod rules;
 
+pub use change::{
+    KeptJob, LabelChange, Options, Plan, PlanError, SCHEMA as PLAN_SCHEMA, WorkflowPlan, plan,
+};
 pub use labels::{
     ClassTarget, Declared, Destination, DockerHosts, KeepReason, LABEL_TABLE_VERSION, LabelTable,
+};
+pub use native::{
+    Images, JobMapping, NOTE_ENV, NOTE_INPUTS, NOTE_KEYS, NOTE_STUBS, Native, STUBS, StepKind,
+    StepMapping,
 };
 pub use rules::{Construct, RULE_TABLE_VERSION, Rule, RuleTable};
 
