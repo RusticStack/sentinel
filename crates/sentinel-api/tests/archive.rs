@@ -12,7 +12,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde_json::json;
 use sentinel_core::{
     ArtifactId, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Namespace, Permissions as P, Principal, Role},
@@ -27,12 +26,12 @@ use sentinel_store::{
     local_auth,
     logs::LogStore,
     objects::{self, Digest, Entry, Expect, Kind, Objects, Remote},
-    retention,
-    runs, tenancy,
+    retention, runs, tenancy,
     tenancy::PoolKind,
     tokens::{self, Grant},
     workers::{self, Presentation},
 };
+use serde_json::json;
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const IMAGE: &str = "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
@@ -771,9 +770,21 @@ fn a_client_that_stops_reading_mid_archive_leaves_nothing_behind() {
         "interrupted downloads left {} descriptors open",
         open_files() - fds
     );
-    let again = download(&d, &archive(&p, "tar"))
-        .body
-        .expect("the next download is whole");
+    // The next download is answered whole: a transfer slot an interrupted response never gave back would show up
+    // here as `rate_limited`.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let again = loop {
+        let answered = download(&d, &archive(&p, "tar"));
+        if answered.status == 200 {
+            break answered.body.expect("the next download is whole");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the download after the interruptions was answered {}",
+            answered.status
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert_eq!(again, whole, "the same bytes, after the interruptions");
 }
 
@@ -969,7 +980,11 @@ fn every_identifier_refuses_a_foreign_tenant_at_the_same_shape() {
     // Minting: a foreign caller cannot make a link for this artifact, and an entry path belongs to the manifest
     // that holds it, so one artifact's link cannot name another's entry.
     let (status, body) = mint_link(&d, p.run, p.artifact, json!({ "format": "tar" }), &foreign);
-    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")), "{body}");
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (404, Some("not_found")),
+        "{body}"
+    );
     let (status, body) = mint_link(
         &d,
         other.run,
@@ -977,7 +992,11 @@ fn every_identifier_refuses_a_foreign_tenant_at_the_same_shape() {
         json!({ "entry": "inner/b.bin" }),
         &bearer(&d),
     );
-    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")), "{body}");
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (404, Some("not_found")),
+        "{body}"
+    );
 
     // The entry's digest is not a way in either: the object route authorizes through the caller's own
     // repositories, and this tenant holds nothing this one does.
