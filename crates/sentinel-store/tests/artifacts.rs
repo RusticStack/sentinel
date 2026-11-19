@@ -206,7 +206,7 @@ fn absent_and_failed_rows_round_trip_without_a_manifest() {
         .read(move |c| artifacts::get(c, tenant, run, id))
         .unwrap();
     assert_eq!(row.name, "dist");
-    assert_eq!(row.job_name, "build");
+    assert_eq!(row.job_name.as_deref(), Some("build"));
     assert_eq!(row.state, artifacts::State::Absent);
     assert_eq!(row.manifest_version, None);
     assert!(

@@ -182,6 +182,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (69, include_str!("migrations/069_runner_mode.sql")),
     (70, include_str!("migrations/070_storage_thresholds.sql")),
     (71, include_str!("migrations/071_storage_notices.sql")),
+    (72, include_str!("migrations/072_run_artifacts.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -290,6 +291,10 @@ mod tests {
         (
             71,
             "an older controller neither reads nor writes the notice latch, so no threshold crossing is told while it runs and its audit paging fails on event 99",
+        ),
+        (
+            72,
+            "an older controller reads every artifact row as a job's, so it neither lists nor serves a run-level or runner-mode artifact, it retires those rows at the sweep without being able to explain them, and its coverage check would take one for a job's declared output",
         ),
     ];
 

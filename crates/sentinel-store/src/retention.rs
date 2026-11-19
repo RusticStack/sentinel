@@ -547,8 +547,11 @@ pub fn reapply_sql(logs_phase: bool, scoped: bool, expires: &str, batch: i64) ->
     let scope = match (scoped, logs_phase) {
         (false, _) => "",
         (true, true) => " AND repo_id = ?3",
+        // A runner-mode artifact carries its repository itself; a job or run-level one names its
+        // run. Both are matched here so a repository's policy re-stamps every artifact of it.
         (true, false) => {
-            " AND EXISTS (SELECT 1 FROM runs WHERE id = artifacts.run_id AND tenant_id = ?1 AND repo_id = ?3)"
+            " AND COALESCE(artifacts.repo_id,
+                 (SELECT repo_id FROM runs WHERE id = artifacts.run_id AND tenant_id = ?1)) = ?3"
         }
     };
     let bound = format!(
@@ -572,7 +575,7 @@ pub fn reapply_sql(logs_phase: bool, scoped: bool, expires: &str, batch: i64) ->
              WHERE id > ?4 AND id <= ?5 AND {filter}{scope}",
             effective_sql(
                 expires,
-                "(SELECT repo_id FROM runs WHERE id = artifacts.run_id)"
+                "COALESCE(artifacts.repo_id, (SELECT repo_id FROM runs WHERE id = artifacts.run_id))"
             ),
         )
     };
@@ -631,7 +634,8 @@ pub fn class_reapply_sql(batch: i64) -> (String, String) {
                         (SELECT artifact_retention_ms FROM storage_policies
                          WHERE tenant_id = artifacts.tenant_id AND repo_id = X''), ?4) AS ms) tp
                     LEFT JOIN storage_policies rp ON rp.tenant_id = artifacts.tenant_id
-                        AND rp.repo_id = (SELECT repo_id FROM runs WHERE id = artifacts.run_id)),
+                        AND rp.repo_id = COALESCE(artifacts.repo_id,
+                            (SELECT repo_id FROM runs WHERE id = artifacts.run_id))),
                  9223372036854775807)))
          WHERE class = ?1 AND id > ?5 AND id <= ?6 AND pinned_ms IS NULL"
         .to_owned();

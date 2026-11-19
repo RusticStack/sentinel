@@ -24,7 +24,7 @@ use sentinel::{
 use sentinel_protocol::oauth::{DeviceAuthorization, Metadata, TokenResponse};
 use serde_json::{Value, json};
 
-const SCOPES: [&str; 10] = [
+const SCOPES: [&str; 11] = [
     "runs:read",
     "runs:write",
     "logs:read",
@@ -35,6 +35,7 @@ const SCOPES: [&str; 10] = [
     "secrets:write",
     "tenant:admin",
     "platform:admin",
+    "artifacts:write",
 ];
 
 fn token(prefix: &str, n: u64) -> String {

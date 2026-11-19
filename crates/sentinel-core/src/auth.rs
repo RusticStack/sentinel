@@ -67,12 +67,23 @@ impl Scopes {
     pub const SECRETS_WRITE: Self = Self(1 << 7);
     pub const TENANT_ADMIN: Self = Self(1 << 8);
     pub const PLATFORM_ADMIN: Self = Self(1 << 9);
-    pub const ALL: Self = Self(0x3FF);
-    pub const MCP: Self =
-        Self(Self::RUNS_READ.0 | Self::RUNS_WRITE.0 | Self::LOGS_READ.0 | Self::SECRETS_METADATA.0);
+    pub const ARTIFACTS_WRITE: Self = Self(1 << 10);
+    pub const ALL: Self = Self(0x7FF);
+    pub const MCP: Self = Self(
+        Self::RUNS_READ.0
+            | Self::RUNS_WRITE.0
+            | Self::LOGS_READ.0
+            | Self::ARTIFACTS_READ.0
+            | Self::SECRETS_METADATA.0,
+    );
     pub const MCP_DEFAULT: Self = Self(Self::RUNS_READ.0 | Self::LOGS_READ.0);
-    pub const MCP_NAMES: [&'static str; 4] =
-        ["runs:read", "runs:write", "logs:read", "secrets:metadata"];
+    pub const MCP_NAMES: [&'static str; 5] = [
+        "runs:read",
+        "runs:write",
+        "logs:read",
+        "artifacts:read",
+        "secrets:metadata",
+    ];
     pub const CLI_DEFAULT: Self = Self(
         Self::RUNS_READ.0
             | Self::RUNS_WRITE.0
@@ -80,7 +91,7 @@ impl Scopes {
             | Self::ARTIFACTS_READ.0
             | Self::CACHE_READ.0,
     );
-    pub const NAMES: [&'static str; 10] = [
+    pub const NAMES: [&'static str; 11] = [
         "runs:read",
         "runs:write",
         "logs:read",
@@ -91,6 +102,7 @@ impl Scopes {
         "secrets:write",
         "tenant:admin",
         "platform:admin",
+        "artifacts:write",
     ];
     const READS: Self = Self(
         Self::RUNS_READ.0
@@ -99,7 +111,7 @@ impl Scopes {
             | Self::CACHE_READ.0
             | Self::SECRETS_METADATA.0,
     );
-    const RUNS: Self = Self(Self::RUNS_WRITE.0 | Self::CACHE_WRITE.0);
+    const RUNS: Self = Self(Self::RUNS_WRITE.0 | Self::CACHE_WRITE.0 | Self::ARTIFACTS_WRITE.0);
 
     pub const fn bits(self) -> u32 {
         self.0
@@ -287,7 +299,7 @@ mod tests {
         assert_eq!(parsed.to_names(), "runs:read logs:read platform:admin");
         assert_eq!(Scopes::parse(&parsed.to_names()), Ok(parsed));
         assert_eq!(Scopes::parse(&Scopes::ALL.to_names()), Ok(Scopes::ALL));
-        assert_eq!(Scopes::ALL.names().count(), 10);
+        assert_eq!(Scopes::ALL.names().count(), 11);
         assert_eq!(Scopes::parse(""), Ok(Scopes::NONE));
         assert_eq!(
             Scopes::CLI_DEFAULT.to_names(),
@@ -300,8 +312,8 @@ mod tests {
         assert_eq!(Scopes::parse("runs:read admin"), Err(UnknownScope));
         assert_eq!(Scopes::parse("RUNS:READ"), Err(UnknownScope));
         assert_eq!(Scopes::parse("runs:read,logs:read"), Err(UnknownScope));
-        assert_eq!(Scopes::from_bits(0x3FF), Some(Scopes::ALL));
-        assert_eq!(Scopes::from_bits(0x400), None);
+        assert_eq!(Scopes::from_bits(0x7FF), Some(Scopes::ALL));
+        assert_eq!(Scopes::from_bits(0x800), None);
         assert_eq!(Scopes::from_bits(u32::MAX), None);
     }
 
@@ -318,6 +330,7 @@ mod tests {
         }
         assert_eq!(Scopes::RUNS_WRITE.ceiling(), Permissions::RUN);
         assert_eq!(Scopes::CACHE_WRITE.ceiling(), Permissions::RUN);
+        assert_eq!(Scopes::ARTIFACTS_WRITE.ceiling(), Permissions::RUN);
         assert_eq!(Scopes::SECRETS_WRITE.ceiling(), Permissions::WRITE_SECRETS);
         assert_eq!(Scopes::TENANT_ADMIN.ceiling(), Permissions::TENANT_ADMIN);
         assert_eq!(
