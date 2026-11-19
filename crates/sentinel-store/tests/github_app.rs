@@ -388,6 +388,7 @@ fn observed(id: u64, personal: bool) -> Observed<'static> {
         suspended: false,
         permissions_valid: true,
         runner: sentinel_core::RunnerPermissions::ALL,
+        migration: sentinel_core::MigrationPermissions::ALL,
     }
 }
 

@@ -68,6 +68,7 @@ fn fixture() -> Fixture {
             suspended: false,
             permissions_valid: true,
             runner: sentinel_core::RunnerPermissions::ALL,
+            migration: sentinel_core::MigrationPermissions::ALL,
             expected: 0,
         },
         NOW,

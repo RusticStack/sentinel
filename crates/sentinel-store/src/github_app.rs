@@ -428,6 +428,8 @@ pub struct Observed<'a> {
     pub permissions_valid: bool,
     /// What runner mode needs, as this snapshot states it.
     pub runner: sentinel_core::RunnerPermissions,
+    /// What a migration writes with, as this snapshot states it.
+    pub migration: sentinel_core::MigrationPermissions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,6 +475,7 @@ pub fn bind(
             suspended: observed.suspended,
             permissions_valid: observed.permissions_valid,
             runner: observed.runner,
+            migration: observed.migration,
             expected: existing.map_or(0, |(_, version)| version as u64),
         },
         now,

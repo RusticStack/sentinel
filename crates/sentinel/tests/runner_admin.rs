@@ -88,6 +88,7 @@ impl Controller<'_> {
                         suspended: false,
                         permissions_valid: true,
                         runner,
+                        migration: sentinel_core::MigrationPermissions::ALL,
                         expected: version as u64,
                     },
                     now,

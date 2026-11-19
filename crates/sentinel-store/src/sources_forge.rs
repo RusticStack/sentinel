@@ -1,6 +1,8 @@
 use crate::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use sentinel_core::{InstallationId, RepoId, RunnerPermissions, TenantId, UnixMillis};
+use sentinel_core::{
+    InstallationId, MigrationPermissions, RepoId, RunnerPermissions, TenantId, UnixMillis,
+};
 
 pub struct Snapshot<'a> {
     pub external_id: u64,
@@ -12,6 +14,9 @@ pub struct Snapshot<'a> {
     /// What runner mode needs, as this snapshot states it; a withdrawn permission is
     /// gone from here at the next refresh, which is what refuses a queued job at once.
     pub runner: RunnerPermissions,
+    /// What a migration writes with, as this snapshot states it: withdrawn the same way, and the
+    /// next write path reads it from here.
+    pub migration: MigrationPermissions,
     pub expected: u64,
 }
 
@@ -22,6 +27,7 @@ struct Row {
     suspended: i64,
     permissions_valid: i64,
     runner: i64,
+    migration: i64,
 }
 
 pub fn refresh(tx: &Transaction<'_>, s: Snapshot<'_>, now: UnixMillis) -> Result<InstallationId> {
@@ -41,7 +47,7 @@ pub fn refresh(tx: &Transaction<'_>, s: Snapshot<'_>, now: UnixMillis) -> Result
     )?;
     let old = tx
         .query_row(
-            "SELECT account_id,account_personal,account_login,suspended,permissions_valid,runner_permissions FROM installations WHERE id=?1",
+            "SELECT account_id,account_personal,account_login,suspended,permissions_valid,runner_permissions,migration_permissions FROM installations WHERE id=?1",
             [id.as_bytes()],
             |r| {
                 Ok(Row {
@@ -51,6 +57,7 @@ pub fn refresh(tx: &Transaction<'_>, s: Snapshot<'_>, now: UnixMillis) -> Result
                     suspended: r.get(3)?,
                     permissions_valid: r.get(4)?,
                     runner: r.get(5)?,
+                    migration: r.get(6)?,
                 })
             },
         )
@@ -68,16 +75,17 @@ pub fn refresh(tx: &Transaction<'_>, s: Snapshot<'_>, now: UnixMillis) -> Result
             && row.suspended == i64::from(s.suspended)
             && row.permissions_valid == i64::from(s.permissions_valid)
             && row.runner == i64::from(s.runner.bits())
+            && row.migration == i64::from(s.migration.bits())
     }) {
         return Ok(id);
     }
-    if tx.execute("UPDATE installations SET account_id=?2,account_personal=?3,account_login=?4,suspended=?5,permissions_valid=?6,runner_permissions=?8,lifecycle_version=lifecycle_version+1 WHERE id=?1 AND lifecycle_version=?7",params![id.as_bytes(),s.account_id as i64,s.personal,s.login,s.suspended,s.permissions_valid,s.expected as i64,i64::from(s.runner.bits())])? != 1 { return Err(Error::Conflict); }
+    if tx.execute("UPDATE installations SET account_id=?2,account_personal=?3,account_login=?4,suspended=?5,permissions_valid=?6,runner_permissions=?8,migration_permissions=?9,lifecycle_version=lifecycle_version+1 WHERE id=?1 AND lifecycle_version=?7",params![id.as_bytes(),s.account_id as i64,s.personal,s.login,s.suspended,s.permissions_valid,s.expected as i64,i64::from(s.runner.bits()),i64::from(s.migration.bits())])? != 1 { return Err(Error::Conflict); }
     Ok(id)
 }
 
 // Removal disables issuance at once; only a fresh API snapshot may re-enable it.
 pub fn remove(tx: &Transaction<'_>, id: InstallationId) -> Result<()> {
-    if tx.execute("UPDATE installations SET suspended=1,permissions_valid=0,runner_permissions=0,lifecycle_version=lifecycle_version+1 WHERE id=?1",[id.as_bytes()])? != 1 { return Err(Error::NotFound); }
+    if tx.execute("UPDATE installations SET suspended=1,permissions_valid=0,runner_permissions=0,migration_permissions=0,lifecycle_version=lifecycle_version+1 WHERE id=?1",[id.as_bytes()])? != 1 { return Err(Error::NotFound); }
     Ok(())
 }
 
@@ -99,4 +107,14 @@ pub fn grant(conn: &Connection, tenant: TenantId, repo: RepoId) -> Result<Grant>
         repo: repo as u64,
         lifecycle_version: version,
     })
+}
+
+/// Whether the tenant has any installation it can act through: what a switch needs before it can
+/// ask what that installation grants.
+pub fn live_installation(conn: &Connection, tenant: TenantId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM installations WHERE tenant_id = ?1 AND suspended = 0)",
+        )?
+        .query_row([tenant.as_bytes()], |r| r.get(0))?)
 }

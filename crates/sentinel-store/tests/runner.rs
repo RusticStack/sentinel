@@ -4,7 +4,7 @@
 use rusqlite::Connection;
 use sentinel_auth::sealed::Key;
 use sentinel_core::{
-    InstallationId, RepoId, RunnerPermissions, TenantId, UnixMillis, UserId,
+    InstallationId, MigrationPermissions, RepoId, RunnerPermissions, TenantId, UnixMillis, UserId,
     auth::{Namespace, Permissions, Principal},
 };
 use sentinel_protocol::source::{Binding, Credential};
@@ -12,9 +12,10 @@ use sentinel_store::{
     Error,
     auth::{self, NamespaceKind, provisioning},
     registration::Authority,
-    runner::{self, Switch},
+    runner,
     sources::{self, Update},
     sources_forge,
+    switch::Switch,
 };
 
 const NOW: UnixMillis = UnixMillis(1_000);
@@ -94,6 +95,7 @@ fn installation(f: &mut Fixture, runner_permissions: RunnerPermissions, personal
             suspended: false,
             permissions_valid: true,
             runner: runner_permissions,
+            migration: MigrationPermissions::ALL,
             expected: existing as u64,
         },
         NOW,

@@ -467,6 +467,7 @@ fn fixture(public_url: Option<&str>) -> Fixture {
                     suspended: false,
                     permissions_valid: true,
                     runner: sentinel_core::RunnerPermissions::ALL,
+                    migration: sentinel_core::MigrationPermissions::ALL,
                     expected: 0,
                 },
                 now,
