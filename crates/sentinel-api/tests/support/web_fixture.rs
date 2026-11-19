@@ -15,12 +15,12 @@ use sentinel_protocol::{
     summary::{AttemptSummary, CacheRecord, StepOutcome, StepRecord},
 };
 use sentinel_store::{
-    Durability, Store,
+    Durability, Store, artifacts,
     auth::{self as authz, Authority, NamespaceKind},
     checks, dispatch, jobs, local_auth,
     logs::LogStore,
     lookup, mfa,
-    objects::Objects,
+    objects::{Entry, Expect, Kind, Objects},
     provenance,
     registration::{self, Applicant, DeploymentPolicy, Terms},
     runs,
@@ -31,6 +31,16 @@ use sentinel_store::{
 use serde_json::{Value, json};
 
 pub const PASSWORD: &str = "correct horse battery staple";
+/// A line only the artifact browser's text preview shows, so a check reads it from the preview and nowhere else.
+pub const PREVIEW_NEEDLE: &str = "preview-needle-4711";
+/// A 1x1 transparent PNG: one artifact's image entry, small enough to preview whole.
+const PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
 /// The controller's Tailcat address the fixture writes for worker enrollment. A credential: tests assert it never leaks.
 pub const TAILCAT_ADDRESS: &str = "tcQ2w3E4r5T6y7U8i9O0p1A2s3D4f5G6h7J8";
 const BUSYBOX: &str = "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
@@ -209,6 +219,71 @@ fn job_named(store: &Store, tenant: TenantId, run: RunId, name: &str) -> JobId {
         .read(|c| sentinel_store::status::run(c, tenant, run))
         .unwrap();
     view.jobs.iter().find(|j| j.name == name).unwrap().id
+}
+
+/// One published artifact of an attempt that already settled: each body staged as an object, the manifest committed, and
+/// the row recorded under its class — the calls the controller's own publication path makes.
+#[allow(clippy::too_many_arguments)]
+fn publish_artifact(
+    store: &Store,
+    objects: &Arc<Objects>,
+    tenant: TenantId,
+    run: RunId,
+    job: JobId,
+    attempt: AttemptId,
+    name: &str,
+    class: &str,
+    bodies: &[(&str, Vec<u8>)],
+) {
+    let mut entries = Vec::with_capacity(bodies.len());
+    let mut staged = Vec::with_capacity(bodies.len());
+    let mut payload_len = 0;
+    for (path, body) in bodies {
+        let one = objects
+            .stage(tenant, &body[..], u64::MAX, Expect::default())
+            .unwrap();
+        entries.push(Entry {
+            path: (*path).to_owned(),
+            digest: one.digest(),
+            len: one.len(),
+            mode: 0o644,
+        });
+        payload_len += one.len();
+        staged.push(one);
+    }
+    let listed = entries.clone();
+    let (name, class, objects) = (name.to_owned(), class.to_owned(), Arc::clone(objects));
+    store
+        .writer()
+        .write(move |tx| {
+            for one in &staged {
+                objects.commit(tx, one)?;
+            }
+            let version = objects.commit_manifest(
+                tx,
+                tenant,
+                Kind::Artifact,
+                &artifacts::manifest_name(job, &name),
+                &listed,
+            )?;
+            artifacts::record_class(
+                tx,
+                tenant,
+                run,
+                job,
+                attempt,
+                &name,
+                Some(&class),
+                artifacts::State::Captured,
+                Some(version),
+                listed.len() as u64,
+                payload_len,
+                UnixMillis(UnixMillis::now().0 + 86_400_000),
+                UnixMillis::now(),
+            )
+            .map(|_| ())
+        })
+        .unwrap();
 }
 
 fn lease(store: &Store, tenant: TenantId, job: JobId, worker: WorkerId) -> (AttemptId, Fence) {
@@ -908,6 +983,47 @@ impl Fixture {
 
     pub fn member(&self, user: UserId) -> String {
         self.bearer(user, P::REPOSITORY.union(P::TENANT_ADMIN))
+    }
+
+    /// Artifacts for the run page's browser: a tree with text, an image, an entry past the preview bound and a binary,
+    /// under two jobs and two classes, so the page lists them by job and the previews have something to cut. Kept out of
+    /// `serving` because they are stored bytes: the storage-threshold tests measure this tenant's usage.
+    pub fn seed_artifacts(&self) {
+        let mut unit =
+            b"=== RUN   TestCheckout\n    api_test.go:42: expected 200, got 500\n".to_vec();
+        unit.extend_from_slice(PREVIEW_NEEDLE.as_bytes());
+        unit.push(b'\n');
+        publish_artifact(
+            &self.store,
+            &self.objects,
+            self.acme,
+            self.diamond,
+            self.jobs["beta"],
+            self.attempts["beta"].0,
+            "reports",
+            "evidence",
+            &[
+                ("logs/unit.txt", unit),
+                (
+                    "coverage/report.html",
+                    b"<html><body>coverage 92.4%</body></html>\n".to_vec(),
+                ),
+                ("coverage/pass.png", PNG.to_vec()),
+                ("logs/full.txt", vec![b'x'; (1 << 20) + 512]),
+                ("bin/runner", vec![0, 1, 2, 0xff]),
+            ],
+        );
+        publish_artifact(
+            &self.store,
+            &self.objects,
+            self.acme,
+            self.diamond,
+            self.jobs["alpha"],
+            self.attempts["alpha"].0,
+            "bundle",
+            "standard",
+            &[("dist/app.tar", b"not really a tarball\n".to_vec())],
+        );
     }
 
     /// Accounts for the step-up and shown-once browser checks (`web/test/ui.mjs`), kept out of `serving` because

@@ -11,6 +11,7 @@ mod mcp;
 mod metrics;
 mod notices;
 mod oauth;
+mod preview;
 mod refresh;
 mod routes;
 mod secret_routes;

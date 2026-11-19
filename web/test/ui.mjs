@@ -417,6 +417,84 @@ await scenario("runs and filters", async () => {
   check("evidence link opens the log at the line", (await page.eval("location.search")).includes("seq="));
 });
 
+await scenario("artifacts", async () => {
+  await go(page, PAGES.run[0], PAGES.run[1]);
+  const ARTIFACTS = `(() => [...document.querySelectorAll('main table')].find((t) => t.querySelector('caption') && t.querySelector('caption').textContent.trim() === 'Artifacts'))()`;
+  const listing = await page.eval(`(() => { const t = ${ARTIFACTS}; if (!t) return null;
+    return { head: [...t.querySelectorAll('thead th')].map((h) => h.textContent.trim()), rows: [...t.querySelectorAll('tbody tr')].map((r) => [...r.cells].map((c) => c.textContent.trim())) }; })()`);
+  check("artifacts: listed by job with class, size and expiry", !!listing && listing.head.includes("Job") && listing.head.includes("Class") && listing.head.includes("Kept until"), listing);
+  const bundle = listing?.rows.find((r) => r[0] === "bundle");
+  const reports = listing?.rows.find((r) => r[0] === "reports");
+  check("artifacts: one row per artifact, each under its own job and class",
+    bundle?.[1] === "alpha" && bundle?.[2] === "standard" && reports?.[1] === "beta" && reports?.[2] === "evidence", { bundle, reports });
+  check("artifacts: sizes and an expiry are shown, never a zero or a dash", /\d/.test(reports?.[5] ?? "") && !(reports?.[5] ?? "").includes("—") && /\d/.test(reports?.[6] ?? ""), reports);
+
+  await page.click('main table button[aria-label="Browse the files of reports"]');
+  await page.waitFor("!!document.querySelector('#artifact-files') && !!document.querySelector('#artifact-search')", 10000, "the file tree");
+  const paths = await page.eval(`[...document.querySelectorAll('#artifact-files [data-path]')].map((b) => b.getAttribute('data-path'))`);
+  check("tree: every file, folders above them, each with a size and a digest",
+    JSON.stringify(paths) === JSON.stringify(["bin/runner", "coverage/pass.png", "coverage/report.html", "logs/full.txt", "logs/unit.txt"]), paths);
+  const row = await page.eval(`(() => { const b = document.querySelector('#artifact-files [data-path="coverage/pass.png"]'); const li = b.closest('li'); return { text: li.textContent.replace(/\\s+/g, ' '), digest: li.querySelector('code').textContent, title: li.querySelector('code').title }; })()`);
+  check("tree: a file row carries its size, its digest and a download", /67 B/.test(row.text) && row.digest.length >= 8 && /^[0-9a-f]{64}$/.test(row.title), row.text.slice(0, 120));
+  check("tree: a binary has no preview to offer", await page.eval(`document.querySelector('#artifact-files [data-path="bin/runner"]').disabled`));
+
+  await page.fill("#artifact-search", "unit");
+  await page.waitFor(`document.querySelectorAll('#artifact-files [data-path]').length === 1`, 8000, "the search");
+  check("search: one match of five, and the count says so", (await page.eval("document.querySelector('#artifact-files [role=status]').textContent")).includes("1 of 5"), await page.eval("document.querySelector('#artifact-files [role=status]').textContent"));
+  await page.fill("#artifact-search", "nothing-here");
+  await page.waitFor(`document.body.textContent.includes('No path holds that text')`, 8000, "the empty search");
+  check("search: no match is said, not drawn as an empty tree", true);
+  await page.fill("#artifact-search", "unit.txt");
+  await page.waitFor(`document.querySelectorAll('#artifact-files [data-path]').length === 1`, 8000, "the narrowed tree");
+  await page.click('#artifact-files [data-path="logs/unit.txt"]');
+  await page.waitFor(`!!document.querySelector('#artifact-preview pre')`, 10000, "the text preview");
+  const text = await page.eval("document.querySelector('#artifact-preview pre').textContent");
+  check("preview: text is shown in place", text.includes(cfg.preview_needle), text.slice(0, 120));
+  check("preview: the entry's path, size and digest are beside it", (await page.eval("document.querySelector('#artifact-preview').textContent")).includes("logs/unit.txt"));
+
+  await page.fill("#artifact-search", "full.txt");
+  await page.click('#artifact-files [data-path="logs/full.txt"]');
+  await page.waitFor("!!document.querySelector('#artifact-preview-truncated')", 10000, "the cut notice");
+  const big = await page.eval("document.querySelector('#artifact-preview pre').textContent.length");
+  check("preview: a text entry past 1 MiB is cut there and said", big === 1 << 20, big);
+
+  await page.fill("#artifact-search", "pass.png");
+  await page.click('#artifact-files [data-path="coverage/pass.png"]');
+  await page.waitFor("!!document.querySelector('#artifact-preview img')", 10000, "the image preview");
+  await page.waitFor("document.querySelector('#artifact-preview img').complete", 10000, "the image loaded");
+  const image = await page.eval(`(() => { const i = document.querySelector('#artifact-preview img'); return { w: i.naturalWidth, h: i.naturalHeight, alt: i.alt }; })()`);
+  check("preview: an image is drawn from its own request", image.w === 1 && image.h === 1, image);
+  const headers = await page.eval(`fetch(document.querySelector('#artifact-preview img').src).then((r) => ({ type: r.headers.get('content-type'), disposition: r.headers.get('content-disposition'), nosniff: r.headers.get('x-content-type-options'), csp: r.headers.get('content-security-policy') }))`);
+  check("preview: served as an attachment, never sniffed, under a sandboxing policy",
+    headers.type === "image/png" && headers.disposition === 'attachment; filename="pass.png"' && headers.nosniff === "nosniff" && headers.csp === "default-src 'none'; sandbox", headers);
+
+  const download = await page.eval(`(() => { const a = document.querySelector('#artifact-files [data-path="coverage/pass.png"]').closest('li').querySelector('a[download]'); return { href: a.getAttribute('href'), name: a.download }; })()`);
+  const bytes = await page.eval(`fetch(${JSON.stringify(download.href)}).then((r) => r.arrayBuffer()).then((b) => b.byteLength)`);
+  check("download: one file comes from its digest as an attachment", download.href.startsWith("/api/v1/tenants/acme/objects/") && download.name === "pass.png" && bytes === 67, { download, bytes });
+  const archived = await page.eval(`fetch(document.querySelector('#artifact-files a[href$="format=tar"]').href).then(async (r) => ({ status: r.status, disposition: r.headers.get('content-disposition'), bytes: (await r.arrayBuffer()).byteLength }))`);
+  check("download: the whole artifact as one archive", archived.status === 200 && archived.bytes > 1 << 20, archived);
+
+  for (const dark of [false, true]) {
+    await page.scheme(dark);
+    await sleep(200);
+    const result = await page.eval(CONTRAST);
+    check(`artifacts, ${dark ? "dark" : "light"}: text contrast meets WCAG AA (${result.checked} elements)`, result.count === 0, result.bad);
+  }
+  await page.scheme(false);
+  const wide = await page.eval(OVERFLOW);
+  check("artifacts: the open tree and preview fit the page", wide.scroll <= wide.width + 1, wide);
+  await page.viewport(360, 800);
+  await sleep(200);
+  const narrow = await page.eval(OVERFLOW);
+  check("artifacts at 360px: no horizontal page scroll", narrow.scroll <= narrow.width + 1, narrow);
+  await page.viewport(1280, 860);
+  await sleep(200);
+  await page.eval(`document.querySelector('#artifact-search').focus()`);
+  const ring = await page.eval(FOCUS_RING);
+  check("keyboard: the path search shows a focus ring", ring && ring.ring === true, ring);
+  await page.screenshot(join(cfg.out, "artifacts-1280.png"));
+});
+
 await scenario("log search, gaps and deep links", async () => {
   await go(page, PAGES.log[0], PAGES.log[1]);
   const text = await page.eval("document.querySelector('#log-view').textContent");
