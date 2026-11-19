@@ -1,0 +1,39 @@
+# The ripgrep `ci.yml` shape from docs/pilot-repositories.md: a `test` job over an OS
+# matrix with a toolchain matrix beside it, and one job per extra check.
+name: ci
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+jobs:
+  test:
+    name: test ${{ matrix.os }} ${{ matrix.rust }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+      - name: Build
+        run: cargo build --verbose --workspace
+      - name: Test
+        run: cargo test --verbose --workspace
+  wasm:
+    name: wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add wasm32-wasip1
+      - run: cargo build --target wasm32-wasip1
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --all -- --check

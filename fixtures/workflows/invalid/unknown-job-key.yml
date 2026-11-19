@@ -1,0 +1,7 @@
+# expect: unknown key `step`
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    step:
+      - run: echo hi

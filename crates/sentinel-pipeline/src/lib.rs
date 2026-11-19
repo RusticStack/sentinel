@@ -8,6 +8,7 @@ pub mod hash_files;
 pub mod policy;
 pub mod run;
 pub mod schema;
+pub mod workflow;
 pub mod yaml;
 
 use std::fmt;

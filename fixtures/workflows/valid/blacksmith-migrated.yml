@@ -1,0 +1,77 @@
+# A workflow already pointing at a Blacksmith runner, the shape guided migration reads:
+# exact labels, an older Ubuntu image, an arm64 label, a GPU label, macOS, a container job
+# with a Docker step, a service, a cache, and the two triggers no native path serves yet.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: keep the workspace
+        type: boolean
+  schedule:
+    - cron: "0 3 * * 1"
+permissions:
+  contents: read
+  checks: write
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: ${{ vars.RUST_BACKTRACE }}
+jobs:
+  linux:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('Cargo.lock') }}
+      - run: cargo test --locked
+  old-image:
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build
+  windows:
+    runs-on: blacksmith-2vcpu-windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: cargo test
+  arm:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build
+  docker:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    container:
+      image: node:22
+      credentials:
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker://alpine:3
+        with:
+          args: echo ready
+      - run: npm ci && npm test
+  gpu:
+    runs-on: blacksmith-4vcpu-ubuntu-2404-gpu
+    steps:
+      - run: nvidia-smi
+  mac:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: xcodebuild -list
+  self-hosted:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - run: ./ci.sh

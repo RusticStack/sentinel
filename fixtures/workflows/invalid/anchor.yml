@@ -1,0 +1,7 @@
+# expect: anchors are not allowed
+on: [push]
+jobs:
+  build:
+    runs-on: &host ubuntu-latest
+    steps:
+      - run: echo hi

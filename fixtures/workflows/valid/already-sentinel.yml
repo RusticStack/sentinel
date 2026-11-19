@@ -1,0 +1,17 @@
+# A workflow that already names Sentinel classes, so re-running the analyzer over a
+# migration's own output changes nothing; and a named runner group, which is GitHub's own
+# scaling concept and is never a Sentinel class.
+name: ci
+on: [push, pull_request, merge_group]
+permissions: read-all
+jobs:
+  test:
+    runs-on: sentinel-8vcpu-ubuntu-2404
+    steps:
+      - run: cargo test
+  group:
+    runs-on:
+      group: large-runners
+      labels: [self-hosted, linux]
+    steps:
+      - run: ./ci.sh
