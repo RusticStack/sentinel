@@ -210,21 +210,27 @@ impl AttemptSummary {
         if bytes.len() > MAX_SUMMARY_BYTES {
             return Err(SummaryError::TooLarge);
         }
-        match bytes.split_first() {
+        let summary = match bytes.split_first() {
             Some((&SUMMARY_FORMAT, body)) => {
-                postcard::from_bytes(body).map_err(|_| SummaryError::Decode)
+                postcard::from_bytes(body).map_err(|_| SummaryError::Decode)?
             }
-            Some((&SUMMARY_FORMAT_V3, body)) => postcard::from_bytes::<AttemptSummaryV3>(body)
-                .map(AttemptSummary::from)
-                .map_err(|_| SummaryError::Decode),
-            Some((&SUMMARY_FORMAT_V2, body)) => postcard::from_bytes::<AttemptSummaryV2>(body)
-                .map(AttemptSummary::from)
-                .map_err(|_| SummaryError::Decode),
-            Some((&SUMMARY_FORMAT_V1, body)) => postcard::from_bytes::<AttemptSummaryV1>(body)
-                .map(AttemptSummary::from)
-                .map_err(|_| SummaryError::Decode),
-            _ => Err(SummaryError::Decode),
+            Some((&SUMMARY_FORMAT_V3, body)) => AttemptSummary::from(
+                postcard::from_bytes::<AttemptSummaryV3>(body).map_err(|_| SummaryError::Decode)?,
+            ),
+            Some((&SUMMARY_FORMAT_V2, body)) => AttemptSummary::from(
+                postcard::from_bytes::<AttemptSummaryV2>(body).map_err(|_| SummaryError::Decode)?,
+            ),
+            Some((&SUMMARY_FORMAT_V1, body)) => AttemptSummary::from(
+                postcard::from_bytes::<AttemptSummaryV1>(body).map_err(|_| SummaryError::Decode)?,
+            ),
+            _ => return Err(SummaryError::Decode),
+        };
+        // Encode refuses a summary past these bounds, so a blob that decodes past them did not come from
+        // this protocol. A reader stops there instead of carrying records the writer may never produce.
+        if summary.steps.len() > MAX_STEP_RECORDS || summary.caches.len() > MAX_CACHE_RECORDS {
+            return Err(SummaryError::TooLarge);
         }
+        Ok(summary)
     }
 }
 
@@ -460,5 +466,44 @@ mod tests {
             AttemptSummary::decode(&bytes[..bytes.len() - 1]),
             Err(SummaryError::Decode)
         );
+    }
+
+    #[test]
+    fn a_blob_past_the_record_envelope_is_refused_by_its_reader() {
+        let steps = |count: usize| -> Vec<StepRecord> {
+            (0..count)
+                .map(|index| StepRecord {
+                    index: index as u32,
+                    id: String::new(),
+                    outcome: StepOutcome::NotRun,
+                    duration_ns: None,
+                })
+                .collect()
+        };
+        let over = AttemptSummary {
+            steps: steps(MAX_STEP_RECORDS + 1),
+            ..AttemptSummary::default()
+        };
+        // Written by hand: `encode` refuses what the reader must also refuse.
+        let mut bytes = vec![SUMMARY_FORMAT];
+        bytes.extend(postcard::to_allocvec(&over).unwrap());
+        assert!(bytes.len() <= MAX_SUMMARY_BYTES, "{} bytes", bytes.len());
+        assert_eq!(AttemptSummary::decode(&bytes), Err(SummaryError::TooLarge));
+
+        let over = AttemptSummary {
+            caches: vec![full_cache_record(); MAX_CACHE_RECORDS + 1],
+            ..AttemptSummary::default()
+        };
+        let mut bytes = vec![SUMMARY_FORMAT];
+        bytes.extend(postcard::to_allocvec(&over).unwrap());
+        assert!(bytes.len() <= MAX_SUMMARY_BYTES);
+        assert_eq!(AttemptSummary::decode(&bytes), Err(SummaryError::TooLarge));
+
+        let full = AttemptSummary {
+            steps: steps(MAX_STEP_RECORDS),
+            caches: vec![full_cache_record(); MAX_CACHE_RECORDS],
+            ..AttemptSummary::default()
+        };
+        assert_eq!(AttemptSummary::decode(&full.encode().unwrap()), Ok(full));
     }
 }
