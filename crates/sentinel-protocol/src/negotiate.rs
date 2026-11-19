@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct ProtocolVersion(pub u16);
 
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(12);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(13);
 
 /// Digest-first artifact transfer: the worker offers every file's digest and length before a body travels and
 /// the controller answers the ones the tenant already holds. A session below this version has no offer at all.
@@ -17,6 +17,10 @@ pub const PREFETCH_MIN: ProtocolVersion = ProtocolVersion(9);
 
 /// The controller may push `Cancel` the moment a cancel commits instead of waiting for the next heartbeat.
 pub const CANCEL_PUSH_MIN: ProtocolVersion = ProtocolVersion(11);
+
+/// Runner-mode leases: the offer, the single-use configuration and the stop list. A worker below
+/// this version is never offered a runner, so its sessions behave exactly as before.
+pub const RUNNER_MIN: ProtocolVersion = ProtocolVersion(13);
 
 pub const MAX_CANCEL_PUSH: usize = 1024;
 

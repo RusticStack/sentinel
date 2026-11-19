@@ -24,6 +24,12 @@ impl SecretBytes {
         Self(bytes.to_vec())
     }
 
+    /// Hand the bytes to the one holder that needs them. Nothing is copied and nothing is left
+    /// for the drop to wipe, so a frame that decodes into this type can still be handed on whole.
+    pub fn into_vec(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0)
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }

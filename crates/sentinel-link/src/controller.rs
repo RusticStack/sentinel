@@ -12,19 +12,20 @@ use std::{
 use sentinel_auth::secret::{Digest, Secret};
 use sentinel_cache::remote::{Need, Upload};
 use sentinel_core::{
-    AttemptId, Event, Fence, JobId, PoolId, RunId, TenantId, UnixMillis, WorkerId,
+    AttemptId, Event, Fence, JobId, Labelled, PoolId, RunId, RunnerClass, RunnerLeaseId, TenantId,
+    UnixMillis, WorkerId,
 };
 use sentinel_protocol::limits::{MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES};
 use sentinel_protocol::logs::Frame;
 use sentinel_protocol::negotiate::{
     CANCEL_PUSH_MIN, Capabilities, Hello, MAX_CANCEL_PUSH, MAX_PREFETCH_IMAGES, PREFETCH_MIN,
-    PROFILE_MIN, Profile,
+    PROFILE_MIN, Profile, RUNNER_MIN,
 };
 use sentinel_store::{
     Store, artifacts, classes, dispatch,
     logs::LogStore,
     objects::{self, Objects},
-    retention, skipped, workers,
+    retention, runner_provision as runner_store, skipped, workers,
 };
 
 use crate::{
@@ -132,6 +133,13 @@ pub struct Stats {
     pub revoked_refused: AtomicU64,
     pub deferred_worker_messages: AtomicU64,
     pub deferred_dropped: AtomicU64,
+    /// Runner-mode leases placed, configurations issued, leases stopped, registrations removed and
+    /// queued jobs a reconciliation pass recovered.
+    pub runner_placed: AtomicU64,
+    pub runner_configured: AtomicU64,
+    pub runner_stopped: AtomicU64,
+    pub runner_unregistered: AtomicU64,
+    pub runner_recovered: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -506,6 +514,12 @@ struct Inner {
     cancel_hint: AtomicBool,
     deferred: Mutex<DeferredQueue>,
     next_deferred: AtomicU64,
+    /// Runner mode's policy while the deployment serves one, and nothing when it serves none: the
+    /// provisioning loop runs either way and does no store work when there is no policy.
+    runner: Mutex<Option<crate::runner::Policy>>,
+    runner_at: AtomicI64,
+    runner_after: Mutex<Option<(sentinel_core::TenantId, sentinel_core::RepoId)>>,
+    runner_warned: AtomicI64,
 }
 
 const WARN_INTERVAL_MS: i64 = 60_000;
@@ -943,6 +957,24 @@ impl Inner {
         self.wake();
         let _ = session.serve(&**self);
         self.unregister(worker, generation);
+        // A session that ended cannot be sent a configuration or a stop, so what it held is over:
+        // the runner goes, and the sweep removes its registration.
+        if self
+            .runner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+            && let Err(e) = self.write_store(move |tx| {
+                runner_store::release_worker(
+                    tx,
+                    worker,
+                    runner_store::SESSION_LOST,
+                    UnixMillis::steady(),
+                )
+            })
+        {
+            self.failed(false, "runner_session", &e);
+        }
         peer.sender.close();
         if let Some(bulk) = peer.bulk.lock().unwrap_or_else(|p| p.into_inner()).take() {
             bulk.close();
@@ -1078,6 +1110,7 @@ impl Inner {
         self.uninstall_pass();
         self.revocation_pass(now);
         self.placement_pass();
+        self.runner_pass();
         self.prefetch_pass();
     }
 
@@ -1469,6 +1502,471 @@ impl Inner {
             }
             active.retain(|i| !done.contains(i));
         }
+    }
+
+    /// Runner mode's provisioning pass: end what is over, renew what is held, issue and deliver the
+    /// configurations leases asked for, remove the registrations of finished runners, place fresh
+    /// demand, and — on its own interval — read GitHub's queue for the deliveries that never came.
+    ///
+    /// The pass is bounded at every step: at most [`runner::PROVISION_BATCH`] configurations are
+    /// asked for, [`runner::UNREGISTER_BATCH`] registrations removed, [`runner::PLACES_PER_WORKER`]
+    /// leases placed on one worker and [`runner::RECONCILE_REPOS`] repositories reconciled. What it
+    /// did not reach is the next pass's.
+    fn runner_pass(&self) {
+        let policy = self
+            .runner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(policy) = policy else {
+            return;
+        };
+        let now = UnixMillis::steady();
+
+        // What is over: an offer nobody answered, a runner nobody handed a job before its idle
+        // bound, and a lease this controller stopped renewing. The worker is told to stop each one,
+        // and any registration it made is removed by the sweep below.
+        let idle_ms = policy.idle_ms;
+        let ended = self.write_store(move |tx| {
+            let mut ended = runner_store::lapsed(tx, now)?;
+            ended.extend(runner_store::idle(tx, now, idle_ms)?);
+            ended.extend(runner_store::expired(tx, now)?);
+            Ok(ended)
+        });
+        match ended {
+            Ok(ended) => self.runner_stops(&ended),
+            Err(e) => self.failed(false, "runner_sweep", &e),
+        }
+
+        // A live session keeps its leases: renewal is per pass, so a worker that is gone is caught by
+        // the session ending (which releases its leases) and not by a missed beat of its own.
+        let until = UnixMillis(now.0 + runner_store::LEASE_MS);
+        let workers: Vec<WorkerId> = self
+            .fleet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        if !workers.is_empty()
+            && let Err(e) = self.write_store(move |tx| {
+                for worker in workers {
+                    runner_store::renew(tx, worker, until)?;
+                }
+                Ok(())
+            })
+        {
+            self.failed(false, "runner_renew", &e);
+        }
+
+        self.runner_provision(&policy, now);
+        self.runner_deliver(&policy, now);
+        self.runner_unregister(now);
+        self.runner_place(&policy, now);
+        if now.0.saturating_sub(self.runner_at.load(Ordering::Relaxed)) >= policy.reconcile_ms {
+            self.runner_at.store(now.0, Ordering::Relaxed);
+            self.runner_reconcile(&policy, now);
+        }
+    }
+
+    fn runner_stops(&self, ended: &[(RunnerLeaseId, WorkerId)]) {
+        if ended.is_empty() {
+            return;
+        }
+        let mut by_worker: HashMap<WorkerId, Vec<RunnerLeaseId>> = HashMap::new();
+        for &(lease, worker) in ended {
+            by_worker.entry(worker).or_default().push(lease);
+        }
+        for (worker, leases) in by_worker {
+            let Some(peer) = self.peer(worker) else {
+                continue;
+            };
+            match crate::runner::stop(&peer.sender, &leases) {
+                Ok(()) => {
+                    self.stats
+                        .runner_stopped
+                        .fetch_add(leases.len() as u64, Ordering::Relaxed);
+                }
+                Err(_) => peer.sender.close(),
+            }
+        }
+    }
+
+    /// Ask GitHub for the configuration of every lease that has none yet, seal it, and record the
+    /// registration. A lease whose repository, installation or App cannot reach GitHub is released
+    /// at once with `register_failed`, so its capacity returns and the next pass tries again.
+    fn runner_provision(&self, policy: &crate::runner::Policy, now: UnixMillis) {
+        let due = match self
+            .store
+            .read(|c| runner_store::awaiting_config(c, crate::runner::PROVISION_BATCH))
+        {
+            Ok(due) => due,
+            Err(e) => return self.failed(false, "runner_provision", &e),
+        };
+        if due.is_empty() {
+            return;
+        }
+        let (Some(app), Some(key)) = (self.source_app(), self.source_key()) else {
+            self.runner_warn("runner_app_missing");
+            return;
+        };
+        let wall = UnixMillis::now().0;
+        for lease in due {
+            let binding = match self
+                .store
+                .read(move |c| runner_store::provision_binding(c, lease.tenant, lease.repo))
+            {
+                Ok(Some(binding)) => binding,
+                Ok(None) => {
+                    self.runner_release(lease.id, runner_store::REGISTER_FAILED, now);
+                    continue;
+                }
+                Err(e) => {
+                    self.failed(false, "runner_binding", &e);
+                    continue;
+                }
+            };
+            let Some(scope) =
+                crate::runner::scope(&binding.remote, &binding.login, binding.personal)
+            else {
+                self.runner_release(lease.id, runner_store::REGISTER_FAILED, now);
+                continue;
+            };
+            let token = match app.runner_token(
+                binding.installation,
+                binding.account,
+                binding.repo_id,
+                &binding.remote,
+                &scope,
+                wall,
+            ) {
+                Ok(token) => token,
+                Err(_) => {
+                    self.runner_release(lease.id, runner_store::REGISTER_FAILED, now);
+                    continue;
+                }
+            };
+            let labels = [lease.class.clone()];
+            let mut issued = match app.generate_jitconfig(
+                &token,
+                &scope,
+                &lease.runner_name,
+                policy.runner_group,
+                &labels,
+            ) {
+                Ok(issued) => issued,
+                Err(_) => {
+                    // The answer may carry the reason; it never carries the configuration.
+                    tracing::warn!(event = "runner_register_failed", job = lease.runner_name);
+                    self.runner_release(lease.id, runner_store::REGISTER_FAILED, now);
+                    continue;
+                }
+            };
+            let context = crate::runner::seal_context(lease.tenant, lease.repo, lease.id);
+            let sealed = key.seal(&context, &issued.encoded);
+            sentinel_auth::secret::wipe(&mut issued.encoded);
+            let (id, worker) = (lease.id, lease.worker);
+            let runner_id = issued.runner_id;
+            match self.write_store(move |tx| {
+                runner_store::set_config(tx, id, worker, runner_id, &sealed, now)
+            }) {
+                Ok(true) => {
+                    self.stats.runner_configured.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(false) => {}
+                Err(e) => self.failed(false, "runner_config", &e),
+            }
+        }
+    }
+
+    /// Send the configuration of each accepted lease to the worker that holds it, once. The sealed
+    /// bytes stay in the row until the frame is written, so a lost connection is a retry and never a
+    /// second registration.
+    fn runner_deliver(&self, _policy: &crate::runner::Policy, now: UnixMillis) {
+        let pending = match self
+            .store
+            .read(|c| runner_store::pending_delivery(c, crate::runner::PROVISION_BATCH))
+        {
+            Ok(pending) => pending,
+            Err(e) => return self.failed(false, "runner_delivery", &e),
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let Some(key) = self.source_key() else {
+            self.runner_warn("runner_app_missing");
+            return;
+        };
+        for delivery in pending {
+            let Some(peer) = self.peer(delivery.worker) else {
+                continue;
+            };
+            let Some(sealed) = self
+                .store
+                .read(move |c| runner_store::sealed_config(c, delivery.lease, delivery.worker))
+                .unwrap_or(None)
+            else {
+                continue;
+            };
+            let context =
+                crate::runner::seal_context(delivery.tenant, delivery.repo, delivery.lease);
+            let Ok(plain) = key.open(&context, &sealed) else {
+                self.runner_release(delivery.lease, runner_store::REGISTER_FAILED, now);
+                continue;
+            };
+            match crate::runner::deliver(&peer.sender, delivery.lease, plain) {
+                Ok(()) => {
+                    let (lease, worker) = (delivery.lease, delivery.worker);
+                    match self.write_store(move |tx| {
+                        runner_store::take_config(tx, lease, worker, now).map(|_| ())
+                    }) {
+                        Ok(()) => {}
+                        Err(e) => self.failed(false, "runner_delivered", &e),
+                    }
+                }
+                // The frame did not reach the worker: the sealed row stays and the next pass retries
+                // with the same registration.
+                Err(_) => peer.sender.close(),
+            }
+        }
+    }
+
+    /// Remove the registrations of runners that are over. An ephemeral runner de-registers itself
+    /// when its job ends, so "already gone" is the state this wanted.
+    fn runner_unregister(&self, now: UnixMillis) {
+        let due = match self
+            .store
+            .read(|c| runner_store::to_unregister(c, crate::runner::UNREGISTER_BATCH))
+        {
+            Ok(due) => due,
+            Err(e) => return self.failed(false, "runner_unregister", &e),
+        };
+        if due.is_empty() {
+            return;
+        }
+        let Some(app) = self.source_app() else {
+            self.runner_warn("runner_app_missing");
+            return;
+        };
+        let wall = UnixMillis::now().0;
+        for registration in due {
+            let binding = match self.store.read(move |c| {
+                runner_store::provision_binding(c, registration.tenant, registration.repo)
+            }) {
+                Ok(binding) => binding,
+                Err(e) => {
+                    self.failed(false, "runner_binding", &e);
+                    continue;
+                }
+            };
+            let Some(binding) = binding else {
+                // Nothing can address this registration any more: the binding or the installation is
+                // gone, and the runner was removed with it at GitHub.
+                self.runner_unregistered(registration.lease, now);
+                continue;
+            };
+            let Some(scope) =
+                crate::runner::scope(&binding.remote, &binding.login, binding.personal)
+            else {
+                self.runner_unregistered(registration.lease, now);
+                continue;
+            };
+            let Ok(token) = app.runner_token(
+                binding.installation,
+                binding.account,
+                binding.repo_id,
+                &binding.remote,
+                &scope,
+                wall,
+            ) else {
+                continue;
+            };
+            match app.remove_runner(&token, &scope, registration.runner_id) {
+                Ok(_) => self.runner_unregistered(registration.lease, now),
+                Err(_) => self.runner_warn("runner_unregister_failed"),
+            }
+        }
+    }
+
+    fn runner_unregistered(&self, lease: RunnerLeaseId, now: UnixMillis) {
+        match self.write_store(move |tx| runner_store::unregistered(tx, lease, now)) {
+            Ok(_) => {
+                self.stats
+                    .runner_unregistered
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => self.failed(false, "runner_unregistered", &e),
+        }
+    }
+
+    /// Offer the freshest demand of this pool to every worker that can host it. A worker serves a
+    /// class only by naming its label, so a machine without the runtime is never offered one.
+    fn runner_place(&self, _policy: &crate::runner::Policy, now: UnixMillis) {
+        let mut peers: Vec<(WorkerId, Arc<Peer>)> = self
+            .fleet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(_, peer)| peer.protocol >= RUNNER_MIN.0 && session::is_free(&peer.sender))
+            .map(|(worker, peer)| (*worker, Arc::clone(peer)))
+            .collect();
+        if peers.is_empty() {
+            return;
+        }
+        // Rounds, not one worker at a time: a burst spreads over the fleet before any machine takes
+        // a second runner, and a fleet of one still fills its room within the same pass.
+        for _ in 0..crate::runner::PLACES_PER_WORKER {
+            let mut placed_any = false;
+            let round = std::mem::take(&mut peers);
+            for (worker, peer) in round {
+                let placed = self.write_store(move |tx| {
+                    runner_store::place(tx, worker, runner_store::LEASE_MS, now)
+                });
+                let lease = match placed {
+                    Ok(Some(lease)) => lease,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        self.failed(true, "runner_place", &e);
+                        continue;
+                    }
+                };
+                let until = UnixMillis(now.0 + runner_store::LEASE_MS);
+                if crate::runner::offer(&peer.sender, &lease, until).is_err() {
+                    self.runner_release(lease.id, runner_store::SESSION_LOST, now);
+                    continue;
+                }
+                self.stats.runner_placed.fetch_add(1, Ordering::Relaxed);
+                peers.push((worker, peer));
+                placed_any = true;
+            }
+            if !placed_any {
+                return;
+            }
+        }
+    }
+
+    /// Read GitHub's own queue for the repositories whose deliveries may have been lost, and record
+    /// the queued jobs no delivery announced. The pass is bounded per repository and per run, and a
+    /// pass that filled its bound resumes after the last repository it read.
+    fn runner_reconcile(&self, policy: &crate::runner::Policy, now: UnixMillis) {
+        let after = *self.runner_after.lock().unwrap_or_else(|p| p.into_inner());
+        let targets = match self.store.read(move |c| {
+            runner_store::reconcile_targets(c, after, crate::runner::RECONCILE_REPOS)
+        }) {
+            Ok(targets) => targets,
+            Err(e) => return self.failed(false, "runner_reconcile", &e),
+        };
+        *self.runner_after.lock().unwrap_or_else(|p| p.into_inner()) = match targets.len() {
+            len if len as u32 == crate::runner::RECONCILE_REPOS => {
+                targets.last().map(|t| (t.tenant, t.repo))
+            }
+            _ => None,
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let Some(app) = self.source_app() else {
+            self.runner_warn("runner_app_missing");
+            return;
+        };
+        let wall = UnixMillis::now().0;
+        for target in targets {
+            let binding = match self
+                .store
+                .read(move |c| runner_store::provision_binding(c, target.tenant, target.repo))
+            {
+                Ok(Some(binding)) => binding,
+                Ok(None) => continue,
+                Err(e) => {
+                    self.failed(false, "runner_binding", &e);
+                    continue;
+                }
+            };
+            let Some((owner, repo)) = crate::runner::github_owner_repo(&binding.remote) else {
+                continue;
+            };
+            let Ok(token) = app.runner_token(
+                binding.installation,
+                binding.account,
+                binding.repo_id,
+                &binding.remote,
+                &crate::runner::scope(&binding.remote, &binding.login, binding.personal)
+                    .unwrap_or(sentinel_github::runner::Scope::Repository { owner, repo }),
+                wall,
+            ) else {
+                continue;
+            };
+            let jobs = match app.queued_jobs(
+                &token,
+                owner,
+                repo,
+                crate::runner::RECONCILE_RUNS,
+                crate::runner::RECONCILE_JOBS,
+            ) {
+                Ok(jobs) => jobs,
+                Err(_) => {
+                    self.runner_warn("runner_reconcile_unavailable");
+                    continue;
+                }
+            };
+            for job in jobs {
+                let class = match RunnerClass::of_labels(job.labels.iter().map(String::as_str)) {
+                    Labelled::Class(class) => class,
+                    _ => continue,
+                };
+                let label = class.to_string();
+                if policy.serves(&label).is_none() {
+                    continue;
+                }
+                let (tenant, repo_id) = (target.tenant, target.repo);
+                match self.write_store(move |tx| {
+                    runner_store::observe(tx, tenant, repo_id, job.job, job.run, &label, now)
+                }) {
+                    Ok(true) => {
+                        self.stats.runner_recovered.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(false) => {}
+                    Err(e) => self.failed(false, "runner_observe", &e),
+                }
+            }
+        }
+    }
+
+    fn runner_release(&self, lease: RunnerLeaseId, reason: &'static str, now: UnixMillis) {
+        match self.write_store(move |tx| runner_store::release(tx, lease, reason, now)) {
+            Ok(_) => {}
+            Err(e) => self.failed(false, "runner_release", &e),
+        }
+    }
+
+    fn runner_warn(&self, what: &'static str) {
+        let now = UnixMillis::steady().0;
+        let last = self.runner_warned.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= WARN_INTERVAL_MS
+            && self
+                .runner_warned
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                event = what,
+                "runner mode cannot reach GitHub or the sealed key yet"
+            );
+        }
+    }
+
+    fn source_app(&self) -> Option<Arc<sentinel_github::app::App>> {
+        self.source_app
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn source_key(&self) -> Option<Arc<sentinel_auth::sealed::Key>> {
+        self.source_key
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Runs one maintenance pass; `false` when a backup or the replicator holds the maintenance lock and nothing ran.
@@ -2469,6 +2967,29 @@ impl SessionHandler for Inner {
         }
     }
 
+    fn runner_acked(&self, worker: WorkerId, lease: RunnerLeaseId, accepted: bool) {
+        let now = UnixMillis::steady();
+        let answered = self.write_store(move |tx| {
+            if accepted {
+                let taken = runner_store::accept(tx, worker, lease, now)?;
+                if !taken {
+                    // The offer lapsed between the frame and this write: the worker holds a lease
+                    // nothing counts, and the next pass tells it to stop.
+                    runner_store::release(tx, lease, runner_store::LAPSED, now)?;
+                }
+                Ok(taken)
+            } else {
+                runner_store::decline(tx, worker, lease, now)?;
+                Ok(false)
+            }
+        });
+        match answered {
+            Ok(true) => self.wake(),
+            Ok(false) => {}
+            Err(e) => self.failed(false, "runner_ack", &e),
+        }
+    }
+
     fn spec(&self, _worker: WorkerId, _attempt: AttemptId) -> Option<(JobContext, Vec<u8>)> {
         None
     }
@@ -3434,6 +3955,33 @@ impl Controller {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Arc::new(destinations);
     }
+    /// State what this deployment serves of runner mode and start its provisioning loop. Called once
+    /// at start; a later call replaces the policy the next pass reads.
+    pub fn set_runner_policy(&self, policy: crate::runner::Policy) {
+        let first = self
+            .inner
+            .runner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(policy)
+            .is_none();
+        if !first {
+            return;
+        }
+        let watched = Arc::downgrade(&self.inner);
+        let _ = thread::Builder::new()
+            .name("sentinel-runner".into())
+            .spawn(move || {
+                while let Some(inner) = watched.upgrade() {
+                    thread::sleep(crate::runner::PASS_INTERVAL);
+                    if inner.stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    inner.runner_pass();
+                }
+            });
+    }
+
     pub fn set_source_app(&self, app: Arc<sentinel_github::app::App>) {
         *self
             .inner
@@ -3611,6 +4159,10 @@ impl Controller {
             cancel_hint: AtomicBool::new(false),
             deferred: Mutex::new(DeferredQueue::default()),
             next_deferred: AtomicU64::new(0),
+            runner: Mutex::new(None),
+            runner_at: AtomicI64::new(i64::MIN),
+            runner_after: Mutex::new(None),
+            runner_warned: AtomicI64::new(i64::MIN),
         });
         let _ = inner.me.set(Arc::downgrade(&inner));
         let acceptor = {

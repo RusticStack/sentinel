@@ -2335,8 +2335,9 @@ fn start_server(
     let tailcat = start_tailcat(config, &store, tailcat, listen, controller.handle())?;
     let destinations = crate::source_admin::load_destinations(&config.data_dir)
         .map_err(|_| Error::runtime("cannot load source destination policy"))?;
-    let runner_classes = crate::source_admin::load_runner_classes(&config.data_dir)
+    let runner_policy = crate::source_admin::load_runner_policy(&config.data_dir)
         .map_err(|_| Error::runtime("cannot load runner class policy"))?;
+    let runner_classes: Arc<[sentinel_core::RunnerClass]> = Arc::clone(&runner_policy.classes);
     let intake_destinations: Arc<[String]> = destinations.clone().into();
     controller.set_source_destinations(destinations);
     let github = crate::source_admin::load_github(
@@ -2357,6 +2358,11 @@ fn start_server(
     }
     if let Some(key) = &key {
         controller.set_source_key(Arc::clone(key));
+    }
+    // The provisioning loop runs only where the deployment serves a class: with none, there is no
+    // demand it could satisfy and no call it could make.
+    if !runner_policy.classes.is_empty() {
+        controller.set_runner_policy(runner_policy);
     }
     let resolver = sentinel_intake::Resolver::new(
         Arc::clone(&store),

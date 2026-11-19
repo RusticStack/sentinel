@@ -302,32 +302,65 @@ const MAX_RUNNER_CLASSES: usize = 32;
 
 /// `<data_dir>/runner-classes.json` — `{"classes": ["sentinel-4vcpu-ubuntu-2404", …]}`: the
 /// runner-mode resource classes this deployment serves, named exactly as a workflow's
-/// `runs-on:` names them. Absent, runner mode serves nothing, so turning it on would only
-/// collect refused jobs. A label naming any other class is refused visibly, never run.
+/// `runs-on:` names them. Optional keys state where the runners register and how long one may sit
+/// idle: `runner_group_id` (GitHub's runner group, 1 by default), `idle_ms` (120 s) and
+/// `reconcile_ms` (60 s). Absent, runner mode serves nothing, so turning it on would only collect
+/// refused jobs. A label naming any other class is refused visibly, never run.
 pub fn load_runner_classes(root: &Path) -> Result<Arc<[RunnerClass]>, Error> {
+    Ok(load_runner_policy(root)?.classes)
+}
+
+/// Everything `runner-classes.json` states: the classes, the runner group, and the two bounds the
+/// provisioning pass reads.
+pub fn load_runner_policy(root: &Path) -> Result<sentinel_link::runner::Policy, Error> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Policy {
         classes: Vec<String>,
+        #[serde(default)]
+        runner_group_id: Option<u64>,
+        #[serde(default)]
+        idle_ms: Option<i64>,
+        #[serde(default)]
+        reconcile_ms: Option<i64>,
     }
     let path = root.join("runner-classes.json");
+    let mut policy = sentinel_link::runner::Policy::new(Arc::from(Vec::new()));
     if !path.exists() {
-        return Ok(Arc::from(Vec::new()));
+        return Ok(policy);
     }
-    let policy: Policy = serde_json::from_slice(&file(&path, 8 * 1024)?)
+    let stated: Policy = serde_json::from_slice(&file(&path, 8 * 1024)?)
         .map_err(|_| fail("invalid runner class policy"))?;
-    if policy.classes.len() > MAX_RUNNER_CLASSES {
+    // A runner group is an id GitHub assigned; 0 is not one, and neither is a negative bound.
+    policy.runner_group = stated.runner_group_id.unwrap_or(policy.runner_group);
+    if policy.runner_group == 0 {
         return Err(fail("invalid runner class policy"));
     }
-    let mut classes: Vec<RunnerClass> = Vec::with_capacity(policy.classes.len());
-    for label in &policy.classes {
+    for (value, slot, floor) in [
+        (stated.idle_ms, &mut policy.idle_ms, 1_000),
+        (stated.reconcile_ms, &mut policy.reconcile_ms, 5_000),
+    ] {
+        if let Some(value) = value {
+            if !(floor..=86_400_000).contains(&value) {
+                return Err(fail("invalid runner class policy"));
+            }
+            *slot = value;
+        }
+    }
+    let policy_classes = &stated.classes;
+    if policy_classes.len() > MAX_RUNNER_CLASSES {
+        return Err(fail("invalid runner class policy"));
+    }
+    let mut classes: Vec<RunnerClass> = Vec::with_capacity(policy_classes.len());
+    for label in policy_classes {
         let class = RunnerClass::parse(label).ok_or_else(|| fail("invalid runner class policy"))?;
         if classes.contains(&class) {
             return Err(fail("invalid runner class policy"));
         }
         classes.push(class);
     }
-    Ok(classes.into())
+    policy.classes = classes.into();
+    Ok(policy)
 }
 
 #[derive(Deserialize)]

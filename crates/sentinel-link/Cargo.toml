@@ -37,9 +37,15 @@ libc = "0.2"
 
 [dev-dependencies]
 sentinel-link = { path = ".", features = ["controller"] }
+sentinel-auth = { path = "../sentinel-auth" }
+sentinel-github = { path = "../sentinel-github" }
 sentinel-pipeline = { path = "../sentinel-pipeline" }
+sentinel-protocol = { path = "../sentinel-protocol" }
+rusqlite = { version = "0.40", features = ["bundled"] }
 sentinel-store = { path = "../sentinel-store" }
+serde_json = "1.0"
 tempfile = "3.20"
+time = "0.3"
 
 [lints]
 workspace = true

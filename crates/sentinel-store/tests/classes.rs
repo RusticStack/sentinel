@@ -740,6 +740,9 @@ fn database_at_latest_without_classes(path: &Path) {
          ALTER TABLE deployment_policy DROP COLUMN ai_enabled;
          DROP TRIGGER runner_terms_insert; DROP TRIGGER runner_terms_immutable;
          DROP TRIGGER runner_job_identity;
+         DROP TRIGGER runner_lease_identity; DROP TRIGGER runner_lease_jit_once;
+         DROP TRIGGER runner_lease_binding; DROP TRIGGER runner_lease_owner;
+         DROP TABLE runner_leases;
          DROP TABLE runner_deliveries; DROP TABLE runner_jobs;
          ALTER TABLE installations DROP COLUMN runner_permissions;
          ALTER TABLE tenants DROP COLUMN runner_mode;

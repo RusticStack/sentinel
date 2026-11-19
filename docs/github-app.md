@@ -175,6 +175,23 @@ The manifest now subscribes to `workflow_job`, so an installation approved befor
 receives no such event and grants none of the three permissions until an owner approves the
 change; until then enabling runner mode is refused naming them.
 
+What those permissions are used for, once runner mode is on
+([intake](intake.md#demand-provisioning-and-reconciliation)):
+
+| Call | Credential | What it does |
+|---|---|---|
+| `POST /orgs/{org}/actions/runners/generate-jitconfig` | installation token, `organization_self_hosted_runners: write` | registers one ephemeral runner in the deployment's runner group (`runner_group_id`) with the class label, and returns the runner object and `encoded_jit_config` |
+| `POST /repos/{owner}/{repo}/actions/runners/generate-jitconfig` | installation token, `administration: write` | the same for a personal namespace, which has no organization, without a runner group |
+| `DELETE /orgs/{org}/actions/runners/{id}`, `DELETE /repos/{owner}/{repo}/actions/runners/{id}` | the same as above | removes a registration a runner left behind; a `404` is the state we wanted, because an ephemeral runner de-registers itself after its job |
+| `GET /repos/{owner}/{repo}/actions/runs?status=queued`, `GET .../runs/{id}/jobs?filter=queued` | the same as above | the reconciliation pass's reading of GitHub's own queue |
+
+The owner and repository of a personal namespace come from the binding's remote
+(`https://github.com/owner/repository.git`); a remote on another host is not one this build can
+register a runner for, and the lease is released rather than registered somewhere else. The
+configuration is never stored in plaintext and never logged: it is sealed at rest under the
+controller's master key with a context that binds the tenant, the repository and the lease, and
+delivered once over worker protocol 13 ([worker link](worker-link.md#protocol-13-runner-leases)).
+
 ## Failure modes and recovery
 
 | What happened | What the person sees | Recovery |

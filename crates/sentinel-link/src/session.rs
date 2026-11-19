@@ -18,8 +18,8 @@ use sentinel_cache::remote::{
     Chunk, DIGEST_AT_END, End, Grant, Need, Push, Refusal, Refused, Serving, Upload,
 };
 use sentinel_core::{
-    AttemptId, Event, FailureClass, Fence, JobId, Outcome, RepoId, RunId, TenantId, UnixMillis,
-    WorkerId,
+    AttemptId, Event, FailureClass, Fence, JobId, Outcome, RepoId, RunId, RunnerLeaseId, TenantId,
+    UnixMillis, WorkerId,
 };
 use sentinel_protocol::{
     cache::Trust,
@@ -32,7 +32,7 @@ use sentinel_protocol::{
     negotiate::{
         CACHE_CANCEL_MIN, CANCEL_PUSH_MIN, DIGEST_AT_END_MIN, DIGEST_FIRST_MIN, Hello,
         MAX_CANCEL_PUSH, MAX_PREFETCH_IMAGES, MAX_PREFETCH_REFERENCE_BYTES, Negotiated,
-        PREFETCH_MIN, PROFILE_MIN, Profile, Rejected,
+        PREFETCH_MIN, PROFILE_MIN, Profile, RUNNER_MIN, Rejected,
     },
     summary::MAX_SUMMARY_BYTES,
 };
@@ -52,6 +52,9 @@ fn clamp_heartbeat(announced_ms: u32) -> Duration {
 }
 const TLS_READ_BYTES: usize = 16 * 1024 + 512;
 pub const SPEC_CHUNK_BYTES: usize = 48 * 1024;
+/// The largest runner-mode just-in-time configuration a frame carries. GitHub's is a few kilobytes;
+/// the bound is what stops a broken answer from becoming a frame nobody could write.
+pub const MAX_RUNNER_CONFIG_BYTES: usize = 65_536;
 pub const MAX_SPEC_BYTES: usize = MAX_API_BODY_BYTES;
 const MAX_IN_FLIGHT_SECRET_BYTES: usize = 8 * sentinel_protocol::secrets::MAX_DELIVERY_BYTES;
 pub const MAX_CACHE_CHUNK_BYTES: usize = sentinel_protocol::limits::MAX_CACHE_CHUNK_BYTES;
@@ -177,6 +180,12 @@ pub enum ClientMessage {
         name: String,
         entries: Vec<Offered>,
         last: bool,
+    },
+    /// Protocol 13: the worker's answer to a runner lease — whether it can host one ephemeral runner of
+    /// that class. A refusal costs nothing: no configuration has been asked of GitHub yet.
+    RunnerAck {
+        lease: [u8; 16],
+        accepted: bool,
     },
 }
 
@@ -378,6 +387,33 @@ pub enum ServerMessage {
         name: String,
         held: Vec<u32>,
     },
+    /// Protocol 13: one ephemeral runner this worker is offered the capacity for. The lease id is minted
+    /// for this offer and never reused; the class is the label set it satisfies.
+    RunnerOffer(RunnerLeaseWire),
+    /// Protocol 13: the just-in-time configuration of an accepted runner lease, delivered once. It is a
+    /// credential: the frame is wiped after it is sent and never logged.
+    RunnerConfig {
+        lease: [u8; 16],
+        config: sentinel_protocol::secrets::SecretBytes,
+    },
+    /// Protocol 13: leases the worker no longer holds — ended, idle, or released by the controller.
+    RunnerStop {
+        leases: Vec<[u8; 16]>,
+    },
+}
+
+/// A runner lease as the wire states it: what the worker needs to accept or refuse one, and nothing
+/// about the job it will run, which GitHub decides later.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerLeaseWire {
+    pub lease: [u8; 16],
+    /// The class the lease satisfies, as its label spells it.
+    pub class: String,
+    /// How long the offer stands unless the controller renews it.
+    pub lease_until_ms: i64,
+    /// What the sandbox may take: the class's vCPUs and the memory the class reserves.
+    pub cpu_millis: u64,
+    pub memory_bytes: u64,
 }
 
 pub(crate) trait SensitiveFrame {
@@ -392,7 +428,10 @@ impl SensitiveFrame for ClientMessage {
 
 impl SensitiveFrame for ServerMessage {
     fn is_sensitive(&self) -> bool {
-        matches!(self, ServerMessage::SecretChunk { .. })
+        matches!(
+            self,
+            ServerMessage::SecretChunk { .. } | ServerMessage::RunnerConfig { .. }
+        )
     }
 }
 
@@ -925,6 +964,8 @@ pub trait SessionHandler: Send + Sync {
         LogVerdict::Refused
     }
     fn abandoned(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
+    /// The worker's answer to a runner lease: it can host the runner, or it cannot.
+    fn runner_acked(&self, _worker: WorkerId, _lease: RunnerLeaseId, _accepted: bool) {}
     fn artifact_begin(&self, _worker: WorkerId, _attempt: AttemptId, _name: &str) -> ArtifactReply {
         ArtifactReply::Verdict(ArtifactCode::Stale)
     }
@@ -2151,6 +2192,16 @@ fn serve_connection(
                 let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
                 handler.acknowledged(worker, attempt, Fence(fence));
             }
+            ClientMessage::RunnerAck { lease, accepted } => {
+                if !control {
+                    return Err(Error::Protocol("control message on bulk"));
+                }
+                if protocol < RUNNER_MIN.0 {
+                    return Err(Error::Protocol("runner ack needs protocol 13"));
+                }
+                let lease = RunnerLeaseId::from_bytes(lease).map_err(|_| Error::Protocol("id"))?;
+                handler.runner_acked(worker, lease, accepted);
+            }
             ClientMessage::Decline { attempt, fence } => {
                 if !control {
                     return Err(Error::Protocol("control message on bulk"));
@@ -2687,17 +2738,24 @@ fn ids(raw: &[[u8; 16]]) -> Result<Vec<AttemptId>> {
 }
 
 pub fn offer(sender: &Sender, offer: &Offer) -> Result<()> {
-    let message = ServerMessage::Offer(offer.to_wire());
+    push(sender, &ServerMessage::Offer(offer.to_wire()))
+}
+
+/// Write one control message that must not be dropped over a moment's contention — an offer of
+/// placed work, or the configuration a lease is waiting for. The reader holds the connection lock
+/// only for in-memory TLS processing, so a bounded retry is enough; socket backpressure stays
+/// bounded by the waiting write's own deadline.
+pub fn push<M: serde::Serialize>(sender: &Sender, message: &M) -> Result<()> {
     let give_up = Instant::now() + OFFER_BUSY_WAIT;
     loop {
-        match sender.send_bounded(&message, DISPATCH_WRITE_BOUND) {
+        match sender.send_bounded(message, DISPATCH_WRITE_BOUND) {
             Err(error) if is_busy(&error) && Instant::now() < give_up => {
                 std::thread::sleep(Duration::from_millis(1));
             }
             Err(error) if is_busy(&error) => {
                 // The reader holds this lock only for in-memory TLS processing. Waiting cannot
                 // strand a leased offer behind reader contention; socket backpressure stays bounded.
-                return sender.send_waiting(&message, DISPATCH_WRITE_BOUND);
+                return sender.send_waiting(message, DISPATCH_WRITE_BOUND);
             }
             outcome => return outcome,
         }
@@ -2838,6 +2896,9 @@ pub fn connect(
         }),
         ServerMessage::Reject(why) => Err(Error::Rejected(why)),
         ServerMessage::Pong { .. }
+        | ServerMessage::RunnerOffer(_)
+        | ServerMessage::RunnerConfig { .. }
+        | ServerMessage::RunnerStop { .. }
         | ServerMessage::Offer(_)
         | ServerMessage::Spec { .. }
         | ServerMessage::NoSpec { .. }
@@ -3099,6 +3160,20 @@ pub trait Executor: Send + Sync {
     fn fence_of(&self, _attempt: AttemptId) -> Option<Fence> {
         None
     }
+    /// Whether this machine can host one ephemeral runner of that class. A worker that does not answer
+    /// refuses, so a controller that offered the class to the wrong machine loses nothing.
+    fn runner_offered(&self, _lease: &RunnerLeaseWire) -> bool {
+        false
+    }
+    /// The configuration of a lease this worker accepted. It is a credential: it is used to start the
+    /// runner and wiped afterwards, and it is never written to a log, a workspace or an environment.
+    fn runner_config(&self, _lease: [u8; 16], _config: Vec<u8>) {}
+    /// Leases the controller no longer counts as held: the runner stops and its sandbox goes.
+    fn runner_stopped(&self, _lease: [u8; 16]) {}
+    /// The leases this worker holds, for a controller that has to stop them after a lost session.
+    fn runner_held(&self) -> Vec<[u8; 16]> {
+        Vec::new()
+    }
     fn no_spec(&self, attempt: AttemptId);
     fn bulk_detached(&self) {}
     fn log_acked(&self, attempt: AttemptId, through: u64);
@@ -3330,6 +3405,43 @@ impl Link {
                 }
                 for attempt in ids(&attempts)? {
                     executor.cancel(attempt);
+                }
+                Ok(false)
+            }
+            ServerMessage::RunnerOffer(wire) => {
+                if self.negotiated.protocol.0 < RUNNER_MIN.0 {
+                    return Err(Error::Protocol("runner offer needs protocol 13"));
+                }
+                if wire.class.len() > 40 || wire.cpu_millis == 0 || wire.memory_bytes == 0 {
+                    return Err(Error::Protocol("runner lease"));
+                }
+                let take = executor.runner_offered(&wire);
+                self.tx.send(&ClientMessage::RunnerAck {
+                    lease: wire.lease,
+                    accepted: take,
+                })?;
+                Ok(false)
+            }
+            ServerMessage::RunnerConfig { lease, config } => {
+                if self.negotiated.protocol.0 < RUNNER_MIN.0 {
+                    return Err(Error::Protocol("runner configuration needs protocol 13"));
+                }
+                if config.is_empty() || config.len() > MAX_RUNNER_CONFIG_BYTES {
+                    return Err(Error::Protocol("runner configuration"));
+                }
+                executor.runner_config(lease, config.into_vec());
+                Ok(false)
+            }
+            ServerMessage::RunnerStop { leases } => {
+                if self.negotiated.protocol.0 < RUNNER_MIN.0 {
+                    return Err(Error::Protocol("runner stop needs protocol 13"));
+                }
+                if leases.is_empty() || leases.len() > MAX_LIST_ITEMS {
+                    return Err(Error::Protocol("runner stop list"));
+                }
+                for lease in &leases {
+                    RunnerLeaseId::from_bytes(*lease).map_err(|_| Error::Protocol("id"))?;
+                    executor.runner_stopped(*lease);
                 }
                 Ok(false)
             }
@@ -3620,6 +3732,9 @@ fn handle_bulk_message(
         ServerMessage::Welcome { .. }
         | ServerMessage::Reject(_)
         | ServerMessage::Pong { .. }
+        | ServerMessage::RunnerOffer(_)
+        | ServerMessage::RunnerConfig { .. }
+        | ServerMessage::RunnerStop { .. }
         | ServerMessage::Offer(_)
         | ServerMessage::Prefetch { .. }
         | ServerMessage::Cancel { .. } => return Err(Error::Protocol("control message on bulk")),

@@ -184,6 +184,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (71, include_str!("migrations/071_storage_notices.sql")),
     (72, include_str!("migrations/072_run_artifacts.sql")),
     (73, include_str!("migrations/073_oauth_scope_bits.sql")),
+    (74, include_str!("migrations/074_runner_provisioning.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -300,6 +301,10 @@ mod tests {
         (
             73,
             "an older binary still bounds a stored scope set at the ten bits migration 30 admitted: release 72 cannot store the artifacts:write grant or client cap it can already name, and every earlier release reads such a row as a corrupt scope set and fails the request it authorizes",
+        ),
+        (
+            74,
+            "an older controller records runner-mode demand it never places: it can neither generate a JIT configuration, deliver one, nor de-register the runners this one registered, so it leaves them registered and unaccounted while the tenant's switch still reads on, and it never counts the capacity a runner lease holds",
         ),
     ];
 

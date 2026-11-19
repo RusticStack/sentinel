@@ -5,6 +5,8 @@ mod admission;
 #[cfg(feature = "controller")]
 pub mod controller;
 pub mod identity;
+#[cfg(feature = "controller")]
+pub mod runner;
 pub mod session;
 pub mod tailcat;
 pub mod tls;

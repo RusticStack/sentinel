@@ -134,7 +134,7 @@ impl Client {
         {
             return Err(Error::Config("request size"));
         }
-        if !matches!(method, "GET" | "POST" | "PATCH") {
+        if !matches!(method, "GET" | "POST" | "PATCH" | "DELETE") {
             return Err(Error::Config("request method"));
         }
         let authorization = bearer(token)?;

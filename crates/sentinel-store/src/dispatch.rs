@@ -103,8 +103,8 @@ pub fn report_capacity(tx: &Transaction<'_>, worker: WorkerId, capacity: Capacit
     Ok(())
 }
 
-const FREE_CAPACITY_SQL: &str = "SELECT w.cpu_millis - COALESCE(s.cpu, 0),
-            w.memory_bytes - COALESCE(s.memory, 0),
+const FREE_CAPACITY_SQL: &str = "SELECT w.cpu_millis - COALESCE(s.cpu, 0) - COALESCE(l.cpu, 0),
+            w.memory_bytes - COALESCE(s.memory, 0) - COALESCE(l.memory, 0),
             CASE WHEN w.disk_bytes = 0 THEN 0 ELSE w.disk_bytes - COALESCE(s.disk, 0) END
      FROM workers w,
           (SELECT SUM(a.cpu_millis) AS cpu, SUM(a.memory_bytes) AS memory,
@@ -113,7 +113,15 @@ const FREE_CAPACITY_SQL: &str = "SELECT w.cpu_millis - COALESCE(s.cpu, 0),
                 ON ((me.host_id IS NOT NULL AND h.host_id = me.host_id)
                     OR (me.host_id IS NULL AND h.id = me.id))
            JOIN attempts a ON a.worker_id = h.id AND a.released_ms IS NULL
-           WHERE me.id = ?1) s
+           WHERE me.id = ?1) s,
+          -- A runner lease holds its class's capacity on the same host, so a job is never placed
+          -- into room a runner that is already being started has taken.
+          (SELECT SUM(r.cpu_millis) AS cpu, SUM(r.memory_bytes) AS memory
+           FROM workers me JOIN workers h
+                ON ((me.host_id IS NOT NULL AND h.host_id = me.host_id)
+                    OR (me.host_id IS NULL AND h.id = me.id))
+           JOIN runner_leases r ON r.worker_id = h.id AND r.released_ms IS NULL
+           WHERE me.id = ?1) l
      WHERE w.id = ?1 AND w.revoked_ms IS NULL";
 
 fn disk_reported(protocol: i64) -> bool {

@@ -57,6 +57,7 @@ Enforced from declared lengths before any body is read; exceeding one is `payloa
 | GitHub webhook body | 4 MiB (`intake::MAX_WEBHOOK_BODY_BYTES`, which the route enforces; GitHub's own cap is 25 MiB) |
 | `.sentinel.yml` file | 256 KiB |
 | Worker control message | 64 KiB |
+| Runner-mode JIT configuration (`RunnerConfig`) | 65,536 bytes (`MAX_RUNNER_CONFIG_BYTES`) |
 | Log frame payload | 32 KiB; larger output is split, never dropped |
 | Unacknowledged log frames per worker | 256 |
 | List page | default 100, maximum 500 |
@@ -132,6 +133,22 @@ Protocol 11 appends `Cancel { attempts }`, at most 1,024 attempt ids (`MAX_CANCE
 ## Protocol 12 digest-first artifact transfer
 
 Protocol 12 appends `ArtifactOffer { attempt, name, entries, last }` (worker → controller) and `ArtifactHeld { attempt, name, held }` (controller → worker). The offer states each file's path, BLAKE3 digest, length and mode before a body travels; the answer names the indexes of the entries this tenant already holds. Bodies for the rest follow as protocol 4's `ArtifactFile`/`ArtifactData`, and the controller verifies each sealed body against the digest its offer promised. `DIGEST_FIRST_MIN` is 12, so a session that negotiated 11 has no offer at all and publishes bodies exactly as it did: the version, not a capability bit, is the promise that both sides understand the messages. An offer on a below-12 session is a protocol error on either side, never a message that is dropped in silence. See [worker link](worker-link.md#dispatch) and [storage](storage.md#digest-first-publication).
+
+## Protocol 13 runner leases
+
+Protocol 13 appends three server variants and one client variant for runner mode
+([intake](intake.md#demand-provisioning-and-reconciliation),
+[worker link](worker-link.md#protocol-13-runner-leases)): `RunnerOffer` carries
+one lease — its id, its class label, its deadline and what the sandbox may take;
+`RunnerConfig` carries that lease's encoded just-in-time configuration, once;
+`RunnerStop` names the leases a worker no longer holds; `RunnerAck` is the
+worker's answer to an offer. A session below 13 is never offered a runner, and
+none of the four is sent to it — `RUNNER_MIN` is the promise, so an offer on an
+older session is a protocol error on both sides rather than a message that is
+quietly skipped. The configuration frame is the worker protocol's second
+sensitive frame (`SecretChunk` is the first): its encode buffer is wiped after
+the write. `MAX_RUNNER_CONFIG_BYTES` (65,536) bounds it, beside the control
+message bound in [size limits](#size-limits).
 
 ## Versioning policy
 

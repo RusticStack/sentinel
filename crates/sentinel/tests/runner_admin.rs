@@ -268,4 +268,42 @@ fn an_unknown_tenant_and_an_unreadable_class_policy_are_refused_by_name() {
         "{}",
         text(&broken.stderr)
     );
+
+    // The provisioning bounds and the runner group are optional, and a value that is not an id or
+    // not a bound refuses the file the same way a malformed class does.
+    for (policy, ok) in [
+        (
+            r#"{"classes": ["sentinel-2vcpu-ubuntu-2404"], "runner_group_id": 4, "idle_ms": 60000, "reconcile_ms": 120000}"#,
+            true,
+        ),
+        (
+            r#"{"classes": ["sentinel-2vcpu-ubuntu-2404"], "runner_group_id": 0}"#,
+            false,
+        ),
+        (
+            r#"{"classes": ["sentinel-2vcpu-ubuntu-2404"], "idle_ms": 10}"#,
+            false,
+        ),
+        (
+            r#"{"classes": ["sentinel-2vcpu-ubuntu-2404"], "reconcile_ms": 1}"#,
+            false,
+        ),
+        (
+            r#"{"classes": ["sentinel-2vcpu-ubuntu-2404"], "reconcile_ms": 86400001}"#,
+            false,
+        ),
+        (
+            r#"{"classes": ["sentinel-2vcpu-ubuntu-2404"], "unknown_key": 1}"#,
+            false,
+        ),
+    ] {
+        std::fs::write(dir.path().join("runner-classes.json"), policy.as_bytes()).unwrap();
+        let shown = c.admin(&["runner-mode", "show", "--tenant", "acme"], PASSWORD);
+        assert_eq!(
+            shown.status.success(),
+            ok,
+            "{policy}: {}",
+            text(&shown.stderr)
+        );
+    }
 }
