@@ -346,6 +346,104 @@ fn acknowledged_writes_survive_reopen_without_checkpoint() {
     reopened.checkpoint().unwrap();
 }
 
+// The transition, the fence it advances and the attempt row it opens are one commit: an image taken while
+// that transaction is still open holds none of them, and the writer's own commit holds all of them.
+#[test]
+fn a_crash_between_a_transition_and_its_commit_leaves_none_of_it() {
+    let Fixture {
+        _dir,
+        path,
+        store,
+        tenant,
+        job,
+        run: _,
+    } = fixture();
+    let lease_until = UnixMillis(60_000);
+    store
+        .writer()
+        .write(move |tx| {
+            runs::resolve_image(tx, tenant, job, DIGEST, "linux/amd64")?;
+            jobs::transition(
+                tx,
+                tenant,
+                job,
+                Actor::Controller,
+                Event::DependenciesSatisfied,
+                UnixMillis(4),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // Small enough that the transaction's pages reach the log before the commit record does.
+    store
+        .writer()
+        .raw(|c| {
+            c.execute_batch("PRAGMA cache_size = -16")?;
+            Ok(())
+        })
+        .unwrap();
+    let crashed = tempfile::tempdir().unwrap();
+    let image = crashed.path().join("meta.sqlite");
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    let writer = thread::spawn(move || {
+        let worker = WorkerId::new();
+        store
+            .writer()
+            .write(move |tx| {
+                jobs::lease(tx, tenant, job, worker, lease_until, UnixMillis(5))?;
+                entered_tx.send(()).unwrap();
+                // Held open until the test has photographed the files, as a power cut would leave them.
+                let _ = resume_rx.recv();
+                Ok(())
+            })
+            .unwrap();
+    });
+    entered_rx.recv().unwrap();
+    for suffix in ["", "-wal"] {
+        let from = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+        if from.exists() {
+            std::fs::copy(&from, format!("{}{suffix}", image.display())).unwrap();
+        }
+    }
+    let log = std::path::PathBuf::from(format!("{}-wal", image.display()));
+    assert!(
+        std::fs::metadata(&log).unwrap().len() > 0,
+        "the image holds the uncommitted log the crash test needs"
+    );
+    resume_tx.send(()).unwrap();
+    writer.join().unwrap();
+
+    let reopened = Store::open(&image, Durability::Full).unwrap();
+    let row = reopened.read(|c| jobs::get_job(c, tenant, job)).unwrap();
+    assert_eq!(row.state, JobState::Queued, "the lease is not there");
+    assert_eq!(row.fence, Fence::NONE, "the fence did not move");
+    assert_eq!(row.failure_class, None);
+    assert_eq!(row.timestamps.leased, None);
+    let attempts: i64 = reopened
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM attempts", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(attempts, 0, "the attempt row went with it");
+    reopened
+        .read(|c| {
+            let check: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+            assert_eq!(check, "ok");
+            Ok(())
+        })
+        .unwrap();
+    drop(reopened);
+
+    // The same files after the commit carry the transition and the row it opened.
+    let committed = Store::open(&path, Durability::Full).unwrap();
+    let row = committed.read(|c| jobs::get_job(c, tenant, job)).unwrap();
+    assert_eq!(row.state, JobState::Leased);
+    assert_eq!(row.fence, Fence(1));
+    let attempts: i64 = committed
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM attempts", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(attempts, 1);
+}
+
 #[test]
 fn writer_queue_is_bounded_and_reports_back_pressure() {
     let f = fixture();

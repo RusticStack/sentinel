@@ -432,6 +432,53 @@ fn a_canceled_report_without_a_request_is_not_recorded_as_a_cancel() {
 
 // A profile-protocol worker reporting zero disk offers none; a worker too old to report disk is admitted on CPU and memory alone.
 // A rollback below the profile protocol forgets the disk figure it can no longer refresh.
+// A ready row this store could not have written must not hold the queue behind it: placement passes it
+// over, counts and names it, and the next worker still gets work.
+#[test]
+fn a_damaged_ready_row_is_passed_over_and_the_jobs_behind_it_are_placed() {
+    let f = fixture();
+    let w = worker(&f);
+    let (_, first) = run(&f, CHAIN);
+    let (_, second) = run(&f, CHAIN);
+    let damaged = first[0];
+    // First in the queue's own order, so placement meets it before the healthy row.
+    f.store
+        .writer()
+        .write(move |tx| {
+            let changed = tx.execute(
+                "UPDATE jobs SET fence = -1, priority = 0 WHERE id = ?1 AND state_code = 1",
+                [damaged.as_bytes()],
+            )?;
+            assert_eq!(changed, 1);
+            Ok(())
+        })
+        .unwrap();
+    let before = sentinel_store::skipped::total();
+    let offer = place(&f, w, at(2_100));
+    assert_eq!(offer.job, second[0], "the row behind the damaged one");
+    assert_eq!(offer.tenant, f.tenant);
+    let named = sentinel_store::skipped::last().expect("the passed-over row is named");
+    assert_eq!(named.table, "jobs");
+    let key = damaged
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    assert_eq!(named.key, key);
+    assert!(sentinel_store::skipped::total() > before);
+    let left: i64 = f
+        .store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT state_code FROM jobs WHERE id = ?1",
+                [damaged.as_bytes()],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(left, 1, "the damaged row is left where it was");
+}
+
 #[test]
 fn zero_disk_from_a_profile_worker_is_none_not_unlimited() {
     let f = fixture();
@@ -516,6 +563,73 @@ fn an_oversized_summary_is_dropped_and_the_pass_stands() {
         .read(move |c| dispatch::attempt_summary(c, tenant, attempt))
         .unwrap();
     assert_eq!(stored, None);
+}
+
+// A worker that resends a step report or a completion changes nothing the first one wrote.
+#[test]
+fn a_duplicate_report_is_refused_and_leaves_the_job_where_it_was() {
+    let f = fixture();
+    let w = worker(&f);
+    let (_, ids) = run(&f, CHAIN);
+    let offer = place(&f, w, at(2_100));
+    ack(&f, w, &offer, at(2_200));
+    let (attempt, fence) = (offer.attempt, offer.fence);
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::PreparationStarted,
+                None,
+                at(2_210),
+                None,
+            )
+        })
+        .unwrap();
+    // The same report again: no edge leaves `preparing` for `preparing`.
+    assert!(matches!(
+        f.store.writer().write(move |tx| {
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::PreparationStarted,
+                None,
+                at(2_220),
+                None,
+            )
+        }),
+        Err(Error::Transition(
+            sentinel_core::TransitionError::Invalid { .. }
+        ))
+    ));
+    assert_eq!(state(&f, ids[0]), JobState::Preparing);
+    f.store
+        .writer()
+        .write(move |tx| {
+            for (ms, event) in [
+                (2_230, Event::StepsStarted),
+                (2_240, Event::FinalizationStarted),
+                (2_250, Event::Passed),
+            ] {
+                dispatch::report(tx, w, attempt, fence, event, None, at(ms), None)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(state(&f, ids[0]), JobState::Terminal(Outcome::Passed));
+    // The completion again, after the attempt was released: the report names no live attempt.
+    assert!(matches!(
+        f.store.writer().write(move |tx| {
+            dispatch::report(tx, w, attempt, fence, Event::Passed, None, at(2_260), None)
+        }),
+        Err(Error::NotFound)
+    ));
+    assert_eq!(state(&f, ids[0]), JobState::Terminal(Outcome::Passed));
 }
 
 #[test]

@@ -8,7 +8,7 @@ use sentinel_core::{
 
 use crate::{
     Error, Result,
-    codec::{READY, decode_state, encode_failure, encode_state},
+    codec::{READY, decode_fence, decode_flag, decode_state, encode_failure, encode_state},
 };
 
 pub fn insert_tenant(
@@ -125,8 +125,8 @@ fn raw_job(r: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<RawJob> {
 fn decode_job((code, fence, cancel, class, timestamps): RawJob) -> Result<JobRow> {
     Ok(JobRow {
         state: decode_state(code).ok_or(Error::Corrupt("state_code"))?,
-        fence: Fence(fence as u64),
-        cancel_requested: cancel != 0,
+        fence: decode_fence(fence).ok_or(Error::Corrupt("fence"))?,
+        cancel_requested: decode_flag(cancel).ok_or(Error::Corrupt("cancel_requested"))?,
         failure_class: match class {
             None => None,
             Some(c) => {

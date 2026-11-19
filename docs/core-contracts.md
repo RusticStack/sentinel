@@ -91,4 +91,4 @@ Dependency policies: `on_success` (default) starts when the upstream passed or w
 
 ## Persistence
 
-Tables persist `state` and the outcome as one-byte codes, `fence` as an integer, `cancel_requested` as a flag, and the timestamp columns above. Every transition is `UPDATE … WHERE id=? AND state=? AND fence=?` with the new values from `JobControl::apply`, which is the compare-and-set that makes the fence meaningful.
+Tables persist `state` and the outcome as one-byte codes, `fence` as an integer, `cancel_requested` as a flag, and the timestamp columns above. Every transition is `UPDATE … WHERE id=? AND state=? AND fence=?` with the new values from `JobControl::apply`, which is the compare-and-set that makes the fence meaningful. The store decodes those codes before `apply` sees them: a `fence` below zero, a flag that is neither 0 nor 1, or a code outside the two tables above is `corrupt`, the row-specific refusal, never a state the machine is asked about. A wrapped fence would read as `u64::MAX`, which no lease can advance, so damage has to be named at the boundary.

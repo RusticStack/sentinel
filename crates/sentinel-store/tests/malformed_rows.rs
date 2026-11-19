@@ -3,6 +3,7 @@
 use rusqlite::{Connection, params};
 use sentinel_core::{TenantId, UnixMillis};
 use sentinel_store::{
+    Error,
     objects::Digest,
     offload::{self, Delete},
     skipped,
@@ -60,4 +61,49 @@ fn a_malformed_object_row_does_not_stop_replication() {
     assert_eq!(rows.len(), 1);
     assert_eq!((rows[0].tenant, rows[0].len), (good, 5));
     assert!(skipped::total() > before);
+}
+
+#[test]
+fn a_job_row_with_a_fence_or_flag_this_store_never_wrote_is_corrupt() {
+    let conn = database();
+    let (tenant, repo, run, job) = (
+        TenantId::new(),
+        sentinel_core::RepoId::new(),
+        sentinel_core::RunId::new(),
+        sentinel_core::JobId::new(),
+    );
+    let tx = conn.unchecked_transaction().unwrap();
+    sentinel_store::jobs::insert_tenant(&tx, tenant, "acme", UnixMillis(1)).unwrap();
+    sentinel_store::jobs::insert_repo(&tx, tenant, repo, "app", UnixMillis(1)).unwrap();
+    sentinel_store::jobs::insert_run(&tx, tenant, repo, run, "0c87e018", UnixMillis(1)).unwrap();
+    sentinel_store::jobs::insert_job(&tx, tenant, run, job, "build", 5, 1).unwrap();
+    tx.commit().unwrap();
+
+    // A negative fence would wrap into `u64::MAX`, a live-looking job no lease can advance: the row is
+    // corrupt, not a job at the end of its fence range.
+    conn.execute("UPDATE jobs SET fence = -1 WHERE id = ?1", [job.as_bytes()])
+        .unwrap();
+    assert!(matches!(
+        sentinel_store::jobs::get_job(&conn, tenant, job),
+        Err(Error::Corrupt("fence"))
+    ));
+    assert_eq!(
+        sentinel_store::jobs::for_run(&conn, tenant, run)
+            .unwrap_err()
+            .kind(),
+        "corrupt"
+    );
+
+    // The flag column's own constraint refuses a value other than 0 or 1, and the decoder refuses it too,
+    // so neither a pasted-in row nor a damaged page reaches a transition as a live cancellation.
+    assert!(
+        conn.execute(
+            "UPDATE jobs SET cancel_requested = 7 WHERE id = ?1",
+            [job.as_bytes()]
+        )
+        .is_err()
+    );
+    conn.execute("UPDATE jobs SET fence = 0 WHERE id = ?1", [job.as_bytes()])
+        .unwrap();
+    assert!(sentinel_store::jobs::get_job(&conn, tenant, job).is_ok());
 }
