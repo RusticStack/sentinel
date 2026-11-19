@@ -2772,10 +2772,6 @@ pub fn is_busy(error: &Error) -> bool {
     matches!(error, Error::Internal(BUSY))
 }
 
-pub fn is_free(sender: &Sender) -> bool {
-    sender.0.conn.try_lock().is_ok()
-}
-
 pub fn prefetch(sender: &Sender, images: &[String]) -> Result<()> {
     if images.len() > MAX_PREFETCH_IMAGES
         || images
@@ -4170,7 +4166,6 @@ mod tests {
     fn a_bounded_send_skips_a_busy_connection_without_closing_it() {
         let (tx, _rx) = tls_pair();
         let held = tx.0.conn.lock().unwrap();
-        assert!(!is_free(&tx));
         let started = Instant::now();
         let refused = tx
             .send_bounded(
@@ -4181,7 +4176,6 @@ mod tests {
         assert!(is_busy(&refused), "{refused}");
         assert!(started.elapsed() < Duration::from_millis(100));
         drop(held);
-        assert!(is_free(&tx));
         tx.send_bounded(
             &ServerMessage::NoSpec { attempt: [2; 16] },
             DISPATCH_WRITE_BOUND,

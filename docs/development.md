@@ -138,6 +138,8 @@ Benchmarks run only on the host class pinned by their contract. Set `SENTINEL_BE
 
 The `test-*` aliases use cargo-nextest with `--no-fail-fast`, running every test of every binary in parallel and in separate processes. The workspace has no doctests. `tests/browser.rs` supplies its own libtest-compatible entry point for nextest discovery and filtering. The `sentinel-link` fleet binaries are the exception: they drive real controller and worker sessions and several of them assert on placement order and throughput, which a shared CPU distorts, so `.config/nextest.toml` runs `fleet` and `fleet_sessions` one test at a time.
 
+`bench/q10-fleet-stress.sh` repeats just those two binaries and records every run, with the assertion of every test that failed, to `bench/q10-fleet-stress.jsonl`: `SENTINEL_SRC=/checkout SENTINEL_BENCH_HOST_LABEL=<label> SPIN=2 ITER=20 bench/q10-fleet-stress.sh` runs twenty of them beside two busy loops, which deschedules the session threads the way a machine running another suite does, and stamps the build and host of each run. A change to placement, admission or the wake path is stress-run this way before it is called fixed; a clean run under that load is the evidence, not a clean run on an idle host.
+
 `bench/smoke.sh [--quick]` runs the benchmark harnesses once at tiny parameters (every Python unit test under `bench/`, the Q13 self-test, and `bench/micro-run.sh --smoke` for each contract whose binary is built) and counts passes, pending runs and missing binaries apart; it belongs on the Linux verification host, like every other test ([benchmarking](benchmarking.md#harness-smoke)).
 
 ## Panicking calls in production code

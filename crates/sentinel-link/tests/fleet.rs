@@ -20,7 +20,7 @@ use sentinel_link::{
     controller::{Controller, OrderFactor, PlacementOrder, RECONCILE_INTERVAL},
     identity::Identity,
     session::{self, Capacity, Executor, Offer},
-    worker,
+    tls, worker,
 };
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
 use sentinel_protocol::negotiate::{Arch, Capabilities, Hello, Profile, ProtocolVersion};
@@ -1240,6 +1240,86 @@ fn finish(mut d: Deployment, processes: Vec<WorkerProcess>) {
     for process in processes {
         process.stop().unwrap();
     }
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
+}
+
+/// A session takes part in placement only once it has stated its profile: the machine it shares with
+/// sibling identities, the load it measured and the cache it holds all arrive with that message. A
+/// reconnect keeps the disk its last session stated (only a hello below protocol 7 clears it), so hard
+/// admission on its own would let placement put work on a peer whose machine it has not learned yet.
+#[test]
+fn a_session_is_ranked_only_once_it_has_stated_its_profile() {
+    let mut d = deployment();
+    let id = WorkerId::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+    Identity::generate("unprofiled")
+        .unwrap()
+        .save(&cert, &key)
+        .unwrap();
+    let connect = |enrollment: Option<&Secret>| {
+        let identity = Identity::load(&cert, &key).unwrap();
+        let config = tls::client_config(identity, d.controller().fingerprint()).unwrap();
+        session::connect(
+            d.controller().local_addr(),
+            config,
+            id,
+            "unprofiled",
+            hello(),
+            enrollment,
+            STANDARD,
+        )
+        .unwrap()
+    };
+    let secret = d.enrollment();
+    let mut first = connect(Some(&secret));
+    first.send_profile(&profile(90, 128 << 30)).unwrap();
+    eventually("the stating session ranked", || {
+        d.controller()
+            .handle()
+            .placement_ranking()
+            .iter()
+            .any(|r| r.worker == id)
+    });
+    drop(first);
+    eventually("the session ended", || {
+        d.controller().connected().is_empty()
+    });
+
+    let mut again = connect(None);
+    eventually("the session reconnected", || {
+        d.controller().connected() == vec![id]
+    });
+    assert!(
+        d.controller().handle().placement_ranking().is_empty(),
+        "a session that has stated no profile is not ranked"
+    );
+    let job = d.runs(vec![(d.tenant_a, d.repo_a, one_job())])[0][0];
+    d.controller().wake();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        d.state(d.tenant_a, job),
+        JobState::Queued,
+        "work placed on a machine the session has not stated"
+    );
+
+    again.send_profile(&profile(90, 128 << 30)).unwrap();
+    eventually("ranked once the profile arrived", || {
+        d.controller()
+            .handle()
+            .placement_ranking()
+            .iter()
+            .any(|r| r.worker == id)
+    });
+    eventually("the job placed", || {
+        d.state(d.tenant_a, job) == JobState::Leased
+    });
+    drop(again);
     assert!(
         d.controller
             .take()
