@@ -254,6 +254,124 @@ pub fn parse_merge_group(body: &[u8]) -> Result<MergeGroup> {
     })
 }
 
+/// A `workflow_job`: one job of a GitHub-orchestrated workflow, and the label set its
+/// `runs-on:` asked for. GitHub delivers `queued`, `in_progress` and `completed` for the
+/// same job id, so the job and its run are the identity a Sentinel job is kept under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowJob {
+    pub installation: u64,
+    pub repository: u64,
+    pub action: String,
+    pub job: u64,
+    pub run: u64,
+    /// The labels the workflow asked for; a Sentinel label among them names the class.
+    pub labels: Vec<String>,
+    /// The runner GitHub assigned, once it has one.
+    pub runner: Option<String>,
+    /// GitHub's conclusion for a completed job.
+    pub conclusion: Option<String>,
+}
+
+/// At most this many labels are read from one job; GitHub's own limit is far smaller.
+const MAX_JOB_LABELS: usize = 32;
+/// The longest single label this build keeps.
+const MAX_LABEL_LEN: usize = 128;
+/// A job's labels together with their separators, which is what intake stores.
+pub const MAX_LABEL_SET_LEN: usize = 512;
+
+pub fn parse_workflow_job(body: &[u8]) -> Result<WorkflowJob> {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|_| Error::Response("payload is not JSON"))?;
+    let object = value
+        .as_object()
+        .filter(|o| o.len() <= MAX_BODY_FIELDS + 32)
+        .ok_or(Error::Response("payload shape"))?;
+    let map_number = |v: &serde_json::Map<String, Value>, key: &'static str| -> Result<u64> {
+        v.get(key)
+            .and_then(Value::as_u64)
+            .filter(|id| *id > 0 && *id <= i64::MAX as u64)
+            .ok_or(Error::Response(key))
+    };
+    let installation = map_number(
+        object
+            .get("installation")
+            .and_then(Value::as_object)
+            .ok_or(Error::Response("installation id"))?,
+        "id",
+    )?;
+    let repository = map_number(
+        object
+            .get("repository")
+            .and_then(Value::as_object)
+            .ok_or(Error::Response("repository id"))?,
+        "id",
+    )?;
+    let job = object
+        .get("workflow_job")
+        .and_then(Value::as_object)
+        .ok_or(Error::Response("workflow job"))?;
+    let text = |v: &serde_json::Map<String, Value>,
+                key: &'static str,
+                max: usize|
+     -> Result<String> {
+        v.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && s.len() <= max && !s.bytes().any(|b| b < 32 || b == 127))
+            .map(str::to_owned)
+            .ok_or(Error::Response(key))
+    };
+    let bounded = |v: Option<&Value>, key: &'static str, max: usize| -> Result<Option<String>> {
+        match v {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s))
+                if !s.is_empty() && s.len() <= max && !s.bytes().any(|b| b < 32 || b == 127) =>
+            {
+                Ok(Some(s.clone()))
+            }
+            Some(_) => Err(Error::Response(key)),
+        }
+    };
+    let labels = match job.get("labels") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) => {
+            if values.len() > MAX_JOB_LABELS {
+                return Err(Error::Response("labels"));
+            }
+            let mut labels = Vec::with_capacity(values.len());
+            let mut total = 0usize;
+            for value in values {
+                // A comma separates labels in the runner's own configuration, so one
+                // cannot contain one; joining the set for storage therefore round-trips.
+                let label = value
+                    .as_str()
+                    .filter(|s| {
+                        !s.is_empty()
+                            && s.len() <= MAX_LABEL_LEN
+                            && !s.bytes().any(|b| b < 32 || b == 127 || b == b',')
+                    })
+                    .ok_or(Error::Response("labels"))?;
+                total = total.saturating_add(label.len() + 1);
+                labels.push(label.to_owned());
+            }
+            if total > MAX_LABEL_SET_LEN {
+                return Err(Error::Response("labels"));
+            }
+            labels
+        }
+        Some(_) => return Err(Error::Response("labels")),
+    };
+    Ok(WorkflowJob {
+        installation,
+        repository,
+        action: text(object, "action", 32)?,
+        job: map_number(job, "id")?,
+        run: map_number(job, "run_id")?,
+        labels,
+        runner: bounded(job.get("runner_name"), "runner", 128)?,
+        conclusion: bounded(job.get("conclusion"), "conclusion", 32)?,
+    })
+}
+
 fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 {
         return None;
@@ -625,6 +743,98 @@ mod tests {
         long_reason["action"] = Value::from("destroyed");
         long_reason["reason"] = Value::String("x".repeat(64));
         assert!(parse_merge_group(&serde_json::to_vec(&long_reason).unwrap()).is_err());
+    }
+
+    #[test]
+    fn workflow_job_payloads_keep_the_job_its_run_and_its_labels() {
+        let body = serde_json::json!({
+            "action": "queued",
+            "workflow_job": {
+                "id": 4001,
+                "run_id": 3002,
+                "labels": ["self-hosted", "sentinel-4vcpu-ubuntu-2404"],
+                "runner_name": null,
+                "conclusion": null,
+                "steps": [{"name": "Set up job", "status": "queued"}],
+            },
+            "installation": {"id": 42},
+            "repository": {"id": 91, "full_name": "account/widget"},
+            "sender": {"login": "someone"},
+        });
+        let job = parse_workflow_job(&serde_json::to_vec(&body).unwrap()).unwrap();
+        assert_eq!((job.installation, job.repository), (42, 91));
+        assert_eq!(job.action, "queued");
+        assert_eq!((job.job, job.run), (4001, 3002));
+        assert_eq!(
+            job.labels,
+            ["self-hosted", "sentinel-4vcpu-ubuntu-2404"]
+                .map(str::to_owned)
+                .to_vec()
+        );
+        assert_eq!(job.runner, None);
+        assert_eq!(job.conclusion, None);
+
+        let mut started = body.clone();
+        started["action"] = Value::from("in_progress");
+        started["workflow_job"]["runner_name"] = Value::from("sentinel-runner-7");
+        // A field this build does not read is never kept, whatever the sender puts in it.
+        started["workflow_job"]["encoded_jit_config"] = Value::from("a-credential-value");
+        let job = parse_workflow_job(&serde_json::to_vec(&started).unwrap()).unwrap();
+        assert_eq!(job.action, "in_progress");
+        assert_eq!(job.runner.as_deref(), Some("sentinel-runner-7"));
+        assert!(!format!("{job:?}").contains("a-credential-value"));
+
+        let mut finished = body.clone();
+        finished["action"] = Value::from("completed");
+        finished["workflow_job"]["conclusion"] = Value::from("success");
+        let job = parse_workflow_job(&serde_json::to_vec(&finished).unwrap()).unwrap();
+        assert_eq!(job.conclusion.as_deref(), Some("success"));
+
+        let without = |path: &str| {
+            let mut body = body.clone();
+            if let Some((object, key)) = path.split_once('.') {
+                body[object].as_object_mut().unwrap().remove(key);
+            } else {
+                body.as_object_mut().unwrap().remove(path);
+            }
+            parse_workflow_job(&serde_json::to_vec(&body).unwrap())
+        };
+        assert!(without("installation").is_err(), "App deliveries only");
+        assert!(without("repository").is_err());
+        assert!(without("action").is_err());
+        assert!(without("workflow_job.id").is_err());
+        assert!(without("workflow_job.run_id").is_err());
+        let mut many = body.clone();
+        many["workflow_job"]["labels"] = Value::from(
+            (0..64)
+                .map(|n| Value::String(format!("label-{n}")))
+                .collect::<Vec<_>>(),
+        );
+        assert!(parse_workflow_job(&serde_json::to_vec(&many).unwrap()).is_err());
+        let mut long = body.clone();
+        long["workflow_job"]["labels"] = Value::from(vec![
+            Value::String("x".repeat(200)),
+            Value::String("y".into()),
+        ]);
+        assert!(parse_workflow_job(&serde_json::to_vec(&long).unwrap()).is_err());
+        let mut wide = body.clone();
+        wide["workflow_job"]["labels"] = Value::from(
+            (0..10)
+                .map(|n| Value::String(format!("{n}{}", "z".repeat(60))))
+                .collect::<Vec<_>>(),
+        );
+        assert!(parse_workflow_job(&serde_json::to_vec(&wide).unwrap()).is_err());
+        let mut no_labels = body;
+        no_labels["workflow_job"]
+            .as_object_mut()
+            .unwrap()
+            .remove("labels");
+        assert!(
+            parse_workflow_job(&serde_json::to_vec(&no_labels).unwrap())
+                .unwrap()
+                .labels
+                .is_empty()
+        );
     }
 
     #[test]

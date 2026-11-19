@@ -738,6 +738,11 @@ fn database_at_latest_without_classes(path: &Path) {
          DROP TABLE tenant_ai;
          ALTER TABLE deployment_policy DROP COLUMN ai_providers;
          ALTER TABLE deployment_policy DROP COLUMN ai_enabled;
+         DROP TRIGGER runner_terms_insert; DROP TRIGGER runner_terms_immutable;
+         DROP TRIGGER runner_job_identity;
+         DROP TABLE runner_deliveries; DROP TABLE runner_jobs;
+         ALTER TABLE installations DROP COLUMN runner_permissions;
+         ALTER TABLE tenants DROP COLUMN runner_mode;
          DELETE FROM schema_migrations WHERE version >= 65;",
     )
     .unwrap();

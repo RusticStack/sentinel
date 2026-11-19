@@ -2321,6 +2321,8 @@ fn start_server(
     let tailcat = start_tailcat(config, &store, tailcat, listen, controller.handle())?;
     let destinations = crate::source_admin::load_destinations(&config.data_dir)
         .map_err(|_| Error::runtime("cannot load source destination policy"))?;
+    let runner_classes = crate::source_admin::load_runner_classes(&config.data_dir)
+        .map_err(|_| Error::runtime("cannot load runner class policy"))?;
     let intake_destinations: Arc<[String]> = destinations.clone().into();
     controller.set_source_destinations(destinations);
     let github = crate::source_admin::load_github(
@@ -2347,6 +2349,7 @@ fn start_server(
         key.clone(),
         github.current.clone(),
         Arc::clone(&intake_destinations),
+        Arc::clone(&runner_classes),
         Arc::new(sentinel_intake::resolve::GitFetch),
         config.data_dir.join("intake-work"),
         sentinel_intake::resolve::Config::default(),
@@ -2510,6 +2513,7 @@ fn start_server(
             })
             .collect(),
         github_app: github_app_setup(github.current.clone(), github.source, on_activate),
+        runner_classes,
     };
     let api = sentinel_api::Server::start_with(
         sentinel_api::Config {

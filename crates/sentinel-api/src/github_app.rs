@@ -11,7 +11,7 @@ use std::{
 };
 
 use sentinel_auth::secret::Secret;
-use sentinel_core::{SessionId, TenantId, UnixMillis, UserId};
+use sentinel_core::{RunnerPermissions, SessionId, TenantId, UnixMillis, UserId, auth::Scopes};
 use sentinel_github::{
     app::{Answer, App, Current, Described, OrgRole},
     http::Client,
@@ -22,6 +22,7 @@ use sentinel_protocol::error::{ApiError, ErrorCode};
 use sentinel_store::{
     Error as StoreError, auth as authz,
     github_app::{self as stored, Purpose, Refusal},
+    runner::{self as stored_runner, Switch},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -223,8 +224,74 @@ pub(crate) fn route(
         ("POST", ["api", "v1", "tenants", slug, "github", "installation-url"]) => {
             installation_url(state, request, slug)
         }
+        ("GET", ["api", "v1", "tenants", slug, "runner-mode"]) => runner_mode(state, request, slug),
+        ("POST", ["api", "v1", "tenants", slug, "runner-mode"]) => {
+            set_runner_mode(state, request, slug)
+        }
         _ => return None,
     })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerModeBody {
+    enabled: bool,
+}
+
+/// What runner mode reads: the tenant's switch, the classes this deployment serves (which is
+/// what a workflow's `runs-on:` may name), and what the installations still lack, so an
+/// administrator sees why enabling would be refused before trying.
+fn runner_mode(state: &State, request: &mut Request, slug: &str) -> Route {
+    let who = identify(state, request, false)?;
+    crate::auth::require_scope(&who, Scopes::RUNS_READ)?;
+    let slug = slug.to_owned();
+    let principal = who.principal;
+    let (enabled, missing) = state
+        .store
+        .read(move |c| {
+            let tenant = authz::member_tenant_by_slug(c, principal, &slug)?;
+            Ok((
+                stored_runner::mode(c, tenant)?,
+                stored_runner::missing(c, tenant)?,
+            ))
+        })
+        .map_err(store_error)?;
+    ok(json!({
+        "enabled": enabled,
+        "classes": state.runner_classes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "missing": missing,
+    }))
+}
+
+/// Turning the switch on is refused while the App's installations do not hold what runner
+/// mode needs, naming exactly what is missing; turning it off never is.
+fn set_runner_mode(state: &State, request: &mut Request, slug: &str) -> Route {
+    let who = identify(state, request, true)?;
+    crate::auth::require_scope(&who, Scopes::TENANT_ADMIN)?;
+    let body: RunnerModeBody = parse(&body_limit(request, MAX_BODY_BYTES)?)?;
+    let authority = who.authority();
+    let slug = slug.to_owned();
+    let switch = state
+        .store
+        .writer()
+        .write(move |tx| {
+            let tenant = authz::member_tenant_by_slug(tx, who.principal, &slug)?;
+            stored_runner::set_mode(tx, authority, tenant, body.enabled)
+        })
+        .map_err(store_error)?;
+    match switch {
+        Switch::Set | Switch::Unchanged => ok(json!({ "enabled": body.enabled })),
+        Switch::Missing(missing) => Err(err(
+            ErrorCode::Conflict,
+            "the GitHub App's installations do not grant what runner mode needs",
+        )
+        .with_detail("missing", missing)),
+        Switch::NoInstallation => Err(err(
+            ErrorCode::Conflict,
+            "the tenant has no GitHub App installation to register a runner through",
+        )
+        .with_detail("reason", "not_configured")),
+    }
 }
 
 fn is_platform(state: &State, who: &Identity) -> Result<bool, ApiError> {
@@ -673,6 +740,7 @@ fn install(state: &State, request: &mut Request) -> Route {
             installed.personal,
             installed.suspended,
             installed.permissions_valid,
+            RunnerPermissions::grants(installed.actions_read, installed.registers_runners),
         ),
     );
     let slug = state
@@ -690,6 +758,7 @@ fn install(state: &State, request: &mut Request) -> Route {
                     personal: observed.3,
                     suspended: observed.4,
                     permissions_valid: observed.5,
+                    runner: observed.6,
                 },
                 now,
             )?;

@@ -512,6 +512,7 @@ fn github_targets_resolve_only_through_a_bound_installation() {
         personal: false,
         suspended,
         permissions_valid: true,
+        runner: sentinel_core::RunnerPermissions::ALL,
         expected,
     };
     let tx = f.conn.transaction().unwrap();

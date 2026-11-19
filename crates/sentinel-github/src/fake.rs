@@ -675,7 +675,9 @@ fn confirm_install(state: &mut Inner, body: &str) -> Reply {
                 },
                 "suspended_at": null,
                 "permissions": {
-                    "checks": "write", "contents": "read", "metadata": "read",
+                    "actions": "read", "administration": "write", "checks": "write",
+                    "contents": "read", "metadata": "read",
+                    "organization_self_hosted_runners": "write",
                     "pull_requests": "read", "members": "read",
                 },
             })

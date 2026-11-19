@@ -600,6 +600,8 @@ pub fn record_delivery(
     let Some(conclusion) = Conclusion::of_reason(reason) else {
         return Ok(());
     };
+    // A runner-mode delivery publishes no Sentinel check at all: GitHub reports that job
+    // under the workflow's own name, so no outcome here is Sentinel's to report.
     let row: Option<Row> = tx
         .prepare_cached(
             "SELECT d.tenant_id, d.repo_id, COALESCE(p.head_sha, d.new_sha), d.ref_name,
@@ -607,7 +609,7 @@ pub fn record_delivery(
              FROM webhook_deliveries d
              LEFT JOIN pr_deliveries p ON p.delivery_id = d.id
              LEFT JOIN source_bindings b ON b.repo_id = d.repo_id
-             WHERE d.id = ?1",
+             WHERE d.id = ?1 AND d.event <> 'workflow_job'",
         )?
         .query_row([delivery.as_bytes()], |r| {
             Ok((

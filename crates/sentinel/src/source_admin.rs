@@ -2,7 +2,7 @@ use crate::{
     admin::{self, Error},
     cli::{SourceArgs, SourceCommand},
 };
-use sentinel_core::{InstallationId, RepoId, TenantId, UnixMillis, UserId};
+use sentinel_core::{InstallationId, RepoId, RunnerClass, TenantId, UnixMillis, UserId};
 use sentinel_protocol::source::{Binding, Credential, MAX_SOURCE_BYTES};
 use sentinel_store::{
     MASTER_KEY_FILE, auth, intake, poll, registration, registration::Authority, sources,
@@ -296,6 +296,40 @@ pub fn load_destinations(root: &Path) -> Result<Vec<String>, Error> {
     Ok(destinations)
 }
 
+/// The most classes one deployment may serve; more names than this is a policy
+/// mistake, not a deployment shape.
+const MAX_RUNNER_CLASSES: usize = 32;
+
+/// `<data_dir>/runner-classes.json` — `{"classes": ["sentinel-4vcpu-ubuntu-2404", …]}`: the
+/// runner-mode resource classes this deployment serves, named exactly as a workflow's
+/// `runs-on:` names them. Absent, runner mode serves nothing, so turning it on would only
+/// collect refused jobs. A label naming any other class is refused visibly, never run.
+pub fn load_runner_classes(root: &Path) -> Result<Arc<[RunnerClass]>, Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Policy {
+        classes: Vec<String>,
+    }
+    let path = root.join("runner-classes.json");
+    if !path.exists() {
+        return Ok(Arc::from(Vec::new()));
+    }
+    let policy: Policy = serde_json::from_slice(&file(&path, 8 * 1024)?)
+        .map_err(|_| fail("invalid runner class policy"))?;
+    if policy.classes.len() > MAX_RUNNER_CLASSES {
+        return Err(fail("invalid runner class policy"));
+    }
+    let mut classes: Vec<RunnerClass> = Vec::with_capacity(policy.classes.len());
+    for label in &policy.classes {
+        let class = RunnerClass::parse(label).ok_or_else(|| fail("invalid runner class policy"))?;
+        if classes.contains(&class) {
+            return Err(fail("invalid runner class policy"));
+        }
+        classes.push(class);
+    }
+    Ok(classes.into())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
@@ -493,6 +527,10 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                             personal: snapshot.personal,
                             suspended: snapshot.suspended,
                             permissions_valid: snapshot.permissions_valid,
+                            runner: sentinel_core::RunnerPermissions::grants(
+                                snapshot.actions_read,
+                                snapshot.registers_runners,
+                            ),
                             expected,
                         },
                         now,

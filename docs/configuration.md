@@ -259,6 +259,29 @@ SENTINEL_AUTO_JOIN_DOMAINS="example.com=engineering, example.org, bücher.exampl
 - A value that is not valid Unicode (possible on Linux) stops the controller at start with an error that names the variable and never echoes the value; unset means no rules.
 - Only the controller reads it; a worker ignores it.
 
+### Runner classes
+
+`<data_dir>/runner-classes.json` states which GitHub Actions runner classes this deployment serves
+([plan 16.10](../plan.md#1610-github-actions-runner-mode), [sources](sources.md#workflow-jobs)):
+
+```json
+{"classes": ["sentinel-4vcpu-ubuntu-2404", "sentinel-16vcpu-ubuntu-2404-arm"]}
+```
+
+- Each entry is a **label**, exactly as a workflow's `runs-on:` names it:
+  `sentinel-<n>vcpu-ubuntu-2404`, `sentinel-<n>vcpu-windows-2025` or
+  `sentinel-<n>vcpu-ubuntu-2404-arm`, with `n` from 1 to 128 and no leading zero. The memory and
+  disk behind a class are the ones the worker that serves it runs, not a setting.
+- At most 32 classes; a duplicate or a malformed entry refuses the whole file, and the controller
+  does not start (`cannot load runner class policy`). The file names no host, no credential and no
+  address, so it is safe to keep beside `source-destinations.json`.
+- **Absent, the deployment serves no class**, and every queued job whose labels name a Sentinel class
+  is refused `failed:runner_class_unavailable` with an audit row ([intake](intake.md#runner-mode-jobs)).
+  That is the honest default: a deployment has to say what it can run, and a job is never quietly
+  placed somewhere else.
+- The classes are read at start and reported by `GET /tenants/{slug}/runner-mode`, which is where a
+  tenant reads what its workflows may name ([API](api.md#routes)).
+
 ### Remote cache
 
 `[remote_cache] enabled = true` (the default) makes the two halves line up: the controller keeps objects workers offer under `<data_dir>/remote-cache`, and a worker fetches, offers and resumes objects over its bulk connection. Set it to `false` on either side to make every remote lookup a local miss — a worker then never asks and never offers, and a controller without the section serves nothing (`denied`). A local cache hit never touches the link in any configuration.

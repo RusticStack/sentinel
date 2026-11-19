@@ -244,6 +244,38 @@ The worker needs nothing new: a merge-group run is an ordinary run of a pinned
 commit with a ref name for its expression context, and the App token minted for
 resolution is the same narrowed `contents: read` token a push uses.
 
+## Workflow jobs
+
+Runner mode ([plan 16.10](../plan.md#1610-github-actions-runner-mode), [GitHub App](github-app.md#runner-mode-permissions))
+has no pipeline to resolve and no source to read: GitHub orchestrates the
+workflow and Sentinel supplies the machine. What arrives through the same
+signed webhook route is a `workflow_job` **delivery**, and what the binding
+proves about it is only which tenant and repository the job belongs to:
+
+- the delivery is attributed through the **bound installation**, exactly as a
+  push is: a repository with no binding, or one bound through another
+  installation, is answered `{"ignored": "unbound_repository"}` and nothing is
+  stored, so tenant ownership is never inferred from the payload;
+- it carries **no ref**: GitHub names the commit on the job itself, so the
+  binding's `allowed_refs` gate nothing here and validation skips that check for
+  exactly this event;
+- the **labels** are the demand. `sentinel-<n>vcpu-ubuntu-2404`,
+  `sentinel-<n>vcpu-windows-2025` and `sentinel-<n>vcpu-ubuntu-2404-arm` name a
+  class; a job whose label set names none of them is another runner's and is
+  acknowledged (`{"ignored": "runner_label"}`) without a stored row, because a
+  job meant for another runner must never start a Sentinel machine. A label set
+  that names two of Sentinel's classes satisfies no one runner and is refused
+  with its own reason;
+- a class is only a **request**: what the deployment actually serves is its own
+  configuration (`<data_dir>/runner-classes.json`,
+  [configuration](configuration.md#runner-classes)), and a class it does not
+  serve is refused visibly rather than quietly run elsewhere.
+
+A repository therefore needs nothing new: the App association it already has is
+what makes its jobs attributable, and its `job_network = "egress"` pools are what
+serve them once provisioning exists — a runner talks to GitHub by nature
+([intake](intake.md#runner-mode-jobs)).
+
 ## Commands
 
 These host-local commands are authorized by holding the database file, not by `--actor`, which is only the attribution recorded in the audit trail; adding an actor check expecting it to gate access would not change who can run them. The authenticated tenant-administrator path is the API route `POST /tenants/{slug}/repos`.

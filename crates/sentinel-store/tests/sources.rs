@@ -323,6 +323,7 @@ fn installation_lifecycle_requires_binding_and_fresh_permissions() {
         personal,
         suspended,
         permissions_valid: true,
+        runner: sentinel_core::RunnerPermissions::ALL,
         expected,
     };
     let tx = f.conn.transaction().unwrap();
@@ -394,6 +395,7 @@ fn a_transfer_never_reauthorizes_the_old_accounts_bindings() {
         personal: false,
         suspended: false,
         permissions_valid: true,
+        runner: sentinel_core::RunnerPermissions::ALL,
         expected,
     };
     let tx = f.conn.transaction().unwrap();

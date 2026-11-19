@@ -201,6 +201,28 @@ Every command below takes the [shared client flags](#the-shared-client). `--tena
 
 `sentinel pipeline validate|explain` stay offline and take `--output text|json` (`--json` is `--output json`; there is no list to stream, so no `ndjson`). In JSON mode `explain` prints `sentinel.explain/1` and `validate` prints `{"file", "valid": true, "jobs"}` (text `validate` prints nothing on success), each as one line; a failure is one `sentinel.error/1` line on stderr (`invalid_pipeline`, including a file over the 256 KiB limit, or `client_usage` for an unreadable file) with stdout empty, like the networked commands. The limit bounds the bytes read, not a reported size, so `validate /dev/zero` fails at 256 KiB.
 
+## Host-local runner mode
+
+`sentinel admin runner-mode show --data-dir DIR --tenant SLUG|tnt_...` and
+`sentinel admin runner-mode set --data-dir DIR --tenant SLUG|tnt_... --enabled true|false` are
+host-local `admin` commands like `admin worker policy`: no sign-in, authorized by access to an
+absolute `--data-dir`, opening the metadata database directly, so run them on the controller host
+beside a stopped controller. The networked equivalent is `GET`/`POST /tenants/{slug}/runner-mode`
+([API](api.md#routes), [GitHub App](github-app.md#runner-mode-permissions)).
+
+- **`show`** prints four lines: `tenant` (`tnt_...`), `runner mode` (`on`/`off`), `classes` — the
+  runner classes this deployment serves from `<data_dir>/runner-classes.json`, or `none` — and
+  `missing`, the App permissions the tenant's live installations still lack, named as GitHub's App
+  settings name them, or `none`. Nothing is written.
+- **`set`** writes the switch and prints `runner mode on|off for tnt_...`, or the same line ending
+  `was already so` when it already read that; the change is audited (`runner-mode-changed`).
+- **Refusals exit 2** with the usual `admin` text: `no active tenant with that slug` (or `... with
+  that identifier`), `runner mode needs the GitHub App to grant actions,
+  organization_self_hosted_runners; an owner approves the permission change on GitHub and the next
+  installation snapshot records it`, `the tenant has no GitHub App installation to register a
+  runner through`, `cannot load the runner class policy` (a `runner-classes.json` that does not
+  parse), and `cannot change the runner-mode switch: ...` for a store fault.
+
 ## Host-local worker policy
 
 `sentinel admin worker policy --data-dir DIR --id wrk_... [--cpu-millis N|none] [--memory-bytes N|none] [--disk-bytes N|none] [--priority N]` shows or changes the ceilings and priority the controller approves for one enrolled worker. It is a host-local `admin` command like `admin worker enroll`: no sign-in, authorized by access to the controller's data directory (an absolute `--data-dir`), and it opens the metadata database directly, so run it on the controller host, beside a stopped controller. The networked equivalent is `PUT /admin/workers/{wrk}/policy` ([API](api.md#routes)), which a platform administrator calls with a fresh second factor and which also wakes a running controller's placement loop; this command does not wake one.
