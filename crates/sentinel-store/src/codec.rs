@@ -1,8 +1,26 @@
-use sentinel_core::{FailureClass, JobState, Outcome};
+use sentinel_core::{FailureClass, Fence, JobState, Outcome};
 
 // The ready-queue partial index tests `state_code = READY`, and `>= TERMINAL_BASE` selects every terminal row.
 pub const TERMINAL_BASE: i64 = 16;
 pub const READY: i64 = 1;
+
+/// A stored fence is a non-negative integer. Wrapping a negative one into `u64` would turn a damaged
+/// row into a live job at `u64::MAX`, which no lease can advance and no worker can report on.
+pub const fn decode_fence(code: i64) -> Option<Fence> {
+    if code < 0 {
+        return None;
+    }
+    Some(Fence(code as u64))
+}
+
+/// The stored cancellation flag is 0 or 1; anything else is not a value this store wrote.
+pub const fn decode_flag(code: i64) -> Option<bool> {
+    match code {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
 
 pub const fn encode_state(state: JobState) -> i64 {
     match state {
@@ -92,5 +110,18 @@ mod tests {
             assert_eq!(encode_failure(class), code);
         }
         assert_eq!(decode_failure(12), None);
+    }
+
+    #[test]
+    fn a_negative_fence_or_an_off_flag_is_not_a_stored_value() {
+        assert_eq!(decode_fence(0), Some(Fence::NONE));
+        assert_eq!(decode_fence(i64::MAX), Some(Fence(i64::MAX as u64)));
+        assert_eq!(decode_fence(-1), None);
+        assert_eq!(decode_fence(i64::MIN), None);
+        assert_eq!(decode_flag(0), Some(false));
+        assert_eq!(decode_flag(1), Some(true));
+        for wrong in [-1, 2, i64::MAX] {
+            assert_eq!(decode_flag(wrong), None);
+        }
     }
 }
