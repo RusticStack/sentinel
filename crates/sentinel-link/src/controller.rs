@@ -310,6 +310,8 @@ struct Peer {
     cache_bytes: AtomicI64,
     /// The machine identity from the worker's profile; identities sharing one are one physical host.
     host: Mutex<Option<[u8; 16]>>,
+    /// Whether the session has stated the profile placement reads; set by the `profiled` handler.
+    profiled: AtomicBool,
     seen_recorded_ms: AtomicI64,
     fingerprint: Digest,
     protocol: u16,
@@ -738,6 +740,15 @@ impl Peer {
     fn host(&self) -> Option<[u8; 16]> {
         *self.host.lock().unwrap_or_else(|p| p.into_inner())
     }
+
+    /// Whether the next placement round may rank this session. Everything placement reads about a
+    /// machine — which identities share it, how busy it measured, what cache it holds — is stated in
+    /// its profile, so a protocol-7 session that has not sent one yet would be ranked as an idle
+    /// machine of its own, and a second identity on that machine would take work in the same round.
+    /// A legacy session states no profile: it is ranked on what its hello said, as before.
+    fn ranked(&self) -> bool {
+        self.profiled.load(Ordering::Acquire) || self.protocol < PROFILE_MIN.0
+    }
 }
 
 struct Reach {
@@ -943,6 +954,7 @@ impl Inner {
             load_ns: AtomicI64::new(0),
             cache_bytes: AtomicI64::new(0),
             host: Mutex::new(None),
+            profiled: AtomicBool::new(false),
             seen_recorded_ms: AtomicI64::new(0),
             fingerprint: session.fingerprint,
             protocol: session.admitted.negotiated.protocol.0,
@@ -1292,7 +1304,7 @@ impl Inner {
         let (host_held, host_busy) = host_commitments(&fleet, &hosts, &held);
         let entries: Vec<(WorkerId, i32, Standing)> = fleet
             .iter()
-            .filter(|(_, p)| session::is_free(&p.sender))
+            .filter(|(_, p)| p.ranked())
             .map(|(w, p)| {
                 let size = effective_size(p, approved.get(w));
                 let host = hosts[w];
@@ -1326,9 +1338,15 @@ impl Inner {
             .iter()
             .map(|(w, p)| (*w, Arc::clone(p)))
             .collect();
+        // The candidates are the whole fleet that has stated what placement ranks, never the workers
+        // an instant's sender check happened to pass: a snapshot that drops the session which is mid
+        // frame offers its job to the next-ranked host instead, and, because a lease is not moved
+        // once it is taken, the worker it dropped gets nothing for the rest of the round and the
+        // burst it should have shared stays on one machine. A sender that is busy for the moment is
+        // waited on by [`session::offer`], which bounds the wait.
         let mut peers: Vec<(WorkerId, Arc<Peer>)> = fleet
             .iter()
-            .filter(|(_, p)| session::is_free(&p.sender))
+            .filter(|(_, p)| p.ranked())
             .map(|(w, p)| (*w, Arc::clone(p)))
             .collect();
         if peers.is_empty() {
@@ -1808,7 +1826,7 @@ impl Inner {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .filter(|(_, peer)| peer.protocol >= RUNNER_MIN.0 && session::is_free(&peer.sender))
+            .filter(|(_, peer)| peer.protocol >= RUNNER_MIN.0 && peer.ranked())
             .map(|(worker, peer)| (*worker, Arc::clone(peer)))
             .collect();
         if peers.is_empty() {
@@ -3031,7 +3049,8 @@ impl SessionHandler for Inner {
             .then(|| i64::try_from(profile.availability.cache_bytes).unwrap_or(i64::MAX));
         let load_ns = (profile.availability.load_ns != 0)
             .then(|| i64::try_from(profile.availability.load_ns).unwrap_or(i64::MAX));
-        if let Some(peer) = self.peer(worker) {
+        let peer = self.peer(worker);
+        if let Some(peer) = &peer {
             peer.disk_bytes
                 .store(capacity.disk_bytes, Ordering::Relaxed);
             peer.load_ns.store(load_ns.unwrap_or(0), Ordering::Relaxed);
@@ -3041,6 +3060,12 @@ impl SessionHandler for Inner {
             // must be the same value, so it is scoped here too.
             *peer.host.lock().unwrap_or_else(|p| p.into_inner()) =
                 host_id.map(|h| dispatch::scope_host(&h, peer.arch.as_str()));
+            // A candidate before the store write, never after it: a round that ranks this session then
+            // always has the machine and the load it stated, and hard admission reading a profile one
+            // write behind delays a placement instead of ranking the machine wrong. Set after the write
+            // instead, a round could see the committed profile in the store while a preempted session
+            // thread had not yet published it here, and rank the machine as idle one of its own.
+            peer.profiled.store(true, Ordering::Release);
         }
         self.write(move |tx| {
             dispatch::report_capacity(tx, worker, capacity)?;
