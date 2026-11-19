@@ -1220,3 +1220,126 @@ fn dropping_the_lane_joins_its_thread() {
         "the lane did not stop promptly"
     );
 }
+
+#[test]
+fn an_unreadable_adoption_lookup_is_refused_rather_than_creating_a_duplicate() {
+    let mut f = fixture(None);
+    let (run, _) = event_run(&mut f);
+    // Both creates' answers are lost, so each retry must look its run up rather than create a second one.
+    f.stub.script_lost("POST", "/check-runs", 909);
+    f.stub.script_lost("POST", "/check-runs", 910);
+    for _ in 0..2 {
+        f.stub.script(
+            "GET",
+            "filter=all",
+            200,
+            serde_json::json!({"message": "unreadable"}),
+        );
+    }
+    let lane = start_lane(&f, publisher(&f));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
+        if rows.len() == 2 && rows.iter().all(|row| row.state == State::Refused) {
+            for row in &rows {
+                let reason = row.reason.as_deref().unwrap_or_default();
+                assert!(reason.starts_with("lookup: "), "{reason}");
+                assert_eq!(row.published_seq, 0, "{row:?}");
+            }
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the refused lookups: {rows:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let records = f.stub.records();
+    assert_eq!(
+        posts(&records, "/check-runs").len(),
+        2,
+        "the duplicate-free answer is a refusal, never a second create: {records:#?}"
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r.method == "PATCH" && r.path.contains("/check-runs/"))
+            .count(),
+        0,
+        "{records:#?}"
+    );
+    drop(lane);
+}
+
+#[test]
+fn a_429_without_timing_headers_parks_the_installation_without_spending_an_attempt() {
+    let mut f = fixture(None);
+    let (run, _) = event_run(&mut f);
+    f.stub.script(
+        "POST",
+        "/check-runs",
+        429,
+        serde_json::json!({"message": "You have exceeded a secondary rate limit"}),
+    );
+    let before = UnixMillis::now().0;
+    let lane = start_lane(&f, publisher(&f));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (attempts, deferred): (i64, Vec<i64>) = loop {
+        let parked = f
+            .store
+            .read(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT attempts, next_attempt_ms FROM check_publications
+                     WHERE run_id = ?1 AND state = 0",
+                )?;
+                let rows: Vec<(i64, Option<i64>)> = stmt
+                    .query_map([run.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<std::result::Result<_, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        if parked.len() == 2 && parked.iter().all(|(_, until)| until.is_some()) {
+            break (
+                parked.iter().map(|(attempts, _)| *attempts).max().unwrap(),
+                parked
+                    .iter()
+                    .map(|(_, until)| until.unwrap())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the parked rows: {parked:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(attempts, 0, "a throttle spends no attempt");
+    assert!(
+        deferred.iter().all(|until| *until >= before + 59_000),
+        "a headerless 429 parks for a minute: {deferred:?}"
+    );
+    assert!(
+        deferred.iter().all(|until| *until <= before + 61_000),
+        "and no longer: {deferred:?}"
+    );
+    let early = f
+        .store
+        .read(|c| checks::due(c, UnixMillis(before + 30_000), 10))
+        .unwrap();
+    assert!(early.is_empty(), "{early:?}");
+    let late = f
+        .store
+        .read(|c| checks::due(c, UnixMillis(before + 61_000), 10))
+        .unwrap();
+    assert_eq!(
+        late.publications.len(),
+        2,
+        "both rows come back after the pause"
+    );
+    assert_eq!(
+        posts(&f.stub.records(), "/check-runs").len(),
+        1,
+        "the installation is parked after the first answer"
+    );
+    drop(lane);
+}

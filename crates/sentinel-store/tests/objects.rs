@@ -1164,3 +1164,176 @@ fn a_renamed_file_without_a_reference_is_an_orphan_not_a_published_object() {
     assert_eq!(report.orphans, vec![path]);
     assert!(report.corrupt.is_empty());
 }
+
+#[test]
+fn a_read_of_a_reaped_object_is_not_found_and_a_manifest_entry_of_it_is_corrupt() {
+    let mut fx = fixture();
+    let digest = fx.put(fx.tenant, b"reaped bytes");
+    let path = object_path(&fx, digest);
+    let later = UnixMillis(UnixMillis::now().0 + objects::UNREFERENCED_GRACE_MS + 1);
+    let tx = fx.conn.transaction().unwrap();
+    let reclaimed = fx.objects.reclaim(&tx, later, 256).unwrap();
+    assert_eq!(reclaimed.objects, 1);
+    assert_eq!(fx.objects.unlink(&tx, &reclaimed.doomed).unwrap(), 1);
+    tx.commit().unwrap();
+    assert!(!path.exists(), "the reaped file is gone");
+    let mut out = Vec::new();
+    assert!(matches!(
+        fx.objects.read(&fx.conn, fx.tenant, digest, &mut out),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        fx.objects.open_read(&fx.conn, fx.tenant, digest),
+        Err(Error::NotFound)
+    ));
+    // A manifest that outlived the object still names its digest and length, so the entry path asks the
+    // filesystem directly: bytes that are gone are a corrupt object, never an empty one.
+    assert!(matches!(
+        fx.objects.open_entry(fx.tenant, digest, 12),
+        Err(Error::Corrupt("object missing"))
+    ));
+    assert!(!fx.objects.reader_active(fx.tenant, digest));
+}
+
+#[test]
+fn an_object_shared_by_two_manifests_survives_until_the_last_one_is_retired() {
+    let mut fx = fixture();
+    let body = b"shared payload";
+    let digest = fx.put(fx.tenant, body);
+    let tx = fx.conn.transaction().unwrap();
+    for name in ["one", "two"] {
+        fx.objects
+            .commit_manifest(
+                &tx,
+                fx.tenant,
+                Kind::Artifact,
+                name,
+                &[entry("f", digest, body.len() as u64)],
+            )
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    let later = UnixMillis(UnixMillis::now().0 + objects::UNREFERENCED_GRACE_MS + 1);
+    let tx = fx.conn.transaction().unwrap();
+    let retired = fx
+        .objects
+        .retire_manifest(&tx, fx.tenant, Kind::Artifact, "one", 1)
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(retired.path()).unwrap();
+    assert_eq!(fx.objects.reclaim(&tx, later, 256).unwrap().objects, 0);
+    tx.commit().unwrap();
+    let mut out = Vec::new();
+    assert_eq!(
+        fx.objects
+            .read(&fx.conn, fx.tenant, digest, &mut out)
+            .unwrap(),
+        body.len() as u64
+    );
+    assert_eq!(out, body);
+
+    let tx = fx.conn.transaction().unwrap();
+    let retired = fx
+        .objects
+        .retire_manifest(&tx, fx.tenant, Kind::Artifact, "two", 1)
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(retired.path()).unwrap();
+    let reclaimed = fx.objects.reclaim(&tx, later, 256).unwrap();
+    assert_eq!(
+        reclaimed.objects, 1,
+        "the last reference leaving frees the object"
+    );
+    assert_eq!(fx.objects.unlink(&tx, &reclaimed.doomed).unwrap(), 1);
+    tx.commit().unwrap();
+    let mut out = Vec::new();
+    assert!(matches!(
+        fx.objects.read(&fx.conn, fx.tenant, digest, &mut out),
+        Err(Error::NotFound)
+    ));
+}
+
+#[test]
+fn an_interrupted_upload_whose_staging_file_vanished_publishes_nothing() {
+    let mut fx = fixture();
+    let id = fx.begin(fx.tenant, 4, None);
+    assert_eq!(fx.chunk(fx.tenant, id, 0, b"data").unwrap(), 4);
+    // The file a crash or a lost device leaves behind: the ranges say every byte arrived, the bytes do not exist.
+    std::fs::remove_file(fx.dir.path().join("incoming").join(id.to_string())).unwrap();
+    assert!(matches!(
+        fx.seal(fx.tenant, id),
+        Err(Error::Corrupt("upload file"))
+    ));
+    let count: i64 = fx
+        .conn
+        .query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "no reference is committed for bytes the store does not hold"
+    );
+    let hex = blake3::hash(b"data").to_hex().to_string();
+    assert!(
+        !fx.dir
+            .path()
+            .join("objects")
+            .join(fx.tenant.to_string())
+            .join(&hex[..2])
+            .join(&hex)
+            .exists()
+    );
+    assert!(
+        !fx.objects.reader_active(
+            fx.tenant,
+            Digest::from_bytes(*blake3::hash(b"data").as_bytes())
+        ),
+        "the refused seal releases its pin"
+    );
+}
+
+#[test]
+fn a_manifest_file_under_another_name_is_corrupt_even_when_its_bytes_verify() {
+    let mut fx = fixture();
+    let digest = fx.put(fx.tenant, b"entry body");
+    let tx = fx.conn.transaction().unwrap();
+    fx.objects
+        .commit_manifest(
+            &tx,
+            fx.tenant,
+            Kind::Artifact,
+            "alpha",
+            &[entry("f", digest, 10)],
+        )
+        .unwrap();
+    let alpha = fx
+        .dir
+        .path()
+        .join(objects::manifest_relpath(fx.tenant, 0, b"alpha", 1));
+    let beta = fx
+        .dir
+        .path()
+        .join(objects::manifest_relpath(fx.tenant, 0, b"beta", 1));
+    std::fs::create_dir_all(beta.parent().unwrap()).unwrap();
+    std::fs::copy(&alpha, &beta).unwrap();
+    let stored: Vec<u8> = tx
+        .query_row(
+            "SELECT digest FROM manifests WHERE name = X'616c706861'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    tx.execute(
+        "INSERT INTO manifests(tenant_id, kind, name, version, digest, entries, payload_len,
+             created_ms, refs_indexed)
+         VALUES (?1, 0, X'62657461', 1, ?2, 1, 10, 1, 1)",
+        rusqlite::params![fx.tenant.as_bytes().as_slice(), stored],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    // The file hashes to the stored digest, so only the identity check can catch it.
+    assert!(matches!(
+        fx.objects
+            .manifest(&fx.conn, fx.tenant, Kind::Artifact, "beta", Some(1)),
+        Err(Error::Corrupt("manifest identity"))
+    ));
+}

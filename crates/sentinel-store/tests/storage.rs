@@ -1438,3 +1438,90 @@ fn admission_flapping_under_sustained_writes_leaks_nothing() {
         .unwrap_or(0);
     assert_eq!(staging_left, 0, "no staging file left behind");
 }
+
+#[test]
+fn a_stage_refused_below_the_watermark_leaves_no_file_a_row_or_a_charge() {
+    let mut fx = fixture();
+    let free = Arc::new(AtomicU64::new(0));
+    let admission = probed(
+        &free,
+        Watermarks {
+            reserve: 1_000,
+            low: 2_000,
+            high: 4_000,
+            floor: 500,
+        },
+    );
+    let admission = Arc::new(admission);
+    fx.objects.set_admission(Arc::clone(&admission));
+    assert!(matches!(
+        fx.objects.stage(
+            fx.tenant,
+            &b"full disk body"[..],
+            u64::MAX,
+            Expect::default()
+        ),
+        Err(Error::StorageFull)
+    ));
+    assert_eq!(
+        admission.inflight(fx.tenant),
+        0,
+        "the refused bytes hold no charge"
+    );
+    assert_eq!(
+        fs::read_dir(fx.dir.path().join("tmp")).unwrap().count(),
+        0,
+        "no staging file survives the refusal"
+    );
+    let rows: i64 = fx
+        .conn
+        .query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+
+    // The same body publishes once the disk is back above the watermark.
+    free.store(u64::MAX / 2, Ordering::Relaxed);
+    refresh();
+    let digest = fx.put(b"full disk body");
+    assert_eq!(fx.usage(), 14);
+    let mut out = Vec::new();
+    fx.objects
+        .read(&fx.conn, fx.tenant, digest, &mut out)
+        .unwrap();
+    assert_eq!(out, b"full disk body");
+}
+
+#[test]
+fn a_reclaimed_row_whose_file_was_left_behind_is_swept_as_an_orphan_after_the_grace() {
+    let mut fx = fixture();
+    let body = b"orphaned by a crash between the commit and the unlink";
+    let digest = fx.put(body);
+    let hex = digest.to_string();
+    let path = fx
+        .dir
+        .path()
+        .join("objects")
+        .join(fx.tenant.to_string())
+        .join(&hex[..2])
+        .join(&hex);
+    let later = UnixMillis(UnixMillis::now().0 + objects::UNREFERENCED_GRACE_MS + 1);
+    let tx = fx.conn.transaction().unwrap();
+    let reclaimed = fx.objects.reclaim(&tx, later, 256).unwrap();
+    assert_eq!(reclaimed.objects, 1);
+    tx.commit().unwrap();
+    // The unlink never ran: the file outlives its row, and reads answer nothing while the sweep waits out
+    // the grace, so a stage that adopted it in the meantime cannot lose its bytes.
+    assert!(path.is_file());
+    let mut out = Vec::new();
+    assert!(matches!(
+        fx.objects.read(&fx.conn, fx.tenant, digest, &mut out),
+        Err(Error::NotFound)
+    ));
+    assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 256).unwrap(), 0);
+    age(
+        &path,
+        Duration::from_millis(objects::FILE_ORPHAN_GRACE_MS as u64 + 60_000),
+    );
+    assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 256).unwrap(), 1);
+    assert!(!path.exists());
+}
