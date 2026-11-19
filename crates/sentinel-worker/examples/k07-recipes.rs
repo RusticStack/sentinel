@@ -298,8 +298,14 @@ mod imp {
             },
             None => Arc::new(NoOutput),
         };
-        let (verdict, summary) =
-            attempt::run(&args.worker_dir, &mut job, &notes, output, &NoSink, &cancel);
+        let (verdict, summary) = attempt::run(
+            &args.worker_dir,
+            &mut job,
+            &notes,
+            output,
+            Arc::new(NoSink),
+            &cancel,
+        );
         let cache_notes = notes.cache.lock().unwrap().clone();
         let costly = notes.costly.lock().unwrap().clone();
         let record = serde_json::json!({

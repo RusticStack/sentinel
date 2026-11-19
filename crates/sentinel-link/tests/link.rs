@@ -10,8 +10,8 @@ use std::{
 
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
-    AttemptId, Event, Fence, JobState, Outcome, PoolId, RepoId, RunId, TenantId, UnixMillis,
-    UserId, WorkerId,
+    AttemptId, Event, FailureClass, Fence, JobState, Outcome, PoolId, RepoId, RunId, TenantId,
+    UnixMillis, UserId, WorkerId,
     auth::{Namespace, Permissions as P, Principal},
 };
 use sentinel_link::{
@@ -1261,16 +1261,19 @@ fn artifact_publication_commits_and_refusals_are_terminal() {
     process.stop().unwrap();
 }
 
+/// Everything a test needs to drive one attempt of `ARTIFACT_PIPELINE` by hand.
+struct Publication {
+    process: WorkerProcess,
+    recorder: Arc<Recorder>,
+    reporter: session::Reporter,
+    attempt: AttemptId,
+    fence: Fence,
+    run: RunId,
+    job: JobId,
+}
+
 /// A connected worker holding the one attempt of `ARTIFACT_PIPELINE`.
-fn artifact_attempt(
-    d: &Deployment,
-) -> (
-    WorkerProcess,
-    Arc<Recorder>,
-    session::Reporter,
-    AttemptId,
-    RunId,
-) {
+fn artifact_session(d: &Deployment) -> Publication {
     let secret = d.enrollment(60_000);
     let (recorder, offers) = Recorder::new();
     let id = WorkerId::new();
@@ -1293,7 +1296,28 @@ fn artifact_attempt(
             .any(|h| h.attempt == offer.attempt && h.acknowledged)
     });
     let reporter = recorder.reporter.lock().unwrap().clone().unwrap();
-    (process, recorder, reporter, offer.attempt, run)
+    Publication {
+        process,
+        recorder,
+        reporter,
+        attempt: offer.attempt,
+        fence: offer.fence,
+        run,
+        job: offer.job,
+    }
+}
+
+fn artifact_attempt(
+    d: &Deployment,
+) -> (
+    WorkerProcess,
+    Arc<Recorder>,
+    session::Reporter,
+    AttemptId,
+    RunId,
+) {
+    let p = artifact_session(d);
+    (p.process, p.recorder, p.reporter, p.attempt, p.run)
 }
 
 fn verdict_seen(
@@ -1496,6 +1520,102 @@ fn a_repository_at_its_quota_is_refused_at_begin() {
     });
     assert!(!granted(&recorder, attempt, "dist"));
     process.stop().unwrap();
+}
+
+/// A publication that began inside the attempt's lease finishes after a cancel released the attempt: it commits
+/// nothing and records nothing, and its staged objects are given back.
+#[test]
+fn a_publication_racing_a_cancel_commits_nothing() {
+    let d = deployment();
+    let p = artifact_session(&d);
+    let (tenant, run) = (d.tenant, p.run);
+    p.reporter.artifact_begin(p.attempt, "dist").unwrap();
+    eventually("grant", || granted(&p.recorder, p.attempt, "dist"));
+    p.reporter
+        .artifact_file(p.attempt, "out/a.txt", 4, 0o644)
+        .unwrap();
+    p.reporter.artifact_data(p.attempt, 0, b"data").unwrap();
+
+    let job = p.job;
+    assert_eq!(
+        d.store
+            .writer()
+            .write(move |tx| dispatch::cancel(tx, tenant, job, UnixMillis::now()))
+            .unwrap(),
+        dispatch::Cancelled::Requested
+    );
+    p.reporter
+        .report(p.attempt, p.fence, Event::Failed(FailureClass::Canceled))
+        .unwrap();
+    eventually("canceled", || {
+        d.state(p.job) == JobState::Terminal(Outcome::Canceled)
+    });
+
+    p.reporter.artifact_end(p.attempt, "dist").unwrap();
+    eventually("stale verdict", || {
+        verdict_seen(&p.recorder, p.attempt, "dist", session::ArtifactCode::Stale)
+    });
+    // Finalization records the declarations the attempt never published; nothing of the upload itself did.
+    let rows = d
+        .store
+        .read(move |c| sentinel_store::artifacts::for_run(c, tenant, run))
+        .unwrap();
+    assert!(
+        rows.iter()
+            .all(|r| r.state != sentinel_store::artifacts::State::Captured),
+        "{rows:?}"
+    );
+    let usage = d
+        .store
+        .read(move |c| sentinel_store::retention::tenant_usage(c, tenant))
+        .unwrap();
+    assert_eq!(usage.total(), 0, "the staged objects were discarded");
+    p.process.stop().unwrap();
+}
+
+/// The same window, closed by a lease that lapsed and was reconciled instead of by a cancel.
+#[test]
+fn a_publication_after_lease_loss_commits_nothing() {
+    let d = deployment();
+    let p = artifact_session(&d);
+    let (tenant, run) = (d.tenant, p.run);
+    p.reporter.artifact_begin(p.attempt, "dist").unwrap();
+    eventually("grant", || granted(&p.recorder, p.attempt, "dist"));
+    p.reporter
+        .artifact_file(p.attempt, "out/a.txt", 4, 0o644)
+        .unwrap();
+    p.reporter.artifact_data(p.attempt, 0, b"data").unwrap();
+
+    let attempt = p.attempt;
+    let later = UnixMillis(UnixMillis::steady().0 + 2 * sentinel_store::dispatch::DEFAULT_LEASE_MS);
+    assert_eq!(
+        d.store
+            .writer()
+            .write(move |tx| dispatch::expire(tx, attempt, later, None))
+            .unwrap(),
+        JobState::Terminal(Outcome::InfraFailed)
+    );
+    p.reporter.artifact_end(p.attempt, "dist").unwrap();
+    eventually("stale verdict", || {
+        verdict_seen(&p.recorder, p.attempt, "dist", session::ArtifactCode::Stale)
+    });
+    let rows = d
+        .store
+        .read(move |c| sentinel_store::artifacts::for_run(c, tenant, run))
+        .unwrap();
+    assert!(
+        rows.iter()
+            .all(|r| r.state != sentinel_store::artifacts::State::Captured),
+        "{rows:?}"
+    );
+
+    // A publication begun after the attempt was released never even gets its grant.
+    p.reporter.artifact_begin(p.attempt, "cov").unwrap();
+    eventually("refused at begin", || {
+        verdict_seen(&p.recorder, p.attempt, "cov", session::ArtifactCode::Stale)
+    });
+    assert!(!granted(&p.recorder, p.attempt, "cov"));
+    p.process.stop().unwrap();
 }
 
 #[test]

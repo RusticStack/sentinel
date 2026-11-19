@@ -1,6 +1,10 @@
 #![cfg(target_os = "linux")]
 
-use std::{fs, os::unix::fs::PermissionsExt, sync::Mutex};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    sync::{Arc, Mutex, mpsc},
+};
 
 use sentinel_core::AttemptId;
 use sentinel_link::session::{ArtifactCode, Offered};
@@ -164,6 +168,123 @@ fn capture_policy_selects_on_the_step_verdict() {
     assert!(artifacts::due(&art(ArtifactWhen::Failure), false));
     assert!(artifacts::due(&art(ArtifactWhen::Always), true));
     assert!(artifacts::due(&art(ArtifactWhen::Always), false));
+}
+
+/// A publication held inside the link, so the test decides when it may finish.
+struct Gated {
+    reached: mpsc::Sender<()>,
+    go: Mutex<mpsc::Receiver<()>>,
+}
+
+impl Sink for Gated {
+    fn capable(&self) -> bool {
+        true
+    }
+    fn begin(&self, _a: AttemptId, _name: &str) -> Option<ArtifactCode> {
+        self.reached.send(()).unwrap();
+        self.go.lock().unwrap().recv().unwrap();
+        None
+    }
+    fn file(&self, _a: AttemptId, _path: &str, _len: u64, _mode: u32) -> bool {
+        true
+    }
+    fn data(&self, _a: AttemptId, _seq: u32, _bytes: &[u8]) -> bool {
+        true
+    }
+    fn end(&self, _a: AttemptId, _name: &str) -> ArtifactCode {
+        ArtifactCode::Stored
+    }
+    fn absent(&self, _a: AttemptId, _name: &str, _reason: u8) -> ArtifactCode {
+        ArtifactCode::Store
+    }
+    fn settle(&self, _a: AttemptId, _name: &str) -> ArtifactCode {
+        ArtifactCode::Store
+    }
+}
+
+fn step(id: &str) -> sentinel_pipeline::schema::Step {
+    sentinel_pipeline::schema::Step {
+        id: id.to_owned(),
+        run: "true".to_owned(),
+        condition: None,
+        shell: sentinel_pipeline::schema::Shell::Sh,
+        env: Vec::new(),
+        secrets: Vec::new(),
+        secret_files: Vec::new(),
+        workdir: None,
+        timeout_secs: None,
+    }
+}
+
+#[test]
+fn a_step_trigger_never_publishes_at_finalization() {
+    let art = decl("dist", &["out/**"], ArtifactWhen::Step(0), true);
+    assert!(!artifacts::due(&art, true));
+    assert!(!artifacts::due(&art, false));
+    assert_eq!(art.when.step(), Some(0));
+    assert_eq!(ArtifactWhen::Always.step(), None);
+}
+
+/// The step's end starts the upload and returns: the steps after it run while the link is still taking the file.
+#[test]
+fn a_step_publication_returns_before_the_upload_finishes_and_is_joined_at_finalization() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("out")).unwrap();
+    fs::write(dir.path().join("out/a.txt"), "alpha").unwrap();
+    let (reached, reached_rx) = mpsc::channel();
+    let (go, go_rx) = mpsc::channel();
+    let sink: Arc<dyn Sink> = Arc::new(Gated {
+        reached,
+        go: Mutex::new(go_rx),
+    });
+    let declared = [decl("dist", &["out/**"], ArtifactWhen::Step(0), true)];
+    let mut publications = artifacts::StepPublications::default();
+    publications.publish(0, &declared[0], dir.path(), &sink, attempt_id());
+
+    // The publication is inside the link and this thread is free: that is the overlap with later steps.
+    reached_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the publication never started");
+    go.send(()).unwrap();
+
+    assert_eq!(publications.settle(&declared, &[step("build")], true), None);
+}
+
+#[test]
+fn a_required_step_artifact_is_reported_when_its_step_never_completed() {
+    let declared = [decl("dist", &["out/**"], ArtifactWhen::Step(1), true)];
+    let steps = [step("build"), step("package")];
+    let mut publications = artifacts::StepPublications::default();
+    let failure = publications
+        .settle(&declared, &steps, true)
+        .expect("a required artifact whose step never ran");
+    assert!(
+        failure.contains("step `package` did not complete"),
+        "{failure}"
+    );
+    assert_eq!(
+        publications.settle(&declared, &steps, false),
+        None,
+        "a job already failing on a step is not failed again for its artifact"
+    );
+}
+
+#[test]
+fn a_failed_step_publication_of_a_required_artifact_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("present.txt"), "p\n").unwrap();
+    let scripted = Arc::new(Scripted {
+        verdict: ArtifactCode::CaptureFailed,
+        ..Scripted::stored()
+    });
+    let sink: Arc<dyn Sink> = scripted.clone();
+    let declared = [decl("dist", &["present.txt"], ArtifactWhen::Step(0), true)];
+    let mut publications = artifacts::StepPublications::default();
+    publications.publish(0, &declared[0], dir.path(), &sink, attempt_id());
+    let failure = publications
+        .settle(&declared, &[step("build")], true)
+        .expect("a required artifact that did not publish");
+    assert!(failure.contains("required artifact `dist`"), "{failure}");
 }
 
 #[test]

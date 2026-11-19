@@ -3,6 +3,7 @@ use std::{fs, path::Path};
 use sentinel_pipeline::{
     RefFilter, Triggers, compile_str,
     expr::{Context, DependencySummary, HashFilesError, Lookup, Phase, Value},
+    schema::ArtifactWhen,
 };
 use sentinel_protocol::cache::Class;
 
@@ -94,6 +95,18 @@ fn full_fixture_decodes_every_field() {
     assert_eq!(build.spec.timeout_secs, 5400);
     assert_eq!(build.spec.artifacts[0].retain_secs, 7 * 86_400);
     assert_eq!(build.spec.artifacts[0].class.as_deref(), Some("release"));
+}
+
+#[test]
+fn a_step_trigger_resolves_to_the_position_of_its_step() {
+    let text = fs::read_to_string(fixture_dir("valid").join("artifact-step.yml")).unwrap();
+    let p = compile_str(&text).unwrap();
+    let artifacts = &p.jobs[0].spec.artifacts;
+    assert_eq!(artifacts[0].when, ArtifactWhen::Step(0));
+    assert_eq!(artifacts[1].when, ArtifactWhen::Step(1));
+    assert!(artifacts[1].required);
+    assert_eq!(artifacts[1].retain_secs, 30 * 86_400);
+    assert_eq!(artifacts[2].when, ArtifactWhen::Always);
 }
 
 #[test]

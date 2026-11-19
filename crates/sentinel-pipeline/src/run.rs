@@ -148,10 +148,10 @@ pub enum SpecError {
     Decode,
 }
 
-/// Format 8 adds `artifacts[].class`; format 7 adds `runs_on.os` and `runs_on.isolation`. A spec whose
-/// artifacts state no class is written as format 7 or 6, byte for byte what earlier controllers wrote, so a
-/// worker that predates the newer fields keeps running it.
-pub const SPEC_FORMAT: u8 = 8;
+/// Format 9 adds `artifacts[].when: step:<id>`; format 8 adds `artifacts[].class`; format 7 adds `runs_on.os`
+/// and `runs_on.isolation`. A spec whose artifacts state no class or step trigger is written as format 7 or 6,
+/// byte for byte what earlier controllers wrote, so a worker that predates the newer fields keeps running it.
+pub const SPEC_FORMAT: u8 = 9;
 
 pub const SPEC_FORMAT_READ_MIN: u8 = 3;
 
@@ -177,9 +177,16 @@ impl RunSpec {
             .pipeline
             .jobs
             .iter()
-            .any(|j| j.spec.artifacts.iter().any(|a| a.class.is_some()))
+            .any(|j| j.spec.artifacts.iter().any(|a| a.when.step().is_some()))
         {
             SPEC_FORMAT
+        } else if self
+            .pipeline
+            .jobs
+            .iter()
+            .any(|j| j.spec.artifacts.iter().any(|a| a.class.is_some()))
+        {
+            8
         } else if self
             .pipeline
             .jobs
@@ -197,15 +204,7 @@ impl RunSpec {
         let body = match format {
             6 => postcard::to_allocvec(&RunSpecV6::from(self)),
             7 => postcard::to_allocvec(&RunSpecV7::from(self)),
-            _ => postcard::to_allocvec(&RunSpecV8 {
-                base: RunSpecV7::from(self),
-                classes: self
-                    .pipeline
-                    .jobs
-                    .iter()
-                    .flat_map(|j| j.spec.artifacts.iter().map(|a| a.class.clone()))
-                    .collect(),
-            }),
+            _ => postcard::to_allocvec(&RunSpecV8::from(self)),
         };
         body.map(|body| {
             let mut out = Vec::with_capacity(body.len() + 1);
@@ -224,7 +223,10 @@ impl RunSpec {
             }
         }
         match bytes.split_first() {
+            // Format 9 is format 8's layout: the only difference is what `when` may hold, and this reader
+            // takes both.
             Some((&SPEC_FORMAT, body)) => whole::<RunSpecV8>(body).map(RunSpec::from),
+            Some((&8, body)) => whole::<RunSpecV8>(body).map(RunSpec::from),
             Some((&7, body)) => whole::<RunSpecV7>(body).map(RunSpec::from),
             Some((&6, body)) => whole::<RunSpecV6>(body).map(RunSpec::from),
             Some((&5, body)) => whole::<RunSpecV5>(body).map(RunSpec::from),
@@ -380,7 +382,9 @@ impl From<RunSpecV6> for RunSpec {
     }
 }
 
-/// The artifact layout of formats 3 to 7: everything a declaration stated before `class`.
+/// The artifact layout of formats 3 to 7: everything a declaration stated before `class`. Its `when` never holds
+/// a step trigger there: `RunSpec::format` writes such a spec as format 9, whose body a reader predating it refuses
+/// at the leading byte rather than misreading the enum.
 #[derive(Debug, Serialize, Deserialize)]
 struct ArtifactV7 {
     name: String,
@@ -536,6 +540,20 @@ impl From<RunSpecV7> for RunSpec {
 struct RunSpecV8 {
     base: RunSpecV7,
     classes: Vec<Option<String>>,
+}
+
+impl From<&RunSpec> for RunSpecV8 {
+    fn from(spec: &RunSpec) -> RunSpecV8 {
+        RunSpecV8 {
+            base: RunSpecV7::from(spec),
+            classes: spec
+                .pipeline
+                .jobs
+                .iter()
+                .flat_map(|j| j.spec.artifacts.iter().map(|a| a.class.clone()))
+                .collect(),
+        }
+    }
 }
 
 impl From<RunSpecV8> for RunSpec {
@@ -1252,7 +1270,7 @@ mod tests {
             compile_str(text).unwrap(),
         )
         .unwrap();
-        assert_eq!(spec.format(), SPEC_FORMAT);
+        assert_eq!(spec.format(), 8, "no artifact carries a step trigger");
         let bytes = spec.encode().unwrap();
         assert_eq!(bytes[0], 8);
         let decoded = RunSpec::decode(&bytes).unwrap();
@@ -1282,6 +1300,50 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xFF;
         let _ = RunSpec::decode(&corrupt);
+    }
+
+    #[test]
+    fn a_step_trigger_is_format_9_and_round_trips() {
+        let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    artifacts:\n      - {name: early, paths: [out], when: 'step:first'}\n      - {name: later, paths: [out], when: success, class: debug}\n    steps:\n      - id: first\n        run: echo hi\n      - id: second\n        run: echo hi\n";
+        let spec = RunSpec::new(
+            PinnedSource::new("r", SHA, None).unwrap(),
+            compile_str(text).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(spec.format(), SPEC_FORMAT);
+        let bytes = spec.encode().unwrap();
+        assert_eq!(bytes[0], 9);
+        let decoded = RunSpec::decode(&bytes).unwrap();
+        assert_eq!(decoded, spec);
+        assert_eq!(
+            decoded.pipeline.jobs[0]
+                .spec
+                .artifacts
+                .iter()
+                .map(|a| (a.when, a.class.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (ArtifactWhen::Step(0), None),
+                (ArtifactWhen::Success, Some("debug"))
+            ],
+            "format 9 keeps what formats 7 and 8 added"
+        );
+        assert_eq!(
+            RunSpec::decode(&bytes[..bytes.len() - 1]),
+            Err(SpecError::Decode)
+        );
+    }
+
+    #[test]
+    fn a_stated_class_without_a_step_trigger_stays_format_8() {
+        let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    artifacts:\n      - {name: log, paths: [out], class: debug}\n    steps:\n      - id: s\n        run: echo hi\n";
+        let spec = RunSpec::new(
+            PinnedSource::new("r", SHA, None).unwrap(),
+            compile_str(text).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(spec.format(), 8);
+        assert_eq!(spec.encode().unwrap()[0], 8);
     }
 
     #[test]

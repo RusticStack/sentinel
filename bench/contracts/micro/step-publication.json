@@ -1,0 +1,25 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "step-publication",
+  "revision": 1,
+  "harness": {
+    "example": "step-publication-bench",
+    "build": "cargo build --release --locked -p sentinel-worker --example step-publication-bench"
+  },
+  "run": {
+    "args": ["--files", "48", "--file-bytes", "1048576", "--later-ms", "250", "--rounds", "5"],
+    "smoke_args": ["--files", "4", "--file-bytes", "16384", "--later-ms", "20", "--rounds", "1"]
+  },
+  "ordering": {
+    "scheme": "abba",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/step-publication/1",
+    "out": "bench/step-publication.jsonl"
+  },
+  "notes": "ABBA per round: the step sample comes first on odd rounds and last on even ones, so the order is fixed and no seed is drawn. The bench keeps its own temporary store and workspace, so it measures no DIR file system. Protocol 11 is pinned so both modes send every body; what digest-first saves is the digest-transfer record's subject."
+}

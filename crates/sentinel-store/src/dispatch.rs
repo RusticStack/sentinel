@@ -1651,10 +1651,13 @@ fn due_coverage(
     let mut missing = Vec::new();
     let mut required_lost = false;
     for decl in &job.spec.artifacts {
+        // A step-triggered artifact published while the attempt ran, or its step never reached its end. Required
+        // coverage is still judged here, by the same rule `success` uses: a passing attempt must have published it.
         let due = match decl.when {
             ArtifactWhen::Success => passed,
             ArtifactWhen::Failure => !passed,
             ArtifactWhen::Always => true,
+            ArtifactWhen::Step(_) => passed,
         };
         if !due {
             continue;

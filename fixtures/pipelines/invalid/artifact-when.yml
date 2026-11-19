@@ -1,0 +1,8 @@
+# expect: jobs.a.artifacts[0].when: expected success, failure, always or step:<id>
+schema: 1
+on: [push]
+jobs:
+  a:
+    image: busybox
+    steps: [{id: s, run: x}]
+    artifacts: [{name: out, paths: [out], when: sometimes}]

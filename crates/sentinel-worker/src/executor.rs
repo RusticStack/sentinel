@@ -1007,10 +1007,17 @@ impl Executor {
                 (executor.notify)(Notice::Started(attempt));
                 let pipe = Arc::clone(&logs);
                 let output: Arc<dyn attempt::Output> = logs;
-                let sink: &dyn artifacts::Sink = &*executor;
+                let sink: Arc<dyn artifacts::Sink> = executor.clone();
                 // A panic must not leave the attempt held and renewed: tear it down and report a runtime failure.
                 let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    attempt::run(&executor.root, &mut job, &*executor, output, sink, &cancel)
+                    attempt::run(
+                        &executor.root,
+                        &mut job,
+                        &*executor,
+                        output,
+                        Arc::clone(&sink),
+                        &cancel,
+                    )
                 }));
                 let verdict = match ran {
                     Ok((verdict, _)) => verdict,

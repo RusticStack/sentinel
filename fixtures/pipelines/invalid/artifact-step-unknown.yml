@@ -1,0 +1,8 @@
+# expect: jobs.a.artifacts[0].when: names no step of this job: `missing`
+schema: 1
+on: [push]
+jobs:
+  a:
+    image: busybox
+    steps: [{id: s, run: x}]
+    artifacts: [{name: out, paths: [out], when: 'step:missing'}]

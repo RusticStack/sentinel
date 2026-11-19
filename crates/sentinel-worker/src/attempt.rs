@@ -451,7 +451,7 @@ pub fn run(
     job: &mut Job,
     report: &dyn Report,
     output: Arc<dyn Output>,
-    sink: &dyn artifacts::Sink,
+    sink: Arc<dyn artifacts::Sink>,
     cancel: &Cancel,
 ) -> (Verdict, AttemptSummary) {
     report.event(job.attempt, job.fence, Event::PreparationStarted);
@@ -494,6 +494,7 @@ pub fn run(
         Ok(prepared) => {
             report.event(job.attempt, job.fence, Event::StepsStarted);
             let started = Instant::now();
+            let mut publications = artifacts::StepPublications::default();
             let verdict = execute(
                 job,
                 report,
@@ -501,6 +502,8 @@ pub fn run(
                 prepared.workspace.path(),
                 prepared.secret_directory.as_ref(),
                 &output,
+                &sink,
+                &mut publications,
                 cancel,
                 &mut summary,
             );
@@ -529,6 +532,13 @@ pub fn run(
                 .filter(|rel| !rel.as_os_str().is_empty())
                 .filter_map(|rel| rel.to_str().map(str::to_owned))
                 .collect();
+            // A step-triggered publication reads the workspace, so it is joined before either the sync-out or
+            // the sandbox teardown can move what it is reading.
+            let step_failure = publications.settle(
+                declared,
+                &job.spec.pipeline.jobs[job.job_index].spec.steps,
+                matches!(verdict, Verdict::Passed),
+            );
             // A cache sealed from a view that could not be brought back would hold a truncated tree, so
             // none is published then.
             let synced = match prepared
@@ -541,13 +551,16 @@ pub fn run(
                     false
                 }
             };
-            let artifact_failure = capture_artifacts(
+            // Both run: a step-triggered publication that failed says nothing about the declarations the verdict
+            // decides, and they publish here whether or not it did.
+            let captured = capture_artifacts(
                 job.attempt,
                 prepared.workspace.path(),
                 declared,
                 matches!(verdict, Verdict::Passed),
-                sink,
+                &*sink,
             );
+            let artifact_failure = step_failure.or(captured);
             sealed = finalize(root, job, &verdict, synced, report, prepared, cancel);
             let published = output.complete();
             if published {
@@ -971,6 +984,8 @@ fn execute(
     workspace: &Path,
     secret_directory: Option<&SecretDirectory>,
     output: &Arc<dyn Output>,
+    sink: &Arc<dyn artifacts::Sink>,
+    publications: &mut artifacts::StepPublications,
     cancel: &Cancel,
     summary: &mut AttemptSummary,
 ) -> Verdict {
@@ -1129,12 +1144,12 @@ fn execute(
         if step_secrets.as_ref().is_some_and(|s| s.env_file.is_some()) {
             command.argv = wrap_with_env(std::mem::take(&mut command.argv), index);
         }
-        let sink: crate::process::Sink = {
+        let output_sink: crate::process::Sink = {
             let output = Arc::clone(output);
             let step_index = index as u32;
             Arc::new(move |stream, bytes: &[u8]| output.write(step_index, stream, bytes))
         };
-        let exec = container.exec_streaming(&command, &extra, Some(sink));
+        let exec = container.exec_streaming(&command, &extra, Some(output_sink));
         ran.store(true, Ordering::Release);
         let cleared = if secret_step
             && exec.as_ref().is_ok_and(|exit| !exit.timed_out)
@@ -1238,6 +1253,20 @@ fn execute(
         record.outcome = outcome;
         summary.steps.push(record);
         failure = why;
+        if outcome == StepOutcome::Passed
+            && !cancel.load(Ordering::Acquire)
+            && let Ok(step) = u8::try_from(index)
+        {
+            publish_step_artifacts(
+                job.attempt,
+                compiled,
+                step,
+                workspace,
+                sink,
+                publications,
+                &refresh,
+            );
+        }
     }
     if let Some(g) = &guard
         && (g.unreadable() || g.timed_out())
@@ -1247,6 +1276,36 @@ fn execute(
     match failure {
         None => Verdict::Passed,
         Some((class, why)) => Verdict::Failed(class, why),
+    }
+}
+
+/// Publishes the artifacts declared behind `step` now that it completed, so the steps after it run during the
+/// upload. A microVM's workspace is pulled out first: the publication reads the host's copy.
+fn publish_step_artifacts(
+    attempt: AttemptId,
+    compiled: &sentinel_pipeline::schema::Job,
+    step: u8,
+    workspace: &Path,
+    sink: &Arc<dyn artifacts::Sink>,
+    publications: &mut artifacts::StepPublications,
+    pull: &dyn Fn(&[&str]),
+) {
+    // Two passes over at most `MAX_ARTIFACTS` declarations: the pull needs every path first, because one upload
+    // at a time is what the controller admits.
+    let mut patterns: Vec<&str> = Vec::new();
+    for decl in &compiled.artifacts {
+        if decl.when.step() == Some(step) {
+            patterns.extend(decl.paths.iter().map(String::as_str));
+        }
+    }
+    if patterns.is_empty() {
+        return;
+    }
+    pull(&patterns);
+    for (index, decl) in compiled.artifacts.iter().enumerate() {
+        if decl.when.step() == Some(step) {
+            publications.publish(index, decl, workspace, sink, attempt);
+        }
     }
 }
 
@@ -1264,13 +1323,7 @@ pub fn capture_artifacts(
         }
         let outcome = artifacts::capture(workspace, decl, sink, attempt);
         if decl.required && outcome != artifacts::Outcome::Published {
-            failed.get_or_insert_with(|| match outcome {
-                artifacts::Outcome::QuotaExceeded => format!(
-                    "required artifact `{}` was refused at the tenant's storage limit; its record names the bytes stored, the threshold and the largest classes",
-                    decl.name
-                ),
-                _ => format!("required artifact `{}` was not published", decl.name),
-            });
+            failed.get_or_insert_with(|| artifacts::required_missing(decl, outcome));
         }
     }
     failed
