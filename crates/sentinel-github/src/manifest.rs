@@ -1,8 +1,10 @@
 //! GitHub's App manifest flow: the manifest Sentinel asks GitHub to register, and the one-time
 //! conversion of the code GitHub hands back into the App's identity and credentials.
 //!
-//! The permissions and events are exactly what the controller uses today; a feature that needs
-//! more asks for them only when a tenant turns it on.
+//! The App carries every permission the controller can use, runner mode's included, so a
+//! deployment stays one App, one click and one binding ([plan 16.10](../../../plan.md#1610-github-actions-runner-mode)).
+//! What is conditional is the check, not the manifest: runner mode's two are verified only
+//! for a tenant that turns it on, and setup is refused naming what is missing until then.
 
 use std::{fmt, net::IpAddr};
 
@@ -18,18 +20,24 @@ use crate::{
 /// at a revision (source tokens, reconciliation), `metadata` is GitHub's mandatory baseline and
 /// what the per-repository collaborator read needs, `pull_requests` is required to receive
 /// `pull_request` events, and the organization permission `members` reads membership for
-/// GitHub-backed organizations. Sign-in reads only the account's numeric id and asks no scope.
-pub const PERMISSIONS: [(&str, &str); 5] = [
+/// GitHub-backed organizations. Runner mode adds `actions` read (it delivers `workflow_job`)
+/// and `organization_self_hosted_runners` write, or `administration` write inside a personal
+/// namespace, which has no organization to register a runner in. Sign-in reads only the
+/// account's numeric id and asks no scope.
+pub const PERMISSIONS: [(&str, &str); 8] = [
+    ("actions", "read"),
+    ("administration", "write"),
     ("checks", "write"),
     ("contents", "read"),
     ("metadata", "read"),
+    ("organization_self_hosted_runners", "write"),
     ("pull_requests", "read"),
     ("members", "read"),
 ];
 
 /// The events the webhook route acts on. `installation` and `installation_repositories` are
 /// delivered to every App without a subscription.
-pub const EVENTS: [&str; 9] = [
+pub const EVENTS: [&str; 10] = [
     "push",
     "pull_request",
     "check_run",
@@ -39,6 +47,7 @@ pub const EVENTS: [&str; 9] = [
     "membership",
     "member",
     "team",
+    "workflow_job",
 ];
 
 /// The controller's GitHub webhook route, relative to `public_url`.
@@ -484,7 +493,9 @@ mod tests {
         assert_eq!(v["setup_on_update"], true);
         assert_eq!(
             v["default_permissions"],
-            json!({"checks":"write","contents":"read","metadata":"read","pull_requests":"read","members":"read"})
+            json!({"actions":"read","administration":"write","checks":"write","contents":"read",
+                   "metadata":"read","organization_self_hosted_runners":"write",
+                   "pull_requests":"read","members":"read"})
         );
         assert_eq!(v["default_events"].as_array().unwrap().len(), EVENTS.len());
         let inactive: Value = serde_json::from_str(&manifest(&Request {

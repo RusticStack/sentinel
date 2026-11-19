@@ -73,6 +73,7 @@ fn organization(
                     personal,
                     suspended: false,
                     permissions_valid: true,
+                    runner: sentinel_core::RunnerPermissions::ALL,
                     expected: 0,
                 },
                 at(1),

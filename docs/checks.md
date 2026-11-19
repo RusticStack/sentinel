@@ -22,6 +22,12 @@ Names are stable on purpose: a repository protects `sentinel / ci` as a
 required check, and it must mean the same thing on every run. Per-job checks
 are namespaced so a required aggregate is never satisfied by a partial run.
 
+**Runner mode publishes nothing here.** A `workflow_job` delivery produces a
+runner-mode job and no Sentinel check, at any outcome and refusals included:
+GitHub reports that job under the workflow's own name, and a second check from
+Sentinel would be a required check no workflow owns ([intake](intake.md#runner-mode-jobs),
+[plan 16.10](../plan.md#1610-github-actions-runner-mode)).
+
 ### Check identity for merge groups
 
 A merge queue asks for its required checks under its own event, so a merge-group

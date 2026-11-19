@@ -949,6 +949,12 @@ pub fn validate(conn: &Connection, delivery: &Delivery) -> Result<Resolution> {
     if metadata.revoked {
         return Ok(Resolution::Failed("binding_revoked"));
     }
+    // A runner-mode job names its own commit and carries no ref, so no binding ref gates
+    // it: what decides it is the tenant's switch and the installation's permissions, at
+    // resolution, where a refusal is visible and never retried.
+    if delivery.event == crate::runner::EVENT {
+        return Ok(Resolution::Ready);
+    }
     let (Some(ref_name), Some(new_sha)) = (&delivery.ref_name, &delivery.new_sha) else {
         return Ok(Resolution::Ignored("no_ref"));
     };
@@ -1004,6 +1010,14 @@ pub fn settle_dispatched(
         return Err(Error::Conflict);
     }
     Ok(())
+}
+
+/// A delivery that produced a runner-mode job. GitHub orchestrates that job, so the delivery
+/// dispatches no run of Sentinel's own — and `dispatched` is defined by having one, which the
+/// table's check enforces — so it settles `ignored:runner_job`: nothing is owed, nothing
+/// retries, and the job row is the durable record it produced.
+pub fn settle_runner(tx: &Transaction<'_>, id: DeliveryId, now: UnixMillis) -> Result<()> {
+    settle(tx, id, Resolution::Ignored("runner_job"), now)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1135,7 +1149,7 @@ pub fn purge_settled(tx: &Transaction<'_>, before: UnixMillis, limit: u32) -> Re
     )?)
 }
 
-fn audit(
+pub(crate) fn audit(
     tx: &Transaction<'_>,
     tenant: TenantId,
     repo: RepoId,

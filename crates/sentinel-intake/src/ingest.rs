@@ -1,6 +1,6 @@
-use sentinel_core::{DeliveryId, RepoId, UnixMillis};
+use sentinel_core::{DeliveryId, Labelled, RepoId, RunnerClass, UnixMillis};
 use sentinel_protocol::intake::{RefUpdate, valid_delivery_id, valid_ref, valid_sha};
-use sentinel_store::{Store, intake};
+use sentinel_store::{Store, intake, runner};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -117,6 +117,7 @@ pub fn github(
         "push" => {}
         "pull_request" => return pull_request(store, delivery_id, body, now),
         "merge_group" => return merge_group(store, delivery_id, body, now),
+        "workflow_job" => return workflow_job(store, delivery_id, body, now),
         _ => return Ok(Github::Ignored("unsupported_event")),
     }
     let push =
@@ -346,6 +347,76 @@ fn merge_group(
         now,
     )
     .map(Github::Ingested)
+}
+
+/// A GitHub-orchestrated job. Only a job whose `runs-on:` names one of Sentinel's labels is
+/// ours at all: another runner's labels are acknowledged and never stored. The delivery is
+/// stored with the job facts and resolved later, where the tenant's switch and the
+/// installation's permissions decide whether Sentinel provisions it.
+fn workflow_job(
+    store: &Store,
+    delivery_id: &str,
+    body: &[u8],
+    now: UnixMillis,
+) -> Result<Github, Error> {
+    let job = sentinel_github::webhook::parse_workflow_job(body)
+        .map_err(|_| Error::InvalidRequest("payload"))?;
+    if !runner::action_known(&job.action) {
+        return Ok(Github::Ignored("runner_action"));
+    }
+    if matches!(
+        RunnerClass::of_labels(job.labels.iter().map(String::as_str)),
+        Labelled::None
+    ) {
+        return Ok(Github::Ignored("runner_label"));
+    }
+    let repository = i64::try_from(job.repository).map_err(|_| Error::InvalidRequest("payload"))?;
+    let installation = job.installation.to_string();
+    let target = match store.read(|c| intake::github_target(c, &installation, repository)) {
+        Ok(target) => target,
+        Err(sentinel_store::Error::NotFound) => {
+            return Ok(Github::Ignored("unbound_repository"));
+        }
+        Err(e) => return Err(Error::from(e)),
+    };
+    accept_runner(store, target.1, delivery_id, &job, now).map(Github::Ingested)
+}
+
+fn accept_runner(
+    store: &Store,
+    repo: RepoId,
+    delivery_id: &str,
+    job: &sentinel_github::webhook::WorkflowJob,
+    now: UnixMillis,
+) -> Result<Ingested, Error> {
+    let labels = job.labels.join(",");
+    let delivery_id = delivery_id.to_owned();
+    let action = job.action.clone();
+    let runner_name = job.runner.clone();
+    let conclusion = job.conclusion.clone();
+    let (job_id, run_id) = (job.job, job.run);
+    let accepted = store.writer().write(move |tx| {
+        runner::accept(
+            tx,
+            repo,
+            &runner::NewRunner {
+                authentication: intake::Authentication::SignedWebhook,
+                provider: "github",
+                external_id: &delivery_id,
+                action: &action,
+                job: job_id,
+                run: run_id,
+                labels: &labels,
+                runner: runner_name.as_deref(),
+                conclusion: conclusion.as_deref(),
+            },
+            now,
+        )
+    })?;
+    Ok(Ingested {
+        id: accepted.id(),
+        duplicate: accepted.duplicate(),
+    })
 }
 
 fn accept(

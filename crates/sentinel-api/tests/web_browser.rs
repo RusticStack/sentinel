@@ -582,7 +582,9 @@ fn the_github_app_setup_in_a_real_browser() {
     assert_eq!(
         manifest["default_permissions"],
         json!({
-            "checks": "write", "contents": "read", "metadata": "read",
+            "actions": "read", "administration": "write", "checks": "write",
+            "contents": "read", "metadata": "read",
+            "organization_self_hosted_runners": "write",
             "pull_requests": "read", "members": "read",
         })
     );

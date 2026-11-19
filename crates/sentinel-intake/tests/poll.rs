@@ -236,6 +236,7 @@ fn an_observed_push_becomes_a_delivery_and_dispatches_a_run() {
         Some(Arc::clone(&f.key)),
         None,
         destinations(),
+        Arc::from(Vec::new()),
         Arc::new(FakeFetch),
         f.dir.path().join("intake-work"),
         resolve::Config::default(),

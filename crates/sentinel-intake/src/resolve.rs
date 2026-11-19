@@ -4,14 +4,14 @@
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 use sentinel_auth::sealed::Key;
-use sentinel_core::{RunId, UnixMillis};
+use sentinel_core::{Labelled, RunId, RunnerClass, UnixMillis};
 use sentinel_github::app::Current;
 use sentinel_pipeline::{Event, EventKind, PinnedSource, RunSpec};
 use sentinel_store::{
     Error as StoreError, Store,
     intake::{self, Delivery, MergeDelivery, PrDelivery},
     provenance::Provenance,
-    runs,
+    runner, runs,
 };
 
 use crate::source;
@@ -159,6 +159,9 @@ pub struct Resolver {
     key: Option<Arc<Key>>,
     app: Current,
     destinations: Arc<[String]>,
+    /// The resource classes this deployment serves, from its own configuration. A label
+    /// naming any other class is refused visibly, never silently run elsewhere.
+    runner_classes: Arc<[RunnerClass]>,
     fetch: Arc<dyn Fetch>,
     work_root: PathBuf,
     config: Config,
@@ -171,6 +174,7 @@ impl Resolver {
         key: Option<Arc<Key>>,
         app: impl Into<Current>,
         destinations: Arc<[String]>,
+        runner_classes: Arc<[RunnerClass]>,
         fetch: Arc<dyn Fetch>,
         work_root: PathBuf,
         config: Config,
@@ -186,6 +190,7 @@ impl Resolver {
             key,
             app: app.into(),
             destinations,
+            runner_classes,
             fetch,
             work_root,
             config,
@@ -228,6 +233,11 @@ impl Resolver {
                 },
                 now,
             );
+        }
+
+        // A GitHub-orchestrated job: no pipeline, no fetch, no lease of this build's own.
+        if delivery.event == runner::EVENT {
+            return self.runner_job(delivery, now);
         }
 
         // One point read, and only for the event class that has terms to read.
@@ -532,6 +542,79 @@ impl Resolver {
             Err(e) => return Err(e),
         };
         Ok(Outcome::Dispatched { run })
+    }
+
+    /// One `workflow_job` delivery. Only a queued job is demand: it becomes one durable job of
+    /// the class its labels name, and the tenant's switch and the installation's permissions
+    /// decide whether Sentinel offers to serve it. The later activities record what GitHub did
+    /// with the job it already has. Every refusal is settled with its reason and an audit row,
+    /// never retried, because no later attempt can change any of those facts.
+    fn runner_job(&self, delivery: &Delivery, now: UnixMillis) -> Result<Outcome, StoreError> {
+        let (tenant, repo) = (delivery.tenant, delivery.repo);
+        let access = match self.store.read(move |c| runner::access(c, tenant, repo)) {
+            Ok(access) => access,
+            Err(StoreError::NotFound) => {
+                return self.refuse(delivery, "runner_no_installation", now);
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(terms) = self
+            .store
+            .read(move |c| runner::terms_for(c, delivery.id))?
+        else {
+            return self.refuse(delivery, "runner_terms", now);
+        };
+        // Ingest stores only a job whose labels name a Sentinel class; one class must survive
+        // to here, and a set naming two of them is a class no one runner can satisfy.
+        let class = match terms.class() {
+            Labelled::Class(class) => class,
+            Labelled::None => return self.refuse(delivery, "runner_label", now),
+            Labelled::Conflict => return self.refuse(delivery, "runner_labels_conflict", now),
+        };
+        if terms.action == runner::QUEUED {
+            if !access.enabled {
+                return self.refuse(delivery, "runner_mode_off", now);
+            }
+            if !access.permissions.missing(access.personal).is_empty() {
+                return self.refuse(delivery, "runner_permissions", now);
+            }
+            if !self.runner_classes.contains(&class) {
+                return self.refuse(delivery, "runner_class_unavailable", now);
+            }
+        }
+        let dispatched = delivery.clone();
+        match self
+            .store
+            .writer()
+            .write(move |tx| runner::record(tx, &dispatched, &terms, class, now))
+        {
+            // Recorded, not dispatched: the job row is the work; GitHub runs that job itself.
+            Ok(()) => Ok(Outcome::Ignored("runner_job")),
+            Err(StoreError::Conflict) => Ok(Outcome::Skipped),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Settle a delivery with its reason and its audit row in one transaction.
+    fn refuse(
+        &self,
+        delivery: &Delivery,
+        reason: &'static str,
+        now: UnixMillis,
+    ) -> Result<Outcome, StoreError> {
+        let settled = delivery.clone();
+        match self
+            .store
+            .writer()
+            .write(move |tx| runner::refuse(tx, &settled, reason, now))
+        {
+            Ok(()) => Ok(Outcome::Failed {
+                reason,
+                detail: None,
+            }),
+            Err(StoreError::Conflict) => Ok(Outcome::Skipped),
+            Err(e) => Err(e),
+        }
     }
 
     fn plan(

@@ -392,6 +392,7 @@ fn fixture(dir: &std::path::Path, app_endpoint: &str) -> Result<(Fixture, Github
                     personal: false,
                     suspended: false,
                     permissions_valid: true,
+                    runner: sentinel_core::RunnerPermissions::ALL,
                     expected: 0,
                 },
                 now,

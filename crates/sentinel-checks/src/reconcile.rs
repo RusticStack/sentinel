@@ -301,6 +301,10 @@ impl Worker {
             personal: installed.personal,
             suspended: installed.suspended,
             permissions_valid: installed.permissions_valid,
+            runner: sentinel_core::RunnerPermissions::grants(
+                installed.actions_read,
+                installed.registers_runners,
+            ),
             expected: target.expected,
         };
         let login = std::mem::take(&mut installed.login);

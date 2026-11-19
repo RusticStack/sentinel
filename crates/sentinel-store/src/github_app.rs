@@ -426,6 +426,8 @@ pub struct Observed<'a> {
     pub personal: bool,
     pub suspended: bool,
     pub permissions_valid: bool,
+    /// What runner mode needs, as this snapshot states it.
+    pub runner: sentinel_core::RunnerPermissions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -470,6 +472,7 @@ pub fn bind(
             personal: observed.personal,
             suspended: observed.suspended,
             permissions_valid: observed.permissions_valid,
+            runner: observed.runner,
             expected: existing.map_or(0, |(_, version)| version as u64),
         },
         now,

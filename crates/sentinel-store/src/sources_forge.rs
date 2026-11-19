@@ -1,6 +1,6 @@
 use crate::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use sentinel_core::{InstallationId, RepoId, TenantId, UnixMillis};
+use sentinel_core::{InstallationId, RepoId, RunnerPermissions, TenantId, UnixMillis};
 
 pub struct Snapshot<'a> {
     pub external_id: u64,
@@ -9,6 +9,9 @@ pub struct Snapshot<'a> {
     pub personal: bool,
     pub suspended: bool,
     pub permissions_valid: bool,
+    /// What runner mode needs, as this snapshot states it; a withdrawn permission is
+    /// gone from here at the next refresh, which is what refuses a queued job at once.
+    pub runner: RunnerPermissions,
     pub expected: u64,
 }
 
@@ -18,6 +21,7 @@ struct Row {
     login: String,
     suspended: i64,
     permissions_valid: i64,
+    runner: i64,
 }
 
 pub fn refresh(tx: &Transaction<'_>, s: Snapshot<'_>, now: UnixMillis) -> Result<InstallationId> {
@@ -37,7 +41,7 @@ pub fn refresh(tx: &Transaction<'_>, s: Snapshot<'_>, now: UnixMillis) -> Result
     )?;
     let old = tx
         .query_row(
-            "SELECT account_id,account_personal,account_login,suspended,permissions_valid FROM installations WHERE id=?1",
+            "SELECT account_id,account_personal,account_login,suspended,permissions_valid,runner_permissions FROM installations WHERE id=?1",
             [id.as_bytes()],
             |r| {
                 Ok(Row {
@@ -46,6 +50,7 @@ pub fn refresh(tx: &Transaction<'_>, s: Snapshot<'_>, now: UnixMillis) -> Result
                     login: r.get(2)?,
                     suspended: r.get(3)?,
                     permissions_valid: r.get(4)?,
+                    runner: r.get(5)?,
                 })
             },
         )
@@ -62,16 +67,17 @@ pub fn refresh(tx: &Transaction<'_>, s: Snapshot<'_>, now: UnixMillis) -> Result
             && row.login == s.login
             && row.suspended == i64::from(s.suspended)
             && row.permissions_valid == i64::from(s.permissions_valid)
+            && row.runner == i64::from(s.runner.bits())
     }) {
         return Ok(id);
     }
-    if tx.execute("UPDATE installations SET account_id=?2,account_personal=?3,account_login=?4,suspended=?5,permissions_valid=?6,lifecycle_version=lifecycle_version+1 WHERE id=?1 AND lifecycle_version=?7",params![id.as_bytes(),s.account_id as i64,s.personal,s.login,s.suspended,s.permissions_valid,s.expected as i64])? != 1 { return Err(Error::Conflict); }
+    if tx.execute("UPDATE installations SET account_id=?2,account_personal=?3,account_login=?4,suspended=?5,permissions_valid=?6,runner_permissions=?8,lifecycle_version=lifecycle_version+1 WHERE id=?1 AND lifecycle_version=?7",params![id.as_bytes(),s.account_id as i64,s.personal,s.login,s.suspended,s.permissions_valid,s.expected as i64,i64::from(s.runner.bits())])? != 1 { return Err(Error::Conflict); }
     Ok(id)
 }
 
 // Removal disables issuance at once; only a fresh API snapshot may re-enable it.
 pub fn remove(tx: &Transaction<'_>, id: InstallationId) -> Result<()> {
-    if tx.execute("UPDATE installations SET suspended=1,permissions_valid=0,lifecycle_version=lifecycle_version+1 WHERE id=?1",[id.as_bytes()])? != 1 { return Err(Error::NotFound); }
+    if tx.execute("UPDATE installations SET suspended=1,permissions_valid=0,runner_permissions=0,lifecycle_version=lifecycle_version+1 WHERE id=?1",[id.as_bytes()])? != 1 { return Err(Error::NotFound); }
     Ok(())
 }
 

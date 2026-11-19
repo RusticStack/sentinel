@@ -179,6 +179,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     ),
     (67, include_str!("migrations/067_ai_policy.sql")),
     (68, include_str!("migrations/068_artifact_classes.sql")),
+    (69, include_str!("migrations/069_runner_mode.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -278,6 +279,10 @@ mod tests {
         (
             68,
             "an older controller writes artifacts without a class or a charge weight, so the repository quota it enforces would not count what a class weighs, and it cannot decode run spec format 8",
+        ),
+        (
+            69,
+            "an older controller re-reads a queued workflow_job delivery as failed:unsupported_event and completes a Sentinel check runner mode never publishes, and it knows neither the tenant's runner switch nor the installation's runner permissions",
         ),
     ];
 

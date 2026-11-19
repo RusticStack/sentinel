@@ -21,7 +21,7 @@ becomes a GitHub Check when the repository is forge-associated
 | Route | `POST /api/v1/intake/{repo}` | `POST /api/v1/hooks/github` |
 | Credential | per-repository hook secret (`Authorization: Bearer sentinel_hook_…`) | App webhook secret (HMAC-SHA256 over the raw body in `X-Hub-Signature-256`) |
 | Identity | the relay's own stable delivery ID | `X-GitHub-Delivery` |
-| Event | one ref transition (always `ref_update`) | `X-GitHub-Event` (`push`, `pull_request`, `merge_group`; control events below) |
+| Event | one ref transition (always `ref_update`) | `X-GitHub-Event` (`push`, `pull_request`, `merge_group`, `workflow_job`; control events below) |
 | Body limit | 64 KiB | 4 MiB |
 | Enabled by | a bound source and an issued hook secret | `<data_dir>/github-webhook.json`; without it the route is `not_found` |
 
@@ -142,6 +142,54 @@ Trust is decided from those facts, and only those facts:
   from that same revision, so what runs is exactly what was proposed for the
   base branch — and provenance records the verified merge commit, not the
   payload's claim.
+
+### Runner mode jobs
+
+A `workflow_job` event is **intake**, not control: signed, deduplicated on
+`X-GitHub-Delivery`, attributed through the bound installation, audited and
+resolved by the same lane, with no pipeline and no remote work (a runner-mode
+delivery never fetches anything). Three of its activities are acted on —
+`queued`, `in_progress` and `completed`; any other is answered
+`200 {"ignored": "runner_action"}` without a stored row, a job whose labels name
+no Sentinel class is `{"ignored": "runner_label"}`, and an unbound repository is
+`{"ignored": "unbound_repository"}` like every other event.
+
+Ingest stores the delivery with its **terms** (`runner_deliveries`, migration
+67): the activity, GitHub's job and run ids, the label set its `runs-on:` asked
+for, and the runner and conclusion the later activities state. The delivery
+carries no ref — the job names its own commit — so validation settles it `ready`
+without the ref checks and resolution hands it to the runner branch instead of
+the pipeline branch.
+
+Resolution keeps **one row per GitHub job** (`runner_jobs`, keyed by the
+repository and GitHub's job id), so duplicates and reordered deliveries cannot
+create a second job or move one backwards:
+
+| Delivery | What it does |
+|---|---|
+| `queued` | One durable job of the class its label names, `state_code` 0. The same job delivered again under another delivery id does nothing; a later `queued` for a job already past that state does nothing |
+| `in_progress` | `state_code` 1 and the runner GitHub assigned; the start stamp is the first sighting |
+| `completed` | `state_code` 2, the conclusion and the completion stamp; a start never seen stays absent, never zero |
+
+A **refusal** is a decision, settled with its reason and one `source_audit` row,
+never retried: the tenant's runner mode is off (`failed:runner_mode_off`), the
+installation no longer grants what runner mode needs
+(`failed:runner_permissions` — checked from the last installation snapshot, so a
+withdrawn permission stops the flow without asking GitHub), the repository is
+bound through no live installation (`failed:runner_no_installation`), the
+deployment does not serve the class (`failed:runner_class_unavailable`), or the
+label set names two classes (`failed:runner_labels_conflict`). Only a `queued`
+job is judged by the tenant's switch and permissions: `in_progress` and
+`completed` record what GitHub did with a job Sentinel already has.
+
+A delivery that produced a job settles **`ignored:runner_job`**: GitHub runs
+that job itself, so the delivery dispatches no run of Sentinel's own —
+`dispatched` means having one, which the store's check enforces — and nothing is
+owed. A runner-mode delivery publishes **no Sentinel check at all**, because
+GitHub reports the job under the workflow's own name. Admission, retention and
+purging are the same as for every other delivery; the job rows are not, because
+they are what provisioning works from ([sources](sources.md#workflow-jobs),
+[GitHub App](github-app.md#runner-mode-permissions)).
 
 ## Hook secrets
 
@@ -465,6 +513,7 @@ above, which supersedes a push the branch already moved past.
 | `<data_dir>/intake-work/` | per-delivery scratch repositories for phase two; discarded and recreated on start |
 | `<data_dir>/poll-work/` | per-repository scratch for poll credential helpers; discarded and recreated on start |
 | `<data_dir>/github-app.json` | the App that authorizes source access **and** publishes Checks ([checks](checks.md)) |
+| `<data_dir>/runner-classes.json` | the runner-mode classes this deployment serves (`{"classes": ["sentinel-4vcpu-ubuntu-2404", …]}`); absent, every queued job of a Sentinel class is refused ([configuration](configuration.md#runner-classes)) |
 
 ## Verification
 
@@ -518,6 +567,25 @@ above, which supersedes a push the branch already moved past.
 - `crates/sentinel-git/tests/ancestry.rs` (Unix, needs `git`): the ancestry
   window, force-pushed tips, and unauthenticated fetches refusing `ssh`,
   `git://` and plain `http://`.
+- `crates/sentinel-intake/tests/runner.rs`: runner mode end to end over a real
+  store and resolver — an unbound repository and one bound through another
+  installation refused and neither stored, another runner's labels and an
+  unhandled activity acknowledged without a row, a `queued` job becoming one
+  located job of its class with its later activities updating it, a duplicate
+  and a reordered delivery changing nothing, the switch off, a withdrawn
+  permission and a removed App refusing the next queued job (the removed App at
+  ingest, before a row exists), a class the deployment does not serve and a
+  label set naming two classes refused with their audit rows, no Sentinel check
+  published, and a canary scan of every answer, row and the database file for
+  registration text a payload carried.
+- `crates/sentinel-store/tests/runner.rs`: the switch refused naming exactly
+  what the installations lack (organization and personal namespaces), accepted
+  and audited once it is granted, idempotent, administrator-only, and the flow
+  stopping at once on a withdrawn permission or a removed App.
+- `crates/sentinel-api/tests/runner_mode.rs`: the two routes over loopback — the
+  classes and missing permissions read, a `409` naming exactly what is missing,
+  the switch accepted and audited once, `not_configured` without an
+  installation, and a credential without tenant administration refused.
 - `crates/sentinel-intake/tests/flow.rs`: both ingest paths over a real store,
   including signature/tamper refusals, pull-request terms, merge-group
   acceptance with its terms, dedup and audit, a misplaced merge-group action, an

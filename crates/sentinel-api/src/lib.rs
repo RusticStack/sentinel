@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 
-use sentinel_core::UserId;
+use sentinel_core::{RunnerClass, UserId};
 use sentinel_link::controller::Handle;
 use sentinel_store::{Store, logs::LogStore, objects::Objects};
 
@@ -136,6 +136,8 @@ pub struct Options {
     /// Called after a machine redeems an enrollment, so the controller admits its Tailcat node key
     /// at once instead of at its next periodic pass.
     pub on_worker_enrolled: Option<Notify>,
+    /// The runner-mode classes this deployment serves (`runner-classes.json`).
+    pub runner_classes: Arc<[RunnerClass]>,
 }
 
 /// A callback the embedding controller hands the API.
@@ -150,6 +152,7 @@ impl std::fmt::Debug for Notify {
 
 pub(crate) struct State {
     pub auto_join: Vec<AutoJoinRule>,
+    pub runner_classes: Arc<[RunnerClass]>,
     pub mail: Option<Arc<sentinel_mail::Resend>>,
     pub worker_bootstrap: Option<Arc<WorkerBootstrap>>,
     pub on_worker_enrolled: Option<Notify>,
@@ -291,6 +294,7 @@ impl Server {
         let refresh = refresh::Refresh::start(Arc::downgrade(&config.store))?;
         let state = Arc::new(State {
             auto_join: options.auto_join,
+            runner_classes: options.runner_classes,
             mail: options.mail,
             worker_bootstrap: options.worker_bootstrap,
             on_worker_enrolled: options.on_worker_enrolled,

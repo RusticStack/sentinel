@@ -116,6 +116,12 @@ pub struct Installation {
     pub personal: bool,
     pub suspended: bool,
     pub permissions_valid: bool,
+    /// Actions read: `workflow_job` deliveries reach this installation.
+    pub actions_read: bool,
+    /// A self-hosted runner can be registered through this installation — organization
+    /// self-hosted runners write, or repository administration write inside a personal
+    /// namespace, which has no organization to register one in.
+    pub registers_runners: bool,
 }
 
 pub struct Token {
@@ -669,6 +675,12 @@ fn parse_installation(v: &Value, app: u64, id: u64) -> Result<Installation> {
             v["permissions"]["contents"].as_str(),
             Some("read" | "write")
         ) && v["permissions"]["checks"].as_str() == Some("write"),
+        actions_read: v["permissions"]["actions"].as_str() == Some("read"),
+        registers_runners: if personal {
+            v["permissions"]["administration"].as_str() == Some("write")
+        } else {
+            v["permissions"]["organization_self_hosted_runners"].as_str() == Some("write")
+        },
     })
 }
 
@@ -726,6 +738,25 @@ mod tests {
         assert!(!parse_installation(&v, 2, 4).unwrap().permissions_valid);
         v["suspended_at"] = json!("2026-09-14T00:00:00Z");
         assert!(parse_installation(&v, 2, 4).unwrap().suspended);
+    }
+
+    #[test]
+    fn runner_mode_permissions_follow_the_account_kind() {
+        let mut v = json!({"id":4,"app_id":2,"account":{"id":9,"login":"sample","type":"Organization"},"suspended_at":null,"permissions":{"contents":"read","checks":"write","actions":"read","organization_self_hosted_runners":"write"}});
+        let org = parse_installation(&v, 2, 4).unwrap();
+        assert!(org.actions_read && org.registers_runners && !org.personal);
+        // A personal namespace has no organization to register a runner in: the
+        // organization grant alone is not enough there, administration write is.
+        v["account"]["type"] = json!("User");
+        let personal = parse_installation(&v, 2, 4).unwrap();
+        assert!(personal.actions_read && !personal.registers_runners && personal.personal);
+        v["permissions"]["administration"] = json!("write");
+        assert!(parse_installation(&v, 2, 4).unwrap().registers_runners);
+        v["permissions"]["actions"] = json!("write");
+        assert!(!parse_installation(&v, 2, 4).unwrap().actions_read);
+        v["permissions"].as_object_mut().unwrap().remove("actions");
+        let without = parse_installation(&v, 2, 4).unwrap();
+        assert!(!without.actions_read && without.registers_runners);
     }
     #[test]
     fn token_is_read_only_short_lived_and_debug_redacted() {

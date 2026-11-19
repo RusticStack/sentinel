@@ -301,6 +301,7 @@ fn fixture() -> Fixture {
                         personal: false,
                         suspended: false,
                         permissions_valid: true,
+                        runner: sentinel_core::RunnerPermissions::ALL,
                         expected: 0,
                     },
                     UnixMillis::now(),
@@ -338,6 +339,7 @@ fn fixture() -> Fixture {
         Some(Arc::clone(&key)),
         None,
         Arc::clone(&destinations),
+        Arc::from(Vec::new()),
         Arc::new(sentinel_intake::resolve::GitFetch),
         dir.path().join("work"),
         Config {
@@ -1037,6 +1039,7 @@ fn app_resolver(f: &Fixture, name: &str, fetch: Arc<dyn Fetch>) -> (Resolver, Gi
         None,
         Some(app),
         Arc::clone(&f.destinations),
+        Arc::from(Vec::new()),
         fetch,
         f.dir.path().join(format!("work-{name}")),
         Config {

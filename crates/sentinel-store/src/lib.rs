@@ -32,6 +32,7 @@ pub mod registration;
 pub mod replicate;
 pub mod reseal;
 pub mod retention;
+pub mod runner;
 pub mod runs;
 pub mod schema;
 pub mod secrets;

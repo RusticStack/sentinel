@@ -104,20 +104,27 @@ An unreachable controller can still create the App: everything outbound works �
 
 ## Permissions and events
 
-Exactly what the controller uses today ([CLAUDE.md](../CLAUDE.md): a feature that needs more asks for it only when a tenant turns it on, so nothing for runner mode or migration):
+The App is one App, as the plan decided (16.10): the permissions every feature can need are in its
+manifest, so a deployment stays one click and one binding, and what is conditional is the **check**,
+not the request — runner mode's two are verified only for a tenant that turns it on
+([runner mode](#runner-mode-permissions)). Guided migration's writes join them the same way when it
+lands.
 
 | Permission | Access | Why |
 |---|---|---|
+| `actions` | read | required to receive `workflow_job` events, which is how a runner-mode job arrives ([intake](intake.md#runner-mode-jobs)); verified only for a tenant with runner mode on |
+| `administration` | write | register a just-in-time self-hosted runner in a **personal** namespace, which has no organization ([runner mode](#runner-mode-permissions)); verified only with runner mode on |
 | `checks` | write | publish check runs and suites ([checks](checks.md)); also what `check_run`/`check_suite` events need |
 | `contents` | read | source tokens for resolution, jobs and polling, and reconciliation ([intake](intake.md), [sources](sources.md)); also what `push` events need |
 | `metadata` | read | GitHub's mandatory baseline; the repository and collaborator-permission reads of membership derivation |
+| `organization_self_hosted_runners` (organization) | write | register a just-in-time self-hosted runner in an organization ([runner mode](#runner-mode-permissions)); verified only with runner mode on |
 | `pull_requests` | read | required to receive `pull_request` events (intake) |
 | `merge_queues` | read | **not requested by the manifest**: GitHub delivers `merge_group` events only to an App that holds it, and it is granted on GitHub to a deployment whose repositories use a merge queue (intake, [sources](sources.md#merge-groups)). A repository without a queue never emits the event, so nothing needs it until then ([CLAUDE.md](../CLAUDE.md): a feature that needs more asks for it only when a tenant turns it on) |
 | `members` (organization) | read | membership of GitHub-backed organizations ([GitHub sign-in](github-sign-in.md#github-backed-organizations)) and the owner proof when binding an organization's installation |
 
 Sign-in reads only the numeric account id (`GET /user`) and asks no scope or account permission; email is never an identity.
 
-Events the manifest subscribes to: `push`, `pull_request`, `check_run`, `check_suite`, `repository`, `organization`, `membership`, `member`, `team`. `installation` and `installation_repositories` reach every App without a subscription.
+Events the manifest subscribes to: `push`, `pull_request`, `check_run`, `check_suite`, `repository`, `organization`, `membership`, `member`, `team`, `workflow_job`. `installation` and `installation_repositories` reach every App without a subscription.
 
 `merge_group` is the one intake event the manifest does not ask for, because it
 needs the repository permission **Merge queues: read** and a repository that uses
@@ -129,6 +136,44 @@ delivery log shows no `merge_group` deliveries, which is how to tell this apart
 from a refused delivery (`admin intake list` shows none). Existing installations
 get the permission with their next accepted permission change; GitHub does not
 deliver the event until an owner approves it.
+
+## Runner mode permissions
+
+Runner mode needs two permissions the base App does not ([plan 16.10](../plan.md#1610-github-actions-runner-mode)):
+
+| Need | Organization namespace | Personal namespace |
+|---|---|---|
+| `workflow_job` deliveries | `actions` read | `actions` read |
+| Register a just-in-time runner | `organization_self_hosted_runners` write | `administration` write |
+
+They live in the one App's manifest, and the controller **verifies** them per installation, only
+for a tenant that turned runner mode on. Enabling is refused while any of the tenant's live
+installations lacks one — every installation it administers, whether or not a repository is bound
+through it yet — and the answer names exactly what is missing:
+
+```json
+{"schema": "sentinel.error/1", "code": "conflict", "retryable": false,
+ "message": "the GitHub App's installations do not grant what runner mode needs",
+ "details": {"missing": ["actions", "organization_self_hosted_runners"]}}
+```
+
+`GET /tenants/{slug}/runner-mode` states the same thing before anyone tries: the classes this
+deployment serves ([configuration](configuration.md#runner-classes)) and the names still missing.
+Granting a permission is a change on GitHub's side (the App's settings, then the installation's
+approval); the next installation snapshot the controller reads records it, and the switch is
+accepted. **Withdrawing** one is the same path in reverse and needs no restart: the snapshot drops
+the bit and the next queued job is refused at once with `failed:runner_permissions` and an audit
+row ([intake](intake.md#runner-mode-jobs)).
+
+Removing the App is stronger: `installation` `deleted` (or `suspend`) suspends the installation and
+clears every runner permission in the same transaction, so the repositories it authorized are no
+longer delivery targets at all — GitHub's next `workflow_job` is answered
+`{"ignored": "unbound_repository"}` before a row exists, and nothing is provisioned. An installation
+abandoned by a `repository` rename loses only that repository's binding the same way.
+
+The manifest now subscribes to `workflow_job`, so an installation approved before this release
+receives no such event and grants none of the three permissions until an owner approves the
+change; until then enabling runner mode is refused naming them.
 
 ## Failure modes and recovery
 

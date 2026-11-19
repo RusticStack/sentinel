@@ -84,6 +84,9 @@ fn an_upgrade_keeps_a_copy_of_the_database_from_before_it() {
     assert!(readable.contains(&(52, 51)), "{readable:?}");
     assert!(readable.contains(&(53, 51)), "{readable:?}");
     assert!(readable.contains(&(57, 56)), "{readable:?}");
+    assert!(readable.contains(&(67, 66)), "{readable:?}");
+    assert!(readable.contains(&(68, 68)), "{readable:?}");
+    assert!(readable.contains(&(69, 69)), "{readable:?}");
     let (_, again) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
     assert!(again.is_none());
     let other = dir.path().join("other");
@@ -433,7 +436,7 @@ fn upgrade_sources() -> Vec<u32> {
 fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expects() {
     // docs/upgrades.md (tests/compat_doc.rs compares it with the code): a database at schema N
     // runs on release R only when no migration in (R, N] declares a readable_by above R. Rows
-    // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, LATEST.
+    // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, 68, LATEST.
     let readable = |db: &Connection, release: u32, newest: u32| -> bool {
         let needs: u32 = db
             .query_row(
@@ -446,11 +449,11 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        68,
+        69,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
-    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 67]);
+    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 67, 68]);
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.sqlite");
@@ -465,7 +468,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         drop(store);
         assert_eq!(version(&path), schema::LATEST, "from {from}");
         let db = Connection::open(&path).unwrap();
-        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68]
+        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68, 69]
             .iter()
             .map(|&newest| from >= newest || readable(&db, from, newest))
             .collect();
@@ -478,21 +481,27 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         // nothing older — an older controller settles a merge-group delivery it re-reads as
         // failed:unsupported_event — so 63, 64 and 65 all stop at 65. Migration 67 (the AI policy)
         // is readable by 66, so 66 runs on a database at 67 while 65 does not. Migration 68
-        // (artifact classes) is readable by nothing older, so 67 stops at 67.
+        // (artifact classes) is readable by nothing older, so 67 stops at 67, and migration 69
+        // (runner mode) is readable by nothing either: an older controller re-reads a queued
+        // workflow_job delivery as failed:unsupported_event and completes a check runner mode never
+        // publishes, and it knows neither the tenant's switch nor the installation's permissions.
         let expected = match from {
-            44 | 47 | 48 => [false, false, false, false, false, false, false, false],
-            51 => [true, false, false, false, false, false, false, false],
-            56 => [true, true, false, false, false, false, false, false],
-            57 => [true, true, true, false, false, false, false, false],
-            63 => [true, true, true, true, false, false, false, false],
-            64 | 65 => [true, true, true, true, true, false, false, false],
-            66 => [true, true, true, true, true, true, true, false],
-            67 => [true, true, true, true, true, true, true, false],
+            44 | 47 | 48 => [
+                false, false, false, false, false, false, false, false, false,
+            ],
+            51 => [true, false, false, false, false, false, false, false, false],
+            56 => [true, true, false, false, false, false, false, false, false],
+            57 => [true, true, true, false, false, false, false, false, false],
+            63 => [true, true, true, true, false, false, false, false, false],
+            64 | 65 => [true, true, true, true, true, false, false, false, false],
+            66 => [true, true, true, true, true, true, true, false, false],
+            67 => [true, true, true, true, true, true, true, false, false],
+            68 => [true, true, true, true, true, true, true, true, false],
             _ => unreachable!(),
         };
         assert_eq!(
             ok, expected,
-            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68"
+            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69"
         );
     }
 }
