@@ -480,9 +480,9 @@ fn tenant_storage(state: &State, request: &Request, slug: &str) -> Route {
 fn deployment_storage(state: &State, request: &Request) -> Route {
     platform(state, request, false)?;
     let d = state.objects.deployment();
-    let stored = state
+    let (stored, classes) = state
         .store
-        .read(retention::deployment_usage)
+        .read(|c| Ok((retention::deployment_usage(c)?, retention::classes(c)?)))
         .map_err(store_error)?;
     let total = sentinel_store::space::total_bytes(state.objects.root()).ok();
     let admission = state.objects.admission();
@@ -508,6 +508,14 @@ fn deployment_storage(state: &State, request: &Request) -> Route {
         "log_retention_ms": d.log_retention_ms,
         "artifact_retention_ms": d.artifact_retention_ms,
         "run_artifact_bytes": d.run_artifact_bytes,
+        "artifact_classes": {
+            "default_class": classes.default_class,
+            "classes": classes.classes.iter().map(|c| json!({
+                "name": c.name,
+                "max_age_ms": c.max_age_ms,
+                "weight": c.weight,
+            })).collect::<Vec<_>>(),
+        },
         "s3": state.objects.replication().map(|r| {
             use std::sync::atomic::Ordering::Relaxed;
             let at = |v: i64| (v > 0).then_some(v);

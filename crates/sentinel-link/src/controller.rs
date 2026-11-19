@@ -305,6 +305,7 @@ struct InFlight {
     job: sentinel_core::JobId,
     name: String,
     retain_secs: u64,
+    class: Option<String>,
     done: Vec<(String, u32, objects::Staged)>,
     accounted: u64,
     last_path: String,
@@ -1844,6 +1845,7 @@ impl Inner {
     ) {
         let (tenant, run, job) = (f.tenant, f.run, f.job);
         let name = f.name.clone();
+        let class = f.class.clone();
         // Only a captured artifact keeps what it staged; a failed one discards it, so it holds
         // no bytes against the repository's quota.
         let captured = state == artifacts::State::Captured;
@@ -1859,13 +1861,14 @@ impl Inner {
                 .saturating_add(f.retain_secs.saturating_mul(1000) as i64),
         );
         let _ = self.write(move |tx| {
-            artifacts::record(
+            artifacts::record_class(
                 tx,
                 tenant,
                 run,
                 job,
                 attempt,
                 &name,
+                class.as_deref(),
                 state,
                 manifest_version,
                 entries,
@@ -2582,6 +2585,7 @@ impl SessionHandler for Inner {
                 job,
                 name: name.to_string(),
                 retain_secs: decl.retain_secs,
+                class: decl.class.clone(),
                 done: Vec::new(),
                 accounted: 0,
                 last_path: String::new(),
@@ -2716,6 +2720,7 @@ impl SessionHandler for Inner {
         self.settle(attempt, f);
         let done = std::mem::take(&mut f.done);
         let (tenant, run, job, retain_secs) = (f.tenant, f.run, f.job, f.retain_secs);
+        let class = f.class.clone();
         let artifact_name = std::mem::take(&mut f.name);
         drop(guard);
         let entries: Vec<objects::Entry> = done
@@ -2749,13 +2754,14 @@ impl SessionHandler for Inner {
                 for s in staged {
                     objects.discard(tx, s)?;
                 }
-                artifacts::record(
+                artifacts::record_class(
                     tx,
                     tenant,
                     run,
                     job,
                     attempt,
                     &artifact_name,
+                    class.as_deref(),
                     artifacts::State::Failed,
                     None,
                     0,
@@ -2775,13 +2781,14 @@ impl SessionHandler for Inner {
                 &manifest,
                 &entries,
             )?;
-            artifacts::record(
+            artifacts::record_class(
                 tx,
                 tenant,
                 run,
                 job,
                 attempt,
                 &artifact_name,
+                class.as_deref(),
                 artifacts::State::Captured,
                 Some(version),
                 count,

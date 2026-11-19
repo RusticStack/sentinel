@@ -684,6 +684,43 @@ fn database_at_latest_without_classes(path: &Path) {
     let db = Connection::open(path).unwrap();
     db.execute_batch(
         "PRAGMA foreign_keys = ON;
+         DROP TRIGGER artifacts_class_known;
+         DROP TRIGGER repo_usage_artifact_reweigh;
+         DROP TRIGGER repo_usage_artifact_ins;
+         DROP TRIGGER repo_usage_artifact_del;
+         DROP TRIGGER artifacts_retention_cap;
+         DROP INDEX artifacts_class_reapply;
+         DROP TABLE artifact_classes;
+         ALTER TABLE artifacts DROP COLUMN class;
+         ALTER TABLE artifacts DROP COLUMN charged_bytes;
+         ALTER TABLE artifacts DROP COLUMN pinned_ms;
+         ALTER TABLE storage_defaults DROP COLUMN default_class;
+         CREATE TRIGGER repo_usage_artifact_ins AFTER INSERT ON artifacts
+             WHEN NEW.bytes > 0 BEGIN
+             INSERT OR IGNORE INTO repo_usage(tenant_id, repo_id)
+                 SELECT NEW.tenant_id, repo_id FROM runs WHERE id = NEW.run_id;
+             UPDATE repo_usage SET artifact_bytes = artifact_bytes + NEW.bytes
+                 WHERE tenant_id = NEW.tenant_id
+                   AND repo_id = (SELECT repo_id FROM runs WHERE id = NEW.run_id);
+         END;
+         CREATE TRIGGER repo_usage_artifact_del AFTER DELETE ON artifacts
+             WHEN OLD.bytes > 0 BEGIN
+             UPDATE repo_usage SET artifact_bytes = artifact_bytes - OLD.bytes
+                 WHERE tenant_id = OLD.tenant_id
+                   AND repo_id = (SELECT repo_id FROM runs WHERE id = OLD.run_id);
+         END;
+         CREATE TRIGGER artifacts_retention_cap AFTER INSERT ON artifacts BEGIN
+             UPDATE artifacts SET retain_until_ms = MIN(retain_until_ms, COALESCE(created_ms + (
+                 SELECT MIN(COALESCE(rp.artifact_retention_ms, tp.ms), tp.ms) FROM
+                     (SELECT COALESCE(
+                         (SELECT artifact_retention_ms FROM storage_policies
+                          WHERE tenant_id = NEW.tenant_id AND repo_id = X''),
+                         (SELECT artifact_retention_ms FROM storage_defaults WHERE id = 1)) AS ms) tp
+                     LEFT JOIN storage_policies rp ON rp.tenant_id = NEW.tenant_id
+                         AND rp.repo_id = (SELECT repo_id FROM runs WHERE id = NEW.run_id)),
+                 retain_until_ms))
+             WHERE id = NEW.id;
+         END;
          DROP TRIGGER class_usage_object_ins; DROP TRIGGER class_usage_object_del;
          DROP TRIGGER class_usage_ref_ins; DROP TRIGGER class_usage_ref_del;
          DROP TRIGGER class_usage_upload_ins; DROP TRIGGER class_usage_upload_close;

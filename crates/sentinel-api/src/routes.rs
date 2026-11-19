@@ -743,6 +743,9 @@ pub(crate) fn route(
             artifact_link(state, request, run, art)
         }
         ("GET", ["dl", token]) => redeem_link(state, token),
+        ("PUT" | "DELETE", ["api", "v1", "runs", run, "artifacts", art, "pin"]) => {
+            artifact_pin(state, request, run, art, method == "PUT")
+        }
         ("GET", ["api", "v1", "attempts", attempt, "logs"]) => {
             attempt_logs(state, request, attempt, query)
         }
@@ -1291,6 +1294,23 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
              push the pipeline to a bound revision",
         )
         .with_detail("reason", "manual_run_secrets"));
+    }
+    // A class the deployment does not define is refused here too, not only when the artifact is
+    // recorded: a manual run that could never publish its artifacts should not be created.
+    let classes = state
+        .store
+        .read(sentinel_store::retention::artifact_classes)
+        .map_err(store_error)?;
+    let declared = compiled
+        .jobs
+        .iter()
+        .flat_map(|job| job.spec.artifacts.iter())
+        .filter_map(|a| a.class.as_deref());
+    if let Some(unknown) = sentinel_store::retention::unknown_class(&classes, declared) {
+        return Err(err(
+            ErrorCode::InvalidRequest,
+            format!("pipeline: artifact class `{unknown}` is not defined by this deployment"),
+        ));
     }
     let source = PinnedSource::new(
         &dispatch.source.repo,
@@ -1924,9 +1944,43 @@ fn artifact_json(row: &artifacts::Row) -> Value {
         "manifest_version": row.manifest_version,
         "entries": row.entries,
         "bytes": row.bytes,
+        "class": row.class,
+        "charged_bytes": row.charged_bytes,
         "retain_until_ms": row.retain_until_ms.0,
+        "pinned_ms": row.pinned_ms.map(|p| p.0),
         "created_ms": row.created_ms.0,
     })
+}
+
+/// Pin keeps an artifact past its deadline (and its bytes counted) until an administrator unpins it;
+/// unpinning puts the stored deadline back into effect.
+fn artifact_pin(state: &State, request: &mut Request, run: &str, art: &str, pin: bool) -> Route {
+    let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::ARTIFACTS_READ)?;
+    auth::require_scope(&who, Scopes::TENANT_ADMIN)?;
+    let (run, art): (RunId, ArtifactId) = (id(run, "run")?, id(art, "artifact")?);
+    let authority = who.authority();
+    let pinned = state
+        .store
+        .writer()
+        .write(move |tx| {
+            let tenant = lookup::run_tenant(tx, run)?;
+            if pin {
+                Ok(Some(sentinel_store::retention::pin(
+                    tx,
+                    &authority,
+                    tenant,
+                    run,
+                    art,
+                    UnixMillis::now(),
+                )?))
+            } else {
+                sentinel_store::retention::unpin(tx, &authority, tenant, run, art)?;
+                Ok(None)
+            }
+        })
+        .map_err(store_error)?;
+    ok(json!({ "pinned_ms": pinned.map(|at| at.0) }))
 }
 
 fn upload_json(upload: UploadId, status: &sentinel_store::objects::UploadStatus) -> Value {
@@ -2135,8 +2189,8 @@ fn artifact_archive(
             let (tenant, _) = authz::require_repo_slug(c, who.principal, repo, Permissions::READ)?;
             let row = artifacts::get(c, tenant, run, art)?;
             // Retention is re-checked here and not only by the sweep: an artifact past its deadline is gone to the
-            // client from the moment it is due, whatever the maintenance pass has reached.
-            if row.retain_until_ms <= UnixMillis::now() {
+            // client from the moment it is due, whatever the maintenance pass has reached. A pin holds it.
+            if row.pinned_ms.is_none() && row.retain_until_ms <= UnixMillis::now() {
                 return Err(StoreError::NotFound);
             }
             let Some(version) = row.manifest_version else {
@@ -2281,9 +2335,9 @@ fn artifact_link(state: &State, request: &mut Request, run: &str, art: &str) -> 
             let repo = lookup::run_repo(c, run)?;
             let (tenant, _) = authz::require_repo_slug(c, who.principal, repo, Permissions::READ)?;
             let row = artifacts::get(c, tenant, run, art)?;
-            // A link is minted only while the artifact is downloadable: past its deadline, or with no manifest,
-            // there is nothing it could redeem to.
-            if row.retain_until_ms <= UnixMillis::now() {
+            // A link is minted only while the artifact is downloadable: past its deadline unless a pin holds it, or
+            // with no manifest, there is nothing it could redeem to.
+            if row.pinned_ms.is_none() && row.retain_until_ms <= UnixMillis::now() {
                 return Err(StoreError::NotFound);
             }
             let Some(version) = row.manifest_version else {
@@ -2332,8 +2386,9 @@ fn redeem_link(state: &State, token: &str) -> Route {
     let (row, manifest) = match state.store.read(|c| {
         let row = artifacts::for_link(c, link.tenant, link.artifact)?;
         // Retention and tenant status are re-checked at redemption: minting authorized a caller once, and this is what
-        // makes a link worthless from the moment its artifact is due, whatever happens to the minting session.
-        if row.retain_until_ms <= now {
+        // makes a link worthless from the moment its artifact is due unless a pin holds it, whatever happens to the
+        // minting session.
+        if row.pinned_ms.is_none() && row.retain_until_ms <= now {
             return Err(StoreError::NotFound);
         }
         let Some(version) = row.manifest_version else {

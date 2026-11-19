@@ -23,6 +23,7 @@ pub const MAX_LABELS: usize = 8;
 pub const MAX_SECRETS: usize = 16;
 pub const MAX_RUN_BYTES: usize = 4096;
 pub const MAX_ID_BYTES: usize = 64;
+pub const MAX_CLASS_NAME: usize = 32;
 pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 60 * 60;
 
@@ -174,6 +175,8 @@ pub struct Artifact {
     pub when: ArtifactWhen,
     pub retain_secs: u64,
     pub required: bool,
+    /// The deployment's retention class, by name; `None` takes the deployment's default class.
+    pub class: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -542,6 +545,16 @@ pub fn valid_id(s: &str) -> bool {
     !b.is_empty()
         && b.len() <= MAX_ID_BYTES
         && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-')
+}
+
+/// An artifact class name: what a deployment may define (`artifact_classes.name`).
+pub fn valid_class_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.len() <= MAX_CLASS_NAME
+        && b[0].is_ascii_lowercase()
         && b.iter()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-')
 }
@@ -1038,6 +1051,22 @@ fn artifact(path: &str, node: &Node) -> Result<Artifact> {
         None => false,
         Some(n) => expect_bool(&map.child("required"), n)?,
     };
+    let class = match map.take("class") {
+        None => None,
+        Some(n) => {
+            let child = map.child("class");
+            let name = expect_str(&child, n, MAX_CLASS_NAME)?;
+            if !valid_class_name(name) {
+                return Err(err(
+                    &child,
+                    SchemaErrorKind::Invalid(
+                        "expected 1-32 lowercase letters, digits, `_` or `-`".into(),
+                    ),
+                ));
+            }
+            Some(name.to_owned())
+        }
+    };
     map.finish()?;
     Ok(Artifact {
         name,
@@ -1045,6 +1074,7 @@ fn artifact(path: &str, node: &Node) -> Result<Artifact> {
         when,
         retain_secs,
         required,
+        class,
     })
 }
 

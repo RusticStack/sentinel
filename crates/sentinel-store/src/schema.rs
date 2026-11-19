@@ -178,6 +178,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("migrations/066_merge_group_deliveries.sql"),
     ),
     (67, include_str!("migrations/067_ai_policy.sql")),
+    (68, include_str!("migrations/068_artifact_classes.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -273,6 +274,10 @@ mod tests {
         (
             66,
             "an older controller re-reads a queued merge-group delivery as failed:unsupported_event and completes a required check the merge queue is waiting on, and it reads no queue branch into provenance",
+        ),
+        (
+            68,
+            "an older controller writes artifacts without a class or a charge weight, so the repository quota it enforces would not count what a class weighs, and it cannot decode run spec format 8",
         ),
     ];
 

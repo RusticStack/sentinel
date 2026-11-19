@@ -278,6 +278,8 @@ fn call(
     let mut request = match method {
         "GET" => agent.get(&url).force_send_body(),
         "POST" => agent.post(&url),
+        "PUT" => agent.put(&url),
+        "DELETE" => agent.delete(&url).force_send_body(),
         _ => unreachable!(),
     };
     if let Some(auth) = auth {
@@ -2399,6 +2401,16 @@ fn artifact_routes_are_authorized_and_scoped() {
     assert_eq!(status, 200);
     let rows = rows["artifacts"].as_array().unwrap();
     assert_eq!(rows.len(), 2, "{rows:?}");
+    let report = rows.iter().find(|r| r["state"] == "captured").unwrap();
+    assert_eq!(
+        report["class"], "standard",
+        "the deployment's default class"
+    );
+    assert_eq!(
+        report["charged_bytes"], 12,
+        "its bytes at the class's weight"
+    );
+    assert_eq!(report["pinned_ms"], serde_json::json!(null));
     let (status, detail) = call(
         &d,
         "GET",
@@ -2484,6 +2496,71 @@ fn artifact_routes_are_authorized_and_scoped() {
             .secret
         )
     );
+    // A pin is the tenant administrator's retention decision, not an operator's and not a reader's.
+    let pin = format!("/api/v1/runs/{run}/artifacts/{captured}/pin");
+    let (status, _) = call(&d, "PUT", &pin, None, Some(&reader_auth), &[]);
+    assert_eq!(status, 403, "a reader pinned an artifact");
+    let tenant_token = {
+        let (root, tenant) = (d.root, d.tenant);
+        let user = UserId::new();
+        d.store
+            .writer()
+            .write(move |tx| {
+                provisioning::insert_human(tx, user, "Olive", false, now)?;
+                auth::set_membership(
+                    tx,
+                    Principal::new(root, P::ALL, None, None),
+                    tenant,
+                    user,
+                    sentinel_core::auth::Role::TenantAdmin,
+                )
+            })
+            .unwrap();
+        let granted = tokens::provision(
+            &d.store,
+            Grant {
+                user,
+                name: "olive",
+                permissions: P::READ.union(P::TENANT_ADMIN),
+                tenant: None,
+                repo: None,
+                lifetime_ms: 60_000,
+            },
+            now,
+        )
+        .unwrap();
+        format!("Bearer {}", sentinel_auth::token::format(&granted.secret))
+    };
+    let (status, body) = call(&d, "PUT", &pin, None, Some(&tenant_token), &[]);
+    assert_eq!(status, 200, "{body}");
+    let pinned = body["pinned_ms"].as_i64().expect("a pin time");
+    let (status, body) = call(&d, "PUT", &pin, None, Some(&tenant_token), &[]);
+    assert_eq!((status, body["pinned_ms"].as_i64()), (200, Some(pinned)));
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run}/artifacts/{captured}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, body["pinned_ms"].as_i64()), (200, Some(pinned)));
+    let (status, body) = call(&d, "DELETE", &pin, None, Some(&tenant_token), &[]);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["pinned_ms"], serde_json::json!(null));
+    let (status, _) = call(
+        &d,
+        "PUT",
+        &format!(
+            "/api/v1/runs/{run}/artifacts/{}/pin",
+            sentinel_core::ArtifactId::new()
+        ),
+        None,
+        Some(&tenant_token),
+        &[],
+    );
+    assert_eq!(status, 404);
+
     let unknown = format!("/api/v1/tenants/acme/objects/{}", "0".repeat(64));
     let (status, missing, _) = raw(&d, "GET", &unknown, None, Some(&reader_auth), &[]);
     assert_eq!(status, 404);

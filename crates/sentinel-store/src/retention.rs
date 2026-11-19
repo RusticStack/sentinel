@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use sentinel_core::{AttemptId, JobId, RepoId, RunId, TenantId, UnixMillis};
+use sentinel_core::{ArtifactId, AttemptId, JobId, RepoId, RunId, TenantId, UnixMillis};
 
 use crate::{Error, Result, auth::Authority};
 
@@ -32,6 +32,153 @@ impl Default for Deployment {
             run_artifact_bytes: sentinel_protocol::limits::MAX_RUN_ARTIFACT_BYTES,
         }
     }
+}
+
+/// An artifact class's longest retention and how heavily its bytes count against the repository quota.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Class {
+    pub name: String,
+    pub max_age_ms: i64,
+    pub weight: u32,
+}
+
+/// The deployment's artifact class map and the class an undeclared artifact takes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Classes {
+    pub default_class: String,
+    pub classes: Vec<Class>,
+}
+
+pub const CLASS_NAME_MAX: usize = 32;
+pub const CLASS_WEIGHT_MAX: u32 = 100;
+
+impl Default for Classes {
+    fn default() -> Self {
+        let class = |name: &str, days: i64, weight: u32| Class {
+            name: name.to_owned(),
+            max_age_ms: days * DAY_MS,
+            weight,
+        };
+        Classes {
+            default_class: "standard".to_owned(),
+            classes: vec![
+                class("debug", 7, 1),
+                class("standard", 30, 1),
+                class("evidence", 90, 1),
+                class("release", 90, 2),
+            ],
+        }
+    }
+}
+
+/// The one name rule: a pipeline's `artifacts[].class` and a class row are the same shape.
+fn valid_class_name(name: &str) -> bool {
+    name.len() <= CLASS_NAME_MAX && sentinel_pipeline::schema::valid_class_name(name)
+}
+
+impl Classes {
+    /// Bounds a class map the way the other storage limits are: a name, an age within the
+    /// deployment's artifact retention, a weight, and a default that names a defined class.
+    pub fn validate(&self, d: &Deployment) -> Result<()> {
+        if self.classes.is_empty() || !valid_class_name(&self.default_class) {
+            return Err(Error::InvalidInput("artifact class"));
+        }
+        for class in &self.classes {
+            if !valid_class_name(&class.name)
+                || !(MIN_RETENTION_MS..=d.artifact_retention_ms).contains(&class.max_age_ms)
+                || !(1..=CLASS_WEIGHT_MAX).contains(&class.weight)
+            {
+                return Err(Error::InvalidInput("artifact class"));
+            }
+        }
+        if !self.classes.iter().any(|c| c.name == self.default_class) {
+            return Err(Error::InvalidInput("default artifact class"));
+        }
+        Ok(())
+    }
+}
+
+/// Writes the deployment's class map and default, and returns the classes whose age or weight
+/// changed (or which are new), so the caller re-applies exactly those rows.
+pub fn install_classes(
+    tx: &Transaction<'_>,
+    d: &Deployment,
+    classes: &Classes,
+) -> Result<Vec<String>> {
+    classes.validate(d)?;
+    let mut known: Vec<(String, i64, i64)> = tx
+        .prepare_cached("SELECT name, max_age_ms, weight FROM artifact_classes")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut changed = Vec::new();
+    for class in &classes.classes {
+        let kept = known.iter().position(|(name, _, _)| *name == class.name);
+        let weight = i64::from(class.weight);
+        match kept {
+            Some(at) => {
+                let (_, age, prior) = known.remove(at);
+                if age != class.max_age_ms || prior != weight {
+                    changed.push(class.name.clone());
+                }
+            }
+            None => changed.push(class.name.clone()),
+        }
+        tx.prepare_cached(
+            "INSERT INTO artifact_classes(name, max_age_ms, weight) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET max_age_ms = excluded.max_age_ms,
+                 weight = excluded.weight",
+        )?
+        .execute(params![class.name, class.max_age_ms, weight])?;
+    }
+    for (name, _, _) in known {
+        tx.prepare_cached("DELETE FROM artifact_classes WHERE name = ?1")?
+            .execute([name])?;
+    }
+    tx.prepare_cached("UPDATE storage_defaults SET default_class = ?1 WHERE id = 1")?
+        .execute([&classes.default_class])?;
+    Ok(changed)
+}
+
+/// The names the deployment defines, for a caller that refuses a pipeline naming another.
+pub fn artifact_classes(conn: &Connection) -> Result<Vec<String>> {
+    Ok(conn
+        .prepare_cached("SELECT name FROM artifact_classes ORDER BY name")?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?)
+}
+
+/// The first class a pipeline declares that the deployment does not define, if any. `defined` is
+/// [`artifact_classes`]; the loader accepts any well-formed name and the deployment decides which exist.
+pub fn unknown_class<'a>(
+    defined: &[String],
+    declared: impl Iterator<Item = &'a str>,
+) -> Option<&'a str> {
+    declared
+        .into_iter()
+        .find(|name| !defined.iter().any(|known| known == name))
+}
+
+/// The default class and the weight and maximum age of every defined class.
+pub fn classes(conn: &Connection) -> Result<Classes> {
+    let default_class = conn
+        .prepare_cached("SELECT default_class FROM storage_defaults WHERE id = 1")?
+        .query_row([], |r| r.get(0))
+        .optional()?
+        .unwrap_or_else(|| Classes::default().default_class);
+    let classes = conn
+        .prepare_cached("SELECT name, max_age_ms, weight FROM artifact_classes ORDER BY name")?
+        .query_map([], |r| {
+            Ok(Class {
+                name: r.get(0)?,
+                max_age_ms: r.get(1)?,
+                weight: r.get::<_, i64>(2)?.max(0) as u32,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(Classes {
+        default_class,
+        classes,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -295,7 +442,11 @@ pub fn reapply_sql(logs_phase: bool, scoped: bool, expires: &str, batch: i64) ->
             "tenant_id = ?1 AND log_expires_ms IS NOT NULL AND log_expired_ms IS NULL",
         )
     } else {
-        ("artifacts", "artifacts_reapply", "tenant_id = ?1")
+        (
+            "artifacts",
+            "artifacts_reapply",
+            "tenant_id = ?1 AND pinned_ms IS NULL",
+        )
     };
     let scope = match (scoped, logs_phase) {
         (false, _) => "",
@@ -318,7 +469,10 @@ pub fn reapply_sql(logs_phase: bool, scoped: bool, expires: &str, batch: i64) ->
     } else {
         format!(
             "UPDATE artifacts INDEXED BY {index}
-             SET retain_until_ms = MIN(retain_until_ms, created_ms + {})
+             SET retain_until_ms = MIN(retain_until_ms, created_ms + MIN(
+                 COALESCE((SELECT max_age_ms FROM artifact_classes
+                     WHERE name = artifacts.class), 9223372036854775807),
+                 {}))
              WHERE id > ?4 AND id <= ?5 AND {filter}{scope}",
             effective_sql(
                 expires,
@@ -343,6 +497,182 @@ pub fn finish_reapply(
             .write(move |tx| reapply_step(tx, &d, tenant, repo, at, REAPPLY_BATCH))?;
     }
     Ok(())
+}
+
+/// Where a class re-application had reached: the last row id of the class, or done.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[must_use = "the rows past the first batch are re-applied by finish_class_reapply"]
+pub struct ClassReapply {
+    after: [u8; 16],
+    done: bool,
+}
+
+impl ClassReapply {
+    pub fn done(&self) -> bool {
+        self.done
+    }
+}
+
+/// The two statements of one class re-application step: the cursor bound and the update.
+///
+/// INDEXED BY pins the class's own index, so a changed class reads only its rows and never walks
+/// another class's: the bound stops at `OFFSET batch - 1` and the update is confined to
+/// `(after, bound]`. The effective retention is resolved per row from its tenant and repository;
+/// a pinned artifact keeps its deadline. Public only so the query-plan tests can assert on it.
+#[doc(hidden)]
+pub fn class_reapply_sql(batch: i64) -> (String, String) {
+    let bound = format!(
+        "SELECT id FROM artifacts INDEXED BY artifacts_class_reapply
+         WHERE id > ?2 AND class = ?1 AND pinned_ms IS NULL
+         ORDER BY id LIMIT 1 OFFSET {}",
+        batch - 1
+    );
+    let update = "UPDATE artifacts INDEXED BY artifacts_class_reapply
+         SET charged_bytes = bytes * ?2,
+             retain_until_ms = MIN(retain_until_ms, created_ms + MIN(?3,
+                 COALESCE((SELECT MIN(COALESCE(rp.artifact_retention_ms, tp.ms), tp.ms) FROM
+                    (SELECT COALESCE(
+                        (SELECT artifact_retention_ms FROM storage_policies
+                         WHERE tenant_id = artifacts.tenant_id AND repo_id = X''), ?4) AS ms) tp
+                    LEFT JOIN storage_policies rp ON rp.tenant_id = artifacts.tenant_id
+                        AND rp.repo_id = (SELECT repo_id FROM runs WHERE id = artifacts.run_id)),
+                 9223372036854775807)))
+         WHERE class = ?1 AND id > ?5 AND id <= ?6 AND pinned_ms IS NULL"
+        .to_owned();
+    (bound, update)
+}
+
+pub fn class_reapply_step(
+    tx: &Transaction<'_>,
+    class: &Class,
+    d: &Deployment,
+    at: ClassReapply,
+    batch: i64,
+) -> Result<ClassReapply> {
+    if batch < 1 {
+        return Err(Error::InvalidInput("batch"));
+    }
+    if at.done {
+        return Ok(at);
+    }
+    let (bound_sql, update) = class_reapply_sql(batch);
+    let bound: Option<[u8; 16]> = tx
+        .prepare_cached(&bound_sql)?
+        .query_row(params![class.name, at.after.as_slice()], |row| row.get(0))
+        .optional()?;
+    let upper = bound.unwrap_or([0xff; 16]);
+    tx.prepare_cached(&update)?.execute(params![
+        class.name,
+        i64::from(class.weight),
+        class.max_age_ms,
+        d.artifact_retention_ms,
+        at.after.as_slice(),
+        upper.as_slice()
+    ])?;
+    Ok(match bound {
+        Some(after) => ClassReapply { after, done: false },
+        None => ClassReapply {
+            after: [0; 16],
+            done: true,
+        },
+    })
+}
+
+/// Re-applies one class's retention ceiling and weight to every artifact of it, in bounded batches.
+pub fn finish_class_reapply(store: &crate::Store, d: &Deployment, class: &Class) -> Result<()> {
+    let d = *d;
+    let class = class.clone();
+    let mut at = ClassReapply::default();
+    while !at.done() {
+        let step = class.clone();
+        at = store
+            .writer()
+            .write(move |tx| class_reapply_step(tx, &step, &d, at, REAPPLY_BATCH))?;
+    }
+    Ok(())
+}
+
+/// A tenant administrator pins an artifact: it is kept until unpinned, and its bytes stay counted.
+/// Pinning an artifact already pinned keeps the first pin's time.
+pub fn pin(
+    tx: &Transaction<'_>,
+    authority: &Authority,
+    tenant: TenantId,
+    run: RunId,
+    artifact: ArtifactId,
+    now: UnixMillis,
+) -> Result<UnixMillis> {
+    require_artifact_admin(tx, authority, tenant)?;
+    let pinned: Option<i64> = tx
+        .prepare_cached(
+            "UPDATE artifacts SET pinned_ms = COALESCE(pinned_ms, ?4)
+             WHERE tenant_id = ?1 AND run_id = ?2 AND id = ?3
+             RETURNING pinned_ms",
+        )?
+        .query_row(
+            params![
+                tenant.as_bytes().as_slice(),
+                run.as_bytes().as_slice(),
+                artifact.as_bytes().as_slice(),
+                now.0
+            ],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    pinned.map(UnixMillis).ok_or(Error::NotFound)
+}
+
+/// Unpinning restores the deadline the artifact already carries: the sweep collects it at the
+/// next pass when that deadline has passed.
+pub fn unpin(
+    tx: &Transaction<'_>,
+    authority: &Authority,
+    tenant: TenantId,
+    run: RunId,
+    artifact: ArtifactId,
+) -> Result<()> {
+    require_artifact_admin(tx, authority, tenant)?;
+    let changed = tx
+        .prepare_cached(
+            "UPDATE artifacts SET pinned_ms = NULL
+             WHERE tenant_id = ?1 AND run_id = ?2 AND id = ?3 AND pinned_ms IS NOT NULL",
+        )?
+        .execute(params![
+            tenant.as_bytes().as_slice(),
+            run.as_bytes().as_slice(),
+            artifact.as_bytes().as_slice()
+        ])?;
+    if changed == 1 {
+        return Ok(());
+    }
+    let known: bool = tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM artifacts WHERE tenant_id = ?1 AND run_id = ?2 AND id = ?3)",
+        )?
+        .query_row(
+            params![
+                tenant.as_bytes().as_slice(),
+                run.as_bytes().as_slice(),
+                artifact.as_bytes().as_slice()
+            ],
+            |r| r.get(0),
+        )?;
+    if known { Ok(()) } else { Err(Error::NotFound) }
+}
+
+/// Retention is evidence, so pinning it is the tenant administrator's decision, never an operator's.
+fn require_artifact_admin(
+    tx: &Transaction<'_>,
+    authority: &Authority,
+    tenant: TenantId,
+) -> Result<()> {
+    match authority {
+        Authority::HostLocal => Ok(()),
+        Authority::Credential { principal, .. } | Authority::Session { principal, .. } => {
+            crate::auth::require_tenant_admin(tx, *principal, tenant)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
