@@ -7,7 +7,7 @@ use sentinel_protocol::{
     limits::page_size,
 };
 use sentinel_store::{
-    auth as authz, local_auth, lookup, mfa, operations,
+    auth as authz, local_auth, lookup, mfa, notices, operations,
     registration::{self, DeploymentPolicy, InstallationBinding, Registration, TenantCreation},
     retention, sources, tenancy, views,
 };
@@ -462,7 +462,7 @@ fn tenant_storage(state: &State, request: &Request, slug: &str) -> Route {
     let principal = who.principal;
     let d = state.objects.deployment();
     let slug = slug.to_owned();
-    let (usage, own, effective, standing, repos) = state
+    let (usage, own, effective, standing, repos, notice) = state
         .store
         .read(move |c| {
             let tenant = authz::member_tenant_by_slug(c, principal, &slug)?;
@@ -480,6 +480,7 @@ fn tenant_storage(state: &State, request: &Request, slug: &str) -> Route {
                 retention::effective(c, &d, tenant, None)?,
                 retention::standing(c, &d, tenant)?,
                 repos,
+                notices::notice(c, tenant)?,
             ))
         })
         .map_err(store_error)?;
@@ -488,6 +489,16 @@ fn tenant_storage(state: &State, request: &Request, slug: &str) -> Route {
         "policy": storage_policy_json(&own),
         "effective": effective_json(&effective),
         "thresholds": thresholds_json(&standing),
+        "notice": notice.map(|n| json!({
+            "threshold_percent": n.threshold_percent,
+            "used_bytes": n.used_bytes,
+            "limit_bytes": n.limit_bytes,
+            "delivery": match n.delivery {
+                notices::Delivery::Mail => "mail",
+                notices::Delivery::InApp => "in_app",
+            },
+            "notified_ms": n.notified_ms,
+        })),
         "repos": repos.iter().map(|(r, e)| json!({
             "id": r.repo.to_string(),
             "name": r.name,

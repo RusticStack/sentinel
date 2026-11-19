@@ -64,7 +64,7 @@ pub fn state(used: u64, quota: u64, soft_percent: u8, hard_percent: u8) -> State
 
 /// A tenant's own thresholds narrowed to the deployment's, soft never above hard: a tenant may tighten what
 /// the deployment allows and never widen it, and lowering a deployment threshold tightens every tenant with it.
-const fn thresholds(d: &Deployment, soft: Option<u8>, hard: Option<u8>) -> (u8, u8) {
+pub(crate) const fn thresholds(d: &Deployment, soft: Option<u8>, hard: Option<u8>) -> (u8, u8) {
     let hard = match hard {
         Some(own) if own < d.hard_percent => own,
         _ => d.hard_percent,

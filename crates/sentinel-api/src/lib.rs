@@ -9,6 +9,7 @@ mod http;
 mod login_guard;
 mod mcp;
 mod metrics;
+mod notices;
 mod oauth;
 mod refresh;
 mod routes;
@@ -138,6 +139,8 @@ pub struct Options {
     pub on_worker_enrolled: Option<Notify>,
     /// The runner-mode classes this deployment serves (`runner-classes.json`).
     pub runner_classes: Arc<[RunnerClass]>,
+    /// How often the storage-notice pass looks for a threshold crossing (default 60 s); a test shortens it.
+    pub notices_every: Option<std::time::Duration>,
 }
 
 /// A callback the embedding controller hands the API.
@@ -292,6 +295,12 @@ impl Server {
                 .map(|url| url.trim_end_matches('/')),
         );
         let refresh = refresh::Refresh::start(Arc::downgrade(&config.store))?;
+        notices::start(
+            Arc::downgrade(&config.store),
+            Arc::clone(&config.objects),
+            config.secret_key.clone(),
+            options.notices_every.unwrap_or(notices::EVERY),
+        )?;
         let state = Arc::new(State {
             auto_join: options.auto_join,
             runner_classes: options.runner_classes,

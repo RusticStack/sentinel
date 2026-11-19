@@ -181,6 +181,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (68, include_str!("migrations/068_artifact_classes.sql")),
     (69, include_str!("migrations/069_runner_mode.sql")),
     (70, include_str!("migrations/070_storage_thresholds.sql")),
+    (71, include_str!("migrations/071_storage_notices.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -285,6 +286,10 @@ mod tests {
         (
             69,
             "an older controller re-reads a queued workflow_job delivery as failed:unsupported_event and completes a Sentinel check runner mode never publishes, and it knows neither the tenant's runner switch nor the installation's runner permissions",
+        ),
+        (
+            71,
+            "an older controller neither reads nor writes the notice latch, so no threshold crossing is told while it runs and its audit paging fails on event 99",
         ),
     ];
 
