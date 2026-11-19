@@ -1144,6 +1144,25 @@ jobs:
       - { name: cov, paths: ['coverage/**'], when: always }
 ";
 
+/// Two independent jobs of one run, each declaring one artifact: a publication that dies on one job leaves the
+/// other job's publication in the same run's budget.
+const PAIR_PIPELINE: &str = "schema: 1
+on: [push]
+jobs:
+  first:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+    artifacts:
+      - { name: dist, paths: ['out/**'], when: always }
+  second:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+    artifacts:
+      - { name: dist, paths: ['out/**'], when: always }
+";
+
 #[test]
 fn artifact_publication_commits_and_refusals_are_terminal() {
     let d = deployment();
@@ -1616,6 +1635,118 @@ fn a_publication_after_lease_loss_commits_nothing() {
     });
     assert!(!granted(&p.recorder, p.attempt, "cov"));
     p.process.stop().unwrap();
+}
+
+/// The worker dies with an entry half sent and never reaches `ArtifactEnd`: the controller is holding a staging
+/// file, a space charge and the run's artifact budget for an attempt that is over. Nothing may keep them, because
+/// another job of the same run publishes against the same budget while the crashed attempt's bytes are still there.
+#[test]
+fn a_crashed_publication_gives_back_its_staged_bytes_and_its_run_budget() {
+    let d = deployment();
+    d.objects.set_deployment(limits(8));
+    let secret = d.enrollment(60_000);
+    let (recorder, offers) = Recorder::new();
+    let id = WorkerId::new();
+    let process = WorkerProcess::start_version(
+        &d,
+        Identity::generate("w").unwrap(),
+        id,
+        Some(secret),
+        Arc::clone(&recorder),
+        4,
+    );
+    process.wait_for("Connected", 1);
+    let (run, ids) = d.run(PAIR_PIPELINE);
+    let mut placed: Vec<(sentinel_core::JobId, Offer)> = (0..2)
+        .map(|_| offers.recv_timeout(Duration::from_secs(10)).unwrap().0)
+        .map(|offer| (offer.job, offer))
+        .collect();
+    let crashed = placed.remove(0);
+    let survivor = placed.remove(0);
+    let reporter = recorder.reporter.lock().unwrap().clone().unwrap();
+    eventually("both attempts held", || {
+        let held = d.store.read(|c| dispatch::held_by(c, id)).unwrap();
+        held.iter().filter(|h| h.acknowledged).count() == 2
+    });
+
+    reporter.artifact_begin(crashed.1.attempt, "dist").unwrap();
+    eventually("grant", || granted(&recorder, crashed.1.attempt, "dist"));
+    reporter
+        .artifact_file(crashed.1.attempt, "out/a.bin", 6, 0o644)
+        .unwrap();
+    reporter
+        .artifact_data(crashed.1.attempt, 0, b"123")
+        .unwrap();
+    eventually("the half-sent entry is staged", || staged_bytes(&d) == 3);
+
+    // The crash: the worker is gone and nothing more arrives for this attempt. Its lease lapses and the
+    // controller's own dispatch pass expires it, exactly as a killed worker's would.
+    let attempt = crashed.1.attempt;
+    d.store
+        .writer()
+        .write(move |tx| -> Result<(), sentinel_store::Error> {
+            tx.execute(
+                "UPDATE attempts SET lease_until_ms = 0 WHERE id = ?1",
+                [attempt.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    d.controller().wake();
+    eventually("the crashed attempt is expired", || {
+        d.state(crashed.0).is_terminal()
+    });
+    eventually(
+        "the staged bytes of the crashed publication are gone",
+        || staged_bytes(&d) == 0,
+    );
+
+    // The other job of the run is untouched and publishes against the same budget the crashed attempt held.
+    reporter.artifact_begin(survivor.1.attempt, "dist").unwrap();
+    eventually("survivor grant", || {
+        granted(&recorder, survivor.1.attempt, "dist")
+    });
+    reporter
+        .artifact_file(survivor.1.attempt, "out/a.bin", 8, 0o644)
+        .unwrap();
+    reporter
+        .artifact_data(survivor.1.attempt, 0, b"12345678")
+        .unwrap();
+    reporter.artifact_end(survivor.1.attempt, "dist").unwrap();
+    eventually("stored", || {
+        verdict_seen(
+            &recorder,
+            survivor.1.attempt,
+            "dist",
+            session::ArtifactCode::Stored,
+        )
+    });
+    let tenant = d.tenant;
+    let usage = d
+        .store
+        .read(move |c| sentinel_store::retention::tenant_usage(c, tenant))
+        .unwrap();
+    assert_eq!(usage.total(), 8, "one artifact's bytes, no staging left");
+    let _ = (run, ids);
+    process.stop().unwrap();
+}
+
+/// Bytes under the objects store's staging directory: what an in-flight publication has written but not committed.
+fn staged_bytes(d: &Deployment) -> u64 {
+    let tmp = d
+        ._dir
+        .path()
+        .join("objects")
+        .join(sentinel_store::objects::TMP_DIR);
+    std::fs::read_dir(tmp)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| entry.metadata().ok())
+                .map(|meta| meta.len())
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 #[test]

@@ -535,3 +535,122 @@ fn a_deduped_stage_seal_leaves_nothing_in_tmp() {
         .collect();
     assert!(left.is_empty(), "tmp leftovers: {left:?}");
 }
+
+/// Eight workers publishing the same content at once, half of them giving it up: the bytes are stored once and a
+/// creator's discard never takes the copy another committed.
+#[test]
+fn concurrent_identical_publications_store_one_object_and_lose_nothing() {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let f = Arc::new(fixture());
+    let tenant = f.tenant;
+    let body: Arc<Vec<u8>> = Arc::new((0..(64 << 10)).map(|i| (i % 251) as u8).collect());
+    let seek = Arc::new(Barrier::new(8));
+    let commits = Arc::new(AtomicU32::new(0));
+    let mut tries = Vec::new();
+    for round in 0..8 {
+        let (f, body, seek, commits) = (
+            Arc::clone(&f),
+            Arc::clone(&body),
+            Arc::clone(&seek),
+            Arc::clone(&commits),
+        );
+        tries.push(std::thread::spawn(move || {
+            let staged = f
+                .objects
+                .stage(tenant, &body[..], u64::MAX, Expect::default())
+                .unwrap();
+            // Every stage is sealed and about to commit before any of them commits.
+            seek.wait();
+            let objects = Arc::clone(&f.objects);
+            if round % 2 == 0 {
+                let created = f
+                    .store
+                    .writer()
+                    .write(move |tx| objects.commit(tx, &staged))
+                    .unwrap();
+                if created {
+                    commits.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                f.store
+                    .writer()
+                    .write(move |tx| objects.discard(tx, staged))
+                    .unwrap();
+            }
+        }));
+    }
+    for tried in tries {
+        tried.join().unwrap();
+    }
+    assert_eq!(commits.load(Ordering::Relaxed), 1, "one row for one body");
+    let digest = f
+        .objects
+        .stage(tenant, &body[..], u64::MAX, Expect::default())
+        .unwrap()
+        .digest();
+    let mut out = Vec::new();
+    f.store
+        .read(|c| f.objects.read(c, tenant, digest, &mut out))
+        .unwrap();
+    assert_eq!(out, *body, "the committed bytes are whole");
+    let left: Vec<_> = std::fs::read_dir(f._dir.path().join("objects").join("tmp"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert!(left.is_empty(), "tmp leftovers: {left:?}");
+}
+
+/// The same publication delivered twice at once: `UNIQUE(attempt_id, name)` admits one row and the other is a
+/// conflict, never a second artifact charged twice.
+#[test]
+fn concurrent_identical_rows_of_one_attempt_leave_one_row() {
+    use std::sync::Barrier;
+
+    let f = Arc::new(fixture());
+    let (run, job) = f.run();
+    let (_, attempt) = f.attempt(job);
+    let tenant = f.tenant;
+    let seek = Arc::new(Barrier::new(2));
+    let mut tries = Vec::new();
+    for _ in 0..2 {
+        let (f, seek) = (Arc::clone(&f), Arc::clone(&seek));
+        tries.push(std::thread::spawn(move || {
+            seek.wait();
+            f.store.writer().write(move |tx| {
+                artifacts::record(
+                    tx,
+                    tenant,
+                    run,
+                    job,
+                    attempt,
+                    "dist",
+                    artifacts::State::Absent,
+                    None,
+                    0,
+                    0,
+                    UnixMillis(NOW.0 + 86_400_000),
+                    NOW,
+                )
+            })
+        }));
+    }
+    let mut admitted = 0;
+    for tried in tries {
+        match tried.join().unwrap() {
+            Ok(_) => admitted += 1,
+            Err(error) => assert!(
+                !matches!(error, Error::NotFound),
+                "the loser of the race is refused, not {error:?}"
+            ),
+        }
+    }
+    assert_eq!(admitted, 1, "one row admitted");
+    let rows = f
+        .store
+        .read(move |c| artifacts::for_attempt(c, attempt))
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+}

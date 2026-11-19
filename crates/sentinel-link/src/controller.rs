@@ -1047,6 +1047,7 @@ impl Inner {
                         self.swept("expire", swept);
                         for (attempt, _, _) in due {
                             self.logs.forget(attempt);
+                            self.cancel_publication(attempt);
                         }
                     }
                     Err(e) => self.failed(false, "expire", &e),
@@ -1782,6 +1783,7 @@ impl Inner {
 
     fn released(&self, worker: WorkerId, attempt: AttemptId) {
         self.logs.forget(attempt);
+        self.cancel_publication(attempt);
         if let Some(peer) = self.peer(worker) {
             peer.logging
                 .lock()
@@ -1955,6 +1957,25 @@ impl Inner {
         if let Some(r) = state.runs.get_mut(&f.run) {
             *r = r.saturating_sub(f.accounted);
         }
+    }
+
+    /// An attempt that ends or lapses takes its in-flight publication with it. A worker that dies mid-upload never
+    /// sends the `ArtifactEnd` that would have settled it, so the staging file, its space charge and the run budget
+    /// it held have to go with the attempt: they are nobody's artifact once it is over.
+    fn cancel_publication(&self, attempt: AttemptId) {
+        let Some(publication) = self.publication(attempt) else {
+            return;
+        };
+        let mut guard = publication.lock().unwrap_or_else(|p| p.into_inner());
+        let f = &mut *guard;
+        if f.settled {
+            return;
+        }
+        self.settle(attempt, f);
+        f.file = None;
+        let done = std::mem::take(&mut f.done);
+        drop(guard);
+        self.discard(done);
     }
 
     fn artifact_fail(

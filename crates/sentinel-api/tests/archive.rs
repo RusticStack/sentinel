@@ -14,23 +14,24 @@ use std::{
 
 use sentinel_core::{
     ArtifactId, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
-    auth::{Namespace, Permissions as P, Principal},
+    auth::{Namespace, Permissions as P, Principal, Role},
 };
 use sentinel_link::{controller::Controller, identity::Identity};
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
 use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
 use sentinel_store::{
     Durability, Error, Store, artifacts,
-    auth::{self, Authority, NamespaceKind},
+    auth::{self, Authority, NamespaceKind, provisioning},
     dispatch::{self, Capacity},
     local_auth,
     logs::LogStore,
     objects::{self, Digest, Entry, Expect, Kind, Objects, Remote},
-    runs, tenancy,
+    retention, runs, tenancy,
     tenancy::PoolKind,
     tokens::{self, Grant},
     workers::{self, Presentation},
 };
+use serde_json::json;
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const IMAGE: &str = "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
@@ -718,6 +719,370 @@ fn a_damaged_entry_ends_the_stream_short_of_its_length() {
     );
 }
 
+/// A client that hangs up mid-archive: the controller drops that response's reader with it, leaves nothing staged
+/// and serves the next download whole.
+#[test]
+fn a_client_that_stops_reading_mid_archive_leaves_nothing_behind() {
+    let d = deployment();
+    let bodies: Vec<(&str, Vec<u8>)> = (0..6)
+        .map(|i| {
+            (
+                Box::leak(format!("part-{i}.bin").into_boxed_str()) as &str,
+                vec![0x30 + i as u8; 512 << 10],
+            )
+        })
+        .collect();
+    let p = publish(&d, "hung-up", &bodies, 7 * DAY_MS);
+    let whole = download(&d, &archive(&p, "tar"))
+        .body
+        .expect("the reference download is whole");
+    let fds = open_files();
+    for _ in 0..12 {
+        let mut response = agent()
+            .get(&format!("{}{}", d.base, archive(&p, "zip")))
+            .header("authorization", &bearer(&d))
+            .call()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let mut head = [0u8; 4096];
+        response
+            .body_mut()
+            .as_reader()
+            .read_exact(&mut head)
+            .expect("the response begins");
+        // The client goes away with the rest of the archive unread.
+        drop(response);
+    }
+    // Nothing of those responses is staged, and the descriptors they held came back.
+    for dir in [objects::TMP_DIR, objects::INCOMING_DIR] {
+        assert_eq!(
+            entries_in(&d._dir.path().join(dir)),
+            0,
+            "{dir} holds nothing after interrupted downloads"
+        );
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while open_files() > fds + 4 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        open_files() <= fds + 4,
+        "interrupted downloads left {} descriptors open",
+        open_files() - fds
+    );
+    // The next download is answered whole: a transfer slot an interrupted response never gave back would show up
+    // here as `rate_limited`.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let again = loop {
+        let answered = download(&d, &archive(&p, "tar"));
+        if answered.status == 200 {
+            break answered.body.expect("the next download is whole");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the download after the interruptions was answered {}",
+            answered.status
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(again, whole, "the same bytes, after the interruptions");
+}
+
+/// Every descriptor this process holds: the server runs in it, so a response that leaks is visible here.
+fn open_files() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+/// A retention class shortened while an archive is streaming: the response in flight keeps the bytes it opened
+/// (they are pinned), finishes whole, and the artifact is gone to the next request.
+#[test]
+fn a_class_change_during_a_download_never_truncates_it() {
+    let d = deployment();
+    let bodies: Vec<(&str, Vec<u8>)> = (0..4)
+        .map(|i| {
+            (
+                Box::leak(format!("blob-{i}.bin").into_boxed_str()) as &str,
+                vec![0xA0 + i as u8; 256 << 10],
+            )
+        })
+        .collect();
+    let p = publish(&d, "shortened", &bodies, 30 * DAY_MS);
+    let whole = download(&d, &archive(&p, "tar"))
+        .body
+        .expect("the reference download is whole");
+
+    let mut response = agent()
+        .get(&format!("{}{}", d.base, archive(&p, "tar")))
+        .header("authorization", &bearer(&d))
+        .call()
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let mut head = vec![0u8; 8192];
+    response
+        .body_mut()
+        .as_reader()
+        .read_exact(&mut head)
+        .expect("the response begins");
+
+    // The deployment shortens its classes, the changed class is re-applied, and the maintenance pass retires
+    // what is now past its deadline, while the response above is still streaming.
+    let mut classes = retention::Classes::default();
+    for class in &mut classes.classes {
+        if class.name == "standard" {
+            class.max_age_ms = retention::MIN_RETENTION_MS;
+        }
+    }
+    let deployment = sentinel_store::retention::Deployment::default();
+    let changed = d
+        .store
+        .writer()
+        .write(move |tx| retention::install_classes(tx, &deployment, &classes))
+        .unwrap();
+    assert_eq!(changed, vec!["standard".to_owned()]);
+    retention::finish_class_reapply(
+        &d.store,
+        &deployment,
+        &retention::Class {
+            name: "standard".to_owned(),
+            max_age_ms: retention::MIN_RETENTION_MS,
+            weight: 1,
+        },
+    )
+    .unwrap();
+    let objects = Arc::clone(&d.objects);
+    d.store
+        .writer()
+        .write(move |tx| {
+            let doomed = artifacts::sweep_expired(
+                tx,
+                &objects,
+                UnixMillis(UnixMillis::now().0 + 31 * DAY_MS),
+                64,
+            )?;
+            objects.unlink(tx, &doomed).map(|_| ())
+        })
+        .unwrap();
+    assert!(
+        d.store
+            .read(|c| artifacts::get(c, d.tenant, p.run, p.artifact))
+            .is_err(),
+        "the retired artifact is gone from the store"
+    );
+
+    let mut rest = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .read_to_end(&mut rest)
+        .expect("the rest of the archive still arrives");
+    let mut received = head;
+    received.extend_from_slice(&rest);
+    assert_eq!(
+        received, whole,
+        "the download in flight finished with the bytes it opened"
+    );
+    assert_eq!(entries_in(&d._dir.path().join(objects::TMP_DIR)), 0);
+    let (status, body) = get(&d, &archive(&p, "tar"), Some(&bearer(&d)));
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+}
+
+/// The external copy is unreachable: a stream that needs it ends short of its stated length instead of completing,
+/// and the same archive is whole once the service answers again.
+#[test]
+fn an_s3_outage_ends_the_stream_instead_of_completing_it() {
+    let d = deployment();
+    let remote = Arc::new(Fake::default());
+    d.objects.set_remote(Arc::clone(&remote) as Arc<dyn Remote>);
+    let bodies = vec![
+        ("first.bin", vec![0x11u8; 256 << 10]),
+        ("second.bin", vec![0x22u8; 512 << 10]),
+    ];
+    let p = publish(&d, "outage", &bodies, 7 * DAY_MS);
+    for entry in &p.entries {
+        let (_, body) = bodies.iter().find(|(path, _)| *path == entry.path).unwrap();
+        remote.holds(objects::remote_key(d.tenant, &entry.digest), body);
+    }
+    let evicted = d.objects.evict_files(
+        &p.entries
+            .iter()
+            .map(|entry| (d.tenant, entry.digest))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(evicted.len(), 2);
+
+    remote.set_down(true);
+    for format in ["tar", "zip"] {
+        let downloaded = download(&d, &archive(&p, format));
+        assert_eq!(downloaded.status, 200, "{format}");
+        assert!(
+            truncated(&downloaded),
+            "{format}: an outage ends the body short of the length the response promised"
+        );
+    }
+    assert_eq!(
+        entries_in(&d._dir.path().join(objects::TMP_DIR)),
+        0,
+        "an outage stages nothing"
+    );
+    for entry in &p.entries {
+        assert!(
+            !object_path(&d, entry.digest).exists(),
+            "an outage rehydrated nothing onto the local disk"
+        );
+    }
+
+    // The service answers again: the same archive is whole, and the bytes are what the manifest names.
+    remote.set_down(false);
+    let whole = download(&d, &archive(&p, "tar"));
+    assert_eq!(whole.status, 200);
+    let read = read_tar(&whole.body.expect("a complete archive"));
+    assert_eq!(read.len(), 2);
+    assert_eq!(read[0].body, bodies[0].1);
+    assert_eq!(read[1].body, bodies[1].1);
+}
+
+/// Every identifier the Part added is scoped by the caller's tenant: a member of another organization, holding
+/// everything its own tenant grants, gets the same `not_found` for a run, an artifact, an entry, an archive and a
+/// link as for one that does not exist.
+#[test]
+fn every_identifier_refuses_a_foreign_tenant_at_the_same_shape() {
+    let d = deployment();
+    let bodies = vec![
+        ("a.txt", b"alpha".to_vec()),
+        ("inner/b.bin", vec![0x5Au8; 64 << 10]),
+    ];
+    let p = publish(&d, "scoped", &bodies, 7 * DAY_MS);
+    let other = publish(&d, "unrelated", &[("a.txt", b"other".to_vec())], 7 * DAY_MS);
+    let foreign = foreign_bearer(&d);
+    // The same refusals a member of this tenant gets for an identifier that names nothing.
+    let missing_run = format!("/api/v1/runs/{}/artifacts", RunId::new());
+    let missing_artifact = format!("/api/v1/runs/{}/artifacts/{}", p.run, ArtifactId::new());
+    for path in [
+        format!("/api/v1/runs/{}/artifacts", p.run),
+        format!("/api/v1/runs/{}/artifacts/{}", p.run, p.artifact),
+        archive(&p, "tar"),
+        format!(
+            "/api/v1/runs/{}/artifacts/{}/preview?path=a.txt",
+            p.run, p.artifact
+        ),
+    ] {
+        let (status, body) = get(&d, &path, Some(&foreign));
+        assert_eq!(status, 404, "foreign tenant on {path}: {body}");
+        assert_eq!(body["code"].as_str(), Some("not_found"), "{path}");
+    }
+    let (status, body) = get(&d, &missing_run, Some(&bearer(&d)));
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    let (status, body) = get(&d, &missing_artifact, Some(&bearer(&d)));
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+
+    // Minting: a foreign caller cannot make a link for this artifact, and an entry path belongs to the manifest
+    // that holds it, so one artifact's link cannot name another's entry.
+    let (status, body) = mint_link(&d, p.run, p.artifact, json!({ "format": "tar" }), &foreign);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (404, Some("not_found")),
+        "{body}"
+    );
+    let (status, body) = mint_link(
+        &d,
+        other.run,
+        other.artifact,
+        json!({ "entry": "inner/b.bin" }),
+        &bearer(&d),
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (404, Some("not_found")),
+        "{body}"
+    );
+
+    // The entry's digest is not a way in either: the object route authorizes through the caller's own
+    // repositories, and this tenant holds nothing this one does.
+    for entry in &p.entries {
+        let (status, body) = get(
+            &d,
+            &format!("/api/v1/tenants/acme/objects/{}", entry.digest),
+            Some(&foreign),
+        );
+        assert_eq!(status, 404, "foreign tenant on an object: {body}");
+        assert_eq!(body["code"].as_str(), Some("not_found"));
+    }
+
+    // The identifiers are valid for their owner: the refusals above are about the tenant, not the ids.
+    let (status, _) = get(&d, &archive(&p, "zip"), Some(&bearer(&d)));
+    assert_eq!(status, 200);
+}
+
+/// A member of a second organization who holds everything that organization grants and nothing of this one.
+fn foreign_bearer(d: &Deployment) -> String {
+    let (user, tenant, repo) = (UserId::new(), TenantId::new(), RepoId::new());
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            provisioning::insert_human(tx, user, "Outsider", true, now)?;
+            let admin = Principal::new(user, P::ALL, None, None);
+            auth::create_namespace(
+                tx,
+                admin,
+                tenant,
+                Namespace::parse("other").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )?;
+            auth::set_membership(tx, admin, tenant, user, Role::TenantAdmin)?;
+            auth::create_repo(tx, admin, tenant, repo, "other", now)
+        })
+        .unwrap();
+    let granted = tokens::provision(
+        &d.store,
+        Grant {
+            user,
+            name: "outsider",
+            permissions: P::ALL,
+            tenant: None,
+            repo: None,
+            lifetime_ms: 3_600_000,
+        },
+        UnixMillis::now(),
+    )
+    .unwrap();
+    format!("Bearer {}", sentinel_auth::token::format(&granted.secret))
+}
+
+/// A link mint for one artifact, as its owner or a foreign caller asks for it.
+fn mint_link(
+    d: &Deployment,
+    run: RunId,
+    artifact: ArtifactId,
+    body: serde_json::Value,
+    credential: &str,
+) -> (u16, serde_json::Value) {
+    let response = agent()
+        .post(&format!(
+            "{}/api/v1/runs/{run}/artifacts/{artifact}/link",
+            d.base
+        ))
+        .header("authorization", credential)
+        .header("content-type", "application/json")
+        .send(body.to_string())
+        .unwrap();
+    let status = response.status().as_u16();
+    let mut response = response;
+    let mut text = String::new();
+    response
+        .body_mut()
+        .as_reader()
+        .read_to_string(&mut text)
+        .unwrap();
+    (
+        status,
+        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "raw": text })),
+    )
+}
+
 fn truncated(download: &Download) -> bool {
     match &download.body {
         Err(_) => true,
@@ -814,6 +1179,7 @@ fn retention_is_rechecked_when_the_archive_is_requested() {
 struct Fake {
     objects: Mutex<HashMap<String, Vec<u8>>>,
     ranges: std::sync::atomic::AtomicU32,
+    down: std::sync::atomic::AtomicBool,
 }
 
 impl Fake {
@@ -823,10 +1189,20 @@ impl Fake {
     fn ranged_requests(&self) -> u32 {
         self.ranges.load(std::sync::atomic::Ordering::Relaxed)
     }
+    /// The service is unreachable: every call fails as an outage does.
+    fn set_down(&self, down: bool) {
+        self.down.store(down, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn unavailable(&self) -> bool {
+        self.down.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl Remote for Fake {
     fn fetch(&self, key: &str, out: &mut dyn Write) -> sentinel_store::Result<u64> {
+        if self.unavailable() {
+            return Err(Error::Corrupt("service unavailable"));
+        }
         let objects = self.objects.lock().unwrap();
         let body = objects.get(key).ok_or(Error::Corrupt("object missing"))?;
         out.write_all(body)?;
@@ -840,6 +1216,9 @@ impl Remote for Fake {
     ) -> sentinel_store::Result<Box<dyn Read + Send>> {
         self.ranges
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.unavailable() {
+            return Err(Error::Corrupt("service unavailable"));
+        }
         let objects = self.objects.lock().unwrap();
         let body = objects.get(key).ok_or(Error::Corrupt("object missing"))?;
         let span = body
