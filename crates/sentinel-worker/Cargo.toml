@@ -23,6 +23,7 @@ tar = { version = "0.4", default-features = false }
 libc = "0.2"
 
 [dev-dependencies]
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 sentinel-api = { path = "../sentinel-api" }
 sentinel-auth = { path = "../sentinel-auth" }
 sentinel-link = { path = "../sentinel-link", features = ["controller"] }

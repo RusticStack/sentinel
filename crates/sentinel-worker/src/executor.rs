@@ -190,7 +190,7 @@ struct Awaiting {
     secrets: Vec<sentinel_protocol::secrets::SecretBytes>,
 }
 
-fn valid_delivery(
+pub(crate) fn valid_delivery(
     spec: &RunSpec,
     job_index: usize,
     bundle: &sentinel_protocol::secrets::DeliveryBundle,
