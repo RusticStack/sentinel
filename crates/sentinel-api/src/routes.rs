@@ -2335,9 +2335,9 @@ fn artifact_link(state: &State, request: &mut Request, run: &str, art: &str) -> 
             let repo = lookup::run_repo(c, run)?;
             let (tenant, _) = authz::require_repo_slug(c, who.principal, repo, Permissions::READ)?;
             let row = artifacts::get(c, tenant, run, art)?;
-            // A link is minted only while the artifact is downloadable: past its deadline, or with no manifest,
-            // there is nothing it could redeem to.
-            if row.retain_until_ms <= UnixMillis::now() {
+            // A link is minted only while the artifact is downloadable: past its deadline unless a pin holds it, or
+            // with no manifest, there is nothing it could redeem to.
+            if row.pinned_ms.is_none() && row.retain_until_ms <= UnixMillis::now() {
                 return Err(StoreError::NotFound);
             }
             let Some(version) = row.manifest_version else {
@@ -2386,8 +2386,9 @@ fn redeem_link(state: &State, token: &str) -> Route {
     let (row, manifest) = match state.store.read(|c| {
         let row = artifacts::for_link(c, link.tenant, link.artifact)?;
         // Retention and tenant status are re-checked at redemption: minting authorized a caller once, and this is what
-        // makes a link worthless from the moment its artifact is due, whatever happens to the minting session.
-        if row.retain_until_ms <= now {
+        // makes a link worthless from the moment its artifact is due unless a pin holds it, whatever happens to the
+        // minting session.
+        if row.pinned_ms.is_none() && row.retain_until_ms <= now {
             return Err(StoreError::NotFound);
         }
         let Some(version) = row.manifest_version else {

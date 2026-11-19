@@ -373,7 +373,8 @@ pub fn for_link(conn: &Connection, tenant: TenantId, id: ArtifactId) -> Result<R
     let row = conn
         .prepare_cached(
             "SELECT a.job_id, j.name, a.attempt_id, a.name, a.state_code,
-                    a.manifest_version, a.entries, a.bytes, a.retain_until_ms, a.created_ms
+                    a.manifest_version, a.entries, a.bytes, a.class, a.charged_bytes,
+                    a.retain_until_ms, a.pinned_ms, a.created_ms
              FROM artifacts a
              JOIN jobs j ON j.id = a.job_id
              JOIN tenants t ON t.id = a.tenant_id AND t.active = 1
@@ -391,14 +392,31 @@ pub fn for_link(conn: &Connection, tenant: TenantId, id: ArtifactId) -> Result<R
                     r.get::<_, Option<i64>>(5)?,
                     r.get::<_, i64>(6)?,
                     r.get::<_, i64>(7)?,
-                    r.get::<_, i64>(8)?,
+                    r.get::<_, String>(8)?,
                     r.get::<_, i64>(9)?,
+                    r.get::<_, i64>(10)?,
+                    r.get::<_, Option<i64>>(11)?,
+                    r.get::<_, i64>(12)?,
                 ))
             },
         )
         .optional()?
         .ok_or(Error::NotFound)?;
-    let (job, job_name, attempt, name, state, version, entries, bytes, retain, created) = row;
+    let (
+        job,
+        job_name,
+        attempt,
+        name,
+        state,
+        version,
+        entries,
+        bytes,
+        class,
+        charged,
+        retain,
+        pinned,
+        created,
+    ) = row;
     Ok(Row {
         id,
         job: JobId::from_bytes(
@@ -415,7 +433,10 @@ pub fn for_link(conn: &Connection, tenant: TenantId, id: ArtifactId) -> Result<R
         manifest_version: version.map(|v| v as u64),
         entries: entries as u64,
         bytes: bytes as u64,
+        class,
+        charged_bytes: charged as u64,
         retain_until_ms: UnixMillis(retain),
+        pinned_ms: pinned.map(UnixMillis),
         created_ms: UnixMillis(created),
     })
 }
