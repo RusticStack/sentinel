@@ -1,0 +1,25 @@
+{
+  "format": "sentinel.bench-micro-contract/1",
+  "id": "archive-download",
+  "revision": 1,
+  "harness": {
+    "example": "archive-download-bench",
+    "build": "cargo build --release --locked -p sentinel-api --example archive-download-bench"
+  },
+  "run": {
+    "args": ["--files", "48", "--file-bytes", "1048576", "--rounds", "5"],
+    "smoke_args": ["--files", "4", "--file-bytes", "16384", "--rounds", "1", "--warmup", "1"]
+  },
+  "ordering": {
+    "scheme": "abba",
+    "seed": null
+  },
+  "quiet_start": {
+    "max_cpu_pressure_avg60": 5.0
+  },
+  "record": {
+    "schema": "sentinel-bench/archive-download/1",
+    "out": "bench/archive-download.jsonl"
+  },
+  "notes": "ABBA per round over three cases (tar, zip, one entry): every case takes each place in the order once per two rounds, so the order is fixed and no seed is drawn. The bench builds its own temporary store, publishes one artifact of 48 MiB and serves it from the real API on loopback, so it measures no DIR file system and no link between hosts."
+}
