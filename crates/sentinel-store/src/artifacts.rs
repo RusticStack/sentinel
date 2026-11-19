@@ -275,6 +275,59 @@ pub fn get(conn: &Connection, tenant: TenantId, run: RunId, id: ArtifactId) -> R
     })
 }
 
+/// A record a short-lived link names, resolved from its tenant and id alone because the token carries no run. A
+/// suspended tenant and a foreign or absent id are the same `NotFound`, so redemption reveals neither.
+pub fn for_link(conn: &Connection, tenant: TenantId, id: ArtifactId) -> Result<Row> {
+    let row = conn
+        .prepare_cached(
+            "SELECT a.job_id, j.name, a.attempt_id, a.name, a.state_code,
+                    a.manifest_version, a.entries, a.bytes, a.retain_until_ms, a.created_ms
+             FROM artifacts a
+             JOIN jobs j ON j.id = a.job_id
+             JOIN tenants t ON t.id = a.tenant_id AND t.active = 1
+             WHERE a.tenant_id = ?1 AND a.id = ?2",
+        )?
+        .query_row(
+            params![tenant.as_bytes().as_slice(), id.as_bytes().as_slice()],
+            |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                    r.get::<_, i64>(8)?,
+                    r.get::<_, i64>(9)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    let (job, job_name, attempt, name, state, version, entries, bytes, retain, created) = row;
+    Ok(Row {
+        id,
+        job: JobId::from_bytes(
+            <[u8; 16]>::try_from(job.as_slice()).map_err(|_| Error::Corrupt("job id"))?,
+        )
+        .map_err(|_| Error::Corrupt("job id"))?,
+        job_name,
+        attempt: AttemptId::from_bytes(
+            <[u8; 16]>::try_from(attempt.as_slice()).map_err(|_| Error::Corrupt("attempt id"))?,
+        )
+        .map_err(|_| Error::Corrupt("attempt id"))?,
+        name,
+        state: State::from_code(state)?,
+        manifest_version: version.map(|v| v as u64),
+        entries: entries as u64,
+        bytes: bytes as u64,
+        retain_until_ms: UnixMillis(retain),
+        created_ms: UnixMillis(created),
+    })
+}
+
 pub fn captured(
     conn: &Connection,
     tenant: TenantId,

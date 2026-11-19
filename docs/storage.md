@@ -149,6 +149,25 @@ A captured row and its manifest commit in **one writer transaction**: the contro
 
 The API lists a run's artifacts (`GET /runs/{run}/artifacts`) and shows one row's detail (`GET /runs/{run}/artifacts/{arf}`), the latter inlining the manifest's entry paths, digests, lengths and modes; entry bytes download through the existing `GET /tenants/{slug}/objects/{digest}` route.
 
+### Short-lived download links
+
+A link is a signed capability, not a stored one: the `artifacts` row and its manifest are the only state it touches, so
+minting writes nothing and redemption is one read connection — the artifact by primary key, the tenant's active state
+through the join, then the manifest. `crates/sentinel-api/src/download_link.rs` holds the format: a binary payload
+(version, kind, tenant, artifact, expiry, key epoch, and the entry's path for an entry link) followed by a BLAKE3 keyed
+tag, base64url-encoded for the URL. The tag key is a `derive_key` subkey of the sealed master key's active key
+([sealed storage](sealed-storage.md)), and the epoch in the payload is that key's ID, so a rotation invalidates every
+outstanding token without a revocation list. Redemption re-checks `retain_until_ms` and `tenants.active` at the request,
+so a link cannot outlive the record it names, and an entry link resolves its path in the stored manifest again rather
+than trusting the token.
+
+Every failure — a broken tag, an expiry reached, another epoch, a foreign or suspended tenant, a retired artifact —
+answers one `not_found`, so the route reveals nothing it is not serving. Redemption goes through the same archive and
+object paths the authenticated routes use, including the transfer slot, the stated length and the verified stream; an
+evicted entry streams back from the external copy exactly as it does there. A token may be redeemed repeatedly inside
+its window: nothing is consumed, because a redemption record would put a write on every anonymous download. The
+access-log line keeps a 16-hex digest of the token and never the text ([API](api.md#short-lived-download-links)).
+
 ## Whole-artifact archives
 
 `GET /runs/{run}/artifacts/{arf}/archive?format=tar|zip` ([API](api.md#routes)) serves one artifact as a single archive, assembled from the committed manifest as the body streams. `crates/sentinel-api/src/archive.rs` is a `Read` over the manifest's entries: there is no archive on disk, no staging file, and no pass over the entries before the response starts.
@@ -223,6 +242,14 @@ Statements that run inside a bounded writer transaction are asserted to be keyed
 ## Verification
 
 Store integration tests: `tests/runs.rs` (spec persisted and read back byte-for-byte, job states seeded from dependencies, cross-tenant read denied, duplicate run creation rejected with the original intact, rerun keeps the fence and stales the old attempt, rerun refused for running and canceled jobs); `tests/store.rs` (migrations idempotent with WAL and foreign keys on; full lifecycle with fence, timestamps and run aggregation; stale fence and wrong tenant rejected; a compare-and-set conflict rolls back the whole transaction; dangling and cross-tenant inserts fail; ready-queue ordering and index use; durable cancel flag; acknowledged writes survive drop-without-checkpoint and reopen; writer back-pressure rejects only overflow); `tests/bounds.rs`, `tests/changes.rs`, `tests/faults.rs`, `tests/storage.rs`, `tests/artifacts.rs` and `tests/fleet_load.rs`, cited above.
+
+The link route's tests are `crates/sentinel-api/tests/download_link.rs`: a minted archive (`tar` and `zip`) and entry
+link each stream the bytes the authenticated routes stream, a second tenant's member is refused with exactly the body a
+forged token gets, expiry is exclusive at its boundary, a token whose artifact reached its retention deadline is
+refused, an old-epoch token is refused after a key rotation and a new-epoch one works, one token is redeemed twice, and
+the canary: no minted token appears in a captured log line, in a refusal body or in `metadata.sqlite` or its WAL. Its
+unit tests in `download_link.rs` cover the round trip and the exclusive boundary, a forged tag, another key, another
+epoch, a rewritten path or length, and the stream of malformed tokens.
 
 The archive route's tests are `crates/sentinel-api/tests/archive.rs` (both formats read back with the test's own tar and zip readers against the manifest, a 48 MiB entry streamed with `tmp/` and `incoming/` asserted empty, an evicted entry streamed back from a fake external copy with no file left behind, a truncated file, an altered file, a corrupt remote copy and a short remote copy each leaving the body shorter than its stated length, an absent, expired, other-run and unauthorized artifact all `not_found`, retention re-checked while the row is still stored, and the two measured gates above) and the unit tests in `crates/sentinel-api/src/archive.rs` (stated length against produced length for both formats, a pax record for a path no ustar header holds, a ustar prefix split, zip64 fields, and a damaged entry withholding its last chunk).
 
