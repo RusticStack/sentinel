@@ -1180,6 +1180,16 @@ fn start_members(
 }
 
 /// Workers that also state their own architecture and capabilities.
+/// Every started host has to be in the ranking before a test asserts on its order: a worker is absent
+/// from the ranking for the instant it is mid-report, so the read waits for the whole fleet instead of
+/// whichever moment it landed on.
+fn ranked(d: &Deployment, ids: &[WorkerId]) {
+    eventually("every host ranked", || {
+        let ranking = d.controller().handle().placement_ranking();
+        ids.iter().all(|id| ranking.iter().any(|r| r.worker == *id))
+    });
+}
+
 fn start_hosts(
     d: &Deployment,
     members: Vec<(Hello, Profile, Secret)>,
@@ -1511,6 +1521,7 @@ fn priority_orders_free_workers_ahead_of_speed_only_when_the_policy_is_on() {
             ],
         );
         assert_eq!(d.controller().handle().placement_order(), order);
+        ranked(&d, &ids);
         let ranking = d.controller().handle().placement_ranking();
         assert_eq!(ranking.len(), 2);
         let (idle, busy) = (ids[0], ids[1]);
@@ -1602,6 +1613,7 @@ fn priority_cannot_bypass_ownership_capabilities_or_capacity() {
             (gpu, d.enrollment_with(priority(0))),
         ],
     );
+    ranked(&d, &ids);
     let ranking = d.controller().handle().placement_ranking();
     assert_eq!(ranking[0].worker, ids[0], "the capped host is ranked first");
     assert_eq!(ranking[0].priority, 100);
@@ -1740,6 +1752,7 @@ fn priority_cannot_lend_a_host_the_kvm_architecture_or_os_it_lacks() {
             ),
         ],
     );
+    ranked(&d, &ids);
     let ranking = d.controller().handle().placement_ranking();
     assert_eq!(ranking[0].worker, ids[0], "the plain host ranks first");
     assert_eq!(ranking[0].priority, 100);
@@ -1829,6 +1842,7 @@ fn the_default_picks_the_fastest_eligible_host_and_priority_never_widens_the_set
                 ),
             ],
         );
+        ranked(&d, &ids);
         let ranking = d.controller().handle().placement_ranking();
         let first_eligible = ranking
             .iter()
