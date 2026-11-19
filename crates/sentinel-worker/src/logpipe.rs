@@ -26,6 +26,8 @@ struct PipeState {
     redactor: Redactor,
     reporter: Option<Reporter>,
     route: Option<Route>,
+    /// The route a write failed on: nothing more is sent until the reporter's route moves past it.
+    stuck: Option<Route>,
     sent: u64,
     unsynced: u32,
     ended: bool,
@@ -53,6 +55,17 @@ impl PipeState {
     // A newly attached route could let new frames overtake frames still in flight on the old one.
     fn route_ready(&mut self, reporter: &Reporter) -> bool {
         let now = reporter.route();
+        if let Some(stuck) = self.stuck {
+            if now == stuck {
+                return false;
+            }
+            // The route that failed is gone: nothing may overtake the frames still in flight on it, so the pipe
+            // rewinds to its last acknowledgement and sends everything after it again on the new one.
+            self.stuck = None;
+            self.resend_from_ack();
+            self.route = Some(now);
+            return true;
+        }
         match self.route {
             Some(before) if before.detached != now.detached => {
                 self.resend_from_ack();
@@ -144,6 +157,7 @@ impl LogPipe {
                 spool: Some(spool),
                 redactor,
                 route: reporter.as_ref().map(Reporter::route),
+                stuck: None,
                 reporter,
                 sent,
                 unsynced: 0,
@@ -201,7 +215,13 @@ impl LogPipe {
                         }
                     }
                     Err(_) => {
-                        st.reporter = None;
+                        // A failed write is the route's, not the session's: the reporter still holds the control
+                        // connection the fallback uses, so the pipe stops here and rewinds once the route moves.
+                        match expected.filter(|route| *route != Route::default()) {
+                            Some(route) => st.stuck = Some(route),
+                            None => st.reporter = None,
+                        }
+                        self.progress.notify_all();
                         return;
                     }
                 }
@@ -265,6 +285,7 @@ impl LogPipe {
         let mut st = self.lock();
         st.end_acked_protocol = reporter.protocol() >= 5;
         st.route = Some(reporter.route());
+        st.stuck = None;
         st.reporter = Some(reporter);
         st.refused = false;
         if !st.end_acked {
@@ -326,7 +347,10 @@ impl Output for LogPipe {
                         spool.sent_tail(seq);
                         st.sent = seq;
                     }
-                    Err(_) => st.reporter = None,
+                    Err(_) => match st.route.filter(|route| *route != Route::default()) {
+                        Some(route) => st.stuck = Some(route),
+                        None => st.reporter = None,
+                    },
                 }
             }
         }

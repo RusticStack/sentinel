@@ -103,7 +103,10 @@ fingerprint and serves it at the protocol that control session negotiated.
   bulk connection is lost, frames handed to it may never have arrived; every
   log pipe rewinds to its last acknowledgement before it sends anything on
   the fallback route (the route change is visible to it as a `Route` count),
-  so no frame is acknowledged past without having been stored.
+  so no frame is acknowledged past without having been stored. A pipe whose
+  write fails on the bulk route stops rather than dropping its reporter — that
+  reporter still carries the control connection the fallback needs — and
+  resumes from the last acknowledgement when the route moves.
 
 The point of the split is that neither direction of bulk traffic can delay a
 beat. Each connection owns its own rustls state behind its own mutex, so a
@@ -373,7 +376,7 @@ What each unchecked gate in the tracker is backed by, so a check mark is a state
 |---|---|---|
 | Q05 control priority over bulk | `priority.rs` (stalled bulk never holds up a beat; bulk on control served as fallback; a failing bulk redial never delays control teardown) | none |
 | Q05 reconnect jitter | `worker.rs` unit tests above; `link.rs` reconnect with back-off; `handoff.rs` shortest back-off after a deliberate close; `hardening.rs` jittered retry of `Unavailable` | none |
-| Q05 event replay | `executor.rs` unconfirmed-verdict resend and keep-window tests; spool reopen/resend (`spool.rs`); `duplicate.rs` (a repeated offer is acknowledged twice, executed once); `hardening.rs` deferred log frames | none |
+| Q05 event replay | `executor.rs` unconfirmed-verdict resend and keep-window tests; spool reopen/resend (`spool.rs`); `duplicate.rs` (a repeated offer is acknowledged twice, executed once); `hardening.rs` deferred log frames; `sentinel-worker/tests/log_route.rs` (a bulk route torn down mid-stream: every frame reaches the store once, in sequence, and the log closes with no gap) | none |
 | Q05 expired-lease handling | store `dispatch.rs`/`execution.rs` (see [cancellation](cancellation.md)); worker watchdog test above (needs a podman host); `fleet.rs` partition and recovery | the watchdog test runs only where `SENTINEL_PODMAN_TESTS` is set |
 | Q05 fleet-level restart reconciliation | the controller-restart fleet test above; store `a_controller_start_settles_what_the_last_one_left_and_abandonment_is_fenced`; `revoking_a_connected_worker_ends_its_session_and_fences_its_work`; `end_to_end.rs` leftover recovery | none |
 | Q06 Tailcat helper, pinned, optional, scoped, identities, enrollment, fallback docs | `tailcat.rs` (unpinned helper never executed; modes widening past the link port refused; serve carries only the link port and allowed keys; disabled transport leaves direct TLS alone; rotation, hand-off, allow-list per worker); [configuration](configuration.md) for direct TLS and operator-owned DERP | the live helper behind real NAT is `tailcat_live.rs` (rootful Podman), not run in the verification lane |

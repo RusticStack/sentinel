@@ -1260,6 +1260,141 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
 }
 
 #[test]
+fn the_log_route_seeks_by_line_and_by_wall_clock() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let (status, run) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&dispatch_body()),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201, "{run}");
+    let (tenant, repo) = (d.tenant, d.repo);
+    let _ = (tenant, repo);
+    let run_id: RunId = run["id"].as_str().unwrap().parse().unwrap();
+    let job_id: sentinel_core::JobId = run["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
+    let attempt = d
+        .store
+        .writer()
+        .write(move |tx| {
+            let (attempt, _) = sentinel_store::jobs::lease(
+                tx,
+                tenant,
+                job_id,
+                WorkerId::new(),
+                UnixMillis(i64::MAX / 2),
+                UnixMillis::now(),
+            )?;
+            Ok(attempt)
+        })
+        .unwrap();
+    let started = UnixMillis::now();
+    let frame = |seq: u64, text: &str| Frame {
+        seq,
+        step: 0,
+        stream: Stream::Stdout,
+        bytes: text.as_bytes().to_vec(),
+    };
+    for (seq, text) in [(1, "first\n"), (2, "second\n"), (3, "third\n")] {
+        d.logs
+            .append(run_id, job_id, attempt, &frame(seq, text))
+            .unwrap();
+    }
+    // A refused spool range closes as a jump: line 4 starts behind a hole, so its number counts stored frames only.
+    d.logs
+        .append(run_id, job_id, attempt, &frame(6, "fourth\n"))
+        .unwrap();
+    d.logs.finish(run_id, job_id, attempt, 6, &[]).unwrap();
+    let ended = UnixMillis::now();
+
+    let get = |query: &str| {
+        call(
+            &d,
+            "GET",
+            &format!("/api/v1/attempts/{attempt}/logs?{query}"),
+            None,
+            Some(&auth),
+            &[],
+        )
+    };
+
+    let (status, body) = get("line=2");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["seek"]["line"], 2);
+    assert_eq!(body["seek"]["found"], true);
+    assert_eq!(body["seek"]["exact"], true);
+    assert_eq!(body["seek"]["complete"], true);
+    assert_eq!(body["seek"]["after"], 1);
+    assert_eq!(body["frames"][0]["seq"], 2);
+    assert_eq!(body["frames"][0]["text"], "second\n");
+
+    let (status, body) = get("line=4");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["seek"]["after"], 5,
+        "a newline that ends a frame starts the next line in the next frame"
+    );
+    assert_eq!(body["seek"]["found"], true);
+    assert_eq!(
+        body["seek"]["exact"], false,
+        "a line at or past the jump counts the stored frames only"
+    );
+    assert_eq!(body["frames"][0]["seq"], 6);
+
+    let (status, body) = get("line=5");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["seek"]["found"], false);
+    assert_eq!(
+        body["seek"]["after"], 6,
+        "a line past the log answers the newest stored position, so a live log is asked again"
+    );
+    assert_eq!(body["frames"].as_array().unwrap().len(), 0);
+    assert_eq!(body["complete"], true);
+
+    let (status, body) = get("line=5&wait=1");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["seek"]["found"], false,
+        "a finished log answers at once rather than parking for a line it can never gain"
+    );
+
+    let (status, body) = get(&format!("at={}", started.0));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["seek"]["after"], 0);
+    assert_eq!(
+        body["seek"]["until"], 1,
+        "the first checkpoint stamped at or after the instant is the frame held back"
+    );
+    let (status, body) = get(&format!("at={}", ended.0 + 1));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["seek"]["after"], 6);
+    assert_eq!(body["seek"]["until"], serde_json::Value::Null);
+    assert_eq!(body["seek"]["complete"], true);
+    assert_eq!(body["frames"].as_array().unwrap().len(), 0);
+
+    for query in [
+        "line=0",
+        "line=x",
+        "at=-1",
+        "at=x",
+        "line=2&at=0",
+        "line=2&after=1",
+        "line=2&cursor=sntl_c1_invalid",
+        "at=0&after=1",
+    ] {
+        let (status, body) = get(query);
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("invalid_request")),
+            "{query}"
+        );
+    }
+}
+
+#[test]
 fn a_password_session_needs_the_csrf_header_for_mutations() {
     let d = deployment();
     let (status, body) = call(
