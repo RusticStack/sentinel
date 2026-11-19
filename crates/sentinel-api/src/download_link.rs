@@ -205,7 +205,7 @@ mod tests {
         let mut bytes = URL_SAFE_NO_PAD.decode(&token).unwrap();
         for damaged in [
             String::new(),
-            token.trim_end_matches(|c| c != '-').to_owned(),
+            token[..token.len() - 1].to_owned(),
             "not a token".to_owned(),
             {
                 *bytes.last_mut().unwrap() ^= 1;
@@ -216,6 +216,7 @@ mod tests {
                 URL_SAFE_NO_PAD.encode(&bytes)
             },
         ] {
+            assert_ne!(damaged, token, "the damage must change the token");
             assert_eq!(
                 verify(&key, &damaged, UnixMillis(1), epoch),
                 None,
