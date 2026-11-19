@@ -436,7 +436,7 @@ fn upgrade_sources() -> Vec<u32> {
 fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expects() {
     // docs/upgrades.md (tests/compat_doc.rs compares it with the code): a database at schema N
     // runs on release R only when no migration in (R, N] declares a readable_by above R. Rows
-    // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, LATEST.
+    // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, LATEST.
     let readable = |db: &Connection, release: u32, newest: u32| -> bool {
         let needs: u32 = db
             .query_row(
@@ -449,13 +449,13 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        72,
+        73,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
     assert_eq!(
         sources,
-        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 70, 71]
+        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 71, 72]
     );
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
@@ -471,7 +471,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         drop(store);
         assert_eq!(version(&path), schema::LATEST, "from {from}");
         let db = Connection::open(&path).unwrap();
-        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72]
+        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]
             .iter()
             .map(|&newest| from >= newest || readable(&db, from, newest))
             .collect();
@@ -494,43 +494,53 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         // result it enforces the bare quota instead of the tenant's narrowed hard threshold.
         // Migration 72 (run-level and runner-mode artifacts) rebuilds the artifact table with a
         // nullable job and attempt and two origins an older controller cannot explain, so 70 and 71
-        // stop at 70.
+        // stop at 70. Migration 73 (the OAuth scope bound) changes a constraint and rewrites the
+        // CLI's seeded cap, so 72 stops at 72.
         let expected = match from {
             44 | 47 | 48 => [
                 false, false, false, false, false, false, false, false, false, false, false, false,
+                false,
             ],
             51 => [
                 true, false, false, false, false, false, false, false, false, false, false, false,
+                false,
             ],
             56 => [
                 true, true, false, false, false, false, false, false, false, false, false, false,
+                false,
             ],
             57 => [
                 true, true, true, false, false, false, false, false, false, false, false, false,
+                false,
             ],
             63 => [
                 true, true, true, true, false, false, false, false, false, false, false, false,
+                false,
             ],
             64 | 65 => [
                 true, true, true, true, true, false, false, false, false, false, false, false,
+                false,
             ],
             66 | 67 => [
-                true, true, true, true, true, true, true, false, false, false, false, false,
+                true, true, true, true, true, true, true, false, false, false, false, false, false,
             ],
             68 => [
-                true, true, true, true, true, true, true, true, false, false, false, false,
+                true, true, true, true, true, true, true, true, false, false, false, false, false,
             ],
             69 | 70 => [
-                true, true, true, true, true, true, true, true, true, true, false, false,
+                true, true, true, true, true, true, true, true, true, true, false, false, false,
             ],
             71 => [
-                true, true, true, true, true, true, true, true, true, true, true, false,
+                true, true, true, true, true, true, true, true, true, true, true, false, false,
+            ],
+            72 => [
+                true, true, true, true, true, true, true, true, true, true, true, true, false,
             ],
             _ => unreachable!(),
         };
         assert_eq!(
             ok, expected,
-            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72"
+            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73"
         );
     }
 }
@@ -867,6 +877,141 @@ fn a_database_upgraded_from_071_keeps_its_artifacts_and_equals_a_fresh_one() {
     assert_eq!(rows[1].2, "evidence", "its class is unchanged");
     assert_eq!(rows[1].5, 40, "and so is its charge");
     assert!(rows[1].3.is_some(), "and it still names its job");
+    let upgraded = store.read(|c| Ok(schema_sql(c))).unwrap();
+    drop(store);
+    assert_eq!(version(&path), schema::LATEST);
+    let fresh = tempfile::tempdir().unwrap();
+    let fresh_store = Store::open(fresh.path().join("metadata.sqlite"), Durability::Full).unwrap();
+    assert_eq!(
+        upgraded,
+        fresh_store.read(|c| Ok(schema_sql(c))).unwrap(),
+        "the upgraded database has the schema a fresh one has, triggers and indexes included"
+    );
+}
+
+/// Migration 73 widens every stored OAuth scope column and repoints the rebuilt children at the
+/// rebuilt parents; every row of every OAuth table has to survive with its digest, index and
+/// trigger, and the database has to equal a fresh one.
+#[test]
+fn a_database_upgraded_from_072_keeps_its_oauth_rows_and_equals_a_fresh_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.sqlite");
+    let (user, grant, code, device, refresh, access) = (
+        UserId::new(),
+        GrantId::new(),
+        [0x02u8; 32],
+        [0x03u8; 32],
+        [0x04u8; 32],
+        [0x05u8; 32],
+    );
+    {
+        let mut conn = database_at(&path, 72);
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        let tx = conn.transaction().unwrap();
+        provisioning::insert_human(&tx, user, "Root", true, NOW).unwrap();
+        tx.commit().unwrap();
+        conn.execute(
+            "INSERT INTO oauth_clients(client_id, name, first_party, loopback, redirect_path,
+                 device, max_scopes, created_ms)
+             VALUES('legacy-cli', 'Legacy', 0, 1, '/cb', 1, 1023, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO oauth_client_redirects(client_id, uri)
+             VALUES('legacy-cli', 'https://legacy.example/cb')",
+            [],
+        )
+        .unwrap();
+        let challenge = "a".repeat(43);
+        conn.execute(
+            "INSERT INTO oauth_grants(id, user_id, client_id, kind, scopes, audience, created_ms,
+                 expires_ms, resource)
+             VALUES(?1, ?2, 'legacy-cli', 1, 1023, 1, 1, 2, 1)",
+            params![grant.as_bytes().as_slice(), user.as_bytes().as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO oauth_codes(code_digest, client_id, redirect_uri, code_challenge, user_id,
+                 scopes, audience, created_ms, expires_ms, resource)
+             VALUES(?1, 'legacy-cli', 'https://legacy.example/cb', ?2, ?3, 1023, 1, 1, 2, 1)",
+            params![code.as_slice(), challenge, user.as_bytes().as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO oauth_device_codes(device_digest, user_code, client_id, scopes, audience,
+                 created_ms, expires_ms, resource)
+             VALUES(?1, 'BCDFGHJK', 'legacy-cli', 1023, 1, 1, 2, 1)",
+            [device.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO oauth_refresh_tokens(token_digest, grant_id, generation, created_ms,
+                 idle_expires_ms)
+             VALUES(?1, ?2, 1, 1, 2)",
+            params![refresh.as_slice(), grant.as_bytes().as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO oauth_access_tokens(token_digest, grant_id, generation, scopes,
+                 created_ms, expires_ms)
+             VALUES(?1, ?2, 1, 1023, 1, 2)",
+            params![access.as_slice(), grant.as_bytes().as_slice()],
+        )
+        .unwrap();
+        assert_eq!(version(&path), 72);
+    }
+    let (store, copy) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
+    assert!(copy.is_some(), "a pending migration takes a copy first");
+    type Oauth = (Vec<(String, i64)>, i64, Vec<u8>, Vec<u8>, i64);
+    let (caps, grants, kept_refresh, kept_access, redirects): Oauth = store
+        .read(|c| {
+            let mut caps =
+                c.prepare("SELECT client_id, max_scopes FROM oauth_clients ORDER BY 1")?;
+            let caps = caps
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let grants: i64 = c.query_row("SELECT scopes FROM oauth_grants", [], |r| r.get(0))?;
+            let refresh: Vec<u8> =
+                c.query_row("SELECT token_digest FROM oauth_refresh_tokens", [], |r| {
+                    r.get(0)
+                })?;
+            let access: Vec<u8> =
+                c.query_row("SELECT token_digest FROM oauth_access_tokens", [], |r| {
+                    r.get(0)
+                })?;
+            let redirects: i64 =
+                c.query_row("SELECT count(*) FROM oauth_client_redirects", [], |r| {
+                    r.get(0)
+                })?;
+            Ok((caps, grants, refresh, access, redirects))
+        })
+        .unwrap();
+    assert_eq!(
+        caps,
+        vec![
+            ("legacy-cli".to_owned(), 1023),
+            ("sentinel-cli".to_owned(), 2047)
+        ],
+        "a stored client cap is copied as it is; the CLI seed is every scope"
+    );
+    assert_eq!(grants, 1023, "the grant keeps the scopes it was issued");
+    assert_eq!(
+        kept_refresh,
+        refresh.to_vec(),
+        "refresh digests are unchanged"
+    );
+    assert_eq!(kept_access, access.to_vec(), "access digests are unchanged");
+    assert_eq!(redirects, 1, "the client's redirect survives the rebuild");
+    let codes: (i64, i64) = store
+        .read(|c| {
+            Ok((
+                c.query_row("SELECT scopes FROM oauth_codes", [], |r| r.get(0))?,
+                c.query_row("SELECT scopes FROM oauth_device_codes", [], |r| r.get(0))?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(codes, (1023, 1023), "codes and device requests keep theirs");
     let upgraded = store.read(|c| Ok(schema_sql(c))).unwrap();
     drop(store);
     assert_eq!(version(&path), schema::LATEST);
