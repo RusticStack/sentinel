@@ -797,6 +797,8 @@ pub fn apply(
     }
 }
 
+/// Derived rows are ordinary grants, so a pass that changes any is audited like an administrator's grant:
+/// one row per pass, because a GitHub answer can move hundreds of repositories at once.
 fn settle_grants(
     tx: &Transaction<'_>,
     check: &Check,
@@ -805,13 +807,35 @@ fn settle_grants(
     timing: Timing,
     now: UnixMillis,
 ) -> Result<bool> {
+    let changed = write_grants(tx, check, role, observed, timing, now)?;
+    if changed > 0 {
+        audit(
+            tx,
+            Event::GrantChanged,
+            None,
+            Some(check.user),
+            false,
+            Some("github"),
+        )?;
+    }
+    Ok(changed > 0)
+}
+
+fn write_grants(
+    tx: &Transaction<'_>,
+    check: &Check,
+    role: Role,
+    observed: &Observed,
+    timing: Timing,
+    now: UnixMillis,
+) -> Result<usize> {
     let mut changed = 0;
     if role == Role::TenantAdmin {
         changed += tx.execute(
             "DELETE FROM repo_grants WHERE tenant_id = ?1 AND user_id = ?2 AND synced_ms IS NOT NULL",
             params![check.tenant.as_bytes(), check.user.as_bytes()],
         )?;
-        return Ok(changed > 0);
+        return Ok(changed);
     }
     for (repo, access) in &observed.repos {
         let RepoAccess::Known(bits) = access else {
@@ -883,7 +907,7 @@ fn settle_grants(
             now.0.saturating_sub(timing.grace_ms)
         ],
     )?;
-    Ok(changed > 0)
+    Ok(changed)
 }
 
 const fn role_label(role: Role) -> &'static str {
