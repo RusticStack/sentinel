@@ -24,6 +24,72 @@ Hooks: `post-receive.d/sentinel` under each forge's managed hooks directory
 hook reaches the loopback API through a TCP forwarder on the bridge gateway —
 the hook itself is unmodified.
 
+## Fixtures
+
+The five container rows above are raised by `scripts/git-fixtures/`, one script per row, from an
+unprivileged account and with no root anywhere. Each script creates the forge's user, the private
+repository with a first pipeline commit, and the row's hook carrying the shipped
+[`examples/hooks/post-receive`](../examples/hooks/post-receive) — the shipped file, copied in, never
+a fixture-local variant — then writes the binding a verification run applies.
+
+| Script | Container | Ports | Hook | Binding credential |
+|---|---|---|---|---|
+| `gitea-https.sh` | Gitea 1.27.3 | `3443` HTTPS | `hooks/post-receive.d/sentinel` | `read:repository` token |
+| `gitea-ssh.sh` | Gitea 1.27.3 | `3022` SSH, `3445` admin HTTP | `hooks/post-receive.d/sentinel` | deploy key + pinned known_hosts |
+| `forgejo-https.sh` | Forgejo 17.0.2 | `3444` HTTPS | `hooks/post-receive.d/sentinel` | `read:repository` token |
+| `gitlab-ssh.sh` | GitLab CE 18.3.2 | `3023` SSH, `8080` admin HTTP | `custom_hooks/post-receive` | SSH key + pinned known_hosts |
+| `bare-sshd.sh` | Alpine 3.22 + sshd | `2222` SSH | `hooks/post-receive` | SSH key + pinned known_hosts |
+
+Requirements: a rootless Podman (what `bench/` uses) or a Docker the account may drive — the
+scripts prefer `podman` and fall back to `docker`, and `SENTINEL_FIXTURE_RUNTIME` names one;
+`git`, `curl`, `openssl`, OpenSSH (`ssh`, `ssh-keygen`, `ssh-keyscan`) and `python3`. Every image
+is pinned by digest, so only the first run pulls: 253 MiB for Gitea, 277 MiB for Forgejo and
+5.8 GiB for GitLab CE unpacked (the pull itself is smaller), and the bare `sshd` image at 34 MiB is
+built once from `sshd.Containerfile`. An absent runtime, a root account or an unusable runtime
+exits `3` with the reason, before anything is pulled, and a taken port is refused before a container
+is created.
+
+```sh
+scripts/git-fixtures/run.sh up                   # every fixture
+scripts/git-fixtures/run.sh up gitea-https       # one of them
+scripts/git-fixtures/run.sh status
+scripts/git-fixtures/run.sh exercise             # push through each hook, verify the delivery
+scripts/git-fixtures/run.sh down
+```
+
+`up` removes the fixture it is about to raise and starts again from an empty volume, so a second
+run in a row gives the same working fixture and rotates its keys and tokens. State lives under
+`${SENTINEL_FIXTURE_ROOT:-$XDG_STATE_HOME/sentinel-git-fixtures}/<fixture>/` (mode `0700`):
+
+| File | Contents |
+|---|---|
+| `binding.json` | the JSON `sentinel admin source bind` reads: `remote`, `allowed_refs`, `pipeline_path`, `trust` (the CA PEM, or the pinned `known_hosts` line) and the credential. Mode `0600` |
+| `bindings.sh` | the same addresses and paths as shell variables (`FIXTURE_REMOTE`, `FIXTURE_CA_PEM`, `FIXTURE_KNOWN_HOSTS`, `FIXTURE_SSH_KEY`, `FIXTURE_HOOK_ENV`, `FIXTURE_HOOK_INTAKE`), never the credential |
+| `hook.env` | the `SENTINEL_INTAKE_URL` and `SENTINEL_HOOK_SECRET` the installed hook reads. Mode `0600` |
+| `seed/` | a checkout whose first commit carries `.sentinel.yml` |
+| `pat`, `push-token`, `read-token`, `client-key` | the fixture's own credentials, `0600`, so `run.sh push` can push without a password |
+
+The token a binding carries is `read:repository`; the fixture's own pushes use a separate
+`write:repository,write:user` token. The fixtures are not bound themselves: a verification run
+applies `binding.json` with `admin source bind` and issues its own hook token, as
+[deployment](deployment.md#fully-local-operation) describes. The secret a fixture writes
+into `hook.env` is a fixed placeholder because nothing in the fixture validates it; point the hook
+at a controller and it must be that repository's real `admin source hook-token`.
+
+`run.sh exercise` needs no controller. It starts `listener.py` on `7099`, raises each requested
+fixture, pushes twice through the fixture's own credential, and reads the listener's JSONL to
+check that the hook delivered both pushes to its own intake route with the bearer secret, a JSON
+content type, the pushed `old_sha`/`new_sha`, and a delivery id per push. `SENTINEL_FIXTURE_REUSE=1`
+reuses a fixture that is already up. The hook posts to `host.containers.internal:<port>`: a
+bridged container cannot reach another process's loopback, so a controller or listener on the host
+must listen on the bridge gateway as well (`listener.py` binds both addresses under Docker).
+
+`scripts/git-fixtures/selftest.sh` runs no container: it checks that every script parses, that
+`up`, `down` and `status` each exit `3` naming the runtime when none is on `PATH`, that a named
+but absent runtime is refused, that no script asks for `sudo` and that every image is
+digest-pinned. `crates/sentinel/tests/git_fixtures.rs` runs it, and holds this page and the
+scripts to the same fixture names and hook locations.
+
 ## What was exercised live
 
 - Hook delivery to a passing run on Gitea (HTTPS), Forgejo, a bare repository over SSH and GitLab over SSH, with `trigger=push`.
@@ -60,37 +126,6 @@ No record: observed once on 2026-09-15 on a pilot host; no raw timings or fixtur
   remote: 72/91/120 ms per pass; steady cadence ~32 s on a 30 s interval
   (interval + ≤¼ jitter).
 
-## Standing the fixtures up
-
-`bench/g08-forges.py` creates the matrix above from containers on one loopback, so a binding written here can be reproduced rather than remembered. It needs Podman (rootless preferred) or Docker, `openssl`, `ssh-keygen` and `git`; it refuses a fixture before pulling anything when the host cannot carry it.
-
-```
-python3 bench/g08-forges.py up bare        # or gitea, forgejo, gitlab, all
-python3 bench/g08-forges.py bind gitea https://sentinel.example/api/v1/intake/rep_... secret-file
-python3 bench/g08-forges.py converge gitea # the bindings a controller needs, as JSON
-python3 bench/g08-forges.py status
-python3 bench/g08-forges.py down
-```
-
-What each fixture is, and what it hands back:
-
-| Fixture | What it runs | Ports | Hands back |
-|---|---|---|---|
-| `gitea` | Gitea 1.27.3 over HTTPS with the fixture CA, its built-in SSH server, users and repositories `ci/app`, `ci/app2` | 3443, 3022 | CA path, a `read:repository` token file for the binding, a `write:repository` token file for the person pushing |
-| `forgejo` | Forgejo over HTTPS, same layout | 3444, 3024 | CA path, the two token files |
-| `gitlab` | GitLab CE; refused below 6 GiB of memory | 3445, 3023 | the SSH URL |
-| `bare` | A minimal sshd-with-git image built from `bench/g08/ssh-git.Containerfile`, serving `/git/app.git` | 2222 | the deploy key path |
-
-Two things the harness gets right that a hand-built fixture usually does not: every container runs with host networking, so a push's `post-receive` reaches a controller on the same loopback (a bridged container would need the forwarder the GitLab row used to); and `bind` writes the hook's environment beside every hook the fixture runs, owned by the forge's own user, with a spool directory that user may write — a hook that cannot spool fails a push instead of losing an event.
-
-The secret is read from a file, never from the command line, matching the hook's own rule that it reaches `curl` on stdin and never appears in `ps`.
-
-### What has been exercised from this harness
-
-- **bare repository over SSH**: fixture raised, a repository pushed to it twice, and both pushes delivered a signed `202`-answering POST to a loopback listener carrying `delivery_id`, `ref`, `old_sha` and `new_sha`.
-- **Gitea over HTTPS**: fixture raised with the local CA, the user, both repositories and both tokens created, the hook installed globally and into each repository, and the hook's delivery received by the same listener with the same body.
-- Not exercised from this harness: Forgejo, and GitLab (which needs more memory than the host this was written on). The rows in [What was exercised live](#what-was-exercised-live) above remain the record for those combinations, from the 2026-09-15 run.
-
 ## What is not covered
 
 - GitLab was exercised over SSH only; the fixture serves plain HTTP on its admin port and `sentinel_protocol::source::remote` accepts `https://` and `ssh://` only, so no GitLab HTTPS endpoint was stood up.
@@ -99,6 +134,8 @@ The secret is read from a file, never from the command line, matching the hook's
 
 ## Verification
 
-Executed 2026-09-15 on a Linux verification host (Ubuntu 24.04, Docker, Podman 4.9.3, fixture `sshd`, Gitea 1.27.3, Forgejo, GitLab CE 18.3.2). The fixture scripts of that run were local and are not in the repository; from 2026-11-19 the fixtures are [bench/g08-forges.py](../bench/g08-forges.py), and the two rows it has been exercised on since are listed above.
+Executed 2026-09-15 on a Linux verification host (Ubuntu 24.04, Docker, Podman 4.9.3, fixture `sshd`, Gitea 1.27.3, Forgejo, GitLab CE 18.3.2). The fixtures that produced those runs were local to that host. `scripts/git-fixtures/` now commits the containers, users, repositories and hooks they raised, so the transport side of the matrix can be raised again; the controller-side work above still cannot.
 
-`bench/test_g08_forges.py` covers the harness without a container: the bindings, the refusals, and its own self-test.
+Re-verified 2026-11-19 on an unprivileged x86_64 Linux account (Ubuntu 24.04, Docker 29.9.3, Gitea 1.27.3, Forgejo 17.0.2, GitLab CE 18.3.2, Alpine 3.22 with OpenSSH): `scripts/git-fixtures/run.sh exercise` raised all five fixtures and verified two hook deliveries from each — the shipped hook's bearer secret, JSON content type, its own intake route and the pushed `old_sha`/`new_sha`, with a distinct delivery id per push — for Gitea over HTTPS and over its built-in SSH, Forgejo over HTTPS, GitLab CE over SSH and the bare `sshd` repository. That run used Docker because the machine also running it denied unprivileged access to `/dev/net/tun`, which a rootless Podman needs to give a container a network; the scripts still prefer rootless Podman, which is what the bench harnesses use.
+
+Not reproduced by the committed fixtures: every row of "What was exercised live" that needs a controller and a worker — admission, dispatch, execution, failure settlement, cancellation, rerun, the poll lane, credential revocation and rotation, controller and worker restarts, and the refusals — and the timings above, which remain the 2026-09-15 observation and were not measured again. The matrix's `ci/app2` (poll) and `other/foreign` (a second user's repository) rows are two further repositories on the Gitea HTTPS fixture, not separate fixtures: the scripts raise the transport rows, so those two are created on a running `gitea-https` fixture with `gitea admin user create` and the API.
