@@ -129,6 +129,16 @@ artifact_retention_secs = 7776000  # longest a pipeline's `retain` may keep an a
 run_artifact_bytes = 17179869184   # artifact bytes one run may store (1 MiB .. 1 TiB, default 16 GiB)
 attempt_log_bytes = 268435456      # stored log bytes one attempt may produce (1 MiB .. 4 GiB, default 256 MiB); past it frames are refused and declared as gaps
 sweep_interval_secs = 300          # the maintenance pass runs on its own thread at most this often (5..86400)
+artifact_default_class = "standard" # the class an artifact that names none takes; must be one of [storage.classes]
+
+# Artifact retention classes ([retention](retention.md#artifact-classes-and-pins)). Omit the section
+# for `debug` (7 d, weight 1), `standard` (30 d, 1), `evidence` (90 d, 1) and `release` (90 d, 2).
+[storage.classes.debug]
+max_age_secs = 604800               # longest an artifact of the class is kept (1 h .. artifact_retention_secs); a pipeline's `retain` is shortened to it
+weight = 1                          # how many times the artifact's bytes count against its repository's quota (1..100)
+[storage.classes.release]
+max_age_secs = 7776000
+weight = 2
 ```
 
 The three common fields are optional in the file; `listen`, `api_listen`, `public_url`, `placement_order` and `[storage]` are refused for the worker and the worker keys (`controller`, `controller_fingerprint`, `controller_fingerprint_also`, `worker_name`, `enrollment_file`, `cpu_millis`, `memory_bytes`, `git_mirrors`, `labels`, `job_network`, `isolation`, `disk_bytes`, `spool_reserve_bytes`, `spool_quota_bytes`, `cache_budget_bytes`, `mirror_budget_bytes`, `image_budget_bytes`, `tailcat_address`, `metrics_listen`) and `[microvm]` for the server, as are `[remote_cache] budget_bytes`, `[s3]` and `[backup]` for the worker; `[tailcat]` is accepted by both roles; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys (including `controller_fingerprint_also`) need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
