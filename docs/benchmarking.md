@@ -234,6 +234,33 @@ Interpretation, limited to what was measured:
 - **The time saving is real here but modest and host-sensitive.** Every paired difference in this record is positive (7.5–48.6 ms, median 14.0 ms of a 69.8 ms bodies publication), but a first run of the same binary, discarded before this record, put the pairs in both directions (−33.3 ms to +29.3 ms). On loopback the transfer is not the dominant cost of a publication: the fixed work (the begin/grant, offer/held and end/verdict round trips, the artifact's writer transaction and its fsync) dominates at this size. Digest-first also moves CPU work rather than removing it: the worker hashes each file once to offer it, and the controller hashes nothing it already holds. A larger artifact or a slower link is where the time saving would have to be measured, and neither was run.
 - The spread is wide in both modes (65.0–82.2 ms against 16.4–63.8 ms) and is not a distribution of the transfer; it is the fixed costs plus the scheduler of one shared 2-vCPU container. Read the medians, not an individual sample.
 
+### Repeat on the Part's verification host
+
+Record: [`bench/e09-digest-transfer.jsonl`](../bench/e09-digest-transfer.jsonl), 10 samples in 5 rounds, captured
+2026-11-19 with the same frozen arguments, through `bench/digest-transfer-record.sh` because the host exposes no
+`/proc/pressure/cpu`.
+
+| Item | Value |
+|---|---|
+| Host | `capy-verify-cloud`, AMD EPYC, 2 vCPUs, 7.8 GiB RAM, kernel `6.1.158`, Ubuntu 24.04 container |
+| Link | loopback only: the controller, the relay and both workers on one machine |
+| Workload | 48 files × 256 KiB = 12 MiB per artifact, the same content published five times into one tenant |
+| Build | `3f743b8`, release, `dirty: false` |
+
+| Mode | Link bytes | median | min | max |
+|---|---|---|---|---|
+| `bodies` (protocol 11) | 12,617,473 | 25.1 ms | 23.0 ms | 64.4 ms |
+| `digest` (protocol 12) | 3,798 (one sample 3,826) | 6.1 ms | 5.8 ms | 7.6 ms |
+| saved | 12,613,647 (99.97 %) | 19.3 ms | 15.3 ms | 58.3 ms |
+
+- **The bytes repeat exactly; the time does not.** A repeated 12 MiB artifact crosses the link as 3.8 KiB, the figure
+  the change is for. Every one of the five pairs saved time (15.3–58.3 ms), and the digest side is the steady one:
+  six of its samples sit in 5.8–7.6 ms while the bodies samples range 23.0–64.4 ms, so the paired saving moves with
+  how slow the same publication would have been with its bytes attached. The 58.3 ms pair is a 64.4 ms bodies
+  sample, not a faster digest run. Read the medians and the pairs on a shared 2-vCPU container, not one sample.
+- This is a second machine of the same shape as the record above, so the two are comparable in kind and not in
+  series: they are separate files for that reason.
+
 ## Streaming artifact publication
 
 `crates/sentinel-worker/examples/step-publication-bench.rs` measures what publishing an artifact behind a step saves ([storage](storage.md#streaming-publication)). It starts the real `Controller` on a loopback address, connects one real worker session, and drives the same `artifacts::StepPublications` the executor uses at a step's end: each sample publishes one declared artifact of `--files` files of `--file-bytes` bytes (defaults 48 and 1 MiB, a 48 MiB output shaped like the pilots') and models a later step of `--later-ms` (default 250). In mode `step` the publication starts when the first step ends and the later step runs while it uploads; in mode `finalize` the later step runs first and the publication follows it, which is what every artifact did before `when: step:<id>`. Both modes run the same capture, over the same files, through the same link, in ABBA order per round. The session asks for protocol 11 on purpose: every sample then sends every body, so both modes move the same bytes and what digest-first saves is not what this record measures.
@@ -262,9 +289,63 @@ Interpretation, limited to what was measured:
 - **The publication that outlives the remaining steps only removes what it overlaps.** The bench models a later step longer than the publication on purpose. When the rest of the job is shorter, the residual stays in the finalization join, which is where every artifact's publication used to be; the change moves the start of the upload earlier, it does not make the bytes cheaper.
 - 48 MiB in about 80 ms is a loopback figure for one store on the same machine, and the tail figures carry the scheduler of one shared 2-vCPU container: read the medians and the per-sample pairing, not an individual sample.
 
+## Artifact download
+
+`crates/sentinel-api/examples/archive-download-bench.rs` measures what a download costs
+([storage](storage.md#whole-artifact-archives)). It publishes one artifact of `--files` files of `--file-bytes` bytes
+(defaults 48 and 1 MiB, a 48 MiB artifact shaped like the pilots' outputs) into a temporary store, serves it from the
+real `sentinel_api::Server` on loopback, and reads every response to its last byte. Three cases share one order: the
+whole archive as `tar`, the whole archive as `zip`, and one entry through the objects route (what a short-lived link
+redeems to). Time to first byte is recorded separately from the total, because a client that streams feels both, and
+the archive is generated from the committed manifest as it streams, so no archive is staged on disk.
+
+Record `sentinel-bench/archive-download/1`: `seq`, `round`, `position`, `case` (`tar`, `zip` or `entry`), `files`,
+`file_bytes`, `artifact_bytes`, `bytes` (the response body's length, which is the manifest's entries plus the format's
+headers), `ttfb_ns` (from the request to the first chunk the client reads) and `total_ns`. Run it through
+`bench/archive-download.sh`, which is `bench/micro-run.sh` over `bench/contracts/micro/archive-download.json` (ABBA per
+round over the three cases, `seed` null because the order is fixed); a host whose kernel exposes no
+`/proc/pressure/cpu` takes it through `bench/archive-download-record.sh`, which stamps the build and host and states in
+`lock` that no shared lock was taken.
+
+Record: [`bench/archive-download.jsonl`](../bench/archive-download.jsonl), 30 samples in 5 rounds, captured
+2026-11-19.
+
+| Item | Value |
+|---|---|
+| Host | `capy-verify-cloud`, AMD EPYC, 2 vCPUs, 7.8 GiB RAM, kernel `6.1.158`, Ubuntu 24.04 container |
+| Link | loopback only: the client, the API and the store on one machine |
+| Workload | 48 files × 1 MiB = 48 MiB per artifact, every response read whole |
+| Build | `3f743b8`, release, `dirty: false` |
+
+| Case | n | Body | First byte (median, range) | Total (median, range) | Throughput (median, range) |
+|---|---|---|---|---|---|
+| `tar` | 10 | 50,357,248 B | 0.27 ms (0.23–0.41) | 50.4 ms (40.3–54.0) | 953 MiB/s (889–1,193) |
+| `zip` | 10 | 50,337,622 B | 0.25 ms (0.13–0.33) | 47.4 ms (41.5–53.9) | 1,013 MiB/s (890–1,155) |
+| `entry` | 10 | 1,048,576 B | 0.17 ms (0.10–0.29) | 1.1 ms (1.0–1.2) | 923 MiB/s (805–1,031) |
+
+Interpretation, limited to what was measured:
+
+- **A download starts before any entry is sent.** The first byte of a 48 MiB archive arrives within half a
+  millisecond in every one of the twenty archive samples (worst 0.41 ms), because the response is the manifest plus a
+  reused header buffer: nothing is assembled to answer. That is the property a browser or a CLI writing to a file
+  depends on, and it is the one the 100 ms gate in [storage](storage.md#whole-artifact-archives) bounds, with about
+  three orders of magnitude to spare on this host.
+- **The archive is a hashing copy, not an assembly.** 48 MiB moves at 0.9–1.0 GiB/s median for both formats here, so
+  the headers, the per-entry BLAKE3 pass and the socket are what a plain loopback copy would leave. The figures say
+  nothing about a link between two hosts, which is where a real download's bytes are spent.
+- **The two formats are within the container's variance of each other.** `zip` carries a CRC-32 pass beside the BLAKE3
+  one and a central directory at the end, yet this record puts it 6 % ahead of `tar` on the median; captures of this
+  harness on this host have put them either way round, so neither format's figure should be read on its own. Both
+  stream, and neither is staged on disk.
+- **One entry is cheaper than an archive only in proportion.** A 1 MiB entry takes 1.1 ms median against 50.4 ms for
+  48 MiB. Its 1.0–1.2 ms spread says the object read and the response are a small part of a fixed cost the container
+  imposes, which is why an individual sample is not a figure.
+- These are warm-page-cache loopback figures for one store on one machine, taken on a 2-vCPU container. Nothing here
+  measures a cold disk, an evicted object streamed back from the external copy, or a link with latency.
+
 ## Micro-contract benches
 
-The in-process benches (log-ack, checks-lane, s3-hash, backup-rehash, digest-transfer, step-publication, auth-cost, store-cost, spawn-cost, the `sentinel-bench` no-op interleave, `f07-storage`, `k02-cache-clone`, the ignored measurement tests and M06) are frozen by a **micro contract**, `bench/contracts/micro/<id>.json`, format `sentinel.bench-micro-contract/1`. It sits beside `sentinel.bench-contract/1` (container lanes run by `sentinel-bench --contract`) and shares its `format`, `id`, `revision`, `reference_host` and the 5 percent start-pressure bound; an in-process bench has no image, source or lane to pin. A contract names the `harness` (an `example` binary, or a `script`, with the `build` command), `run.args` (the frozen arguments), `run.smoke_args` (and `smoke_env`) for the tiny run, the `ordering` (`abba`, `shuffle` or `single`, with `seed` null for a bench that has no random choice, stated explicitly, or `{env, recorded_as}` for one that shuffles from a seed), `quiet_start.max_cpu_pressure_avg60`, and the `record` (`schema`, `out`, `own_stamp` for `sentinel-bench`, which stamps itself, and `from_stdout` for a script harness that prints its records on stdout and has the runner stamp them; the other script harnesses, `f07-storage.sh` and `k02-cache-clone.sh`, write their own stamped records and the runner only takes the lock and checks the host).
+The in-process benches (log-ack, checks-lane, s3-hash, backup-rehash, digest-transfer, step-publication, archive-download, auth-cost, store-cost, spawn-cost, the `sentinel-bench` no-op interleave, `f07-storage`, `k02-cache-clone`, the ignored measurement tests and M06) are frozen by a **micro contract**, `bench/contracts/micro/<id>.json`, format `sentinel.bench-micro-contract/1`. It sits beside `sentinel.bench-contract/1` (container lanes run by `sentinel-bench --contract`) and shares its `format`, `id`, `revision`, `reference_host` and the 5 percent start-pressure bound; an in-process bench has no image, source or lane to pin. A contract names the `harness` (an `example` binary, or a `script`, with the `build` command), `run.args` (the frozen arguments), `run.smoke_args` (and `smoke_env`) for the tiny run, the `ordering` (`abba`, `shuffle` or `single`, with `seed` null for a bench that has no random choice, stated explicitly, or `{env, recorded_as}` for one that shuffles from a seed), `quiet_start.max_cpu_pressure_avg60`, and the `record` (`schema`, `out`, `own_stamp` for `sentinel-bench`, which stamps itself, and `from_stdout` for a script harness that prints its records on stdout and has the runner stamp them; the other script harnesses, `f07-storage.sh` and `k02-cache-clone.sh`, write their own stamped records and the runner only takes the lock and checks the host).
 
 `bench/micro-run.sh bench/contracts/micro/<id>.json [--smoke] [--out FILE] [--dir DIR] [-- extra bench args]` is the only runner (the per-bench `bench/<id>.sh` scripts are three-line wrappers around it). A measured run does these things in this order, and measures nothing when one refuses: validate the contract (exit 2 names the field); stamp the build and host with `benchstamp.py` (a commit and an anonymized `SENTINEL_BENCH_HOST_LABEL` are required); check `reference_host` when the contract names one; take the shared lock (see [Benchmark lock](#b09-reliability-and-performance-scenarios-and-the-regression-gate)) and record the wait; refuse unless CPU pressure avg60 is below the contract's bound; run the bench; and append the stamped records only when the bench exits 0 and every line carries the contract's schema. A record gains `contract {id, revision, sha256}`, `ordering`, `conditions {start, end}` (pressure, load average, steal) and `lock {path, waited_ns}`. The file is appended to and never truncated. Exit codes: 2 for a contract or argument problem, 3 for a host, quiet-host or label refusal, 75 for "pending" (below; a bench that exits 75 itself, as a test does when it skipped, is pending too and appends nothing), otherwise the bench's own status. `python3 bench/micro_contract.py check <contract>` validates one without running it.
 
