@@ -1605,3 +1605,115 @@ fn the_maintenance_pass_snapshots_each_tenant_once_a_day_and_the_class_metrics_n
         "no tenant is named: {family:?}"
     );
 }
+
+/// The soft threshold is a state, not a gate: a tenant past it is reported and refused nothing; past the hard
+/// one an upload is `quota_exceeded`. Neither figure names a tenant.
+#[test]
+fn a_tenant_between_its_thresholds_is_reported_and_refused_nothing() {
+    use sentinel_core::UnixMillis;
+    use std::sync::Arc;
+    let f = Fixture::new(1);
+    let (objects, acme) = (Arc::clone(&f.objects), f.acme);
+    let deployment = sentinel_store::retention::Deployment {
+        tenant_quota_bytes: 1_000_000,
+        soft_percent: 50,
+        hard_percent: 100,
+        ..sentinel_store::retention::Deployment::default()
+    };
+    f.objects.set_deployment(deployment);
+    // 600 000 bytes stored: past the soft threshold of 500 000, inside the hard one.
+    f.store
+        .writer()
+        .write(move |tx| {
+            objects
+                .begin_upload(tx, acme, 600_000, None, 60_000, UnixMillis::now())
+                .map(|_| ())
+        })
+        .unwrap();
+
+    let (status, body) = send(
+        &f,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        json!({ "len": 1_000 }),
+        &f.auth,
+    );
+    assert_eq!(
+        status, 201,
+        "nothing is refused at the soft threshold: {body}"
+    );
+
+    let (status, body) = get(&f, "/api/v1/tenants/acme/storage", &f.auth);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["thresholds"]["state"], "soft");
+    assert_eq!(body["thresholds"]["soft_limit_bytes"], 500_000);
+    assert_eq!(body["thresholds"]["hard_limit_bytes"], 1_000_000);
+    assert_eq!(body["effective"]["soft_percent"], 50);
+    assert_eq!(body["effective"]["hard_percent"], 100);
+    assert_eq!(body["policy"]["soft_percent"], Value::Null);
+
+    let (status, body) = get(&f, "/api/v1/admin/storage", &f.auth);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["soft_percent"], 50);
+    assert_eq!(body["hard_percent"], 100);
+
+    // The metric counts tenants by state and names none of them.
+    let (status, _, body) = call(
+        &f.base,
+        "GET",
+        "/metrics",
+        None,
+        &[("authorization", &f.auth)],
+    );
+    assert_eq!(status, 200);
+    let text = body.as_str().expect("text exposition");
+    let sample = |name: &str| -> f64 {
+        text.lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.rsplit(' ').next()?.parse().ok())
+            .unwrap_or_else(|| panic!("{name} missing:\n{text}"))
+    };
+    assert_eq!(sample("sentinel_storage_tenants{state=\"soft\"}"), 1.0);
+    assert!(sample("sentinel_storage_tenants{state=\"ok\"}") >= 1.0);
+    assert_eq!(sample("sentinel_storage_tenants{state=\"hard\"}"), 0.0);
+    assert!(!text.contains("acme"), "the metric names no tenant");
+
+    // A tenant may tighten the deployment's thresholds and never widen them.
+    let (status, _) = send(
+        &f,
+        "PUT",
+        "/api/v1/admin/tenants/acme/storage",
+        json!({ "soft_percent": 60 }),
+        &f.auth,
+    );
+    assert_eq!(status, 400);
+    let (status, _) = send(
+        &f,
+        "PUT",
+        "/api/v1/admin/tenants/acme/storage",
+        json!({ "hard_percent": 101 }),
+        &f.auth,
+    );
+    assert_eq!(status, 400);
+    let (status, body) = send(
+        &f,
+        "PUT",
+        "/api/v1/admin/tenants/acme/storage",
+        json!({ "soft_percent": 40, "hard_percent": 60 }),
+        &f.auth,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["effective"]["soft_percent"], 40);
+    assert_eq!(body["effective"]["hard_percent"], 60);
+
+    // 601 000 bytes is past a hard threshold of 600 000: the next upload is refused.
+    let (status, _, body) = call(
+        &f.base,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&json!({ "len": 1 })),
+        &[("authorization", &f.auth)],
+    );
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["code"], "quota_exceeded");
+}

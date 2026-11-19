@@ -589,15 +589,30 @@ fn restore(
     Ok(())
 }
 
+/// One policy change from the command line: the fields to set, and the ones to drop so they inherit again.
+struct StorageChange<'a> {
+    quota: Option<u64>,
+    log_retention: Option<&'a str>,
+    artifact_retention: Option<&'a str>,
+    soft_percent: Option<u8>,
+    hard_percent: Option<u8>,
+    inherit: &'a [String],
+}
+
 fn tenant_storage(
     data: &DataDir,
     tenant: &str,
     repo: Option<&str>,
-    quota: Option<u64>,
-    log_retention: Option<&str>,
-    artifact_retention: Option<&str>,
-    inherit: &[String],
+    change: StorageChange<'_>,
 ) -> Result<(), Error> {
+    let StorageChange {
+        quota,
+        log_retention,
+        artifact_retention,
+        soft_percent,
+        hard_percent,
+        inherit,
+    } = change;
     use sentinel_store::retention;
     const MAX_MS: i64 = retention::MAX_RETENTION_MS;
     let store = open(data, true)?;
@@ -618,15 +633,19 @@ fn tenant_storage(
     for name in inherit {
         if !matches!(
             name.as_str(),
-            "quota" | "log-retention" | "artifact-retention" | "all"
+            "quota" | "log-retention" | "artifact-retention" | "thresholds" | "all"
         ) {
             return Err(fail(
-                "--inherit takes quota, log-retention, artifact-retention or all",
+                "--inherit takes quota, log-retention, artifact-retention, thresholds or all",
             ));
         }
     }
-    let changing =
-        quota.is_some() || log_ms.is_some() || artifact_ms.is_some() || !inherit.is_empty();
+    let changing = quota.is_some()
+        || log_ms.is_some()
+        || artifact_ms.is_some()
+        || soft_percent.is_some()
+        || hard_percent.is_some()
+        || !inherit.is_empty();
     if changing {
         let inherit = inherit.to_vec();
         let (d, rest) = store
@@ -639,12 +658,18 @@ fn tenant_storage(
                         "quota" => policy.quota_bytes = None,
                         "log-retention" => policy.log_retention_ms = None,
                         "artifact-retention" => policy.artifact_retention_ms = None,
+                        "thresholds" => {
+                            policy.soft_percent = None;
+                            policy.hard_percent = None;
+                        }
                         _ => policy = retention::Policy::default(),
                     }
                 }
                 policy.quota_bytes = quota.or(policy.quota_bytes);
                 policy.log_retention_ms = log_ms.or(policy.log_retention_ms);
                 policy.artifact_retention_ms = artifact_ms.or(policy.artifact_retention_ms);
+                policy.soft_percent = soft_percent.or(policy.soft_percent);
+                policy.hard_percent = hard_percent.or(policy.hard_percent);
                 let rest = retention::set(
                     tx,
                     &Authority::HostLocal,
@@ -682,12 +707,16 @@ fn tenant_storage(
                     "quota_bytes": own.quota_bytes,
                     "log_retention_ms": own.log_retention_ms,
                     "artifact_retention_ms": own.artifact_retention_ms,
+                    "soft_percent": own.soft_percent,
+                    "hard_percent": own.hard_percent,
                 },
                 "effective": {
                     "tenant_quota_bytes": effective.tenant_quota_bytes,
                     "repo_quota_bytes": effective.repo_quota_bytes,
                     "log_retention_ms": effective.log_retention_ms,
                     "artifact_retention_ms": effective.artifact_retention_ms,
+                    "soft_percent": effective.soft_percent,
+                    "hard_percent": effective.hard_percent,
                 },
                 "usage": usage,
             }))
@@ -1687,16 +1716,22 @@ fn tenant(args: &TenantArgs, now: UnixMillis) -> Result<(), Error> {
             quota,
             log_retention,
             artifact_retention,
+            soft_percent,
+            hard_percent,
             inherit,
         } => {
             return tenant_storage(
                 data,
                 tenant,
                 repo.as_deref(),
-                *quota,
-                log_retention.as_deref(),
-                artifact_retention.as_deref(),
-                inherit,
+                StorageChange {
+                    quota: *quota,
+                    log_retention: log_retention.as_deref(),
+                    artifact_retention: artifact_retention.as_deref(),
+                    soft_percent: *soft_percent,
+                    hard_percent: *hard_percent,
+                    inherit,
+                },
             );
         }
         TenantCommand::Suspend { data, tenant } => (data, tenant, true),

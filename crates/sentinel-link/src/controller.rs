@@ -74,6 +74,27 @@ pub struct StoragePolicy {
 
 /// The remote store's budget when none is configured: a tenth of the data file system, from 1 GiB up to the
 /// maximum every storage budget shares.
+/// The refusal an operator reads on the artifact row: what the tenant stores, the line it crossed, the bytes the
+/// publication would have added and where the bytes already are. Bounded by `artifacts::MAX_FAILURE_BYTES`.
+fn quota_refusal(standing: &retention::Standing, stored: &classes::Classes, bytes: u64) -> String {
+    let mut top = stored.by_name();
+    top.sort_unstable_by_key(|(_, held)| std::cmp::Reverse(*held));
+    format!(
+        "quota_exceeded: {} bytes stored of the {} byte hard threshold ({}% of a {} byte quota),          a {} byte artifact refused; largest classes {}={}, {}={}, {}={}",
+        standing.used,
+        standing.hard_bytes,
+        standing.hard_percent,
+        standing.quota_bytes,
+        bytes,
+        top[0].0,
+        top[0].1,
+        top[1].0,
+        top[1].1,
+        top[2].0,
+        top[2].1,
+    )
+}
+
 pub fn default_remote_cache_budget(total: u64) -> u64 {
     (total / 10).clamp(1 << 30, sentinel_cache::gc::MAX_BUDGET_BYTES)
 }
@@ -1954,6 +1975,47 @@ impl Inner {
         code
     }
 
+    /// The tenant's caches give way before its artifacts do. Every bundle of the tenant's repositories leaves the
+    /// controller's store, least recently served first — the order the store's own byte-budget pass evicts in, so
+    /// one policy governs both — and an entry a transfer is uploading survives it. Returns the bytes freed.
+    fn evict_tenant_cache(&self, tenant: TenantId) -> u64 {
+        let root = self
+            .remote_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(root) = root else {
+            return 0;
+        };
+        let Ok(repos) = self.store.read(|c| retention::repo_ids(c, tenant)) else {
+            return 0;
+        };
+        if repos.is_empty() {
+            return 0;
+        }
+        // The tenant's cache gives way entirely: nothing of it is kept while its artifacts are refused.
+        let evicted = sentinel_cache::remote::evict_repos(
+            &root,
+            &repos,
+            0,
+            sentinel_cache::gc::DEFAULT_PASS_WORK,
+            UnixMillis::now().0,
+        );
+        if evicted.entries > 0 || evicted.errors > 0 {
+            self.stats
+                .remote_cache_freed
+                .fetch_add(evicted.bytes, Ordering::Relaxed);
+            tracing::info!(
+                event = "tenant_cache_evicted",
+                entries = evicted.entries,
+                bytes = evicted.bytes,
+                errors = evicted.errors,
+                "a tenant at its hard storage threshold gave up its remote-cache bundles"
+            );
+        }
+        evicted.bytes
+    }
+
     fn discard(&self, done: Vec<Planned>) {
         if done.is_empty() {
             return;
@@ -2587,13 +2649,31 @@ impl SessionHandler for Inner {
                 retention::check_run_repo(&tx, &deployment, tenant, run, 1),
                 Err(sentinel_store::Error::QuotaExceeded)
             );
+            // The tenant's own hard threshold, before the run's: a tenant that has no room for one more byte
+            // refuses the artifact here, so a job that cannot store its output does not stream it first.
+            let tenant_full =
+                retention::standing(&tx, &deployment, tenant)?.state == retention::State::Hard;
             Ok((
-                tenant, run, job, index, spec, duplicate, committed, repo_full,
+                tenant,
+                run,
+                job,
+                index,
+                spec,
+                duplicate,
+                committed,
+                repo_full,
+                tenant_full,
             ))
         });
-        let Ok((tenant, run, job, index, spec, duplicate, committed, repo_full)) = scope else {
+        let Ok((tenant, run, job, index, spec, duplicate, committed, repo_full, tenant_full)) =
+            scope
+        else {
             return Verdict(ArtifactCode::Stale);
         };
+        if tenant_full {
+            self.evict_tenant_cache(tenant);
+            return Verdict(ArtifactCode::QuotaExceeded);
+        }
         if duplicate {
             return Verdict(ArtifactCode::Duplicate);
         }
@@ -2942,10 +3022,40 @@ impl SessionHandler for Inner {
         let bytes = entries.iter().map(|e| e.len).sum::<u64>();
         let count = entries.len() as u64;
         let deployment = self.objects.deployment();
+        // At the hard threshold the tenant's caches give way first, before the publication is answered: the
+        // eviction runs outside the writer transaction, so a slow store can never hold up the single writer. The
+        // state is read once here and checked again in the transaction, which is what decides.
+        if matches!(
+            self.store
+                .read(|c| Ok(retention::standing(c, &deployment, tenant)?.state)),
+            Ok(retention::State::Hard)
+        ) {
+            self.evict_tenant_cache(tenant);
+        }
         // One transaction: a crash mid-commit leaves only adoptable orphans; the stages stay pinned until it ends.
         self.write(move |tx| {
             // The repository quota binds at commit, not only when the artifact begins: the
             // begin check cannot know the size, and the single writer makes this one exact.
+            let standing = retention::standing(tx, &deployment, tenant)?;
+            if standing.used.saturating_add(bytes) > standing.hard_bytes && standing.hard_bytes > 0
+            {
+                for s in staged {
+                    objects.discard(tx, s)?;
+                }
+                artifacts::record_refused(
+                    tx,
+                    tenant,
+                    run,
+                    job,
+                    attempt,
+                    &artifact_name,
+                    class.as_deref(),
+                    &quota_refusal(&standing, &classes::tenant(tx, tenant)?, bytes),
+                    retain_until,
+                    UnixMillis::now(),
+                )?;
+                return Ok(ArtifactCode::QuotaExceeded);
+            }
             if matches!(
                 retention::check_run_repo(tx, &deployment, tenant, run, bytes),
                 Err(sentinel_store::Error::QuotaExceeded)

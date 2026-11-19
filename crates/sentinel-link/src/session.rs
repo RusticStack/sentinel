@@ -419,6 +419,10 @@ pub enum ArtifactCode {
     CaptureFailed,
     Stale,
     Store,
+    /// The tenant is at its hard storage threshold: its caches were evicted first and the artifact was refused
+    /// (the row records used, limit and the largest classes). Code 9, which an older worker reads as `stale` and
+    /// so fails the artifact rather than storing it.
+    QuotaExceeded,
 }
 
 impl ArtifactCode {
@@ -433,6 +437,7 @@ impl ArtifactCode {
             Self::CaptureFailed => 6,
             Self::Stale => 7,
             Self::Store => 8,
+            Self::QuotaExceeded => 9,
         }
     }
     pub fn from_u8(code: u8) -> Self {
@@ -444,6 +449,7 @@ impl ArtifactCode {
             4 => Self::TooLarge,
             5 => Self::Absent,
             6 => Self::CaptureFailed,
+            9 => Self::QuotaExceeded,
             _ => Self::Stale,
         }
     }

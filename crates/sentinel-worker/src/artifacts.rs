@@ -36,6 +36,9 @@ pub enum Outcome {
     Published,
     Absent,
     Failed,
+    /// The controller refused the publication at the tenant's hard storage threshold, after evicting its caches;
+    /// the artifact's row records used, limit and the largest classes.
+    QuotaExceeded,
 }
 
 pub struct NoSink;
@@ -120,8 +123,8 @@ pub fn capture(workspace: &Path, decl: &Artifact, sink: &dyn Sink, attempt: Atte
             return Outcome::Failed;
         }
     };
-    if let Some(_code) = sink.begin(attempt, &decl.name) {
-        return Outcome::Failed;
+    if let Some(code) = sink.begin(attempt, &decl.name) {
+        return refused(code);
     }
     let mut buf = vec![0u8; MAX_ARTIFACT_CHUNK_BYTES];
     let offered = if sink.digests() {
@@ -259,6 +262,13 @@ pub fn capture(workspace: &Path, decl: &Artifact, sink: &dyn Sink, attempt: Atte
     }
     match sink.end(attempt, &decl.name) {
         ArtifactCode::Stored => Outcome::Published,
+        code => refused(code),
+    }
+}
+
+fn refused(code: ArtifactCode) -> Outcome {
+    match code {
+        ArtifactCode::QuotaExceeded => Outcome::QuotaExceeded,
         _ => Outcome::Failed,
     }
 }

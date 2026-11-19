@@ -1639,6 +1639,107 @@ pub fn sweep_store(root: &Path, budget_bytes: u64, max_entries: u64, now_ms: i64
     out
 }
 
+/// What a tenant-scoped eviction removed: whole entries of the named repositories, least recently served first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Evicted {
+    pub entries: u64,
+    pub bytes: u64,
+    pub errors: u64,
+    /// The walk reached every entry of the named repositories: false when it stopped at `max_entries`.
+    pub complete: bool,
+}
+
+/// Evict the entries of `repos` from the store, least recently served first, until they keep at most
+/// `keep_bytes`. A serve touches the entry's `current`, so its mtime is the last time a worker fetched the bundle
+/// and the entry that answered longest ago goes first — the bundle least likely to be needed again. The order is
+/// the byte budget's ([`sweep_store`]); what differs is the scope: one tenant's repositories, which the tenant's
+/// own policy reached, rather than every tenant's because the whole store is over its budget.
+///
+/// An entry with a live upload is a transfer in flight and is left alone: the push's staging and its lock live
+/// under it, and removing them would fail a worker's transfer mid-stream. A serve is not a pin — a reader holds
+/// the bundle's descriptor open, so unlinking the directory takes the entry out of the store while the transfer
+/// that already opened it finishes from its own descriptor.
+pub fn evict_repos(
+    root: &Path,
+    repos: &[RepoId],
+    keep_bytes: u64,
+    max_entries: u64,
+    now_ms: i64,
+) -> Evicted {
+    let mut out = Evicted {
+        complete: true,
+        ..Evicted::default()
+    };
+    let mut candidates: Vec<(i64, u64, PathBuf)> = Vec::new();
+    for repo in repos {
+        let mut stack = vec![(root.join(repo.to_string()), 1u32)];
+        while let Some((dir, depth)) = stack.pop() {
+            if candidates.len() as u64 >= max_entries {
+                out.complete = false;
+                break;
+            }
+            if depth == 7 {
+                if lease::writing_lock_live(&dir, now_ms) {
+                    continue;
+                }
+                let Some(id) = read_current(&dir) else {
+                    continue;
+                };
+                let Ok(meta) = fs::metadata(bundle_path(&dir, &id)) else {
+                    continue;
+                };
+                let used = fs::metadata(dir.join(scope::CURRENT_NAME))
+                    .map(|m| mtime_ms(&m))
+                    .unwrap_or(0);
+                candidates.push((used, meta.len(), dir));
+                continue;
+            }
+            match fs::read_dir(&dir) {
+                Ok(children) => {
+                    for child in children.flatten() {
+                        if child.file_type().is_ok_and(|t| t.is_dir()) {
+                            stack.push((child.path(), depth + 1));
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => out.errors += 1,
+            }
+        }
+    }
+    let mut held = candidates
+        .iter()
+        .fold(0u64, |sum, (_, bytes, _)| sum.saturating_add(*bytes));
+    if held <= keep_bytes {
+        return out;
+    }
+    candidates.sort_unstable_by_key(|(used, _, _)| *used);
+    for (_, bytes, entry) in candidates {
+        if held <= keep_bytes {
+            break;
+        }
+        if lease::writing_lock_live(&entry, now_ms) {
+            continue;
+        }
+        match fs::remove_dir_all(&entry) {
+            Ok(()) => {
+                out.entries += 1;
+                out.bytes = out.bytes.saturating_add(bytes);
+                held = held.saturating_sub(bytes);
+            }
+            Err(_) => out.errors += 1,
+        }
+    }
+    out
+}
+
+fn mtime_ms(m: &fs::Metadata) -> i64 {
+    m.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
 fn sweep_entry(entry: &Path, now_ms: i64, out: &mut StoreSweep) -> Option<(i64, u64, PathBuf)> {
     let stale_ms = STALE_UPLOAD.as_millis() as i64;
     let mtime_ms = |m: &fs::Metadata| {

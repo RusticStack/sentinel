@@ -357,6 +357,10 @@ struct StorageBody {
     log_retention_secs: Option<u64>,
     #[serde(default)]
     artifact_retention_secs: Option<u64>,
+    #[serde(default)]
+    soft_percent: Option<u8>,
+    #[serde(default)]
+    hard_percent: Option<u8>,
 }
 
 fn secs_ms(secs: Option<u64>) -> Result<Option<i64>, ApiError> {
@@ -379,6 +383,8 @@ fn storage_policy_json(p: &retention::Policy) -> Value {
         "quota_bytes": p.quota_bytes,
         "log_retention_ms": p.log_retention_ms,
         "artifact_retention_ms": p.artifact_retention_ms,
+        "soft_percent": p.soft_percent,
+        "hard_percent": p.hard_percent,
     })
 }
 
@@ -388,6 +394,17 @@ fn effective_json(e: &retention::Effective) -> Value {
         "repo_quota_bytes": e.repo_quota_bytes,
         "log_retention_ms": e.log_retention_ms,
         "artifact_retention_ms": e.artifact_retention_ms,
+        "soft_percent": e.soft_percent,
+        "hard_percent": e.hard_percent,
+    })
+}
+
+/// The tenant's own thresholds as byte counts, so a client never re-derives a boundary the controller rounds.
+fn thresholds_json(standing: &retention::Standing) -> Value {
+    json!({
+        "state": standing.state.as_str(),
+        "soft_limit_bytes": standing.soft_bytes,
+        "hard_limit_bytes": standing.hard_bytes,
     })
 }
 
@@ -408,6 +425,8 @@ fn set_storage(state: &State, request: &mut Request, slug: &str, repo: Option<&s
         quota_bytes: body.quota_bytes,
         log_retention_ms: secs_ms(body.log_retention_secs)?,
         artifact_retention_ms: secs_ms(body.artifact_retention_secs)?,
+        soft_percent: body.soft_percent,
+        hard_percent: body.hard_percent,
     };
     let authority = who.authority();
     let principal = who.principal;
@@ -443,7 +462,7 @@ fn tenant_storage(state: &State, request: &Request, slug: &str) -> Route {
     let principal = who.principal;
     let d = state.objects.deployment();
     let slug = slug.to_owned();
-    let (usage, own, effective, repos) = state
+    let (usage, own, effective, standing, repos) = state
         .store
         .read(move |c| {
             let tenant = authz::member_tenant_by_slug(c, principal, &slug)?;
@@ -459,6 +478,7 @@ fn tenant_storage(state: &State, request: &Request, slug: &str) -> Route {
                 retention::tenant_usage(c, tenant)?,
                 retention::policy(c, tenant, None)?,
                 retention::effective(c, &d, tenant, None)?,
+                retention::standing(c, &d, tenant)?,
                 repos,
             ))
         })
@@ -467,6 +487,7 @@ fn tenant_storage(state: &State, request: &Request, slug: &str) -> Route {
         "usage": { "object_bytes": usage.object_bytes, "log_bytes": usage.log_bytes },
         "policy": storage_policy_json(&own),
         "effective": effective_json(&effective),
+        "thresholds": thresholds_json(&standing),
         "repos": repos.iter().map(|(r, e)| json!({
             "id": r.repo.to_string(),
             "name": r.name,
@@ -505,6 +526,8 @@ fn deployment_storage(state: &State, request: &Request) -> Route {
         "stored_bytes": stored,
         "quota_bytes": d.quota_bytes,
         "tenant_quota_bytes": d.tenant_quota_bytes,
+        "soft_percent": d.soft_percent,
+        "hard_percent": d.hard_percent,
         "log_retention_ms": d.log_retention_ms,
         "artifact_retention_ms": d.artifact_retention_ms,
         "run_artifact_bytes": d.run_artifact_bytes,

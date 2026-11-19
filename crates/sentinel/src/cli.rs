@@ -778,8 +778,14 @@ pub enum TenantCommand {
         /// Longest artifact retention a pipeline may ask for, as in 30d
         #[arg(long, value_name = "DURATION")]
         artifact_retention: Option<String>,
-        /// Drop the named settings (quota, log-retention, artifact-retention)
-        /// so they inherit again; `all` removes the whole policy
+        /// Percent of the quota where a tenant is warned, at most the deployment's
+        #[arg(long, value_name = "PERCENT")]
+        soft_percent: Option<u8>,
+        /// Percent of the quota where its caches are evicted and its artifacts refused, at most the deployment's
+        #[arg(long, value_name = "PERCENT")]
+        hard_percent: Option<u8>,
+        /// Drop the named settings (quota, log-retention, artifact-retention,
+        /// thresholds) so they inherit again; `all` removes the whole policy
         #[arg(long, value_name = "SETTING")]
         inherit: Vec<String>,
     },

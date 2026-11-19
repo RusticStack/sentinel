@@ -436,6 +436,8 @@ struct StorageFile {
     sweep_interval_secs: Option<u64>,
     artifact_default_class: Option<String>,
     classes: Option<std::collections::BTreeMap<String, ClassFile>>,
+    soft_percent: Option<u8>,
+    hard_percent: Option<u8>,
 }
 
 #[cfg(feature = "server")]
@@ -518,6 +520,16 @@ impl StorageFile {
             return Err(Error::config("storage quotas must fit in 63 bits"));
         }
         let classes = self.resolve_classes(artifact_retention_secs)?;
+        let soft_percent = self.soft_percent.unwrap_or(defaults.soft_percent);
+        let hard_percent = self.hard_percent.unwrap_or(defaults.hard_percent);
+        if !(1..=100).contains(&soft_percent)
+            || !(1..=100).contains(&hard_percent)
+            || soft_percent > hard_percent
+        {
+            return Err(Error::config(
+                "storage soft_percent and hard_percent must be 1..=100 with soft_percent at most hard_percent",
+            ));
+        }
         Ok(Storage {
             reserve: self.reserve_bytes,
             low: self.low_watermark_bytes,
@@ -529,6 +541,8 @@ impl StorageFile {
                 log_retention_ms: (log_retention_secs * 1000) as i64,
                 artifact_retention_ms: (artifact_retention_secs * 1000) as i64,
                 run_artifact_bytes,
+                soft_percent,
+                hard_percent,
             },
             attempt_log_bytes,
             sweep_interval_ms: (sweep_interval_secs * 1000) as i64,
@@ -4300,6 +4314,7 @@ credentials_file = '/etc/sentinel/s3'
                     },
                 ),
             ])),
+            ..StorageFile::default()
         };
         let resolved = resolve_ok(file);
         assert_eq!(marks_ok(&resolved, 1 << 50).high, 3 << 30);
@@ -4319,6 +4334,25 @@ credentials_file = '/etc/sentinel/s3'
                 .collect::<Vec<_>>(),
             [("debug", 3_600_000, 1), ("release", 86_400_000, 3)]
         );
+        assert_eq!(resolved.deployment.soft_percent, 80);
+        assert_eq!(resolved.deployment.hard_percent, 100);
+        // A threshold pair is 1..=100 and soft never above hard.
+        for bad in [(Some(0_u8), None), (None, Some(101)), (Some(70), Some(60))] {
+            let file = StorageFile {
+                soft_percent: bad.0,
+                hard_percent: bad.1,
+                ..StorageFile::default()
+            };
+            assert!(file.resolve().is_err(), "{bad:?}");
+        }
+        let narrowed = StorageFile {
+            soft_percent: Some(50),
+            hard_percent: Some(75),
+            ..StorageFile::default()
+        };
+        let resolved = resolve_ok(narrowed);
+        assert_eq!(resolved.deployment.soft_percent, 50);
+        assert_eq!(resolved.deployment.hard_percent, 75);
     }
 
     fn settled(file: MailFile, env: &dyn Fn(&str) -> Option<String>) -> MailSettings {

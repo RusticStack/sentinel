@@ -1264,8 +1264,12 @@ pub fn capture_artifacts(
         }
         let outcome = artifacts::capture(workspace, decl, sink, attempt);
         if decl.required && outcome != artifacts::Outcome::Published {
-            failed.get_or_insert_with(|| {
-                format!("required artifact `{}` was not published", decl.name)
+            failed.get_or_insert_with(|| match outcome {
+                artifacts::Outcome::QuotaExceeded => format!(
+                    "required artifact `{}` was refused at the tenant's storage limit; its record names the bytes stored, the threshold and the largest classes",
+                    decl.name
+                ),
+                _ => format!("required artifact `{}` was not published", decl.name),
             });
         }
     }

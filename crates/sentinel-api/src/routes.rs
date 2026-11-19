@@ -1949,6 +1949,7 @@ fn artifact_json(row: &artifacts::Row) -> Value {
         "retain_until_ms": row.retain_until_ms.0,
         "pinned_ms": row.pinned_ms.map(|p| p.0),
         "created_ms": row.created_ms.0,
+        "failure": row.failure,
     })
 }
 

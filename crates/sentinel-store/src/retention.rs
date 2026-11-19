@@ -13,6 +13,69 @@ const DAY_MS: i64 = 24 * 3_600_000;
 pub const MIN_RETENTION_MS: i64 = 3_600_000;
 pub const MAX_RETENTION_MS: i64 = 366 * DAY_MS;
 
+/// Below this share of its quota a tenant is warned and nothing is refused; at the hard one the caches go first
+/// and an artifact that would pass it is refused. Both are percentages of the effective quota, so one policy
+/// serves every quota size.
+pub const DEFAULT_SOFT_PERCENT: u8 = 80;
+pub const DEFAULT_HARD_PERCENT: u8 = 100;
+
+/// A tenant's position against its own thresholds. `Soft` refuses nothing: it is what the API and the
+/// `sentinel_storage_tenants` metric report so an operator sees a tenant filling up before it is full.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Ok,
+    Soft,
+    Hard,
+}
+
+impl State {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            State::Ok => "ok",
+            State::Soft => "soft",
+            State::Hard => "hard",
+        }
+    }
+}
+
+/// The first byte count at or above which `percent` of `quota` is reached, rounded up so that the number a
+/// report shows and the comparison `check_tenant` makes are the same boundary. An unlimited tenant (quota 0)
+/// has no threshold and answers 0.
+pub fn limit_bytes(quota: u64, percent: u8) -> u64 {
+    if quota == 0 {
+        return 0;
+    }
+    let scaled = u128::from(quota) * u128::from(percent);
+    u64::try_from(scaled.div_ceil(100)).unwrap_or(u64::MAX)
+}
+
+pub fn state(used: u64, quota: u64, soft_percent: u8, hard_percent: u8) -> State {
+    if quota == 0 {
+        return State::Ok;
+    }
+    if used >= limit_bytes(quota, hard_percent) {
+        State::Hard
+    } else if used >= limit_bytes(quota, soft_percent) {
+        State::Soft
+    } else {
+        State::Ok
+    }
+}
+
+/// A tenant's own thresholds narrowed to the deployment's, soft never above hard: a tenant may tighten what
+/// the deployment allows and never widen it, and lowering a deployment threshold tightens every tenant with it.
+const fn thresholds(d: &Deployment, soft: Option<u8>, hard: Option<u8>) -> (u8, u8) {
+    let hard = match hard {
+        Some(own) if own < d.hard_percent => own,
+        _ => d.hard_percent,
+    };
+    let soft = match soft {
+        Some(own) if own < d.soft_percent => own,
+        _ => d.soft_percent,
+    };
+    (if soft < hard { soft } else { hard }, hard)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deployment {
     pub quota_bytes: u64,
@@ -20,6 +83,8 @@ pub struct Deployment {
     pub log_retention_ms: i64,
     pub artifact_retention_ms: i64,
     pub run_artifact_bytes: u64,
+    pub soft_percent: u8,
+    pub hard_percent: u8,
 }
 
 impl Default for Deployment {
@@ -30,6 +95,8 @@ impl Default for Deployment {
             log_retention_ms: 14 * DAY_MS,
             artifact_retention_ms: 90 * DAY_MS,
             run_artifact_bytes: sentinel_protocol::limits::MAX_RUN_ARTIFACT_BYTES,
+            soft_percent: DEFAULT_SOFT_PERCENT,
+            hard_percent: DEFAULT_HARD_PERCENT,
         }
     }
 }
@@ -186,6 +253,9 @@ pub struct Policy {
     pub quota_bytes: Option<u64>,
     pub log_retention_ms: Option<i64>,
     pub artifact_retention_ms: Option<i64>,
+    /// The tenant's thresholds; a repository row never carries them, because a threshold is the tenant's.
+    pub soft_percent: Option<u8>,
+    pub hard_percent: Option<u8>,
 }
 
 impl Policy {
@@ -195,6 +265,14 @@ impl Policy {
     fn validate(&self) -> Result<()> {
         if self.quota_bytes == Some(0) || self.quota_bytes.is_some_and(|q| q > i64::MAX as u64) {
             return Err(Error::InvalidInput("quota"));
+        }
+        let percent = |p: Option<u8>| p.is_none_or(|v| (1..=100).contains(&v));
+        if !percent(self.soft_percent) || !percent(self.hard_percent) {
+            return Err(Error::InvalidInput("threshold"));
+        }
+        if matches!((self.soft_percent, self.hard_percent), (Some(soft), Some(hard)) if hard < soft)
+        {
+            return Err(Error::InvalidInput("threshold"));
         }
         for ms in [self.log_retention_ms, self.artifact_retention_ms]
             .into_iter()
@@ -214,6 +292,8 @@ pub struct Effective {
     pub repo_quota_bytes: u64,
     pub log_retention_ms: i64,
     pub artifact_retention_ms: i64,
+    pub soft_percent: u8,
+    pub hard_percent: u8,
 }
 
 fn blob_repo(repo: Option<RepoId>) -> Vec<u8> {
@@ -223,7 +303,7 @@ fn blob_repo(repo: Option<RepoId>) -> Vec<u8> {
 pub fn policy(conn: &Connection, tenant: TenantId, repo: Option<RepoId>) -> Result<Policy> {
     Ok(conn
         .prepare_cached(
-            "SELECT quota_bytes, log_retention_ms, artifact_retention_ms
+            "SELECT quota_bytes, log_retention_ms, artifact_retention_ms, soft_percent, hard_percent
              FROM storage_policies WHERE tenant_id = ?1 AND repo_id = ?2",
         )?
         .query_row(
@@ -233,6 +313,8 @@ pub fn policy(conn: &Connection, tenant: TenantId, repo: Option<RepoId>) -> Resu
                     quota_bytes: r.get::<_, Option<i64>>(0)?.map(|q| q as u64),
                     log_retention_ms: r.get(1)?,
                     artifact_retention_ms: r.get(2)?,
+                    soft_percent: r.get::<_, Option<i64>>(3)?.map(|p| p as u8),
+                    hard_percent: r.get::<_, Option<i64>>(4)?.map(|p| p as u8),
                 })
             },
         )
@@ -249,11 +331,14 @@ pub fn effective(
     let own = policy(conn, tenant, None)?;
     let tenant_logs = own.log_retention_ms.unwrap_or(d.log_retention_ms);
     let tenant_artifacts = own.artifact_retention_ms.unwrap_or(d.artifact_retention_ms);
+    let (soft_percent, hard_percent) = thresholds(d, own.soft_percent, own.hard_percent);
     let mut out = Effective {
         tenant_quota_bytes: own.quota_bytes.unwrap_or(d.tenant_quota_bytes),
         repo_quota_bytes: 0,
         log_retention_ms: tenant_logs,
         artifact_retention_ms: tenant_artifacts,
+        soft_percent,
+        hard_percent,
     };
     if repo.is_some() {
         let narrow = policy(conn, tenant, repo)?;
@@ -319,6 +404,13 @@ pub fn set(
         {
             return Err(Error::InvalidInput("quota above the tenant's"));
         }
+        if policy.soft_percent.is_some() || policy.hard_percent.is_some() {
+            return Err(Error::InvalidInput("a threshold is the tenant's"));
+        }
+    } else if policy.soft_percent.is_some_and(|p| p > d.soft_percent)
+        || policy.hard_percent.is_some_and(|p| p > d.hard_percent)
+    {
+        return Err(Error::InvalidInput("threshold above the deployment's"));
     }
     if policy.is_empty() {
         tx.prepare_cached("DELETE FROM storage_policies WHERE tenant_id = ?1 AND repo_id = ?2")?
@@ -326,12 +418,14 @@ pub fn set(
     } else {
         tx.prepare_cached(
             "INSERT INTO storage_policies(tenant_id, repo_id, quota_bytes, log_retention_ms,
-                 artifact_retention_ms, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 artifact_retention_ms, soft_percent, hard_percent, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(tenant_id, repo_id) DO UPDATE SET
                  quota_bytes = excluded.quota_bytes,
                  log_retention_ms = excluded.log_retention_ms,
                  artifact_retention_ms = excluded.artifact_retention_ms,
+                 soft_percent = excluded.soft_percent,
+                 hard_percent = excluded.hard_percent,
                  updated_ms = excluded.updated_ms",
         )?
         .execute(params![
@@ -340,6 +434,8 @@ pub fn set(
             policy.quota_bytes.map(|q| q as i64),
             policy.log_retention_ms,
             policy.artifact_retention_ms,
+            policy.soft_percent.map(i64::from),
+            policy.hard_percent.map(i64::from),
             now.0,
         ])?;
     }
@@ -746,10 +842,20 @@ pub struct RepoStorage {
     pub policy: Policy,
 }
 
+/// The tenant's repository ids alone, for a pass that acts on the tenant's share of a shared store (the
+/// remote cache's eviction at the hard threshold).
+pub fn repo_ids(conn: &Connection, tenant: TenantId) -> Result<Vec<RepoId>> {
+    let mut stmt = conn.prepare_cached("SELECT id FROM repos WHERE tenant_id = ?1")?;
+    let rows = stmt.query_map([tenant.as_bytes().as_slice()], |r| r.get::<_, [u8; 16]>(0))?;
+    rows.map(|row| RepoId::from_bytes(row?).map_err(|_| Error::Corrupt("repo_id")))
+        .collect()
+}
+
 pub fn repos(conn: &Connection, tenant: TenantId) -> Result<Vec<RepoStorage>> {
     let mut stmt = conn.prepare_cached(
         "SELECT r.id, r.name, COALESCE(u.artifact_bytes, 0), COALESCE(u.log_bytes, 0),
-                p.quota_bytes, p.log_retention_ms, p.artifact_retention_ms
+                p.quota_bytes, p.log_retention_ms, p.artifact_retention_ms, p.soft_percent,
+                p.hard_percent
          FROM repos r
          LEFT JOIN repo_usage u ON u.tenant_id = r.tenant_id AND u.repo_id = r.id
          LEFT JOIN storage_policies p ON p.tenant_id = r.tenant_id AND p.repo_id = r.id
@@ -764,11 +870,13 @@ pub fn repos(conn: &Connection, tenant: TenantId) -> Result<Vec<RepoStorage>> {
             r.get::<_, Option<i64>>(4)?,
             r.get::<_, Option<i64>>(5)?,
             r.get::<_, Option<i64>>(6)?,
+            r.get::<_, Option<i64>>(7)?,
+            r.get::<_, Option<i64>>(8)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, name, artifacts, logs, quota, log_ms, art_ms) = row?;
+        let (id, name, artifacts, logs, quota, log_ms, art_ms, soft, hard) = row?;
         out.push(RepoStorage {
             repo: RepoId::from_bytes(id).map_err(|_| Error::Corrupt("repo_id"))?,
             name,
@@ -780,6 +888,8 @@ pub fn repos(conn: &Connection, tenant: TenantId) -> Result<Vec<RepoStorage>> {
                 quota_bytes: quota.map(|q| q as u64),
                 log_retention_ms: log_ms,
                 artifact_retention_ms: art_ms,
+                soft_percent: soft.map(|p| p as u8),
+                hard_percent: hard.map(|p| p as u8),
             },
         });
     }
@@ -793,14 +903,96 @@ pub fn check_tenant(
     owed: u64,
     extra: u64,
 ) -> Result<()> {
-    let quota = effective(conn, d, tenant, None)?.tenant_quota_bytes;
-    if quota > 0 && owed.saturating_add(extra) > quota {
+    let e = effective(conn, d, tenant, None)?;
+    let limit = limit_bytes(e.tenant_quota_bytes, e.hard_percent);
+    if limit > 0 && owed.saturating_add(extra) > limit {
         return Err(Error::QuotaExceeded);
     }
     if d.quota_bytes > 0 && deployment_usage(conn)?.saturating_add(extra) > d.quota_bytes {
         return Err(Error::QuotaExceeded);
     }
     Ok(())
+}
+
+/// A tenant's counted bytes against its own thresholds, in one keyed read: what a refusal names and what the
+/// storage page and the metric report. The bytes counted are the quota's (`artifacts + uploads + logs`), the
+/// same numbers `check_tenant` enforces, so a report and a refusal can never disagree about where the line is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Standing {
+    pub used: u64,
+    pub quota_bytes: u64,
+    pub soft_bytes: u64,
+    pub hard_bytes: u64,
+    pub soft_percent: u8,
+    pub hard_percent: u8,
+    pub state: State,
+}
+
+const STANDING: &str = "SELECT COALESCE(u.bytes, 0) + COALESCE(u.log_bytes, 0),
+        p.quota_bytes, p.soft_percent, p.hard_percent
+    FROM (SELECT ?1 AS id) one
+    LEFT JOIN tenant_usage u ON u.tenant_id = one.id
+    LEFT JOIN storage_policies p ON p.tenant_id = one.id AND p.repo_id = X''";
+
+pub fn standing(conn: &Connection, d: &Deployment, tenant: TenantId) -> Result<Standing> {
+    let (used, quota, soft, hard) =
+        conn.prepare_cached(STANDING)?
+            .query_row([tenant.as_bytes().as_slice()], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            })?;
+    let (soft_percent, hard_percent) = thresholds(
+        d,
+        soft.map(|p| p.clamp(1, 100) as u8),
+        hard.map(|p| p.clamp(1, 100) as u8),
+    );
+    let quota_bytes = quota.map_or(d.tenant_quota_bytes, |q| q.max(0) as u64);
+    Ok(Standing {
+        used: used.max(0) as u64,
+        quota_bytes,
+        soft_bytes: limit_bytes(quota_bytes, soft_percent),
+        hard_bytes: limit_bytes(quota_bytes, hard_percent),
+        soft_percent,
+        hard_percent,
+        state: state(used.max(0) as u64, quota_bytes, soft_percent, hard_percent),
+    })
+}
+
+const STATES: &str = "SELECT COALESCE(u.bytes, 0) + COALESCE(u.log_bytes, 0),
+        p.quota_bytes, p.soft_percent, p.hard_percent
+    FROM tenants t
+    LEFT JOIN tenant_usage u ON u.tenant_id = t.id
+    LEFT JOIN storage_policies p ON p.tenant_id = t.id AND p.repo_id = X''";
+
+/// How many tenants stand in each state, `[ok, soft, hard]`, for the metric that names no tenant. Every tenant
+/// is one keyed row here: a tenant with no usage row is `ok`, and one with no policy row inherits the
+/// deployment's thresholds.
+pub fn states(conn: &Connection, d: &Deployment) -> Result<[u64; 3]> {
+    let mut stmt = conn.prepare_cached(STATES)?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, Option<i64>>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+        ))
+    })?;
+    let mut out = [0u64; 3];
+    for row in rows {
+        let (used, quota, soft, hard) = row?;
+        let (soft_percent, hard_percent) = thresholds(
+            d,
+            soft.map(|p| p.clamp(1, 100) as u8),
+            hard.map(|p| p.clamp(1, 100) as u8),
+        );
+        let quota_bytes = quota.map_or(d.tenant_quota_bytes, |q| q.max(0) as u64);
+        out[state(used.max(0) as u64, quota_bytes, soft_percent, hard_percent) as usize] += 1;
+    }
+    Ok(out)
 }
 
 pub fn check_repo(
@@ -851,13 +1043,15 @@ pub fn install(tx: &Transaction<'_>, d: &Deployment) -> Result<()> {
     }
     tx.prepare_cached(
         "INSERT INTO storage_defaults(id, quota_bytes, tenant_quota_bytes, log_retention_ms,
-             artifact_retention_ms, run_artifact_bytes, installed_ms)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+             artifact_retention_ms, run_artifact_bytes, soft_percent, hard_percent, installed_ms)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(id) DO UPDATE SET quota_bytes = excluded.quota_bytes,
              tenant_quota_bytes = excluded.tenant_quota_bytes,
              log_retention_ms = excluded.log_retention_ms,
              artifact_retention_ms = excluded.artifact_retention_ms,
              run_artifact_bytes = excluded.run_artifact_bytes,
+             soft_percent = excluded.soft_percent,
+             hard_percent = excluded.hard_percent,
              installed_ms = excluded.installed_ms",
     )?
     .execute(params![
@@ -866,6 +1060,8 @@ pub fn install(tx: &Transaction<'_>, d: &Deployment) -> Result<()> {
         d.log_retention_ms,
         d.artifact_retention_ms,
         fits(d.run_artifact_bytes)?,
+        i64::from(d.soft_percent),
+        i64::from(d.hard_percent),
         UnixMillis::now().0,
     ])?;
     Ok(())
@@ -875,7 +1071,7 @@ pub fn installed(conn: &Connection) -> Result<Deployment> {
     Ok(conn
         .prepare_cached(
             "SELECT quota_bytes, tenant_quota_bytes, log_retention_ms, artifact_retention_ms,
-                    run_artifact_bytes
+                    run_artifact_bytes, soft_percent, hard_percent
              FROM storage_defaults WHERE id = 1",
         )?
         .query_row([], |r| {
@@ -885,6 +1081,8 @@ pub fn installed(conn: &Connection) -> Result<Deployment> {
                 log_retention_ms: r.get(2)?,
                 artifact_retention_ms: r.get(3)?,
                 run_artifact_bytes: r.get::<_, i64>(4)?.max(1) as u64,
+                soft_percent: r.get::<_, i64>(5)?.clamp(1, 100) as u8,
+                hard_percent: r.get::<_, i64>(6)?.clamp(1, 100) as u8,
             })
         })
         .optional()?
