@@ -207,11 +207,13 @@ pub(crate) fn entry(state: &State, request: &Request, run: &str, art: &str, quer
             let Some(version) = row.manifest_version else {
                 return Err(StoreError::NotFound);
             };
+            // A row's producer names its manifest: a job's `{job}/{name}`, a run-level artifact's
+            // `run/{run}/{name}` or a runner-mode one's GitHub coordinates.
             let manifest = state.objects.manifest(
                 c,
                 tenant,
                 sentinel_store::objects::Kind::Artifact,
-                &artifacts::manifest_name(row.job, &row.name),
+                &row.manifest()?,
                 Some(version),
             )?;
             manifest
