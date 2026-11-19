@@ -842,14 +842,19 @@ impl LogStore {
 
     fn seal(&self, w: &mut Open) -> Result<()> {
         persist_holes(w)?;
+        // The segment reaches the disk before the seal entry that covers it: a durable entry names the frames and
+        // lines the log holds through its last one, and a crash between the two must not leave an index claiming
+        // a segment whose tail was never written — a reader would trust it, and the worker's resends would read as
+        // duplicates nothing can fill.
+        if let Some(file) = w.file.as_ref() {
+            file.sync_data()?;
+        }
+        w.dirty = false;
         let mut entry = Vec::with_capacity(INDEX_ENTRY_BYTES);
         seal_entry(w, w.seg, &mut entry);
         index_write(w, &entry)?;
         w.index.sync_data()?;
-        if let Some(file) = w.file.take() {
-            file.sync_data()?;
-        }
-        w.dirty = false;
+        w.file = None;
         self.compressor.enqueue(seg_path(&w.dir, w.seg, false));
         w.seg += 1;
         w.seg_len = 0;

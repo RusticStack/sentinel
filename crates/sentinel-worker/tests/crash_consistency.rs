@@ -67,6 +67,15 @@ enum Op {
         seq: u64,
         bytes: Vec<u8>,
     },
+    /// The session's own path: written without a sync, durable only once `StoreSync` follows.
+    StoreAppendDeferred {
+        log: usize,
+        seq: u64,
+        bytes: Vec<u8>,
+    },
+    StoreSync {
+        log: usize,
+    },
     StoreFinish {
         log: usize,
         last_seq: u64,
@@ -122,11 +131,16 @@ fn plan() -> Vec<Op> {
         gaps: vec![(8, 8)],
     });
     for seq in 1..=BIG_FRAMES {
-        ops.push(Op::StoreAppend {
+        ops.push(Op::StoreAppendDeferred {
             log: 1,
             seq,
             bytes: big_frame(seq),
         });
+        // The frames between the last sync and the segment's seal are the ones a power cut can take while the
+        // index already names the segment as closed.
+        if seq == 40 || seq == 90 {
+            ops.push(Op::StoreSync { log: 1 });
+        }
     }
     ops.push(Op::StoreFinish {
         log: 1,
@@ -156,6 +170,9 @@ enum Outcome {
         gaps: Vec<(u64, u64)>,
     },
     Stored,
+    StoreSynced {
+        through: u64,
+    },
     Ended,
 }
 
@@ -210,7 +227,7 @@ fn apply(root: &Path, live: &mut Live, op: &Op) -> Outcome {
             live.store = Some(LogStore::open(&logs_dir).unwrap());
             Outcome::None
         }
-        Op::StoreAppend { log, seq, bytes } => {
+        Op::StoreAppend { log, seq, bytes } | Op::StoreAppendDeferred { log, seq, bytes } => {
             let (run, job, attempt) = logs()[*log];
             let frame = Frame {
                 seq: *seq,
@@ -218,15 +235,23 @@ fn apply(root: &Path, live: &mut Live, op: &Op) -> Outcome {
                 stream: Stream::Stdout,
                 bytes: bytes.clone(),
             };
-            match live
-                .store
-                .as_ref()
-                .unwrap()
-                .append(run, job, attempt, &frame)
-                .unwrap()
-            {
+            let store = live.store.as_ref().unwrap();
+            let appended = if matches!(op, Op::StoreAppendDeferred { .. }) {
+                store.append_deferred(run, job, attempt, &frame)
+            } else {
+                store.append(run, job, attempt, &frame)
+            };
+            match appended.unwrap() {
                 sentinel_store::logs::Appended::Stored { .. } => Outcome::Stored,
                 other => panic!("append {seq} of log {log}: {other:?}"),
+            }
+        }
+        Op::StoreSync { log } => {
+            let (_, _, attempt) = logs()[*log];
+            let store = live.store.as_ref().unwrap();
+            store.sync(attempt).unwrap();
+            Outcome::StoreSynced {
+                through: store.frontier(attempt).map_or(0, |(seq, _)| seq),
             }
         }
         Op::StoreFinish {
@@ -314,12 +339,16 @@ struct Promises {
     spool_acked_at_most: u64,
     store_open: bool,
     stored: Vec<BTreeSet<u64>>,
+    deferred: Vec<BTreeSet<u64>>,
+    store_synced: Vec<u64>,
     ended: Vec<bool>,
 }
 
 fn promises(golden: &Golden, done: usize) -> Promises {
     let mut p = Promises {
         stored: vec![BTreeSet::new(); logs().len()],
+        deferred: vec![BTreeSet::new(); logs().len()],
+        store_synced: vec![0; logs().len()],
         ended: vec![false; logs().len()],
         ..Promises::default()
     };
@@ -355,6 +384,12 @@ fn promises(golden: &Golden, done: usize) -> Promises {
             (Op::StoreOpen, _) => p.store_open = true,
             (Op::StoreAppend { log, seq, .. }, Outcome::Stored) => {
                 p.stored[*log].insert(*seq);
+            }
+            (Op::StoreAppendDeferred { log, seq, .. }, Outcome::Stored) => {
+                p.deferred[*log].insert(*seq);
+            }
+            (Op::StoreSync { log }, Outcome::StoreSynced { through }) => {
+                p.store_synced[*log] = p.store_synced[*log].max(*through);
             }
             (Op::StoreFinish { log, .. }, Outcome::Ended) => p.ended[*log] = true,
             _ => {}
@@ -486,6 +521,12 @@ fn verify_store(root: &Path, p: &Promises, golden: &Golden, bad: &mut Vec<String
                         bad.push(format!("log {log}: acknowledged frame {seq} was lost"));
                     }
                 }
+                // A deferred frame is promised from the sync that covered it: the same boundary `LogAck` holds.
+                for seq in p.deferred[log].range(..=p.store_synced[log]) {
+                    if !seen.contains(seq) {
+                        bad.push(format!("log {log}: synced frame {seq} was lost"));
+                    }
+                }
                 if p.ended[log] && (!tail.complete || tail.gaps != want.gaps) {
                     bad.push(format!(
                         "log {log}: the durable end was lost ({} {:?})",
@@ -519,7 +560,10 @@ fn verify_store(root: &Path, p: &Promises, golden: &Golden, bad: &mut Vec<String
         }
         for (op, _) in golden.ops.iter().zip(&golden.outcomes) {
             match op {
-                Op::StoreAppend { log: l, seq, bytes } if *l == log => {
+                Op::StoreAppend { log: l, seq, bytes }
+                | Op::StoreAppendDeferred { log: l, seq, bytes }
+                    if *l == log =>
+                {
                     let frame = Frame {
                         seq: *seq,
                         step: 0,
@@ -1373,7 +1417,12 @@ fn power_cut_on_dm_flakey() {
     let big_start = golden
         .ops
         .iter()
-        .position(|op| matches!(op, Op::StoreAppend { log: 1, .. }))
+        .position(|op| {
+            matches!(
+                op,
+                Op::StoreAppend { log: 1, .. } | Op::StoreAppendDeferred { log: 1, .. }
+            )
+        })
         .unwrap();
     let big_end = big_start + BIG_FRAMES as usize;
     let points: Vec<usize> = (0..total)
