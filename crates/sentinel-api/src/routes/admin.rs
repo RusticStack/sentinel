@@ -7,7 +7,7 @@ use sentinel_protocol::{
     limits::page_size,
 };
 use sentinel_store::{
-    auth as authz, local_auth, lookup, mfa, notices, operations,
+    auth as authz, classes, local_auth, lookup, mfa, notices, operations,
     registration::{self, DeploymentPolicy, InstallationBinding, Registration, TenantCreation},
     retention, sources, tenancy, views,
 };
@@ -111,7 +111,9 @@ pub(super) fn route(
         ("GET", ["api", "v1", "admin", "backups"]) => list_backups(state, request),
         ("POST", ["api", "v1", "admin", "backups"]) => start_backup(state, request),
         ("GET", ["api", "v1", "admin", "diagnostics"]) => diagnostics(state, request, query),
-        ("GET", ["api", "v1", "tenants", slug, "storage"]) => tenant_storage(state, request, slug),
+        ("GET", ["api", "v1", "tenants", slug, "storage"]) => {
+            tenant_storage(state, request, slug, query)
+        }
         ("PUT", ["api", "v1", "tenants", slug, "repos", name, "storage"]) => {
             set_storage(state, request, slug, Some(name))
         }
@@ -215,6 +217,7 @@ fn list_tenants(state: &State, request: &Request, query: &str) -> Route {
     let who = platform(state, request, false)?;
     let after = query_param(query, "after").map(str::to_owned);
     let limit = limit(query);
+    let d = state.objects.deployment();
     let rows = state
         .store
         .read(|c| {
@@ -222,16 +225,17 @@ fn list_tenants(state: &State, request: &Request, query: &str) -> Route {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
                 let effective = state.objects.quota(c, row.id)?;
-                out.push((row, effective));
+                let standing = retention::standing(c, &d, row.id)?;
+                out.push((row, effective, standing));
             }
             Ok(out)
         })
         .map_err(store_error)?;
     let next = (rows.len() == usize::from(limit))
-        .then(|| rows.last().map(|(r, _)| r.slug.clone()))
+        .then(|| rows.last().map(|(r, _, _)| r.slug.clone()))
         .flatten();
     ok(json!({
-        "tenants": rows.iter().map(|(t, effective)| json!({
+        "tenants": rows.iter().map(|(t, effective, standing)| json!({
             "id": t.id.to_string(),
             "slug": t.slug,
             "kind": if t.personal { "personal" } else { "organization" },
@@ -243,6 +247,10 @@ fn list_tenants(state: &State, request: &Request, query: &str) -> Route {
             "quota_set": t.quota_bytes.is_some(),
             "log_retention_ms": t.log_retention_ms,
             "artifact_retention_ms": t.artifact_retention_ms,
+            "used_percent": percent_used(standing),
+            "state": standing.state.as_str(),
+            "soft_limit_bytes": standing.soft_bytes,
+            "hard_limit_bytes": standing.hard_bytes,
         })).collect::<Vec<_>>(),
         "next": next,
     }))
@@ -408,6 +416,63 @@ fn thresholds_json(standing: &retention::Standing) -> Value {
     })
 }
 
+/// How full a tenant is, in whole percent, or `null` for an unlimited one: the same ratio `sentinel_storage_tenants`
+/// counts by state, so a list and a metric cannot disagree. Rounded down, so 100 means the hard line is reached.
+fn percent_used(standing: &retention::Standing) -> Option<u64> {
+    (standing.quota_bytes > 0).then(|| standing.used.saturating_mul(100) / standing.quota_bytes)
+}
+
+/// The classes the tenant quota counts, in `classes::CLASS_NAMES` order: the stored ones. The cache classes are
+/// reported beside them and never part of the quota.
+const COUNTED_CLASSES: [&str; 3] = ["artifacts", "uploads", "logs"];
+
+fn classes_json(classes: &classes::Classes) -> Value {
+    let mut out = serde_json::Map::with_capacity(8);
+    for (name, bytes) in classes.by_name() {
+        out.insert(name.to_owned(), json!(bytes));
+    }
+    out.insert("counted".to_owned(), json!(COUNTED_CLASSES));
+    Value::Object(out)
+}
+
+fn items_json(items: &[classes::Item]) -> Value {
+    Value::Array(
+        items
+            .iter()
+            .map(|i| {
+                json!({
+                    "id": i.artifact.to_string(),
+                    "name": i.name,
+                    "class": i.class,
+                    "repo": i.repo,
+                    "bytes": i.bytes,
+                    "expires_ms": i.expires.0,
+                    "pinned": i.pinned,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The snapshots newest first, each with the total the quota counts beside its classes: the trend's one figure.
+fn trend_json(rows: &[classes::Snapshot]) -> Value {
+    Value::Array(
+        rows.iter()
+            .map(|s| {
+                let mut one = json!({
+                    "day": s.day,
+                    "taken_ms": s.taken_ms,
+                    "stored_bytes": s.classes.stored(),
+                });
+                if let Value::Object(map) = &mut one {
+                    map.insert("classes".to_owned(), classes_json(&s.classes));
+                }
+                one
+            })
+            .collect(),
+    )
+}
+
 fn set_storage(state: &State, request: &mut Request, slug: &str, repo: Option<&str>) -> Route {
     let who = if repo.is_some() {
         tenant_admin(state, request, true)?
@@ -457,12 +522,43 @@ fn set_storage(state: &State, request: &mut Request, slug: &str, repo: Option<&s
     ok(json!({ "policy": storage_policy_json(&own), "effective": effective_json(&effective) }))
 }
 
-fn tenant_storage(state: &State, request: &Request, slug: &str) -> Route {
+/// How many days of snapshots the trend carries unless the request names fewer.
+const TREND_DAYS: usize = 30;
+/// How far ahead the storage page looks for what expires: the window the page's own section is titled by.
+const EXPIRY_WINDOW_MS: i64 = 7 * 86_400_000;
+/// The heaviest artifacts listed, and the soonest expiring ones: a page is read by a person, so both are short.
+const LARGEST_LISTED: usize = 10;
+const SOONEST_LISTED: usize = 10;
+
+/// Everything the tenant's storage page reads, gathered in one read connection so the parts cannot disagree.
+struct StorageReport {
+    usage: retention::Usage,
+    own: retention::Policy,
+    effective: retention::Effective,
+    standing: retention::Standing,
+    repos: Vec<(retention::RepoStorage, retention::Effective)>,
+    notice: Option<notices::Notice>,
+    by_class: classes::Classes,
+    trend: Vec<classes::Snapshot>,
+    largest: Vec<classes::Item>,
+    expiring: classes::Expiry,
+}
+
+fn tenant_storage(state: &State, request: &Request, slug: &str, query: &str) -> Route {
     let who = tenant_admin(state, request, false)?;
+    let days = match query_param(query, "days") {
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|d| (1..=classes::SNAPSHOT_DAYS).contains(d))
+            .ok_or_else(|| err(ErrorCode::InvalidRequest, "days must be 1 to 90 snapshots"))?,
+        None => TREND_DAYS,
+    };
     let principal = who.principal;
     let d = state.objects.deployment();
     let slug = slug.to_owned();
-    let (usage, own, effective, standing, repos, notice) = state
+    let until = UnixMillis(UnixMillis::now().0.saturating_add(EXPIRY_WINDOW_MS));
+    let report = state
         .store
         .read(move |c| {
             let tenant = authz::member_tenant_by_slug(c, principal, &slug)?;
@@ -474,21 +570,48 @@ fn tenant_storage(state: &State, request: &Request, slug: &str) -> Route {
                     Ok((r, e))
                 })
                 .collect::<sentinel_store::Result<Vec<_>>>()?;
-            Ok((
-                retention::tenant_usage(c, tenant)?,
-                retention::policy(c, tenant, None)?,
-                retention::effective(c, &d, tenant, None)?,
-                retention::standing(c, &d, tenant)?,
+            Ok(StorageReport {
+                usage: retention::tenant_usage(c, tenant)?,
+                own: retention::policy(c, tenant, None)?,
+                effective: retention::effective(c, &d, tenant, None)?,
+                standing: retention::standing(c, &d, tenant)?,
                 repos,
-                notices::notice(c, tenant)?,
-            ))
+                notice: notices::notice(c, tenant)?,
+                by_class: classes::tenant(c, tenant)?,
+                trend: classes::snapshots(c, tenant, days)?,
+                largest: classes::largest(c, tenant, LARGEST_LISTED)?,
+                expiring: classes::expiring(c, tenant, until, SOONEST_LISTED)?,
+            })
         })
         .map_err(store_error)?;
+    let StorageReport {
+        usage,
+        own,
+        effective,
+        standing,
+        repos,
+        notice,
+        by_class,
+        trend,
+        largest,
+        expiring,
+    } = report;
     ok(json!({
         "usage": { "object_bytes": usage.object_bytes, "log_bytes": usage.log_bytes },
+        "classes": classes_json(&by_class),
         "policy": storage_policy_json(&own),
         "effective": effective_json(&effective),
         "thresholds": thresholds_json(&standing),
+        "trend": trend_json(&trend),
+        "largest": items_json(&largest),
+        "expiring": {
+            "window_ms": EXPIRY_WINDOW_MS,
+            "artifact_bytes": expiring.artifact_bytes,
+            "artifacts": expiring.artifacts,
+            "log_bytes": expiring.log_bytes,
+            "logs": expiring.logs,
+            "soonest": items_json(&expiring.items),
+        },
         "notice": notice.map(|n| json!({
             "threshold_percent": n.threshold_percent,
             "used_bytes": n.used_bytes,

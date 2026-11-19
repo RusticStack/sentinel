@@ -308,11 +308,37 @@ fn deployment(bulk_mib: usize, relayed: bool) -> (Arc<Fixture>, Web, String, Str
     (f, web, web_addr, origin)
 }
 
+/// What the storage page needs beyond the fixtures: a quota to be measured against, two daily snapshots for the trend,
+/// and one stamped log due inside the 7-day window.
+fn seed_storage_days(f: &Fixture) {
+    const DAY: i64 = 86_400_000;
+    const QUOTA: u64 = 64 << 20;
+    let (objects, acme) = (Arc::clone(&f.objects), f.acme);
+    let now = UnixMillis::now();
+    let today = sentinel_store::classes::day_of(now);
+    let attempt = f.attempts["alpha"].0;
+    f.store
+        .writer()
+        .write(move |tx| {
+            for day in [today - 1, today] {
+                sentinel_store::classes::snapshot_day(tx, day, UnixMillis(day * DAY), None, 64)?;
+            }
+            objects.set_quota(tx, acme, QUOTA)?;
+            tx.execute(
+                "UPDATE attempts SET log_bytes = 4096, log_expires_ms = ?2 WHERE id = ?1",
+                (attempt.as_bytes().as_slice(), now.0.saturating_add(3 * DAY)),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
 #[test]
 #[ignore = "needs Node, the built web interface and a Chromium-family browser"]
 fn the_web_interface_in_a_real_browser() {
     let (f, web, web_addr, origin) = deployment(64, true);
     f.seed_artifacts();
+    seed_storage_days(&f);
     let seed = f.seed_step_up_users();
     let stop = Arc::new(AtomicBool::new(false));
     let writer = keep_writing(&f, &stop);

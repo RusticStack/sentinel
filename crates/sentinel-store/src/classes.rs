@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use sentinel_core::{RepoId, TenantId, UnixMillis};
+use sentinel_core::{ArtifactId, RepoId, TenantId, UnixMillis};
 
-use crate::{Result, Store};
+use crate::{Error, Result, Store};
 
 pub const DAY_MS: i64 = 86_400_000;
 /// Snapshots a tenant keeps; the same number is in the `storage_class_snapshots_bound` trigger.
@@ -128,6 +128,20 @@ pub const STATEMENTS: &[(&str, &str)] = &[
     ("snapshot_keys", SNAPSHOT_KEYS),
     ("snapshot_insert", SNAPSHOT_INSERT),
     ("snapshots", SNAPSHOTS),
+];
+
+/// The reads the storage page adds beyond the class totals, each with the index that answers it: the two expiry
+/// figures are range reads over a partial index, and the heaviest-first list walks the tenant's own artifacts. A
+/// plan test asserts every one of them names its index and none scans a table.
+pub const PAGE_READS: &[(&str, &str, &str)] = &[
+    ("largest", LARGEST, "artifacts_by_run"),
+    (
+        "expiring_artifacts",
+        EXPIRING_ARTIFACTS,
+        "artifacts_retention",
+    ),
+    ("expiring_totals", EXPIRING_TOTALS, "artifacts_retention"),
+    ("expiring_logs", EXPIRING_LOGS, "attempts_log_expiry"),
 ];
 
 /// The tenant's classes as the triggers and reports keep them; a tenant that never stored anything has none.
@@ -295,4 +309,140 @@ pub fn snapshots(conn: &Connection, tenant: TenantId, limit: usize) -> Result<Ve
         })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// One artifact as the storage page lists it: the bytes it holds against the quota and when they go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Item {
+    pub artifact: ArtifactId,
+    pub name: String,
+    pub class: String,
+    pub repo: Option<String>,
+    pub bytes: u64,
+    pub expires: UnixMillis,
+    pub pinned: bool,
+}
+
+/// The heaviest artifacts a tenant holds, heaviest first. Bounded by `limit`: SQLite sorts the tenant's own rows for
+/// the order and keeps the head of it, which is the one sort this page's reads cannot avoid without an index of its
+/// own (the metadata schema is frozen here), so the walk is the tenant's artifacts and nothing else.
+const LARGEST: &str = "SELECT a.id, a.name, a.class, a.bytes, a.retain_until_ms, a.pinned_ms,
+        (SELECT p.name FROM repos p WHERE p.id = COALESCE(a.repo_id,
+            (SELECT r.repo_id FROM runs r WHERE r.id = a.run_id)))
+     FROM artifacts a INDEXED BY artifacts_by_run
+     WHERE a.tenant_id = ?1 AND a.state_code = 0
+     ORDER BY a.bytes DESC LIMIT ?2";
+
+/// The artifacts that expire from `now` to `until` (not the pinned ones, which the sweep keeps), soonest first.
+const EXPIRING_ARTIFACTS: &str =
+    "SELECT a.id, a.name, a.class, a.bytes, a.retain_until_ms, a.pinned_ms,
+        (SELECT p.name FROM repos p WHERE p.id = COALESCE(a.repo_id,
+            (SELECT r.repo_id FROM runs r WHERE r.id = a.run_id)))
+     FROM artifacts a INDEXED BY artifacts_retention
+     WHERE a.retain_until_ms <= ?2 AND a.pinned_ms IS NULL AND a.state_code = 0
+       AND a.tenant_id = ?1
+     ORDER BY a.retain_until_ms LIMIT ?3";
+
+/// The tenant's expiring artifact bytes and log bytes in one row each; the same window as the list above.
+const EXPIRING_TOTALS: &str = "SELECT COALESCE(SUM(bytes), 0), COUNT(*)
+     FROM artifacts a INDEXED BY artifacts_retention
+     WHERE a.retain_until_ms <= ?2 AND a.pinned_ms IS NULL AND a.state_code = 0
+       AND a.tenant_id = ?1";
+
+/// A tenant's stamped, unexpired logs due by `until`. The partial index is on the deadline alone, so the walk is the
+/// logs due in the window for every tenant and the tenant's are the rows kept — bounded by the window, never by the
+/// tenant's whole log history.
+const EXPIRING_LOGS: &str = "SELECT COALESCE(SUM(log_bytes), 0), COUNT(*)
+     FROM attempts INDEXED BY attempts_log_expiry
+     WHERE log_expires_ms <= ?2 AND tenant_id = ?1 AND log_expired_ms IS NULL";
+
+type ItemRow = (
+    [u8; 16],
+    String,
+    String,
+    i64,
+    i64,
+    Option<i64>,
+    Option<String>,
+);
+
+fn item(r: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+    ))
+}
+
+fn item_of((id, name, class, bytes, expires, pinned, repo): ItemRow) -> Result<Item> {
+    Ok(Item {
+        artifact: ArtifactId::from_bytes(id).map_err(|_| Error::Corrupt("artifact_id"))?,
+        name,
+        class,
+        repo,
+        bytes: clamp(bytes),
+        expires: UnixMillis(expires),
+        pinned: pinned.is_some(),
+    })
+}
+
+fn items(rows: impl Iterator<Item = rusqlite::Result<ItemRow>>) -> Result<Vec<Item>> {
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(item_of(row?)?);
+    }
+    Ok(out)
+}
+
+pub fn largest(conn: &Connection, tenant: TenantId, limit: usize) -> Result<Vec<Item>> {
+    let mut stmt = conn.prepare_cached(LARGEST)?;
+    let rows = stmt.query_map(params![tenant.as_bytes().as_slice(), limit as i64], item)?;
+    items(rows)
+}
+
+/// What a tenant loses inside a window, and the soonest artifacts in it when a list is asked for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Expiry {
+    pub artifacts: u64,
+    pub artifact_bytes: u64,
+    pub logs: u64,
+    pub log_bytes: u64,
+    pub items: Vec<Item>,
+}
+
+pub fn expiring(
+    conn: &Connection,
+    tenant: TenantId,
+    until: UnixMillis,
+    limit: usize,
+) -> Result<Expiry> {
+    let id = tenant.as_bytes().as_slice();
+    let totals = |sql: &str| -> Result<(u64, u64)> {
+        let (bytes, count) = conn
+            .prepare_cached(sql)?
+            .query_row(params![id, until.0], |r| {
+                Ok((clamp(r.get(0)?), clamp(r.get(1)?)))
+            })?;
+        Ok((bytes, count))
+    };
+    let (artifact_bytes, artifacts) = totals(EXPIRING_TOTALS)?;
+    let (log_bytes, logs) = totals(EXPIRING_LOGS)?;
+    let soonest = if limit == 0 {
+        Vec::new()
+    } else {
+        let mut stmt = conn.prepare_cached(EXPIRING_ARTIFACTS)?;
+        let rows = stmt.query_map(params![id, until.0, limit as i64], item)?;
+        items(rows)?
+    };
+    Ok(Expiry {
+        artifacts,
+        artifact_bytes,
+        logs,
+        log_bytes,
+        items: soonest,
+    })
 }

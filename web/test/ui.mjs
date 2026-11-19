@@ -794,6 +794,110 @@ await scenario("storage policy", async () => {
   check("the deployment's disk and stored bytes are shown", await page.eval("document.body.textContent.includes('Stored by tenants') && document.body.textContent.includes('Data filesystem')"));
 });
 
+const fmtStorage = (n) => {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let v = Number(n), u = 0;
+  while (Math.abs(v) >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+  return `${u ? v.toFixed(v < 10 ? 1 : 0) : v} ${units[u]}`;
+};
+
+await scenario("storage by class", async () => {
+  const { body } = await root("GET", "/api/v1/tenants/acme/storage");
+  await go(page, ...PAGES.storage);
+  const section = (id) => `document.querySelector('#${id}').closest('section')`;
+  const quota = await page.eval(`${section("storage-quota-h")}.textContent.replace(/\\s+/g, ' ')`);
+  check("storage: the quota card states both thresholds and where the tenant stands",
+    quota.includes("Warned at") && quota.includes(`${body.effective.soft_percent} %`) && quota.includes("Refused at") && quota.includes(`${body.effective.hard_percent} %`), quota.slice(0, 240));
+  const rows = await page.eval(`[...${section("storage-classes-h")}.querySelectorAll('tbody tr')].map((r) => r.textContent.replace(/\\s+/g, ' ').trim())`);
+  check("storage: every class is listed with its figure and whether the quota counts it",
+    rows.length === 6 && rows.filter((r) => r.includes("counted")).length === 3 &&
+    rows.some((r) => r.startsWith("Artifacts") && r.includes(fmtStorage(body.classes.artifacts))) &&
+    rows.some((r) => r.startsWith("Logs") && r.includes(fmtStorage(body.classes.logs))), rows);
+  const bars = await page.eval(`${section("storage-trend-h")}.querySelectorAll('[role=img] div').length`);
+  check("storage: the trend draws the recorded snapshots, newest last", bars === body.trend.length && bars >= 2, { bars, trend: body.trend.length });
+  const trendText = await page.eval(`${section("storage-trend-h")}.textContent.replace(/\\s+/g, ' ')`);
+  check("storage: the trend's caption carries the same figures as its bars",
+    trendText.includes(fmtStorage(body.trend[0].stored_bytes)), trendText.slice(0, 240));
+  const heaviest = await page.eval(`${section("storage-largest-h")}.querySelector('tbody tr').textContent.replace(/\\s+/g, ' ')`);
+  check("storage: the largest artifacts agree with the report, heaviest first",
+    heaviest.includes(body.largest[0].name) && heaviest.includes(body.largest[0].repo) && heaviest.includes(fmtStorage(body.largest[0].bytes)), { heaviest, api: body.largest[0] });
+  const expiring = await page.eval(`${section("storage-expiring-h")}.textContent.replace(/\\s+/g, ' ')`);
+  check("storage: what expires within 7 days is a figure for artifacts and for logs",
+    expiring.includes(fmtStorage(body.expiring.artifact_bytes)) && expiring.includes(fmtStorage(body.expiring.log_bytes)) &&
+    expiring.includes(`${body.expiring.artifacts} artifacts`) && expiring.includes(`${body.expiring.logs} log`), { expiring, api: body.expiring });
+});
+
+await scenario("storage: keyboard, contrast and layout", async () => {
+  await go(page, ...PAGES.storage);
+  await page.eval("(() => { document.activeElement && document.activeElement.blur(); document.body.tabIndex = -1; document.body.focus(); document.body.removeAttribute('tabindex'); })()");
+  const stops = [];
+  for (let i = 0; i < 140; i++) {
+    await page.key("Tab");
+    const f = await page.eval(FOCUS_RING);
+    if (!f) break;
+    stops.push(f);
+  }
+  const blind = stops.filter((s) => !s.ring || !s.visible);
+  check("storage: every tab stop shows a focus indicator", blind.length === 0, blind.slice(0, 5));
+  check("storage: each repository's policy button is keyboard reachable",
+    stops.filter((s) => (s.text || "").includes("Storage policy of")).length >= 1, stops.map((s) => s.text).slice(0, 40));
+  await page.eval(`[...document.querySelectorAll('button')].find((b) => (b.getAttribute('aria-label') || '').includes('Storage policy of app')).focus()`);
+  await page.key("Enter");
+  await page.waitFor("!!document.querySelector('dialog[open] #repo-app-logs')", 8000, "policy dialog");
+  check("storage: Enter on a policy button opens its form with focus inside the dialog",
+    await page.eval("document.querySelector('dialog[open]').contains(document.activeElement)"));
+  await page.key("Escape");
+  await page.waitFor("!document.querySelector('dialog[open]')", 8000, "dialog closed by Escape");
+  check("storage: Escape closes it and focus returns to the button that opened it",
+    await page.eval("(document.activeElement.getAttribute('aria-label') || '').includes('Storage policy of app')"));
+  for (const dark of [false, true]) {
+    await page.scheme(dark);
+    await sleep(200);
+    const result = await page.eval(CONTRAST);
+    check(`storage by class, ${dark ? "dark" : "light"}: text contrast meets WCAG AA (${result.checked} elements)`, result.count === 0, result.bad);
+  }
+  await page.scheme(false);
+  await page.viewport(360, 800);
+  await sleep(300);
+  const narrow = await page.eval(OVERFLOW);
+  check("storage at 360px: no horizontal page scroll", narrow.scroll <= narrow.width + 1, narrow);
+  await page.screenshot(join(cfg.out, "storage-360.png"));
+  await page.viewport(1280, 860);
+  await sleep(200);
+  await page.screenshot(join(cfg.out, "storage-1280.png"));
+});
+
+await scenario("platform: tenants by percentage used", async () => {
+  const quota = 64 * 2 ** 20;
+  await root("PUT", "/api/v1/admin/tenants/acme/quota", { bytes: quota });
+  try {
+    const { body } = await root("GET", "/api/v1/admin/tenants?limit=50");
+    const acme = body.tenants.find((t) => t.slug === "acme");
+    const beta = body.tenants.find((t) => t.slug === "beta");
+    await go(page, ...PAGES.platform);
+    const text = await page.eval("document.querySelector('main').textContent.replace(/\\s+/g, ' ')");
+    check("the platform lists each tenant by the percentage of its limit used",
+      acme.used_percent !== null && text.includes(`${acme.used_percent} %`) && text.includes(`of ${fmtStorage(quota)}`), { text: text.slice(0, 300), acme });
+    check("a tenant with no limit is marked as such rather than as 0 %", beta.used_percent === null && text.includes("no limit"), beta);
+
+    await page.click('[aria-label="Storage policy of acme"]');
+    await page.waitFor("!!document.querySelector('#tenant-acme-soft')", 8000, "the tenant's threshold fields");
+    await page.fill("#tenant-acme-soft", "40");
+    await page.key("Tab");
+    await page.fill("#tenant-acme-hard", "60");
+    await page.key("Tab");
+    await page.clickText("[role=dialog] button", "Save");
+    await page.waitFor("!document.querySelector('dialog[open]')", 8000, "saved");
+    const { body: after } = await root("GET", "/api/v1/admin/tenants?limit=50");
+    const row = after.tenants.find((t) => t.slug === "acme");
+    check("a platform administrator sets a tenant's threshold overrides from that list",
+      row.soft_limit_bytes === Math.ceil((quota * 40) / 100) && row.hard_limit_bytes === Math.ceil((quota * 60) / 100), row);
+  } finally {
+    await root("PUT", "/api/v1/admin/tenants/acme/storage", { soft_percent: null, hard_percent: null });
+    await root("DELETE", "/api/v1/admin/tenants/acme/quota");
+  }
+});
+
 await scenario("organizations and invitations", async () => {
   const { body: tenants } = await apiAs(cfg.auth, "GET", "/api/v1/tenants");
   check("the tenant list says each namespace's kind and membership source",

@@ -159,11 +159,13 @@ export interface Backups {
   backups: { id: string; started_ms: number; took_ms: number; schema: number; version: string; metadata_bytes: number; objects: number; objects_remote_only: number; key_required: boolean; key_ids: number[] }[];
 }
 
-/** A storage policy as set; `null` inherits. */
+/** A storage policy as set; `null` inherits. A repository row never carries a threshold: the line is the tenant's. */
 export interface StoragePolicy {
   quota_bytes: number | null;
   log_retention_ms: number | null;
   artifact_retention_ms: number | null;
+  soft_percent?: number | null;
+  hard_percent?: number | null;
 }
 
 export interface StorageEffective {
@@ -171,12 +173,57 @@ export interface StorageEffective {
   repo_quota_bytes: number;
   log_retention_ms: number;
   artifact_retention_ms: number;
+  soft_percent: number;
+  hard_percent: number;
+}
+
+/** A tenant's stored bytes split by what holds them; `counted` names the classes its quota counts. */
+export interface StorageClasses {
+  artifacts: number;
+  uploads: number;
+  logs: number;
+  remote_cache: number;
+  actions_cache: number;
+  worker_cache: number;
+  counted: string[];
+}
+
+/** One artifact the storage page lists: what it holds and when it goes. */
+export interface StorageItem {
+  id: string;
+  name: string;
+  class: string;
+  repo: string | null;
+  bytes: number;
+  expires_ms: number;
+  pinned: boolean;
+}
+
+/** A day's snapshot of the tenant's classes, newest first. */
+export interface StorageTrendDay {
+  day: number;
+  taken_ms: number;
+  stored_bytes: number;
+  classes: StorageClasses;
 }
 
 export interface TenantStorage {
   usage: { object_bytes: number; log_bytes: number };
+  classes: StorageClasses;
   policy: StoragePolicy;
   effective: StorageEffective;
+  thresholds: { state: "ok" | "soft" | "hard"; soft_limit_bytes: number; hard_limit_bytes: number };
+  trend: StorageTrendDay[];
+  largest: StorageItem[];
+  expiring: {
+    window_ms: number;
+    artifact_bytes: number;
+    artifacts: number;
+    log_bytes: number;
+    logs: number;
+    soonest: StorageItem[];
+  };
+  notice: { threshold_percent: number; used_bytes: number; limit_bytes: number; delivery: "mail" | "in_app"; notified_ms: number } | null;
   repos: {
     id: string;
     name: string;
@@ -202,6 +249,8 @@ export interface DeploymentStorage {
   stored_bytes: number;
   quota_bytes: number;
   tenant_quota_bytes: number;
+  soft_percent: number;
+  hard_percent: number;
   log_retention_ms: number;
   artifact_retention_ms: number;
   run_artifact_bytes: number;
