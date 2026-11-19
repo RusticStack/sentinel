@@ -1554,6 +1554,11 @@ fn offer_caches(
     }
 }
 
+/// S07's end-to-end gate: one canary through bind, deliver, stage, run, log, diagnostic and teardown.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "attempt/secret_provisioning.rs"]
+mod secret_provisioning;
+
 #[cfg(test)]
 mod tests {
     use std::{fs, sync::Mutex};
