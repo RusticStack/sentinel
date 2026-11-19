@@ -183,6 +183,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (70, include_str!("migrations/070_storage_thresholds.sql")),
     (71, include_str!("migrations/071_storage_notices.sql")),
     (72, include_str!("migrations/072_run_artifacts.sql")),
+    (73, include_str!("migrations/073_oauth_scope_bits.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -295,6 +296,10 @@ mod tests {
         (
             72,
             "an older controller reads every artifact row as a job's, so it neither lists nor serves a run-level or runner-mode artifact, it retires those rows at the sweep without being able to explain them, and its coverage check would take one for a job's declared output",
+        ),
+        (
+            73,
+            "an older binary still bounds a stored scope set at the ten bits migration 30 admitted: release 72 cannot store the artifacts:write grant or client cap it can already name, and every earlier release reads such a row as a corrupt scope set and fails the request it authorizes",
         ),
     ];
 
