@@ -5,22 +5,33 @@ import type { StoragePolicy } from "../lib/types";
 import { fmtBytes } from "../lib/format.ts";
 import { Button, Field, Input } from "./ui.tsx";
 
-export interface StoragePolicyBody { quota_bytes: number | null; log_retention_secs: number | null; artifact_retention_secs: number | null }
+export interface StoragePolicyBody {
+  quota_bytes: number | null;
+  log_retention_secs: number | null;
+  artifact_retention_secs: number | null;
+  // Absent for a repository: the line a tenant is measured against is the tenant's.
+  soft_percent?: number | null;
+  hard_percent?: number | null;
+}
 
 const DAY = 86_400_000;
 const GIB = 2 ** 30;
 const days = (ms: number) => `${Math.round((ms / DAY) * 10) / 10} days`;
 
-export function StoragePolicyForm({ id, policy, inherited, maxLogDays, maxArtifactDays, onSave }: {
+export function StoragePolicyForm({ id, policy, inherited, maxLogDays, maxArtifactDays, maxSoft, maxHard, onSave }: {
   id: string;
   policy: StoragePolicy;
   inherited: { quota_bytes: number; log_retention_ms: number; artifact_retention_ms: number };
   // A repository may only narrow: its retentions cap at these.
   maxLogDays?: number;
   maxArtifactDays?: number;
+  // A tenant narrows the deployment's thresholds and never widens them; a repository never carries one.
+  maxSoft?: number;
+  maxHard?: number;
   onSave: (body: StoragePolicyBody) => void;
 }) {
   const form = useRef<HTMLFormElement>(null);
+  const thresholds = maxSoft !== undefined && maxHard !== undefined;
   const field = (suffix: string) => form.current?.querySelector<HTMLInputElement>(`#${CSS.escape(`${id}-${suffix}`)}`) ?? null;
   function read(suffix: string, min: number, max: number): number | null {
     const text = field(suffix)?.value.trim() ?? "";
@@ -28,20 +39,30 @@ export function StoragePolicyForm({ id, policy, inherited, maxLogDays, maxArtifa
     if (!Number.isFinite(v) || v === 0) return null;
     return Math.min(max, Math.max(min, v));
   }
+  // A percentage is a whole number: the store refuses a fraction, and an absent field inherits.
+  function percent(suffix: string, max: number): number | null {
+    const value = read(suffix, 1, max);
+    return value === null ? null : Math.round(value);
+  }
 
   function save(e?: React.FormEvent) {
     e?.preventDefault();
     const quota = read("quota", 0.001, Infinity);
     const logs = read("logs", 0.05, maxLogDays ?? 366);
     const artifacts = read("artifacts", 0.05, maxArtifactDays ?? 366);
-    onSave({
+    const body: StoragePolicyBody = {
       quota_bytes: quota ? Math.round(quota * GIB) : null,
       log_retention_secs: logs ? Math.round(logs * 86_400) : null,
       artifact_retention_secs: artifacts ? Math.round(artifacts * 86_400) : null,
-    });
+    };
+    if (thresholds) {
+      body.soft_percent = percent("soft", maxSoft!);
+      body.hard_percent = percent("hard", maxHard!);
+    }
+    onSave(body);
   }
   function inheritAll() {
-    for (const s of ["quota", "logs", "artifacts"]) { const el = field(s); if (el) el.value = ""; }
+    for (const s of ["quota", "logs", "artifacts", "soft", "hard"]) { const el = field(s); if (el) el.value = ""; }
     save();
   }
 
@@ -60,6 +81,18 @@ export function StoragePolicyForm({ id, policy, inherited, maxLogDays, maxArtifa
           <Input id={`${id}-artifacts`} name={`${id}-artifacts`} type="number" inputMode="decimal" min={0.05} max={maxArtifactDays ?? 366} step="any" placeholder="inherit"
             defaultValue={policy.artifact_retention_ms ? String(policy.artifact_retention_ms / DAY) : ""} />
         </Field>
+        {thresholds ? (
+          <>
+            <Field label="Warn at (% of quota)" htmlFor={`${id}-soft`} help={`Blank: ${maxSoft} %, never above the deployment's`}>
+              <Input id={`${id}-soft`} name={`${id}-soft`} type="number" inputMode="numeric" min={1} max={maxSoft} step={1} placeholder="inherit"
+                defaultValue={policy.soft_percent ? String(policy.soft_percent) : ""} />
+            </Field>
+            <Field label="Refuse at (% of quota)" htmlFor={`${id}-hard`} help={`Blank: ${maxHard} %, never above the deployment's`}>
+              <Input id={`${id}-hard`} name={`${id}-hard`} type="number" inputMode="numeric" min={1} max={maxHard} step={1} placeholder="inherit"
+                defaultValue={policy.hard_percent ? String(policy.hard_percent) : ""} />
+            </Field>
+          </>
+        ) : null}
       </div>
       <div className="flex gap-2">
         <Button type="submit" size="sm" label="Save" />

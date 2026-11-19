@@ -8,12 +8,16 @@ import { fmtBytes } from "../../lib/format.ts";
 import { LoadFailed } from "../LoadFailed.tsx";
 import { StateBadge } from "../StateBadge.tsx";
 import { StoragePolicyForm, type StoragePolicyBody } from "../StoragePolicyForm.tsx";
-import { Button, DialogModal, Field, Input, Table, TextLink } from "../ui.tsx";
+import { Badge, Button, DialogModal, Field, Input, Table, TextLink } from "../ui.tsx";
 import { confirmChange } from "../admin/Confirm.tsx";
 
 interface TenantRow {
   slug: string; kind: string; active: boolean; members: number; usage_bytes: number;
   quota_bytes: number | null; quota_set: boolean; log_retention_ms?: number | null; artifact_retention_ms?: number | null;
+  soft_percent?: number | null; hard_percent?: number | null;
+  // Against the tenant's own thresholds; `used_percent` is null for an unlimited tenant.
+  used_percent: number | null; state: "ok" | "soft" | "hard";
+  soft_limit_bytes: number; hard_limit_bytes: number;
 }
 export interface TenantsPage { tenants: TenantRow[]; next: string | null }
 export interface TenantsLoad { page: Load<TenantsPage>; deployment: Load<DeploymentStorage> }
@@ -30,7 +34,6 @@ export function Tenants({ initial }: { initial: TenantsLoad }) {
   const [after, setAfter] = useState<string | null>(null);
   const refresh = (at = after) => readTenants(at).then(setData, () => {});
   const deployment = initial.deployment.value;
-  const [quotas, setQuotas] = useState<Record<string, string>>({});
   const [slug, setSlug] = useState("");
   const [editing, setEditing] = useState<TenantRow | null>(null);
 
@@ -43,17 +46,6 @@ export function Tenants({ initial }: { initial: TenantsLoad }) {
       setEditing(null);
       await refresh();
     }
-  }
-  async function setQuota(e: React.FormEvent, t: TenantRow) {
-    e.preventDefault();
-    const gib = Number(quotas[t.slug] ?? "");
-    if (!gib || gib <= 0 || !Number.isFinite(gib)) return;
-    await act(me, `Quota of ${t.slug}`, () => api(`/api/v1/admin/tenants/${t.slug}/quota`, { method: "PUT", body: { bytes: Math.round(Math.max(1, gib) * 2 ** 30) } }));
-    await refresh();
-  }
-  async function clearQuota(t: TenantRow) {
-    await act(me, `Default quota of ${t.slug}`, () => api(`/api/v1/admin/tenants/${t.slug}/quota`, { method: "DELETE" }));
-    await refresh();
   }
   async function toggle(t: TenantRow) {
     if (await act(me, `${t.active ? "Suspend" : "Reactivate"} ${t.slug}`, () => api(`/api/v1/admin/tenants/${t.slug}/${t.active ? "suspend" : "reactivate"}`, { method: "POST", body: {} }))) {
@@ -82,7 +74,7 @@ export function Tenants({ initial }: { initial: TenantsLoad }) {
       <section aria-labelledby="tenants-h" className="space-y-3">
         <h2 id="tenants-h" className="text-base font-semibold text-strong">Tenants</h2>
         {failure ? <LoadFailed what="the tenants" words={failure} /> : <Table caption="Tenants">
-          <thead><tr><th>Tenant</th><th>Kind</th><th>State</th><th>Members</th><th>Storage</th><th>Quota</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Tenant</th><th>Kind</th><th>State</th><th>Members</th><th>Storage</th><th>Percentage used</th><th>Actions</th></tr></thead>
           <tbody>
             {tenants.length ? tenants.map((t) => (
               <tr key={t.slug}>
@@ -96,14 +88,21 @@ export function Tenants({ initial }: { initial: TenantsLoad }) {
                 <td>{t.members}</td>
                 <td>{fmtBytes(t.usage_bytes)}</td>
                 <td>
-                  <form className="flex items-center gap-2" onSubmit={(e) => void setQuota(e, t)}>
-                    <Input type="number" inputMode="decimal" min={1} step="any" value={quotas[t.slug] ?? ""} onChange={(e) => setQuotas({ ...quotas, [t.slug]: e.target.value })}
-                      placeholder={t.quota_bytes ? (t.quota_bytes / 2 ** 30).toFixed(0) : "unlimited"} aria-label={`Quota of ${t.slug} in GiB`} className="w-40" />
-                    <span className="text-sm text-muted">GiB</span>
-                    <Button type="submit" size="sm" color="neutral" variant="outline" label="Set" />
-                    {t.quota_set ? <Button size="sm" color="neutral" variant="ghost" label="Default" onClick={() => void clearQuota(t)} /> : null}
-                  </form>
-                  <p className="mt-1 text-xs text-muted">{t.quota_bytes ? `${Math.round((100 * t.usage_bytes) / t.quota_bytes)}% of ${fmtBytes(t.quota_bytes)} used` : "no limit"}</p>
+                  {t.used_percent === null ? (
+                    <span className="text-muted">no limit</span>
+                  ) : (
+                    <span className="flex items-center gap-2">
+                      <Badge color={t.state === "hard" ? "error" : t.state === "soft" ? "warning" : "success"}>
+                        {t.state === "hard" ? "over" : t.state === "soft" ? "warned" : "ok"}
+                      </Badge>
+                      <span className="text-strong">{t.used_percent} %</span>
+                      <span className="text-muted">of {fmtBytes(t.quota_bytes)}</span>
+                    </span>
+                  )}
+                  <div className="mt-1 h-1.5 w-40 overflow-hidden rounded bg-elevated" aria-hidden="true">
+                    <div className={t.state === "hard" ? "h-full bg-error" : t.state === "soft" ? "h-full bg-warning" : "h-full bg-primary"}
+                      style={{ width: `${Math.min(100, t.used_percent ?? 0)}%` }} />
+                  </div>
                 </td>
                 <td>
                   <div className="flex flex-wrap gap-2">
@@ -135,8 +134,9 @@ export function Tenants({ initial }: { initial: TenantsLoad }) {
       <DialogModal isOpen={!!editing} onClose={() => setEditing(null)} title={`Storage policy · ${editing?.slug}`} description="Blank fields inherit the deployment's configuration.">
         {editing ? (
           <StoragePolicyForm id={`tenant-${editing.slug}`}
-            policy={{ quota_bytes: editing.quota_set ? editing.quota_bytes : null, log_retention_ms: editing.log_retention_ms ?? null, artifact_retention_ms: editing.artifact_retention_ms ?? null }}
+            policy={{ quota_bytes: editing.quota_set ? editing.quota_bytes : null, log_retention_ms: editing.log_retention_ms ?? null, artifact_retention_ms: editing.artifact_retention_ms ?? null, soft_percent: editing.soft_percent, hard_percent: editing.hard_percent }}
             inherited={{ quota_bytes: deployment?.tenant_quota_bytes ?? 0, log_retention_ms: deployment?.log_retention_ms ?? 14 * 86_400_000, artifact_retention_ms: deployment?.artifact_retention_ms ?? 90 * 86_400_000 }}
+            maxSoft={deployment?.soft_percent ?? 80} maxHard={deployment?.hard_percent ?? 100}
             onSave={(body) => void saveStorage(editing, body)} />
         ) : null}
       </DialogModal>

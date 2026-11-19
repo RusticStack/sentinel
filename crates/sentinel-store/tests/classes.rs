@@ -929,6 +929,30 @@ fn a_snapshot_batch_resumes_from_its_last_key_and_skips_tenants_without_usage() 
     assert_eq!(classes::day_of(UnixMillis(day * classes::DAY_MS)), day);
 }
 
+/// The storage page's own reads: a bounded top-N list and two range reads, each answered by the index it names and
+/// none of them scanning a table.
+#[test]
+fn the_storage_page_reads_are_answered_by_the_index_each_names() {
+    let f = fixture();
+    f.store
+        .read(|c| {
+            for (name, sql, index) in classes::PAGE_READS {
+                let plan = plan(c, sql);
+                assert!(
+                    plan.iter()
+                        .any(|p| p.contains(&format!("USING INDEX {index}"))),
+                    "{name} does not use {index}: {plan:?}"
+                );
+                assert!(
+                    plan.iter().all(|p| !p.starts_with("SCAN ")),
+                    "{name} scans a table: {plan:?}"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
 #[test]
 fn the_new_statements_are_answered_by_keys_not_table_scans() {
     let f = fixture();
