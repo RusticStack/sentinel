@@ -711,7 +711,7 @@ pub(crate) fn route(
                             c,
                             tenant,
                             sentinel_store::objects::Kind::Artifact,
-                            &artifacts::manifest_name(row.job, &row.name),
+                            &row.manifest()?,
                             Some(version),
                         )?),
                         None => None,
@@ -736,6 +736,54 @@ pub(crate) fn route(
             }
             ok(body)
         }
+        ("POST", ["api", "v1", "runs", run, "artifacts"]) => {
+            run_artifact_attach(state, request, run)
+        }
+        (
+            "GET",
+            [
+                "api",
+                "v1",
+                "tenants",
+                slug,
+                "repos",
+                name,
+                "runner-runs",
+                run,
+                "artifacts",
+            ],
+        ) => runner_artifacts(state, request, slug, name, run),
+        (
+            "GET",
+            [
+                "api",
+                "v1",
+                "tenants",
+                slug,
+                "repos",
+                name,
+                "runner-runs",
+                run,
+                "artifacts",
+                art,
+            ],
+        ) => runner_artifact(state, request, slug, name, run, art),
+        (
+            "POST",
+            [
+                "api",
+                "v1",
+                "tenants",
+                slug,
+                "repos",
+                name,
+                "runner-runs",
+                run,
+                "jobs",
+                job,
+                "artifacts",
+            ],
+        ) => runner_artifact_attach(state, request, slug, name, run, job),
         ("GET", ["api", "v1", "runs", run, "artifacts", art, "archive"]) => {
             artifact_archive(state, request, run, art, query)
         }
@@ -1934,11 +1982,16 @@ fn upload_tenant(
 }
 
 fn artifact_json(row: &artifacts::Row) -> Value {
-    json!({
+    let mut body = json!({
         "id": row.id.to_string(),
-        "job": row.job.to_string(),
+        "origin": row.origin.as_str(),
+        "run": row.run.map(|run| run.to_string()),
+        "job": row.job.map(|job| job.to_string()),
         "job_name": row.job_name,
-        "attempt": row.attempt.to_string(),
+        "attempt": row.attempt.map(|attempt| attempt.to_string()),
+        "repo": row.repo.map(|repo| repo.to_string()),
+        "github_run": row.github_run,
+        "github_job": row.github_job,
         "name": row.name,
         "state": row.state.as_str(),
         "manifest_version": row.manifest_version,
@@ -1950,7 +2003,14 @@ fn artifact_json(row: &artifacts::Row) -> Value {
         "pinned_ms": row.pinned_ms.map(|p| p.0),
         "created_ms": row.created_ms.0,
         "failure": row.failure,
-    })
+    });
+    if let Some(uploader) = &row.uploader {
+        body["uploader"] = json!({
+            "user_id": uploader.user.to_string(),
+            "display_name": uploader.display_name,
+        });
+    }
+    body
 }
 
 /// Pin keeps an artifact past its deadline (and its bytes counted) until an administrator unpins it;
@@ -2131,6 +2191,332 @@ fn upload_abort(state: &State, request: &mut Request, upload: &str) -> Route {
     ok(json!({ "upload": upload.to_string(), "aborted": true }))
 }
 
+/// One file of an artifact an authorized client is recording: bytes it already holds as a
+/// committed object, put there through an upload session.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttachEntry {
+    path: String,
+    digest: String,
+    len: u64,
+    #[serde(default)]
+    mode: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttachBody {
+    name: String,
+    entries: Vec<AttachEntry>,
+    #[serde(default)]
+    class: Option<String>,
+    #[serde(default)]
+    retain_secs: Option<u64>,
+}
+
+/// What a recorded artifact is attached to.
+enum Attach {
+    /// A run the caller may operate on: the files belong to the run itself.
+    Run(RunId),
+    /// The GitHub run and job a runner-mode job produced it under, in one of a tenant's repositories.
+    Runner {
+        slug: String,
+        repo: String,
+        run: u64,
+        job: u64,
+    },
+}
+
+/// The entries of an attach request, validated before the manifest is written: a path the manifest
+/// would refuse, an unparsable digest, an entry count or size past the artifact bounds are all
+/// `invalid_request`, so a malformed request never stages a manifest.
+fn attach_entries(
+    entries: &[AttachEntry],
+) -> Result<Vec<sentinel_store::objects::Entry>, ApiError> {
+    use sentinel_protocol::limits::{MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES};
+    if entries.is_empty() || entries.len() > MAX_ARTIFACT_ENTRIES {
+        return Err(err(ErrorCode::InvalidRequest, "invalid artifact entries"));
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    let mut total = 0u64;
+    for entry in entries {
+        let digest = Digest::parse(&entry.digest)
+            .map_err(|_| err(ErrorCode::InvalidRequest, "malformed digest"))?;
+        if !sentinel_store::objects::valid_entry_path(&entry.path) {
+            return Err(err(ErrorCode::InvalidRequest, "invalid entry path"));
+        }
+        total = total.saturating_add(entry.len);
+        out.push(sentinel_store::objects::Entry {
+            path: entry.path.clone(),
+            digest,
+            len: entry.len,
+            mode: entry.mode.unwrap_or(0o644) & 0o777,
+        });
+    }
+    if total > MAX_ARTIFACT_BYTES {
+        return Err(err(ErrorCode::InvalidRequest, "artifact too large"));
+    }
+    Ok(out)
+}
+
+/// Records one artifact from objects the tenant already holds — bytes that went through the
+/// existing upload sessions — and answers the row it wrote. A run-level artifact names its run and
+/// its uploader; a runner-mode one names the GitHub run and job. Neither carries an attempt, so
+/// neither can stand in for a job's declared required artifact. The repository quota counts the
+/// class's charge and a run-level artifact its run's budget.
+fn attach(state: &State, request: &mut Request, target: Attach) -> Route {
+    let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::ARTIFACTS_WRITE)?;
+    let body: AttachBody = parse(&body(request)?)?;
+    if body.name.is_empty()
+        || body.name.len() > artifacts::MAX_NAME
+        || body.name.bytes().any(|b| b < 32 || b == 127)
+    {
+        return Err(err(ErrorCode::InvalidRequest, "invalid artifact name"));
+    }
+    let entries = attach_entries(&body.entries)?;
+    let bytes: u64 = entries.iter().map(|entry| entry.len).sum();
+    let ceiling = sentinel_store::retention::MAX_RETENTION_MS / 1_000;
+    if body
+        .retain_secs
+        .is_some_and(|secs| secs == 0 || secs > u64::try_from(ceiling).unwrap_or(0))
+    {
+        return Err(err(ErrorCode::InvalidRequest, "retain_secs out of range"));
+    }
+    let deployment = state.objects.deployment();
+    let objects = Arc::clone(&state.objects);
+    let principal = who.principal;
+    let uploader = who.user;
+    let name = body.name;
+    let class = body.class;
+    let requested = body.retain_secs;
+    let (slug, row) = state
+        .store
+        .writer()
+        .write(move |tx| {
+            let now = UnixMillis::now();
+            let (tenant, repo, manifest, run_id) = match &target {
+                Attach::Run(run) => {
+                    let repo = lookup::run_repo(tx, *run)?;
+                    let tenant = authz::require_repo(tx, principal, repo, Permissions::RUN)?;
+                    (
+                        tenant,
+                        repo,
+                        artifacts::run_manifest_name(*run, &name),
+                        Some(*run),
+                    )
+                }
+                Attach::Runner {
+                    slug,
+                    repo,
+                    run,
+                    job,
+                } => {
+                    let tenant = lookup::tenant_by_slug(tx, slug)?;
+                    let repo = lookup::repo_by_name(tx, tenant, repo)?;
+                    authz::require_repo(tx, principal, repo, Permissions::RUN)?;
+                    (
+                        tenant,
+                        repo,
+                        artifacts::runner_manifest_name(repo, *run, *job, &name),
+                        None,
+                    )
+                }
+            };
+            // A repeated attach is a conflict before any manifest is written, so a name the run or
+            // the GitHub job already holds never leaves a manifest no row names.
+            let duplicate = match &target {
+                Attach::Run(run) => artifacts::run_upload_exists(tx, *run, &name)?,
+                Attach::Runner { run, job, .. } => {
+                    artifacts::runner_exists(tx, tenant, repo, *run, *job, &name)?
+                }
+            };
+            if duplicate {
+                return Err(StoreError::Conflict);
+            }
+            let charge = artifacts::charge(tx, class.as_deref(), bytes)?;
+            sentinel_store::retention::check_repo(tx, &deployment, tenant, repo, charge.charged)?;
+            if let Some(run) = run_id
+                && artifacts::run_bytes(tx, tenant, run)?.saturating_add(bytes)
+                    > deployment.run_artifact_bytes
+            {
+                // The run budget is the artifact's logical size, charged before the row commits.
+                return Err(StoreError::QuotaExceeded);
+            }
+            // The deadline is the request's, or the effective artifact retention of the repository;
+            // the insert trigger narrows it further to the class's maximum age.
+            let effective =
+                sentinel_store::retention::effective(tx, &deployment, tenant, Some(repo))?;
+            let retain_until = UnixMillis(
+                now.0
+                    + requested
+                        .and_then(|secs| i64::try_from(secs).ok())
+                        .map_or(effective.artifact_retention_ms, |secs| secs * 1_000),
+            );
+            // The manifest commits in the row's own transaction, so a captured row always names one
+            // committed manifest; a row the insert refuses leaves only that manifest's file behind,
+            // which the orphan sweep collects once its grace has passed.
+            let version = objects.commit_manifest(
+                tx,
+                tenant,
+                sentinel_store::objects::Kind::Artifact,
+                &manifest,
+                &entries,
+            )?;
+            let (count, len) = (entries.len() as u64, bytes);
+            let row = match target {
+                Attach::Run(run) => {
+                    let id = artifacts::record_upload(
+                        tx,
+                        tenant,
+                        run,
+                        &name,
+                        &charge,
+                        version,
+                        count,
+                        len,
+                        retain_until,
+                        uploader,
+                        now,
+                    )?;
+                    artifacts::get(tx, tenant, run, id)?
+                }
+                Attach::Runner { run, job, .. } => {
+                    let id = artifacts::record_runner(
+                        tx,
+                        tenant,
+                        repo,
+                        run,
+                        job,
+                        &name,
+                        &charge,
+                        version,
+                        count,
+                        len,
+                        retain_until,
+                        now,
+                    )?;
+                    artifacts::runner_get(tx, tenant, repo, run, id)?
+                }
+            };
+            let slug = lookup::tenant_slug(tx, tenant)?;
+            Ok((slug, row))
+        })
+        .map_err(store_error)?;
+    let mut body = artifact_json(&row);
+    body["tenant"] = Value::String(slug);
+    Ok(Reply::Json(201, body, Vec::new()))
+}
+
+fn run_artifact_attach(state: &State, request: &mut Request, run: &str) -> Route {
+    let run: RunId = id(run, "run")?;
+    attach(state, request, Attach::Run(run))
+}
+
+fn runner_artifact_attach(
+    state: &State,
+    request: &mut Request,
+    slug: &str,
+    repo: &str,
+    run: &str,
+    job: &str,
+) -> Route {
+    let run: u64 = id(run, "github run")?;
+    let job: u64 = id(job, "github job")?;
+    attach(
+        state,
+        request,
+        Attach::Runner {
+            slug: slug.to_owned(),
+            repo: repo.to_owned(),
+            run,
+            job,
+        },
+    )
+}
+
+/// Every artifact one GitHub run's jobs produced, in job order, so a later job of that run reads
+/// what an earlier one uploaded without asking GitHub.
+fn runner_artifacts(
+    state: &State,
+    request: &mut Request,
+    slug: &str,
+    name: &str,
+    run: &str,
+) -> Route {
+    let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::ARTIFACTS_READ)?;
+    let run: u64 = id(run, "github run")?;
+    let (slug, rows) = state
+        .store
+        .read(|c| {
+            let tenant = lookup::tenant_by_slug(c, slug)?;
+            let repo = lookup::repo_by_name(c, tenant, name)?;
+            authz::require_repo(c, who.principal, repo, Permissions::READ)?;
+            Ok((
+                slug.to_owned(),
+                artifacts::for_runner_run(c, tenant, repo, run)?,
+            ))
+        })
+        .map_err(store_error)?;
+    ok(json!({
+        "tenant": slug,
+        "github_run": run,
+        "artifacts": rows.iter().map(artifact_json).collect::<Vec<_>>()
+    }))
+}
+
+/// One artifact of a GitHub run with its manifest, so its entries download through the objects route.
+fn runner_artifact(
+    state: &State,
+    request: &mut Request,
+    slug: &str,
+    name: &str,
+    run: &str,
+    art: &str,
+) -> Route {
+    let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::ARTIFACTS_READ)?;
+    let run: u64 = id(run, "github run")?;
+    let art: ArtifactId = id(art, "artifact")?;
+    let (slug, row, manifest) = state
+        .store
+        .read(|c| {
+            let tenant = lookup::tenant_by_slug(c, slug)?;
+            let repo = lookup::repo_by_name(c, tenant, name)?;
+            authz::require_repo(c, who.principal, repo, Permissions::READ)?;
+            let row = artifacts::runner_get(c, tenant, repo, run, art)?;
+            let manifest = match row.manifest_version {
+                Some(version) => Some(state.objects.manifest(
+                    c,
+                    tenant,
+                    sentinel_store::objects::Kind::Artifact,
+                    &row.manifest()?,
+                    Some(version),
+                )?),
+                None => None,
+            };
+            Ok((slug.to_owned(), row, manifest))
+        })
+        .map_err(store_error)?;
+    let mut body = artifact_json(&row);
+    body["tenant"] = Value::String(slug);
+    if let Some(manifest) = manifest {
+        body["manifest"] = json!({
+            "version": manifest.version,
+            "digest": manifest.digest.to_string(),
+            "payload_len": manifest.payload_len,
+            "entries": manifest.entries.iter().map(|e| json!({
+                "path": e.path,
+                "digest": e.digest.to_string(),
+                "len": e.len,
+                "mode": e.mode,
+            })).collect::<Vec<_>>(),
+        });
+    }
+    ok(body)
+}
+
 fn byte_range(spec: &str, len: u64) -> Result<(u64, u64), ApiError> {
     let invalid = || err(ErrorCode::InvalidRequest, "unsatisfiable range");
     let spec = spec.strip_prefix("bytes=").ok_or_else(invalid)?;
@@ -2201,7 +2587,7 @@ fn artifact_archive(
                 c,
                 tenant,
                 sentinel_store::objects::Kind::Artifact,
-                &artifacts::manifest_name(row.job, &row.name),
+                &row.manifest()?,
                 Some(version),
             )?;
             Ok((tenant, row, manifest))
@@ -2261,11 +2647,9 @@ fn archive_reply(
 /// The download's file name: the job's and the artifact's own names, cut to what a manifest name may hold and
 /// stripped of anything that is not a plain file-name character.
 fn archive_file_name(row: &artifacts::Row, format: Format) -> String {
-    let mut name = String::with_capacity(row.job_name.len() + row.name.len() + 8);
-    for (at, part) in [row.job_name.as_str(), row.name.as_str()]
-        .into_iter()
-        .enumerate()
-    {
+    let owner = row.owner_label();
+    let mut name = String::with_capacity(owner.len() + row.name.len() + 8);
+    for (at, part) in [owner, row.name.as_str()].into_iter().enumerate() {
         if at > 0 {
             name.push('-');
         }
@@ -2349,7 +2733,7 @@ fn artifact_link(state: &State, request: &mut Request, run: &str, art: &str) -> 
                     c,
                     tenant,
                     sentinel_store::objects::Kind::Artifact,
-                    &artifacts::manifest_name(row.job, &row.name),
+                    &row.manifest()?,
                     Some(version),
                 )?;
                 if !manifest.entries.iter().any(|entry| entry.path == *path) {
@@ -2399,7 +2783,7 @@ fn redeem_link(state: &State, token: &str) -> Route {
             c,
             link.tenant,
             sentinel_store::objects::Kind::Artifact,
-            &artifacts::manifest_name(row.job, &row.name),
+            &row.manifest()?,
             Some(version),
         )?;
         Ok((row, manifest))

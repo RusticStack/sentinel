@@ -386,3 +386,44 @@ fn registration_policy_defaults_to_metadata_documents_and_names_are_not_imperson
         );
     }
 }
+
+/// A registered MCP client may be capped at `artifacts:read` (bit 3) since migration 71 — the mask
+/// migration 42 wrote refused it — and the trigger still refuses a scope the MCP set does not hold.
+#[test]
+fn a_client_cap_may_now_name_artifacts_read_and_nothing_outside_its_mask() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
+    let id = format!("m_{}", "c".repeat(62));
+    let spec = McpClientSpec {
+        id: &id,
+        name: "Artifact reader",
+        max_scopes: Scopes::MCP,
+        kind: McpRegistrationKind::Dynamic,
+        metadata_url: None,
+    };
+    assert!(spec.max_scopes.contains(Scopes::ARTIFACTS_READ));
+    oauth::register_mcp_client(&store, &spec, &["http://127.0.0.1:33418"]).unwrap();
+    let stored = store
+        .read(|connection| oauth::client(connection, &id))
+        .unwrap();
+    assert_eq!(stored.max_scopes, Scopes::MCP);
+    // `cache:write` is not an MCP scope, and asking for it is refused before a row exists.
+    assert!(!Scopes::MCP.contains(Scopes::CACHE_WRITE));
+    // The trigger is the backstop for a row written without that check.
+    let raw = store.writer().write(|tx| {
+        for (client, mask) in [("m_raw_ok", 79), ("m_raw_bad", 1023)] {
+            let written = tx.execute(
+                "INSERT INTO oauth_clients(client_id, name, first_party, loopback, redirect_path,
+                     device, max_scopes, created_ms, resource, registration_kind)
+                 VALUES(?1, 'raw', 0, 0, NULL, 0, ?2, 1, 2, 1)",
+                rusqlite::params![client, mask],
+            );
+            if client == "m_raw_bad" {
+                return Ok(written.is_err());
+            }
+            written?;
+        }
+        Ok(false)
+    });
+    assert!(raw.unwrap(), "the mask refuses a wider row");
+}

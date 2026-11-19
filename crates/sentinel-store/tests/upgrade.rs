@@ -449,11 +449,14 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        71,
+        72,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
-    assert_eq!(sources, vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 70]);
+    assert_eq!(
+        sources,
+        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 70, 71]
+    );
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.sqlite");
@@ -468,7 +471,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         drop(store);
         assert_eq!(version(&path), schema::LATEST, "from {from}");
         let db = Connection::open(&path).unwrap();
-        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71]
+        let ok: Vec<bool> = [53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72]
             .iter()
             .map(|&newest| from >= newest || readable(&db, from, newest))
             .collect();
@@ -489,41 +492,45 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         // writes the new columns, its `storage_defaults` insert takes their defaults and a tenant
         // policy it writes leaves them NULL, which inherits; while an older controller runs on the
         // result it enforces the bare quota instead of the tenant's narrowed hard threshold.
-        // Migration 71 (the threshold notices) is readable by nothing older: an older controller
-        // neither writes nor reads the notice latch, so no crossing is told while it runs.
+        // Migration 72 (run-level and runner-mode artifacts) rebuilds the artifact table with a
+        // nullable job and attempt and two origins an older controller cannot explain, so 70 and 71
+        // stop at 70.
         let expected = match from {
             44 | 47 | 48 => [
-                false, false, false, false, false, false, false, false, false, false, false,
+                false, false, false, false, false, false, false, false, false, false, false, false,
             ],
             51 => [
-                true, false, false, false, false, false, false, false, false, false, false,
+                true, false, false, false, false, false, false, false, false, false, false, false,
             ],
             56 => [
-                true, true, false, false, false, false, false, false, false, false, false,
+                true, true, false, false, false, false, false, false, false, false, false, false,
             ],
             57 => [
-                true, true, true, false, false, false, false, false, false, false, false,
+                true, true, true, false, false, false, false, false, false, false, false, false,
             ],
             63 => [
-                true, true, true, true, false, false, false, false, false, false, false,
+                true, true, true, true, false, false, false, false, false, false, false, false,
             ],
             64 | 65 => [
-                true, true, true, true, true, false, false, false, false, false, false,
+                true, true, true, true, true, false, false, false, false, false, false, false,
             ],
             66 | 67 => [
-                true, true, true, true, true, true, true, false, false, false, false,
+                true, true, true, true, true, true, true, false, false, false, false, false,
             ],
             68 => [
-                true, true, true, true, true, true, true, true, false, false, false,
+                true, true, true, true, true, true, true, true, false, false, false, false,
             ],
             69 | 70 => [
-                true, true, true, true, true, true, true, true, true, true, false,
+                true, true, true, true, true, true, true, true, true, true, false, false,
+            ],
+            71 => [
+                true, true, true, true, true, true, true, true, true, true, true, false,
             ],
             _ => unreachable!(),
         };
         assert_eq!(
             ok, expected,
-            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71"
+            "release {from} on schemas 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72"
         );
     }
 }
@@ -740,4 +747,134 @@ fn a_database_upgraded_from_066_has_the_thresholds_a_fresh_one_has() {
         "an upgraded database has the schema a fresh one has: {differing:?}"
     );
     assert_eq!(upgraded_schema.len(), fresh_schema.len());
+}
+
+/// Migration 72 rebuilds `artifacts` with a nullable job and attempt and two more origins; the
+/// upgraded database has to equal a fresh one and an artifact stored before it keeps its identity,
+/// its refusal reason and its class.
+#[test]
+fn a_database_upgraded_from_071_keeps_its_artifacts_and_equals_a_fresh_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.sqlite");
+    let (tenant, repo, run, job, attempt, captured, refused) = (
+        TenantId::new(),
+        RepoId::new(),
+        RunId::new(),
+        sentinel_core::JobId::new(),
+        sentinel_core::AttemptId::new(),
+        sentinel_core::ArtifactId::new(),
+        sentinel_core::ArtifactId::new(),
+    );
+    {
+        let conn = database_at(&path, 71);
+        let (t, r, ru, j, a, c, f) = (
+            tenant.as_bytes().as_slice(),
+            repo.as_bytes().as_slice(),
+            run.as_bytes().as_slice(),
+            job.as_bytes().as_slice(),
+            attempt.as_bytes().as_slice(),
+            captured.as_bytes().as_slice(),
+            refused.as_bytes().as_slice(),
+        );
+        let worker = [0x11u8; 16];
+        let sha = "0".repeat(40);
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute(
+            "INSERT INTO tenants(id, slug, created_ms) VALUES(?1, 'acme', 1)",
+            [t],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repos(id, tenant_id, name, created_ms) VALUES(?1, ?2, 'app', 1)",
+            params![r, t],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runs(id, tenant_id, repo_id, source_sha, created_ms)
+             VALUES(?1, ?2, ?3, ?4, 1)",
+            params![ru, t, r, sha],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs(id, tenant_id, run_id, name, state_code, priority, created_seq)
+             VALUES(?1, ?2, ?3, 'build', 5, 0, 0)",
+            params![j, t, ru],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attempts(id, tenant_id, job_id, fence, worker_id, lease_until_ms)
+             VALUES(?1, ?2, ?3, 1, ?4, 1)",
+            params![a, t, j, worker.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artifacts(id, tenant_id, run_id, job_id, attempt_id, name, state_code,
+                 manifest_version, entries, bytes, retain_until_ms, created_ms, class,
+                 charged_bytes)
+             VALUES(?1, ?2, ?3, ?4, ?5, 'out', 0, 1, 2, 40, 5000000000, 1, 'evidence', 40)",
+            params![c, t, ru, j, a],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artifacts(id, tenant_id, run_id, job_id, attempt_id, name, state_code,
+                 manifest_version, entries, bytes, retain_until_ms, created_ms, failure)
+             VALUES(?1, ?2, ?3, ?4, ?5, 'logs', 2, NULL, 0, 0, 5000000000, 1, 'quota_exceeded')",
+            params![f, t, ru, j, a],
+        )
+        .unwrap();
+        assert_eq!(version(&path), 71);
+    }
+    let (store, copy) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
+    assert!(copy.is_some(), "a pending migration takes a copy first");
+    type Stored = (String, i64, String, Option<Vec<u8>>, Option<String>, i64);
+    let rows: Vec<Stored> = store
+        .read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT name, origin_code, class, job_id, failure, charged_bytes
+                 FROM artifacts ORDER BY name",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                })?
+                .collect::<Result<_, _>>()?;
+            Ok(rows)
+        })
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "both artifacts survive the rebuild: {rows:?}"
+    );
+    assert_eq!(rows[0].0, "logs");
+    assert_eq!(
+        rows[0].1, 0,
+        "an artifact stored before the migration is a job's"
+    );
+    assert!(
+        rows[0].3.is_some(),
+        "the refused row still names its job and attempt"
+    );
+    assert_eq!(rows[0].4.as_deref(), Some("quota_exceeded"));
+    assert_eq!(rows[1].0, "out");
+    assert_eq!(rows[1].2, "evidence", "its class is unchanged");
+    assert_eq!(rows[1].5, 40, "and so is its charge");
+    assert!(rows[1].3.is_some(), "and it still names its job");
+    let upgraded = store.read(|c| Ok(schema_sql(c))).unwrap();
+    drop(store);
+    assert_eq!(version(&path), schema::LATEST);
+    let fresh = tempfile::tempdir().unwrap();
+    let fresh_store = Store::open(fresh.path().join("metadata.sqlite"), Durability::Full).unwrap();
+    assert_eq!(
+        upgraded,
+        fresh_store.read(|c| Ok(schema_sql(c))).unwrap(),
+        "the upgraded database has the schema a fresh one has, triggers and indexes included"
+    );
 }

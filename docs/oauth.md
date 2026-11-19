@@ -93,6 +93,9 @@ Scopes are stored bits (`sentinel_core::auth::Scopes`) and a ceiling on the acco
 | 128 | `secrets:write` | write secrets |
 | 256 | `tenant:admin` | tenant admin (never for a service principal) |
 | 512 | `platform:admin` | platform admin (only a super admin; dropped at authentication once demoted; a bearer never steps up) |
+| 1024 | `artifacts:write` | run |
+
+`artifacts:write` is new in migration 71 and lets a client attach files to a run it may operate on ([API](api.md#routes), [storage](storage.md#artifact-records)). It cannot yet be granted through OAuth: every stored scope column (`oauth_clients.max_scopes` and the `scopes` of grants, codes, device codes and refresh tokens) is bounded at 1023, so bits 0–9 are what a client cap and a grant can hold, and an `sntl_` API credential or a browser session carries it (both derive their scopes from live permissions). A registered MCP client's cap may now include `artifacts:read` (bit 8), which migration 42's mask refused.
 
 The CLI asks for `runs:read runs:write logs:read artifacts:read cache:read` by default (`Scopes::CLI_DEFAULT`). The audience (`Audience::Api` = 1, `{issuer}/api/v1`) or MCP resource (`{issuer}/mcp`) is stored with every grant, code and device request; MCP uses resource code 2.
 

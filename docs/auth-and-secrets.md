@@ -14,7 +14,7 @@ Keep three relationships separate:
 
 Sentinel exposes its own OAuth authorization service as an integrated server module, built using maintained protocol/crypto libraries. There is no external authorization server and no provider boundary for one: the issuer, the clients, grants and tokens are all in the controller's own database, and the protected-resource metadata advertises only this deployment as authorization server. **Planned:** delegating authorization to an external authorization server is not implemented and is not on the tracker. Admission/invite policy still applies after OAuth sign-in; authenticating must not bypass super-admin registration controls.
 
-Scopes include `runs:read`, `runs:write`, `logs:read`, `artifacts:read`, `cache:read`, `cache:write`, `secrets:metadata`, `secrets:write`, and administrative scopes. Effective authority is scope intersected with current membership, tenant/repo grants, client policy, and resource ownership. Holding `secrets:write` for one repo grants no authority in another.
+Scopes include `runs:read`, `runs:write`, `logs:read`, `artifacts:read`, `artifacts:write`, `cache:read`, `cache:write`, `secrets:metadata`, `secrets:write`, and administrative scopes. Effective authority is scope intersected with current membership, tenant/repo grants, client policy, and resource ownership. Holding `secrets:write` for one repo grants no authority in another.
 
 ## 2. CLI OAuth
 

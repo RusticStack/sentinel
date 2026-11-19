@@ -321,7 +321,7 @@ fn metadata_documents_name_this_deployment_exactly() {
         json!(["none"])
     );
     assert_eq!(meta.body["response_types_supported"], json!(["code"]));
-    assert_eq!(meta.body["scopes_supported"].as_array().unwrap().len(), 10);
+    assert_eq!(meta.body["scopes_supported"].as_array().unwrap().len(), 11);
     assert_eq!(
         meta.body["authorization_response_iss_parameter_supported"],
         true
@@ -386,7 +386,7 @@ fn an_access_token_reads_runs_and_me_reports_the_grant() {
     assert_eq!(root.body["username"], "root");
     assert_eq!(root.body["via"], "bearer");
     assert_eq!(root.body["grant"], Value::Null);
-    assert_eq!(root.body["scopes"].as_array().unwrap().len(), 10);
+    assert_eq!(root.body["scopes"].as_array().unwrap().len(), 11);
 }
 
 #[test]

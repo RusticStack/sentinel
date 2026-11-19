@@ -276,7 +276,9 @@ fn a_wrong_verifier_redirect_or_client_is_invalid_and_spends_the_code() {
             loopback: true,
             redirect_path: Some("/callback"),
             device: false,
-            max_scopes: Scopes::ALL,
+            // A stored client cap holds the bits migration 30's column bound allows: `artifacts:write`
+            // was added after it and needs that bound relaxed first.
+            max_scopes: Scopes::ALL.difference(Scopes::ARTIFACTS_WRITE),
         },
         &[],
     )
@@ -443,7 +445,9 @@ fn approval_only_narrows_what_the_account_and_client_may_hold() {
         )
         .is_ok()
     );
-    assert!(code::approve(&store, &approval(i.root, Scopes::ALL, &challenge), NOW).is_ok());
+    // A grant stores its scopes in the same bounded column, so it names what a client cap can hold.
+    let widest = Scopes::ALL.difference(Scopes::ARTIFACTS_WRITE);
+    assert!(code::approve(&store, &approval(i.root, widest, &challenge), NOW).is_ok());
 }
 
 #[test]

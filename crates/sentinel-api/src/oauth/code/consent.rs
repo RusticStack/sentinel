@@ -152,6 +152,7 @@ fn describe(scope: &str) -> &'static str {
         "runs:write" => "dispatch, cancel and rerun runs",
         "logs:read" => "read job logs",
         "artifacts:read" => "download artifacts",
+        "artifacts:write" => "attach files to runs",
         "cache:read" => "read cache records",
         "cache:write" => "write to caches",
         "secrets:metadata" => "list secret names (never values)",
