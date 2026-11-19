@@ -1867,6 +1867,41 @@ fn a_missing_scope_names_the_login_that_asks_for_it() {
         (error["code"].as_str(), error["details"]["scope"].as_str()),
         (Some("forbidden"), Some("artifacts:read"))
     );
+    // Every artifact surface asks for the same scope, and refuses before touching the filesystem.
+    let tree = m.dir.path().join("tree");
+    let artifact = sentinel_core::ArtifactId::new().to_string();
+    for args in [
+        vec!["artifact", "show", &run, &artifact, "--profile", "narrow"],
+        vec![
+            "artifact",
+            "download",
+            &run,
+            &artifact,
+            "--path",
+            "out/report.txt",
+            "--out",
+            tree.join("report.txt").to_str().unwrap(),
+            "--profile",
+            "narrow",
+        ],
+        vec![
+            "artifact",
+            "download",
+            &run,
+            &artifact,
+            "--all",
+            "--out",
+            tree.to_str().unwrap(),
+            "--profile",
+            "narrow",
+        ],
+        vec!["artifact", "link", &run, &artifact, "--profile", "narrow"],
+    ] {
+        let out = m.run(&args);
+        assert_eq!(out.code, 3, "{args:?}: {out:?}");
+        assert!(out.stderr.contains(&expected), "{args:?}: {}", out.stderr);
+    }
+    assert!(!tree.exists(), "a refused download wrote nothing");
 }
 
 #[cfg(target_os = "linux")]

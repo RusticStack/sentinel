@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
 
 use super::{List, segment, tenant, text};
 use crate::client::{self, Client, Error, Exit, Output};
@@ -78,11 +78,148 @@ pub(super) fn download(
     let run = segment("run", run)?;
     let artifact = segment("artifact", artifact)?;
     let view = client.get(&format!("/api/v1/runs/{run}/artifacts/{artifact}"))?;
-    let slug = match (tenant_flag, view["tenant"].as_str()) {
-        (Some(flag), _) => tenant(client, Some(flag))?,
-        (None, Some(owner)) => segment("tenant", owner)?.to_owned(),
-        (None, None) => tenant(client, None)?,
-    };
+    let slug = owner_slug(client, &view, tenant_flag)?;
+    let (digest, len) = manifest_entry(&view, artifact, entry_path)?;
+    write_entry(client, &slug, &digest, len, out)?;
+    let result = json!({
+        "artifact": artifact,
+        "path": entry_path,
+        "out": out.display().to_string(),
+        "digest": digest,
+        "len": len,
+    });
+    client::emit(output, &result, || {
+        format!(
+            "{entry_path}: {len} bytes, digest {digest} -> {}\n",
+            out.display()
+        )
+    });
+    Ok(())
+}
+
+/// Every entry of one artifact, written under `dir` at its manifest path: each object is verified on its own, so a
+/// failure part way keeps the entries already written and names the one that stopped.
+pub(super) fn download_all(
+    client: &Client,
+    output: Output,
+    run: &str,
+    artifact: &str,
+    dir: &Path,
+    tenant_flag: Option<String>,
+) -> Result<(), Error> {
+    let run = segment("run", run)?;
+    let artifact = segment("artifact", artifact)?;
+    let view = client.get(&format!("/api/v1/runs/{run}/artifacts/{artifact}"))?;
+    let slug = owner_slug(client, &view, tenant_flag)?;
+    let entries = view["manifest"]["entries"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    if entries.is_empty() {
+        return Err(Error::new(
+            Exit::NotFound,
+            format!(
+                "artifact {artifact} has no manifest to download (its state is {})",
+                text(&view, "state")
+            ),
+        ));
+    }
+    fs::create_dir_all(dir)
+        .map_err(|e| Error::usage(format!("cannot create {}: {e}", dir.display())))?;
+    let mut list = List::new(output);
+    for entry in entries {
+        let path = text(entry, "path");
+        let digest = segment("digest", text(entry, "digest"))?.to_owned();
+        let len = entry["len"]
+            .as_u64()
+            .ok_or_else(|| Error::remote("the manifest entry has no length"))?;
+        let dest = entry_destination(dir, path)?;
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| Error::usage(format!("cannot create {}: {e}", parent.display())))?;
+        }
+        write_entry(client, &slug, &digest, len, &dest)?;
+        let item = json!({
+            "path": path,
+            "out": dest.display().to_string(),
+            "digest": digest,
+            "len": len,
+        });
+        list.item(item, || {
+            format!(
+                "{path}: {len} bytes, digest {digest} -> {}\n",
+                dest.display()
+            )
+        });
+    }
+    let mut extra = Map::with_capacity(2);
+    extra.insert("artifact".to_owned(), Value::String(artifact.to_owned()));
+    extra.insert("out".to_owned(), Value::String(dir.display().to_string()));
+    list.finish("entries", extra);
+    Ok(())
+}
+
+/// A short-lived download URL for one entry or the whole archive; minting is a write of nothing, so it is idempotent.
+pub(super) fn link(
+    client: &Client,
+    output: Output,
+    run: &str,
+    artifact: &str,
+    entry: Option<&str>,
+    format: Option<&str>,
+    expires: u64,
+) -> Result<(), Error> {
+    let run = segment("run", run)?;
+    let artifact = segment("artifact", artifact)?;
+    match format {
+        None | Some("tar" | "zip") => {}
+        Some(other) => {
+            return Err(Error::usage(format!(
+                "--format is tar or zip, not {other:?}"
+            )));
+        }
+    }
+    if entry.is_some() && format.is_some() {
+        return Err(Error::usage(
+            "--entry names one file and takes no --format; omit --entry for a whole archive",
+        ));
+    }
+    if !(1..=3600).contains(&expires) {
+        return Err(Error::usage("--expires is 1 to 3600 seconds"));
+    }
+    let mut body =
+        Map::with_capacity(1 + usize::from(entry.is_some()) + usize::from(format.is_some()));
+    if let Some(entry) = entry {
+        body.insert("entry".to_owned(), Value::String(entry.to_owned()));
+    }
+    if let Some(format) = format {
+        body.insert("format".to_owned(), Value::String(format.to_owned()));
+    }
+    body.insert("expires_secs".to_owned(), Value::from(expires));
+    let view = client.post(
+        &format!("/api/v1/runs/{run}/artifacts/{artifact}/link"),
+        &Value::Object(body),
+        None,
+    )?;
+    client::emit(output, &view, || {
+        format!(
+            "{}\nexpires in {expires}s: anyone holding this URL can download until then\n",
+            text(&view, "url")
+        )
+    });
+    Ok(())
+}
+
+/// The slug the artifact row belongs to, so entry bytes come from the owning tenant's objects.
+fn owner_slug(client: &Client, view: &Value, tenant_flag: Option<String>) -> Result<String, Error> {
+    match (tenant_flag, view["tenant"].as_str()) {
+        (Some(flag), _) => tenant(client, Some(flag)),
+        (None, Some(owner)) => Ok(segment("tenant", owner)?.to_owned()),
+        (None, None) => tenant(client, None),
+    }
+}
+
+/// The digest and length the manifest gives one entry, or `not_found` when it holds no such path.
+fn manifest_entry(view: &Value, artifact: &str, entry_path: &str) -> Result<(String, u64), Error> {
     let entry = view["manifest"]["entries"]
         .as_array()
         .into_iter()
@@ -98,33 +235,45 @@ pub(super) fn download(
     let len = entry["len"]
         .as_u64()
         .ok_or_else(|| Error::remote("the manifest entry has no length"))?;
+    Ok((digest, len))
+}
+
+/// An entry path joins under the directory only as plain names: the manifest is the server's, and a path that could
+/// leave the destination is refused rather than normalized.
+fn entry_destination(dir: &Path, path: &str) -> Result<PathBuf, Error> {
+    let mut dest = dir.to_path_buf();
+    for part in path.split('/') {
+        if part.is_empty() || part == "." || part == ".." || part.contains(['\\', ':']) {
+            return Err(Error::remote(format!(
+                "the manifest entry {path:?} is not a plain relative path"
+            )));
+        }
+        dest.push(part);
+    }
+    Ok(dest)
+}
+
+/// One entry's bytes into `out`: a partial file beside it resumes and verifies, and only matching bytes are renamed.
+fn write_entry(
+    client: &Client,
+    slug: &str,
+    digest: &str,
+    len: u64,
+    out: &Path,
+) -> Result<(), Error> {
     let object = format!("/api/v1/tenants/{slug}/objects/{digest}");
-    let part = partial_path(out, &digest);
-    match fetch(client, &object, &part, len, &digest) {
+    let part = partial_path(out, digest);
+    match fetch(client, &object, &part, len, digest) {
         Ok(()) => fs::rename(&part, out).map_err(|e| {
             let _ = fs::remove_file(&part);
             Error::usage(format!("cannot write {}: {e}", out.display()))
-        })?,
-        Err(Failure::Interrupted(error)) => return Err(error),
+        }),
+        Err(Failure::Interrupted(error)) => Err(error),
         Err(Failure::Failed(error)) => {
             let _ = fs::remove_file(&part);
-            return Err(error);
+            Err(error)
         }
     }
-    let result = json!({
-        "artifact": artifact,
-        "path": entry_path,
-        "out": out.display().to_string(),
-        "digest": digest,
-        "len": len,
-    });
-    client::emit(output, &result, || {
-        format!(
-            "{entry_path}: {len} bytes, digest {digest} -> {}\n",
-            out.display()
-        )
-    });
-    Ok(())
 }
 
 const STALLED_ATTEMPTS: u32 = 3;
@@ -357,4 +506,35 @@ pub(super) fn cache(client: &Client, output: Output, attempt: &str) -> Result<()
         out
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_paths_join_under_the_directory_only_as_plain_names() {
+        let dir = Path::new("/tmp/tree");
+        assert_eq!(
+            entry_destination(dir, "out/report.txt").unwrap(),
+            dir.join("out").join("report.txt")
+        );
+        assert_eq!(
+            entry_destination(dir, "a/b/c.bin").unwrap(),
+            dir.join("a/b/c.bin")
+        );
+        for bad in [
+            "../escape.bin",
+            "out/../../escape.bin",
+            "/etc/passwd",
+            "out//x",
+            "out/./x",
+            "out\\x",
+            "c:x",
+            "",
+        ] {
+            let error = entry_destination(dir, bad).unwrap_err();
+            assert_eq!(error.exit, Exit::Remote, "{bad:?}");
+        }
+    }
 }

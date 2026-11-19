@@ -2258,9 +2258,17 @@ fn transfer_slots_are_bounded() {
     assert_eq!(bytes.len(), content.len());
 }
 
-#[test]
-fn artifact_routes_are_authorized_and_scoped() {
-    let d = deployment();
+/// One run with a captured artifact holding `out/report.txt` and an absent companion row, for the artifact
+/// routes and the MCP tools that read them.
+fn publish_report_artifact(
+    d: &Deployment,
+) -> (
+    RunId,
+    sentinel_core::JobId,
+    AttemptId,
+    sentinel_core::ArtifactId,
+    sentinel_core::ArtifactId,
+) {
     let (tenant, repo) = (d.tenant, d.intake_repo);
     let now = UnixMillis::now();
     let run = RunId::new();
@@ -2390,6 +2398,15 @@ fn artifact_routes_are_authorized_and_scoped() {
             })
             .unwrap()
     };
+    (run, job, offer.attempt, captured, absent)
+}
+
+#[test]
+fn artifact_routes_are_authorized_and_scoped() {
+    let d = deployment();
+    let (run, job, attempt, captured, absent) = publish_report_artifact(&d);
+    let _ = (job, attempt);
+    let (tenant, repo, now) = (d.tenant, d.intake_repo, UnixMillis::now());
     let auth = bearer(&d);
     let (status, rows) = call(
         &d,
@@ -4146,6 +4163,83 @@ fn mcp_lists_a_slash_named_repositorys_secret_bindings_as_metadata_only() {
         .map(|(_, value)| value.as_str())
         .unwrap_or_default();
     assert!(challenge.contains("insufficient_scope"), "{challenge}");
+}
+
+#[test]
+fn mcp_artifact_tools_ask_every_http_session_for_artifacts_read() {
+    use sentinel_core::auth::Scopes;
+    let d = deployment();
+    let (run, _, _, captured, _) = publish_report_artifact(&d);
+    let (run, captured) = (run.to_string(), captured.to_string());
+    let tool = |session: &(String, String), name: &str, arguments: serde_json::Value| {
+        mcp_post(
+            &d,
+            &serde_json::json!({
+                "jsonrpc":"2.0", "id":2, "method":"tools/call",
+                "params":{"name":name,"arguments":arguments}
+            }),
+            &session.0,
+            &[
+                ("mcp-protocol-version", "2025-11-25"),
+                ("mcp-session-id", session.1.as_str()),
+            ],
+        )
+    };
+    // A registered MCP client may hold no scope outside `Scopes::MCP`, so every artifact tool is refused over this
+    // transport with the challenge that names what it needs; the stdio transport reaches them with a CLI profile.
+    let widest = mcp_session(&d, "artifact-mcp-widest", Scopes::MCP);
+    let (status, _, body) = mcp_post(
+        &d,
+        &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        &widest.0,
+        &[
+            ("mcp-protocol-version", "2025-11-25"),
+            ("mcp-session-id", widest.1.as_str()),
+        ],
+    );
+    assert_eq!(status, 200, "{body}");
+    for name in [
+        "list_artifacts",
+        "get_artifact",
+        "read_artifact_file",
+        "get_artifact_link",
+    ] {
+        let listed = body["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not offered"));
+        assert_eq!(listed["annotations"]["readOnlyHint"], true, "{listed}");
+        assert_eq!(listed["annotations"]["destructiveHint"], false, "{listed}");
+    }
+    for (name, arguments) in [
+        ("list_artifacts", serde_json::json!({"run": run})),
+        (
+            "get_artifact",
+            serde_json::json!({"run": run, "artifact": captured}),
+        ),
+        (
+            "read_artifact_file",
+            serde_json::json!({"run": run, "artifact": captured, "path": "out/report.txt"}),
+        ),
+        (
+            "get_artifact_link",
+            serde_json::json!({"run": run, "artifact": captured}),
+        ),
+    ] {
+        let (status, headers, body) = tool(&widest, name, arguments);
+        assert_eq!(status, 403, "{name}: {body}");
+        let challenge = headers
+            .iter()
+            .find(|(key, _)| key == "www-authenticate")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or_default();
+        assert!(
+            challenge.contains("insufficient_scope") && challenge.contains("artifacts:read"),
+            "{name}: {challenge}"
+        );
+    }
 }
 
 /// How a raw request frames its body.

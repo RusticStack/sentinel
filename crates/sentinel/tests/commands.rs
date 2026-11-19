@@ -1,11 +1,13 @@
 use std::{
     collections::HashSet,
-    process::{Command, Output},
+    io::{Read, Write},
+    process::{Command, Output, Stdio},
     sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
+use sentinel_auth::sealed::Key;
 use sentinel_core::{
     AttemptId, Event, Fence, JobId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Namespace, Permissions as P, Principal, Role},
@@ -71,6 +73,9 @@ fn deployment() -> Deployment {
         .unwrap();
     let granted =
         tokens::provision(&store, Grant::new(root, "cli", P::ALL), UnixMillis::now()).unwrap();
+    let key_path = dir.path().join("master.key");
+    Key::create(&key_path).unwrap();
+    let key = Arc::new(Key::load(&key_path).unwrap());
     let controller = Controller::start(
         Arc::clone(&store),
         Arc::clone(&logs),
@@ -91,7 +96,7 @@ fn deployment() -> Deployment {
         public_url: None,
         github_sign_in: None,
         trusted_proxies: sentinel_api::TrustedProxy::loopback(),
-        secret_key: None,
+        secret_key: Some(Arc::clone(&key)),
     })
     .unwrap();
     Deployment {
@@ -490,6 +495,380 @@ fn an_artifact_entry_downloads_with_its_length_and_digest_checked() {
         summary,
         json!({ "attempt": attempt.to_string(), "present": false })
     );
+}
+
+#[test]
+fn every_artifact_entry_downloads_into_a_directory_and_a_link_mints_a_working_url() {
+    let d = deployment();
+    let (run, job) = dispatch_run(&d);
+    let (_, attempt, _) = lease(&d, job);
+    let bodies: [(&str, &[u8]); 3] = [
+        ("out/report.txt", b"report-bytes"),
+        ("out/nested/coverage.json", b"{\"covered\":true}"),
+        ("top.bin", &[0u8, 159, 146, 150]),
+    ];
+    let (tenant, dir_path) = (d.tenant, d.dir.path().to_path_buf());
+    let artifact = d
+        .store
+        .writer()
+        .write(move |tx| {
+            let objects = Objects::open(&dir_path).unwrap();
+            let mut entries = Vec::with_capacity(bodies.len());
+            let mut bytes = 0u64;
+            for (path, body) in bodies {
+                let staged = objects
+                    .stage(tenant, body, u64::MAX, Expect::default())
+                    .unwrap();
+                objects.commit(tx, &staged)?;
+                bytes += staged.len();
+                entries.push(Entry {
+                    path: path.to_owned(),
+                    digest: staged.digest(),
+                    len: staged.len(),
+                    mode: 0o644,
+                });
+            }
+            let version = objects.commit_manifest(
+                tx,
+                tenant,
+                Kind::Artifact,
+                &artifacts::manifest_name(job, "report"),
+                &entries,
+            )?;
+            let now = UnixMillis::now();
+            artifacts::record(
+                tx,
+                tenant,
+                run,
+                job,
+                attempt,
+                "report",
+                artifacts::State::Captured,
+                Some(version),
+                entries.len() as u64,
+                bytes,
+                UnixMillis(now.0 + 86_400_000),
+                now,
+            )
+        })
+        .unwrap();
+    let dir = d.dir.path().join("tree");
+    let out = cli(
+        &d,
+        &[
+            "artifact",
+            "download",
+            &run.to_string(),
+            &artifact.to_string(),
+            "--all",
+            "--out",
+            dir.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    for (path, body) in bodies {
+        assert_eq!(std::fs::read(dir.join(path)).unwrap(), body, "{path}");
+    }
+    let printed = stdout(&out);
+    let lines: Vec<&str> = printed.lines().collect();
+    assert_eq!(lines.len(), 3, "{printed}");
+    assert!(
+        lines[0].contains("out/report.txt: 12 bytes"),
+        "{}",
+        lines[0]
+    );
+    let json_dir = d.dir.path().join("tree-json");
+    let out = cli(
+        &d,
+        &[
+            "artifact",
+            "download",
+            &run.to_string(),
+            &artifact.to_string(),
+            "--all",
+            "--out",
+            json_dir.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let listed: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(listed["artifact"], artifact.to_string());
+    assert_eq!(listed["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(listed["entries"][2]["path"], "top.bin");
+    assert_eq!(
+        listed["entries"][2]["out"],
+        json_dir.join("top.bin").display().to_string()
+    );
+
+    let neither = cli(
+        &d,
+        &[
+            "artifact",
+            "download",
+            &run.to_string(),
+            &artifact.to_string(),
+            "--out",
+            json_dir.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code(&neither), 2, "{}", stderr(&neither));
+    let both = cli(
+        &d,
+        &[
+            "artifact",
+            "download",
+            &run.to_string(),
+            &artifact.to_string(),
+            "--all",
+            "--path",
+            "top.bin",
+            "--out",
+            json_dir.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code(&both), 2, "{}", stderr(&both));
+
+    let absent = cli(
+        &d,
+        &[
+            "artifact",
+            "download",
+            &run.to_string(),
+            &sentinel_core::ArtifactId::new().to_string(),
+            "--all",
+            "--out",
+            json_dir.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code(&absent), 4, "{}", stderr(&absent));
+
+    let link = cli(
+        &d,
+        &[
+            "artifact",
+            "link",
+            &run.to_string(),
+            &artifact.to_string(),
+            "--entry",
+            "out/report.txt",
+            "--expires",
+            "60",
+            "--json",
+        ],
+    );
+    assert_eq!(code(&link), 0, "{}", stderr(&link));
+    let minted: Value = serde_json::from_str(&stdout(&link)).unwrap();
+    let url = minted["url"].as_str().unwrap();
+    assert!(url.contains("/dl/"), "{url}");
+    let expires = minted["expires_ms"].as_i64().unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(expires > now_ms && expires <= now_ms + 61_000, "{expires}");
+    let response = ureq::get(url).call().unwrap();
+    let mut body = Vec::new();
+    response
+        .into_body()
+        .into_reader()
+        .read_to_end(&mut body)
+        .unwrap();
+    assert_eq!(body, b"report-bytes");
+    let text = cli(
+        &d,
+        &[
+            "artifact",
+            "link",
+            &run.to_string(),
+            &artifact.to_string(),
+            "--format",
+            "zip",
+        ],
+    );
+    assert_eq!(code(&text), 0, "{}", stderr(&text));
+    let printed = stdout(&text);
+    assert!(printed.starts_with("http"), "{printed}");
+    assert!(
+        printed.contains("anyone holding this URL can download"),
+        "{printed}"
+    );
+    for args in [
+        &["--format", "rar"][..],
+        &["--expires", "0"],
+        &["--expires", "3601"],
+        &["--entry", "top.bin", "--format", "tar"],
+    ] {
+        let mut argv = vec!["artifact", "link", "run_x", "arf_x"];
+        argv.extend_from_slice(args);
+        let out = cli(&d, &argv);
+        assert_eq!(code(&out), 2, "{args:?}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn mcp_reads_artifacts_through_the_shared_tools_and_refuses_an_entry_over_the_text_bound() {
+    let d = deployment();
+    let (run, job) = dispatch_run(&d);
+    let (_, attempt, _) = lease(&d, job);
+    let (tenant, dir_path) = (d.tenant, d.dir.path().to_path_buf());
+    let big = vec![b'x'; sentinel_protocol::limits::MAX_ARTIFACT_TEXT_BYTES + 1];
+    let (report, large) = d
+        .store
+        .writer()
+        .write(move |tx| {
+            let objects = Objects::open(&dir_path).unwrap();
+            let publish = |name: &str, files: &[(&str, &[u8])]| {
+                let mut entries = Vec::with_capacity(files.len());
+                let mut bytes = 0u64;
+                for (path, body) in files {
+                    let staged = objects
+                        .stage(tenant, *body, u64::MAX, Expect::default())
+                        .unwrap();
+                    objects.commit(tx, &staged)?;
+                    bytes += staged.len();
+                    entries.push(Entry {
+                        path: (*path).to_owned(),
+                        digest: staged.digest(),
+                        len: staged.len(),
+                        mode: 0o644,
+                    });
+                }
+                let version = objects.commit_manifest(
+                    tx,
+                    tenant,
+                    Kind::Artifact,
+                    &artifacts::manifest_name(job, name),
+                    &entries,
+                )?;
+                let now = UnixMillis::now();
+                artifacts::record(
+                    tx,
+                    tenant,
+                    run,
+                    job,
+                    attempt,
+                    name,
+                    artifacts::State::Captured,
+                    Some(version),
+                    entries.len() as u64,
+                    bytes,
+                    UnixMillis(now.0 + 86_400_000),
+                    now,
+                )
+            };
+            let report = publish(
+                "report",
+                &[
+                    ("out/report.txt", &b"report-bytes"[..]),
+                    ("out/notes/nested.md", &b"# notes\n"[..]),
+                ],
+            )?;
+            let large = publish("large", &[("dump/full.log", &big[..])])?;
+            Ok::<_, sentinel_store::Error>((report, large))
+        })
+        .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+        .env("SENTINEL_TOKEN", &d.token)
+        .env("SENTINEL_SERVER", &d.base)
+        .env_remove("SENTINEL_PROFILE")
+        .env("SENTINEL_CONFIG_DIR", d.dir.path().join("no-profiles"))
+        .args(["mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let call = |id: u32, name: &str, arguments: Value| {
+        json!({
+            "jsonrpc":"2.0", "id":id, "method":"tools/call",
+            "params":{"name":name,"arguments":arguments}
+        })
+    };
+    {
+        let mut input = child.stdin.take().unwrap();
+        for request in [
+            json!({
+                "jsonrpc":"2.0", "id":1, "method":"initialize",
+                "params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+            }),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+            call(3, "list_artifacts", json!({"run": run.to_string()})),
+            call(
+                4,
+                "get_artifact",
+                json!({"run": run.to_string(), "artifact": report.to_string()}),
+            ),
+            call(
+                5,
+                "read_artifact_file",
+                json!({"run": run.to_string(), "artifact": report.to_string(), "path": "out/report.txt"}),
+            ),
+            call(
+                6,
+                "read_artifact_file",
+                json!({"run": run.to_string(), "artifact": large.to_string(), "path": "dump/full.log"}),
+            ),
+            call(
+                7,
+                "get_artifact_link",
+                json!({"run": run.to_string(), "artifact": report.to_string(), "entry": "out/notes/nested.md"}),
+            ),
+        ] {
+            writeln!(input, "{request}").unwrap();
+        }
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let replies: Vec<Value> = stdout(&output)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 7, "one reply per request");
+    let tools = replies[1]["result"]["tools"].as_array().unwrap();
+    for name in [
+        "list_artifacts",
+        "get_artifact",
+        "read_artifact_file",
+        "get_artifact_link",
+    ] {
+        assert!(
+            tools.iter().any(|tool| tool["name"] == name),
+            "{name} is not offered"
+        );
+    }
+    let listed = &replies[2]["result"]["structuredContent"];
+    assert_eq!(listed["artifacts"].as_array().unwrap().len(), 2, "{listed}");
+    let detail = &replies[3]["result"]["structuredContent"];
+    assert_eq!(detail["manifest"]["entries"].as_array().unwrap().len(), 2);
+    let read = &replies[4]["result"]["structuredContent"];
+    assert_eq!(read["text"], "report-bytes");
+    assert_eq!(read["untrusted"], true);
+    assert_eq!(read["media"], "text");
+    let refused = &replies[5]["result"];
+    assert_eq!(refused["isError"], true, "{refused}");
+    let message = refused["structuredContent"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!(
+            "{}",
+            sentinel_protocol::limits::MAX_ARTIFACT_TEXT_BYTES + 1
+        )) && message.contains("text bound"),
+        "{message}"
+    );
+    let url = replies[6]["result"]["structuredContent"]["url"]
+        .as_str()
+        .unwrap();
+    let response = ureq::get(url).call().unwrap();
+    let mut body = Vec::new();
+    response
+        .into_body()
+        .into_reader()
+        .read_to_end(&mut body)
+        .unwrap();
+    assert_eq!(body, b"# notes\n");
 }
 
 #[test]
