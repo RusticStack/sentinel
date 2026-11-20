@@ -25,6 +25,7 @@ const row = {
   data_policy: "local_only",
   state: "claimed",
   outcome: null,
+  reused: false,
   created_ms: 1_700_000_000_000,
   deadline_ms: 1_700_000_900_000,
 };

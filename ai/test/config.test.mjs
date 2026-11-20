@@ -11,13 +11,41 @@ const MINIMAL = {
 };
 
 test("the smallest usable configuration is a controller, a grant and a local endpoint", () => {
-  const config = load({ ...MINIMAL, SENTINEL_AI_MODEL_LOCAL: "qwen2.5-coder" });
+  const config = load({
+    ...MINIMAL,
+    SENTINEL_AI_MODEL_LOCAL: "qwen2.5-coder",
+    SENTINEL_AI_BUDGET_LOCAL: "2048:0:0",
+  });
   assert.ok(!(config instanceof ConfigError));
   assert.equal(config.controller, "http://127.0.0.1:8080");
   assert.equal(config.endpoints.local.url, "http://127.0.0.1:11434/v1");
   assert.equal(config.endpoints.openrouter, null);
-  assert.equal(config.models.local, "qwen2.5-coder");
+  assert.deepEqual(config.models.local, {
+    id: "qwen2.5-coder",
+    maxOutputTokens: 2048,
+    inputMicrosPerMtok: 0,
+    outputMicrosPerMtok: 0,
+  });
+  assert.equal(config.models.openrouter, undefined, "a provider with no model is never used");
   assert.equal(config.pollMs, 2000);
+});
+
+test("a model with no budget is refused rather than reserving nothing", () => {
+  const missing = load({ ...MINIMAL, SENTINEL_AI_MODEL_OPENROUTER: "openai/gpt-fake" });
+  assert.ok(missing instanceof ConfigError);
+  assert.match(missing.reason, /SENTINEL_AI_BUDGET_OPENROUTER is not set/);
+
+  for (const spec of ["", "1024", "1024:1", "1024:1:2:3", "0:1:2", "1024:1.5:2", "x:1:2", "-1:1:2"]) {
+    const config = load({
+      ...MINIMAL,
+      SENTINEL_AI_MODEL_OPENROUTER: "openai/gpt-fake",
+      SENTINEL_AI_BUDGET_OPENROUTER: spec,
+    });
+    assert.ok(config instanceof ConfigError, spec);
+    // The reason names the variable and never prints what it held.
+    assert.match(config.reason, /SENTINEL_AI_BUDGET_OPENROUTER/);
+    assert.equal(config.reason.includes(spec === "" ? "=" : spec), false, spec);
+  }
 });
 
 test("a missing controller, grant or unfitting endpoint is refused by name", () => {

@@ -5,11 +5,13 @@ is optional advisory text on top of them: a model reads a bounded, redacted evid
 built from logs and diagnostics the controller already stored, and writes a summary that cites
 the lines it used. This page states the guarantees that hold whether AI is on or off, the
 deployment and tenant policy that decides whether it may run at all, what the bundle holds, and
-what each data policy commits to. What is built today is the policy, its routes, its gate, the
-evidence bundle the controller serves, and the separate process that talks to a provider,
-`sentinel-ai`, with the durable requests it consumes and the request-scoped credential it reads
-evidence with. Budgets (Y04), the analyses themselves (Y05) and everything after are
-[plan 16.6](../plan.md#166-ai-assistance) and the backlog items after Y03.
+what each data policy commits to, and what one tenant's month may cost. What is built today is the
+policy, its routes, its gate, the evidence bundle the controller serves, the separate process that
+talks to a provider, `sentinel-ai`, with the durable requests it consumes and the request-scoped
+credential it reads evidence with, the budget ledger every request reserves against before it goes
+anywhere, and the analysis cache a repeated question is answered from. The analyses themselves
+(Y05) and everything after are [plan 16.6](../plan.md#166-ai-assistance) and the backlog items after
+Y04.
 
 ## The guarantees
 
@@ -62,13 +64,15 @@ A tenant administrator opts one tenant in, under a data policy:
 
 ```json
 PUT /api/v1/tenants/{slug}/ai
-{ "enabled": true, "data_policy": "zero_retention" }
+{ "enabled": true, "data_policy": "zero_retention",
+  "budgets": { "monthly_tokens": 2000000, "concurrency": 2 } }
 ```
 
 The route needs the tenant's `admin` role and a live step-up, and is refused while the
 deployment allows no provider. `GET /api/v1/tenants/{slug}/ai` answers the tenant's own choice,
-its data policy (`null` until it first opts in) and the providers it may use right now — empty
-while either side is off — without a step-up. Every change is audited as
+its data policy (`null` until it first opts in), its budget and the providers it may use right
+now — empty while either side is off — without a step-up. What the budget fields mean, and what a
+request does when it does not fit them, is [below](#budgets). Every change is audited as
 `ai-policy-changed` (deployment) or `tenant-ai-policy-changed` (tenant) in
 `GET /api/v1/admin/audit`.
 
@@ -116,6 +120,9 @@ SENTINEL_AI_CONTROLLER=http://127.0.0.1:8080   # the controller's API base
 SENTINEL_AI_TOKEN=sntl_…                      # the ai:context grant, shown once when issued
 SENTINEL_AI_MODEL_OPENROUTER=…                # one model per provider the deployment allows;
 SENTINEL_AI_MODEL_LOCAL=…                     # a provider with no model is refused, not guessed at
+SENTINEL_AI_BUDGET_OPENROUTER=4096:150000:600000  # <output cap>:<input micros per Mtok>:
+SENTINEL_AI_BUDGET_LOCAL=2048:0:0             # <output micros per Mtok>; a model with no
+                                              # budget is refused, not reserved at nothing
 SENTINEL_AI_LOCAL_URL=http://127.0.0.1:11434/v1
 SENTINEL_AI_LOCAL_KEY=…                       # vLLM and LiteLLM need one; Ollama does not
 SENTINEL_AI_OPENROUTER_KEY=…
@@ -144,14 +151,99 @@ is on it.
    It is shown once, to the process, and it is what reads the evidence bundle — so the credential
    that sees a bundle can read nothing the requester could not read, and it reads no other
    attempt's bundle even inside a repository the requester can read.
-4. `POST /ai/requests/{id}/complete` settles the row exactly once, with the answer or the reason
-   there is none, and revokes the delegation in the same write. A settled request's delegation no
-   longer authenticates; a request past its deadline has none left either.
+4. `POST /ai/requests/{id}/reserve` is the pre-call decision ([below](#budgets)): it holds the
+   request's maximum against its tenant's month, answers from an analysis the ledger already paid
+   for, or refuses — and a refusal settles the row in that same write, so nothing waits.
+5. `POST /ai/requests/{id}/complete` settles the row exactly once, with the answer or the reason
+   there is none and what the provider reported, and revokes the delegation in the same write. A
+   settled request's delegation no longer authenticates; a request past its deadline has none left
+   either.
 
 The row moves `queued` → `claimed` → `settled` and never back. `GET /api/v1/ai/requests/{id}`
 answers a member who can read its repository, so the answer the process stored is where Y05 reads
 it from, and `crates/sentinel-api/tests/ai_requests.rs` proves the two halves the row's gate names:
 a delegation cannot read past the requester, and a `local_only` request reaches no public host.
+
+## Budgets
+
+A tenant administrator states what its AI may cost in the same call that opts the tenant in:
+
+```json
+PUT /api/v1/tenants/{slug}/ai
+{ "enabled": true, "data_policy": "zero_retention",
+  "budgets": { "monthly_tokens": 2000000, "monthly_cost_micros": 500000,
+               "max_input_tokens": 32000, "max_output_tokens": 4096,
+               "max_cost_micros": 100000, "concurrency": 2 } }
+```
+
+Every field is optional: the one stated replaces what the tenant had, the ones left out keep it, so
+changing a data policy never resets a budget by omission. `GET /tenants/{slug}/ai` reads them back.
+The defaults are no monthly ceiling (a monthly field of `0` is no budget at all, as
+`tenant_quota_bytes` of `0` is no quota), 32,000 input tokens, 4,096 output tokens and 100,000
+micros for one request, and two requests in flight. Cost is in **millionths of the deployment's own
+currency**, because Sentinel never guesses a price: `sentinel-ai` holds its model's two rates
+(`SENTINEL_AI_BUDGET_<PROVIDER>`), prices the maximum from them, and reports what it actually spent;
+the controller stores and compares those numbers and knows nothing about models.
+
+The ledger is two tables. `ai_ledger` is what a tenant was charged, one row per tenant and UTC
+calendar month (`YYYYMM`). `ai_reservations` is what a claimed request holds before its provider is
+contacted: its maximum tokens and cost, the analysis key it will publish on success, and the request
+deadline it expires with. The decision is `charged + held + this request ≤ limit`, read and written in
+the same writer transaction, so concurrent requests cannot pass the limit between a check and a hold
+— the controller is the only writer and reservations are serialized with it. `GET
+/tenants/{slug}/ai/usage` reports the month, the budget, what has been charged, what is held and how
+many requests are in flight.
+
+**Refusal is immediate, never queued.** `POST /ai/requests/{id}/reserve` answers one of three
+things, and two of them end the request in that same write:
+
+| Answer | What happened |
+|---|---|
+| `reserved` | The maximum is held until the request's deadline. The provider may be contacted. |
+| `reused` | The tenant already has this analysis ([below](#the-analysis-cache)). The request is settled `completed` with it, marked `reused`, and charged nothing. |
+| `refused` | Per-request cap, concurrency limit or monthly budget. The request is settled `unavailable` with the reason (`per_request: …`, `concurrency: …`, `budget: …`), and nothing was held. |
+
+Because a refused request is settled by the call that refused it, nothing waits in the queue for its
+deadline to notice, and the AI process has no second call to make. The per-request caps and the
+concurrency limit are refused on the same path, before any provider exists for the request. The
+output cap one request asks for is its model's own (`SENTINEL_AI_BUDGET_*`), which is also the
+`max_tokens` the provider is sent, so a deployment whose cap is above a tenant's gets refusals
+naming it rather than a cap quietly lowered underneath it: the two numbers have to agree.
+
+**A hold nobody releases expires.** A reservation's `expires_ms` is its request's deadline — ten
+minutes — and the sweep that settles an expired request as `unavailable` deletes the reservation in
+the same write. A killed AI process therefore holds a tenant's month for at most those ten minutes,
+and the next request of the same size is admitted as soon as it has expired.
+
+**Settlement is what the provider reported.** The completion carries the usage the provider stated,
+and the ledger is charged per component: an unreported count settles at the reservation's maximum,
+because `null` is never zero, and no component settles above what was held, so a call can never
+spend past the maximum that was approved before it. A reservation is charged to the month it was
+made in, even when it settles after midnight on the last day of one.
+
+## The analysis cache
+
+The same question over the same evidence costs nothing the second time, and a rerun of the same
+failure reuses what the earlier run paid for. An analysis is stored under its tenant and three key
+parts — the evidence, the prompt and the model — in `ai_analyses`, and `reserve` looks it up before
+it looks at any cap, limit or budget, because an answer already paid for costs nothing to serve:
+
+- **The evidence digest** is the exact bundle `sentinel-ai` would send, byte for byte: the same
+  attempt asked twice, with the same bundle budget, is one question. A bundle that gained a log
+  frame is a different question.
+- **The failure fingerprint** is what survives a new attempt: the failure class, the normalized
+  failed step, each diagnostic's test identity or code location, and the first line of each
+  diagnostic's message with the run's specifics — addresses, durations, numbers — masked. A rerun of
+  the same failing test finds the earlier analysis under it.
+- **The prompt version and the model** are part of both keys. Changing the instructions or the model
+  makes every stored analysis inapplicable rather than subtly wrong.
+
+A served analysis settles the request `completed` with `reused` set and a `by` of `evidence` or
+`fingerprint`, and the member's row reports `reused: true`. Only a tenant's own analyses can answer
+its requests. An analysis is kept for 30 days and pruned by the sweep that expires requests; a
+disable deletes a tenant's analyses with its queue. A reused analysis cites the evidence of the
+attempt it was computed from — which is why the row says `reused` rather than the text pretending to
+describe this run's log.
 
 ## Disabling
 
@@ -172,7 +264,9 @@ request may be made under, or nothing at all — because AI is off for the deplo
 tenant, the provider is outside the allow-list, or the data policy does not allow it. Reading it
 costs one statement joining the deployment's row to the tenant's, and it allocates nothing. Any
 request path that does not call it is a bug: with no opt-in there is no bundle, no prompt and no
-provider call.
+provider call. The second half of the gate is `sentinel_store::ai::reserve`, which no provider call
+may skip either: it is the one write that holds a maximum, answers from the cache or refuses, and
+its three answers are the only ways a claimed request can leave the queue for a provider.
 
 `sentinel_store::ai::permits(conn, tenant)` is the same reading without a provider named, for the
 bundle: it is `admit` for whichever provider the tenant may use, so a tenant that could send
@@ -245,14 +339,22 @@ because the evidence it cites does.
 
 ## What is not built yet
 
-No budget ledger and no analysis exists: `sentinel-ai` settles a request with the model's answer as
-plain text, which Y04 replaces with a reserved-and-settled budget and Y05 with an answer decoded
-against a schema and cited to the evidence it used. The skeleton has no prompt registry, no
-analysis cache and no evaluation set; those are Y04, Y05 and Y09.
+No analysis assertion exists: `sentinel-ai` settles a request with the model's answer as plain
+text, which Y05 replaces with an answer decoded against a schema and cited to the evidence it used,
+so a cached answer is text and a citation is not yet something the controller checks. The skeleton
+has one prompt, whose version is `skeleton-1`; a prompt registry and an evaluation set are Y05 and
+Y09.
 [Backlog Part 22](backlog.md) carries the rest, including the later flaky tests, the log-search
 assistant and the MCP read-only tools that expose them.
 
 Verification of this package is local: `pnpm typecheck` and
 `cd ai && node --import ./test/ts-register.mjs --test test/*.test.mjs`, both of which contact no
 provider — the provider tests run against a recording fake HTTP client, and the controller tests
-run over the API in `crates/sentinel-api/tests/ai_requests.rs`.
+run over the API in `crates/sentinel-api/tests/ai_requests.rs` and `ai_budget.rs`. The budget's own
+gates are `crates/sentinel-store/tests/ai_budget.rs`: budget and cost are charged from reported
+usage, an unreported component settles at its hold, an unsettled reservation expires with its
+request and frees the month, 24 concurrent reservations against a budget of eight admit exactly
+eight and settle every other request in the write that refused it, per-request caps and the
+concurrency limit refuse before anything is held, a fingerprint is reused across reruns and a
+different prompt version, model or failure is not, and a disable takes the analyses and the
+reservations with the queue.

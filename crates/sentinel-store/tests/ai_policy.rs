@@ -10,7 +10,7 @@ use sentinel_core::{
 };
 use sentinel_store::{
     Durability, Error, Store,
-    ai::{self, DataPolicy, Deployment, Provider, Providers, Tenant},
+    ai::{self, Budgets, DataPolicy, Deployment, Provider, Providers, Tenant},
     auth::{self, Authority, provisioning},
     jobs,
     local_auth::{self, Event},
@@ -136,6 +136,7 @@ fn set_tenant(
             Tenant {
                 enabled,
                 data_policy: policy,
+                budgets: Budgets::default(),
             },
             NOW,
         )
@@ -400,6 +401,7 @@ fn a_tenant_opts_in_only_with_a_step_up_and_the_deployment_allowing_it() {
         Some(Tenant {
             enabled: true,
             data_policy: DataPolicy::ZeroRetention,
+            budgets: Budgets::default(),
         })
     );
     assert_eq!(
@@ -514,6 +516,7 @@ fn disabling_takes_effect_at_the_next_request_and_is_audited() {
         Some(Tenant {
             enabled: false,
             data_policy: DataPolicy::ZeroRetention,
+            budgets: Budgets::default(),
         }),
         "the tenant's data policy is kept for the next opt-in"
     );

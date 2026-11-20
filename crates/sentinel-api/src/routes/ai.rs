@@ -12,6 +12,10 @@
 //! Y03 adds the durable requests that process consumes ([`enqueue`], [`queued`], [`claim`],
 //! [`complete`]) and the delegation each one mints: the requester's own identity capped to reads,
 //! bound to that request and that attempt, ten minutes or the request's deadline at most.
+//!
+//! Y04 adds the one decision that stands between a claim and a provider call ([`reserve`]), the
+//! tenant's budget policy and its month of usage ([`usage`]). A request whose maximum does not fit
+//! is refused there and settled in the same write: nothing waits, and no provider is contacted.
 
 use sentinel_core::{
     AiRequestId, AttemptId, UnixMillis,
@@ -26,7 +30,9 @@ use sentinel_protocol::{
     summary::{AttemptSummary, StepOutcome},
 };
 use sentinel_store::{
-    Error as StoreError, ai, auth as authz, dispatch, logs, lookup, secrets, status,
+    Error as StoreError,
+    ai::{self, Budgets},
+    auth as authz, dispatch, logs, lookup, secrets, status,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -62,6 +68,10 @@ pub(super) fn route(
         ("POST", ["api", "v1", "ai", "requests", request_id, "claim"]) => {
             claim(state, request, request_id)
         }
+        ("POST", ["api", "v1", "ai", "requests", request_id, "reserve"]) => {
+            reserve(state, request, request_id)
+        }
+        ("GET", ["api", "v1", "tenants", slug, "ai", "usage"]) => usage(state, request, slug),
         ("POST", ["api", "v1", "ai", "requests", request_id, "complete"]) => {
             complete(state, request, request_id)
         }
@@ -81,6 +91,18 @@ fn tenant_json(policy: Option<ai::Tenant>, providers: ai::Providers) -> Value {
         "enabled": policy.is_some_and(|p| p.enabled),
         "data_policy": policy.map(|p| p.data_policy.as_str()),
         "providers": providers.list().map(ai::Provider::as_str).collect::<Vec<_>>(),
+        "budgets": budgets_json(policy.map_or_else(Budgets::default, |p| p.budgets)),
+    })
+}
+
+fn budgets_json(budgets: ai::Budgets) -> Value {
+    json!({
+        "monthly_tokens": budgets.monthly_tokens,
+        "monthly_cost_micros": budgets.monthly_cost_micros,
+        "max_input_tokens": budgets.max_input_tokens,
+        "max_output_tokens": budgets.max_output_tokens,
+        "max_cost_micros": budgets.max_cost_micros,
+        "concurrency": budgets.concurrency,
     })
 }
 
@@ -133,6 +155,67 @@ fn unknown_provider(name: &str) -> ApiError {
 struct TenantBody {
     enabled: bool,
     data_policy: String,
+    /// Each field stated replaces what is stored; one left out keeps it, so a policy change never
+    /// resets a budget by omission.
+    budgets: Option<BudgetsBody>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct BudgetsBody {
+    monthly_tokens: Option<u64>,
+    monthly_cost_micros: Option<u64>,
+    max_input_tokens: Option<u64>,
+    max_output_tokens: Option<u64>,
+    max_cost_micros: Option<u64>,
+    concurrency: Option<u32>,
+}
+
+impl BudgetsBody {
+    /// Refuses a field the schema could not hold, naming it. A monthly field may be `0`, which is no
+    /// budget at all; the per-request maxima are always positive.
+    fn validate(&self) -> Result<(), ApiError> {
+        for (value, name, positive) in [
+            (self.monthly_tokens, "monthly_tokens", false),
+            (self.monthly_cost_micros, "monthly_cost_micros", false),
+            (self.max_input_tokens, "max_input_tokens", true),
+            (self.max_output_tokens, "max_output_tokens", true),
+            (self.max_cost_micros, "max_cost_micros", true),
+        ] {
+            let Some(value) = value else { continue };
+            if i64::try_from(value).is_err() || (positive && value == 0) {
+                return Err(err(
+                    ErrorCode::InvalidRequest,
+                    format!("budgets.{name} must be a whole number this deployment can hold"),
+                )
+                .with_detail("budget", name));
+            }
+        }
+        if let Some(value) = self.concurrency
+            && !(1..=ai::MAX_CONCURRENCY).contains(&value)
+        {
+            return Err(err(
+                ErrorCode::InvalidRequest,
+                format!("budgets.concurrency must be 1..={}", ai::MAX_CONCURRENCY),
+            )
+            .with_detail("budget", "concurrency"));
+        }
+        Ok(())
+    }
+
+    /// `current` with what the body states laid over it: a field left out keeps the stored value.
+    fn over(self, current: ai::Budgets) -> ai::Budgets {
+        ai::Budgets {
+            monthly_tokens: self.monthly_tokens.unwrap_or(current.monthly_tokens),
+            monthly_cost_micros: self
+                .monthly_cost_micros
+                .unwrap_or(current.monthly_cost_micros),
+            max_input_tokens: self.max_input_tokens.unwrap_or(current.max_input_tokens),
+            max_output_tokens: self.max_output_tokens.unwrap_or(current.max_output_tokens),
+            max_cost_micros: self.max_cost_micros.unwrap_or(current.max_cost_micros),
+            concurrency: self.concurrency.unwrap_or(current.concurrency),
+        }
+    }
 }
 
 fn tenant_policy(state: &State, request: &Request, slug: &str) -> Route {
@@ -160,19 +243,24 @@ fn set_tenant(state: &State, request: &mut Request, slug: &str) -> Route {
         )
         .with_detail("data_policy", body.data_policy.as_str())
     })?;
-    let policy = ai::Tenant {
-        enabled: body.enabled,
-        data_policy,
-    };
+    let stated = body.budgets.unwrap_or_default();
+    stated.validate()?;
     let (principal, authority) = (who.principal, who.authority());
     let slug = slug.to_owned();
-    let providers = state
+    let (policy, providers) = state
         .store
         .writer()
         .write(move |tx| {
             let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
+            let current =
+                ai::tenant(tx, tenant)?.map_or_else(ai::Budgets::default, |row| row.budgets);
+            let policy = ai::Tenant {
+                enabled: body.enabled,
+                data_policy,
+                budgets: stated.over(current),
+            };
             ai::set_tenant(tx, authority, tenant, policy, UnixMillis::now())?;
-            Ok(ai::effective(tx, tenant)?.0)
+            Ok((policy, ai::effective(tx, tenant)?.0))
         })
         .map_err(store_error)?;
     ok(tenant_json(Some(policy), providers))
@@ -662,6 +750,7 @@ fn request_json(request: &ai::Request, with_result: bool) -> Value {
         "data_policy": request.data_policy.as_str(),
         "state": request.state.as_str(),
         "outcome": request.outcome.map(ai::Outcome::as_str),
+        "reused": request.reused,
         "reason": request.reason.as_deref().filter(|_| with_result),
         "created_ms": request.created.0,
         "deadline_ms": request.deadline.0,
@@ -807,6 +896,27 @@ struct CompleteBody {
     outcome: String,
     text: Option<String>,
     reason: Option<String>,
+    /// What the provider reported. A component left out settles at the reservation's maximum; it is
+    /// absent because the provider did not report it, never because it was free.
+    usage: Option<UsageBody>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsageBody {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cost_micros: Option<u64>,
+}
+
+impl UsageBody {
+    const fn usage(&self) -> ai::Usage {
+        ai::Usage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cost_micros: self.cost_micros,
+        }
+    }
 }
 
 /// The AI service settles a request: the answer, or the reason there is none. Exactly once, and
@@ -828,6 +938,7 @@ fn complete(state: &State, request: &mut Request, request_id: &str) -> Route {
         }
     };
     let now = UnixMillis::now();
+    let usage = body.usage.map(|usage| usage.usage());
     let row = state
         .store
         .writer()
@@ -839,8 +950,129 @@ fn complete(state: &State, request: &mut Request, request_id: &str) -> Route {
                 body.text.as_deref(),
                 body.reason.as_deref(),
                 now,
+                usage,
             )
         })
         .map_err(store_error)?;
     ok(request_json(&row, true))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReserveBody {
+    /// The prompt's estimated tokens: what the model will be sent, counted conservatively.
+    input_tokens: u64,
+    /// The output cap the provider will be asked for.
+    output_tokens: u64,
+    /// The two of them priced at this model's rate, in millionths of the deployment's currency.
+    cost_micros: u64,
+    /// The digest of the exact evidence bundle the model will read, as 64 lower-case hex digits.
+    digest: String,
+    /// The failure's signature, stable across reruns of the same failure.
+    fingerprint: String,
+    prompt_version: String,
+    model: String,
+}
+
+/// A 32-byte digest from its 64 lower-case hex digits.
+fn hex32(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (at, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        if pair[0].is_ascii_uppercase() || pair[1].is_ascii_uppercase() {
+            return None;
+        }
+        out[at] = (high * 16 + low) as u8;
+    }
+    Some(out)
+}
+
+/// The pre-call decision (Y04): hold this request's maximum, answer it from an analysis the ledger
+/// already paid for, or refuse it — immediately, in this one write, with the row settled and the
+/// reason on it. A refused request is never queued and no provider is contacted for it.
+fn reserve(state: &State, request: &mut Request, request_id: &str) -> Route {
+    let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::AI_CONTEXT)?;
+    let id: AiRequestId = id(request_id, "request")?;
+    let body: ReserveBody = parse(&body(request)?)?;
+    let evidence = hex32(&body.digest).ok_or_else(|| bad_digest("digest"))?;
+    let fingerprint = hex32(&body.fingerprint).ok_or_else(|| bad_digest("fingerprint"))?;
+    let asked = ai::Reservation {
+        input_tokens: body.input_tokens,
+        output_tokens: body.output_tokens,
+        cost_micros: body.cost_micros,
+        digest: evidence,
+        fingerprint,
+        prompt_version: body.prompt_version,
+        model: body.model,
+    };
+    let now = UnixMillis::now();
+    let (admitted, row) = state
+        .store
+        .writer()
+        .write(move |tx| Ok((ai::reserve(tx, id, &asked, now)?, ai::by_id(tx, id)?)))
+        .map_err(store_error)?;
+    ok(match admitted {
+        ai::Admitted::Reserved { expires } => json!({
+            "state": "reserved",
+            "expires_ms": expires.0,
+            "request": request_json(&row, false),
+        }),
+        ai::Admitted::Reused { text, by } => json!({
+            "state": "reused",
+            "by": by.as_str(),
+            "text": text,
+            "request": request_json(&row, false),
+        }),
+        ai::Admitted::Refused { reason } => json!({
+            "state": "refused",
+            "reason": reason,
+            "request": request_json(&row, false),
+        }),
+    })
+}
+
+fn bad_digest(field: &'static str) -> ApiError {
+    err(
+        ErrorCode::InvalidRequest,
+        format!("{field} must be 64 lower-case hex digits"),
+    )
+    .with_detail("field", field)
+}
+
+/// What one tenant's AI month holds: the budget it was given, what it has been charged, what live
+/// reservations are holding, and how many of its requests are in flight.
+fn usage(state: &State, request: &Request, slug: &str) -> Route {
+    let who = admin::tenant_admin(state, request, false)?;
+    let principal = who.principal;
+    let slug = slug.to_owned();
+    let (budgets, month) = state
+        .store
+        .read(move |c| {
+            let tenant = authz::member_tenant_by_slug(c, principal, &slug)?;
+            authz::require_tenant_admin(c, principal, tenant)?;
+            Ok((
+                ai::tenant(c, tenant)?.map_or_else(Budgets::default, |row| row.budgets),
+                ai::month(c, tenant, UnixMillis::now())?,
+            ))
+        })
+        .map_err(store_error)?;
+    let spend = |spend: ai::Spend| {
+        json!({
+            "input_tokens": spend.input_tokens,
+            "output_tokens": spend.output_tokens,
+            "cost_micros": spend.cost_micros,
+        })
+    };
+    ok(json!({
+        "month": format!("{:04}-{:02}", month.month / 100, month.month % 100),
+        "budget": budgets_json(budgets),
+        "settled": spend(month.settled),
+        "reserved": spend(month.reserved),
+        "in_flight": month.in_flight,
+    }))
 }

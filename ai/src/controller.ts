@@ -22,6 +22,8 @@ export const RequestRow = Schema.Struct({
   data_policy: Schema.String,
   state: Schema.String,
   outcome: Schema.NullOr(Schema.String),
+  /** Whether the answer was an analysis the ledger had already paid for. */
+  reused: Schema.Boolean,
   created_ms: Schema.Int,
   deadline_ms: Schema.Int,
 });
@@ -36,6 +38,50 @@ export const Delegation = Schema.Struct({
 export type Delegation = typeof Delegation.Type;
 
 const Queued = Schema.Struct({ requests: Schema.Array(RequestRow) });
+
+/** What one reservation holds, and the key its answer is cached under. */
+export interface Reservation {
+  readonly input_tokens: number;
+  readonly output_tokens: number;
+  readonly cost_micros: number;
+  /** The evidence bundle's digest: 64 lower-case hex digits. */
+  readonly digest: string;
+  /** The failure's signature across reruns: 64 lower-case hex digits. */
+  readonly fingerprint: string;
+  readonly prompt_version: string;
+  readonly model: string;
+}
+
+/**
+ * What the controller decided before any provider is contacted: hold the maximum and call, answer
+ * from an analysis it already has, or refuse — in which case the request is already settled and
+ * nothing more is asked of it.
+ */
+export type Decision =
+  | { readonly state: "reserved"; readonly expires_ms: number }
+  | {
+      readonly state: "reused";
+      readonly by: "evidence" | "fingerprint";
+      readonly text: string;
+    }
+  | { readonly state: "refused"; readonly reason: string };
+
+const Decision = Schema.Union([
+  Schema.Struct({ state: Schema.Literal("reserved"), expires_ms: Schema.Int }),
+  Schema.Struct({
+    state: Schema.Literal("reused"),
+    by: Schema.Literals(["evidence", "fingerprint"]),
+    text: Schema.String,
+  }),
+  Schema.Struct({ state: Schema.Literal("refused"), reason: Schema.String }),
+]);
+
+/** What a provider reported, priced; a count it did not report stays `null`. */
+export interface ReportedUsage {
+  readonly input_tokens: number | null;
+  readonly output_tokens: number | null;
+  readonly cost_micros: number | null;
+}
 const Claim = Schema.Struct({
   request: RequestRow,
   evidence: Schema.String,
@@ -65,12 +111,21 @@ export interface ControllerShape {
   readonly claim: (id: string) => Effect.Effect<Claimed, ControllerError>;
   /** The redacted evidence bundle, read under the request's own delegation. */
   readonly evidence: (claimed: Claimed) => Effect.Effect<string, ControllerError>;
-  /** Settle `id`: the answer text, or the reason there is none. */
+  /**
+   * Reserve `id`'s maximum before any provider is contacted, or learn that the controller already
+   * has the answer or that the request does not fit.
+   */
+  readonly reserve: (
+    id: string,
+    reservation: Reservation,
+  ) => Effect.Effect<Decision, ControllerError>;
+  /** Settle `id`: the answer text, or the reason there is none, and what the provider reported. */
   readonly settle: (
     id: string,
     outcome: Outcome,
     text: string | null,
     reason: string | null,
+    usage: ReportedUsage | null,
   ) => Effect.Effect<void, ControllerError>;
 }
 
@@ -81,6 +136,9 @@ export class Controller extends Context.Service<Controller, ControllerShape>()(
 
 /** The evidence bundle's ceiling: the controller serves at most 64 KiB and we read no more. */
 const MAX_BUNDLE_BYTES = 128 << 10;
+
+/** A reservation's answer is a decision, not a payload: a few hundred bytes at most. */
+const MAX_DECISION_BYTES = 8 << 10;
 
 const unreachable = (error: { readonly message: string } | string) =>
   new ControllerError({
@@ -157,9 +215,25 @@ export const httpLayer = (base: string, grant: Redacted.Redacted<string>) =>
             Effect.mapError((error) => annotate(error, "an unreadable evidence bundle")),
           );
         },
-        settle: (id, outcome, text, reason) =>
+        reserve: (id, reservation) =>
           Effect.flatMap(
-            HttpClientRequest.bodyJson({ outcome, text, reason })(
+            HttpClientRequest.bodyJson(reservation)(
+              HttpClientRequest.post(
+                url(`/api/v1/ai/requests/${encodeURIComponent(id)}/reserve`),
+              ).pipe(
+                HttpClientRequest.setHeader("authorization", `Bearer ${Redacted.value(grant)}`),
+                HttpClientRequest.acceptJson,
+              ),
+            ),
+            (request) => call(request),
+          ).pipe(
+            Effect.flatMap(HttpIncomingMessage.schemaBodyJson(Decision)),
+            Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(MAX_DECISION_BYTES)),
+            Effect.mapError((error) => annotate(error, "an undecodable reservation")),
+          ),
+        settle: (id, outcome, text, reason, usage) =>
+          Effect.flatMap(
+            HttpClientRequest.bodyJson({ outcome, text, reason, usage })(
               HttpClientRequest.post(url(`/api/v1/ai/requests/${encodeURIComponent(id)}/complete`)).pipe(
                 HttpClientRequest.setHeader("authorization", `Bearer ${Redacted.value(grant)}`),
                 HttpClientRequest.acceptJson,

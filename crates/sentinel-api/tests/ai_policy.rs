@@ -257,7 +257,19 @@ fn a_fresh_deployment_states_ai_off_and_nothing_else() {
     assert_eq!(reply.status, 200, "{}", reply.text);
     assert_eq!(
         reply.json(),
-        json!({ "enabled": false, "data_policy": null, "providers": [] })
+        json!({
+            "enabled": false,
+            "data_policy": null,
+            "providers": [],
+            "budgets": {
+            "monthly_tokens": 0,
+            "monthly_cost_micros": 0,
+            "max_input_tokens": 32000,
+            "max_output_tokens": 4096,
+            "max_cost_micros": 100000,
+            "concurrency": 2,
+        },
+        })
     );
 }
 
@@ -346,14 +358,38 @@ fn a_tenant_administrator_opts_in_behind_a_step_up_and_a_known_data_policy() {
     assert_eq!(reply.status, 200, "{}", reply.text);
     assert_eq!(
         reply.json(),
-        json!({ "enabled": true, "data_policy": "local_only", "providers": ["local"] }),
+        json!({
+            "enabled": true,
+            "data_policy": "local_only",
+            "providers": ["local"],
+            "budgets": {
+            "monthly_tokens": 0,
+            "monthly_cost_micros": 0,
+            "max_input_tokens": 32000,
+            "max_output_tokens": 4096,
+            "max_cost_micros": 100000,
+            "concurrency": 2,
+        },
+        }),
         "local_only leaves only the local endpoint usable"
     );
 
     let reply = send(&d, "GET", "/api/v1/tenants/acme/ai", None, &ada.headers());
     assert_eq!(
         reply.json(),
-        json!({ "enabled": true, "data_policy": "local_only", "providers": ["local"] })
+        json!({
+            "enabled": true,
+            "data_policy": "local_only",
+            "providers": ["local"],
+            "budgets": {
+            "monthly_tokens": 0,
+            "monthly_cost_micros": 0,
+            "max_input_tokens": 32000,
+            "max_output_tokens": 4096,
+            "max_cost_micros": 100000,
+            "concurrency": 2,
+        },
+        })
     );
 
     let reply = opt_in(
@@ -364,7 +400,19 @@ fn a_tenant_administrator_opts_in_behind_a_step_up_and_a_known_data_policy() {
     assert_eq!(reply.status, 200, "{}", reply.text);
     assert_eq!(
         reply.json(),
-        json!({ "enabled": false, "data_policy": "local_only", "providers": [] })
+        json!({
+            "enabled": false,
+            "data_policy": "local_only",
+            "providers": [],
+            "budgets": {
+            "monthly_tokens": 0,
+            "monthly_cost_micros": 0,
+            "max_input_tokens": 32000,
+            "max_output_tokens": 4096,
+            "max_cost_micros": 100000,
+            "concurrency": 2,
+        },
+        })
     );
     let audit: Vec<(String, i64)> = d
         .store
@@ -395,7 +443,19 @@ fn no_request_path_reaches_a_provider_while_the_tenant_is_off() {
     let reply = send(&d, "GET", "/api/v1/tenants/acme/ai", None, &ada.headers());
     assert_eq!(
         reply.json(),
-        json!({ "enabled": false, "data_policy": null, "providers": [] })
+        json!({
+            "enabled": false,
+            "data_policy": null,
+            "providers": [],
+            "budgets": {
+            "monthly_tokens": 0,
+            "monthly_cost_micros": 0,
+            "max_input_tokens": 32000,
+            "max_output_tokens": 4096,
+            "max_cost_micros": 100000,
+            "concurrency": 2,
+        },
+        })
     );
     let tenant = d.tenant;
     for provider in Provider::ALL {

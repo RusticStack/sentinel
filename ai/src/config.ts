@@ -4,21 +4,30 @@
 
 import { Data, Redacted } from "effect";
 
+import type { ModelLimits } from "./budget.ts";
 import type { Endpoints } from "./providers.ts";
-import type { ProviderName } from "./policy.ts";
-import { staysLocal } from "./policy.ts";
+import { PROVIDERS, type ProviderName, staysLocal } from "./policy.ts";
 
 /** Why the configuration cannot be used. The process does not start. */
 export class ConfigError extends Data.TaggedError("ConfigError")<{
   readonly reason: string;
 }> {}
 
+/** One provider's model, what one request through it may spend, and what its tokens cost. */
+export interface Model extends ModelLimits {
+  readonly id: string;
+}
+
 /** Everything one `sentinel-ai` process needs. */
 export interface Config {
   readonly controller: string;
   readonly grant: Redacted.Redacted<string>;
-  /** The model each provider is asked for. A provider with no model is refused, not guessed at. */
-  readonly models: Partial<Record<ProviderName, string>>;
+  /**
+   * The model each provider is asked for, with the budget one request holds against it. A provider
+   * with no model is never used, and a model with no budget is refused at startup rather than
+   * reserving nothing: an unpriced request could spend a tenant's month without being counted.
+   */
+  readonly models: Partial<Record<ProviderName, Model>>;
   readonly endpoints: Endpoints;
   readonly pollMs: number;
 }
@@ -50,15 +59,14 @@ export function load(env: Record<string, string | undefined>): Config | ConfigEr
   if (pollMs instanceof ConfigError) {
     return pollMs;
   }
+  const models = readModels(env);
+  if (models instanceof ConfigError) {
+    return models;
+  }
   return {
     controller,
     grant: Redacted.make(grant),
-    models: {
-      local: env.SENTINEL_AI_MODEL_LOCAL,
-      openrouter: env.SENTINEL_AI_MODEL_OPENROUTER,
-      anthropic: env.SENTINEL_AI_MODEL_ANTHROPIC,
-      openai: env.SENTINEL_AI_MODEL_OPENAI,
-    },
+    models,
     endpoints: {
       local: { url: local, key: env.SENTINEL_AI_LOCAL_KEY ?? null },
       openrouter: env.SENTINEL_AI_OPENROUTER_KEY ?? null,
@@ -67,6 +75,58 @@ export function load(env: Record<string, string | undefined>): Config | ConfigEr
     },
     pollMs,
   };
+}
+
+/**
+ * Each provider's model and the budget one request holds against it. The budget is
+ * `<max output tokens>:<input micros per million tokens>:<output micros per million tokens>`, for
+ * the deployment's own currency: Sentinel stores millionths and never guesses a price, so a model
+ * without one is refused here, naming the variable and never its value.
+ */
+function readModels(
+  env: Record<string, string | undefined>,
+): Partial<Record<ProviderName, Model>> | ConfigError {
+  const models: Partial<Record<ProviderName, Model>> = {};
+  for (const provider of PROVIDERS) {
+    const name = provider.toUpperCase();
+    const id = env[`SENTINEL_AI_MODEL_${name}`];
+    if (id === undefined) {
+      continue;
+    }
+    const spec = env[`SENTINEL_AI_BUDGET_${name}`];
+    if (spec === undefined) {
+      return new ConfigError({ reason: `SENTINEL_AI_BUDGET_${name} is not set` });
+    }
+    const limits = parseLimits(spec);
+    if (limits instanceof ConfigError) {
+      return new ConfigError({ reason: `SENTINEL_AI_BUDGET_${name}: ${limits.reason}` });
+    }
+    models[provider] = { id, ...limits };
+  }
+  return models;
+}
+
+/** `max_output_tokens:input_micros_per_mtok:output_micros_per_mtok`, each a whole number. */
+function parseLimits(spec: string): ModelLimits | ConfigError {
+  const parts = spec.split(":");
+  if (parts.length !== 3) {
+    return new ConfigError({ reason: "must be <max tokens>:<input micros>:<output micros>" });
+  }
+  const values = parts.map((part) => (/^\d+$/.test(part) ? Number(part) : Number.NaN));
+  const max = values[0] ?? Number.NaN;
+  const input = values[1] ?? Number.NaN;
+  const output = values[2] ?? Number.NaN;
+  if (
+    !Number.isSafeInteger(max) ||
+    max <= 0 ||
+    !Number.isSafeInteger(input) ||
+    !Number.isSafeInteger(output)
+  ) {
+    return new ConfigError({
+      reason: "must be three whole numbers, with the output cap above zero",
+    });
+  }
+  return { maxOutputTokens: max, inputMicrosPerMtok: input, outputMicrosPerMtok: output };
 }
 
 function isHttp(value: string): boolean {

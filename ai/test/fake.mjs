@@ -63,3 +63,23 @@ export const anthropicMessage = (text) => ({
   stop_reason: "end_turn",
   usage: { input_tokens: 120, output_tokens: 24 },
 });
+
+/**
+ * One provider's model with the budget a request holds against it, as the configuration states it:
+ * an output cap and two rates per million tokens.
+ */
+export const model = (id, maxOutputTokens = 1_024) => ({
+  id,
+  maxOutputTokens,
+  inputMicrosPerMtok: 150_000,
+  outputMicrosPerMtok: 600_000,
+});
+
+/** The controller's decision before the provider is called: the maximum is held. */
+export const reserved = (expires_ms = 1_700_000_900_000) => ({ state: "reserved", expires_ms });
+
+/** The controller's decision when it already has the analysis. */
+export const reused = (text, by = "evidence") => ({ state: "reused", by, text });
+
+/** The controller's decision when the request does not fit. */
+export const refused = (reason) => ({ state: "refused", reason });
