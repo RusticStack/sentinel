@@ -11,7 +11,7 @@ publish.workspace = true
 [features]
 default = []
 server = ["dep:sentinel-core", "dep:sentinel-cache", "dep:sentinel-store", "dep:sentinel-s3", "dep:sentinel-link", "sentinel-link/controller", "dep:sentinel-api", "dep:sentinel-github", "dep:sentinel-intake", "dep:sentinel-checks", "dep:sentinel-mail", "dep:ctrlc", "dep:toml", "dep:tracing", "dep:tracing-subscriber", "dep:uuid"]
-worker = ["dep:sentinel-core", "dep:sentinel-cache", "dep:sentinel-link", "dep:sentinel-worker", "dep:ctrlc", "dep:toml", "dep:tracing", "dep:tracing-subscriber", "dep:uuid"]
+worker = ["dep:sentinel-core", "dep:sentinel-cache", "dep:sentinel-link", "dep:sentinel-worker", "dep:sentinel-registry", "dep:ctrlc", "dep:toml", "dep:tracing", "dep:tracing-subscriber", "dep:uuid"]
 
 [dependencies]
 blake3 = "1.8"
@@ -43,6 +43,7 @@ sentinel-store = { path = "../sentinel-store", optional = true }
 sentinel-s3 = { path = "../sentinel-s3", optional = true }
 sentinel-link = { path = "../sentinel-link", optional = true }
 sentinel-worker = { path = "../sentinel-worker", optional = true }
+sentinel-registry = { path = "../sentinel-registry", optional = true }
 ctrlc = { version = "3.4", optional = true, features = ["termination"] }
 toml = { version = "1.0", optional = true, default-features = false, features = ["std", "parse", "serde"] }
 tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }

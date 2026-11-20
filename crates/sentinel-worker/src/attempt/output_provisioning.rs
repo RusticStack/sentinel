@@ -96,7 +96,7 @@ fn job(text: &str, outputs: Vec<(String, String, String)>) -> Job {
             reuse_fresh: false,
         },
         secret_bundle: sentinel_protocol::secrets::DeliveryBundle::empty(),
-        images: Images::with_download(|_, _, _, _, _| Ok(false)),
+        images: Images::with_download(|_, _, _, _, _, _| Ok(false)),
         caches: Vec::new(),
         reuse_seal: None,
         reuse_fresh: false,

@@ -195,13 +195,28 @@ fn podman_for_pull() -> Result<Command> {
     cmd.env_remove("DOCKER_HOST");
     cmd.env_remove("REGISTRY_AUTH_FILE");
     cmd.env_remove("DOCKER_CONFIG");
+    // The worker's own cache names the configuration a pull reads; an ambient one from the worker
+    // process's environment could send a pull to a registry the operator never configured.
+    cmd.env_remove("CONTAINERS_REGISTRIES_CONF");
+    cmd.env_remove("CONTAINERS_REGISTRIES_CONF_DIR");
     cmd.env("PATH", "");
     Ok(cmd)
 }
 
-fn podman_pull_command(image: &str, authfile: &Path, store: &Store) -> Result<Command> {
+/// A pull reads exactly one `registries.conf`: the one the worker generated for this attempt's scope,
+/// named by `CONTAINERS_REGISTRIES_CONF`, which containers/image honours for Podman's pulls the same
+/// way it does for its own tools. Without a cache the host's own configuration applies, as before.
+fn podman_pull_command(
+    image: &str,
+    authfile: &Path,
+    registries_conf: Option<&Path>,
+    store: &Store,
+) -> Result<Command> {
     let mut cmd = podman_for_pull()?;
     store.apply(&mut cmd);
+    if let Some(conf) = registries_conf {
+        cmd.env("CONTAINERS_REGISTRIES_CONF", conf);
+    }
     cmd.args(["pull", "--authfile"])
         .arg(authfile)
         .args(["-q", "--", image]);
@@ -348,7 +363,7 @@ pub fn pull(
     timeout: Duration,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<bool> {
-    pull_checked(image, authfile, store, timeout, cancel, true)
+    pull_checked(image, authfile, None, store, timeout, cancel, true)
 }
 
 pub fn registry_check_needed(anonymous: bool, store: &Store) -> bool {
@@ -358,6 +373,7 @@ pub fn registry_check_needed(anonymous: bool, store: &Store) -> bool {
 pub fn pull_checked(
     image: &str,
     authfile: &Path,
+    registries_conf: Option<&Path>,
     store: &Store,
     timeout: Duration,
     cancel: &std::sync::atomic::AtomicBool,
@@ -377,7 +393,7 @@ pub fn pull_checked(
     if present && !recheck {
         return Ok(true);
     }
-    let cmd = podman_pull_command(image, authfile, store)?;
+    let cmd = podman_pull_command(image, authfile, registries_conf, store)?;
     let output = process::run_canceled(cmd, deadline(timeout), "podman pull", None, Some(cancel))?;
     if output.success() {
         Ok(present)
@@ -1110,6 +1126,7 @@ mod tests {
         let Ok(cmd) = podman_pull_command(
             "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             Path::new("/worker/tenant/auth.json"),
+            None,
             &Store::Shared,
         ) else {
             return;
@@ -1133,6 +1150,44 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "pull"));
         assert!(!args.iter().any(|arg| arg.starts_with("--policy")));
         assert!(!args.iter().any(|arg| arg == "--root" || arg == "--runroot"));
+    }
+
+    #[test]
+    fn a_cached_pull_names_one_registries_conf_and_an_ambient_one_is_ignored() {
+        let conf = Path::new("/worker/data/registry/conf/0123/registries.conf");
+        let Ok(cmd) = podman_pull_command(
+            "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Path::new("auth.json"),
+            Some(conf),
+            &Store::Shared,
+        ) else {
+            return;
+        };
+        let env: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .map(|(name, value)| (name.to_string_lossy().into_owned(), value))
+            .collect();
+        assert_eq!(
+            env.get("CONTAINERS_REGISTRIES_CONF").copied().flatten(),
+            Some(conf.as_os_str())
+        );
+        let Ok(uncached) = podman_pull_command(
+            "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Path::new("auth.json"),
+            None,
+            &Store::Shared,
+        ) else {
+            return;
+        };
+        let env: std::collections::HashMap<_, _> = uncached
+            .get_envs()
+            .map(|(name, value)| (name.to_string_lossy().into_owned(), value))
+            .collect();
+        assert_eq!(
+            env.get("CONTAINERS_REGISTRIES_CONF"),
+            Some(&None),
+            "a pull without a cache still clears whatever the worker's environment held"
+        );
     }
 
     #[test]
@@ -1167,7 +1222,7 @@ mod tests {
                 run.display().to_string()
             ]
         );
-        if let Ok(pull) = podman_pull_command("x@sha256:abc", Path::new("a.json"), &a) {
+        if let Ok(pull) = podman_pull_command("x@sha256:abc", Path::new("a.json"), None, &a) {
             let pull = args(&pull);
             assert_eq!(
                 &pull[..exec.len()],
@@ -1182,9 +1237,12 @@ mod tests {
 
     #[test]
     fn pull_command_resolves_podman_before_clearing_path() {
-        if let Ok(cmd) =
-            podman_pull_command("example@sha256:abc", Path::new("auth.json"), &Store::Shared)
-        {
+        if let Ok(cmd) = podman_pull_command(
+            "example@sha256:abc",
+            Path::new("auth.json"),
+            None,
+            &Store::Shared,
+        ) {
             assert!(std::path::Path::new(cmd.get_program()).is_absolute());
         }
     }

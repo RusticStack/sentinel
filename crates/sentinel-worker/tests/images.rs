@@ -88,7 +88,7 @@ fn the_pull_overlaps_the_checkout() {
     let seen = Arc::new(Mutex::new(Seen::default()));
     let images = Images::with_download({
         let (seen, workspace) = (Arc::clone(&seen), workspace.clone());
-        move |image, _, _, _, _| {
+        move |image, _, _, _, _, _| {
             {
                 let mut seen = seen.lock().unwrap();
                 seen.image = image.to_owned();
@@ -198,7 +198,7 @@ fn the_pull_overlaps_the_checkout() {
 
 #[test]
 fn an_unpinned_reference_is_still_refused() {
-    let images = Images::with_download(|_, _, _, _, _| Ok(false));
+    let images = Images::with_download(|_, _, _, _, _, _| Ok(false));
     match images.pull(
         "example.test/image:latest",
         Duration::from_secs(1),
@@ -343,6 +343,7 @@ fn a_credentialed_pull_contacts_the_registry_even_for_a_resident_digest() {
         .pull_for_tenant(
             &reference(&resident),
             [7; 16],
+            sentinel_protocol::cache::Trust::PullRequest,
             [9; 32],
             Path::new("tenant-auth.json"),
             &sentinel_worker::podman::Store::Shared,
@@ -358,5 +359,93 @@ fn a_credentialed_pull_contacts_the_registry_even_for_a_resident_digest() {
         pulls_of(dir, &resident),
         1,
         "authorization needs the registry"
+    );
+}
+
+#[test]
+fn every_pull_names_the_registries_conf_of_its_own_scope() {
+    use sentinel_protocol::cache::Trust;
+    use sentinel_registry::{PullThrough, Registry, Scope, Settings};
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = PullThrough::open(Settings::new(
+        dir.path().join("registry"),
+        64 << 20,
+        vec![Registry::canonical("docker.io")],
+    ))
+    .unwrap();
+    cache.start().unwrap();
+    let seen: Arc<Mutex<Vec<Option<PathBuf>>>> = Arc::new(Mutex::new(Vec::new()));
+    let images = Images::with_download({
+        let seen = Arc::clone(&seen);
+        move |_, _, conf, _, _, _| {
+            seen.lock().unwrap().push(conf.map(Path::to_path_buf));
+            Ok(false)
+        }
+    });
+    images.set_registry_cache(cache.clone());
+
+    let pull = |tenant: Option<([u8; 16], Trust)>| {
+        let (image, trusted) = (reference(DIGEST), reference(DIGEST));
+        match tenant {
+            None => images
+                .pull(&image, Duration::from_secs(5), &uncanceled())
+                .unwrap(),
+            Some((id, trust)) => images
+                .pull_for_tenant(
+                    &trusted,
+                    id,
+                    trust,
+                    [9; 32],
+                    Path::new("tenant-auth.json"),
+                    &sentinel_worker::podman::Store::Shared,
+                    Duration::from_secs(5),
+                    &uncanceled(),
+                )
+                .unwrap(),
+        };
+    };
+    pull(None);
+    pull(Some(([7; 16], Trust::Protected)));
+    pull(Some(([7; 16], Trust::PullRequest)));
+    pull(Some(([8; 16], Trust::Protected)));
+
+    let confs = seen.lock().unwrap().clone();
+    assert_eq!(confs.len(), 4);
+    let anonymous = cache.mirror_conf(Scope::Anonymous).unwrap();
+    let protected = cache
+        .mirror_conf(Scope::Tenant {
+            tenant: [7; 16],
+            trust: Trust::Protected,
+        })
+        .unwrap();
+    let fork = cache
+        .mirror_conf(Scope::Tenant {
+            tenant: [7; 16],
+            trust: Trust::PullRequest,
+        })
+        .unwrap();
+    let other = cache
+        .mirror_conf(Scope::Tenant {
+            tenant: [8; 16],
+            trust: Trust::Protected,
+        })
+        .unwrap();
+    assert_eq!(
+        confs[0].as_ref(),
+        Some(&anonymous),
+        "an anonymous pull shares one scope"
+    );
+    assert_eq!(confs[1].as_ref(), Some(&protected));
+    assert_eq!(
+        confs[2].as_ref(),
+        Some(&fork),
+        "a fork's pull request reads its own scope"
+    );
+    assert_eq!(confs[3].as_ref(), Some(&other));
+    assert_ne!(anonymous, protected);
+    assert_ne!(
+        protected, fork,
+        "a fork and a protected build never share cached layers"
     );
 }
