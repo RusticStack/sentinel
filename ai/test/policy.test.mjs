@@ -21,10 +21,11 @@ test("local_only allows only the operator's own endpoint", () => {
     PROVIDERS.filter((p) => allows("local_only", p)),
     ["local"],
   );
-  const refused = admit("local_only", "openrouter", "some/model");
+  const refused = admit("local_only", "openrouter", "some/model", 1024);
   assert.equal(refused.reason, "policy");
   assert.equal(refused.provider, "openrouter");
-  const local = admit("local_only", "local", "qwen2.5-coder");
+  const local = admit("local_only", "local", "qwen2.5-coder", 1024);
+  assert.equal(local.maxOutputTokens, 1024, "the reservation's cap is what the provider is asked for");
   assert.equal(local.ok, undefined);
   assert.equal(local.provider, "local");
   assert.equal(local.zdr, false);
@@ -36,8 +37,8 @@ test("zero_retention allows what can keep nothing, and refuses what cannot promi
     PROVIDERS.filter((p) => allows("zero_retention", p)),
     ["local", "openrouter"],
   );
-  assert.equal(admit("zero_retention", "anthropic", "claude").reason, "policy");
-  assert.equal(admit("zero_retention", "openai", "gpt").reason, "policy");
+  assert.equal(admit("zero_retention", "anthropic", "claude", 1024).reason, "policy");
+  assert.equal(admit("zero_retention", "openai", "gpt", 1024).reason, "policy");
 });
 
 test("provider_terms allows every allow-listed provider", () => {
@@ -47,24 +48,24 @@ test("provider_terms allows every allow-listed provider", () => {
 });
 
 test("openrouter always asks for zero retention, and denies collection under zero_retention", () => {
-  const zero = admit("zero_retention", "openrouter", "openai/gpt-fake");
+  const zero = admit("zero_retention", "openrouter", "openai/gpt-fake", 1024);
   assert.equal(zero.zdr, true);
   assert.equal(zero.denyCollection, true);
   // The switch is not the tenant's: it is on whatever the data policy says.
-  const terms = admit("provider_terms", "openrouter", "openai/gpt-fake");
+  const terms = admit("provider_terms", "openrouter", "openai/gpt-fake", 1024);
   assert.equal(terms.zdr, true);
   assert.equal(terms.denyCollection, false);
-  const local = admit("local_only", "local", "phi");
+  const local = admit("local_only", "local", "phi", 1024);
   assert.equal(local.zdr, false);
 });
 
 test("an unknown provider or an empty model is refused as such", () => {
-  const unknown = admit("provider_terms", "cohere", "command");
+  const unknown = admit("provider_terms", "cohere", "command", 1024);
   assert.equal(unknown.reason, "provider");
-  assert.equal(admit("provider_terms", "openai", "   ").reason, "model");
-  assert.equal(admit("provider_terms", "openai", "x".repeat(129)).reason, "model");
-  assert.equal(admit("provider_terms", "openai", "gpt\ninjected").reason, "model");
-  assert.equal(admit("provider_terms", "openai", " gpt-4o ").model, "gpt-4o");
+  assert.equal(admit("provider_terms", "openai", "   ", 1024).reason, "model");
+  assert.equal(admit("provider_terms", "openai", "x".repeat(129), 1024).reason, "model");
+  assert.equal(admit("provider_terms", "openai", "gpt\ninjected", 1024).reason, "model");
+  assert.equal(admit("provider_terms", "openai", " gpt-4o ", 1024).model, "gpt-4o");
 });
 
 test("names parse only when they are the ones the controller serves", () => {

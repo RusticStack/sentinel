@@ -189,6 +189,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (76, include_str!("migrations/076_runner_fork_policy.sql")),
     (77, include_str!("migrations/077_migration_switch.sql")),
     (78, include_str!("migrations/078_ai_requests.sql")),
+    (79, include_str!("migrations/079_ai_budgets.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -322,6 +323,10 @@ mod tests {
         (
             78,
             "an older controller serves no AI request route and holds no AI request row, so it would leave the rows a newer controller wrote unclaimed until every one of them timed out, and it neither mints nor revokes the request-scoped delegations those rows name",
+        ),
+        (
+            79,
+            "an older controller contacts a provider without reserving anything: it reads no budget, holds no reservation and settles no ledger, so it would spend a tenant's month past the limit a newer one enforced and publish no analysis to the cache its requests read",
         ),
     ];
 

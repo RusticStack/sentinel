@@ -51,6 +51,7 @@ function build(
   endpoints: Endpoints,
 ): Effect.Effect<Layer.Layer<ModelShape, never, HttpClient>, ProviderError> {
   const model = admission.model;
+  const cap = admission.maxOutputTokens;
   switch (admission.provider) {
     case "local": {
       const { url, key } = endpoints.local;
@@ -63,8 +64,13 @@ function build(
         apiUrl: url,
         apiKey: key === null ? undefined : Redacted.make(key),
       });
+      // The reservation's output cap is what the provider is asked for, so a request can never
+      // generate more than the ledger held for it.
       return Effect.succeed(
-        Layer.provide(CompatLanguageModel.layer({ model }), client),
+        Layer.provide(
+          CompatLanguageModel.layer({ model, config: { max_output_tokens: cap } }),
+          client,
+        ),
       );
     }
     case "openrouter": {
@@ -78,6 +84,7 @@ function build(
       const language = OpenRouterLanguageModel.layer({
         model,
         config: {
+          max_tokens: cap,
           provider: {
             zdr: true,
             data_collection: admission.denyCollection ? "deny" : null,
@@ -93,7 +100,7 @@ function build(
       }
       const client = AnthropicClient.layer({ apiKey: Redacted.make(key) });
       return Effect.succeed(
-        Layer.provide(AnthropicLanguageModel.layer({ model }), client),
+        Layer.provide(AnthropicLanguageModel.layer({ model, config: { max_tokens: cap } }), client),
       );
     }
     case "openai": {
@@ -103,7 +110,10 @@ function build(
       }
       const client = OpenAiClient.layer({ apiKey: Redacted.make(key) });
       return Effect.succeed(
-        Layer.provide(OpenAiLanguageModel.layer({ model }), client),
+        Layer.provide(
+          OpenAiLanguageModel.layer({ model, config: { max_output_tokens: cap } }),
+          client,
+        ),
       );
     }
   }

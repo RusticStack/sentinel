@@ -1,6 +1,7 @@
-//! AI assistance policy and its durable request queue (Part 22 Y01, Y03). Nothing here talks to a
-//! provider: the first half decides whether a request may be made at all, and the second stores
-//! each one as a row that `sentinel-ai` consumes through the API.
+//! AI assistance policy, its durable request queue and its budget (Part 22 Y01, Y03, Y04). Nothing
+//! here talks to a provider: the first half decides whether a request may be made at all, the
+//! second stores each one as a row that `sentinel-ai` consumes through the API, and the third holds
+//! the maximum a request may cost — and reuses an analysis that was already paid for.
 //!
 //! Two administrators must agree before one can be. A platform administrator allows
 //! AI for the deployment and names the providers it may use; a tenant administrator
@@ -8,6 +9,13 @@
 //! a fresh deployment and an upgraded one have nothing to switch on. There is no
 //! cache: [`admit`] reads the policy per request, so a disable applies to the next
 //! request that would have been made, and nothing is left queued to expire.
+//!
+//! Y04's budget is the same shape. [`reserve`] is one writer transaction that decides, before any
+//! provider is contacted, whether this request is already answered (an analysis for its evidence
+//! digest or its failure fingerprint), whether it fits the tenant's monthly ledger, its
+//! per-request caps and its concurrency limit, and what it holds if it does. A refusal and a reuse
+//! settle the request in that same commit, so a refused request is never queued and a reused one
+//! costs nothing.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::secret::Secret;
@@ -207,28 +215,114 @@ pub fn set_deployment(
     )
 }
 
+/// How many of one tenant's requests may hold a reservation at once. The column's own bound, so a
+/// policy that states more is refused rather than stored.
+pub const MAX_CONCURRENCY: u32 = 64;
+
+/// A tenant's AI budget: what one calendar month may spend, what one request may take, and how many
+/// of its requests may be in flight at once. `0` in either monthly field is no budget at all, the
+/// way `tenant_quota_bytes` of `0` is no quota; the per-request maxima are always positive, because
+/// a request with no maximum would reserve nothing and could spend anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budgets {
+    pub monthly_tokens: u64,
+    pub monthly_cost_micros: u64,
+    pub max_input_tokens: u64,
+    pub max_output_tokens: u64,
+    pub max_cost_micros: u64,
+    pub concurrency: u32,
+}
+
+impl Budgets {
+    /// What an upgraded tenant gets and what `PUT /tenants/{slug}/ai` fills in when it states none:
+    /// no monthly ceiling, a 32,000-token prompt (a 64 KiB bundle is far inside it), 4,096 output
+    /// tokens (an answer is 8 KiB at most) and two requests in flight.
+    pub const DEFAULT: Self = Self {
+        monthly_tokens: 0,
+        monthly_cost_micros: 0,
+        max_input_tokens: 32_000,
+        max_output_tokens: 4_096,
+        max_cost_micros: 100_000,
+        concurrency: 2,
+    };
+
+    /// Why this request is past the per-request maxima, as the sentence a refused request carries.
+    /// Reading it allocates only on the refusal path.
+    fn refusal(self, request: &Reservation) -> Option<String> {
+        if request.input_tokens > self.max_input_tokens {
+            return Some(format!(
+                "per_request: a prompt of {} tokens is over the tenant's limit of {}",
+                request.input_tokens, self.max_input_tokens
+            ));
+        }
+        if request.output_tokens > self.max_output_tokens {
+            return Some(format!(
+                "per_request: an output of {} tokens is over the tenant's limit of {}",
+                request.output_tokens, self.max_output_tokens
+            ));
+        }
+        if request.cost_micros > self.max_cost_micros {
+            return Some(format!(
+                "per_request: a request of {} micros is over the tenant's limit of {}",
+                request.cost_micros, self.max_cost_micros
+            ));
+        }
+        None
+    }
+}
+
+impl Default for Budgets {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tenant {
     pub enabled: bool,
     pub data_policy: DataPolicy,
+    pub budgets: Budgets,
 }
 
-/// `None` until the tenant's administrator opts in: no row is off.
+/// `None` until the tenant's administrator opts in: no row is off. The budget is part of the same
+/// row, so one reading answers both and a reservation needs no second statement to find it.
 pub fn tenant(conn: &Connection, tenant: TenantId) -> Result<Option<Tenant>> {
     let row = conn
-        .prepare_cached("SELECT enabled, data_policy FROM tenant_ai WHERE tenant_id = ?1")?
+        .prepare_cached(
+            "SELECT enabled, data_policy, monthly_tokens, monthly_cost_micros, input_tokens_cap,
+                output_tokens_cap, cost_micros_cap, concurrency
+             FROM tenant_ai WHERE tenant_id = ?1",
+        )?
         .query_row([tenant.as_bytes()], |r| {
-            Ok((r.get::<_, bool>(0)?, r.get::<_, i64>(1)?))
+            Ok((r.get::<_, bool>(0)?, r.get::<_, i64>(1)?, budgets_at(r, 2)?))
         })
         .optional()?;
-    let (enabled, code) = match row {
+    let (enabled, code, budgets) = match row {
         Some(row) => row,
         None => return Ok(None),
     };
     Ok(Some(Tenant {
         enabled,
         data_policy: DataPolicy::from_code(code).ok_or(Error::Corrupt("tenant_ai.data_policy"))?,
+        budgets,
     }))
+}
+
+/// The six budget columns that start at `at`, as one value a policy route and a reservation share.
+fn budgets_at(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Budgets> {
+    Ok(Budgets {
+        monthly_tokens: nonzero(row.get::<_, i64>(at)?),
+        monthly_cost_micros: nonzero(row.get::<_, i64>(at + 1)?),
+        max_input_tokens: nonzero(row.get::<_, i64>(at + 2)?),
+        max_output_tokens: nonzero(row.get::<_, i64>(at + 3)?),
+        max_cost_micros: nonzero(row.get::<_, i64>(at + 4)?),
+        concurrency: u32::try_from(row.get::<_, i64>(at + 5)?).unwrap_or(u32::MAX),
+    })
+}
+
+/// A constraint already refuses a negative count; this keeps the conversion out of every reader.
+const fn nonzero(value: i64) -> u64 {
+    if value < 0 { 0 } else { value as u64 }
 }
 
 /// A tenant administrator's decision, refused without a live step-up. Disabling is
@@ -250,26 +344,70 @@ pub fn set_tenant(
             return Err(Error::Forbidden);
         }
     }
+    let budgets = policy.budgets;
+    let too_large = |value: u64| i64::try_from(value).is_err();
+    if [
+        budgets.monthly_tokens,
+        budgets.monthly_cost_micros,
+        budgets.max_input_tokens,
+        budgets.max_output_tokens,
+        budgets.max_cost_micros,
+    ]
+    .into_iter()
+    .any(too_large)
+    {
+        return Err(Error::InvalidInput("ai budget"));
+    }
+    if budgets.max_input_tokens == 0
+        || budgets.max_output_tokens == 0
+        || budgets.max_cost_micros == 0
+        || !(1..=MAX_CONCURRENCY).contains(&budgets.concurrency)
+    {
+        return Err(Error::InvalidInput("ai budget"));
+    }
     tx.prepare_cached(
-        "INSERT INTO tenant_ai(tenant_id, enabled, data_policy, updated_ms, updated_by)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO tenant_ai(tenant_id, enabled, data_policy, monthly_tokens, monthly_cost_micros,
+            input_tokens_cap, output_tokens_cap, cost_micros_cap, concurrency, updated_ms,
+            updated_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(tenant_id) DO UPDATE SET enabled = ?2, data_policy = ?3,
-         updated_ms = ?4, updated_by = ?5",
+            monthly_tokens = ?4, monthly_cost_micros = ?5, input_tokens_cap = ?6,
+            output_tokens_cap = ?7, cost_micros_cap = ?8, concurrency = ?9, updated_ms = ?10,
+            updated_by = ?11",
     )?
     .execute(params![
         tenant.as_bytes(),
         policy.enabled,
         policy.data_policy as u8,
+        i64::try_from(budgets.monthly_tokens).map_err(|_| Error::InvalidInput("ai budget"))?,
+        i64::try_from(budgets.monthly_cost_micros)
+            .map_err(|_| Error::InvalidInput("ai budget"))?,
+        i64::try_from(budgets.max_input_tokens)
+            .map_err(|_| Error::InvalidInput("ai budget"))?,
+        i64::try_from(budgets.max_output_tokens)
+            .map_err(|_| Error::InvalidInput("ai budget"))?,
+        i64::try_from(budgets.max_cost_micros)
+            .map_err(|_| Error::InvalidInput("ai budget"))?,
+        i64::from(budgets.concurrency),
         now.0,
         principal.user.as_bytes()
     ])?;
     if !policy.enabled {
         drop_requests(tx, Some(tenant), now)?;
     }
+    // The budget is what an operator has to be able to see changed, so it is in the row's own
+    // detail: monthly tokens and cost, the per-request maxima and the concurrency limit.
     let detail = format!(
-        "tenant={tenant} ai={} data_policy={}",
+        "tenant={tenant} ai={} data_policy={} monthly_tokens={} monthly_cost_micros={} \
+         max_input_tokens={} max_output_tokens={} max_cost_micros={} concurrency={}",
         if policy.enabled { "on" } else { "off" },
-        policy.data_policy.as_str()
+        policy.data_policy.as_str(),
+        budgets.monthly_tokens,
+        budgets.monthly_cost_micros,
+        budgets.max_input_tokens,
+        budgets.max_output_tokens,
+        budgets.max_cost_micros,
+        budgets.concurrency
     );
     audit(
         tx,
@@ -420,11 +558,14 @@ pub struct Request {
     pub outcome: Option<Outcome>,
     pub reason: Option<String>,
     pub result: Option<String>,
+    /// Whether the answer was an analysis the ledger already paid for (Y04), rather than one this
+    /// request's own provider call produced. It is a property of the answer, not of its text.
+    pub reused: bool,
     pub created: UnixMillis,
     pub deadline: UnixMillis,
 }
 const REQUEST_COLUMNS: &str = "id, tenant_id, repo_id, attempt_id, requester_id, provider,
-     data_policy, state_code, outcome, reason, result, created_ms, deadline_ms";
+     data_policy, state_code, outcome, reason, result, reused, created_ms, deadline_ms";
 
 /// One row's bytes, as the store holds them. Decoded once, outside the query closure.
 type Raw = (
@@ -439,6 +580,7 @@ type Raw = (
     Option<i64>,
     Option<String>,
     Option<String>,
+    bool,
     i64,
     i64,
 );
@@ -458,6 +600,7 @@ fn raw(row: &rusqlite::Row<'_>) -> rusqlite::Result<Raw> {
         row.get(10)?,
         row.get(11)?,
         row.get(12)?,
+        row.get(13)?,
     ))
 }
 
@@ -474,6 +617,7 @@ fn decode(raw: Raw) -> Result<Request> {
         outcome,
         reason,
         result,
+        reused,
         created,
         deadline,
     ) = raw;
@@ -498,6 +642,7 @@ fn decode(raw: Raw) -> Result<Request> {
         },
         reason,
         result,
+        reused,
         created: UnixMillis(created),
         deadline: UnixMillis(deadline),
     })
@@ -593,6 +738,7 @@ pub fn enqueue(
         outcome: None,
         reason: None,
         result: None,
+        reused: false,
         created: now,
         deadline: UnixMillis(deadline),
     })
@@ -693,7 +839,9 @@ pub fn claim(tx: &Transaction<'_>, id: AiRequestId, now: UnixMillis) -> Result<C
 }
 
 /// Settles a request exactly once: the answer, or the reason there is none. Its delegation is
-/// revoked in the same transaction, so nothing survives a request that has ended.
+/// revoked and its reservation released in the same transaction, so nothing survives a request that
+/// has ended and no budget is held by a request nobody can settle again. `usage` is what the
+/// provider reported; a component it did not report settles at the reservation's maximum.
 pub fn settle(
     tx: &Transaction<'_>,
     id: AiRequestId,
@@ -701,6 +849,7 @@ pub fn settle(
     text: Option<&str>,
     reason: Option<&str>,
     now: UnixMillis,
+    usage: Option<Usage>,
 ) -> Result<Request> {
     if text.is_some_and(|t| t.len() > MAX_RESULT_BYTES) {
         return Err(Error::InvalidInput("ai request result"));
@@ -712,13 +861,56 @@ pub fn settle(
         Outcome::Completed => (outcome, text, None),
         Outcome::Unavailable => (outcome, None, reason.or(Some("unavailable"))),
     };
+    close(
+        tx,
+        id,
+        Ending {
+            outcome,
+            text,
+            reason,
+            reused: false,
+            usage,
+        },
+        now,
+    )?;
+    by_id(tx, id)
+}
+
+/// How a request ends and what it is charged, as one value the two writers of a settlement share.
+struct Ending<'a> {
+    outcome: Outcome,
+    text: Option<&'a str>,
+    reason: Option<&'a str>,
+    /// Whether the answer was an analysis the cache already held, which the row states.
+    reused: bool,
+    usage: Option<Usage>,
+}
+
+/// Ends one request in one write: the row, its delegation, its reservation and what the ledger
+/// charges for it. A request that was never reserved (a reuse, a refusal, a policy that stopped it)
+/// charges nothing.
+fn close(tx: &Transaction<'_>, id: AiRequestId, ending: Ending<'_>, now: UnixMillis) -> Result<()> {
+    let Ending {
+        outcome,
+        text,
+        reason,
+        reused,
+        usage,
+    } = ending;
     let settled = tx
         .prepare_cached(
             "UPDATE ai_requests SET state_code = 3, outcome = ?2, result = ?3, reason = ?4,
-                settled_ms = ?5
+                settled_ms = ?5, reused = ?6
               WHERE id = ?1 AND state_code != 3",
         )?
-        .execute(params![id.as_bytes(), outcome as u8, text, reason, now.0])?;
+        .execute(params![
+            id.as_bytes(),
+            outcome as u8,
+            text,
+            reason,
+            now.0,
+            reused
+        ])?;
     if settled == 0 {
         return Err(Error::Conflict);
     }
@@ -728,7 +920,7 @@ pub fn settle(
               SELECT delegation_id FROM ai_requests WHERE id = ?2 AND delegation_id IS NOT NULL)",
     )?
     .execute(params![now.0, id.as_bytes()])?;
-    by_id(tx, id)
+    release(tx, id, text, now, usage)
 }
 
 /// Whether `token` is the live delegation of the request about `attempt`: the check the evidence
@@ -754,7 +946,22 @@ pub fn delegates(
 
 /// Settles every request past its deadline as `unavailable`, up to `limit`, and returns how many.
 /// A provider outage, a disabled tenant and a killed AI process all end this way; nothing waits.
+/// The reservations those requests held are deleted first, in this same write, so a killed AI
+/// process never holds a tenant's budget past the deadline it was allowed; expired analyses are
+/// pruned here too, which is the one clock the AI queue needs.
 pub fn sweep(tx: &Transaction<'_>, now: UnixMillis, limit: u32) -> Result<usize> {
+    tx.prepare_cached(
+        "DELETE FROM ai_analyses WHERE (tenant_id, digest, prompt_version, model) IN (
+            SELECT tenant_id, digest, prompt_version, model FROM ai_analyses
+             WHERE expires_ms <= ?1 LIMIT ?2)",
+    )?
+    .execute(params![now.0, i64::from(limit)])?;
+    tx.prepare_cached(
+        "DELETE FROM ai_reservations WHERE request_id IN (
+            SELECT id FROM ai_requests
+             WHERE state_code != 3 AND deadline_ms <= ?1 ORDER BY deadline_ms LIMIT ?2)",
+    )?
+    .execute(params![now.0, i64::from(limit)])?;
     let swept = tx
         .prepare_cached(
             "UPDATE ai_requests SET state_code = 3, outcome = 1, reason = 'the request deadline passed',
@@ -775,6 +982,470 @@ pub fn sweep(tx: &Transaction<'_>, now: UnixMillis, limit: u32) -> Result<usize>
     )?
     .execute([now.0])?;
     Ok(swept)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Budgets, the ledger and the analysis cache (Y04). The controller still calls no provider: one
+// writer transaction answers whether the request already has an answer, whether it fits, and what
+// it holds if it does. A reuse and a refusal end the row in that same commit, so neither is ever
+// left queued, and a reservation is released by the same write that ends its request or by its own
+// expiry, so a killed AI process cannot hold a tenant's budget.
+// ---------------------------------------------------------------------------------------------
+
+/// How long an analysis is kept for reuse. Past this the logs it cites have usually aged out of
+/// retention, so the sweep that expires requests prunes it here rather than holding it forever.
+pub const ANALYSIS_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Why an analysis was reused, which is what the row records next to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reuse {
+    /// The same evidence: one attempt asked about twice.
+    Evidence,
+    /// The same failure on a later run: normalized failed step, test identities and error lines.
+    Fingerprint,
+}
+
+impl Reuse {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Evidence => "evidence",
+            Self::Fingerprint => "fingerprint",
+        }
+    }
+}
+
+/// What the AI process asks to hold for one claimed request: its maxima, and the key its answer is
+/// published under. The maxima are computed where the model and its price are configured, and the
+/// controller decides whether they fit; it never guesses a price of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reservation {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_micros: u64,
+    /// The digest of the exact evidence bundle the model will read.
+    pub digest: [u8; 32],
+    /// The failure's signature, stable across reruns of the same failure.
+    pub fingerprint: [u8; 32],
+    pub prompt_version: String,
+    pub model: String,
+}
+
+/// What a reservation did, decided in one write and never reconsidered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Admitted {
+    /// The maxima are held until `expires`: the provider may be contacted.
+    Reserved { expires: UnixMillis },
+    /// This question or this failure was already answered; the request is settled with that answer.
+    Reused { text: String, by: Reuse },
+    /// It does not fit. The request is settled `unavailable` carrying `reason`, and nothing is held.
+    Refused { reason: String },
+}
+
+/// What a provider reported for one request. A count it did not report is `None`, never zero: an
+/// unreported component settles at the reservation's maximum, because nothing can say it was free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cost_micros: Option<u64>,
+}
+
+/// Tokens and cost, as a ledger row holds them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Spend {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_micros: u64,
+}
+
+impl Spend {
+    /// What a monthly token limit is compared against: a token is a token, whichever side of the
+    /// call it was counted on.
+    pub const fn tokens(self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
+/// One tenant's calendar month: what it was charged, what live reservations hold, and how many of
+/// its requests are in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Month {
+    /// `YYYYMM`, UTC.
+    pub month: i64,
+    pub settled: Spend,
+    pub reserved: Spend,
+    pub in_flight: u32,
+}
+
+/// The UTC calendar month `ms` falls in, as `YYYYMM`: the ledger's key, so a month costs one
+/// integer comparison and one row per tenant, and no date arithmetic runs on the request path.
+pub const fn month_of(ms: i64) -> i64 {
+    // Howard Hinnant's civil-from-days, shifted so day 0 is 1970-01-01.
+    let days = ms.div_euclid(86_400_000) + 719_468;
+    let era = days.div_euclid(146_097);
+    let doe = days - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    year * 100 + month
+}
+
+/// The decision that stands between a claimed request and a provider call, in one transaction: an
+/// answer the ledger already paid for, then the tenant's per-request caps, its concurrency limit and
+/// its monthly budget — and, only if all of those pass, the reservation that holds the maximum.
+///
+/// The cache is read first because a reused answer costs nothing: neither a cap, nor a request
+/// already in flight, nor an exhausted budget may refuse it. Everything after it is a refusal
+/// before the call, never a queue.
+pub fn reserve(
+    tx: &Transaction<'_>,
+    id: AiRequestId,
+    asked: &Reservation,
+    now: UnixMillis,
+) -> Result<Admitted> {
+    if asked.input_tokens == 0
+        || [asked.input_tokens, asked.output_tokens, asked.cost_micros]
+            .into_iter()
+            .any(|value| i64::try_from(value).is_err())
+        || asked.prompt_version.is_empty()
+        || asked.prompt_version.len() > 64
+        || asked.model.is_empty()
+        || asked.model.len() > 128
+    {
+        return Err(Error::InvalidInput("ai reservation"));
+    }
+    let (tenant, state, deadline) = tx
+        .prepare_cached("SELECT tenant_id, state_code, deadline_ms FROM ai_requests WHERE id = ?1")?
+        .query_row(params![id.as_bytes()], |r| {
+            Ok((
+                r.get::<_, [u8; 16]>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    if State::from_code(state) != Some(State::Claimed) || deadline <= now.0 {
+        return Err(Error::Conflict);
+    }
+    let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?;
+    if let Some((text, by)) = cached(tx, tenant, asked, now)? {
+        close(
+            tx,
+            id,
+            Ending {
+                outcome: Outcome::Completed,
+                text: Some(&text),
+                reason: None,
+                reused: true,
+                usage: None,
+            },
+            now,
+        )?;
+        return Ok(Admitted::Reused { text, by });
+    }
+    let budgets = budgets(tx, tenant)?;
+    if let Some(reason) = budgets.refusal(asked) {
+        return refuse(tx, id, &reason, now);
+    }
+    let in_flight = in_flight(tx, tenant, now)?;
+    if in_flight >= budgets.concurrency {
+        return refuse(
+            tx,
+            id,
+            &format!(
+                "concurrency: {in_flight} requests are in flight and the tenant's limit is {}",
+                budgets.concurrency
+            ),
+            now,
+        );
+    }
+    let month = month_of(now.0);
+    let (settled, reserved) = spend(tx, tenant, month, now)?;
+    let tokens = asked.input_tokens.saturating_add(asked.output_tokens);
+    if budgets.monthly_tokens > 0 {
+        let used = settled.tokens().saturating_add(reserved.tokens());
+        if used.saturating_add(tokens) > budgets.monthly_tokens {
+            return refuse(
+                tx,
+                id,
+                &format!(
+                    "budget: the month has spent or holds {used} tokens of {} and this request asks for {tokens}",
+                    budgets.monthly_tokens
+                ),
+                now,
+            );
+        }
+    }
+    if budgets.monthly_cost_micros > 0 {
+        let used = settled.cost_micros.saturating_add(reserved.cost_micros);
+        if used.saturating_add(asked.cost_micros) > budgets.monthly_cost_micros {
+            return refuse(
+                tx,
+                id,
+                &format!(
+                    "budget: the month has spent or holds {used} micros of {} and this request asks for {}",
+                    budgets.monthly_cost_micros, asked.cost_micros
+                ),
+                now,
+            );
+        }
+    }
+    tx.prepare_cached(
+        "INSERT INTO ai_reservations(request_id, tenant_id, month, input_tokens, output_tokens,
+            cost_micros, digest, fingerprint, prompt_version, model, created_ms, expires_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    )?
+    .execute(params![
+        id.as_bytes(),
+        tenant.as_bytes(),
+        month,
+        i64::try_from(asked.input_tokens).map_err(|_| Error::InvalidInput("ai reservation"))?,
+        i64::try_from(asked.output_tokens).map_err(|_| Error::InvalidInput("ai reservation"))?,
+        i64::try_from(asked.cost_micros).map_err(|_| Error::InvalidInput("ai reservation"))?,
+        asked.digest.as_slice(),
+        asked.fingerprint.as_slice(),
+        asked.prompt_version,
+        asked.model,
+        now.0,
+        deadline,
+    ])?;
+    Ok(Admitted::Reserved {
+        expires: UnixMillis(deadline),
+    })
+}
+
+/// Refuses one request and ends it in the same write: the reason is on the row, nothing is held, and
+/// the caller has nothing left to settle.
+fn refuse(
+    tx: &Transaction<'_>,
+    id: AiRequestId,
+    reason: &str,
+    now: UnixMillis,
+) -> Result<Admitted> {
+    let reason = &reason[..reason.len().min(MAX_REASON_BYTES)];
+    close(
+        tx,
+        id,
+        Ending {
+            outcome: Outcome::Unavailable,
+            text: None,
+            reason: Some(reason),
+            reused: false,
+            usage: None,
+        },
+        now,
+    )?;
+    Ok(Admitted::Refused {
+        reason: reason.to_owned(),
+    })
+}
+
+/// The answer this question already has: its exact evidence first, then the same failure on an
+/// earlier run. One key probe each, and the second takes the newest.
+fn cached(
+    conn: &Connection,
+    tenant: TenantId,
+    asked: &Reservation,
+    now: UnixMillis,
+) -> Result<Option<(String, Reuse)>> {
+    let exact = conn
+        .prepare_cached(
+            "SELECT text FROM ai_analyses
+              WHERE tenant_id = ?1 AND digest = ?2 AND prompt_version = ?3 AND model = ?4
+                AND expires_ms > ?5",
+        )?
+        .query_row(
+            params![
+                tenant.as_bytes(),
+                asked.digest.as_slice(),
+                asked.prompt_version,
+                asked.model,
+                now.0
+            ],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(text) = exact {
+        return Ok(Some((text, Reuse::Evidence)));
+    }
+    let same = conn
+        .prepare_cached(
+            "SELECT text FROM ai_analyses
+              WHERE tenant_id = ?1 AND fingerprint = ?2 AND prompt_version = ?3 AND model = ?4
+                AND expires_ms > ?5
+              ORDER BY created_ms DESC LIMIT 1",
+        )?
+        .query_row(
+            params![
+                tenant.as_bytes(),
+                asked.fingerprint.as_slice(),
+                asked.prompt_version,
+                asked.model,
+                now.0
+            ],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(same.map(|text| (text, Reuse::Fingerprint)))
+}
+
+/// The tenant's budget as its policy row holds it. A request that reached here was admitted, so the
+/// row exists; one that does not is a tenant that opted out between the claim and the reservation.
+fn budgets(conn: &Connection, tenant: TenantId) -> Result<Budgets> {
+    conn.prepare_cached(
+        "SELECT monthly_tokens, monthly_cost_micros, input_tokens_cap, output_tokens_cap,
+            cost_micros_cap, concurrency
+          FROM tenant_ai WHERE tenant_id = ?1",
+    )?
+    .query_row([tenant.as_bytes()], |r| budgets_at(r, 0))
+    .optional()?
+    .ok_or(Error::Forbidden)
+}
+
+/// How many of the tenant's reservations are still live: the concurrency limit's one read.
+fn in_flight(conn: &Connection, tenant: TenantId, now: UnixMillis) -> Result<u32> {
+    let live: i64 = conn
+        .prepare_cached(
+            "SELECT COUNT(*) FROM ai_reservations WHERE tenant_id = ?1 AND expires_ms > ?2",
+        )?
+        .query_row(params![tenant.as_bytes(), now.0], |r| r.get(0))?;
+    Ok(u32::try_from(live).unwrap_or(u32::MAX))
+}
+
+/// The month's charged and held totals: what the budget is compared against.
+fn spend(
+    conn: &Connection,
+    tenant: TenantId,
+    month: i64,
+    now: UnixMillis,
+) -> Result<(Spend, Spend)> {
+    let settled = conn
+        .prepare_cached(
+            "SELECT input_tokens, output_tokens, cost_micros FROM ai_ledger
+              WHERE tenant_id = ?1 AND month = ?2",
+        )?
+        .query_row(params![tenant.as_bytes(), month], |r| {
+            Ok(Spend {
+                input_tokens: nonzero(r.get(0)?),
+                output_tokens: nonzero(r.get(1)?),
+                cost_micros: nonzero(r.get(2)?),
+            })
+        })
+        .optional()?
+        .unwrap_or_default();
+    let reserved = conn
+        .prepare_cached(
+            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(cost_micros), 0)
+              FROM ai_reservations WHERE tenant_id = ?1 AND month = ?2 AND expires_ms > ?3",
+        )?
+        .query_row(params![tenant.as_bytes(), month, now.0], |r| {
+            Ok(Spend {
+                input_tokens: nonzero(r.get(0)?),
+                output_tokens: nonzero(r.get(1)?),
+                cost_micros: nonzero(r.get(2)?),
+            })
+        })?;
+    Ok((settled, reserved))
+}
+
+/// One tenant's month, for the route that reports it.
+pub fn month(conn: &Connection, tenant: TenantId, now: UnixMillis) -> Result<Month> {
+    let month = month_of(now.0);
+    let (settled, reserved) = spend(conn, tenant, month, now)?;
+    Ok(Month {
+        month,
+        settled,
+        reserved,
+        in_flight: in_flight(conn, tenant, now)?,
+    })
+}
+
+/// Releases the reservation a request holds and charges the ledger what it used. A request that
+/// never reserved — a reuse, a refusal, one a policy stopped — has nothing to release and charges
+/// nothing. A completed answer is published under the key the reservation named, in this same write.
+fn release(
+    tx: &Transaction<'_>,
+    id: AiRequestId,
+    text: Option<&str>,
+    now: UnixMillis,
+    usage: Option<Usage>,
+) -> Result<()> {
+    let held = tx
+        .prepare_cached(
+            "SELECT tenant_id, month, input_tokens, output_tokens, cost_micros, digest, fingerprint,
+                prompt_version, model
+              FROM ai_reservations WHERE request_id = ?1",
+        )?
+        .query_row(params![id.as_bytes()], |r| {
+            Ok((
+                r.get::<_, [u8; 16]>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, [u8; 32]>(5)?,
+                r.get::<_, [u8; 32]>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+            ))
+        })
+        .optional()?;
+    let Some((tenant, month, input, output, cost, digest, fingerprint, version, model)) = held
+    else {
+        return Ok(());
+    };
+    tx.prepare_cached("DELETE FROM ai_reservations WHERE request_id = ?1")?
+        .execute(params![id.as_bytes()])?;
+    let usage = usage.unwrap_or_default();
+    tx.prepare_cached(
+        "INSERT INTO ai_ledger(tenant_id, month, input_tokens, output_tokens, cost_micros)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(tenant_id, month) DO UPDATE SET
+            input_tokens = ai_ledger.input_tokens + excluded.input_tokens,
+            output_tokens = ai_ledger.output_tokens + excluded.output_tokens,
+            cost_micros = ai_ledger.cost_micros + excluded.cost_micros",
+    )?
+    .execute(params![
+        tenant.as_slice(),
+        month,
+        charged(usage.input_tokens, input),
+        charged(usage.output_tokens, output),
+        charged(usage.cost_micros, cost)
+    ])?;
+    if let Some(text) = text.filter(|text| !text.is_empty()) {
+        tx.prepare_cached(
+            "INSERT INTO ai_analyses(tenant_id, digest, prompt_version, model, fingerprint, text,
+                created_ms, expires_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(tenant_id, digest, prompt_version, model) DO UPDATE SET
+                fingerprint = excluded.fingerprint, text = excluded.text,
+                created_ms = excluded.created_ms, expires_ms = excluded.expires_ms",
+        )?
+        .execute(params![
+            tenant.as_slice(),
+            digest.as_slice(),
+            version,
+            model,
+            fingerprint.as_slice(),
+            text,
+            now.0,
+            now.0.saturating_add(ANALYSIS_TTL_MS)
+        ])?;
+    }
+    Ok(())
+}
+
+/// What one component settles at: what the provider reported, or the reservation's maximum when it
+/// reported nothing. Never more than was held, so a call cannot spend past what it reserved.
+fn charged(reported: Option<u64>, reserved: i64) -> i64 {
+    match reported {
+        None => reserved,
+        Some(value) => i64::try_from(value).map_or(reserved, |value| value.min(reserved)),
+    }
 }
 
 /// A policy change's queue: queued requests naming a provider the allow-list no longer holds are
@@ -820,6 +1491,12 @@ pub fn drop_requests(
                        WHERE delegation_id IS NOT NULL AND tenant_id = ?2)",
             )?
             .execute(params![now.0, tenant.as_bytes()])?;
+            // The reservations name requests, so they go first; the analyses are the tenant's own
+            // paid-for answers, and a tenant that is off keeps neither.
+            tx.prepare_cached("DELETE FROM ai_reservations WHERE tenant_id = ?1")?
+                .execute(params![tenant.as_bytes()])?;
+            tx.prepare_cached("DELETE FROM ai_analyses WHERE tenant_id = ?1")?
+                .execute(params![tenant.as_bytes()])?;
             tx.prepare_cached("DELETE FROM ai_requests WHERE tenant_id = ?1")?
                 .execute(params![tenant.as_bytes()])?
         }
@@ -830,6 +1507,9 @@ pub fn drop_requests(
                       SELECT delegation_id FROM ai_requests WHERE delegation_id IS NOT NULL)",
             )?
             .execute([now.0])?;
+            tx.prepare_cached("DELETE FROM ai_reservations")?
+                .execute([])?;
+            tx.prepare_cached("DELETE FROM ai_analyses")?.execute([])?;
             tx.prepare_cached("DELETE FROM ai_requests")?.execute([])?
         }
     };
