@@ -1,0 +1,82 @@
+name: ci
+
+# The four checks of the repository's own command list (CLAUDE.md#commands): `cargo fmt-check`,
+# `cargo lint`, `cargo test-cli`, and the Linux roles' `cargo lint-linux` / `cargo test-linux`
+# with a release build of what ships. A Windows leg is deliberately absent: the crate builds for
+# `x86_64-pc-windows-msvc`, but nothing runs on a Windows host yet (docs/backlog.md N01), so a leg
+# here would be red by default. Add it beside N01, not before.
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  format:
+    name: fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain is rust-toolchain.toml's (1.97.0 with rustfmt and clippy), which rustup
+      # installs on the first cargo call.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: format
+          cache-targets: false
+      - run: cargo fmt --all -- --check
+
+  lint:
+    name: lint (all targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (portable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+      - uses: taiki-e/install-action@nextest
+      # The suites that need a rootless Podman account, a microVM host or live credentials gate
+      # themselves on their environment variables and skip; everything else runs here.
+      - run: cargo nextest run --locked --workspace --no-fail-fast
+
+  linux:
+    name: linux roles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux
+      - uses: taiki-e/install-action@nextest
+      - name: lint (all features)
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: test (all features)
+        run: cargo nextest run --locked --workspace --all-features --no-fail-fast
+      # The smoke: the binaries a release ships link and start with every feature on.
+      - name: build the Linux roles
+        run: cargo build --locked --workspace --release --all-features
+      - name: the built binary starts with both roles compiled in
+        run: |
+          ./target/release/sentinel --help > /dev/null
+          ./target/release/sentinel server --help > /dev/null
+          ./target/release/sentinel worker --help > /dev/null
