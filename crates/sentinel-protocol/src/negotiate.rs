@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct ProtocolVersion(pub u16);
 
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(16);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(17);
 
 /// Declared outputs in the job context, and artifact handoff between jobs: a worker below this version is never
 /// offered a job whose context holds outputs or whose job declares a handoff, so its sessions behave as before.
@@ -35,6 +35,11 @@ pub const EXTRA_CHECKOUTS_MIN: ProtocolVersion = ProtocolVersion(15);
 /// The most additional checkouts one job may declare, `sentinel_pipeline::schema::MAX_CHECKOUTS`.
 pub const MAX_CHECKOUT_SOURCES: usize = 8;
 pub const MAX_CHECKOUT_REVISION_BYTES: usize = 64;
+
+/// Runner-mode cache and artifact scopes: the frame naming the boundary a runner's job may read and
+/// write. A session below this version serves no scope, so its sandbox refuses every cache and artifact
+/// call rather than writing one into a boundary nobody stated.
+pub const ACTIONS_MIN: ProtocolVersion = ProtocolVersion(17);
 
 /// Task-result reuse: the context carries the run's forced-refresh flag. A worker below this version is
 /// sent `Context3`, which cannot state it, so it never learns a run asked for fresh execution.

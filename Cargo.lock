@@ -1211,6 +1211,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-actions"
+version = "0.1.0-dev"
+dependencies = [
+ "blake3",
+ "postcard",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "sentinel-cache",
+ "sentinel-core",
+ "sentinel-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "sentinel-agent"
 version = "0.1.0-dev"
 dependencies = [
@@ -1490,6 +1507,7 @@ dependencies = [
  "libc",
  "postcard",
  "rusqlite",
+ "sentinel-actions",
  "sentinel-api",
  "sentinel-auth",
  "sentinel-cache",

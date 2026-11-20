@@ -30,7 +30,7 @@ use sentinel_protocol::{
     },
     logs::{Frame, MAX_GAPS, Stream},
     negotiate::{
-        CACHE_CANCEL_MIN, CANCEL_PUSH_MIN, DIGEST_AT_END_MIN, DIGEST_FIRST_MIN, Hello,
+        ACTIONS_MIN, CACHE_CANCEL_MIN, CANCEL_PUSH_MIN, DIGEST_AT_END_MIN, DIGEST_FIRST_MIN, Hello,
         MAX_CANCEL_PUSH, MAX_PREFETCH_IMAGES, MAX_PREFETCH_REFERENCE_BYTES, Negotiated,
         PREFETCH_MIN, PROFILE_MIN, Profile, RUNNER_MIN, Rejected,
     },
@@ -434,6 +434,13 @@ pub enum ServerMessage {
     /// Protocol 16, appended last so every earlier variant keeps its index: `Context3` plus the run's
     /// forced-refresh flag for task-result reuse.
     Context4(WireContext4),
+    /// Protocol 17, appended last so every earlier variant keeps its index: the boundary of the job one
+    /// runner lease took, sent as soon as GitHub names the job. A sandbox that has not received one
+    /// serves no cache or artifact call at all.
+    RunnerScope {
+        lease: [u8; 16],
+        scope: RunnerScopeWire,
+    },
 }
 
 /// A runner lease as the wire states it: what the worker needs to accept or refuse one, and nothing
@@ -448,6 +455,18 @@ pub struct RunnerLeaseWire {
     /// What the sandbox may take: the class's vCPUs and the memory the class reserves.
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+}
+
+/// The boundary one runner lease's job may read and write (protocol 17): the tenant and repository the
+/// lease was minted for, the trust its provenance allows, and the GitHub run and job the delivery named.
+/// It is the controller's statement about the sandbox, never the client's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerScopeWire {
+    pub tenant: [u8; 16],
+    pub repo: [u8; 16],
+    pub trust: u8,
+    pub run: u64,
+    pub job: u64,
 }
 
 pub(crate) trait SensitiveFrame {
@@ -3403,7 +3422,8 @@ pub fn connect(
         | ServerMessage::SecretChunk { .. }
         | ServerMessage::Handoff { .. }
         | ServerMessage::Cancel { .. }
-        | ServerMessage::Context4(_) => Err(Error::Protocol("message before welcome")),
+        | ServerMessage::Context4(_)
+        | ServerMessage::RunnerScope { .. } => Err(Error::Protocol("message before welcome")),
     }
 }
 
@@ -3671,6 +3691,9 @@ pub trait Executor: Send + Sync {
     /// The configuration of a lease this worker accepted. It is a credential: it is used to start the
     /// runner and wiped afterwards, and it is never written to a log, a workspace or an environment.
     fn runner_config(&self, _lease: [u8; 16], _config: Vec<u8>) {}
+    /// The boundary the lease's job may read and write, which the controller states once GitHub names
+    /// the job. A sandbox that never receives one serves no cache or artifact call.
+    fn runner_scoped(&self, _lease: [u8; 16], _scope: RunnerScopeWire) {}
     /// Leases the controller no longer counts as held: the runner stops and its sandbox goes.
     fn runner_stopped(&self, _lease: [u8; 16]) {}
     /// The leases this worker holds, for a controller that has to stop them after a lost session.
@@ -3946,6 +3969,20 @@ impl Link {
                     RunnerLeaseId::from_bytes(*lease).map_err(|_| Error::Protocol("id"))?;
                     executor.runner_stopped(*lease);
                 }
+                Ok(false)
+            }
+            ServerMessage::RunnerScope { lease, scope } => {
+                if self.negotiated.protocol.0 < ACTIONS_MIN.0 {
+                    return Err(Error::Protocol("runner scope needs protocol 17"));
+                }
+                if Trust::from_u8(scope.trust).is_none()
+                    || TenantId::from_bytes(scope.tenant).is_err()
+                    || RepoId::from_bytes(scope.repo).is_err()
+                {
+                    return Err(Error::Protocol("runner scope"));
+                }
+                RunnerLeaseId::from_bytes(lease).map_err(|_| Error::Protocol("id"))?;
+                executor.runner_scoped(lease, scope);
                 Ok(false)
             }
             ServerMessage::Welcome { .. } | ServerMessage::Reject(_) => {
@@ -4281,6 +4318,7 @@ fn handle_bulk_message(
         | ServerMessage::RunnerStop { .. }
         | ServerMessage::Offer(_)
         | ServerMessage::Prefetch { .. }
+        | ServerMessage::RunnerScope { .. }
         | ServerMessage::Cancel { .. } => return Err(Error::Protocol("control message on bulk")),
     }
     Ok(())
@@ -5274,7 +5312,49 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
+    /// Records the boundaries a controller states, and ends the session once it has seen one.
+    struct Scoped {
+        seen: std::sync::Mutex<Vec<([u8; 16], RunnerScopeWire)>>,
+    }
+
+    impl Default for Scoped {
+        fn default() -> Self {
+            Scoped {
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Scoped {
+        fn take(&self) -> Vec<([u8; 16], RunnerScopeWire)> {
+            std::mem::take(&mut *self.seen.lock().unwrap())
+        }
+        fn seen(&self) -> bool {
+            !self.seen.lock().unwrap().is_empty()
+        }
+    }
+
+    impl Executor for Scoped {
+        fn runner_scoped(&self, lease: [u8; 16], scope: RunnerScopeWire) {
+            self.seen.lock().unwrap().push((lease, scope));
+        }
+        fn offered(&self, _: &Offer) -> bool {
+            false
+        }
+        fn stop(&self, _: AttemptId) {}
+        fn cancel(&self, _: AttemptId) {}
+        fn held(&self) -> Vec<AttemptId> {
+            Vec::new()
+        }
+        fn renewed(&self, _: UnixMillis) {}
+        fn attached(&self, _: Reporter) {}
+        fn detached(&self) {}
+        fn spec(&self, _: AttemptId, _: JobContext, _: Vec<u8>) {}
+        fn no_spec(&self, _: AttemptId) {}
+        fn log_acked(&self, _: AttemptId, _: u64) {}
+        fn log_refused(&self, _: AttemptId) {}
+    }
+
     struct Silent;
 
     impl Executor for Silent {
@@ -5424,6 +5504,55 @@ mod tests {
             matches!(&error, Error::Protocol(what) if *what == "cancel push"),
             "{error}"
         );
+    }
+
+    /// A boundary is the controller's statement, and a session that cannot carry it is never sent one:
+    /// at protocol 17 the frame reaches the executor intact, below it the session ends instead.
+    #[test]
+    fn a_runner_scope_is_stated_at_its_protocol_only() {
+        let (lease, tenant, repo) = (
+            *RunnerLeaseId::new().as_bytes(),
+            *sentinel_core::TenantId::new().as_bytes(),
+            *sentinel_core::RepoId::new().as_bytes(),
+        );
+        let wire = RunnerScopeWire {
+            tenant,
+            repo,
+            trust: 1,
+            run: 7,
+            job: 9,
+        };
+        let frame = || ServerMessage::RunnerScope { lease, scope: wire };
+        let below = worker_outcome(ACTIONS_MIN.0 - 1, vec![frame()]);
+        assert!(
+            matches!(&below, Error::Protocol(what) if *what == "runner scope needs protocol 17"),
+            "{below}"
+        );
+
+        let recorder = Scoped::default();
+        let (addr, pin, pushed) = pushing_controller(ACTIONS_MIN.0, vec![frame()]);
+        let client =
+            crate::tls::client_config(crate::identity::Identity::generate("w").unwrap(), pin)
+                .unwrap();
+        let mut link = connect(
+            addr,
+            client,
+            WorkerId::new(),
+            "boundary",
+            hello_range(1, MAX),
+            None,
+            Capacity {
+                cpu_millis: 1_000,
+                memory_bytes: 1 << 30,
+            },
+        )
+        .expect("the pushing controller welcomes the worker");
+        let outcome = link.run(&recorder, || recorder.seen());
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let seen = recorder.take();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0], (lease, wire));
+        let _ = pushed.join();
     }
 
     #[test]

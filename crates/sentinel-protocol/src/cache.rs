@@ -88,6 +88,18 @@ impl Trust {
         }
     }
 
+    /// The trust a runner-mode job's provenance allows (AR06). A fork pull request's content is the
+    /// fork's, so everything its job writes is `pull_request`; a job on any other pool came from this
+    /// repository's own refs, through GitHub's own admission, so it is `protected`. There is no
+    /// `unprotected` here: a GitHub runner-mode job's content is always this repository's.
+    pub const fn of_runner_job(fork_pr: bool) -> Trust {
+        if fork_pr {
+            Trust::PullRequest
+        } else {
+            Trust::Protected
+        }
+    }
+
     pub const fn for_protocol(self, protocol: u16) -> Trust {
         match self {
             Self::Unprotected if protocol < 8 => Self::PullRequest,

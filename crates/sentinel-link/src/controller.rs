@@ -18,8 +18,8 @@ use sentinel_core::{
 use sentinel_protocol::limits::{MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES};
 use sentinel_protocol::logs::Frame;
 use sentinel_protocol::negotiate::{
-    CANCEL_PUSH_MIN, Capabilities, Hello, MAX_CANCEL_PUSH, MAX_PREFETCH_IMAGES, PREFETCH_MIN,
-    PROFILE_MIN, Profile, RUNNER_MIN,
+    ACTIONS_MIN, CANCEL_PUSH_MIN, Capabilities, Hello, MAX_CANCEL_PUSH, MAX_PREFETCH_IMAGES,
+    PREFETCH_MIN, PROFILE_MIN, Profile, RUNNER_MIN,
 };
 use sentinel_store::{
     Store, artifacts, classes, dispatch, locks,
@@ -172,6 +172,8 @@ pub struct Stats {
     pub runner_stopped: AtomicU64,
     pub runner_unregistered: AtomicU64,
     pub runner_recovered: AtomicU64,
+    /// Boundaries stated to runner sandboxes (AR06).
+    pub runner_scoped: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -1636,6 +1638,7 @@ impl Inner {
         self.runner_deliver(&policy, now);
         self.runner_unregister(now);
         self.runner_place(&policy, now);
+        self.runner_scope();
         if now.0.saturating_sub(self.runner_at.load(Ordering::Relaxed)) >= policy.reconcile_ms {
             self.runner_at.store(now.0, Ordering::Relaxed);
             self.runner_reconcile(&policy, now);
@@ -1914,6 +1917,48 @@ impl Inner {
             }
             if !placed_any {
                 return;
+            }
+        }
+    }
+
+    /// State the boundary of every lease a job has taken. It is a pulse rather than a queue: the
+    /// query answers the bound leases of each live worker, the frame is idempotent, and a worker that
+    /// missed one binds the same boundary on the next pass. Until it arrives the sandbox refuses every
+    /// cache and artifact call, so a missing pulse costs a rebuild, never a write into a guessed scope.
+    fn runner_scope(&self) {
+        let workers: Vec<(WorkerId, Arc<Peer>)> = self
+            .fleet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(_, peer)| peer.protocol >= ACTIONS_MIN.0 && peer.ranked())
+            .map(|(worker, peer)| (*worker, Arc::clone(peer)))
+            .collect();
+        for (worker, peer) in workers {
+            let scopes = match self
+                .store
+                .read(move |c| runner_store::bound_scopes(c, worker))
+            {
+                Ok(scopes) => scopes,
+                Err(e) => {
+                    self.failed(false, "runner_scope", &e);
+                    continue;
+                }
+            };
+            for scope in scopes {
+                if crate::runner::scope_lease(
+                    &peer.sender,
+                    scope.lease,
+                    scope.tenant,
+                    scope.repo,
+                    scope.trust,
+                    scope.run,
+                    scope.job,
+                )
+                .is_ok()
+                {
+                    self.stats.runner_scoped.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }

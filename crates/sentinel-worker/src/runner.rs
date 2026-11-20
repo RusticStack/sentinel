@@ -68,6 +68,18 @@ pub const CONFIG_BYTES: u64 = 128 * 1024;
 /// passes the configuration as an argument.
 pub const START: &str = "/usr/local/bin/sentinel-runner";
 
+/// Where a sandbox's cache and artifact endpoint lives inside it: the anchor a client's Node runtime is
+/// told about, and the two names it answers. The clients dial 443, so that is the port the endpoint
+/// serves on the address the operator states.
+pub use sentinel_actions::ca::{CA_ENV, CA_PATH};
+
+/// The port the pinned clients dial: `https://<host>/` with no port stated is 443.
+pub const ACTIONS_PORT: u16 = 443;
+
+/// How many addresses one worker's block may hold runners at once: one listener serves one boundary,
+/// so the block needs one address per concurrent sandbox, starting at the stated one.
+pub const ACTIONS_ADDRESSES: u8 = 16;
+
 /// The pids one runner container may have: the runner, a step's shell and what a step forks.
 pub const PIDS: u32 = 4096;
 
@@ -123,6 +135,10 @@ impl Image {
 pub struct Policy {
     pub image: Option<Image>,
     pub guard: net::Guard,
+    /// The address a sandbox reaches this worker's cache and artifact endpoint on, as the operator
+    /// states it (the sandbox network's host address). Absent, this worker declines every runner lease:
+    /// a runner whose cache and artifacts would silently go to GitHub's storage is not one AR06 serves.
+    pub actions: Option<Ipv4Addr>,
 }
 
 impl Policy {
@@ -131,6 +147,7 @@ impl Policy {
     /// only fail after GitHub had registered it, so both are declined before anything is asked for.
     pub fn admits(&self, cpu_millis: u64, memory_bytes: u64) -> bool {
         self.image.is_some()
+            && self.actions.is_some()
             && cpu_millis > 0
             && u32::try_from(cpu_millis).is_ok()
             && memory_bytes >= MIN_MEMORY_BYTES
@@ -148,6 +165,30 @@ pub struct Plan {
     lifetime_secs: u64,
 }
 
+/// What one sandbox is told about its cache and artifact endpoint: the address to resolve the two
+/// service hosts to, and the anchor file on the host that the sandbox mounts read-only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Actions {
+    pub address: Ipv4Addr,
+    pub anchor: PathBuf,
+}
+
+/// What the worker grants one sandbox: the network its operator gave it, the endpoints it must never
+/// reach, and the cache and artifact endpoint (if any) it is served from.
+pub struct Grant<'a> {
+    pub network: Network,
+    pub guard: &'a net::Guard,
+    pub actions: Option<&'a Actions>,
+}
+
+impl Actions {
+    /// Where this sandbox's anchor is staged: under the lease's own directory, so the sandbox's
+    /// teardown removes it with everything else it wrote.
+    pub fn anchor_of(dir: &Path) -> PathBuf {
+        dir.join("ca.crt")
+    }
+}
+
 impl Plan {
     /// The sandbox one lease gets. `network` is the worker's operator decision; `guard` is what its
     /// own endpoints are.
@@ -157,9 +198,13 @@ impl Plan {
         lease: RunnerLeaseId,
         image: &Image,
         limits: Limits,
-        network: Network,
-        guard: &net::Guard,
+        grant: &Grant<'_>,
     ) -> Result<Plan> {
+        let Grant {
+            network,
+            guard,
+            actions,
+        } = *grant;
         let name = container_name(lease);
         let dir = dir_of(root, lease);
         let lifetime_secs = match limits.lifetime_secs {
@@ -231,6 +276,24 @@ impl Plan {
             &mut args,
             format!("{}:{WORK_MOUNT}:rw", work_dir(&dir).display()),
         );
+        if let Some(actions) = actions {
+            // The two service names resolve to this worker and nothing else does: `/etc/hosts` is
+            // the sandbox's own, so GitHub's other hosts keep their own answers.
+            for host in sentinel_actions::HOSTS {
+                text(&mut args, "--add-host".to_owned());
+                text(&mut args, format!("{host}:{}", actions.address));
+            }
+            // The anchor is this sandbox's alone: a read-only file in this container, and a path the
+            // clients' Node runtime appends to its own roots. It is a path, never a secret, so the
+            // container still carries no secret of ours in its environment.
+            text(&mut args, "--volume".to_owned());
+            text(
+                &mut args,
+                format!("{}:{CA_PATH}:ro", actions.anchor.display()),
+            );
+            text(&mut args, "--env".to_owned());
+            text(&mut args, format!("{CA_ENV}={CA_PATH}"));
+        }
         text(&mut args, "--".to_owned());
         text(&mut args, image.as_str().to_owned());
         for arg in ["-c", KEEPALIVE, "sentinel-runner-keepalive"] {
@@ -238,7 +301,7 @@ impl Plan {
         }
         text(&mut args, lifetime_secs.to_string());
         let rules = match network {
-            Network::Egress => Some(rules_for_guard(guard)?),
+            Network::Egress => Some(rules_for_guard(guard, actions.map(|a| a.address))?),
             Network::None => None,
         };
         Ok(Plan {
@@ -476,7 +539,7 @@ fn work_dir(dir: &Path) -> PathBuf {
     dir.join("work")
 }
 
-fn hex16(lease: RunnerLeaseId) -> String {
+pub(crate) fn hex16(lease: RunnerLeaseId) -> String {
     let mut text = String::with_capacity(32);
     for byte in lease.as_bytes() {
         let _ = write!(text, "{byte:02x}");
@@ -492,14 +555,14 @@ fn network_argument(network: Network) -> &'static str {
     }
 }
 
-fn rules_for_guard(guard: &net::Guard) -> Result<String> {
+fn rules_for_guard(guard: &net::Guard, endpoint: Option<Ipv4Addr>) -> Result<String> {
     let host = net::host_addresses()
         .map_err(|e| Error::Preparation(format!("the host's addresses: {e}")))?;
-    Ok(rules_for(&host, guard))
+    Ok(rules_for(&host, guard, endpoint))
 }
 
 /// The refusals of a container granted egress, as the nftables script its namespace loads.
-fn rules_for(host: &[Ipv4Addr], guard: &net::Guard) -> String {
+fn rules_for(host: &[Ipv4Addr], guard: &net::Guard, endpoint: Option<Ipv4Addr>) -> String {
     let nets = net::denied_nets(host, []);
     let endpoints = net::denied_endpoints(guard);
     let mut list = String::new();
@@ -536,6 +599,14 @@ fn rules_for(host: &[Ipv4Addr], guard: &net::Guard) -> String {
         out,
         "\t\ttype filter hook output priority filter; policy accept;"
     );
+    // The sandbox's cache and artifact endpoint is the one address the host must serve it on, so the
+    // accept comes before every refusal: the endpoint is the worker's own, by address and port.
+    if let Some(endpoint) = endpoint {
+        let _ = writeln!(
+            out,
+            "\t\toifname != \"lo\" ip daddr {endpoint} tcp dport {ACTIONS_PORT} accept"
+        );
+    }
     let _ = writeln!(out, "\t\toifname != \"lo\" ip daddr @denied_nets drop");
     let _ = writeln!(
         out,
@@ -550,6 +621,14 @@ fn rules_for(host: &[Ipv4Addr], guard: &net::Guard) -> String {
         out,
         "\t\ttype filter hook output priority filter; policy accept;"
     );
+    // The sandbox's cache and artifact endpoint is the one address the host must serve it on, so the
+    // accept comes before every refusal: the endpoint is the worker's own, by address and port.
+    if let Some(endpoint) = endpoint {
+        let _ = writeln!(
+            out,
+            "\t\toifname != \"lo\" ip daddr {endpoint} tcp dport {ACTIONS_PORT} accept"
+        );
+    }
     let _ = writeln!(out, "\t\toifname != \"lo\" drop");
     let _ = writeln!(out, "\t}}");
     let _ = writeln!(out, "}}");
@@ -571,22 +650,39 @@ mod tests {
         }
     }
 
+    fn image() -> Image {
+        Image::parse("ghcr.io/rusticstack/sentinel-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000").unwrap()
+    }
+
+    fn actions() -> Actions {
+        Actions {
+            address: Ipv4Addr::new(10, 0, 2, 2),
+            anchor: PathBuf::from("/var/lib/sentinel-worker/runners/x/ca.crt"),
+        }
+    }
+
+    fn limits() -> Limits {
+        Limits {
+            cpu_millis: 4_000,
+            memory_bytes: 8 << 30,
+            pids: PIDS,
+            disk_bytes: 40 << 30,
+            lifetime_secs: 0,
+        }
+    }
+
     fn plan(network: Network, guard: &net::Guard) -> Plan {
-        let image = Image::parse("ghcr.io/rusticstack/sentinel-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000").unwrap();
         Plan::new(
             Path::new("/var/lib/sentinel-worker"),
             WorkerId::new(),
             RunnerLeaseId::new(),
-            &image,
-            Limits {
-                cpu_millis: 4_000,
-                memory_bytes: 8 << 30,
-                pids: PIDS,
-                disk_bytes: 40 << 30,
-                lifetime_secs: 0,
+            &image(),
+            limits(),
+            &Grant {
+                network,
+                guard,
+                actions: Some(&actions()),
             },
-            network,
-            guard,
         )
         .unwrap()
     }
@@ -597,34 +693,38 @@ mod tests {
 
     #[test]
     fn a_lease_names_one_container_and_one_directory() {
-        let image = Image::parse("ghcr.io/x/runner@sha256:0000000000000000000000000000000000000000000000000000000000000000").unwrap();
         let lease = RunnerLeaseId::new();
-        let limits = Limits {
-            cpu_millis: 4_000,
-            memory_bytes: 8 << 30,
-            pids: PIDS,
-            disk_bytes: 0,
-            lifetime_secs: 60,
-        };
         let guard = net::Guard::default();
         let a = Plan::new(
             Path::new("/root"),
             WorkerId::new(),
             lease,
-            &image,
-            limits,
-            Network::None,
-            &guard,
+            &image(),
+            Limits {
+                lifetime_secs: 60,
+                ..limits()
+            },
+            &Grant {
+                network: Network::None,
+                guard: &guard,
+                actions: None,
+            },
         )
         .unwrap();
         let b = Plan::new(
             Path::new("/root"),
             WorkerId::new(),
             lease,
-            &image,
-            limits,
-            Network::None,
-            &guard,
+            &image(),
+            Limits {
+                lifetime_secs: 60,
+                ..limits()
+            },
+            &Grant {
+                network: Network::None,
+                guard: &guard,
+                actions: None,
+            },
         )
         .unwrap();
         // Two plans for one lease are the same sandbox: the lease decides the name and the path, so a
@@ -635,25 +735,28 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_without_an_image_or_for_a_reservation_too_small_takes_no_runner() {
-        let none = Policy::default();
-        assert!(!none.admits(4_000, 8 << 30));
-        let image = Image::parse("ghcr.io/x/runner@sha256:0000000000000000000000000000000000000000000000000000000000000000").unwrap();
+    fn a_worker_without_an_image_or_an_endpoint_or_for_a_reservation_too_small_takes_no_runner() {
+        assert!(!Policy::default().admits(4_000, 8 << 30));
         let named = Policy {
-            image: Some(image),
+            image: Some(image()),
             guard: net::Guard::default(),
+            actions: Some(Ipv4Addr::new(10, 0, 2, 2)),
         };
         assert!(named.admits(4_000, 8 << 30));
         assert!(!named.admits(0, 8 << 30));
         assert!(!named.admits(4_000, MIN_MEMORY_BYTES - 1));
         assert!(!named.admits(u64::from(u32::MAX) + 1, 8 << 30));
+        // An image and no endpoint address is a worker whose runners would cache at GitHub.
+        let no_endpoint = Policy {
+            actions: None,
+            ..named
+        };
+        assert!(!no_endpoint.admits(4_000, 8 << 30));
     }
 
     #[test]
     fn a_runner_image_must_be_pinned_by_digest() {
-        assert!(
-            Image::parse("ghcr.io/x/runner@sha256:0000000000000000000000000000000000000000000000000000000000000000").is_some()
-        );
+        assert!(Image::parse("ghcr.io/x/runner@sha256:0000000000000000000000000000000000000000000000000000000000000000").is_some());
         for unpinned in [
             "ghcr.io/x/runner:latest",
             "ghcr.io/x/runner",
@@ -667,8 +770,7 @@ mod tests {
 
     #[test]
     fn the_runner_takes_one_job_and_its_configuration_is_not_on_the_command_line() {
-        let g = guard();
-        let plan = plan(Network::None, &g);
+        let plan = plan(Network::None, &guard());
         let args = joined(plan.args());
         // The container is removed with the runner, and its writable paths are tmpfs or scratch.
         assert!(args.contains("--rm"), "{args}");
@@ -677,16 +779,70 @@ mod tests {
         assert!(args.contains(&format!("{WORK_MOUNT}:rw")), "{args}");
         assert!(args.contains("--network none"), "{args}");
         assert!(args.contains("--entrypoint /bin/sh"), "{args}");
-        // Nothing of the configuration, and no environment at all, is on the command line.
-        assert!(!args.contains("--env"), "{args}");
         assert!(!args.contains("--env-file"), "{args}");
         assert!(!args.contains("--jitconfig"), "{args}");
         // The container's keepalive is bounded, so a sandbox nobody stops cannot outlive it.
         assert!(args.ends_with("sentinel-runner-keepalive 21600"), "{args}");
     }
 
+    /// A sandbox resolves the cache and result hosts to its own worker and carries one anchor — its
+    /// own — as a path, never as a secret and never as a second environment variable.
     #[test]
-    fn nothing_of_the_host_is_mounted_but_the_leases_own_scratch() {
+    fn a_sandbox_names_the_two_service_hosts_and_carries_only_its_own_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiring = Actions {
+            address: Ipv4Addr::new(10, 0, 2, 2),
+            anchor: dir.path().join("ca.crt"),
+        };
+        let plan = Plan::new(
+            dir.path(),
+            WorkerId::new(),
+            RunnerLeaseId::new(),
+            &image(),
+            limits(),
+            &Grant {
+                network: Network::Egress,
+                guard: &guard(),
+                actions: Some(&wiring),
+            },
+        )
+        .unwrap();
+        let args = plan.args();
+        let hosts: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i > &0 && args[i - 1] == "--add-host")
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(
+            hosts,
+            vec![
+                &"artifactcache.actions.githubusercontent.com:10.0.2.2".to_owned(),
+                &"results-receiver.actions.githubusercontent.com:10.0.2.2".to_owned(),
+            ]
+        );
+        let joined = args.join(" ");
+        assert!(
+            joined.contains(&format!(
+                "{}:{CA_PATH}:ro",
+                dir.path().join("ca.crt").display()
+            )),
+            "{joined}"
+        );
+        assert!(joined.contains(&format!("{CA_ENV}={CA_PATH}")), "{joined}");
+        // The one environment variable this sandbox carries is a path.
+        let env: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i > &0 && args[i - 1] == "--env")
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(env.len(), 1, "{env:?}");
+        assert!(!joined.contains("TOKEN"), "{joined}");
+    }
+
+    #[test]
+    fn nothing_of_the_host_is_mounted_but_the_leases_own_scratch_and_its_anchor() {
         let plan = plan(Network::None, &guard());
         let volumes: Vec<&String> = plan
             .args()
@@ -695,28 +851,41 @@ mod tests {
             .filter(|(i, _)| plan.args()[i.saturating_sub(1)] == "--volume")
             .map(|(_, v)| v)
             .collect();
-        assert_eq!(volumes.len(), 1, "{volumes:?}");
+        assert_eq!(volumes.len(), 2, "{volumes:?}");
         assert!(
             volumes[0].ends_with(&format!(":{WORK_MOUNT}:rw")),
             "{volumes:?}"
         );
         assert!(volumes[0].starts_with(plan.dir().join("work").to_str().unwrap()));
+        assert!(
+            volumes[1].ends_with(&format!(":{CA_PATH}:ro")),
+            "{volumes:?}"
+        );
     }
 
     #[test]
     fn a_worker_without_egress_installs_no_rules_and_a_granted_one_installs_them_first() {
         let g = guard();
-        assert!(!Plan::new(
-            Path::new("/d"),
-            WorkerId::new(),
-            RunnerLeaseId::new(),
-            &Image::parse("ghcr.io/x/runner@sha256:0000000000000000000000000000000000000000000000000000000000000000").unwrap(),
-            Limits { cpu_millis: 1_000, memory_bytes: 1 << 30, pids: PIDS, disk_bytes: 0, lifetime_secs: 0 },
-            Network::None,
-            &g,
-        )
-        .unwrap()
-        .guarded());
+        assert!(
+            !Plan::new(
+                Path::new("/d"),
+                WorkerId::new(),
+                RunnerLeaseId::new(),
+                &image(),
+                Limits {
+                    cpu_millis: 1_000,
+                    memory_bytes: 1 << 30,
+                    ..limits()
+                },
+                &Grant {
+                    network: Network::None,
+                    guard: &g,
+                    actions: None,
+                },
+            )
+            .unwrap()
+            .guarded()
+        );
         assert!(plan(Network::Egress, &g).guarded());
     }
 
@@ -725,6 +894,7 @@ mod tests {
         let rules = rules_for(
             &[Ipv4Addr::new(192, 168, 7, 20), Ipv4Addr::new(127, 0, 0, 1)],
             &guard(),
+            Some(Ipv4Addr::new(10, 0, 2, 2)),
         );
         for net in [
             "0.0.0.0/8",
@@ -750,6 +920,13 @@ mod tests {
             rules.contains("oifname != \"lo\" ip daddr . th dport @denied_endpoints drop"),
             "{rules}"
         );
+        // The sandbox's own cache and artifact endpoint is accepted ahead of every refusal.
+        let accept = "oifname != \"lo\" ip daddr 10.0.2.2 tcp dport 443 accept";
+        assert!(rules.contains(accept), "{rules}");
+        assert!(
+            rules.find(accept).unwrap() < rules.find("@denied_nets drop").unwrap(),
+            "the endpoint accept must come before the refusals:\n{rules}"
+        );
         assert!(!rules.contains("2001:db8"), "{rules}");
         assert!(rules.contains("table ip6 sentinel_runner6"), "{rules}");
         assert!(rules.contains("oifname != \"lo\" drop"), "{rules}");
@@ -758,23 +935,24 @@ mod tests {
     #[test]
     fn staging_makes_only_the_leases_scratch_and_the_rules_it_will_load() {
         let dir = tempfile::tempdir().unwrap();
-        let image = Image::parse("ghcr.io/x/runner@sha256:0000000000000000000000000000000000000000000000000000000000000000").unwrap();
         let lease = RunnerLeaseId::new();
         let g = guard();
         let mut created = Plan::new(
             dir.path(),
             WorkerId::new(),
             lease,
-            &image,
+            &image(),
             Limits {
                 cpu_millis: 1_000,
                 memory_bytes: 1 << 30,
-                pids: PIDS,
-                disk_bytes: 0,
                 lifetime_secs: 60,
+                ..limits()
             },
-            Network::Egress,
-            &g,
+            &Grant {
+                network: Network::Egress,
+                guard: &g,
+                actions: None,
+            },
         )
         .unwrap();
         created.dir = dir.path().join("runners").join(hex16(lease));
