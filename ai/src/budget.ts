@@ -47,6 +47,16 @@ export function estimateTokens(text: string): number {
   return Math.ceil(weight / 3);
 }
 
+/** Two calls' reported usage as one request's, a component either of them left out staying `null`. */
+export function combined(first: ReportedUsage, second: ReportedUsage): ReportedUsage {
+  const add = (a: number | null, b: number | null) => (a === null || b === null ? null : a + b);
+  return {
+    input_tokens: add(first.input_tokens, second.input_tokens),
+    output_tokens: add(first.output_tokens, second.output_tokens),
+    cost_micros: add(first.cost_micros, second.cost_micros),
+  };
+}
+
 /** What one request at this prompt and these limits reserves. */
 export function reservation(prompt: string, limits: ModelLimits): Metered {
   const inputTokens = estimateTokens(prompt);
@@ -75,7 +85,7 @@ export function reportedUsage(answer: Answer, limits: ModelLimits): ReportedUsag
  * Tokens priced at `limits`, in millionths. Rounded up: a fraction of a micro is still a charge,
  * and rounding down would let every request in a month come out slightly free.
  */
-function price(inputTokens: number, outputTokens: number, limits: ModelLimits): number {
+export function price(inputTokens: number, outputTokens: number, limits: ModelLimits): number {
   const micros =
     (inputTokens * limits.inputMicrosPerMtok + outputTokens * limits.outputMicrosPerMtok) /
     1_000_000;

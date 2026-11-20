@@ -214,6 +214,7 @@ fn a_disable_deletes_the_queue_and_revokes_its_delegation_in_one_transaction() {
                 repo_of(tx, tenant)?,
                 attempt,
                 Provider::Local,
+                None,
                 Scopes::READ_ONLY,
                 NOW,
             )
@@ -248,6 +249,7 @@ fn a_disable_deletes_the_queue_and_revokes_its_delegation_in_one_transaction() {
                     repo_of(tx, tenant)?,
                     attempt,
                     Provider::OpenRouter,
+                    None,
                     Scopes::READ_ONLY,
                     NOW,
                 )
@@ -296,6 +298,7 @@ fn a_disable_deletes_the_queue_and_revokes_its_delegation_in_one_transaction() {
             repo_of(tx, f.tenant)?,
             attempt,
             Provider::Local,
+            None,
             Scopes::READ_ONLY,
             NOW,
         )

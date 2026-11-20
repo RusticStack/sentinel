@@ -21,6 +21,8 @@ const SERVICE = "service-grant";
 const row = {
   id: "air_00000000-0000-4000-8000-000000000002",
   attempt: "att_00000000-0000-4000-8000-000000000001",
+  kind: "analysis",
+  question: null,
   provider: "local",
   data_policy: "local_only",
   origin: "member",
@@ -28,7 +30,9 @@ const row = {
   outcome: null,
   reused: false,
   created_ms: 1_700_000_000_000,
-  deadline_ms: 1_700_000_900_000,
+  // Ten minutes out, as the controller writes it: a row with no time left is never sent to a
+  // provider, so every test that expects a call needs a live deadline.
+  deadline_ms: Date.now() + 600_000,
 };
 
 const claim = (scopes) => ({
