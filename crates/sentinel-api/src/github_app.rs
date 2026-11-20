@@ -362,11 +362,8 @@ fn set_tenant_migration(state: &State, request: &mut Request, slug: &str) -> Rou
         .with_detail("reason", "not_configured")),
         // Migration writes do not depend on runner mode, so this answer cannot arrive here; the two
         // switches share one vocabulary and this arm keeps that sharing honest.
-        Switch::NoRunnerMode => Err(err(
-            ErrorCode::Conflict,
-            "the tenant's runner mode is off",
-        )
-        .with_detail("reason", "runner_mode_off")),
+        Switch::NoRunnerMode => Err(err(ErrorCode::Conflict, "the tenant's runner mode is off")
+            .with_detail("reason", "runner_mode_off")),
     }
 }
 
