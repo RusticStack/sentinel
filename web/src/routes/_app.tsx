@@ -47,6 +47,7 @@ function AppShell() {
     { label: "Queue", icon: "list-ordered", to: `/t/${active}/queue` },
     { label: "Workers", icon: "server", to: `/t/${active}/workers` },
     { label: "GitHub sync", icon: "refresh-cw", to: `/t/${active}/sync` },
+    ...(role === "admin" || me?.super_admin ? [{ label: "Migration", icon: "git-merge", to: `/t/${active}/migration` }] : []),
     { label: "Settings", icon: "settings", to: `/t/${active}/settings` },
     ...(role === "admin" || me?.super_admin ? [{ label: "Tenant admin", icon: "users", to: `/t/${active}/admin` }] : []),
   ] : [];
