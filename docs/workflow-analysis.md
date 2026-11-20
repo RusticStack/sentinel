@@ -85,19 +85,19 @@ The class is always a label the worker vocabulary accepts: `RunnerClass::parse` 
 |---|---|---|
 | `on: push`, `pull_request`, `merge_group`, `workflow_dispatch` | translatable | — |
 | `on: schedule` | unsupported | durable schedules do not exist yet (I02) |
-| `on: workflow_call`, `workflow_run` | unsupported | reusable pipelines and workflow chaining (I10) |
+| `on: workflow_call`, `workflow_run` | unsupported | reusable pipelines and workflow chaining are not in the schema ([pipeline schema](pipeline-schema.md)) |
 | `on: pull_request_target` | unsupported | the privileged context has no native equivalent |
 | any other event | unsupported | no native trigger exists for it |
 | `permissions` | with change | the source credential's scopes replace `GITHUB_TOKEN`; no ambient token |
 | `concurrency`, `env`, `needs`, `timeout-minutes`, `run`, `working-directory` | translatable | — |
 | `defaults` | with change | steps run under sh or bash; `defaults.run` becomes the step's `shell` and `workdir` |
 | `if` (job or step) | with change | a pipeline condition in the expression language, type-checked at compile time |
-| `strategy.matrix` | with change | one declared job per cell; bounded matrices (I10) |
+| `strategy.matrix` | with change | one declared job per matrix cell; a pipeline may declare the `matrix` itself, which version 2 of this table would generate ([pipeline schema](pipeline-schema.md#matrices)) |
 | `container` | unsupported | needs a Docker daemon, which only a microVM sandbox offers (I08) |
-| `services` | unsupported | needs a Docker daemon (I08); service containers (I10) |
-| `environment` | unsupported | deployment environments are not modelled |
+| `services` | unsupported | needs a Docker daemon (I08); service containers are not in the schema ([pipeline schema](pipeline-schema.md)) |
+| `environment` | unsupported | deployment environments and OIDC are not modelled ([pipeline schema](pipeline-schema.md)) |
 | `outputs` | with change | a job's outputs become each step's declared `outputs` and the job's re-exported `outputs`, plain text in the run's record |
-| `jobs.<id>.uses` | unsupported | reusable pipelines (I10) |
+| `jobs.<id>.uses` | unsupported | reusable pipelines are not in the schema ([pipeline schema](pipeline-schema.md)) |
 | `continue-on-error` | unsupported | a failing step fails its job |
 | `shell: sh`, `shell: bash` | translatable | — |
 | another `shell` | unsupported | only sh and bash are available |

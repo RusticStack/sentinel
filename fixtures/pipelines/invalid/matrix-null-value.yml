@@ -1,0 +1,9 @@
+# expect: jobs.build.matrix.jdk[0]: expected string, integer or boolean, found null
+schema: 1
+on: [push]
+jobs:
+  build:
+    matrix:
+      jdk: [null]
+    image: busybox
+    steps: [{id: s, run: echo}]

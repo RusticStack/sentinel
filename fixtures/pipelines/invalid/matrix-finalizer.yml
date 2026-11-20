@@ -1,0 +1,10 @@
+# expect: jobs.build.finalize.run: `matrix.jdk` reaches a job's image, env, run, if and cache keys; it cannot be used here
+schema: 1
+on: [push]
+jobs:
+  build:
+    matrix:
+      jdk: ["17"]
+    image: busybox
+    steps: [{id: s, run: echo}]
+    finalize: {run: "notify ${{ matrix.jdk }}"}

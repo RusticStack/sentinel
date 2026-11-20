@@ -50,7 +50,7 @@ Status (2026-10-28): **not yet confirmed.** The mirror URLs are private runner c
 | `actions/checkout` | Compiled checkout manifest at the pinned revision ([sources](sources.md)) |
 | `setup-go`, `setup-java`, `dtolnay/rust-toolchain` | A digest-pinned toolchain image; record the selected version and never silently substitute it |
 | Dependency and compiler caches | Sentinel cache classes per [recipes](recipes.md), scoped by tenant, repository, trust and toolchain |
-| `strategy.matrix` | One declared job per cell until bounded matrices exist |
+| `strategy.matrix` | The job's `matrix`, one job per cell ([pipeline schema](pipeline-schema.md#matrices)); the committed pilot files state one job per JDK because they pin the lanes that were measured |
 | `$GITHUB_OUTPUT`, `$GITHUB_ENV`, `$GITHUB_PATH` | Typed context and declared environment; outputs only when output contracts are implemented |
 | `schedule` | Durable schedules; scheduled scopes remain external until then |
 | `permissions:`, `GITHUB_TOKEN` | Scoped source credentials with no ambient or publishing token |

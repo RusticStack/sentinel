@@ -1,0 +1,9 @@
+# expect: jobs.build.matrix.jdk[0]: a matrix value is 1 to 64 bytes on one line
+schema: 1
+on: [push]
+jobs:
+  build:
+    matrix:
+      jdk: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    image: busybox
+    steps: [{id: s, run: echo}]

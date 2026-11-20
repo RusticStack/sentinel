@@ -1,0 +1,9 @@
+# expect: jobs.build.image: `matrix.jdk` names no matrix axis this job declares
+schema: 1
+on: [push]
+jobs:
+  build:
+    matrix:
+      target: [x86_64]
+    image: "busybox:${{ matrix.jdk }}"
+    steps: [{id: s, run: echo}]

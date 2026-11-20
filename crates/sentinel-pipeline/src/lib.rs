@@ -7,6 +7,7 @@ pub mod expr;
 pub(crate) mod glob;
 pub mod hash_files;
 pub mod input;
+pub mod matrix;
 pub mod policy;
 pub mod reuse;
 pub mod run;
@@ -24,7 +25,9 @@ pub use hash_files::hash_files;
 pub use input::{InputError, InputKind, InputSpec, InputValue, Inputs};
 pub use policy::{Event, EventKind, RefFilter, Triggers};
 pub use run::{ImageRef, PinnedSource, RunSpec, StepCommand};
-pub use schema::{Document, Pipeline, ResourcePolicy, SCHEMA_VERSION, SchemaError};
+pub use schema::{
+    DeclaredJob, Document, MatrixAxis, Pipeline, ResourcePolicy, SCHEMA_VERSION, SchemaError,
+};
 pub use yaml::YamlError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

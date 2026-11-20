@@ -1,0 +1,15 @@
+# expect: jobs.deploy.handoff: `build` is 2 jobs: build (17), build (21); a handoff takes one job's artifact
+schema: 1
+on: [push]
+jobs:
+  build:
+    matrix:
+      jdk: ["17", "21"]
+    image: busybox
+    steps: [{id: s, run: echo}]
+    artifacts: [{name: app, paths: [out]}]
+  deploy:
+    needs: [build]
+    image: busybox
+    handoff: [{from: build, artifact: app, into: dist}]
+    steps: [{id: s, run: echo}]

@@ -1,0 +1,10 @@
+# expect: jobs.build.matrix: two combinations both render the cell name `build (x, y, z)`
+schema: 1
+on: [push]
+jobs:
+  build:
+    matrix:
+      a: ["x, y", x]
+      b: [z, "y, z"]
+    image: busybox
+    steps: [{id: s, run: echo}]

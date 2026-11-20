@@ -124,7 +124,7 @@ pub fn prepare(
         inputs: &inputs,
     });
     let tenant = job.context.tenant.unwrap_or(attach::UNKNOWN_TENANT);
-    let name = job.context.job_name.clone();
+    let name = entry_id(&job.context.job_name);
     let Ok(scope) = Scope::new(
         tenant,
         job.context.repo,
@@ -190,6 +190,28 @@ pub fn prepare(
             note: Note::Miss,
         }),
     }
+}
+
+/// The id a job's result lives under. A declared job is already an id and keeps it, so no entry that
+/// exists today moves. A matrix cell's name (`build (17)`) is not one a document can write, so it is
+/// spelled as an id — every byte an id cannot hold becomes `-`, a digest of the exact name keeps two
+/// spellings apart — rather than leaving the cell unable to reuse at all.
+fn entry_id(job_name: &str) -> String {
+    if sentinel_pipeline::schema::valid_id(job_name) {
+        return job_name.to_owned();
+    }
+    const TAIL: usize = 16;
+    let mut out = String::with_capacity(64);
+    for byte in job_name.bytes() {
+        let keep = byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_';
+        out.push(char::from(if keep { byte } else { b'-' }));
+    }
+    out.truncate(sentinel_pipeline::schema::MAX_ID_BYTES - TAIL - 1);
+    out.push('-');
+    for byte in &blake3::hash(job_name.as_bytes()).as_bytes()[..TAIL / 2] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 const fn schema_isolation(isolation: Isolation) -> sentinel_pipeline::schema::Isolation {
@@ -395,6 +417,55 @@ mod tests {
         assert_eq!(record.files, 1);
         assert_eq!(record.bytes, 6);
         assert!(record.restore_ns.is_some());
+    }
+
+    /// A matrix cell's name is not an id, and its result is reusable anyway: the entry is spelled as one
+    /// instead of the cell silently executing every time, and two cells of one job are two entries.
+    #[test]
+    fn a_matrix_cells_result_is_reusable() {
+        let boxed = Box_::new("one");
+        let mut job = boxed.job(spec(OPTED_IN));
+        job.context.job_name = "build (17)".into();
+        let Decision::Execute {
+            seal: Some(_),
+            note,
+        } = boxed.decide(&mut job, Isolation::Container)
+        else {
+            panic!("a cell with a name no id allows must still be able to seal");
+        };
+        assert!(matches!(note, Note::Miss), "{}", note.as_str());
+        let decision = boxed.decide(&mut job, Isolation::Container);
+        boxed.pass(&mut job, decision);
+
+        fs::remove_file(boxed.workspace.join("out/result.bin")).unwrap();
+        let mut again = boxed.job(spec(OPTED_IN));
+        again.context.job_name = "build (17)".into();
+        let Decision::Served(served) = boxed.decide(&mut again, Isolation::Container) else {
+            panic!("the sealed result must be served");
+        };
+        assert!(
+            sentinel_pipeline::schema::valid_id(&served.record.entry),
+            "the entry is an id: {}",
+            served.record.entry
+        );
+        assert!(
+            served.record.entry.starts_with("build"),
+            "{}",
+            served.record.entry
+        );
+
+        // Another cell of the same job is another entry, not a result of the first.
+        fs::remove_file(boxed.workspace.join("out/result.bin")).unwrap();
+        let mut other = boxed.job(spec(OPTED_IN));
+        other.context.job_name = "build (21)".into();
+        let Decision::Execute {
+            seal: Some(_),
+            note,
+        } = boxed.decide(&mut other, Isolation::Container)
+        else {
+            panic!("a second cell must not serve the first cell's result");
+        };
+        assert!(matches!(note, Note::Miss), "{}", note.as_str());
     }
 
     #[test]

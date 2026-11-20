@@ -22,6 +22,11 @@ Names are stable on purpose: a repository protects `sentinel / ci` as a
 required check, and it must mean the same thing on every run. Per-job checks
 are namespaced so a required aggregate is never satisfied by a partial run.
 
+A matrix's cell is a compiled job, so it publishes its own check under its own name, and that name is
+the declaration's values on every run: `build` over `jdk: ['17', '21']` publishes
+`sentinel / build (17)` and `sentinel / build (21)`
+([pipeline schema](pipeline-schema.md#matrices)).
+
 A document that declares named pipelines namespaces them by pipeline
 ([pipeline schema](pipeline-schema.md#named-pipelines)): the `acceptance`
 pipeline publishes `sentinel / acceptance` and `sentinel / acceptance / <job>`,
