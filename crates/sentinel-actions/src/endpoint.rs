@@ -76,6 +76,18 @@ impl Endpoint {
     /// pinned clients dial — 443 — and a test states its own. It serves no route until [`Self::bind_scope`]:
     /// a sandbox that has not been told its provenance has no boundary that is always right.
     pub fn bind(ca: &SandboxCa, store: Arc<Store>, address: SocketAddr) -> crate::Result<Endpoint> {
+        Endpoint::bind_with(ca, store, address, None)
+    }
+
+    /// A listener that publishes what it seals: the worker's own, whose artifacts are the tenant's rows
+    /// in the controller's store rather than files only this host knows about. The publisher is held by
+    /// the accept loop for the endpoint's life.
+    pub fn bind_with(
+        ca: &SandboxCa,
+        store: Arc<Store>,
+        address: SocketAddr,
+        publisher: Option<Arc<dyn crate::Publisher>>,
+    ) -> crate::Result<Endpoint> {
         let config = ca.server_config()?;
         let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
@@ -84,6 +96,7 @@ impl Endpoint {
         let stats = Arc::new(Stats::default());
         let stop = Arc::new(AtomicBool::new(false));
         let live = Arc::new(AtomicU64::new(0));
+        let publishing = publisher;
         let join = {
             let scope = Arc::clone(&scope);
             let stats = Arc::clone(&stats);
@@ -104,10 +117,11 @@ impl Endpoint {
                                 let stats = Arc::clone(&stats);
                                 let live = Arc::clone(&live);
                                 let bound = Arc::clone(&store);
+                                let publisher = publishing.clone();
                                 let _ = std::thread::Builder::new()
                                     .name("sentinel-actions-conn".to_owned())
                                     .spawn(move || {
-                                        serve(stream, config, scope, bound, stats);
+                                        serve(stream, config, scope, bound, stats, publisher);
                                         live.fetch_sub(1, Ordering::AcqRel);
                                     });
                             }
@@ -175,6 +189,7 @@ fn serve(
     scope: Arc<RwLock<Option<Scope>>>,
     store: Arc<Store>,
     stats: Arc<Stats>,
+    publisher: Option<Arc<dyn crate::Publisher>>,
 ) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(IDLE));
@@ -192,7 +207,7 @@ fn serve(
         };
         let keep = request.keep_alive();
         let bound = *scope.read().unwrap_or_else(|e| e.into_inner());
-        let response = dispatch(&mut request, bound.as_ref(), &store);
+        let response = dispatch_with(&mut request, bound.as_ref(), &store, publisher.as_deref());
         if response.status < 300 {
             stats.served.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -214,6 +229,17 @@ pub fn dispatch<S: Read + Write>(
     scope: Option<&Scope>,
     store: &Store,
 ) -> Response {
+    dispatch_with(request, scope, store, None)
+}
+
+/// The same surface, with the publisher a sealed artifact is offered to. A listener without one keeps
+/// its artifacts on its own disk.
+pub fn dispatch_with<S: Read + Write>(
+    request: &mut Request<'_, S>,
+    scope: Option<&Scope>,
+    store: &Store,
+    publisher: Option<&dyn crate::Publisher>,
+) -> Response {
     if request.method == "CONNECT" {
         let _ = request.body.discard();
         return refusal(&request.path, Refusal::Tunnel);
@@ -226,7 +252,7 @@ pub fn dispatch<S: Read + Write>(
         return cache::serve(request, scope, store);
     }
     if (request.path.starts_with(TWIRP) || request.path.starts_with(BLOB))
-        && let Some(response) = artifact::serve(request, scope, store)
+        && let Some(response) = artifact::serve(request, scope, store, publisher)
     {
         return response;
     }

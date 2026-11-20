@@ -27,7 +27,7 @@ use sentinel_link::{
     controller::Controller,
     identity::Identity,
     runner::Policy,
-    session::{self, Capacity, Executor, Offer, RunnerLeaseWire},
+    session::{self, ArtifactCode, Capacity, Executor, Offer, RunnerLeaseWire},
     worker,
 };
 use sentinel_protocol::{
@@ -477,6 +477,8 @@ struct Runners {
     /// Any pipeline-secret bundle that reached this worker, which runner mode never sends.
     bundles: AtomicUsize,
     reporter: Mutex<Option<session::Reporter>>,
+    /// What the controller answered about a runner-mode artifact, in arrival order.
+    verdicts: Mutex<Vec<([u8; 16], ArtifactCode)>>,
 }
 
 impl Runners {
@@ -488,6 +490,7 @@ impl Runners {
             held: Mutex::new(Vec::new()),
             bundles: AtomicUsize::new(0),
             reporter: Mutex::new(None),
+            verdicts: Mutex::new(Vec::new()),
         })
     }
 
@@ -505,6 +508,10 @@ impl Runners {
 
     fn bundles(&self) -> usize {
         self.bundles.load(Ordering::SeqCst)
+    }
+
+    fn verdicts(&self) -> Vec<([u8; 16], ArtifactCode)> {
+        self.verdicts.lock().unwrap().clone()
     }
 }
 
@@ -533,6 +540,9 @@ impl Executor for Runners {
         Vec::new()
     }
     fn renewed(&self, _: UnixMillis) {}
+    fn runner_artifact_answered(&self, lease: [u8; 16], _name: &str, code: ArtifactCode) {
+        self.verdicts.lock().unwrap().push((lease, code));
+    }
     fn attached(&self, reporter: session::Reporter) {
         *self.reporter.lock().unwrap() = Some(reporter);
     }
@@ -579,7 +589,7 @@ impl WorkerProcess {
             name: "builder".into(),
             hello: Hello {
                 protocol_min: ProtocolVersion(1),
-                protocol_max: ProtocolVersion(13),
+                protocol_max: ProtocolVersion(18),
                 capabilities: Capabilities::REQUIRED,
                 arch: Arch::X86_64,
                 software: "runner".into(),
@@ -776,6 +786,103 @@ fn a_configuration_is_delivered_once_and_never_again() {
     });
     assert_eq!(d.github.generated(), 1);
     assert!(d.github.removed() >= 1, "and its registration goes with it");
+}
+
+/// What a sandbox's `upload-artifact` sealed is the tenant's artifact: published under the boundary its
+/// lease named, it is one row of the GitHub run and job, with the store's own bytes, charged against the
+/// repository and tenant, and it refuses a name the job already holds rather than storing it twice.
+#[test]
+fn a_runner_artifact_is_published_into_the_tenants_store_under_its_github_job() {
+    let github = Github::start();
+    let d = deployment(github);
+    d.serve(120_000, 60_000);
+    let runners = Runners::new();
+    let process = WorkerProcess::start(&d, Arc::clone(&runners), &[CLASS]);
+    d.queued(7);
+    eventually("a lease is held", || !runners.runner_held().is_empty());
+    let lease = runners.runner_held()[0];
+    let runner_name = d
+        .store
+        .read(move |c| {
+            sentinel_store::runner_provision::get(
+                c,
+                sentinel_core::RunnerLeaseId::from_bytes(lease).unwrap(),
+            )
+        })
+        .unwrap()
+        .expect("the lease row")
+        .runner_name;
+    let (tenant, repo) = (d.tenant, d.repo);
+    let bound = d
+        .store
+        .writer()
+        .write(move |tx| {
+            sentinel_store::runner_provision::bind(
+                tx,
+                tenant,
+                repo,
+                &runner_name,
+                7,
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+    assert!(bound.is_some(), "the lease was bound to job 7");
+    let reporter = runners
+        .reporter
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the worker's session");
+    let bytes = b"PK\x03\x04runner artifact";
+    let digest = *blake3::hash(bytes).as_bytes();
+    reporter
+        .runner_artifact_begin(lease, "dist", bytes.len() as u64, digest)
+        .unwrap();
+    reporter.runner_artifact_data(lease, 0, bytes).unwrap();
+    reporter.runner_artifact_end(lease, "dist").unwrap();
+    eventually("the offer is answered", || !runners.verdicts().is_empty());
+    assert_eq!(
+        runners.verdicts().first().map(|(_, code)| *code),
+        Some(ArtifactCode::Stored),
+        "the begin is granted"
+    );
+    eventually("answered twice", || runners.verdicts().len() >= 2);
+    let answered = runners.verdicts();
+    assert_eq!(
+        answered.last().map(|(_, code)| *code),
+        Some(ArtifactCode::Stored),
+        "{answered:?}"
+    );
+    let rows = d
+        .store
+        .read(move |c| sentinel_store::artifacts::for_runner_run(c, tenant, repo, 1007))
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].name, "dist");
+    assert_eq!(rows[0].bytes, bytes.len() as u64);
+    assert_eq!(rows[0].github_job, Some(7));
+    assert_eq!(rows[0].class, "standard");
+    assert_eq!(rows[0].state, sentinel_store::artifacts::State::Captured);
+    assert!(rows[0].manifest_version.is_some());
+
+    // The same name again is a duplicate rather than a second row: a runner job's artifact is one
+    // artifact of that GitHub job.
+    reporter
+        .runner_artifact_begin(lease, "dist", bytes.len() as u64, digest)
+        .unwrap();
+    eventually("refused as a duplicate", || {
+        runners
+            .verdicts()
+            .iter()
+            .any(|(_, code)| *code == ArtifactCode::Duplicate)
+    });
+    let rows = d
+        .store
+        .read(move |c| sentinel_store::artifacts::for_runner_run(c, tenant, repo, 1007))
+        .unwrap();
+    assert_eq!(rows.len(), 1, "a duplicate holds no second row");
+    process.stop();
 }
 
 /// The numbers behind the demand-source decision (docs/intake.md): what the webhook path costs

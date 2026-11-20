@@ -755,6 +755,51 @@ pub fn bound_scopes(conn: &Connection, worker: WorkerId) -> Result<Vec<BoundScop
     Ok(out)
 }
 
+/// The boundary one lease is bound to, if `worker` holds it: the tenant, repository, GitHub run and job,
+/// and the trust the job's provenance allows. A lease nobody has taken yet, one another worker holds, or
+/// one that is over has no boundary, so nothing can be filed under it.
+pub fn bound_scope(
+    conn: &Connection,
+    worker: WorkerId,
+    lease: RunnerLeaseId,
+) -> Result<Option<BoundScope>> {
+    let row = conn
+        .prepare_cached(
+            "SELECT l.tenant_id, l.repo_id, l.job_id, j.run_id, j.fork_pr
+             FROM runner_leases l
+             JOIN runner_jobs j ON j.tenant_id = l.tenant_id AND j.repo_id = l.repo_id
+                               AND j.job_id = l.job_id
+             WHERE l.id = ?1 AND l.worker_id = ?2 AND l.job_id IS NOT NULL AND l.released_ms IS NULL",
+        )?
+        .query_row(params![lease.as_bytes(), worker.as_bytes()], |r| {
+            Ok((
+                r.get::<_, [u8; 16]>(0)?,
+                r.get::<_, [u8; 16]>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+            ))
+        })
+        .optional()?;
+    let Some((tenant, repo, job, run, fork)) = row else {
+        return Ok(None);
+    };
+    let (Ok(tenant), Ok(repo)) = (TenantId::from_bytes(tenant), RepoId::from_bytes(repo)) else {
+        return Err(Error::Corrupt("runner scope ids"));
+    };
+    let (Ok(job), Ok(run)) = (u64::try_from(job), u64::try_from(run)) else {
+        return Err(Error::Corrupt("runner scope numbers"));
+    };
+    Ok(Some(BoundScope {
+        lease,
+        tenant,
+        repo,
+        trust: Trust::of_runner_job(fork.is_some_and(|f| f != 0)),
+        run,
+        job,
+    }))
+}
+
 /// The GitHub job finished (or was cancelled): end the lease that took it. A job no lease took —
 /// one GitHub ran elsewhere — changes nothing.
 pub fn complete(
