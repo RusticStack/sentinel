@@ -56,6 +56,11 @@ jobs:                           # 1–64, names [a-z0-9][a-z0-9_-]{0,63}
     secrets: [DEPLOY_TOKEN]     # ≤ 16 names [A-Z_][A-Z0-9_]*; values never appear in YAML
 ```
 
+A document may also declare *named* pipelines and typed *inputs* beside the pipeline above — see
+[named pipelines](#named-pipelines) and [inputs](#inputs). The shape above is the document's unnamed
+pipeline, and a document that declares no named pipeline compiles, digests and publishes exactly as it
+did before those keys existed.
+
 Unknown keys anywhere are rejected with their path, for example `jobs.test: unknown key `imgae``. Durations are `<int>s|m|h` sums such as `1h30m`. Sizes use binary units only, `MiB` or `GiB`. CPU is whole cores or a quoted decimal such as `"0.5"`, stored as millicores: plain digits only (no sign), at most three decimals, so `"+4"`, `"0.+5"` and `"0.5555"` are errors rather than being read or truncated. Paths are normalised relative paths with no `..`, `//`, leading `./` or trailing `/`; cache paths may also be absolute inside the container but never `/`. `concurrency.group` and cache `key` are templates; job and step `if` are expressions (see below).
 
 **`on.merge_group`.** A merge-queue group: `checks_requested` when GitHub builds a
@@ -152,7 +157,7 @@ The spec is persisted as one format byte plus a postcard-encoded blob in the sto
 `${{ … }}` in templates and the `if:` keys use one bounded grammar, parsed once at compile time into an AST stored with the run spec:
 
 - Literals: `'single quoted'` (`''` escapes a quote), integers, `true`, `false`, `null`.
-- Context paths: `event.name|ref|base_ref|sha|key|pr_number`, `repo.id|name`, `run.id`, `job.id|name`, `needs.<job>.result`. Any other root or field is a compile error, so a typo cannot evaluate to null.
+- Context paths: `event.name|ref|base_ref|sha|key|pr_number`, `repo.id|name`, `run.id`, `job.id|name`, `needs.<job>.result`, `inputs.<name>`. Any other root or field is a compile error, so a typo cannot evaluate to null, and `inputs.<name>` must name an input the pipeline declares.
 - Operators: `==`, `!=` (same-type only, `null` compares with anything), `!`, `&&`, `||` (short-circuit, boolean operands only), parentheses. Comparisons do not chain.
 - Functions: `success()`, `failure()`, `always()`, `cancelled()`, `contains(a, b)`, `starts_with(a, b)`, `ends_with(a, b)`, `hash_files('pattern', …)`. Nothing else: no arithmetic, no string building, no user functions, no network.
 - Limits: 1,024 bytes, 256 tokens, depth 16, 8 arguments, 4 path segments.
@@ -168,8 +173,9 @@ The event paths are real values recorded as the run's immutable provenance
 | `event.base_ref` | the pull request's or merge group's base branch (`main`); `null` for anything else |
 | `event.pr_number` | the pull request number; `null` for anything else, including a merge group, which may hold several |
 | `event.key` | a short, stable key: the branch or tag name, `pr-<n>`, the queue branch's path for a merge group, `manual`, or the ref a scheduled occurrence read |
+| `inputs.<name>` | the value this run was given for a declared input: a string, a choice's string, a boolean or an integer |
 
-Evaluation is phased. Each path and function has a minimum phase, and an expression evaluated earlier yields an `Unresolved` error rather than a default: `event`, `repo`, `run`, `job` and `cancelled()` at **dispatch**; `needs.*`, `success()`, `failure()`, `always()` at **schedule** (once every dependency is terminal); `hash_files` at **worker** (after the pinned checkout). The compiler enforces placement: `concurrency.group` may only use dispatch context; a job `if` may not use `hash_files` and may only name jobs in its own `needs`; step `if` and cache keys may use everything but also only name jobs in `needs`. A condition must be a boolean: the compiler types every `if` and rejects, with the path of the key, a comparison between types that can never match (`event.ref == 7`, `event.pr_number == 'x'`), a boolean operator or function over a value that is not always a boolean (`!event.ref`, `event.base_ref || true`), and a result that is not a boolean (`if: event.ref`). `null` compares with anything. A condition that compiled therefore cannot fail with a type error when it is evaluated. `success()` and `failure()` summarise dependency outcomes (`failure()` is true when any dependency did not succeed, `success()` when all passed or were skipped by their own condition); `always()` is true unless the run is cancelled.
+Evaluation is phased. Each path and function has a minimum phase, and an expression evaluated earlier yields an `Unresolved` error rather than a default: `event`, `repo`, `run`, `job`, `inputs.*` and `cancelled()` at **dispatch**; `needs.*`, `success()`, `failure()`, `always()` at **schedule** (once every dependency is terminal); `hash_files` at **worker** (after the pinned checkout). The compiler enforces placement: `concurrency.group` may only use dispatch context; a job `if` may not use `hash_files` and may only name jobs in its own `needs`; step `if` and cache keys may use everything but also only name jobs in `needs`. A condition must be a boolean: the compiler types every `if` — with `inputs.<name>` typed by its declaration — and rejects, with the path of the key, a comparison between types that can never match (`event.ref == 7`, `event.pr_number == 'x'`, `inputs.count == 'x'`), a boolean operator or function over a value that is not always a boolean (`!event.ref`, `event.base_ref || true`), and a result that is not a boolean (`if: event.ref`). `null` compares with anything. A condition that compiled therefore cannot fail with a type error when it is evaluated. `success()` and `failure()` summarise dependency outcomes (`failure()` is true when any dependency did not succeed, `success()` when all passed or were skipped by their own condition); `always()` is true unless the run is cancelled.
 
 **Job conditions.** A job's `if` is evaluated by the controller at the schedule phase, once every job in `needs` is terminal, with the run's event, repository, run and job facts, `needs.<job>.result` and the dependency summary (the same values the worker later gives a step's `if`; `hash_files` is a compile error there). A job with an `if` always starts `Blocked`, even with no `needs`, and is decided as soon as its event is recorded. The decision:
 
@@ -197,6 +203,110 @@ Three kinds of binding connect a job to state outside its container, and each is
 
 `sentinel pipeline validate <file>` runs the same loader, decoder and compiler as the server on any platform, prints nothing on success, and on failure prints `<file>: <stage>: <path>: <message>` and exits 1. `sentinel pipeline explain <file> [--json]` prints the compiled view: digest, triggers (with their ref filters), concurrency, every job in execution order with its dependencies, image and pin status, condition, budgets, steps, caches, artifacts and secrets; a **requires** section (repository read, secret names to grant, cache scopes, artifact storage, registry access for unpinned images); and an **unresolved until runtime** list naming each expression with the phase that resolves it. Nothing unresolved is given a value: `hash_files` keys are shown as their template, secrets as names, and unpinned images as needing resolution at first pull. `--json` emits the `sentinel.explain/1` shape for tools and agents; `trigger_filters` lists each declared kind's patterns (empty for an unfiltered kind).
 
+## Named pipelines
+
+A document may declare several named pipelines beside its unnamed one. Each is a whole pipeline —
+its own `on:`, `concurrency:`, `inputs:` and `jobs:` — and each compiles into its own immutable
+spec, its own runs and its own checks:
+
+```yaml
+schema: 1                    # still 1: `pipelines`, `inputs` and `inputs.<name>` are additive keys
+on: [push]                   # the unnamed pipeline, unchanged
+jobs: {…}
+pipelines:                   # 1–16 names, [a-z0-9][a-z0-9_-]{0,63}
+  acceptance:
+    on:
+      pull_request: {branches: [main]}
+    concurrency: {group: "${{ repo.id }}:acceptance", cancel_in_progress: true}
+    jobs: {…}
+  release:
+    on:
+      tag: {tags: ["v*"]}
+    jobs: {…}
+```
+
+- **One event, one run per matching pipeline.** A delivery runs every pipeline whose `on:` admits it,
+  in the document's order (the unnamed pipeline first, then the named ones by name), and each run is
+  created with its own spec, its own jobs and its own provenance naming the delivery. A pipeline no
+  trigger of which matches is not run; a delivery none of them matches settles `ignored:no_trigger`
+  as before. The whole set is created in one transaction, so a delivery produces either all of its
+  runs or none, and every run's provenance names the delivery it came from
+  ([intake](intake.md#resolution)).
+- **One schedule, one run per schedule-enabled pipeline.** An occurrence runs every pipeline that
+  states `on.schedule: true` the same way ([schedules](schedules.md)).
+- **Check identity is namespaced by the pipeline.** The unnamed pipeline publishes `sentinel / ci`
+  and `sentinel / <job>`, exactly the names it always has. A named pipeline publishes
+  `sentinel / <name>` and `sentinel / <name> / <job>` ([checks](checks.md#what-is-published)). The
+  identity is the name and the job name and nothing else, so it is the same on every run: a
+  repository protects `sentinel / acceptance` and gets that check from the `acceptance` pipeline.
+- **No name is reserved.** Sentinel ships no list of pipeline names and no rule that reads a name's
+  spelling: `ci`, `release` and `deploy` are a repository's to use, and the only names Sentinel
+  derives are the namespaced check names above. Nothing a repository calls a pipeline is a Sentinel
+  concept; a GitHub workflow's names never decide anything here.
+- **One name, one check.** A document that gives one check name two meanings is refused, naming
+  both: a named pipeline `acceptance` beside an unnamed job `acceptance` (both publish
+  `sentinel / acceptance`) is `pipelines.acceptance: check `sentinel / acceptance` is also the
+  unnamed pipeline's job `acceptance`; name one of them differently`. Because a job or pipeline name
+  cannot contain `/` or a space, namespaces can only collide where the document itself makes them.
+  The unnamed pipeline keeps the names it always published, a job called `ci` included: nothing an
+  older document declared changes meaning.
+- **Concurrency groups are scoped by the pipeline.** A named pipeline's rendered group is
+  `<name>: <group>`, so two pipelines never share a group even when their templates render to the
+  same text, and one pipeline's `cancel_in_progress` replaces its own previous run and never
+  another pipeline's ([dispatch](core-contracts.md)). The unnamed pipeline's group is the rendered
+  template, byte for byte as before.
+- **Reports stay per pipeline.** A refused *delivery* publishes the single `sentinel / ci` it always
+  has, because it produced no run to carry a pipeline name; a named pipeline's own aggregate is
+  published by its runs.
+
+## Inputs
+
+A pipeline may declare inputs: typed values a **manual dispatch** passes, each with a bound that a
+request must respect.
+
+```yaml
+pipelines:
+  focus:
+    on: [manual]
+    inputs:                          # 1–16, names [a-z][a-z0-9_]{0,31}
+      target:                        # required: no default
+        type: string
+        min_length: 1                # optional, 0..max_length
+        max_length: 40               # required, 1–1024
+      worker_count:
+        type: integer
+        min: 1                       # required
+        max: 8                       # required, greater than min
+        default: 2                   # optional; within the bound
+      full: {type: boolean, default: false}      # bounded by construction
+      profile:
+        type: choice
+        values: [debug, release]     # required, 1–32 distinct values of at most 128 bytes
+        default: debug               # must be one of `values`
+```
+
+- **Every type carries a bound**, and a declaration that states none is refused:
+  `inputs.target.max_length: required`, `inputs.a.max: must be greater than the minimum`,
+  `inputs.a.default: must be one of x`.
+- **A value outside its bound is refused before a run exists**, naming the input and the bound:
+  `inputs.target: 1 to 4 bytes`, `inputs.count: 1 to 8, found 9`,
+  `inputs.profile: one of debug, release`, `inputs.full: expected a boolean, found a string`,
+  `inputs.target: required`, `inputs.extra: no input of this pipeline has that name`. A refusal
+  echoes no value, only the figure its bound compares. The manual dispatch route answers
+  `400 invalid_request` with that message ([API](api.md#routes)).
+- **A required input needs a default unless the pipeline runs only from a manual dispatch**, because
+  no event or schedule can supply one: `inputs.target: a required input needs a default unless the
+  pipeline runs only from a manual dispatch`. A pipeline with a default for every input runs from any
+  trigger with those defaults.
+- **Where a value appears.** An input reads as `inputs.<name>` — at the dispatch phase, and with the
+  type its declaration states — in `concurrency.group`, job and step `if`, and cache keys. Nothing
+  reads an input the pipeline does not declare.
+- **A value is in no identity.** It is not in the compiled digest, not in a check name, and not in a
+  cache key or concurrency group unless the pipeline names it there: two runs of one pipeline with
+  different values publish the same checks and have the same digest, and a cache key that reads
+  `${{ inputs.target }}` differs between them while a key that does not is the same
+  ([cache](cache.md#the-manifest)).
+
 ## Shell semantics
 
 `sh` runs `/bin/sh -e -c <script>` so the first failing command fails the step. `bash` runs `bash -e -o pipefail -c <script>` and requires an image that provides bash. Failure classes are identical for both: exit 0 passes; any other exit status is `command_failed`; death by signal is `command_signaled`; exceeding the step or job timeout is `execution_timeout`; a cgroup memory kill is `out_of_memory`. Output is captured for diagnostics and never interpreted for the verdict. Environment precedence is job `env`, then step `env` overriding by name, then the worker's own `SENTINEL_*` context variables appended last so a pipeline cannot spoof them. A step `workdir` is joined under the job `workdir`; both are validated relative paths so the join cannot escape the workspace. Steps of one job run sequentially in one container and workspace; jobs share nothing implicitly.
@@ -207,6 +317,6 @@ A repository's GitHub Actions workflows are read by a separate, bounded analyzer
 
 ## Verification
 
-Unit tests cover secret-name validation, registry-auth delivery requirements, and the explanation model (requirements, unresolved inputs, no invented values), the expression grammar (precedence, rejected constructs, phase gating, typing, templates), the `hash_files` resolver (globbing, ordering, sensitivity, cross-root stability), scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Fixture tests compile every valid fixture, check the invalid fixtures against their expected messages, evaluate the conditions example across dispatch, schedule and worker phases, decode every field of the full example, and prove determinism on a diamond DAG under reordering.
+Unit tests cover secret-name validation, registry-auth delivery requirements, and the explanation model (requirements, unresolved inputs, no invented values), the expression grammar (precedence, rejected constructs, phase gating, typing, templates), the `hash_files` resolver (globbing, ordering, sensitivity, cross-root stability), scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Fixture tests compile every valid fixture, check the invalid fixtures against their expected messages, evaluate the conditions example across dispatch, schedule and worker phases, decode every field of the full example, and prove determinism on a diamond DAG under reordering. `crates/sentinel-pipeline/tests/named.rs` covers two named pipelines of one repository keeping their own triggers, concurrency policies, digests and check namespaces; the refusal of a document that gives one check name two meanings while any name a repository chooses is otherwise accepted; every input type's bound and refusal message; the loading bounds of a declaration; the required-input rule; the typing of `inputs.<name>`; the digest covering declarations and not values; a cache key changing with an input only when it names one; and an unnamed pipeline keeping its check names, digest and run spec format.
 
-Not in this schema version: named pipelines, manual inputs, matrices, service containers, extra checkouts (Part 16 and later parts). Files using them fail at `unknown key`. A run spec whose pipeline states `on.schedule` is stored as run spec format 10 ([compatibility](compatibility.md)).
+Not in this schema version: matrices, service containers and extra checkouts (Part 16 and later parts). Files using them fail at `unknown key`. A run spec whose pipeline states `on.schedule` and no named pipeline and no input is stored as run spec format 10; one that names a pipeline or states an input is stored as format 11 ([compatibility](compatibility.md)).

@@ -333,6 +333,99 @@ fn a_duplicate_completion_publishes_once() {
     );
 }
 
+/// Two named pipelines of one repository publish disjoint namespaces, so a required check under one
+/// pipeline's name is never satisfied or overwritten by the other's run.
+#[test]
+fn named_pipelines_of_one_repository_publish_disjoint_check_names() {
+    let mut f = fixture();
+    let repo = f.repo;
+    let remote = sources::metadata_trusted(&f.conn, repo)
+        .unwrap()
+        .binding
+        .remote;
+    let document = format!(
+        "schema: 1
+pipelines:
+  acceptance:
+    on: [pull_request]
+    jobs:
+      test:
+        image: {IMAGE}
+        steps: [{{ id: s, run: 'true' }}]
+  release:
+    on: [push]
+    jobs:
+      test:
+        image: {IMAGE}
+        steps: [{{ id: s, run: 'true' }}]
+"
+    );
+    let mut names = Vec::new();
+    for pipeline in sentinel_pipeline::compile_document(&document).unwrap() {
+        let name = pipeline.name.clone().expect("a named pipeline");
+        let spec = RunSpec::new(
+            PinnedSource::new(&remote, SHA_B, Some(REF)).unwrap(),
+            pipeline,
+        )
+        .unwrap();
+        let run = RunId::new();
+        let tx = f.conn.transaction().unwrap();
+        let jobs = runs::create_run(&tx, f.tenant, repo, run, &spec, NOW).unwrap();
+        provenance::insert(
+            &tx,
+            &Provenance {
+                tenant: f.tenant,
+                repo,
+                trigger: "push".into(),
+                delivery: None,
+                provider: None,
+                ref_name: Some(REF.into()),
+                old_sha: Some(SHA_A.into()),
+                new_sha: Some(SHA_B.into()),
+                head_sha: None,
+                base_sha: None,
+                merge_sha: None,
+                pipeline_sha: SHA_B.into(),
+                pipeline_path: Some(".sentinel.yml".into()),
+                pipeline_digest: spec.pipeline.digest.to_le_bytes(),
+                pr_number: None,
+                group_ref: None,
+            },
+            run,
+            NOW,
+        )
+        .unwrap();
+        checks::record_run(&tx, f.tenant, run, NOW).unwrap();
+        tx.commit().unwrap();
+
+        let aggregate = publication(&f, run, checks::AGGREGATE_SCOPE);
+        assert_eq!(aggregate.name, format!("sentinel / {name}"));
+        let job = publication(&f, run, &jobs[0].to_string());
+        assert_eq!(job.name, format!("sentinel / {name} / test"));
+        assert_eq!(
+            sentinel_store::status::run(&f.conn, f.tenant, run)
+                .unwrap()
+                .pipeline,
+            Some(name.clone())
+        );
+        names.push((aggregate.name, job.name));
+    }
+    assert_eq!(
+        names,
+        [
+            (
+                "sentinel / acceptance".to_owned(),
+                "sentinel / acceptance / test".to_owned()
+            ),
+            (
+                "sentinel / release".to_owned(),
+                "sentinel / release / test".to_owned()
+            ),
+        ]
+    );
+    assert_ne!(names[0].1, names[1].1);
+}
+
 #[test]
 fn a_run_gets_a_stable_aggregate_and_one_check_per_job() {
     let mut f = fixture();

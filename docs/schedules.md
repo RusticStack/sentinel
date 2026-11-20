@@ -55,7 +55,11 @@ on: [push, schedule]
 `schedule: true` in the mapping form of `on:` declares the same thing
 ([pipeline schema](pipeline-schema.md#source-policies-on)). A pipeline that does
 not state it is not run by a schedule: the occurrence is recorded `failed` with
-reason `no_trigger`, and the row's cursor still moves past it.
+reason `no_trigger`, and the row's cursor still moves past it. A document that
+declares named pipelines runs every one of them that states `on.schedule: true`
+from one occurrence — one run each, named by the pipeline, with its own checks
+([pipeline schema](pipeline-schema.md#named-pipelines)) — and the occurrence
+names the first of them.
 
 The row is configured with `sentinel admin schedule set`, on a stopped or a
 running controller, and takes a cron, a ref and an overlap policy:

@@ -484,6 +484,8 @@ fn validate_path(path: &[String]) -> Result<(), &'static str> {
         }
         (Some("repo"), Some("id" | "name"), None) => Ok(()),
         (Some("run"), Some("id"), None) => Ok(()),
+        // A named input reads as the type its declaration states; the pipeline checks the name.
+        (Some("inputs"), Some(name), None) if crate::input::valid_input_name(name) => Ok(()),
         (Some("job"), Some("id" | "name"), None) => Ok(()),
         (Some("needs"), Some(job), Some("result")) if seg(3).is_none() => {
             if crate::schema::valid_id(job) {
@@ -492,8 +494,10 @@ fn validate_path(path: &[String]) -> Result<(), &'static str> {
                 Err("needs.<job> must be a valid job name")
             }
         }
-        (Some("event" | "repo" | "run" | "job" | "needs"), _, _) => Err("unknown context field"),
-        _ => Err("unknown context; expected event, repo, run, job or needs"),
+        (Some("event" | "repo" | "run" | "job" | "needs" | "inputs"), _, _) => {
+            Err("unknown context field")
+        }
+        _ => Err("unknown context; expected event, repo, run, job, needs or inputs"),
     }
 }
 
@@ -560,10 +564,10 @@ impl Expr {
         }
     }
 
-    fn types(&self) -> Result<u8, &'static str> {
-        let only = |e: &Expr, want: u8, message: &'static str| match e.types()? {
+    fn types(&self, inputs: &crate::input::Inputs) -> Result<u8, String> {
+        let only = |e: &Expr, want: u8, message: &'static str| match e.types(inputs)? {
             t if t == want => Ok(()),
-            _ => Err(message),
+            _ => Err(message.to_owned()),
         };
         match self {
             Expr::Lit(Value::Null) => Ok(TY_NULL),
@@ -574,6 +578,14 @@ impl Expr {
                 match p.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
                     ["event", "base_ref"] => TY_STR | TY_NULL,
                     ["event", "pr_number"] => TY_INT | TY_NULL,
+                    ["inputs", name] => match inputs.get(name) {
+                        Some(spec) => spec.kind.expr_type(),
+                        None => {
+                            return Err(format!(
+                                "`inputs.{name}` names no input this pipeline declares"
+                            ));
+                        }
+                    },
                     _ => TY_STR,
                 },
             ),
@@ -587,9 +599,9 @@ impl Expr {
                 Ok(TY_BOOL)
             }
             Expr::Bin(BinOp::Eq | BinOp::Ne, a, b) => {
-                let (a, b) = (a.types()? & !TY_NULL, b.types()? & !TY_NULL);
+                let (a, b) = (a.types(inputs)? & !TY_NULL, b.types(inputs)? & !TY_NULL);
                 if a != 0 && b != 0 && (a | b).count_ones() > 1 {
-                    return Err("comparison between different types");
+                    return Err("comparison between different types".to_owned());
                 }
                 Ok(TY_BOOL)
             }
@@ -606,10 +618,28 @@ impl Expr {
         }
     }
 
-    pub fn check_condition(&self) -> Result<(), &'static str> {
-        match self.types()? {
+    pub fn check_condition(&self, inputs: &crate::input::Inputs) -> Result<(), String> {
+        match self.types(inputs)? {
             TY_BOOL => Ok(()),
-            _ => Err("condition must be a boolean expression"),
+            _ => Err("condition must be a boolean expression".to_owned()),
+        }
+    }
+
+    /// Every `inputs.<name>` this expression reads, deduplicated in first-use order.
+    pub fn referenced_inputs(&self, out: &mut Vec<String>) {
+        match self {
+            Expr::Path(p) if p[0] == "inputs" => {
+                if !out.contains(&p[1]) {
+                    out.push(p[1].clone());
+                }
+            }
+            Expr::Lit(_) | Expr::Path(_) => {}
+            Expr::Not(e) => e.referenced_inputs(out),
+            Expr::Bin(_, a, b) => {
+                a.referenced_inputs(out);
+                b.referenced_inputs(out);
+            }
+            Expr::Call(_, args) => args.iter().for_each(|a| a.referenced_inputs(out)),
         }
     }
 
@@ -872,6 +902,14 @@ impl Template {
         }
     }
 
+    pub fn referenced_inputs(&self, out: &mut Vec<String>) {
+        for p in &self.parts {
+            if let Part::Expr(e) = p {
+                e.referenced_inputs(out);
+            }
+        }
+    }
+
     pub fn render(&self, ctx: &dyn Context, max_bytes: usize) -> Result<String, EvalError> {
         let mut out = String::new();
         for p in &self.parts {
@@ -904,6 +942,7 @@ impl Template {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::Inputs;
 
     struct Ctx {
         phase: Phase,
@@ -1059,7 +1098,11 @@ mod tests {
             "hash_files('Cargo.lock') != ''",
             "null == event.base_ref",
         ] {
-            assert_eq!(Expr::parse(ok).unwrap().check_condition(), Ok(()), "{ok}");
+            assert_eq!(
+                Expr::parse(ok).unwrap().check_condition(&Inputs::default()),
+                Ok(()),
+                "{ok}"
+            );
         }
         for bad in [
             "event.ref",
@@ -1076,7 +1119,10 @@ mod tests {
             "hash_files('x')",
         ] {
             assert!(
-                Expr::parse(bad).unwrap().check_condition().is_err(),
+                Expr::parse(bad)
+                    .unwrap()
+                    .check_condition(&Inputs::default())
+                    .is_err(),
                 "{bad}"
             );
         }
@@ -1136,7 +1182,7 @@ mod tests {
         }
         assert_eq!(
             Expr::parse("a.b").unwrap_err().message,
-            "unknown context; expected event, repo, run, job or needs"
+            "unknown context; expected event, repo, run, job, needs or inputs"
         );
         let t = Template::parse("k-${{ repo.id }}:${{ hash_files('x') }}").unwrap();
         assert_eq!(t.to_string(), "k-${{ repo.id }}:${{ hash_files('x') }}");

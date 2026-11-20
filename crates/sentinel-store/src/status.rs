@@ -34,6 +34,8 @@ pub struct RunStatus {
     pub cancel_requested: bool,
     pub state: RunState,
     pub trigger: Option<String>,
+    /// The named pipeline the run belongs to; `None` is the document's unnamed one.
+    pub pipeline: Option<String>,
     pub actor: Option<RunActor>,
     pub jobs: Vec<JobStatus>,
 }
@@ -87,16 +89,18 @@ pub fn attempt_job_status(
 }
 
 pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus> {
-    let head: Option<([u8; 16], String, i64, i64)> = conn
+    /// `(repository, source sha, created, cancel requested, pipeline)`.
+    type Head = ([u8; 16], String, i64, i64, Option<String>);
+    let head: Option<Head> = conn
         .prepare_cached(
-            "SELECT repo_id, source_sha, created_ms, cancel_requested FROM runs
+            "SELECT repo_id, source_sha, created_ms, cancel_requested, pipeline FROM runs
              WHERE id = ?1 AND tenant_id = ?2",
         )?
         .query_row(params![run.as_bytes(), tenant.as_bytes()], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })
         .optional()?;
-    let Some((repo, sha, created, cancel)) = head else {
+    let Some((repo, sha, created, cancel, pipeline)) = head else {
         return Err(Error::NotFound);
     };
     let mut stmt = conn.prepare_cached(
@@ -165,6 +169,7 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
         cancel_requested: cancel != 0,
         state,
         trigger,
+        pipeline,
         actor,
         jobs,
     })

@@ -1,0 +1,14 @@
+# expect: check `sentinel / acceptance` is also the unnamed pipeline's job `acceptance`
+schema: 1
+on: [push]
+jobs:
+  acceptance:
+    image: busybox
+    steps: [{id: s, run: echo}]
+pipelines:
+  acceptance:
+    on: [push]
+    jobs:
+      suite:
+        image: busybox
+        steps: [{id: s, run: echo}]

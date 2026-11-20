@@ -435,7 +435,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     let report = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         report.inspection.pending,
-        vec![73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83]
+        vec![73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
     );
     assert!(report.inspection.openable() && report.inspection.integrity == "ok");
     assert_eq!(
@@ -455,7 +455,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
             .iter()
             .map(|step| step.version)
             .collect::<Vec<_>>(),
-        vec![73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83]
+        vec![73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
     );
     let rewrites = |step: usize| -> Vec<(String, u64)> {
         report.steps[step]
@@ -600,7 +600,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     let report = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         report.inspection.pending,
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
     );
     assert_eq!(
         report.copy.as_deref(),
@@ -608,7 +608,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     );
     assert_eq!(
         report.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
     );
     assert!(report.blocking.is_empty(), "{:?}", report.blocking);
 
@@ -649,9 +649,9 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     );
     assert_eq!(
         schema::readable_by(schema::LATEST),
-        82,
-        "the newest migration only adds a column, a switch and two indexes no earlier statement \
-         names or writes"
+        84,
+        "the newest migration rebuilds the provenance table so one delivery may produce every run \
+         it matched, and a release below it names a check after the job alone"
     );
     for release in [69, schema::LATEST - 2] {
         assert!(
@@ -697,11 +697,11 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     let again = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         again.inspection.pending,
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
     );
     assert_eq!(
         again.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
     );
 }
 
@@ -853,13 +853,13 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        83,
+        84,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
     assert_eq!(
         sources,
-        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 81, 82]
+        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 81, 82, 83]
     );
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
@@ -972,7 +972,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
                 false, false,
             ],
             // The newest releases in the list run on every column they are listed against.
-            75..=82 => [
+            75..=83 => [
                 true, true, true, true, true, true, true, true, true, true, true, true, true, true,
                 true,
             ],
@@ -1546,7 +1546,7 @@ fn the_upgrade_reports_the_tenants_the_new_default_caps_and_keeps_the_precedence
     // What the operator reads before upgrading: the defaults the upgrade will apply, sized from this data
     // file system, and the tenants whose usage or stated limit is above them, heaviest first.
     let report = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(report.inspection.pending, vec![81, 82, schema::LATEST]);
+    assert_eq!(report.inspection.pending, vec![81, 82, 83, schema::LATEST]);
     assert_eq!(
         report.steps[0].rewrites,
         vec![upgrade::Rewrite {

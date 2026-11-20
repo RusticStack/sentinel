@@ -156,7 +156,7 @@ Every command below takes the [shared client flags](#the-shared-client). `--tena
 
 | Command | Route | Prints |
 |---|---|---|
-| `sentinel run dispatch [--tenant] --repo NAME --pipeline FILE --source URL --sha SHA [--ref] [--idempotency-key]` | `POST /tenants/{slug}/repos/{name}/runs` | the new run and its jobs; a retried dispatch with the same key is the same run |
+| `sentinel run dispatch [--tenant] --repo NAME --pipeline FILE --source URL --sha SHA [--ref] [--name PIPELINE] [--input NAME=VALUE]… [--idempotency-key]` | `POST /tenants/{slug}/repos/{name}/runs` | the new run and its jobs; a retried dispatch with the same key is the same run. `--name` selects one of the file's named pipelines and is required when it declares several; `--input` passes a value for a declared input, taken as a boolean for `true`/`false`, an integer for digits and a string otherwise, and a value outside its bound is refused by the engine before any run exists ([pipeline schema](pipeline-schema.md#inputs)) |
 | `sentinel run status RUN`, `sentinel status RUN` | `GET /runs/{id}` | the run and its jobs |
 | `sentinel run list [--tenant] --repo NAME [--limit N \| --all] [--before RUN]` | `GET …/runs?limit&before` | runs newest first ([paging](#output)) |
 | `sentinel run cancel RUN` | `POST /runs/{id}/cancel` | how many jobs were cancelled |
@@ -205,7 +205,7 @@ Every command below takes the [shared client flags](#the-shared-client). `--tena
 
 **Bindings.** A job receives a secret only through a binding. `secret bind NAME --repo REPO` binds the repository's own secret `NAME` for every job that declares it; `--job` narrows it to one job and `--step` to one step of that job. `--from-tenant` binds the tenant secret of that name instead, which a tenant administrator must first `allow` in that repository; `--override-tenant` lets a repository secret win over an allowed tenant secret of the same name. `bind`, `unbind`, `allow`, `deny` and `revoke-version` are idempotent state changes, safe to rerun.
 
-`sentinel pipeline validate|explain` stay offline and take `--output text|json` (`--json` is `--output json`; there is no list to stream, so no `ndjson`). In JSON mode `explain` prints `sentinel.explain/1` and `validate` prints `{"file", "valid": true, "jobs"}` (text `validate` prints nothing on success), each as one line; a failure is one `sentinel.error/1` line on stderr (`invalid_pipeline`, including a file over the 256 KiB limit, or `client_usage` for an unreadable file) with stdout empty, like the networked commands. The limit bounds the bytes read, not a reported size, so `validate /dev/zero` fails at 256 KiB.
+`sentinel pipeline validate|explain` stay offline and take `--output text|json` (`--json` is `--output json`; there is no list to stream, so no `ndjson`). In JSON mode `explain` prints `sentinel.explain/1` — one object for a document with one pipeline, and `{"schema":"sentinel.explain/1","pipelines":[…]}` for a document with several, one entry each — and `validate` prints `{"file", "valid": true, "pipelines", "jobs"}` (text `validate` prints nothing on success), each as one line; a failure is one `sentinel.error/1` line on stderr (`invalid_pipeline`, including a file over the 256 KiB limit, or `client_usage` for an unreadable file) with stdout empty, like the networked commands. The limit bounds the bytes read, not a reported size, so `validate /dev/zero` fails at 256 KiB.
 
 ## Host-local runner mode
 

@@ -775,6 +775,8 @@ fn database_at_latest_without_classes(path: &Path) {
          DROP TABLE schedule_occurrences;
          DROP INDEX schedules_due;
          DROP TABLE schedules;
+         DROP INDEX provenance_by_delivery;
+         ALTER TABLE runs DROP COLUMN pipeline;
          DELETE FROM schema_migrations WHERE version >= 65;",
     )
     .unwrap();

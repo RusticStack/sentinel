@@ -1,0 +1,11 @@
+# expect: inputs.target.max_length: required
+schema: 1
+pipelines:
+  focus:
+    on: [manual]
+    inputs:
+      target: {type: string}
+    jobs:
+      a:
+        image: busybox
+        steps: [{id: s, run: echo}]

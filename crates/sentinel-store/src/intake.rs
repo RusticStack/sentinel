@@ -1110,6 +1110,59 @@ fn is_row_fault(error: &rusqlite::Error) -> bool {
     }
 }
 
+/// One pipeline of a delivery that is about to run, with everything it needs pinned.
+pub struct Part<'a> {
+    pub spec: &'a sentinel_pipeline::RunSpec,
+    pub images: &'a [(String, String)],
+    pub provenance: &'a crate::provenance::Provenance,
+}
+
+/// Run every pipeline a delivery matched: one run each, in the document's order, and the delivery
+/// settles once, in the same transaction that created them all, so a crash leaves either every run
+/// or none. The run the delivery names is the first one's; every run carries the delivery id in its
+/// provenance, and every publication the delivery owes is against that id.
+pub fn dispatch_all(
+    tx: &Transaction<'_>,
+    delivery: &Delivery,
+    parts: &[Part<'_>],
+    now: UnixMillis,
+) -> Result<sentinel_core::RunId> {
+    if delivery.state != State::Ready {
+        return Err(Error::Conflict);
+    }
+    let mut first: Option<sentinel_core::RunId> = None;
+    for part in parts {
+        if part.images.len() != part.spec.pipeline.jobs.len() {
+            return Err(Error::InvalidInput("resolved images"));
+        }
+        let run = create(tx, delivery.tenant, delivery.repo, part, now)?;
+        first = first.or(Some(run));
+    }
+    let run = first.ok_or(Error::InvalidInput("a dispatched delivery runs a pipeline"))?;
+    settle_dispatched(tx, delivery.id, run, now)?;
+    Ok(run)
+}
+
+/// The run one pipeline of a delivery creates, with its images pinned and its checks recorded.
+fn create(
+    tx: &Transaction<'_>,
+    tenant: sentinel_core::TenantId,
+    repo: sentinel_core::RepoId,
+    part: &Part<'_>,
+    now: UnixMillis,
+) -> Result<sentinel_core::RunId> {
+    let run = sentinel_core::RunId::new();
+    let jobs = crate::runs::create_run(tx, tenant, repo, run, part.spec, now)?;
+    for (job, (digest, platform)) in jobs.iter().zip(part.images) {
+        crate::runs::resolve_image(tx, tenant, *job, digest, platform)?;
+    }
+    crate::provenance::insert(tx, part.provenance, run, now)?;
+    crate::runs::apply_concurrency(tx, tenant, run, now)?;
+    crate::dispatch::release_dependents(tx, tenant, run, now)?;
+    crate::checks::record_run(tx, tenant, run, now)?;
+    Ok(run)
+}
+
 pub fn dispatch(
     tx: &Transaction<'_>,
     delivery: &Delivery,
@@ -1118,23 +1171,16 @@ pub fn dispatch(
     provenance: &crate::provenance::Provenance,
     now: UnixMillis,
 ) -> Result<sentinel_core::RunId> {
-    if delivery.state != State::Ready {
-        return Err(Error::Conflict);
-    }
-    if images.len() != spec.pipeline.jobs.len() {
-        return Err(Error::InvalidInput("resolved images"));
-    }
-    let run = sentinel_core::RunId::new();
-    let jobs = crate::runs::create_run(tx, delivery.tenant, delivery.repo, run, spec, now)?;
-    for (job, (digest, platform)) in jobs.iter().zip(images) {
-        crate::runs::resolve_image(tx, delivery.tenant, *job, digest, platform)?;
-    }
-    crate::provenance::insert(tx, provenance, run, now)?;
-    crate::runs::apply_concurrency(tx, delivery.tenant, run, now)?;
-    crate::dispatch::release_dependents(tx, delivery.tenant, run, now)?;
-    crate::checks::record_run(tx, delivery.tenant, run, now)?;
-    settle_dispatched(tx, delivery.id, run, now)?;
-    Ok(run)
+    dispatch_all(
+        tx,
+        delivery,
+        &[Part {
+            spec,
+            images,
+            provenance,
+        }],
+        now,
+    )
 }
 
 pub fn purge_settled(tx: &Transaction<'_>, before: UnixMillis, limit: u32) -> Result<usize> {
