@@ -1,6 +1,6 @@
 # Working on Sentinel
 
-Sentinel is a performance-first, self-hosted Rust CI engine. [TODO.md](TODO.md) is the tracker (work in waves), [plan.md](plan.md) the design reference, `docs/` the contracts. Read a doc only when the task touches it.
+Sentinel is a performance-first, self-hosted Rust CI engine. [TODO.md](TODO.md) is the tracker (work in waves), [plan.md](plan.md) the design reference, `docs/` the contracts. Read a doc only when the task touches it. Designs that are written and deliberately not built are listed under [open designs](docs/designs.md).
 
 **Rule one: write the most optimized code possible.** No allocation, copy, syscall, lock or database round trip the work does not require; data structures fit the access pattern; measurements, not guesses, justify anything slower than the obvious fast path. Correctness and bounded resource usage are never traded for speed.
 

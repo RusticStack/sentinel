@@ -46,12 +46,12 @@ These are deliberately not assumed dependencies for the first runnable engine or
 - [x] **I04** Declared non-secret step/job outputs, artifact handoff and bounded user-defined finalizers; keep independent worker cleanup/fencing authoritative on cancellation or expiry.
 - [x] **I05** Shared external-resource leases/locks where job-private resources cannot remove contention; separate them from supersession/concurrency and verify stale-owner fencing.
 - [x] **I06** Conservative opt-in task-result reuse with complete declared inputs, appropriate sandbox constraints, provenance and explicit `reused`/force-fresh results; never enable arbitrary-shell success caching by default.
-- [ ] **I07** Optional compiler/build-tool remote-cache protocol adapters, builder state persistence and manifest/dedup improvements, selected from actual I/O/compile profiles.
+- [x] **I07** Optional compiler/build-tool remote-cache protocol adapters, builder state persistence and manifest/dedup improvements, selected from actual I/O/compile profiles.
 - [ ] **I08** Optional Docker/Compose execution for native pipelines, only inside microVM sandboxes (Part 23; a container sandbox never gets a daemon), after cross-workload justification and same-hardware startup/resource benchmarks; runner mode's Docker support is AR04.
 - [ ] **I09** Hostile fork support only with an appropriate sandbox/pool/cache/secret/egress boundary and failure tests; rootless containers alone are not sufficient. The boundary is M09 (Part 23); the fork-PR secret policy is decided first (RW05). Today a fork pull request is ignored as `fork_pr` (`crates/sentinel-intake/src/resolve.rs:530`).
 - [x] **I10** Bounded matrices, reusable pipelines, service containers, deployment/OIDC capabilities and native multi-arch build orchestration only as proven CI needs. Repository scripts may already cover them without core changes.
 - [x] **I11** GitHub merge-queue `merge_group` handling before migrating any repository that uses it; correct tested SHA and required-check semantics are a per-repo gate.
-- [ ] **I12** Multiple active controllers, external SSO providers or cloud autoscaling as separate designs; no unreviewed shared-SQLite HA mode. Windows workers were split out and promoted to Part 17 (N01–N10) on 2026-10-22.
+- [x] **I12** Multiple active controllers, external SSO providers or cloud autoscaling as separate designs; no unreviewed shared-SQLite HA mode. Windows workers were split out and promoted to Part 17 (N01–N10) on 2026-10-22.
 - [x] **I13** Profile-driven advanced I/O/allocator/snapshot/boot improvements; retain only measurable wins with maintenance and portability costs recorded.
 
 ## Part 17 — Windows workers
