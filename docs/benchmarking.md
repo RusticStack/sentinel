@@ -461,6 +461,62 @@ Two figures from the probes, on the same box: `Spool::append` costs 2,510 ns a f
 - **Windows and macOS,** where the spool's platform split and any allocator build would have to be verified.
 - **The capacity query's plan,** which the store-cost record does not carry; the growth it shows with history is described, not explained.
 
+## Compiler and build-tool remote-cache protocols: profiled, not taken
+
+Item I07 in the tracker admits an optional adapter that lets a compiler or build tool speak its own remote-cache protocol to Sentinel, "selected from actual I/O/compile profiles". This section is that profile, and its finding is that no committed record shows the condition an adapter would have to improve. Nothing here changed product code, and nothing here is newly measured: every figure is **recomputed from committed records**, named per table.
+
+**What an adapter would have to win.** Sentinel already serves every candidate. A `class: compiler` or `class: downloads` entry materializes the tool's own directory — `GOCACHE`, `CARGO_TARGET_DIR`, `~/.m2`, `~/.gradle/caches`, `CCACHE_DIR` — into a private writable view, the tool does its own per-input invalidation inside it ([compiler state](cache.md#compiler-state)), and a worker with no local generation hydrates the whole sealed generation over the worker link ([remote hydration](cache.md#remote-hydration)). An adapter therefore does not give a tool a cache it lacks; it changes *what crosses the wire*: the tool's individual objects, keyed by the tool's own action hashes, instead of the whole namespace. Nor is it a bytes saving Sentinel lacks: a repeated artifact body never crosses the link because the store answers by digest ([digest-first transfer](#digest-first-artifact-transfer)), and a whole opted-in task is skipped rather than fetched ([task results](cache.md#task-results)). The difference exists in exactly one branch — a cold worker's first attempt on an entry — so an adapter is worth its protocol surface, its pinned-version fidelity and a new endpoint only when all of these hold:
+
+1. On a **local hit** it costs no more than one bulk restore of the namespace, because that is the path every warm job takes and a per-object request path is strictly more work than one reflink or one bounded copy.
+2. On a **cold worker** the objects a job actually needs are a small enough fraction of the namespace, or arrive fast enough, that per-object fetch beats hydrating the generation within the hydration budget.
+3. The saving is large against the job it serves, not against a synthetic payload.
+
+**Pilot cache state and cost.** Recomputed from the committed `pilots-ci` revision-4 records ([`bench/p14-pilot-cli.jsonl`](../bench/p14-pilot-cli.jsonl), [`bench/p14-pilot-ripgrep.jsonl`](../bench/p14-pilot-ripgrep.jsonl), [`bench/p14-pilot-gson.jsonl`](../bench/p14-pilot-gson.jsonl)), non-warmup samples, on `kvm-host` (AMD Ryzen 9 7900, 24 CPUs, 128 GiB, ext4 — `reflink: false` on every hit recorded). Medians across the hits of every lane:
+
+| Lane | Entry | Class | Bytes | Files | Clone | Commit | Publish reuse |
+|---|---|---|---|---|---|---|---|
+| cli | `gocache` | compiler | 1,498.0 MB | 19,908 | 1,255.5 ms | 1,098.0 ms | 99.97 % |
+| cli | `gomod` | downloads | 352.3 MB | 23,284 | 908.1 ms | 824.2 ms | 100.00 % |
+| ripgrep | `target` | compiler | 1,438.0 MB | 831 | 739.7 ms | 980.0 ms | 84.8 % |
+| ripgrep | `registry` | downloads | 50.6 MB | 2,084 | 95.4 ms | 41.2 ms | 99.9 % |
+| gson | `m2` | downloads | 186.5 MB | 3,060 | 219.5 ms | 83.6 ms | — |
+
+`lock_wait` sits beside `clone` in every record and is a median 6.5–32.3 ms per entry, so a clone is within a few per cent of the whole restore: the cli lane's two entries together restore in 2.10–2.28 s per run.
+
+**Steps per run** (the sum of the run's jobs, so gson's figure is three JDK cells):
+
+| Lane | Cold (n = 3) | Warm (n = 10) | Small edit (n = 5) |
+|---|---|---|---|
+| cli | 93.8 s (93.7–94.4) | 56.3 s (55.9–56.8) | 56.4 s (56.1–56.4) |
+| ripgrep | 20.5 s (20.3–20.9) | 17.7 s (17.5–17.7) | 17.8 s (17.6–18.1) |
+| gson | 190.8 s (184.8–197.8) | 112.2 s (111.2–114.4) | 112.0 s (111.8–112.7) |
+
+**What this says about each candidate.** The three pilots' upstream workflows use each tool's own local store — `GOCACHE`, the cargo target directory, the Maven local repository — and the committed pipelines hand those same directories to Sentinel as cache paths ([pilot workloads](pilot-repositories.md#conversion-contract)); none of them uses a remote-cache protocol at all. So the candidates below are proposals against a workload that has not shown a need for one.
+
+- **`GOCACHEPROG`.** Structurally the best-fitting candidate: it is a local program protocol on the tool's own standard streams, so it needs no endpoint reachable from the sandbox. Against the record above it loses on both counted branches. On a local hit it replaces a 1.26 s restore of 19,908 files with one program round trip per object lookup, for the thousands of objects a `go test -race ./...` of this lane resolves. On a cold worker it would fetch the same objects over the link that the generation bundle already carries, one at a time, so it can only be slower than the one bundled transfer whose bytes are the entry's own 1.50 GB.
+- **sccache (WebDAV, S3, Redis), ccache `remote_storage`, a Gradle build-cache node.** All of these are read at *object* granularity by a process inside the job, and the ripgrep lane is the record that would have to justify one — its `target` entry is 1,438.0 MB in 831 files, restoring in 739.7 ms. There is no ratio in that figure to exploit by fetching objects instead of the namespace.
+- **Bazel remote cache (HTTP or the gRPC REAPI).** Same objection, at the largest protocol surface of the set, and no pilot workload uses Bazel. The action cache is exactly the "declared complete inputs" contract [performance research](performance-research.md#bazel-dependency-aware-action-reuse) warns against inferring, so its value would be the action-level reuse that result reuse already provides for opted-in jobs ([task results](cache.md#task-results)) rather than per-object transfer.
+
+**The scope cost is the one runner mode already pays, for a client that has no alternative.** [The Actions cache and artifact endpoint](actions-cache.md) is a cache service a job reaches from inside its sandbox: a certificate authority minted per sandbox, a resolver that answers two names and refuses every other, a listener bound per lease, and a tenant/repository/trust/platform boundary taken from that lease rather than from the request. It exists because `actions/cache` has no mode that writes to a directory the worker prepared — interception is the only way to serve that client at all. Every candidate in this section has the other mode, and the committed pipelines already use it, so an adapter would buy object-level granularity for a client that can be pointed at a directory and pay that whole surface a second time: the same CA, resolver, lease-derived scope and refusal-never-forward rule, in front of a store the compiler's own keys address. That is the cost the item's scope condition names, and the records above show no branch where paying it recovers time.
+
+### What the records do show about builder state and dedup
+
+Both mechanisms the item pairs with the adapters are measurably working, so the item's other half has nothing to improve either:
+
+- **Compiler state persists across edits through the stem namespace.** The cli lane's `gocache` entry accumulates across restore/publish cycles — 1,495.5 MB and 17,521 files on the first warm hit, 1,511.0 MB and 22,386 files on the last small-edit — and its restore grows only from 1.18 s to 1.31 s over that span. A one-line edit costs nothing extra: small-edit steps (56.1–56.4 s) match warm (55.9–56.8 s), because the compiler decides per input inside the namespace rather than the outer key invalidating it ([compiler state](cache.md#compiler-state)).
+- **Publication dedups by digest, and the pilots are its best case.** Re-staging 1.50 GB of compiler state on every run writes 0.4–3.3 MB of new bytes: 99.97 % of the cli `gocache` generation is reused by hardlink from the source generation, and the whole commit costs 1.098 s median. The ripgrep `target` entry reuses 84.8 %, which is the honest lower end — its publishes carry a wider changed set per run.
+- **The restore is a byte copy on every recorded hit.** `reflink` is `false` throughout, so each hit copies 1.4–1.9 GB (ripgrep's 1,438.0 MB in 831 files at 1.9 GB/s, cli's 1.50 GB in 19,908 files at 1.2 GB/s). A reflink filesystem would make those restores near-free, which is the [I13 candidate](#advanced-io-allocator-snapshot-and-boot-candidates-profiled-not-taken) already declined on the ground that no host here offers one; it is a storage-backend question, not a protocol one.
+- **The pilots' compiler namespaces are already at the scale where hydration is bounded by its budget, not by the link.** [Remote hydration](cache.md#remote-hydration) spends at most `min(5 s, job timeout / 4)` (`remote::BUDGET_MAX`). The only hydration figure in the tree is 256 MiB in 367 and 430 ms medians on the staging-write path, and 792 and 1,229 ms including the write-back ([`bench/b04-transfer-copies.jsonl`](../bench/b04-transfer-copies.jsonl), a WSL2 development machine over loopback). Scaling those rates — an extrapolation, not a measurement — 1.50 GB would take 2.2–2.5 s without the write-back and 4.6–7.2 s with it, so a cold worker's first attempt on the cli lane's `gocache` entry is at or past the budget. That is a fact about the budget and the entry size, and it is the one open question this profile found; no adapter answers it, because the same bytes have to cross the link either way.
+
+**No record can carry a hydration, and the pilots do attempt them.** Of the 21 cold cache entries in these records, 12 answer `absent` and 9 answer `unavailable`. An entry with no local generation answers `absent`; the only other path to `unavailable` there is a [remote hydration](cache.md#remote-hydration) that did not complete — `Hydro::Refused` and a transfer past its deadline both answer it (`remote.rs`'s `TRANSFER_MISS`) — so the pilots do reach for the controller's store, and nine recorded attempts did not finish. What each cost is not in the record and cannot be: `remote_ns`, `remote_bytes` and `remote_from` live on the worker's `Stats`, and the `CacheRecord` a summary and the pilot harness carry (`sentinel_protocol::summary::CacheRecord`) has no field for any of them. Branch 2 of the criteria is therefore unmeasurable from the artifacts in the tree, which is the strongest form of the non-finding here, and the B05 cache-usefulness matrix — scripts, fixtures and tests, **no committed record** — is the instrument that would have to answer it first.
+
+### What this profile could not establish
+
+- **A cold-worker hydration at pilot scale.** No record hydrates a 1.4–1.5 GB entry over any link, loopback or real, so the extrapolation above is arithmetic on a 256 MiB synthetic payload.
+- **Cache-usefulness rates.** No B05 record is committed, so nothing here says how often a pilot job lands on a worker without the generation it needs — the frequency that decides whether branch 2 of the criteria is ever taken.
+- **A protocol the pilots' tools would actually call.** None of the three upstream workflows uses a remote-cache protocol; the evidence that one would be used is absent rather than negative.
+- **A hydration's own cost, in any published record.** Carrying `remote_ns` and `remote_bytes` into `CacheRecord` is an `AttemptSummary` format change under [compatibility](compatibility.md), so it is not made here: re-running these lanes as they stand would still not say what a refused or aborted transfer spent, only that it happened.
+- **A reflink host,** and this machine's own figures: the tables are recomputed from `kvm-host` records, and nothing was measured on the host that wrote this section.
 
 ## Spawn cost
 
