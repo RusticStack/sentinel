@@ -434,7 +434,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     let report = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         report.inspection.pending,
-        vec![73, 74, 75, 76, 77, 78, 79, 80]
+        vec![73, 74, 75, 76, 77, 78, 79, 80, 81]
     );
     assert!(report.inspection.openable() && report.inspection.integrity == "ok");
     assert_eq!(
@@ -444,16 +444,17 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     );
     assert_eq!(report.needed_bytes, report.inspection.bytes * 2);
 
-    // What the upgrade does to the rows already stored: migration 73 rebuilds every OAuth table, and
-    // migrations 74 to 80 add runner-mode, guided-migration, fork-policy, AI-request, AI-budget, per-test-outcome and
-    // analysis-cache shape without visiting a row.
+    // What the upgrade does to the rows already stored: migration 73 rebuilds every OAuth table, migration
+    // 81 rebuilds the policy table with the one check relaxed (this database holds no policy row), and
+    // migrations 74 to 80 add runner-mode, guided-migration, fork-policy, AI-request, AI-budget,
+    // per-test-outcome and analysis-cache shape without visiting a row.
     assert_eq!(
         report
             .steps
             .iter()
             .map(|step| step.version)
             .collect::<Vec<_>>(),
-        vec![73, 74, 75, 76, 77, 78, 79, 80]
+        vec![73, 74, 75, 76, 77, 78, 79, 80, 81]
     );
     let rewrites = |step: usize| -> Vec<(String, u64)> {
         report.steps[step]
@@ -493,6 +494,11 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     assert!(
         budgets.is_empty(),
         "migration 79 only adds shape: {budgets:?}"
+    );
+    assert_eq!(
+        rewrites(8),
+        vec![("storage_policies".to_owned(), 0)],
+        "migration 81 rebuilds the policy table this database leaves empty"
     );
 
     // Every enrolled worker is listed with what it announces, and the one this build cannot serve is
@@ -588,7 +594,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     let report = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         report.inspection.pending,
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81]
     );
     assert_eq!(
         report.copy.as_deref(),
@@ -596,7 +602,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     );
     assert_eq!(
         report.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81]
     );
     assert!(report.blocking.is_empty(), "{:?}", report.blocking);
 
@@ -631,8 +637,9 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     );
     assert_eq!(
         schema::readable_by(schema::LATEST),
-        schema::LATEST - 1,
-        "the newest migration is readable by the release before it, and nothing older"
+        schema::LATEST,
+        "the newest migration rebuilds the policy table and changes one of its checks, so no release \
+         below it runs on the result"
     );
     for release in [69, schema::LATEST - 2] {
         assert!(
@@ -678,11 +685,11 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     let again = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         again.inspection.pending,
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81]
     );
     assert_eq!(
         again.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81]
     );
 }
 
@@ -834,13 +841,13 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        80,
+        81,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
     assert_eq!(
         sources,
-        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 78, 79]
+        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 80]
     );
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
@@ -950,7 +957,13 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
                 false, false,
             ],
             // The newest releases in the list run on every column they are listed against.
-            75..=79 => [
+            75..=78 => [
+                true, true, true, true, true, true, true, true, true, true, true, true, true, true,
+                true,
+            ],
+            // Release 80 is the newest release below the current schema, and it cannot read it: the
+            // default-limit migration rebuilds the policy table and rewrites every row it holds.
+            79 | 80 => [
                 true, true, true, true, true, true, true, true, true, true, true, true, true, true,
                 true,
             ],
@@ -1442,4 +1455,218 @@ fn a_database_upgraded_from_072_keeps_its_oauth_rows_and_equals_a_fresh_one() {
         fresh_store.read(|c| Ok(schema_sql(c))).unwrap(),
         "the upgraded database has the schema a fresh one has, triggers and indexes included"
     );
+}
+
+/// A populated database at the schema before the default limit: two organization tenants and a personal
+/// namespace whose stored usage is far above any default the upgrade can size, one tenant with a limit of
+/// its own above it, one well under it, and the deployment row stating no per-tenant limit, which is what
+/// every release before the upgrade wrote for an unconfigured deployment.
+fn populated_at_80(path: &std::path::Path) -> [TenantId; 4] {
+    let (root, owner) = (UserId::new(), UserId::new());
+    let tenants = [
+        TenantId::new(),
+        TenantId::new(),
+        TenantId::new(),
+        TenantId::new(),
+    ];
+    let [heavy, small, larger, alice] = tenants;
+    drop(database_at(path, schema::LATEST - 1));
+    let mut conn = Connection::open(path).unwrap();
+    let tx = conn.transaction().unwrap();
+    provisioning::insert_human(&tx, root, "Root", true, NOW).unwrap();
+    provisioning::insert_human(&tx, owner, "Owner", false, NOW).unwrap();
+    tx.commit().unwrap();
+    const GIB: i64 = 1 << 30;
+    for (tenant, slug, kind, used) in [
+        (heavy, "acme", 0, 900 * GIB),
+        (small, "small", 0, 1 << 20),
+        (larger, "big", 0, 1 << 20),
+        (alice, "alice", 1, 12 * GIB),
+    ] {
+        conn.execute(
+            "INSERT INTO tenants(id, slug, created_ms, kind, owner_user_id) VALUES(?1, ?2, 1, ?3, ?4)",
+            params![
+                tenant.as_bytes().as_slice(),
+                slug,
+                kind,
+                (kind == 1).then(|| owner.as_bytes().to_vec())
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tenant_usage(tenant_id, bytes) VALUES(?1, ?2)",
+            params![tenant.as_bytes().as_slice(), used],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO storage_policies(tenant_id, quota_bytes, updated_ms) VALUES(?1, ?2, 1)",
+        params![larger.as_bytes().as_slice(), 1_024 * GIB],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO storage_defaults(id, quota_bytes, tenant_quota_bytes, log_retention_ms,
+             artifact_retention_ms, run_artifact_bytes, soft_percent, hard_percent, installed_ms)
+         VALUES(1, 0, 0, 1209600000, 7776000000, 17179869184, 80, 100, 1)",
+        [],
+    )
+    .unwrap();
+    tenants
+}
+
+#[test]
+fn the_upgrade_reports_the_tenants_the_new_default_caps_and_keeps_the_precedence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.sqlite");
+    let [heavy, small, larger, alice] = populated_at_80(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    // The policy table cannot hold a tenant's explicit unlimited before the upgrade, which is why the
+    // migration rebuilds it: 0 is refused by the check the older releases shipped.
+    assert!(
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO storage_policies(tenant_id, quota_bytes, updated_ms) VALUES(?1, 0, 1)",
+                [small.as_bytes().as_slice()],
+            )
+            .is_err(),
+        "an explicit unlimited is not storable before the upgrade"
+    );
+
+    // What the operator reads before upgrading: the defaults the upgrade will apply, sized from this data
+    // file system, and the tenants whose usage or stated limit is above them, heaviest first.
+    let report = upgrade::preflight(dir.path()).unwrap();
+    assert_eq!(report.inspection.pending, vec![schema::LATEST]);
+    assert_eq!(
+        report.steps[0].rewrites,
+        vec![upgrade::Rewrite {
+            table: "storage_policies".into(),
+            rows: 1
+        }],
+        "the upgrade carries the one policy row over"
+    );
+    // An organization tenant answers to the deployment default, a personal namespace to its own.
+    assert!(
+        report.tenant_defaults.0 > report.tenant_defaults.1,
+        "a personal namespace is bounded lower: {:?}",
+        report.tenant_defaults
+    );
+    let listed: Vec<(&str, bool, u64, Option<u64>)> = report
+        .capped
+        .iter()
+        .map(|t| (t.slug.as_str(), t.personal, t.used_bytes, t.quota_bytes))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            ("acme", false, 900 << 30, None),
+            ("alice", true, 12 << 30, None),
+            ("big", false, 1 << 20, Some(1_024 << 30)),
+        ],
+        "the tenant under the default is not listed"
+    );
+    assert_eq!(report.capped_total, 3);
+    assert_eq!(report.capped[0].default_bytes, report.tenant_defaults.0);
+    assert_eq!(report.capped[1].default_bytes, report.tenant_defaults.1);
+    assert_eq!(report.capped[2].default_bytes, report.tenant_defaults.0);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the preflight writes nothing"
+    );
+
+    // The upgrade, and the start that follows it, which is what writes the defaults the controller runs
+    // with: here the reference host's sized pair, so the precedence can be read as exact numbers.
+    let (store, copy) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
+    assert_eq!(
+        copy.as_deref(),
+        Some(upgrade::snapshot_path(&path, schema::LATEST - 1).as_path())
+    );
+    let deployment = sentinel_store::retention::Deployment {
+        tenant_quota_bytes: 50 << 30,
+        personal_quota_bytes: 10 << 30,
+        ..Default::default()
+    };
+    store
+        .writer()
+        .write(move |tx| sentinel_store::retention::install(tx, &deployment))
+        .unwrap();
+    let installed = store.read(sentinel_store::retention::installed).unwrap();
+    assert_eq!(
+        (installed.tenant_quota_bytes, installed.personal_quota_bytes),
+        (50 << 30, 10 << 30)
+    );
+    // Precedence is deployment, then tenant, then repository, unchanged: a tenant that states no quota
+    // inherits the default for its kind, and one with its own keeps it whatever the default is.
+    let effective = |tenant| {
+        store
+            .read(|c| sentinel_store::retention::effective(c, &deployment, tenant, None))
+            .unwrap()
+            .tenant_quota_bytes
+    };
+    assert_eq!(effective(heavy), 50 << 30);
+    assert_eq!(effective(small), 50 << 30);
+    assert_eq!(effective(alice), 10 << 30);
+    assert_eq!(effective(larger), 1_024 << 30);
+    let policy = store
+        .read(|c| sentinel_store::retention::policy(c, larger, None))
+        .unwrap();
+    assert_eq!(
+        policy.quota_bytes,
+        Some(1_024 << 30),
+        "its row carried over"
+    );
+
+    // A tenant that was past its limit before the upgrade is still past it after: 900 GiB against the new
+    // default is at its hard threshold, and logs it keeps do not move it off it.
+    let standing = store
+        .read(|c| sentinel_store::retention::standing(c, &deployment, heavy))
+        .unwrap();
+    assert_eq!(standing.state, sentinel_store::retention::State::Hard);
+    assert_eq!(standing.hard_bytes, 50 << 30);
+    assert!(matches!(
+        store.read(|c| sentinel_store::retention::check_tenant(
+            c,
+            &deployment,
+            heavy,
+            900 << 30,
+            1
+        )),
+        Err(Error::QuotaExceeded)
+    ));
+    assert_eq!(
+        store
+            .read(|c| sentinel_store::retention::standing(c, &deployment, small))
+            .unwrap()
+            .state,
+        sentinel_store::retention::State::Ok
+    );
+
+    // The explicit unlimited the migration made storable, set by a platform administrator and read back.
+    let tenant = small;
+    store
+        .writer()
+        .write(move |tx| {
+            sentinel_store::retention::set(
+                tx,
+                &Authority::HostLocal,
+                &deployment,
+                tenant,
+                None,
+                sentinel_store::retention::Policy {
+                    quota_bytes: Some(0),
+                    ..Default::default()
+                },
+                NOW,
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+    let unlimited = store
+        .read(|c| sentinel_store::retention::effective(c, &deployment, small, None))
+        .unwrap();
+    assert_eq!(unlimited.tenant_quota_bytes, 0);
+    drop(store);
+    assert_eq!(version(&path), schema::LATEST);
 }

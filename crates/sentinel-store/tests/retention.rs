@@ -14,7 +14,7 @@ use sentinel_store::{
     jobs,
     logs::LogStore,
     objects::{Expect, Objects},
-    retention::{self, Deployment, Policy},
+    retention::{self, Deployment, Policy, State},
     runs,
     tenancy::{self, PoolKind},
     workers::{self, Presentation},
@@ -301,7 +301,262 @@ fn a_tenant_policy_is_platform_administration_and_a_repository_only_narrows_it()
     let d = Deployment::default();
     assert_eq!(
         (e.tenant_quota_bytes, e.repo_quota_bytes, e.log_retention_ms),
-        (0, 0, d.log_retention_ms)
+        (d.tenant_quota_bytes, 0, d.log_retention_ms)
+    );
+}
+
+impl Fixture {
+    /// A personal namespace in the same deployment, owned by somebody who administers nothing else.
+    fn personal(&self, slug: &str) -> TenantId {
+        let tenant = TenantId::new();
+        let owner = UserId::new();
+        let slug = slug.to_owned();
+        let platform = Principal::new(self.root, P::ALL, None, None);
+        self.store
+            .writer()
+            .write(move |tx| {
+                provisioning::insert_human(tx, owner, "Owner", false, NOW)?;
+                auth::create_namespace(
+                    tx,
+                    platform,
+                    tenant,
+                    sentinel_core::auth::Namespace::parse(&slug).unwrap(),
+                    NamespaceKind::Personal(owner),
+                    NOW,
+                )
+            })
+            .unwrap();
+        tenant
+    }
+
+    fn effective(
+        &self,
+        d: Deployment,
+        tenant: TenantId,
+        repo: Option<RepoId>,
+    ) -> retention::Effective {
+        self.store
+            .read(|c| retention::effective(c, &d, tenant, repo))
+            .unwrap()
+    }
+}
+
+#[test]
+fn the_default_limit_is_the_deployments_and_a_personal_namespace_has_its_own() {
+    let f = fixture();
+    let d = Deployment {
+        tenant_quota_bytes: 1_000,
+        personal_quota_bytes: 200,
+        ..Deployment::default()
+    };
+    // An organization that states no quota inherits the deployment's per-tenant one.
+    assert_eq!(f.effective(d, f.tenant, None).tenant_quota_bytes, 1_000);
+    // A personal namespace inherits its own, which is the deployment's other default.
+    let personal = f.personal("alice");
+    assert_eq!(f.effective(d, personal, None).tenant_quota_bytes, 200);
+
+    // Precedence is deployment, then tenant, then repository: the tenant's own value wins over the default
+    // it would have inherited, and a repository narrows the tenant's and never widens it.
+    f.set(
+        credential(f.root),
+        None,
+        Policy {
+            quota_bytes: Some(400),
+            ..Policy::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(f.effective(d, f.tenant, None).tenant_quota_bytes, 400);
+    f.set(
+        credential(f.admin),
+        Some(f.repo),
+        Policy {
+            quota_bytes: Some(100),
+            ..Policy::default()
+        },
+    )
+    .unwrap();
+    let narrow = f.effective(d, f.tenant, Some(f.repo));
+    assert_eq!(
+        (narrow.tenant_quota_bytes, narrow.repo_quota_bytes),
+        (400, 100)
+    );
+
+    // The tenant's limit is what a refusal is measured against, above or below the default.
+    let capped = Deployment {
+        tenant_quota_bytes: 1_000_000,
+        ..d
+    };
+    assert!(matches!(
+        f.store
+            .read(|c| retention::check_tenant(c, &capped, f.tenant, 400, 1)),
+        Err(Error::QuotaExceeded)
+    ));
+    assert!(
+        f.store
+            .read(|c| retention::check_tenant(c, &capped, personal, 200, 0))
+            .is_ok(),
+        "a personal namespace answers to its own default"
+    );
+    assert!(matches!(
+        f.store
+            .read(|c| retention::check_tenant(c, &capped, personal, 200, 1)),
+        Err(Error::QuotaExceeded)
+    ));
+}
+
+#[test]
+fn a_tenants_unlimited_is_an_explicit_zero_only_a_platform_administrator_can_state() {
+    let f = fixture();
+    let d = Deployment {
+        tenant_quota_bytes: 1_000,
+        personal_quota_bytes: 200,
+        ..Deployment::default()
+    };
+    // A tenant administrator may not lift its own tenant's limit, and a repository row is never unlimited.
+    for user in [f.dev, f.admin] {
+        assert!(matches!(
+            f.set(
+                credential(user),
+                None,
+                Policy {
+                    quota_bytes: Some(0),
+                    ..Policy::default()
+                }
+            ),
+            Err(Error::Forbidden)
+        ));
+    }
+    assert!(matches!(
+        f.set(
+            credential(f.admin),
+            Some(f.repo),
+            Policy {
+                quota_bytes: Some(0),
+                ..Policy::default()
+            }
+        ),
+        Err(Error::InvalidInput(_))
+    ));
+    // The platform administrator may, and 0 is then a tenant with no ceiling at all.
+    f.set(
+        credential(f.root),
+        None,
+        Policy {
+            quota_bytes: Some(0),
+            ..Policy::default()
+        },
+    )
+    .unwrap();
+    let unlimited = f.effective(d, f.tenant, None);
+    assert_eq!(unlimited.tenant_quota_bytes, 0);
+    assert_eq!(f.standing(d).state, State::Ok);
+    assert_eq!(f.standing(d).soft_bytes, 0);
+    f.upload(1_000).unwrap();
+    assert_eq!(
+        f.standing(d).state,
+        State::Ok,
+        "an unlimited tenant has no line"
+    );
+    assert!(
+        f.store
+            .read(|c| retention::check_tenant(c, &d, f.tenant, u64::MAX / 2, 0))
+            .is_ok()
+    );
+    // Clearing it puts the deployment's default back in force.
+    f.set(Authority::HostLocal, None, Policy::default())
+        .unwrap();
+    assert_eq!(f.effective(d, f.tenant, None).tenant_quota_bytes, 1_000);
+}
+
+#[test]
+fn a_tenant_at_its_limit_stays_there_when_the_default_takes_effect() {
+    let f = fixture();
+    // Before the change the deployment stated no limit, so nothing was refused.
+    let unlimited = Deployment {
+        tenant_quota_bytes: 0,
+        personal_quota_bytes: 0,
+        ..Deployment::default()
+    };
+    f.upload(900).unwrap();
+    assert_eq!(f.standing(unlimited).state, State::Ok);
+
+    // The same 900 bytes against the new default, with no policy row written: the tenant is past its hard
+    // threshold, and it stays there through an unrelated policy write.
+    let sized = Deployment {
+        tenant_quota_bytes: 500,
+        ..Deployment::default()
+    };
+    let standing = f.standing(sized);
+    assert_eq!((standing.quota_bytes, standing.hard_bytes), (500, 500));
+    assert_eq!(standing.state, State::Hard);
+    assert!(matches!(
+        f.store
+            .read(|c| retention::check_tenant(c, &sized, f.tenant, 900, 1)),
+        Err(Error::QuotaExceeded)
+    ));
+    f.set(
+        Authority::HostLocal,
+        None,
+        Policy {
+            log_retention_ms: Some(2 * DAY),
+            ..Policy::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(f.standing(sized).state, State::Hard, "still capped");
+    assert!(matches!(
+        f.store
+            .read(|c| retention::check_tenant(c, &sized, f.tenant, 900, 1)),
+        Err(Error::QuotaExceeded)
+    ));
+    // The one way out is the platform administrator's explicit unlimited.
+    f.set(
+        Authority::HostLocal,
+        None,
+        Policy {
+            quota_bytes: Some(0),
+            ..Policy::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(f.standing(sized).state, State::Ok);
+}
+
+#[test]
+fn the_default_limit_is_sized_from_the_data_file_system() {
+    // The reference host's measured data file system (docs/retention.md): a twentieth for a tenant and a
+    // hundredth for a personal namespace, both of which land on their ceilings there.
+    assert_eq!(
+        retention::sized_quota(1_080_795_422_720),
+        (50 << 30, 10 << 30)
+    );
+    // A small disk gets a workable limit rather than a twentieth of nothing, and a large one is bounded.
+    let tiny = retention::sized_quota(8 << 30);
+    assert_eq!(
+        tiny,
+        (
+            retention::MIN_TENANT_QUOTA_BYTES,
+            retention::MIN_PERSONAL_QUOTA_BYTES
+        )
+    );
+    let large = retention::sized_quota(64 << 40);
+    assert_eq!(large, (50 << 30, 10 << 30));
+    assert_eq!(retention::sized_quota(u64::MAX), (50 << 30, 10 << 30));
+    assert_eq!(
+        retention::sized_quota(64 << 30),
+        (8 << 30, 2 << 30),
+        "a 64 GiB disk"
+    );
+    // The deployment's own default is the reference host's, so a store opened without a configuration
+    // states a limit rather than none.
+    let d = Deployment::default();
+    assert_eq!(
+        (d.tenant_quota_bytes, d.personal_quota_bytes),
+        (
+            retention::DEFAULT_TENANT_QUOTA_BYTES,
+            retention::DEFAULT_PERSONAL_QUOTA_BYTES
+        )
     );
 }
 

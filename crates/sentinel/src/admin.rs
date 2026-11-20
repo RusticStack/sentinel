@@ -354,6 +354,20 @@ fn upgrade_check(data: &DataDir) -> Result<(), Error> {
             })).collect::<Vec<_>>(),
             "sealed_values": report.sealed_values,
             "key_present": report.key_present,
+            "tenant_defaults": {
+                "tenant_quota_bytes": report.tenant_defaults.0,
+                "personal_quota_bytes": report.tenant_defaults.1,
+            },
+            "capped_tenants": {
+                "total": report.capped_total,
+                "listed": report.capped.iter().map(|t| serde_json::json!({
+                    "slug": t.slug,
+                    "personal": t.personal,
+                    "used_bytes": t.used_bytes,
+                    "quota_bytes": t.quota_bytes,
+                    "default_bytes": t.default_bytes,
+                })).collect::<Vec<_>>(),
+            },
             "worker_protocol": {
                 "min": sentinel_protocol::negotiate::SUPPORTED_MIN.0,
                 "max": sentinel_protocol::negotiate::SUPPORTED_MAX.0,
