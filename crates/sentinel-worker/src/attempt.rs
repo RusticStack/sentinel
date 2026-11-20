@@ -11,7 +11,7 @@ use std::{
 
 use sentinel_core::{AttemptId, Event, FailureClass, Fence, WorkerId};
 use sentinel_link::session::JobContext;
-use sentinel_pipeline::{RunSpec, expr::EvalError};
+use sentinel_pipeline::{RunSpec, compile::CompiledJob, expr::EvalError};
 use sentinel_protocol::{
     logs::Stream,
     negotiate::Arch,
@@ -151,6 +151,69 @@ impl Drop for SecretDirectory {
     }
 }
 
+/// One attempt's output directory: the file a step writes its declared outputs into, and the script that exports
+/// what its earlier steps wrote. The controller stores what the worker accepts as plain text, so nothing here is
+/// secret; the directory is bounded by the schema's own output bound and by the job's declared disk.
+pub(crate) struct OutputDirectory {
+    dir: PathBuf,
+}
+
+impl OutputDirectory {
+    fn create(root: &Path, attempt: AttemptId) -> Result<Self> {
+        let base = crate::runtime_dir(root).join("attempt-output");
+        if let Some(runtime) = base.parent() {
+            create_private_dir(runtime, true)?;
+        }
+        create_private_dir(&base, true)?;
+        let dir = base.join(attempt.to_string());
+        create_private_dir(&dir, false)?;
+        Ok(Self { dir })
+    }
+
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Writes the values a step sees and empties the file it writes, so a step never reads the previous step's
+    /// outputs as its own and one that appends starts from nothing.
+    fn prepare(&self, values: &[(String, String)]) -> Result<()> {
+        let script = crate::outputs::script(values);
+        std::fs::write(self.dir.join(crate::outputs::VALUES), &script)?;
+        std::fs::write(self.dir.join(crate::outputs::FILE), b"")?;
+        Ok(())
+    }
+
+    /// What the step wrote, or `None` when it wrote past the file's own bound: every declared output at its bound,
+    /// plus the room for their names and newlines.
+    fn read(&self) -> Result<Option<Vec<u8>>> {
+        use std::io::Read;
+        let path = self.dir.join(crate::outputs::FILE);
+        let mut file = std::fs::File::open(&path)?;
+        let mut buf = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = match file.read(&mut chunk) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => return Err(e.into()),
+            };
+            if buf.len() + read > crate::outputs::MAX_FILE_BYTES {
+                // Past the bound: stop reading rather than grow with what the step wrote.
+                return Ok(None);
+            }
+            buf.extend_from_slice(&chunk[..read]);
+        }
+        Ok(Some(buf))
+    }
+}
+
+impl Drop for OutputDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 struct StepSecrets {
     env_file: Option<PathBuf>,
     files: Vec<PathBuf>,
@@ -171,6 +234,55 @@ impl Drop for StepSecrets {
             let _ = fs::remove_dir(dir);
         }
     }
+}
+
+/// Takes the artifacts this job declared from the jobs it needs, before any step runs: the bytes are the
+/// producer's own publication, verified against the digests it recorded, and written under the directory the job
+/// named. A handoff that cannot be taken fails preparation — the artifact is an input the job declared, not an
+/// optional result — and a cancelled attempt stops between them.
+fn take_handoffs(job: &Job, report: &dyn Report, workspace: &Path, cancel: &Cancel) -> Result<()> {
+    let compiled = &job.spec.pipeline.jobs[job.job_index].spec;
+    if compiled.handoff.is_empty() {
+        return Ok(());
+    }
+    let budget = Duration::from_secs((compiled.timeout_secs / 4).clamp(30, 900));
+    for declaration in &compiled.handoff {
+        if cancel.load(Ordering::Acquire) {
+            return Err(Error::Preparation("canceled".into()));
+        }
+        let into = crate::handoff::create(workspace, &declaration.into)?;
+        let mut sink = crate::handoff::Writer::new(into);
+        let deadline = Instant::now() + budget;
+        report
+            .fetch_handoff(
+                job.attempt,
+                &declaration.from,
+                &declaration.artifact,
+                deadline,
+                &mut sink,
+            )
+            .map_err(|e| {
+                Error::Preparation(format!(
+                    "handoff `{}/{}`: {}",
+                    declaration.from,
+                    declaration.artifact,
+                    e.reason()
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+/// Whether the attempt needs an output directory: a step of its job declares an output, the job re-exports one, or
+/// a job it needs published outputs for it to read.
+fn declares_outputs(compiled: &CompiledJob, reads_dependencies: bool) -> bool {
+    reads_dependencies
+        || !compiled.spec.outputs.is_empty()
+        || compiled
+            .spec
+            .steps
+            .iter()
+            .any(|step| !step.outputs.is_empty())
 }
 
 fn create_private_dir(path: &Path, allow_existing: bool) -> Result<()> {
@@ -256,13 +368,29 @@ fn write_export(file: &mut std::fs::File, name: &str, value: &[u8]) -> Result<()
 }
 
 /// Values reach the step by sourced file, never through Podman or argv, which would persist them.
-fn wrap_with_env(argv: Vec<String>, step: usize) -> Vec<String> {
+/// The step's command with the exports it must see sourced first: its secrets' environment file and the outputs
+/// its earlier steps wrote. Both are written by the worker, so neither can be spoofed by the pipeline.
+fn wrap_with_env(argv: Vec<String>, step: Option<usize>, values: bool) -> Vec<String> {
+    let mut script = String::with_capacity(96);
+    if let Some(step) = step {
+        script.push_str(". ");
+        script.push_str(SECRET_ENV_MOUNT);
+        script.push_str("/step-");
+        script.push_str(&step.to_string());
+        script.push_str(".sh && ");
+    }
+    if values {
+        script.push_str(". ");
+        script.push_str(crate::outputs::MOUNT);
+        script.push('/');
+        script.push_str(crate::outputs::VALUES);
+        script.push_str(" && ");
+    }
+    script.push_str("exec \"$@\"");
     let mut wrapped = Vec::with_capacity(argv.len() + 4);
     wrapped.push("/bin/sh".to_owned());
     wrapped.push("-c".to_owned());
-    wrapped.push(format!(
-        ". {SECRET_ENV_MOUNT}/step-{step}.sh && exec \"$@\""
-    ));
+    wrapped.push(script);
     wrapped.push("sentinel-step".to_owned());
     wrapped.extend(argv);
     wrapped
@@ -382,6 +510,17 @@ pub trait Report: Send + Sync {
     }
     /// The attempt's cache figures, once per attempt that declared a cache entry.
     fn cache_records(&self, _attempt: AttemptId, _records: &[CacheRecord]) {}
+    /// Takes one artifact of a job this attempt needs from the controller, writing it through `sink`.
+    fn fetch_handoff(
+        &self,
+        _attempt: AttemptId,
+        _from: &str,
+        _artifact: &str,
+        _deadline: Instant,
+        _sink: &mut dyn sentinel_link::session::HandoffSink,
+    ) -> std::result::Result<(), sentinel_link::session::HandoffError> {
+        Err(sentinel_link::session::HandoffError::Aborted)
+    }
     fn remote(&self) -> Option<Arc<dyn sentinel_cache::remote::Remote>> {
         None
     }
@@ -501,6 +640,7 @@ pub fn run(
                 &prepared.sandbox,
                 prepared.workspace.path(),
                 prepared.secret_directory.as_ref(),
+                prepared.outputs.as_ref(),
                 &output,
                 &sink,
                 &mut publications,
@@ -585,6 +725,11 @@ pub fn run(
     if !summary.detail.is_empty() {
         summary.detail = output.redact(std::mem::take(&mut summary.detail));
     }
+    if let Some(finalizer) = &mut summary.finalizer
+        && !finalizer.annotation.is_empty()
+    {
+        finalizer.annotation = output.redact(std::mem::take(&mut finalizer.annotation));
+    }
     let event = match &verdict {
         Verdict::Passed => Event::Passed,
         Verdict::Failed(class, why) => {
@@ -662,6 +807,18 @@ fn prepare(
                 return Err(error);
             }
         }
+    };
+    // The output directory holds what a step declares for the steps after it, and what the jobs this job needs
+    // published. It is created only when the job reads or writes one, and removed with the attempt.
+    let outputs = match declares_outputs(compiled, !job.context.outputs.is_empty()) {
+        true => match OutputDirectory::create(root, job.attempt) {
+            Ok(directory) => Some(directory),
+            Err(error) => {
+                discard_workspace(report, job.attempt, workspace);
+                return Err(error);
+            }
+        },
+        false => None,
     };
     let outcome = (|| {
         // Everything that can fail on a plain error happens before the checkout thread exists: a return after
@@ -767,6 +924,7 @@ fn prepare(
             return Err(Error::Preparation("canceled".into()));
         }
         checked_out.and(pulled)?;
+        take_handoffs(job, report, workspace.path(), cancel)?;
         let store = job.store.clone();
         let mut mounts = restore_caches(root, job, &declared, workspace.path(), &image, remote);
         let (mut files, mut env) = (false, false);
@@ -797,6 +955,15 @@ fn prepare(
             }
         }
         let isolation = job.runtime.for_job(stated_isolation);
+        if let Some(outputs) = &outputs
+            && matches!(isolation, Isolation::Container)
+        {
+            mounts.push(podman::Mount {
+                host: outputs.dir().to_path_buf(),
+                container: crate::outputs::MOUNT.into(),
+                read_only: false,
+            });
+        }
         if matches!(isolation, Isolation::Container) {
             // The job's `/tmp` lives on the workspace disk, under the same disk budget, not in memory.
             mounts.push(podman::Mount {
@@ -857,6 +1024,7 @@ fn prepare(
             workspace,
             sandbox,
             secret_directory,
+            outputs,
         }),
         Err(e) => {
             discard_workspace(report, job.attempt, workspace);
@@ -983,13 +1151,23 @@ fn execute(
     container: &Sandbox,
     workspace: &Path,
     secret_directory: Option<&SecretDirectory>,
+    outputs_dir: Option<&OutputDirectory>,
     output: &Arc<dyn Output>,
     sink: &Arc<dyn artifacts::Sink>,
     publications: &mut artifacts::StepPublications,
     cancel: &Cancel,
     summary: &mut AttemptSummary,
 ) -> Verdict {
-    let extra = [
+    // The outputs this job's own steps wrote, in declaration order, and what the jobs it needs published: both are
+    // exported into every later step through the output directory's script.
+    let outputs: Vec<(String, String)> = job
+        .context
+        .outputs
+        .iter()
+        .map(|(from, name, value)| (crate::outputs::env_name(Some(from), name), value.clone()))
+        .collect();
+    let mut own: Vec<(String, String)> = Vec::with_capacity(4);
+    let mut extra = vec![
         ("SENTINEL_RUN".to_owned(), job.context.run.to_string()),
         ("SENTINEL_JOB".to_owned(), job.context.job.to_string()),
         ("SENTINEL_ATTEMPT".to_owned(), job.attempt.to_string()),
@@ -1000,6 +1178,12 @@ fn execute(
         ),
         ("CI".to_owned(), "true".to_owned()),
     ];
+    if outputs_dir.is_some() {
+        extra.push((
+            crate::outputs::FILE_VAR.to_owned(),
+            format!("{}/{}", crate::outputs::MOUNT, crate::outputs::FILE),
+        ));
+    }
     let compiled = &job.spec.pipeline.jobs[job.job_index].spec;
     let job_deadline = Instant::now() + Duration::from_secs(compiled.timeout_secs.max(1));
     // A VM works on its own copy of the workspace: before `hash_files` reads one, bring back what the steps
@@ -1015,7 +1199,7 @@ fn execute(
     let mut failure: Option<(FailureClass, String)> = None;
     // A container's workspace has no kernel quota: the guard measures it and stops the container once it passes
     // the declared disk (docs/executor.md#disk). A microVM's scratch disk is the bound there.
-    let guard = container.guard_storage(workspace, compiled.resources.disk_bytes);
+    let guard = container.guard_storage_with(workspace, compiled.resources.disk_bytes, outputs_dir);
     let over_disk = |index: usize| {
         guard.as_ref().and_then(|g| {
             g.exceeded().map(|used| {
@@ -1092,6 +1276,22 @@ fn execute(
             ));
             continue;
         };
+        // The values the step reads and the file it writes are put in place before it starts, so a step never sees
+        // what a step that has not run wrote.
+        if let Some(dir) = outputs_dir {
+            let values: Vec<(String, String)> = outputs.iter().chain(&own).cloned().collect();
+            if let Err(e) = dir
+                .prepare(&values)
+                .and_then(|()| container.deliver_outputs(dir.dir()))
+            {
+                summary.steps.push(record);
+                failure = Some((
+                    FailureClass::Preparation,
+                    format!("step {index} output directory: {e}"),
+                ));
+                continue;
+            }
+        }
         let remaining = job_deadline.saturating_duration_since(Instant::now());
         command.timeout_secs = command.timeout_secs.min(remaining.as_secs().max(1));
         let started = Instant::now();
@@ -1141,8 +1341,14 @@ fn execute(
                 }
             }
         };
-        if step_secrets.as_ref().is_some_and(|s| s.env_file.is_some()) {
-            command.argv = wrap_with_env(std::mem::take(&mut command.argv), index);
+        let secret_env = step_secrets.as_ref().is_some_and(|s| s.env_file.is_some());
+        let values = outputs_dir.is_some_and(|_| !outputs.is_empty() || !own.is_empty());
+        if secret_env || values {
+            command.argv = wrap_with_env(
+                std::mem::take(&mut command.argv),
+                secret_env.then_some(index),
+                values,
+            );
         }
         let output_sink: crate::process::Sink = {
             let output = Arc::clone(output);
@@ -1187,7 +1393,7 @@ fn execute(
             }
         };
         record.duration_ns = ns(started);
-        let (outcome, why) = if cancel.load(Ordering::Acquire) {
+        let (mut outcome, mut why) = if cancel.load(Ordering::Acquire) {
             (
                 StepOutcome::Signaled {
                     signal: exit.signal.unwrap_or(0),
@@ -1250,6 +1456,53 @@ fn execute(
         } else {
             (StepOutcome::Passed, None)
         };
+        // What the step declared and wrote is read as soon as it ends, so the steps after it see it. A value is
+        // plain text and public within the tenant, so one that repeats a delivered secret fails the step instead.
+        if outcome == StepOutcome::Passed
+            && !cancel.load(Ordering::Acquire)
+            && let Some(dir) = outputs_dir
+        {
+            let declared = &compiled.steps[index].outputs;
+            let read = container
+                .collect_outputs(dir.dir())
+                .map_err(|e| StepOutputs::Runtime(e.to_string()))
+                .and_then(|()| dir.read().map_err(|e| StepOutputs::Runtime(e.to_string())))
+                .and_then(|bytes| match bytes {
+                    Some(bytes) => {
+                        crate::outputs::parse(&bytes, declared).map_err(StepOutputs::Violation)
+                    }
+                    None => Err(StepOutputs::Violation(crate::outputs::Violation::TooLong(
+                        declared.first().cloned().unwrap_or_default(),
+                    ))),
+                });
+            match read {
+                Ok(values) => {
+                    for (name, value) in values {
+                        if output.redact(value.clone()) != value {
+                            let violation = crate::outputs::Violation::Secret(name);
+                            outcome = StepOutcome::Failed { code: -1 };
+                            why = Some((
+                                FailureClass::CommandFailed,
+                                format!("step {index} {}", violation.reason()),
+                            ));
+                            break;
+                        }
+                        own.push((name, value));
+                    }
+                }
+                Err(StepOutputs::Violation(violation)) => {
+                    outcome = StepOutcome::Failed { code: -1 };
+                    why = Some((
+                        FailureClass::CommandFailed,
+                        format!("step {index} {}", violation.reason()),
+                    ));
+                }
+                Err(StepOutputs::Runtime(error)) => {
+                    outcome = StepOutcome::Runtime;
+                    why = Some((FailureClass::Runtime, format!("step {index}: {error}")));
+                }
+            }
+        }
         record.outcome = outcome;
         summary.steps.push(record);
         failure = why;
@@ -1273,10 +1526,112 @@ fn execute(
     {
         report.storage_unmeasured(job.attempt, g.unreadable(), g.timed_out());
     }
+    // The job's own outputs, in declaration order: only those a passed step wrote are in `own`.
+    summary.outputs = compiled
+        .outputs
+        .iter()
+        .filter_map(|name| {
+            own.iter()
+                .find(|(written, _)| written == name)
+                .map(|(_, value)| (name.clone(), value.clone()))
+        })
+        .collect();
+    summary.finalizer = finalize_step(
+        job,
+        |command| container.exec(command, &extra),
+        cancel,
+        job_deadline,
+    );
     match failure {
         None => Verdict::Passed,
         Some((class, why)) => Verdict::Failed(class, why),
     }
+}
+
+/// What reading a step's declared outputs can fail with: a value the schema refuses, or the sandbox's own error.
+#[derive(Debug)]
+enum StepOutputs {
+    Violation(crate::outputs::Violation),
+    Runtime(String),
+}
+
+/// Runs the job's bounded finalizer, and answers only what it did: it never decides the verdict, never fences,
+/// never releases the lease and never decides a container is gone. A cancelled attempt does not run it at all, so
+/// the job's cancellation ends on the worker's own authoritative path and nothing here can extend it.
+fn finalize_step(
+    job: &Job,
+    run: impl FnOnce(&sentinel_pipeline::run::StepCommand) -> Result<podman::Exit>,
+    cancel: &Cancel,
+    job_deadline: Instant,
+) -> Option<sentinel_protocol::summary::FinalizerRecord> {
+    use sentinel_protocol::summary::{FinalizerRecord, MAX_ANNOTATION_BYTES};
+    let mut command = job.spec.finalize_command(job.job_index)?;
+    let record = |outcome, duration_ns, annotation: &str| FinalizerRecord {
+        outcome,
+        duration_ns,
+        annotation: annotation
+            .chars()
+            .scan(0usize, |used, c| {
+                *used += c.len_utf8();
+                (*used <= MAX_ANNOTATION_BYTES).then_some(c)
+            })
+            .collect(),
+    };
+    if cancel.load(Ordering::Acquire) {
+        return Some(record(
+            StepOutcome::Skipped,
+            None,
+            "not run: the attempt was canceled",
+        ));
+    }
+    // The finalizer is bounded by its own timeout and by what is left of the job's, so it cannot run the job past
+    // its budget even when the steps ended early.
+    let remaining = job_deadline.saturating_duration_since(Instant::now());
+    command.timeout_secs = command
+        .timeout_secs
+        .min(remaining.as_secs().max(1))
+        .min(sentinel_pipeline::schema::MAX_FINALIZE_SECS);
+    let started = Instant::now();
+    let exit = run(&command);
+    let duration_ns = ns(started);
+    Some(match exit {
+        Err(error) => record(
+            StepOutcome::Runtime,
+            duration_ns,
+            &format!("finalizer could not run: {error}"),
+        ),
+        Ok(exit) if exit.timed_out => record(
+            StepOutcome::TimedOut,
+            duration_ns,
+            &format!(
+                "finalizer exceeded its {} s bound and was stopped",
+                command.timeout_secs
+            ),
+        ),
+        Ok(exit) if cancel.load(Ordering::Acquire) => record(
+            StepOutcome::Signaled {
+                signal: exit.signal.unwrap_or(0),
+            },
+            duration_ns,
+            "finalizer was stopped with the attempt",
+        ),
+        Ok(exit) => match (exit.signal, exit.code) {
+            (None, Some(0)) => record(StepOutcome::Passed, duration_ns, ""),
+            (Some(signal), _) => record(
+                StepOutcome::Signaled { signal },
+                duration_ns,
+                &format!("finalizer died from signal {signal}"),
+            ),
+            (None, code) => {
+                let code = code.unwrap_or(-1);
+                record(
+                    StepOutcome::Failed { code },
+                    duration_ns,
+                    &format!("finalizer exited with {code}"),
+                )
+            }
+        },
+    })
 }
 
 /// Publishes the artifacts declared behind `step` now that it completed, so the steps after it run during the
@@ -1480,6 +1835,7 @@ struct PreparedExecution {
     workspace: Workspace,
     sandbox: Sandbox,
     secret_directory: Option<SecretDirectory>,
+    outputs: Option<OutputDirectory>,
 }
 
 fn finalize(
@@ -1495,7 +1851,10 @@ fn finalize(
         workspace,
         sandbox,
         secret_directory,
+        outputs,
     } = prepared;
+    // What the steps wrote is already reported; the file the last step wrote is not read again.
+    drop(outputs);
     // Stop the sandbox first: no job process may rewrite the views publication reads.
     if let Err(error) = sandbox.destroy() {
         report.cleanup_failed(job.attempt, "sandbox", &error.to_string());
@@ -1554,6 +1913,10 @@ fn offer_caches(
     }
 }
 
+/// I04's sandbox-free gate: declared outputs and finalizers through a real shell.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "attempt/output_provisioning.rs"]
+mod output_provisioning;
 /// S07's end-to-end gate: one canary through bind, deliver, stage, run, log, diagnostic and teardown.
 #[cfg(all(test, target_os = "linux"))]
 #[path = "attempt/secret_provisioning.rs"]
@@ -1673,7 +2036,8 @@ mod tests {
                 "printf '%s' \"$TRICKY\" > \"$0\"; printf '%s' \"${#BIG}\" > \"$0.len\"".into(),
                 temp.path().join("seen").display().to_string(),
             ],
-            3,
+            Some(3),
+            false,
         );
         assert!(
             argv.iter()
@@ -1764,6 +2128,7 @@ mod tests {
                 .into(),
             spec,
             context: JobContext {
+                outputs: Vec::new(),
                 source: None,
                 source_valid_until: None,
                 run: RunId::new(),
@@ -1926,6 +2291,17 @@ mod tests {
             _: &sentinel_cache::Stats,
         ) {
             self.costly.lock().unwrap().push((name.to_owned(), costly));
+        }
+        /// Takes one artifact of a job this attempt needs from the controller, writing it through `sink`.
+        fn fetch_handoff(
+            &self,
+            _attempt: AttemptId,
+            _from: &str,
+            _artifact: &str,
+            _deadline: Instant,
+            _sink: &mut dyn sentinel_link::session::HandoffSink,
+        ) -> std::result::Result<(), sentinel_link::session::HandoffError> {
+            Err(sentinel_link::session::HandoffError::Aborted)
         }
         fn remote(&self) -> Option<Arc<dyn sentinel_cache::remote::Remote>> {
             self.remote.lock().unwrap().clone()

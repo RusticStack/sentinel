@@ -48,11 +48,21 @@ jobs:                           # 1–64, names [a-z0-9][a-z0-9_-]{0,63}
         env: {…}
         workdir: …
         timeout: 5m             # ≤ job timeout
+        outputs: [version]      # ≤ 8 names per step, ≤ 16 per job
     cache:                      # ≤ 8, unique names
       - {name: cargo, key: "cargo-${{ hash_files('Cargo.lock') }}", paths: [/usr/local/cargo/registry, target]}
       - {name: registry, class: downloads, key: "dl-${{ hash_files('Cargo.lock') }}", paths: [/usr/local/cargo/registry]}
     artifacts:                  # ≤ 8, unique names
       - {name: release, paths: [target/release/app], when: success|failure|always|step:<step id>, retain: 7d, required: false, class: standard}
+    outputs: [version]          # ≤ 8 step outputs re-exported to the jobs that need this one
+    handoff:                    # ≤ 8 artifacts of jobs in `needs`, taken before the steps run
+      - {from: build, artifact: release, into: dist}
+    finalize:                   # optional, runs when the job ends, never changes its verdict
+      run: ./notify.sh
+      shell: sh|bash            # default sh
+      env: {…}
+      workdir: …
+      timeout: 30s              # default 1m, at most 5m
     secrets: [DEPLOY_TOKEN]     # ≤ 16 names [A-Z_][A-Z0-9_]*; values never appear in YAML
 ```
 
@@ -186,6 +196,44 @@ Templates render each interpolation as string, integer or boolean; `null` is an 
 `hash_files(root, patterns)` resolves on Linux workers against a pinned checkout root: segments may contain `*` or be `**` (zero or more directories); a terminal `**` includes regular files recursively. Unique matches are sorted by UTF-8 path bytes; the result remains the BLAKE3 hex of `path \0 little-endian-u64-length content` records. No match is an error, not an empty key. Overlapping patterns do not consume the unique-file budget twice.
 
 The [resolver contract](hash-files.md) provides streaming directory enumeration, shared traversal and depth budgets, actual read accounting, and descriptor-rooted no-symlink/no-mount access. Matching symlinks and special files fail closed; filesystem failures are not silently treated as absent input. Secure resolution requires Linux `openat2` and host procfs; other platforms return `UnsupportedPlatform`. Portable offline validation/explanation still reports runtime hashes as unresolved.
+
+## Declared outputs
+
+A step declares the names it writes values under, and writes them into the file `SENTINEL_OUTPUT` names, one
+`name=value` line each. A later step of the same job sees them as `SENTINEL_OUTPUT_<NAME>`; a job's own `outputs`
+re-export the ones the jobs that need it read, as `SENTINEL_OUTPUT_<JOB>_<NAME>`, with `-` written as `_` and
+everything upper case. The bounds are the schema's: at most 8 names per step and 16 across a job's steps, one value
+of at most 1 KiB each, a written file of at most `1 KiB × 16 + 4 KiB`, and a declared output the step never wrote is
+absent rather than empty. A step that writes a name it did not declare, writes one twice, writes a value past the
+bound, writes something that is not text, or repeats a value the attempt was given as a secret fails with
+`command_failed` and a message naming the name and the limit, never the value.
+
+An output is **plain text in the run's record and public within the tenant**: the controller stores what the worker
+accepted in the job's row, the jobs that need it read it from their context, and nothing redacts it. That is why the
+worker refuses one that repeats a delivered secret, and why a value is never a place for one. An output name is an
+id (`[a-z0-9][a-z0-9_-]*`), so two steps of one job cannot write the same name and a later step's read is never
+ambiguous.
+
+## Artifact handoff
+
+`handoff` names artifacts of jobs the job `needs` — `from` must be in `needs` and `artifact` must be one that job
+declares — and the directory each is placed under, before the job's first step runs. The bytes are the producer's own
+publication: the controller streams the artifact's manifest entries and the worker verifies each against the digest
+the publication recorded, so a handoff makes no second copy, keeps the artifact's class, retention and record as the
+publication set them, and honours the same per-artifact and per-run budgets. A declared handoff that is absent,
+expired, refused or damaged fails preparation, because it is an input the job declared rather than an optional
+result; nothing about it is optional and no step of the consuming job starts. Up to 8 artifacts may be taken, up to
+1 GiB each.
+
+## Bounded finalizers
+
+`finalize` is a step that runs once the job's steps have ended, in the same container and workspace, whatever the
+verdict was. It is bounded twice: by its own `timeout` (default 1m, at most 5m) and by what is left of the job's own
+budget, so it can never run the job past its `timeout`. It takes no `outputs`, no `secrets` and no `if`, and it
+cannot change the job's conclusion: what it did is an annotation on the attempt's record — its outcome, how long it
+took and one bounded line naming an exit status or a bound — and a job that passes with a failing finalizer still
+passes. A cancelled attempt does not run it at all, so a finalizer can never extend a cancelled job's life, and the
+worker's own cancel and lease-expiry paths still end the job exactly as they did ([executor](executor.md#finalizers)).
 
 ## Bindings and offline validation
 

@@ -159,9 +159,9 @@ impl RuleTable {
                 reason: "deployment environments with their secrets and approvals are not \
                          modelled",
             },
-            Construct::Outputs => Rule::Unsupported {
-                reason: "declared outputs and artifact handoff between jobs do not exist yet \
-                         (I04)",
+            Construct::Outputs => Rule::WithChange {
+                change: "a job's outputs become the step `outputs` that write them and the job's own \
+                         `outputs`, plain text in the run's record",
             },
             Construct::ReusableWorkflow => Rule::Unsupported {
                 reason: "reusable pipelines do not exist yet (I10)",

@@ -578,9 +578,9 @@ fn the_inventory_records_every_documented_construct() {
             }));
     assert!(rules.iter().any(|(name, rule)| name == "outputs"
         && *rule
-            == Rule::Unsupported {
-                reason: "declared outputs and artifact handoff between jobs do not exist yet \
-                         (I04)"
+            == Rule::WithChange {
+                change: "a job's outputs become the step `outputs` that write them and the job's own \
+                         `outputs`, plain text in the run's record"
             }));
 }
 

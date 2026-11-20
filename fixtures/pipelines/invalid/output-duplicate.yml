@@ -1,0 +1,9 @@
+# expect: jobs.a.steps[1].outputs[0]: duplicate output
+schema: 1
+on: [push]
+jobs:
+  a:
+    image: busybox
+    steps:
+      - {id: one, run: x, outputs: [version]}
+      - {id: two, run: y, outputs: [version]}

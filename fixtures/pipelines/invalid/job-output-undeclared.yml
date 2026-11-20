@@ -1,0 +1,9 @@
+# expect: jobs.a.outputs[0]: a job output must be declared by one of the job's steps
+schema: 1
+on: [push]
+jobs:
+  a:
+    image: busybox
+    steps:
+      - {id: one, run: x, outputs: [version]}
+    outputs: [revision]

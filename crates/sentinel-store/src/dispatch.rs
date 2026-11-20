@@ -2176,6 +2176,11 @@ pub fn report(
     if let Some(summary) = summary
         && next.is_terminal()
     {
+        // The job's declared outputs commit with the transition that ended it, under the same fence, so the jobs
+        // that need it read exactly what this attempt wrote.
+        if let Ok(decoded) = sentinel_protocol::summary::AttemptSummary::decode(summary) {
+            crate::outputs::record(tx, attempt, fence, &decoded.outputs)?;
+        }
         tx.prepare_cached("UPDATE attempts SET summary = ?2 WHERE id = ?1 AND summary IS NULL")?
             .execute(params![attempt.as_bytes(), summary])?;
         // The attempt is over and its reports are what the flaky list is built from: queue it for the pass
@@ -2209,6 +2214,8 @@ pub struct JobContext {
     pub trust: sentinel_protocol::cache::Trust,
     pub cancelled: bool,
     pub needs: Vec<(String, Outcome)>,
+    /// The declared outputs of the jobs in `needs`, by producing job and name.
+    pub outputs: Vec<(String, String, String)>,
 }
 
 type ContextRow = (
@@ -2261,6 +2268,7 @@ pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> R
         .get(usize::try_from(index).map_err(|_| Error::Corrupt("spec_index"))?)
         .ok_or(Error::Corrupt("run_specs.spec"))?;
     let mut needs = Vec::with_capacity(compiled.needs.len());
+    let mut outputs: Vec<(String, String, String)> = Vec::new();
     for need in &compiled.needs {
         let upstream = spec
             .pipeline
@@ -2275,6 +2283,20 @@ pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> R
             return Err(Error::Corrupt("dependency not terminal"));
         };
         needs.push((upstream.name.clone(), outcome));
+        // Only a passed job published outputs: a failed or skipped dependency has none to carry.
+        if outcome == Outcome::Passed && !upstream.spec.outputs.is_empty() {
+            let job: [u8; 16] = conn
+                .prepare_cached("SELECT id FROM jobs WHERE run_id = ?1 AND name = ?2")?
+                .query_row(params![run.as_bytes(), upstream.name.as_str()], |r| {
+                    r.get(0)
+                })
+                .optional()?
+                .ok_or(Error::Corrupt("run_specs.spec"))?;
+            let job = JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?;
+            for (name, value) in crate::outputs::of_job(conn, tenant, job)? {
+                outputs.push((upstream.name.clone(), name, value));
+            }
+        }
     }
     let event = crate::provenance::event_facts(conn, run)?;
     let repo = RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?;
@@ -2290,6 +2312,70 @@ pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> R
         event,
         cancelled: cancel != 0,
         needs,
+        outputs,
+    })
+}
+
+/// One artifact a job this attempt needs published, resolved for the controller to stream: whose it is, and the
+/// manifest the publication recorded. Every check is the publication's own: the attempt is held by this worker, the
+/// producing job is one this job needs, the job declares the handoff, and the artifact is captured and unexpired.
+pub struct HandoffSource {
+    pub tenant: TenantId,
+    pub manifest: String,
+    pub version: u64,
+}
+
+pub fn handoff_source(
+    conn: &Connection,
+    worker: WorkerId,
+    attempt: AttemptId,
+    from: &str,
+    artifact: &str,
+    now: UnixMillis,
+) -> Result<HandoffSource> {
+    let row: Option<([u8; 16], [u8; 16], i64)> = conn
+        .prepare_cached(
+            "SELECT j.tenant_id, j.run_id, j.spec_index
+             FROM attempts a JOIN jobs j ON j.id = a.job_id JOIN workers w ON w.id = a.worker_id
+             WHERE a.id = ?1 AND a.worker_id = ?2 AND a.acked_ms IS NOT NULL
+               AND a.released_ms IS NULL AND w.revoked_ms IS NULL",
+        )?
+        .query_row(params![attempt.as_bytes(), worker.as_bytes()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?;
+    let Some((tenant, run, index)) = row else {
+        return Err(Error::NotFound);
+    };
+    let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?;
+    let run = RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?;
+    let spec = runs::get_run_spec(conn, tenant, run)?;
+    let compiled = spec
+        .pipeline
+        .jobs
+        .get(usize::try_from(index).map_err(|_| Error::Corrupt("spec_index"))?)
+        .ok_or(Error::Corrupt("run_specs.spec"))?;
+    // The job must declare this handoff, and the producing job must be one it needs: a job cannot read an artifact
+    // it never declared, whatever it names.
+    let declared = compiled
+        .spec
+        .handoff
+        .iter()
+        .any(|h| h.from == from && h.artifact == artifact);
+    if !declared {
+        return Err(Error::Forbidden);
+    }
+    let published = crate::artifacts::captured(conn, tenant, run, from, artifact)?;
+    if published.pinned_ms.is_none() && published.retain_until_ms <= now {
+        return Err(Error::NotFound);
+    }
+    let version = published
+        .manifest_version
+        .ok_or_else(|| Error::Corrupt("artifact manifest"))?;
+    Ok(HandoffSource {
+        tenant,
+        manifest: published.manifest()?,
+        version,
     })
 }
 

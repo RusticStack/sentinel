@@ -435,7 +435,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     let report = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         report.inspection.pending,
-        vec![73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+        vec![73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85]
     );
     assert!(report.inspection.openable() && report.inspection.integrity == "ok");
     assert_eq!(
@@ -456,7 +456,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
             .iter()
             .map(|step| step.version)
             .collect::<Vec<_>>(),
-        vec![73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+        vec![73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85]
     );
     let rewrites = |step: usize| -> Vec<(String, u64)> {
         report.steps[step]
@@ -525,7 +525,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     assert_eq!(
         workers,
         vec![
-            ("next", 14, None, true),
+            ("next", 14, None, false),
             ("old", 13, Some("sentinel-worker 0.1.0"), false)
         ]
     );
@@ -601,7 +601,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     let report = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         report.inspection.pending,
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85]
     );
     assert_eq!(
         report.copy.as_deref(),
@@ -609,7 +609,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     );
     assert_eq!(
         report.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85]
     );
     assert!(report.blocking.is_empty(), "{:?}", report.blocking);
 
@@ -657,10 +657,16 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
          writes"
     );
     assert_eq!(
+        schema::readable_by(84),
+        84,
+        "migration 84 adds a request's kind and question, and a controller below it would answer a \
+         question as a failure analysis"
+    );
+    assert_eq!(
         schema::readable_by(schema::LATEST),
         84,
-        "the newest migration adds a request's kind and question, and a controller below it would \
-         answer a question as a failure analysis"
+        "migration 85 adds one nullable column no earlier statement reads or writes, so the release \
+         before it runs on the result"
     );
     for release in [69, schema::LATEST - 2] {
         assert!(
@@ -706,11 +712,11 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     let again = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         again.inspection.pending,
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85]
     );
     assert_eq!(
         again.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85]
     );
 }
 
@@ -849,7 +855,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     // docs/upgrades.md (tests/compat_doc.rs compares it with the code): a database at schema N
     // runs on release R only when no migration in (R, N] declares a readable_by above R. Rows
     // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
-    // 80, 81, 82, 83 and LATEST.
+    // 80, 81, 82, 83, 84 and LATEST.
     let readable = |db: &Connection, release: u32, newest: u32| -> bool {
         let needs: u32 = db
             .query_row(
@@ -862,13 +868,15 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        84,
+        85,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
     assert_eq!(
         sources,
-        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 81, 82, 83]
+        vec![
+            44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 81, 82, 83, 84
+        ]
     );
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
@@ -898,7 +906,8 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         // statement reads or writes, so it is too, as is migration 82 (the schedules and their
         // occurrences) and migration 83 (a request's origin, the tenant's automatic-analysis
         // switch and two indexes: an older statement names its own columns, so it writes the
-        // defaults and reads past the new ones); migrations 78 (the AI request rows and the
+        // defaults and reads past the new ones), 85 (one nullable column holding a job's declared
+        // outputs, which no older statement names); migrations 78 (the AI request rows and the
         // delegations they name), 79 (the budget ledger and reservations), 81 (the rebuilt
         // policy table with its unlimited quota) and 84 (a request's kind and question, which
         // decide what its answer has to be built from) are readable by nothing older. So the release
@@ -982,7 +991,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
                 false, false,
             ],
             // The newest releases in the list run on every column they are listed against.
-            75..=83 => [
+            75..=84 => [
                 true, true, true, true, true, true, true, true, true, true, true, true, true, true,
                 true,
             ],
@@ -1556,7 +1565,10 @@ fn the_upgrade_reports_the_tenants_the_new_default_caps_and_keeps_the_precedence
     // What the operator reads before upgrading: the defaults the upgrade will apply, sized from this data
     // file system, and the tenants whose usage or stated limit is above them, heaviest first.
     let report = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(report.inspection.pending, vec![81, 82, 83, schema::LATEST]);
+    assert_eq!(
+        report.inspection.pending,
+        vec![81, 82, 83, 84, schema::LATEST]
+    );
     assert_eq!(
         report.steps[0].rewrites,
         vec![upgrade::Rewrite {

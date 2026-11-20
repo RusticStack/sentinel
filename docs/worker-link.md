@@ -296,6 +296,36 @@ Runner mode's capacity is leased over the same session as a pipeline job's, and 
 
 Its tests are `crates/sentinel-link/tests/runner_mode.rs` — a burst of queued jobs gets one runner each, a configuration is delivered once and never again, a worker that does not name the class is never offered one, a lost `queued` event is recovered by reconciliation, an idle runner is stopped and de-registered at its bound, and the configuration reaches no log, record, bundle, environment listing or workspace — over a real TLS session and a recorded GitHub fake. The lease's own lifecycle is `crates/sentinel-store/tests/runner_provision.rs`, and the App's calls are `crates/sentinel-github/tests/runner.rs`.
 
+## Protocol 14: declared outputs and artifact handoff
+
+A job's dependencies' declared outputs reach it in its context, and an artifact of a job it needs is fetched over the
+same bulk connection its cache transfers use.
+
+- **Context.** `Context3` is the protocol-6 context plus `outputs`, the `(producing job, name, value)` triples of every
+  job in `needs` that passed and published any: bounded at 8 per job and 1 KiB per value by the pipeline schema, and
+  by the worker at `MAX_LIST_ITEMS × MAX_OUTPUT_RECORDS` entries and 1088 bytes per triple, so a frame past either
+  bound ends the session rather than filling an attempt's environment with it. They are plain text, never secrets:
+  nothing redacts them because nothing may be one, and the worker refuses an output that repeats a delivered secret.
+- **Handoff.** When an attempt's job declares a `handoff`, its worker asks for one artifact at a time with
+  `HandoffNeed { attempt, from, artifact }`. The controller checks that the worker holds the attempt under a live
+  lease, that the job's own spec declares that `(from, artifact)` pair, that the producing job is one it `needs`, and
+  that the artifact is captured and not past its retention — then answers with `Handoff` frames: `Begin` (the entry
+  count and byte total), one `Entry` per manifest entry, that entry's bodies in `CHUNK_BYTES` chunks (an entity of no
+  bytes still gets one empty body, so an entry always ends), and `End` with the digest of the entry list as sent. A
+  refusal is one `Refused` frame naming `not declared`, `absent`, `denied` or `unavailable`. The controller streams at
+  most `MAX_BYTES` (1 GiB) and `MAX_ENTRIES` (4096) per artifact and refuses a plan past either before a body moves.
+- **What the worker does with it.** It writes each entry under the directory the job named, refusing a path that
+  leaves it or a symlink anywhere on the way, and verifies the entry against the digest the publication recorded as its
+  last body arrives, so a damaged publication fails preparation instead of reaching a step. `HANDOFF_MIN` is 14 on
+  both sides: a session below it is never offered a job that declares a handoff and never sees these frames, and a
+  handoff frame on such a session is a protocol error. A fetch is one at a time per attempt, and the attempt's
+  preparation waits for it inside the job's own handoff budget.
+
+Its tests are `crates/sentinel-link/tests/artifact_handoff.rs` (over a real controller session: a consumer takes the
+producer's entry with its own path and bytes, and a job that never declared the artifact is refused `denied`) and the
+`handoff` module's unit tests (an entry that does not hash to its digest, a path that leaves the directory, a
+directory that is a symlink, a body past the declared length and an artifact past its bounds are each refused).
+
 ## Dispatch
 
 **The ready queue is the database.** A job is queued when its row says so (`jobs_ready`, the partial index on `(priority, created_seq) WHERE state_code = 1`); nothing in memory has to be rebuilt after a restart. Its resource needs (`cpu_millis`, `memory_bytes`) are copied from the compiled spec at run creation so placement never decodes a spec blob.

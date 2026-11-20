@@ -1,0 +1,12 @@
+# expect: jobs.b.handoff[0].from: a handoff may only name a job listed in this job's `needs`
+schema: 1
+on: [push]
+jobs:
+  a:
+    image: busybox
+    steps: [{id: one, run: x}]
+    artifacts: [{name: dist, paths: [dist]}]
+  b:
+    image: busybox
+    steps: [{id: one, run: y}]
+    handoff: [{from: a, artifact: dist, into: incoming}]
