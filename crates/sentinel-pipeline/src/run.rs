@@ -2,6 +2,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::input::{InputValue, Inputs};
+
 use sentinel_protocol::cache::Class;
 
 use crate::{
@@ -139,6 +141,9 @@ impl fmt::Display for ImageRef {
 pub struct RunSpec {
     pub source: PinnedSource,
     pub pipeline: CompiledPipeline,
+    /// The values this run was given, ascending by name: the declarations' defaults plus whatever a
+    /// manual dispatch supplied. They are not part of the digest or of any check identity.
+    pub inputs: Vec<(String, InputValue)>,
     pub images: Vec<ImageRef>,
 }
 
@@ -149,12 +154,13 @@ pub enum SpecError {
     Decode,
 }
 
-/// Format 11 adds a job's `checkout` history and its additional `checkouts`; format 10 adds
-/// `on.schedule`; format 9 adds `artifacts[].when: step:<id>`; format 8 adds `artifacts[].class`;
-/// format 7 adds `runs_on.os` and `runs_on.isolation`. A spec that states none of them is written as
-/// format 10, 9, 8, 7 or 6, byte for byte what earlier controllers wrote, so a worker that predates the
-/// newer fields keeps running it.
-pub const SPEC_FORMAT: u8 = 11;
+/// Format 12 adds a job's `checkout` history and its additional `checkouts`; format 11 adds a
+/// pipeline's name and declared inputs with the values a run was given; format 10 adds `on.schedule`;
+/// format 9 adds `artifacts[].when: step:<id>`; format 8 adds `artifacts[].class`; format 7 adds
+/// `runs_on.os` and `runs_on.isolation`. A spec that states none of them is written as format 11, 10,
+/// 9, 8, 7 or 6, byte for byte what earlier controllers wrote, so a worker that predates the newer
+/// fields keeps running it.
+pub const SPEC_FORMAT: u8 = 12;
 
 pub const SPEC_FORMAT_READ_MIN: u8 = 3;
 
@@ -170,12 +176,16 @@ impl RunSpec {
         Ok(Self {
             source,
             pipeline,
+            inputs: Vec::new(),
             images,
         })
     }
 
     /// The format `encode` writes for this spec: the lowest one that carries everything it states.
     pub fn format(&self) -> u8 {
+        let named = !self.inputs.is_empty()
+            || self.pipeline.name.is_some()
+            || !self.pipeline.inputs.is_empty();
         if self
             .pipeline
             .jobs
@@ -183,6 +193,8 @@ impl RunSpec {
             .any(|j| j.spec.history != History::Shallow || !j.spec.checkouts.is_empty())
         {
             SPEC_FORMAT
+        } else if named {
+            11
         } else if self.pipeline.on.schedule {
             10
         } else if self
@@ -217,6 +229,7 @@ impl RunSpec {
             6 => postcard::to_allocvec(&RunSpecV6::from(self)),
             7 => postcard::to_allocvec(&RunSpecV7::from(self)),
             10 => postcard::to_allocvec(&RunSpecV9::from(self)),
+            11 => postcard::to_allocvec(&RunSpecV10::from(self)),
             SPEC_FORMAT => postcard::to_allocvec(self),
             _ => postcard::to_allocvec(&RunSpecV8::from(self)),
         };
@@ -237,14 +250,14 @@ impl RunSpec {
             }
         }
         match bytes.split_first() {
-            // Format 11 is this reader's own layout: a job carries its checkout history and every additional
-            // checkout.
+            // Format 12 is this reader's own layout: a job carries its checkout history and every
+            // additional checkout.
             Some((&SPEC_FORMAT, body)) => whole::<RunSpec>(body),
-            // Format 9 is format 8's layout: the only difference is what `when` may hold, and this reader
-            // takes both.
+            Some((&11, body)) => whole::<RunSpecV10>(body).map(RunSpec::from),
             Some((&10, body)) => whole::<RunSpecV9>(body).map(RunSpec::from),
-            // Format 10 is format 8's layout plus the schedule trigger, which is why the format byte
-            // moves: a reader that predates it refuses such a spec at the leading byte.
+            // Format 9 is format 8's layout: the only difference is what `when` may hold, and this
+            // reader takes both. A spec that states a newer field moves the byte, so a reader that
+            // predates it refuses the spec there instead of misreading it.
             Some((&9, body)) => whole::<RunSpecV8>(body).map(RunSpec::from),
             Some((&8, body)) => whole::<RunSpecV8>(body).map(RunSpec::from),
             Some((&7, body)) => whole::<RunSpecV7>(body).map(RunSpec::from),
@@ -367,8 +380,11 @@ impl From<&RunSpec> for RunSpecV6 {
 impl From<RunSpecV6> for RunSpec {
     fn from(v6: RunSpecV6) -> RunSpec {
         RunSpec {
+            inputs: Vec::new(),
             source: v6.source,
             pipeline: CompiledPipeline {
+                name: None,
+                inputs: Inputs::default(),
                 on: v6.pipeline.on.into(),
                 concurrency: v6.pipeline.concurrency,
                 jobs: v6
@@ -522,8 +538,11 @@ impl From<&RunSpec> for RunSpecV7 {
 impl From<RunSpecV7> for RunSpec {
     fn from(v7: RunSpecV7) -> RunSpec {
         RunSpec {
+            inputs: Vec::new(),
             source: v7.source,
             pipeline: CompiledPipeline {
+                name: None,
+                inputs: Inputs::default(),
                 on: v7.pipeline.on.into(),
                 concurrency: v7.pipeline.concurrency,
                 jobs: v7
@@ -589,6 +608,37 @@ impl From<RunSpecV8> for RunSpec {
                 artifact.class = classes.next().flatten();
             }
         }
+        spec
+    }
+}
+
+/// Format 11: the format-9 layout plus the pipeline's name, its declared inputs and the values this
+/// run was given. A reader that predates it refuses the leading byte instead of misreading a name.
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSpecV10 {
+    base: RunSpecV9,
+    name: Option<String>,
+    inputs: Inputs,
+    values: Vec<(String, InputValue)>,
+}
+
+impl From<&RunSpec> for RunSpecV10 {
+    fn from(spec: &RunSpec) -> RunSpecV10 {
+        RunSpecV10 {
+            base: RunSpecV9::from(spec),
+            name: spec.pipeline.name.clone(),
+            inputs: spec.pipeline.inputs.clone(),
+            values: spec.inputs.clone(),
+        }
+    }
+}
+
+impl From<RunSpecV10> for RunSpec {
+    fn from(v10: RunSpecV10) -> RunSpec {
+        let mut spec = RunSpec::from(v10.base);
+        spec.pipeline.name = v10.name;
+        spec.pipeline.inputs = v10.inputs;
+        spec.inputs = v10.values;
         spec
     }
 }
@@ -834,8 +884,11 @@ impl From<StepV4> for Step {
 impl From<RunSpecV4> for RunSpec {
     fn from(v4: RunSpecV4) -> RunSpec {
         RunSpec {
+            inputs: Vec::new(),
             source: v4.source,
             pipeline: CompiledPipeline {
+                name: None,
+                inputs: Inputs::default(),
                 on: v4.pipeline.on.into(),
                 concurrency: v4.pipeline.concurrency,
                 jobs: v4
@@ -874,8 +927,11 @@ impl From<RunSpecV4> for RunSpec {
 impl From<RunSpecV5> for RunSpec {
     fn from(v5: RunSpecV5) -> RunSpec {
         RunSpec {
+            inputs: Vec::new(),
             source: v5.source,
             pipeline: CompiledPipeline {
+                name: None,
+                inputs: Inputs::default(),
                 on: v5.pipeline.on.into(),
                 concurrency: v5.pipeline.concurrency,
                 jobs: v5
@@ -914,8 +970,11 @@ impl From<RunSpecV5> for RunSpec {
 impl From<RunSpecV3> for RunSpec {
     fn from(v3: RunSpecV3) -> RunSpec {
         RunSpec {
+            inputs: Vec::new(),
             source: v3.source,
             pipeline: CompiledPipeline {
+                name: None,
+                inputs: Inputs::default(),
                 on: v3.pipeline.on.into(),
                 concurrency: v3.pipeline.concurrency,
                 jobs: v3
@@ -1421,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn additional_checkouts_are_format_11_and_round_trip() {
+    fn additional_checkouts_are_format_12_and_round_trip() {
         let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    checkout:\n      history: full\n      repositories:\n        - {repo: shared, path: vendor/shared, ref: refs/heads/main, history: {depth: 25}}\n    steps:\n      - id: s\n        run: echo hi\n";
         let spec = RunSpec::new(
             PinnedSource::new("r", SHA, None).unwrap(),
@@ -1430,7 +1489,7 @@ mod tests {
         .unwrap();
         assert_eq!(spec.format(), SPEC_FORMAT);
         let bytes = spec.encode().unwrap();
-        assert_eq!(bytes[0], 11);
+        assert_eq!(bytes[0], 12);
         let decoded = RunSpec::decode(&bytes).unwrap();
         assert_eq!(decoded, spec);
         let job = &decoded.pipeline.jobs[0].spec;

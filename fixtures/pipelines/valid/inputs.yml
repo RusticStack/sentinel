@@ -1,0 +1,35 @@
+schema: 1
+pipelines:
+  focus:
+    on: [manual]
+    inputs:
+      target:
+        type: string
+        min_length: 1
+        max_length: 40
+      worker_count:
+        type: integer
+        min: 1
+        max: 8
+        default: 2
+      full:
+        type: boolean
+        default: false
+      profile:
+        type: choice
+        values: [debug, release]
+        default: debug
+    concurrency:
+      group: "${{ repo.id }}:${{ inputs.target }}"
+      cancel_in_progress: true
+    jobs:
+      suite:
+        image: rust:1-bookworm
+        if: ${{ inputs.full }}
+        cache:
+          - name: cargo
+            key: "cargo-${{ inputs.profile }}-${{ hash_files('Cargo.lock') }}"
+            paths: [/usr/local/cargo/registry, target]
+        steps:
+          - id: run
+            run: cargo test --locked --profile ${{ inputs.profile }}

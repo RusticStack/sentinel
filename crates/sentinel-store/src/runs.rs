@@ -26,6 +26,13 @@ pub fn create_run(
 ) -> Result<Vec<JobId>> {
     crate::sources::validate_source(tx, repo, &spec.source)?;
     jobs::insert_run(tx, tenant, repo, run, &spec.source.sha, now)?;
+    // Only a named pipeline states one, so the insert for every other run is untouched.
+    if let Some(name) = spec.pipeline.name.as_deref() {
+        tx.execute(
+            "UPDATE runs SET pipeline = ?2 WHERE id = ?1",
+            params![run.as_bytes(), name],
+        )?;
+    }
     let bytes = spec.encode().map_err(Error::Spec)?;
     tx.execute(
         "INSERT INTO run_specs(run_id, tenant_id, digest, format, spec) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -114,15 +121,16 @@ fn job_arch(arch: Option<sentinel_pipeline::schema::Arch>) -> Option<&'static st
 
 const MAX_GROUP_BYTES: usize = 256;
 
-struct RunContext {
+struct RunContext<'a> {
     repo: RepoId,
     repo_name: String,
     run: RunId,
     sha: String,
     event: Option<EventFacts>,
+    inputs: &'a [(String, sentinel_pipeline::InputValue)],
 }
 
-impl Context for RunContext {
+impl Context for RunContext<'_> {
     fn phase(&self) -> Phase {
         Phase::Dispatch
     }
@@ -151,6 +159,10 @@ impl Context for RunContext {
             ["repo", "id"] => Lookup::Value(Value::Str(self.repo.to_string())),
             ["repo", "name"] => Lookup::Value(Value::Str(self.repo_name.clone())),
             ["run", "id"] => Lookup::Value(Value::Str(self.run.to_string())),
+            ["inputs", name] => match self.inputs.iter().find(|(n, _)| n == name) {
+                Some((_, value)) => Lookup::Value(value.expr_value()),
+                None => Lookup::Unresolved,
+            },
             _ => Lookup::Unresolved,
         }
     }
@@ -190,8 +202,24 @@ fn render_group(
         run,
         sha: spec.source.sha.clone(),
         event,
+        inputs: &spec.inputs,
     };
-    Ok(concurrency.group.render(&context, MAX_GROUP_BYTES).ok())
+    let Ok(rendered) = concurrency.group.render(&context, MAX_GROUP_BYTES) else {
+        return Ok(None);
+    };
+    // Two pipelines of one repository never share a group, whatever their templates render to: the
+    // name is part of the scope, as it is part of the check identity. An unnamed pipeline keeps the
+    // group it always had, byte for byte.
+    Ok(match spec.pipeline.name.as_deref() {
+        None => Some(rendered),
+        Some(name) => {
+            let mut scoped = String::with_capacity(name.len() + rendered.len() + 2);
+            scoped.push_str(name);
+            scoped.push_str(": ");
+            scoped.push_str(&rendered);
+            Some(scoped)
+        }
+    })
 }
 
 fn create_group(

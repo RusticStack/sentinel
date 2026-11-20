@@ -800,6 +800,138 @@ fn manual_dispatch_refuses_a_pipeline_that_declares_secrets() {
     assert!(page["runs"].as_array().unwrap().is_empty(), "{page}");
 }
 
+/// A manual dispatch names a pipeline of its document and passes typed inputs; a value outside a
+/// declared bound is refused with the input and the bound named, before any run exists.
+#[test]
+fn a_manual_dispatch_names_its_pipeline_and_refuses_a_value_outside_its_bound() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let document = "schema: 1
+pipelines:
+  focus:
+    on: [manual]
+    inputs:
+      target: {type: string, min_length: 1, max_length: 4}
+      profile: {type: choice, values: [debug, release], default: debug}
+      full: {type: boolean, default: false}
+      count: {type: integer, min: 1, max: 8, default: 2}
+    jobs:
+      suite:
+        image: docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+        steps: [{ id: s, run: 'true' }]
+  nightly:
+    on: [schedule]
+    jobs:
+      sweep:
+        image: docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+        steps: [{ id: s, run: 'true' }]
+";
+    let request = |name: Option<&str>, inputs: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "pipeline": document,
+            "source": { "repo": "https://github.com/o/r.git", "sha": "0123456789abcdef0123456789abcdef01234567", "ref": "main" },
+        });
+        if let Some(name) = name {
+            body["name"] = serde_json::json!(name);
+        }
+        if !inputs.is_null() {
+            body["inputs"] = inputs;
+        }
+        body
+    };
+    let dispatch = |body: serde_json::Value| {
+        call(
+            &d,
+            "POST",
+            "/api/v1/tenants/acme/repos/app/runs",
+            Some(&body),
+            Some(&auth),
+            &[],
+        )
+    };
+    let runs = || {
+        let (status, body) = call(
+            &d,
+            "GET",
+            "/api/v1/tenants/acme/repos/app/runs",
+            None,
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(status, 200, "{body}");
+        body["runs"].as_array().unwrap().len()
+    };
+
+    // Each refusal names the input and the bound, and none of them creates a run.
+    let refused = |inputs: serde_json::Value, expected: &str| {
+        let (status, body) = dispatch(request(Some("focus"), inputs));
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("invalid_request")),
+            "{body}"
+        );
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains(expected), "{expected}: {message}");
+    };
+    let before = runs();
+    refused(serde_json::Value::Null, "inputs.target: required");
+    refused(
+        serde_json::json!({ "target": "release" }),
+        "inputs.target: 1 to 4 bytes",
+    );
+    refused(
+        serde_json::json!({ "target": "main", "profile": "fast" }),
+        "inputs.profile: one of debug, release",
+    );
+    refused(
+        serde_json::json!({ "target": "main", "full": "yes" }),
+        "inputs.full: expected a boolean, found a string",
+    );
+    refused(
+        serde_json::json!({ "target": "main", "count": 9 }),
+        "inputs.count: 1 to 8, found 9",
+    );
+    refused(
+        serde_json::json!({ "target": "main", "extra": 1 }),
+        "inputs.extra: no input of this pipeline has that name",
+    );
+    assert_eq!(runs(), before, "a refused value creates no run");
+
+    // A document with several pipelines needs one named, and an undeclared name is refused.
+    let (status, body) = dispatch(serde_json::json!({
+        "pipeline": document,
+        "source": { "repo": "https://github.com/o/r.git", "sha": "0123456789abcdef0123456789abcdef01234567" },
+    }));
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("the document declares 2 pipelines; name one"),
+        "{body}"
+    );
+    let (status, refused_body) = dispatch(request(Some("deploy"), serde_json::Value::Null));
+    assert_eq!(status, 400, "{refused_body}");
+    assert!(
+        refused_body["message"]
+            .as_str()
+            .unwrap()
+            .contains("the document declares no pipeline `deploy`"),
+        "{refused_body}"
+    );
+
+    // A value inside its bound creates the run, which names the pipeline it belongs to.
+    let (status, created) = dispatch(request(
+        Some("focus"),
+        serde_json::json!({ "target": "main", "count": 8, "full": true }),
+    ));
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["pipeline"], "focus");
+    assert_eq!(created["trigger"], "manual");
+    assert_eq!(created["jobs"][0]["name"], "suite");
+    assert_eq!(runs(), before + 1);
+}
+
 #[test]
 fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     let d = deployment();

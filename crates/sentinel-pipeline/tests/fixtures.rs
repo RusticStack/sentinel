@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 use sentinel_pipeline::{
-    RefFilter, Triggers, compile_str,
+    RefFilter, Triggers, compile_document, compile_str,
     expr::{Context, DependencySummary, HashFilesError, Lookup, Phase, Value},
     schema::ArtifactWhen,
 };
@@ -34,7 +34,7 @@ fn fixtures(sub: &str) -> Vec<(String, String)> {
 #[test]
 fn every_valid_fixture_compiles() {
     for (name, text) in fixtures("valid") {
-        compile_str(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+        compile_document(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
     }
 }
 
@@ -46,7 +46,7 @@ fn every_invalid_fixture_fails_with_the_expected_message() {
             .next()
             .and_then(|l| l.strip_prefix("# expect: "))
             .unwrap_or_else(|| panic!("{name}: missing `# expect:` header"));
-        let err = compile_str(&text)
+        let err = compile_document(&text)
             .err()
             .unwrap_or_else(|| panic!("{name}: compiled unexpectedly"));
         let msg = err.to_string();

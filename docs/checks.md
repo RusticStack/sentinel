@@ -14,13 +14,23 @@ not GitHub is reachable.
 
 | Check | Name | When |
 |---|---|---|
-| Aggregate | `sentinel / ci` | Every event-driven run of a forge-associated repository (push, tag, pull request, merge group) |
-| Per job | `sentinel / <job>` | One per compiled job, from run creation to its terminal outcome |
+| Aggregate | `sentinel / ci`, or `sentinel / <pipeline>` | Every event-driven run of a forge-associated repository (push, tag, pull request, merge group) |
+| Per job | `sentinel / <job>`, or `sentinel / <pipeline> / <job>` | One per compiled job, from run creation to its terminal outcome |
 | Refused event | `sentinel / ci` | An event that was understood but produced no run |
 
 Names are stable on purpose: a repository protects `sentinel / ci` as a
 required check, and it must mean the same thing on every run. Per-job checks
 are namespaced so a required aggregate is never satisfied by a partial run.
+
+A document that declares named pipelines namespaces them by pipeline
+([pipeline schema](pipeline-schema.md#named-pipelines)): the `acceptance`
+pipeline publishes `sentinel / acceptance` and `sentinel / acceptance / <job>`,
+while the document's unnamed pipeline keeps `sentinel / ci` and
+`sentinel / <job>` byte for byte. The name comes from the declaration, never
+from a built-in list, and a document that gives one name two meanings is
+refused at compile time, so a repository can protect one check per pipeline and
+know which pipeline answers it. A refused *delivery* publishes the single
+`sentinel / ci`, because it produced no run to carry a pipeline name.
 
 **Runner mode publishes nothing here.** A `workflow_job` delivery produces a
 runner-mode job and no Sentinel check, at any outcome and refusals included:

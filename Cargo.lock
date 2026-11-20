@@ -1342,6 +1342,7 @@ name = "sentinel-intake"
 version = "0.1.0-dev"
 dependencies = [
  "ring",
+ "rusqlite",
  "sentinel-auth",
  "sentinel-core",
  "sentinel-git",

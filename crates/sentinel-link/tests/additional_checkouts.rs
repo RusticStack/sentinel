@@ -432,9 +432,9 @@ fn a_job_with_additional_checkouts_is_told_the_recorded_revision_and_its_manifes
     let d = deployment(Shared::MainOnly, PIPELINE, Some(&recorded));
     let (context, bytes) = first_spec(&d, 14);
     let context = context.expect("protocol 14 must receive the spec");
-    // The spec itself still states the declaration, and names format 11.
+    // The spec itself still states the declaration, and names the format that carries it.
     let spec = RunSpec::decode(&bytes).unwrap();
-    assert_eq!(bytes[0], 11);
+    assert_eq!(bytes[0], 12);
     assert_eq!(spec.pipeline.jobs[0].spec.checkouts[0].repo, "shared");
     assert_eq!(context.checkouts.len(), 1);
     let checkout = &context.checkouts[0];

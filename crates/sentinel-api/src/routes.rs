@@ -14,7 +14,7 @@ use sentinel_core::{
     auth::{Permissions, Principal, Scopes},
 };
 use sentinel_intake::ingest;
-use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
+use sentinel_pipeline::{PinnedSource, RunSpec};
 use sentinel_protocol::{
     cursor::{Cursor, Seq, StreamKind},
     error::{ApiError, ErrorCode},
@@ -1128,6 +1128,7 @@ fn run_json(view: &status::RunStatus) -> Value {
         "cancel_requested": view.cancel_requested,
         "state": run_state(view.state),
         "trigger": view.trigger,
+        "pipeline": view.pipeline,
         "jobs": view.jobs.iter().map(|j| json!({
             "id": j.id.to_string(),
             "name": j.name,
@@ -1434,6 +1435,82 @@ struct SourceBody {
 struct DispatchBody {
     pipeline: String,
     source: SourceBody,
+    /// The named pipeline of the document to run; absent names the document's only pipeline.
+    #[serde(default)]
+    name: Option<String>,
+    /// Typed values for the pipeline's declared inputs, checked against their bounds here.
+    #[serde(default)]
+    inputs: std::collections::BTreeMap<String, Value>,
+}
+
+/// The pipeline a manual dispatch names, or the document's only pipeline.
+fn select_pipeline(
+    text: &str,
+    name: Option<&str>,
+) -> std::result::Result<sentinel_pipeline::CompiledPipeline, ApiError> {
+    let mut pipelines = sentinel_pipeline::compile_document(text)
+        .map_err(|e| err(ErrorCode::InvalidRequest, format!("pipeline: {e}")))?;
+    match name {
+        Some(name) => pipelines
+            .into_iter()
+            .find(|pipeline| pipeline.name.as_deref() == Some(name))
+            .ok_or_else(|| {
+                err(
+                    ErrorCode::InvalidRequest,
+                    format!("pipeline: the document declares no pipeline `{name}`"),
+                )
+            }),
+        None => match pipelines.len() {
+            1 => Ok(pipelines.pop().expect("one pipeline")),
+            n => Err(err(
+                ErrorCode::InvalidRequest,
+                format!("pipeline: the document declares {n} pipelines; name one"),
+            )),
+        },
+    }
+}
+
+/// The typed values a manual dispatch passes, refused against the declaration that bounds them.
+fn resolve_inputs(
+    pipeline: &sentinel_pipeline::CompiledPipeline,
+    provided: &std::collections::BTreeMap<String, Value>,
+) -> std::result::Result<Vec<(String, sentinel_pipeline::InputValue)>, ApiError> {
+    let typed = provided
+        .iter()
+        .map(|(name, value)| Ok((name.clone(), input_value(name, value)?)))
+        .collect::<std::result::Result<Vec<_>, ApiError>>()?;
+    pipeline
+        .inputs
+        .resolve(&typed)
+        .map_err(|e| err(ErrorCode::InvalidRequest, e.to_string()))
+}
+
+fn input_value(
+    name: &str,
+    value: &Value,
+) -> std::result::Result<sentinel_pipeline::InputValue, ApiError> {
+    let found = match value {
+        Value::String(s) => return Ok(sentinel_pipeline::InputValue::Str(s.clone())),
+        Value::Bool(b) => return Ok(sentinel_pipeline::InputValue::Bool(*b)),
+        Value::Number(n) => {
+            return n
+                .as_i64()
+                .map(sentinel_pipeline::InputValue::Int)
+                .ok_or_else(|| {
+                    err(
+                        ErrorCode::InvalidRequest,
+                        format!("inputs.{name}: expected an integer"),
+                    )
+                });
+        }
+        Value::Null => "null",
+        Value::Array(_) => "a sequence",
+        Value::Object(_) => "a mapping",
+    };
+    Err(err(
+        ErrorCode::InvalidRequest,
+        format!("inputs.{name}: expected a string, boolean or integer, found {found}"),
+    ))
 }
 
 fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) -> Route {
@@ -1456,8 +1533,9 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
             ),
         );
     }
-    let compiled = compile_str(&dispatch.pipeline)
-        .map_err(|e| err(ErrorCode::InvalidRequest, format!("pipeline: {e}")))?;
+    let compiled = select_pipeline(&dispatch.pipeline, dispatch.name.as_deref())?;
+    // A value the declaration does not allow is refused here, before any run exists.
+    let inputs = resolve_inputs(&compiled, &dispatch.inputs)?;
     if compiled
         .jobs
         .iter()
@@ -1493,8 +1571,9 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
         dispatch.source.ref_name.as_deref(),
     )
     .map_err(|e| err(ErrorCode::InvalidRequest, format!("source: {e:?}")))?;
-    let spec = RunSpec::new(source, compiled)
+    let mut spec = RunSpec::new(source, compiled)
         .map_err(|e| err(ErrorCode::InvalidRequest, format!("spec: {e:?}")))?;
+    spec.inputs = inputs;
     let images = runs::pinned_images(&spec).map_err(|error| match error {
         StoreError::InvalidInput(_) => err(ErrorCode::InvalidRequest, "image reference"),
         _ => err(
