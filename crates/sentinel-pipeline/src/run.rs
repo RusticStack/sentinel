@@ -9,7 +9,8 @@ use crate::{
     expr::{Expr, Template},
     policy::{RefFilter, Triggers},
     schema::{
-        Arch, Artifact, ArtifactWhen, Cache, Concurrency, Job, Resources, RunsOn, Shell, Step,
+        Arch, Artifact, ArtifactWhen, Cache, Concurrency, History, Job, Resources, RunsOn, Shell,
+        Step,
     },
 };
 
@@ -148,11 +149,12 @@ pub enum SpecError {
     Decode,
 }
 
-/// Format 10 adds `on.schedule`; format 9 adds `artifacts[].when: step:<id>`; format 8 adds
-/// `artifacts[].class`; format 7 adds `runs_on.os` and `runs_on.isolation`. A spec that states none of
-/// them is written as format 8, 7 or 6, byte for byte what earlier controllers wrote, so a worker that
-/// predates the newer fields keeps running it.
-pub const SPEC_FORMAT: u8 = 10;
+/// Format 11 adds a job's `checkout` history and its additional `checkouts`; format 10 adds
+/// `on.schedule`; format 9 adds `artifacts[].when: step:<id>`; format 8 adds `artifacts[].class`;
+/// format 7 adds `runs_on.os` and `runs_on.isolation`. A spec that states none of them is written as
+/// format 10, 9, 8, 7 or 6, byte for byte what earlier controllers wrote, so a worker that predates the
+/// newer fields keeps running it.
+pub const SPEC_FORMAT: u8 = 11;
 
 pub const SPEC_FORMAT_READ_MIN: u8 = 3;
 
@@ -174,8 +176,15 @@ impl RunSpec {
 
     /// The format `encode` writes for this spec: the lowest one that carries everything it states.
     pub fn format(&self) -> u8 {
-        if self.pipeline.on.schedule {
+        if self
+            .pipeline
+            .jobs
+            .iter()
+            .any(|j| j.spec.history != History::Shallow || !j.spec.checkouts.is_empty())
+        {
             SPEC_FORMAT
+        } else if self.pipeline.on.schedule {
+            10
         } else if self
             .pipeline
             .jobs
@@ -208,6 +217,7 @@ impl RunSpec {
             6 => postcard::to_allocvec(&RunSpecV6::from(self)),
             7 => postcard::to_allocvec(&RunSpecV7::from(self)),
             10 => postcard::to_allocvec(&RunSpecV9::from(self)),
+            SPEC_FORMAT => postcard::to_allocvec(self),
             _ => postcard::to_allocvec(&RunSpecV8::from(self)),
         };
         body.map(|body| {
@@ -227,9 +237,12 @@ impl RunSpec {
             }
         }
         match bytes.split_first() {
+            // Format 11 is this reader's own layout: a job carries its checkout history and every additional
+            // checkout.
+            Some((&SPEC_FORMAT, body)) => whole::<RunSpec>(body),
             // Format 9 is format 8's layout: the only difference is what `when` may hold, and this reader
             // takes both.
-            Some((&SPEC_FORMAT, body)) => whole::<RunSpecV9>(body).map(RunSpec::from),
+            Some((&10, body)) => whole::<RunSpecV9>(body).map(RunSpec::from),
             // Format 10 is format 8's layout plus the schedule trigger, which is why the format byte
             // moves: a reader that predates it refuses such a spec at the leading byte.
             Some((&9, body)) => whole::<RunSpecV8>(body).map(RunSpec::from),
@@ -379,6 +392,8 @@ impl From<RunSpecV6> for RunSpec {
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
                             secrets: j.spec.secrets,
                             registry_auth: j.spec.registry_auth,
+                            history: History::Shallow,
+                            checkouts: Vec::new(),
                         },
                     })
                     .collect(),
@@ -532,6 +547,8 @@ impl From<RunSpecV7> for RunSpec {
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
                             secrets: j.spec.secrets,
                             registry_auth: j.spec.registry_auth,
+                            history: History::Shallow,
+                            checkouts: Vec::new(),
                         },
                     })
                     .collect(),
@@ -792,6 +809,8 @@ impl From<JobV3> for Job {
             artifacts: v3.artifacts.into_iter().map(Artifact::from).collect(),
             secrets: v3.secrets,
             registry_auth: None,
+            history: History::Shallow,
+            checkouts: Vec::new(),
         }
     }
 }
@@ -840,6 +859,8 @@ impl From<RunSpecV4> for RunSpec {
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
                             secrets: j.spec.secrets,
                             registry_auth: None,
+                            history: History::Shallow,
+                            checkouts: Vec::new(),
                         },
                     })
                     .collect(),
@@ -878,6 +899,8 @@ impl From<RunSpecV5> for RunSpec {
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
                             secrets: j.spec.secrets,
                             registry_auth: None,
+                            history: History::Shallow,
+                            checkouts: Vec::new(),
                         },
                     })
                     .collect(),
@@ -1376,7 +1399,7 @@ mod tests {
             compile_str(text).unwrap(),
         )
         .unwrap();
-        assert_eq!(spec.format(), SPEC_FORMAT);
+        assert_eq!(spec.format(), 10);
         let bytes = spec.encode().unwrap();
         assert_eq!(bytes[0], 10);
         let decoded = RunSpec::decode(&bytes).unwrap();
@@ -1395,6 +1418,45 @@ mod tests {
             "a spec that states nothing newer is written as format 6"
         );
         assert_eq!(RunSpec::decode(&bytes).unwrap(), plain);
+    }
+
+    #[test]
+    fn additional_checkouts_are_format_11_and_round_trip() {
+        let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    checkout:\n      history: full\n      repositories:\n        - {repo: shared, path: vendor/shared, ref: refs/heads/main, history: {depth: 25}}\n    steps:\n      - id: s\n        run: echo hi\n";
+        let spec = RunSpec::new(
+            PinnedSource::new("r", SHA, None).unwrap(),
+            compile_str(text).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(spec.format(), SPEC_FORMAT);
+        let bytes = spec.encode().unwrap();
+        assert_eq!(bytes[0], 11);
+        let decoded = RunSpec::decode(&bytes).unwrap();
+        assert_eq!(decoded, spec);
+        let job = &decoded.pipeline.jobs[0].spec;
+        assert_eq!(job.history, History::Full);
+        assert_eq!(job.checkouts.len(), 1);
+        let extra = &job.checkouts[0];
+        assert_eq!(extra.repo, "shared");
+        assert_eq!(extra.path, "vendor/shared");
+        assert_eq!(extra.ref_name, "refs/heads/main");
+        assert_eq!(extra.history, History::Depth(25));
+        // The earlier formats keep reading: this reader still decodes format 10's body.
+        let plain = RunSpec::new(
+            PinnedSource::new("r", SHA, None).unwrap(),
+            compile_str("schema: 1\non: [push, schedule]\njobs:\n  a:\n    image: busybox\n    steps:\n      - id: s\n        run: echo hi\n")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plain.format(), 10, "nothing states a checkout");
+        // A stated shallow history is the default, so it writes no newer format either.
+        let shallow = RunSpec::new(
+            PinnedSource::new("r", SHA, None).unwrap(),
+            compile_str("schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    checkout: {history: shallow}\n    steps:\n      - id: s\n        run: echo hi\n")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(shallow.format(), 6);
     }
 
     #[test]

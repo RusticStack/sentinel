@@ -261,6 +261,7 @@ mod imp {
             context: JobContext {
                 source: None,
                 source_valid_until: None,
+                checkouts: Vec::new(),
                 run: RunId::new(),
                 repo: args.repo_id,
                 repo_name: recipe.to_owned(),

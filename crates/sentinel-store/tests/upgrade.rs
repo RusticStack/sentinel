@@ -388,7 +388,7 @@ fn populated_at_72(path: &std::path::Path) -> [u8; 32] {
     .unwrap();
     for (name, protocol, software, fingerprint) in [
         ("old", 13, Some("sentinel-worker 0.1.0"), 0x21_u8),
-        ("next", 14, None, 0x22_u8),
+        ("next", 15, None, 0x22_u8),
     ] {
         conn.execute(
             "INSERT INTO workers(id, pool_id, fingerprint, name, arch, capabilities, protocol,
@@ -435,7 +435,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     let report = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         report.inspection.pending,
-        vec![73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+        vec![73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85]
     );
     assert!(report.inspection.openable() && report.inspection.integrity == "ok");
     assert_eq!(
@@ -447,16 +447,16 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
 
     // What the upgrade does to the rows already stored: migration 73 rebuilds every OAuth table, migration
     // 81 rebuilds the policy table with the one check relaxed (this database holds no policy row), and
-    // migrations 74 to 84 add runner-mode, guided-migration, fork-policy, AI-request, AI-budget,
-    // per-test-outcome, storage-default, schedule, failure-analysis and log-search shape without
-    // visiting a row.
+    // migrations 74 to 85 add runner-mode, guided-migration, fork-policy, AI-request, AI-budget,
+    // per-test-outcome, storage-default, schedule, failure-analysis, log-search and source-manifest shape
+    // without visiting a row.
     assert_eq!(
         report
             .steps
             .iter()
             .map(|step| step.version)
             .collect::<Vec<_>>(),
-        vec![73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+        vec![73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85]
     );
     let rewrites = |step: usize| -> Vec<(String, u64)> {
         report.steps[step]
@@ -525,7 +525,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     assert_eq!(
         workers,
         vec![
-            ("next", 14, None, true),
+            ("next", 15, None, true),
             ("old", 13, Some("sentinel-worker 0.1.0"), false)
         ]
     );
@@ -601,7 +601,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     let report = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         report.inspection.pending,
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85]
     );
     assert_eq!(
         report.copy.as_deref(),
@@ -609,7 +609,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     );
     assert_eq!(
         report.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85]
     );
     assert!(report.blocking.is_empty(), "{:?}", report.blocking);
 
@@ -625,8 +625,9 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
 
     // The matrix: no release older than the one the newest migration declares runs on the result, because
     // migration 74 (and every migration after 70 but 77, 80, 82 and 83) is readable by nothing below
-    // itself — and migration 84 is not readable either, since an older controller would serve a
-    // log-search row as a failure analysis of its attempt —
+    // itself — and migrations 84 and 85 are not readable either, since an older controller would serve a
+    // log-search row as a failure analysis of its attempt and cannot decode a run spec that declares a
+    // checkout history —
     // itself, so the copy (or a backup) is the only rollback for anything older.
     let needs = |db: &std::path::Path, release: u32| -> u32 {
         Connection::open(db)
@@ -658,9 +659,10 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     );
     assert_eq!(
         schema::readable_by(schema::LATEST),
-        84,
-        "the newest migration adds a request's kind and question, and a controller below it would \
-         answer a question as a failure analysis"
+        85,
+        "the newest migration adds the source manifest, and a controller below it cannot decode the \
+         run spec format that carries an additional checkout, so it could neither serve such a run nor \
+         resolve its recorded revisions"
     );
     for release in [69, schema::LATEST - 2] {
         assert!(
@@ -706,11 +708,11 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     let again = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         again.inspection.pending,
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85]
     );
     assert_eq!(
         again.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85]
     );
 }
 
@@ -862,13 +864,15 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        84,
+        85,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
     assert_eq!(
         sources,
-        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 81, 82, 83]
+        vec![
+            44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 81, 82, 83, 84
+        ]
     );
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
@@ -982,7 +986,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
                 false, false,
             ],
             // The newest releases in the list run on every column they are listed against.
-            75..=83 => [
+            75..=84 => [
                 true, true, true, true, true, true, true, true, true, true, true, true, true, true,
                 true,
             ],
@@ -1556,7 +1560,10 @@ fn the_upgrade_reports_the_tenants_the_new_default_caps_and_keeps_the_precedence
     // What the operator reads before upgrading: the defaults the upgrade will apply, sized from this data
     // file system, and the tenants whose usage or stated limit is above them, heaviest first.
     let report = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(report.inspection.pending, vec![81, 82, 83, schema::LATEST]);
+    assert_eq!(
+        report.inspection.pending,
+        vec![81, 82, 83, 84, schema::LATEST]
+    );
     assert_eq!(
         report.steps[0].rewrites,
         vec![upgrade::Rewrite {

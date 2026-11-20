@@ -198,6 +198,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (82, include_str!("migrations/082_schedules.sql")),
     (83, include_str!("migrations/083_ai_analysis.sql")),
     (84, include_str!("migrations/084_ai_search.sql")),
+    (85, include_str!("migrations/085_run_sources.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -346,6 +347,10 @@ mod tests {
         (
             84,
             "an older controller claims a log-search request as a failure analysis of its attempt and settles it with an answer to a question it never read: it knows neither the question nor the plan the answer must be built from",
+        ),
+        (
+            85,
+            "an older controller cannot decode run spec format 11, so it refuses to serve a run whose pipeline declares a checkout history or an additional checkout, and it holds no source manifest: it could neither say what such a run built nor resolve its recorded revisions on a rerun",
         ),
     ];
 

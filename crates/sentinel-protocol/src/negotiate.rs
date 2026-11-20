@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct ProtocolVersion(pub u16);
 
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(13);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(14);
 
 /// Digest-first artifact transfer: the worker offers every file's digest and length before a body travels and
 /// the controller answers the ones the tenant already holds. A session below this version has no offer at all.
@@ -21,6 +21,15 @@ pub const CANCEL_PUSH_MIN: ProtocolVersion = ProtocolVersion(11);
 /// Runner-mode leases: the offer, the single-use configuration and the stop list. A worker below
 /// this version is never offered a runner, so its sessions behave exactly as before.
 pub const RUNNER_MIN: ProtocolVersion = ProtocolVersion(13);
+
+/// A job's additional repository checkouts: one `CheckoutSources` frame per attempt that names the
+/// revision and the access of each declared checkout. A worker below this version is served no spec for
+/// a job that declares one, so it never checks out a repository it cannot be told about.
+pub const EXTRA_CHECKOUTS_MIN: ProtocolVersion = ProtocolVersion(14);
+
+/// The most additional checkouts one job may declare, `sentinel_pipeline::schema::MAX_CHECKOUTS`.
+pub const MAX_CHECKOUT_SOURCES: usize = 8;
+pub const MAX_CHECKOUT_REVISION_BYTES: usize = 64;
 
 pub const MAX_CANCEL_PUSH: usize = 1024;
 

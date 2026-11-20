@@ -20,6 +20,10 @@ pub const MAX_CACHES: usize = 8;
 pub const MAX_ARTIFACTS: usize = 8;
 pub const MAX_PATHS: usize = 32;
 pub const MAX_LABELS: usize = 8;
+pub const MAX_CHECKOUTS: usize = 8;
+pub const MAX_CHECKOUT_DEPTH: u32 = 10_000;
+/// A repository's name in its tenant, as the API stores it.
+pub const MAX_REPO_NAME_BYTES: usize = 256;
 pub const MAX_SECRETS: usize = 16;
 pub const MAX_RUN_BYTES: usize = 4096;
 pub const MAX_ID_BYTES: usize = 64;
@@ -59,6 +63,53 @@ pub struct Job {
     pub secrets: Vec<String>,
     /// Never exposed to a step: it authorizes only this job's image pull.
     pub registry_auth: Option<String>,
+    /// How much history of the run's own repository the job's checkout needs.
+    pub history: History,
+    /// Additional repositories fetched into the workspace beside the run's own checkout.
+    pub checkouts: Vec<Checkout>,
+}
+
+/// How much history a checkout fetches: the pinned tree alone, the whole reachable past, or a bounded depth.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum History {
+    #[default]
+    Shallow = 0,
+    Full = 1,
+    Depth(u32) = 2,
+}
+
+impl History {
+    /// The `--depth` value Git is given, or `None` for the whole history.
+    pub const fn depth(self) -> Option<u32> {
+        match self {
+            History::Shallow => Some(1),
+            History::Full => None,
+            History::Depth(n) => Some(n),
+        }
+    }
+
+    /// The value the source manifest and the HTTP contract state: `shallow`, `full`, or the depth.
+    pub fn label(self) -> String {
+        match self {
+            History::Shallow => "shallow".to_owned(),
+            History::Full => "full".to_owned(),
+            History::Depth(n) => n.to_string(),
+        }
+    }
+}
+
+/// One repository a job fetches into its workspace. The run's own repository is the implicit primary
+/// checkout at the workspace root; every other checkout states where it lands.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkout {
+    /// The repository's name among the run's tenant's repositories. It can never name a remote.
+    pub repo: String,
+    /// Destination inside the workspace, a normalised relative path.
+    pub path: String,
+    /// The branch or tag whose commit the checkout resolves.
+    pub ref_name: String,
+    pub history: History,
 }
 
 impl Job {
@@ -1135,6 +1186,157 @@ fn artifact(path: &str, node: &Node, steps: &[Step]) -> Result<Artifact> {
     })
 }
 
+/// ```yaml
+/// checkout:
+///   history: full
+///   repositories:
+///     - {repo: tools, path: vendor/tools, ref: refs/heads/main, history: {depth: 50}}
+/// ```
+///
+/// The run's own repository is the implicit primary checkout at the workspace root; `history` states
+/// how much of it the job needs. The primary has no remote or revision here: the run pins those.
+fn checkout(path: &str, node: &Node) -> Result<(History, Vec<Checkout>)> {
+    let mut map = Map::new(path, node)?;
+    let history = match map.take("history") {
+        None => History::Shallow,
+        Some(n) => history(&map.child("history"), n)?,
+    };
+    let checkouts = match map.take("repositories") {
+        None => Vec::new(),
+        Some(n) => {
+            let child = map.child("repositories");
+            expect_seq(&child, n, MAX_CHECKOUTS)?
+                .iter()
+                .enumerate()
+                .map(|(i, n)| repository(&format!("{child}[{i}]"), n))
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    map.finish()?;
+    for (i, extra) in checkouts.iter().enumerate() {
+        let path = format!("{}.repositories[{i}].path", path);
+        if extra.path == GIT_DIR || extra.path.starts_with(".git/") {
+            return Err(err(
+                &path,
+                SchemaErrorKind::Invalid(
+                    "a checkout may not be placed in the checkout's own .git".into(),
+                ),
+            ));
+        }
+        for (earlier, first) in checkouts[..i].iter().zip(0..) {
+            let nested = |outer: &str, inner: &str| {
+                inner
+                    .strip_prefix(outer)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            };
+            if earlier.path == extra.path
+                || nested(&earlier.path, &extra.path)
+                || nested(&extra.path, &earlier.path)
+            {
+                return Err(err(
+                    &path,
+                    SchemaErrorKind::Invalid(format!(
+                        "overlaps checkouts.repositories[{first}].path"
+                    )),
+                ));
+            }
+        }
+    }
+    Ok((history, checkouts))
+}
+
+const GIT_DIR: &str = ".git";
+
+fn repository(path: &str, node: &Node) -> Result<Checkout> {
+    let mut map = Map::new(path, node)?;
+    let repo_path = format!("{path}.repo");
+    let repo = map
+        .take("repo")
+        .ok_or_else(|| err(&repo_path, SchemaErrorKind::Missing))
+        .and_then(|n| expect_str(&repo_path, n, MAX_REPO_NAME_BYTES))?;
+    if repo.bytes().any(|b| b < 32 || b == 127) {
+        return Err(err(
+            &repo_path,
+            SchemaErrorKind::Invalid("must name a repository of the run's tenant".into()),
+        ));
+    }
+    let destination_path = format!("{path}.path");
+    let destination = map
+        .take("path")
+        .ok_or_else(|| err(&destination_path, SchemaErrorKind::Missing))
+        .and_then(|n| relative_path(&destination_path, n))?;
+    let ref_path = format!("{path}.ref");
+    let ref_name = map
+        .take("ref")
+        .ok_or_else(|| err(&ref_path, SchemaErrorKind::Missing))
+        .and_then(|n| expect_str(&ref_path, n, MAX_REF_PATTERN_BYTES))?;
+    if !valid_exact_ref(ref_name) {
+        return Err(err(
+            &ref_path,
+            SchemaErrorKind::Invalid(
+                "must be an exact refs/heads/ or refs/tags/ name, without a wildcard".into(),
+            ),
+        ));
+    }
+    let history = match map.take("history") {
+        None => History::Shallow,
+        Some(n) => history(&map.child("history"), n)?,
+    };
+    map.finish()?;
+    Ok(Checkout {
+        repo: repo.to_owned(),
+        path: destination,
+        ref_name: ref_name.to_owned(),
+        history,
+    })
+}
+
+/// A branch or tag a checkout resolves: the same grammar as an allowed ref, and never a pattern.
+fn valid_exact_ref(reference: &str) -> bool {
+    sentinel_protocol::source::valid_ref_pattern(reference) && !reference.contains('*')
+}
+
+fn history(path: &str, node: &Node) -> Result<History> {
+    match node {
+        Node::Str(s) if s == "shallow" => Ok(History::Shallow),
+        Node::Str(s) if s == "full" => Ok(History::Full),
+        Node::Map(_) => {
+            let mut map = Map::new(path, node)?;
+            let depth_path = format!("{path}.depth");
+            let depth = map
+                .take("depth")
+                .ok_or_else(|| err(&depth_path, SchemaErrorKind::Missing))
+                .and_then(|n| match n {
+                    Node::Int(value) if (1..=i64::from(MAX_CHECKOUT_DEPTH)).contains(value) => {
+                        Ok(*value as u32)
+                    }
+                    Node::Int(_) => Err(err(
+                        &depth_path,
+                        SchemaErrorKind::Invalid(format!(
+                            "must be between 1 and {MAX_CHECKOUT_DEPTH}"
+                        )),
+                    )),
+                    other => Err(err(
+                        &depth_path,
+                        SchemaErrorKind::WrongType {
+                            expected: "integer",
+                            found: other.kind(),
+                        },
+                    )),
+                })?;
+            map.finish()?;
+            Ok(History::Depth(depth))
+        }
+        other => Err(err(
+            path,
+            SchemaErrorKind::Invalid(format!(
+                "expected shallow, full or {{depth: N}}, found {}",
+                other.kind()
+            )),
+        )),
+    }
+}
+
 fn runs_on(path: &str, node: &Node) -> Result<RunsOn> {
     let mut map = Map::new(path, node)?;
     let arch = match map.take("arch") {
@@ -1277,6 +1479,10 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy) -> Result<Job> {
         Some(n) => Some(relative_path(&map.child("workdir"), n)?),
         None => None,
     };
+    let (history, checkouts) = match map.take("checkout") {
+        None => (History::Shallow, Vec::new()),
+        Some(n) => checkout(&map.child("checkout"), n)?,
+    };
     let steps_path = map.child("steps");
     let steps = map
         .take("steps")
@@ -1391,6 +1597,8 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy) -> Result<Job> {
         artifacts,
         secrets,
         registry_auth,
+        history,
+        checkouts,
     })
 }
 
@@ -1484,6 +1692,149 @@ pub fn decode(root: &Node, policy: &ResourcePolicy) -> Result<Pipeline> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn job_with(
+        checkout: &str,
+    ) -> std::result::Result<crate::compile::CompiledPipeline, crate::Error> {
+        let text = format!(
+            "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    {checkout}\n    steps:\n      - id: s\n        run: echo\n"
+        );
+        crate::compile_str(&text)
+    }
+
+    #[test]
+    fn a_checkout_cannot_escape_the_workspace() {
+        for path in [
+            "../outside",
+            "/etc",
+            "vendor/../../etc",
+            "vendor//x",
+            "vendor/",
+            "./vendor",
+            "vendor/./x",
+            r"vendor\x",
+            ".git/hooks",
+        ] {
+            let error = job_with(&format!(
+                "checkout: {{repositories: [{{repo: shared, path: '{path}', ref: refs/heads/main}}]}}"
+            ))
+            .expect_err(path);
+            assert!(
+                matches!(&error, crate::Error::Schema(e) if e.path.contains("path")),
+                "{path}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_checkout_names_a_repository_an_exact_ref_and_a_history() {
+        let ok = job_with(
+            "checkout: {repositories: [{repo: shared, path: vendor/shared, ref: refs/heads/main}]}",
+        )
+        .unwrap();
+        let extra = &ok.jobs[0].spec.checkouts[0];
+        assert_eq!(
+            (extra.history, extra.path.as_str()),
+            (History::Shallow, "vendor/shared")
+        );
+        assert_eq!(ok.jobs[0].spec.history, History::Shallow);
+        for (case, expected) in [
+            (
+                "checkout: {repositories: [{repo: shared, path: vendor, ref: 'refs/tags/v*'}]}",
+                "ref",
+            ),
+            (
+                "checkout: {repositories: [{repo: shared, path: vendor, ref: main}]}",
+                "ref",
+            ),
+            (
+                "checkout: {repositories: [{repo: shared, path: vendor}]}",
+                "ref",
+            ),
+            (
+                "checkout: {repositories: [{path: vendor, ref: refs/heads/main}]}",
+                "repo",
+            ),
+            (
+                "checkout: {repositories: [{repo: 'a\u{7}b', path: vendor, ref: refs/heads/main}]}",
+                "repo",
+            ),
+            (
+                "checkout: {repositories: [{repo: shared, ref: refs/heads/main}]}",
+                "path",
+            ),
+            (
+                "checkout: {repositories: [{repo: shared, path: vendor, ref: refs/heads/main, extra: 1}]}",
+                "repositories[0]",
+            ),
+            ("checkout: {depth: 4}", "checkout"),
+        ] {
+            let error = job_with(case).expect_err(case);
+            assert!(
+                matches!(&error, crate::Error::Schema(e) if e.path.contains(expected)),
+                "{case}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_checkout_history_is_shallow_full_or_a_bounded_depth() {
+        let history = |value: &str| {
+            job_with(&format!(
+                "checkout: {{repositories: [{{repo: shared, path: vendor, ref: refs/heads/main, history: {value}}}]}}"
+            ))
+            .map(|p| p.jobs[0].spec.checkouts[0].history)
+        };
+        assert_eq!(history("full"), Ok(History::Full));
+        assert_eq!(history("shallow"), Ok(History::Shallow));
+        assert_eq!(history("{depth: 25}"), Ok(History::Depth(25)));
+        assert_eq!(History::Depth(25).depth(), Some(25));
+        assert_eq!(History::Full.depth(), None);
+        for bad in [
+            "{depth: 0}",
+            "{depth: 10001}",
+            "{depth: -1}",
+            "{depth: '2'}",
+            "{}",
+            "deep",
+        ] {
+            assert!(history(bad).is_err(), "{bad}");
+        }
+        let primary = job_with("checkout: {history: full}").unwrap();
+        assert_eq!(primary.jobs[0].spec.history, History::Full);
+        assert!(primary.jobs[0].spec.checkouts.is_empty());
+    }
+
+    #[test]
+    fn two_checkouts_cannot_share_or_nest_a_destination() {
+        for repositories in [
+            "[{repo: a, path: vendor/x, ref: refs/heads/main}, {repo: b, path: vendor/x, ref: refs/heads/main}]",
+            "[{repo: a, path: vendor, ref: refs/heads/main}, {repo: b, path: vendor/x, ref: refs/heads/main}]",
+            "[{repo: a, path: vendor/x, ref: refs/heads/main}, {repo: b, path: vendor, ref: refs/heads/main}]",
+        ] {
+            let error = job_with(&format!("checkout: {{repositories: {repositories}}}"))
+                .expect_err(repositories);
+            assert!(
+                matches!(&error, crate::Error::Schema(e) if e.path.ends_with(".path")),
+                "{repositories}: {error}"
+            );
+        }
+        let ok = job_with(
+            "checkout: {repositories: [{repo: a, path: vendor/a, ref: refs/heads/main}, {repo: b, path: vendor/b, ref: refs/heads/main}]}",
+        )
+        .unwrap();
+        assert_eq!(ok.jobs[0].spec.checkouts.len(), 2);
+        let too_many: Vec<String> = (0..9)
+            .map(|i| format!("{{repo: r{i}, path: p{i}, ref: refs/heads/main}}"))
+            .collect();
+        assert!(
+            job_with(&format!(
+                "checkout: {{repositories: [{}]}}",
+                too_many.join(", ")
+            ))
+            .is_err()
+        );
+    }
 
     #[test]
     fn durations_and_sizes() {

@@ -48,6 +48,18 @@ pub struct JobExplanation {
     pub caches: Vec<CacheExplanation>,
     pub artifacts: Vec<String>,
     pub secrets: Vec<String>,
+    /// The run's own checkout: how much history it needs, and what is fetched beside it.
+    pub history: String,
+    pub checkouts: Vec<CheckoutExplanation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CheckoutExplanation {
+    pub repo: String,
+    pub path: String,
+    #[serde(rename = "ref")]
+    pub ref_name: String,
+    pub history: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -68,6 +80,8 @@ pub struct CacheExplanation {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Requirements {
     pub repository_read: bool,
+    /// The other repositories the pipeline's jobs check out, by the name they have in the run's tenant.
+    pub repositories: Vec<String>,
     pub secrets: Vec<String>,
     pub caches: Vec<String>,
     pub artifacts: Vec<String>,
@@ -223,6 +237,9 @@ impl Explanation {
             for name in &s.secrets {
                 push_unique(&mut requires.secrets, name);
             }
+            for checkout in &s.checkouts {
+                push_unique(&mut requires.repositories, &checkout.repo);
+            }
             jobs.push(JobExplanation {
                 name: j.name.clone(),
                 needs: j
@@ -241,6 +258,17 @@ impl Explanation {
                 caches,
                 artifacts: s.artifacts.iter().map(|a| a.name.clone()).collect(),
                 secrets: s.secrets.clone(),
+                history: s.history.label(),
+                checkouts: s
+                    .checkouts
+                    .iter()
+                    .map(|c| CheckoutExplanation {
+                        repo: c.repo.clone(),
+                        path: c.path.clone(),
+                        ref_name: c.ref_name.clone(),
+                        history: c.history.label(),
+                    })
+                    .collect(),
             });
         }
         requires.secrets.sort();
@@ -333,9 +361,22 @@ impl Explanation {
             if !j.secrets.is_empty() {
                 let _ = writeln!(s, "  secrets: {}", j.secrets.join(", "));
             }
+            if j.history != "shallow" {
+                let _ = writeln!(s, "  checkout history: {}", j.history);
+            }
+            for c in &j.checkouts {
+                let _ = writeln!(
+                    s,
+                    "  checkout {} at {} ({}), history {}",
+                    c.repo, c.path, c.ref_name, c.history
+                );
+            }
         }
         let _ = writeln!(s, "\nrequires:");
         let _ = writeln!(s, "  repository read access");
+        for repo in &self.requires.repositories {
+            let _ = writeln!(s, "  read access to repository {repo}");
+        }
         for name in &self.requires.secrets {
             let _ = writeln!(
                 s,
@@ -434,5 +475,26 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"class\":\"downloads\""));
         assert!(json.contains("\"class\":\"compiler\""));
+    }
+
+    #[test]
+    fn explanation_names_every_checkout_a_job_declares() {
+        let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    checkout:\n      history: full\n      repositories:\n        - {repo: shared, path: vendor/shared, ref: refs/heads/main, history: {depth: 20}}\n    steps:\n      - id: s\n        run: echo\n";
+        let e = Explanation::of(&compile_str(text).unwrap());
+        assert_eq!(e.jobs[0].history, "full");
+        assert_eq!(e.jobs[0].checkouts[0].repo, "shared");
+        assert_eq!(e.jobs[0].checkouts[0].history, "20");
+        assert_eq!(e.requires.repositories, ["shared"]);
+        let text = e.render_text();
+        assert!(text.contains("checkout history: full"), "{text}");
+        assert!(
+            text.contains("checkout shared at vendor/shared (refs/heads/main), history 20"),
+            "{text}"
+        );
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(
+            json.contains("\"checkouts\":[{\"repo\":\"shared\""),
+            "{json}"
+        );
     }
 }

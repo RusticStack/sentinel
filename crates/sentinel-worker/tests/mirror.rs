@@ -144,6 +144,7 @@ fn without_a_mirror_the_route_is_direct_and_honest() {
         &source,
         None,
         None,
+        sentinel_pipeline::schema::History::Shallow,
         "att_direct",
         Duration::from_secs(60),
     )
@@ -195,6 +196,7 @@ fn a_manual_run_never_reads_or_feeds_a_mirror() {
         &source,
         None,
         None,
+        sentinel_pipeline::schema::History::Shallow,
         "att_manual",
         Duration::from_secs(60),
     )
@@ -289,6 +291,7 @@ fn an_expired_source_validity_refuses_the_mirrored_and_direct_routes_before_any_
             &source,
             Some(&access),
             expired,
+            sentinel_pipeline::schema::History::Shallow,
             "att_expired",
             Duration::from_secs(60),
         )

@@ -138,6 +138,7 @@ fn make_job(worker_dir: &Path, repo_dir: &Path, sha: &str, repo: RepoId, trust: 
         context: JobContext {
             source: None,
             source_valid_until: None,
+            checkouts: Vec::new(),
             run: RunId::new(),
             repo,
             repo_name: REPO_NAME.to_owned(),

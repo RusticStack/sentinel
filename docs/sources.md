@@ -162,7 +162,48 @@ created `0700` and removed on every path, including failure. On the worker
 the fetch itself usually runs against the repository's [local
 mirror](mirrors.md) — the same access object authorizes it, fetched under
 the mirror's serialized writer lock, with only the binding's allowed refs
-ever becoming mirror refs.
+ever becoming mirror refs. A checkout that asks for more than its pinned
+commit ([`checkout.history`](pipeline-schema.md#job-keys)) fetches from the
+remote itself, because a mirror holds whatever history its own fetches gave
+it and would otherwise answer a `full` or `{depth}` checkout with less than
+it asked for.
+
+## Additional checkouts
+
+A job may declare up to eight further repositories ([pipeline
+schema](pipeline-schema.md#job-keys)), and each is authorized exactly as the
+run's own is: a manual dispatch requires the acting principal to hold `RUN`
+on every repository it names, in the same transaction that authorizes the
+run's own, so naming a repository grants nothing. In the same database
+transaction that checks the run's own binding, the controller resolves the
+declaration's `repo` name **within the run's tenant** and refuses the whole
+attempt — `NoSpec`, nothing fetched,
+nothing recorded — when the tenant holds no such repository, when it has no
+binding, when that binding's remote is outside the deployment's destination
+allowlist, or when the checkout's `ref` is one the binding does not allow.
+User YAML therefore cannot authorize a repository and cannot name a remote:
+it names a repository the tenant already owns and a binding an administrator
+already approved.
+
+The revision is resolved once. The first attempt that needs a checkout's
+commit asks its remote for that one ref (`git ls-remote` under a 30 s bound,
+with the binding's credential installed exactly as a fetch installs it, in
+an owner-only scratch directory removed on every path) and writes what it
+found to the run's **source manifest** — `run_sources`, one row per job and
+checkout, the run's own checkout first — together with the repository, the
+destination, the ref and the history that was asked for. A row is written
+once and is immutable, so every later attempt of that job, a rerun included,
+is told the recorded commit and checks out exactly that. A revision the
+remote no longer serves fails the attempt with "the run's recorded revision
+… is no longer fetchable" rather than resolving the ref again, which is the
+one substitution an exact rerun must never make.
+
+That manifest is what answers what a run built: `GET /runs/{id}/sources`
+lists every checkout of every job with its revision, and a rewrite of a
+pipeline is not needed to read it back. The resolution and its delivery are
+one atomic step: the manifest rows and the delivered accesses are written
+under the same rechecked fence, so an attempt that lost its lease records and
+receives nothing.
 
 ## GitHub App association
 

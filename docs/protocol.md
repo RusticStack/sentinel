@@ -150,6 +150,24 @@ sensitive frame (`SecretChunk` is the first): its encode buffer is wiped after
 the write. `MAX_RUNNER_CONFIG_BYTES` (65,536) bounds it, beside the control
 message bound in [size limits](#size-limits).
 
+## Protocol 14 additional repository checkouts
+
+Protocol 14 appends `CheckoutSource { attempt, index, repo, revision, recorded, access }`
+(controller → worker): one frame per additional checkout a job declares, in index
+order counting from 1 (index 0 is the run's own checkout), each carrying the
+repository the worker's mirror is keyed by, the commit the controller resolved and
+the access that fetch runs under. `recorded` says the revision is the run's source
+manifest one, which is what makes a missing commit reportable as a vanished
+recorded revision instead of an unknown ref. One frame per checkout rather than one
+list, because a bound access — its trust material and its credential — can be as
+large as 48 KiB and does not share a 64 KiB frame with seven others. The worker
+refuses an index out of order, a repeat, more than `MAX_CHECKOUT_SOURCES` (8) and a
+revision that is not a full object id, so a checkout can never run under somebody
+else's access. `EXTRA_CHECKOUTS_MIN` is 14: a job that declares an additional
+checkout is served no spec at all to a session below it, because a worker that
+cannot be told about a repository must not check one out. The frames are a sensitive
+frame class, since each carries a credential. See [sources](sources.md#additional-checkouts).
+
 ## Versioning policy
 
 The protocol version bumps on any incompatible change to messages, framing or semantics. A new message *variant* is additive; a new or changed *struct field* — optional or not — bumps the protocol, because postcard decodes exactly the field list its reader knows and `#[serde(default)]` never fires (see [Protocol 7 additions](#protocol-7-additions)). Error schema, cursor version byte and protocol version are independent so each can move alone. The JSON shapes of `ApiError`, `Hello` and `Rejected` are pinned by tests.

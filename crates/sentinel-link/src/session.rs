@@ -400,6 +400,20 @@ pub enum ServerMessage {
     RunnerStop {
         leases: Vec<[u8; 16]>,
     },
+    /// Protocol 14: one additional checkout of the attempt's job — the checkout's index in the job's spec,
+    /// the repository the worker's mirror is keyed by, the revision the controller resolved for it and the
+    /// access that fetch runs under. One frame per checkout, in index order, so an access never has to
+    /// share a 64 KiB frame with another; sent after the context, ahead of the spec.
+    CheckoutSource {
+        attempt: [u8; 16],
+        index: u32,
+        repo: [u8; 16],
+        revision: String,
+        /// True when `revision` is the manifest's recorded one, so a fetch that cannot find it is reported
+        /// as a vanished recorded revision rather than an unknown one.
+        recorded: bool,
+        access: sentinel_protocol::source::Access,
+    },
 }
 
 /// A runner lease as the wire states it: what the worker needs to accept or refuse one, and nothing
@@ -430,7 +444,9 @@ impl SensitiveFrame for ServerMessage {
     fn is_sensitive(&self) -> bool {
         matches!(
             self,
-            ServerMessage::SecretChunk { .. } | ServerMessage::RunnerConfig { .. }
+            ServerMessage::SecretChunk { .. }
+                | ServerMessage::RunnerConfig { .. }
+                | ServerMessage::CheckoutSource { .. }
         )
     }
 }
@@ -595,6 +611,9 @@ pub struct JobContext {
     /// Worker-local, never on the wire: the monotonic instant at which `source` stops being usable, stamped
     /// when the access arrives. The wall-clock `expires_ms` inside the access can be stepped by the host clock.
     pub source_valid_until: Option<std::time::Instant>,
+    /// The job's additional checkouts, in the job spec's declaration order. Empty for every job that
+    /// declares none, which is what a session below protocol 14 can be given.
+    pub checkouts: Vec<CheckoutSource>,
     pub run: RunId,
     pub repo: RepoId,
     pub repo_name: String,
@@ -606,6 +625,49 @@ pub struct JobContext {
     pub needs: Vec<(String, Outcome)>,
     pub tenant: Option<TenantId>,
     pub trust: Trust,
+}
+
+/// A resolved revision as it travels: a full object id, so nothing else can be asked for by name.
+fn hex_revision(revision: &str) -> bool {
+    (revision.len() == 40 || revision.len() == 64)
+        && revision
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// One additional checkout as the attempt holds it: what to fetch, under which access, and — for the
+/// error a vanished revision earns — whether the revision is the run's recorded one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckoutSource {
+    pub index: u32,
+    pub repo: sentinel_core::RepoId,
+    pub revision: String,
+    pub recorded: bool,
+    pub access: sentinel_protocol::source::Access,
+    /// This process's monotonic bound, restated when the access arrived. Never sent on the wire.
+    pub valid_until: std::time::Instant,
+}
+
+impl CheckoutSource {
+    /// An attempt's additional checkout, with its access restated on this process's clock: the wall-clock
+    /// `expires_ms` a host clock step could move is replaced by one monotonic instant.
+    pub fn at_arrival(
+        index: u32,
+        repo: sentinel_core::RepoId,
+        revision: String,
+        recorded: bool,
+        access: sentinel_protocol::source::Access,
+    ) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            index,
+            repo,
+            revision,
+            recorded,
+            access: access.rebased(UnixMillis::now().0, SOURCE_ACCESS_WINDOW_MS),
+            valid_until: now.checked_add(SOURCE_ACCESS_WINDOW).unwrap_or(now),
+        }
+    }
 }
 
 pub const SOURCE_ACCESS_WINDOW_MS: i64 = 12 * 60 * 1000;
@@ -690,6 +752,7 @@ impl JobContext {
             JobContext {
                 source: None,
                 source_valid_until: None,
+                checkouts: Vec::new(),
                 run: RunId::from_bytes(wire.run).map_err(|_| Error::Protocol("id"))?,
                 repo: RepoId::from_bytes(wire.repo).map_err(|_| Error::Protocol("id"))?,
                 repo_name: wire.repo_name,
@@ -724,6 +787,7 @@ impl JobContext {
             JobContext {
                 source: None,
                 source_valid_until: None,
+                checkouts: Vec::new(),
                 run: RunId::from_bytes(wire.run).map_err(|_| Error::Protocol("id"))?,
                 repo: RepoId::from_bytes(wire.repo).map_err(|_| Error::Protocol("id"))?,
                 repo_name: wire.repo_name,
@@ -2905,6 +2969,7 @@ pub fn connect(
         | ServerMessage::Context(_)
         | ServerMessage::Context2(_)
         | ServerMessage::Source { .. }
+        | ServerMessage::CheckoutSource { .. }
         | ServerMessage::LogAck { .. }
         | ServerMessage::LogRefused { .. }
         | ServerMessage::LogEndAck { .. }
@@ -3661,6 +3726,35 @@ fn handle_bulk_message(
             }
             context.source_valid_until = Some(valid_until);
         }
+        ServerMessage::CheckoutSource {
+            attempt,
+            index,
+            repo,
+            revision,
+            recorded,
+            access,
+        } => {
+            let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+            if !access.well_formed() || !hex_revision(&revision) {
+                return Err(Error::Protocol("checkout source"));
+            }
+            let repo = sentinel_core::RepoId::from_bytes(repo)
+                .map_err(|_| Error::Protocol("checkout repo"))?;
+            let context = state
+                .contexts
+                .get_mut(&attempt)
+                .ok_or(Error::Protocol("checkout source without context"))?;
+            // In index order, one frame each, counting from 1 (the run's own checkout is 0): an index that
+            // repeats or skips is a protocol error, never a checkout that runs with somebody else's access.
+            if index as usize != context.checkouts.len() + 1
+                || context.checkouts.len() >= sentinel_protocol::negotiate::MAX_CHECKOUT_SOURCES
+            {
+                return Err(Error::Protocol("checkout source order"));
+            }
+            context.checkouts.push(CheckoutSource::at_arrival(
+                index, repo, revision, recorded, access,
+            ));
+        }
         ServerMessage::LogAck { attempt, through } => {
             let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
             executor.log_acked(attempt, through);
@@ -4242,6 +4336,7 @@ mod tests {
         JobContext {
             source: None,
             source_valid_until: None,
+            checkouts: Vec::new(),
             run: RunId::new(),
             repo: RepoId::new(),
             repo_name: "org/repo".to_string(),

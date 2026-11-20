@@ -1,11 +1,14 @@
 //! Only mirror-side failures fall back to direct; remote answers never retry, since direct would repeat them.
+//!
+//! An additional checkout of the job is fetched the same way as the run's own: through that repository's
+//! mirror when it asks for nothing but its commit, and directly at the depth it declares otherwise.
 
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use sentinel_core::RepoId;
-use sentinel_pipeline::PinnedSource;
+use sentinel_pipeline::{PinnedSource, schema::History};
 use sentinel_protocol::source::Access;
 use sentinel_protocol::summary::CheckoutRoute;
 
@@ -62,7 +65,18 @@ pub fn checkout(
     credential: Option<&Credential>,
     timeout: Duration,
 ) -> Result<Checkout> {
-    sentinel_git::checkout(workspace, source, credential, timeout).map_err(map)
+    checkout_at(workspace, source, credential, History::Shallow, timeout)
+}
+
+/// A manual checkout at the history selection the job declared.
+pub fn checkout_at(
+    workspace: &Path,
+    source: &PinnedSource,
+    credential: Option<&Credential>,
+    history: History,
+    timeout: Duration,
+) -> Result<Checkout> {
+    sentinel_git::checkout_at(workspace, source, credential, history.depth(), timeout).map_err(map)
 }
 
 pub fn checkout_authorized(
@@ -84,12 +98,14 @@ pub fn checkout_mirrored(
     source: &PinnedSource,
     access: Option<&Access>,
     valid_until: Option<Instant>,
+    history: History,
     lease: &str,
     timeout: Duration,
 ) -> Result<Outcome> {
-    // Only the bound repository's mirror: a manual remote may be a path to another store.
-    match (mirrors, access) {
-        (Some(mirrors), Some(access)) => through_mirror(
+    // Only a bound repository has a mirror, and only a checkout that asks for nothing but its commit uses
+    // it: a deeper one would get whatever history the mirror happens to hold.
+    match (mirrors, access, history) {
+        (Some(mirrors), Some(access), History::Shallow) => through_mirror(
             workspace,
             mirrors,
             repo,
@@ -99,10 +115,12 @@ pub fn checkout_mirrored(
             lease,
             timeout,
         ),
-        _ => direct(workspace, source, access, valid_until, timeout).map(|checkout| Outcome {
-            checkout,
-            route: CheckoutRoute::Direct,
-            fallback_reason: None,
+        _ => direct(workspace, source, access, valid_until, history, timeout).map(|checkout| {
+            Outcome {
+                checkout,
+                route: CheckoutRoute::Direct,
+                fallback_reason: None,
+            }
         }),
     }
 }
@@ -146,7 +164,14 @@ pub fn through_mirror(
                 return Err(map(e));
             }
             clear(workspace)?;
-            let checkout = direct(workspace, source, access, valid_until, left)?;
+            let checkout = direct(
+                workspace,
+                source,
+                access,
+                valid_until,
+                History::Shallow,
+                left,
+            )?;
             Ok(Outcome {
                 checkout,
                 route: CheckoutRoute::MirrorFallback,
@@ -162,11 +187,78 @@ fn direct(
     source: &PinnedSource,
     access: Option<&Access>,
     valid_until: Option<Instant>,
+    history: History,
     timeout: Duration,
 ) -> Result<Checkout> {
     match access {
-        Some(access) => checkout_authorized(workspace, source, access, valid_until, timeout),
-        None => sentinel_git::checkout(workspace, source, None, timeout).map_err(map),
+        Some(access) => {
+            let timeout = bounded(valid_until, timeout)?;
+            sentinel_git::checkout_authorized_at(
+                workspace,
+                source,
+                access,
+                history.depth(),
+                timeout,
+            )
+            .map_err(map)
+        }
+        None => checkout_at(workspace, source, None, history, timeout),
+    }
+}
+
+/// One additional checkout of the job into `workspace`, at the history its declaration asks for.
+///
+/// `recorded` says the revision is the run's recorded one: when the fetch cannot find it, that is reported
+/// as a vanished recorded revision — the rerun must not quietly build the branch's current tip instead.
+#[allow(clippy::too_many_arguments)]
+pub fn checkout_extra(
+    workspace: &Path,
+    mirrors: Option<&Mirrors>,
+    repo: &RepoId,
+    source: &PinnedSource,
+    access: &Access,
+    valid_until: Option<Instant>,
+    history: History,
+    recorded: bool,
+    lease: &str,
+    timeout: Duration,
+) -> Result<Outcome> {
+    let timeout = bounded(valid_until, timeout)?;
+    // A shallow checkout of a bound repository is the mirror's own case; a deeper one would get whatever
+    // history the mirror happens to hold, so it fetches from the remote itself.
+    let (outcome, route) = match (mirrors, history) {
+        (Some(mirrors), History::Shallow) => (
+            mirrors.checkout_authorized(workspace, repo, source, access, lease, timeout),
+            CheckoutRoute::Mirror,
+        ),
+        _ => (
+            sentinel_git::checkout_authorized_at(
+                workspace,
+                source,
+                access,
+                history.depth(),
+                timeout,
+            ),
+            CheckoutRoute::Direct,
+        ),
+    };
+    match outcome {
+        Ok(checkout) => Ok(Outcome {
+            checkout,
+            route,
+            fallback_reason: None,
+        }),
+        Err(sentinel_git::Error::Missing | sentinel_git::Error::Preparation(_)) if recorded => {
+            Err(Error::Preparation(format!(
+                "the run's recorded revision {} of {} is no longer fetchable from its remote",
+                source.sha,
+                source
+                    .ref_name
+                    .as_deref()
+                    .unwrap_or("the additional repository")
+            )))
+        }
+        Err(error) => Err(map(error)),
     }
 }
 

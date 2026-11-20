@@ -121,6 +121,7 @@ fn the_pull_overlaps_the_checkout() {
         context: JobContext {
             source: None,
             source_valid_until: None,
+            checkouts: Vec::new(),
             run: RunId::new(),
             repo: RepoId::new(),
             repo_name: "app".into(),
