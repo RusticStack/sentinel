@@ -68,7 +68,9 @@ impl Scopes {
     pub const TENANT_ADMIN: Self = Self(1 << 8);
     pub const PLATFORM_ADMIN: Self = Self(1 << 9);
     pub const ARTIFACTS_WRITE: Self = Self(1 << 10);
-    pub const ALL: Self = Self(0x7FF);
+    /// The AI evidence bundle (Y02): a grant a deployment gives its AI service, never a permission.
+    pub const AI_CONTEXT: Self = Self(1 << 11);
+    pub const ALL: Self = Self(0xFFF);
     pub const MCP: Self = Self(
         Self::RUNS_READ.0
             | Self::RUNS_WRITE.0
@@ -91,7 +93,7 @@ impl Scopes {
             | Self::ARTIFACTS_READ.0
             | Self::CACHE_READ.0,
     );
-    pub const NAMES: [&'static str; 11] = [
+    pub const NAMES: [&'static str; 12] = [
         "runs:read",
         "runs:write",
         "logs:read",
@@ -103,6 +105,7 @@ impl Scopes {
         "tenant:admin",
         "platform:admin",
         "artifacts:write",
+        "ai:context",
     ];
     const READS: Self = Self(
         Self::RUNS_READ.0
@@ -175,9 +178,12 @@ impl Scopes {
             .map(|(_, name)| *name)
     }
 
+    /// The permissions a holder of these scopes is capped at. `ai:context` reads a repository's
+    /// evidence like any other read, but no permission set implies it ([`Scopes::from_permissions`]),
+    /// so only a grant that names it carries it.
     pub const fn ceiling(self) -> Permissions {
         let mut bits = 0;
-        if self.0 & Self::READS.0 != 0 {
+        if self.0 & Self::READS.0 != 0 || self.0 & Self::AI_CONTEXT.0 != 0 {
             bits |= Permissions::READ.0;
         }
         if self.0 & Self::RUNS.0 != 0 {
@@ -299,7 +305,7 @@ mod tests {
         assert_eq!(parsed.to_names(), "runs:read logs:read platform:admin");
         assert_eq!(Scopes::parse(&parsed.to_names()), Ok(parsed));
         assert_eq!(Scopes::parse(&Scopes::ALL.to_names()), Ok(Scopes::ALL));
-        assert_eq!(Scopes::ALL.names().count(), 11);
+        assert_eq!(Scopes::ALL.names().count(), 12);
         assert_eq!(Scopes::parse(""), Ok(Scopes::NONE));
         assert_eq!(
             Scopes::CLI_DEFAULT.to_names(),
@@ -312,8 +318,8 @@ mod tests {
         assert_eq!(Scopes::parse("runs:read admin"), Err(UnknownScope));
         assert_eq!(Scopes::parse("RUNS:READ"), Err(UnknownScope));
         assert_eq!(Scopes::parse("runs:read,logs:read"), Err(UnknownScope));
-        assert_eq!(Scopes::from_bits(0x7FF), Some(Scopes::ALL));
-        assert_eq!(Scopes::from_bits(0x800), None);
+        assert_eq!(Scopes::from_bits(0xFFF), Some(Scopes::ALL));
+        assert_eq!(Scopes::from_bits(0x1000), None);
         assert_eq!(Scopes::from_bits(u32::MAX), None);
     }
 
@@ -325,6 +331,7 @@ mod tests {
             Scopes::ARTIFACTS_READ,
             Scopes::CACHE_READ,
             Scopes::SECRETS_METADATA,
+            Scopes::AI_CONTEXT,
         ] {
             assert_eq!(scope.ceiling(), Permissions::READ, "{scope:?}");
         }
@@ -355,7 +362,9 @@ mod tests {
         let read = Scopes::from_permissions(Permissions::READ);
         assert!(read.contains(Scopes::LOGS_READ.union(Scopes::SECRETS_METADATA)));
         assert!(!read.contains(Scopes::RUNS_WRITE));
-        assert_eq!(Scopes::from_permissions(Permissions::ALL), Scopes::ALL);
+        let all = Scopes::from_permissions(Permissions::ALL);
+        assert_eq!(all.union(Scopes::AI_CONTEXT), Scopes::ALL);
+        assert!(all.intersect(Scopes::AI_CONTEXT).is_empty());
     }
 
     #[test]

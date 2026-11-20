@@ -94,8 +94,14 @@ fn authenticated(store: &Store, access: &Secret, now: UnixMillis) -> Scopes {
 fn the_cli_client_is_capped_at_every_scope_the_code_defines() {
     let (_dir, store, _) = fixture();
     let client = store.read(|c| oauth::client(c, CLI_CLIENT_ID)).unwrap();
-    assert_eq!(client.max_scopes, Scopes::ALL);
+    assert_eq!(
+        client.max_scopes,
+        Scopes::ALL.difference(Scopes::AI_CONTEXT)
+    );
     assert!(client.max_scopes.contains(Scopes::ARTIFACTS_WRITE));
+    // One scope is deliberately outside the shipped client's cap: the AI service's bundle is
+    // granted through its own client (Y02), never through the CLI an operator signs in with.
+    assert!(!client.max_scopes.contains(Scopes::AI_CONTEXT));
 }
 
 #[test]
