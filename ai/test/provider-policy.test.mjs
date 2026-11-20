@@ -17,7 +17,7 @@ import { Controller } from "../src/controller.ts";
 import { admit } from "../src/policy.ts";
 import { modelLayer } from "../src/providers.ts";
 import { serve } from "../src/service.ts";
-import { chatCompletion, recording } from "./fake.mjs";
+import { chatCompletion, model, recording, reserved } from "./fake.mjs";
 
 const BUNDLE = JSON.stringify({
   schema: "sentinel.ai-context/1",
@@ -41,7 +41,12 @@ const row = (overrides) => ({
 const config = (overrides = {}) => ({
   controller: "http://controller.internal:8080",
   grant: Redacted.make("service-grant"),
-  models: { local: "fake-local", openrouter: "fake/model", anthropic: "fake-anthropic", openai: "fake-openai" },
+  models: {
+    local: model("fake-local"),
+    openrouter: model("fake/model"),
+    anthropic: model("fake-anthropic"),
+    openai: model("fake-openai"),
+  },
   endpoints: {
     local: { url: "http://127.0.0.1:11434/v1", key: null },
     openrouter: "sk-or-fake",
@@ -70,9 +75,10 @@ const controller = (request) => {
           },
         }),
       evidence: () => Effect.succeed(BUNDLE),
-      settle: (id, outcome, text, reason) =>
+      reserve: () => Effect.succeed(reserved()),
+      settle: (id, outcome, text, reason, usage) =>
         Effect.sync(() => {
-          settled.push({ id, outcome, text, reason });
+          settled.push({ id, outcome, text, reason, usage });
         }),
     },
   };

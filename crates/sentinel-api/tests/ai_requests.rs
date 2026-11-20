@@ -200,6 +200,7 @@ fn deployment(opted_in: bool) -> Deployment {
                     sentinel_store::ai::Tenant {
                         enabled: true,
                         data_policy: sentinel_store::ai::DataPolicy::LocalOnly,
+                        budgets: sentinel_store::ai::Budgets::default(),
                     },
                     now,
                 )?;

@@ -593,6 +593,19 @@ pub(crate) fn route(
             ],
         ) => crate::migration::preview(state, request, slug, name),
         (
+            "GET",
+            [
+                "api",
+                "v1",
+                "tenants",
+                slug,
+                "repos",
+                name,
+                "migration",
+                "workflows",
+            ],
+        ) => crate::migration::workflows(state, request, slug, name, query),
+        (
             "POST",
             [
                 "api",

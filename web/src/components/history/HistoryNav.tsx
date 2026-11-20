@@ -13,7 +13,7 @@ export function HistoryNav({ slug, repo, current }: { slug: string; repo: string
       {items.map((i) => {
         const here = i.key === current || (current === "compare" && i.key === "durations");
         return (
-          <PathLink key={i.key} to={i.to} search={repo ? { repo } : undefined} aria-current={here ? "page" : undefined}
+          <PathLink key={i.key} to={i.to} search={repo ? { repo } : undefined} activeOptions={{ exact: true }} aria-current={here ? "page" : undefined}
             className={cx("rounded-md px-3 py-1.5 text-sm", here ? "bg-elevated font-medium text-strong" : "text-fg hover:bg-subtle")}>
             {i.label}
           </PathLink>

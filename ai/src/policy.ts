@@ -31,6 +31,8 @@ export function parseDataPolicy(text: string): DataPolicy | null {
 export interface Admission {
   readonly provider: ProviderName;
   readonly model: string;
+  /** The output cap the provider is asked for: the reservation's, so a request cost what it held. */
+  readonly maxOutputTokens: number;
   readonly policy: DataPolicy;
   /** OpenRouter's zero-data-retention switch. On for every request, whatever the policy. */
   readonly zdr: boolean;
@@ -60,7 +62,12 @@ export function allows(policy: DataPolicy, provider: ProviderName): boolean {
 }
 
 /** The admission for one request, or the reason there is none. */
-export function admit(policy: DataPolicy, provider: string, model: string): Admission | Refusal {
+export function admit(
+  policy: DataPolicy,
+  provider: string,
+  model: string,
+  maxOutputTokens: number,
+): Admission | Refusal {
   const known = parseProvider(provider);
   if (known === null) {
     return { reason: "provider", provider };
@@ -75,6 +82,7 @@ export function admit(policy: DataPolicy, provider: string, model: string): Admi
   return {
     provider: known,
     model: trimmed,
+    maxOutputTokens,
     policy,
     zdr: known === "openrouter",
     denyCollection: known === "openrouter" && policy === "zero_retention",
