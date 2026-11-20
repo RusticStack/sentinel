@@ -1,3 +1,9 @@
+# The pnpm workspace: the web interface and the AI process are members, so one install
+# resolves both and one lockfile pins what they share.
+packages:
+  - web
+  - ai
+
 # Supply chain: refuse any package version published less than seven days
 # ago (minutes), so a freshly hijacked release is not installed.
 minimumReleaseAge: 10080

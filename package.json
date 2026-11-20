@@ -1,0 +1,11 @@
+{
+  "name": "sentinel",
+  "private": true,
+  "type": "module",
+  "description": "Sentinel's pnpm workspace root: the web interface (web) and the AI process (ai)",
+  "scripts": {
+    "typecheck": "pnpm -r typecheck",
+    "test:unit": "pnpm -r test:unit"
+  },
+  "packageManager": "pnpm@12.15.0"
+}
