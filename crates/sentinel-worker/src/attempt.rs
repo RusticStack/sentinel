@@ -1881,6 +1881,9 @@ fn cache_record(attached: &sentinel_cache::attach::Attached, costly_hit: bool) -
         dirty_bytes: dirty,
         publish,
         costly_hit,
+        remote_ns: stats.remote_ns,
+        remote_bytes: stats.remote_bytes,
+        remote_from: stats.remote_from,
     }
 }
 
@@ -2809,6 +2812,101 @@ mod tests {
         manifest.seal(sentinel_core::UnixMillis(1_700_000_000_001));
         fs::write(gdir.join(scope::MANIFEST_NAME), manifest.encode()).unwrap();
         fs::write(entry.join(scope::CURRENT_NAME), format!("{name}\n")).unwrap();
+    }
+
+    fn attached_with(
+        outcome: sentinel_cache::Outcome,
+        stats: sentinel_cache::Stats,
+    ) -> sentinel_cache::attach::Attached {
+        use sentinel_cache::{
+            Scope,
+            scope::{Os, Platform},
+        };
+        let platform = Platform {
+            os: Os::Linux,
+            arch: if cfg!(target_arch = "aarch64") {
+                Arch::Aarch64
+            } else {
+                Arch::X86_64
+            },
+        };
+        let scope = Scope::new(
+            sentinel_cache::attach::UNKNOWN_TENANT,
+            RepoId::new(),
+            sentinel_protocol::cache::Class::Compiler,
+            Trust::Protected,
+            platform,
+            Scope::toolchain_digest(b"image"),
+            "cc",
+        )
+        .unwrap();
+        let compat = sentinel_cache::manifest::Compat::Compiler {
+            flags: String::new(),
+        };
+        sentinel_cache::attach::Attached {
+            name: "cc".to_owned(),
+            key: "cc-normal-ab".to_owned(),
+            generation: None,
+            outcome,
+            targets: Vec::new(),
+            lease: None,
+            scope,
+            compat,
+            stats,
+        }
+    }
+
+    #[test]
+    fn a_hydration_reports_what_the_transfer_cost_and_a_local_hit_reports_none() {
+        let remote = sentinel_cache::Stats {
+            files: 12,
+            bytes: 4_096,
+            lookup_ns: Some(7),
+            remote_ns: Some(1_500_000),
+            remote_bytes: 2_048,
+            remote_from: Some(1_024),
+            ..sentinel_cache::Stats::default()
+        };
+        let record = cache_record(
+            &attached_with(
+                sentinel_cache::Outcome::Miss(sentinel_cache::Miss::Absent),
+                remote,
+            ),
+            false,
+        );
+        assert_eq!(record.outcome, "absent");
+        assert_eq!(record.remote_ns, Some(1_500_000));
+        assert_eq!(record.remote_bytes, 2_048);
+        assert_eq!(record.remote_from, Some(1_024));
+
+        // A transfer that ran and did not finish reports its cost too: that is the case the pilots record.
+        let aborted = sentinel_cache::Stats {
+            remote_ns: Some(900_000),
+            remote_bytes: 512,
+            ..sentinel_cache::Stats::default()
+        };
+        let record = cache_record(
+            &attached_with(
+                sentinel_cache::Outcome::Miss(sentinel_cache::Miss::Unavailable),
+                aborted,
+            ),
+            false,
+        );
+        assert_eq!(record.outcome, "unavailable");
+        assert_eq!(record.remote_ns, Some(900_000));
+        assert_eq!(record.remote_bytes, 512);
+        assert_eq!(record.remote_from, None);
+
+        let local = cache_record(
+            &attached_with(
+                sentinel_cache::Outcome::Miss(sentinel_cache::Miss::Absent),
+                sentinel_cache::Stats::default(),
+            ),
+            false,
+        );
+        assert_eq!(local.remote_ns, None);
+        assert_eq!(local.remote_bytes, 0);
+        assert_eq!(local.remote_from, None);
     }
 
     #[test]

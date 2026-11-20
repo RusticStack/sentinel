@@ -812,25 +812,52 @@ fn an_attempt_summary_needs_cache_read_and_reports_cache_records() {
     );
     let summary = AttemptSummary {
         image_present: Some(true),
-        caches: vec![CacheRecord {
-            name: "deps".into(),
-            class: 1,
-            outcome: "hit".into(),
-            lookup_ns: Some(10),
-            lock_wait_ns: None,
-            clone_ns: Some(12),
-            first_touch_ns: None,
-            files: 40,
-            bytes: 900,
-            copied_bytes: 0,
-            reflink: true,
-            commit_ns: None,
-            staged_bytes: None,
-            reused_bytes: None,
-            dirty_bytes: None,
-            publish: None,
-            costly_hit: false,
-        }],
+        caches: vec![
+            CacheRecord {
+                name: "deps".into(),
+                class: 1,
+                outcome: "hit".into(),
+                lookup_ns: Some(10),
+                lock_wait_ns: None,
+                clone_ns: Some(12),
+                first_touch_ns: None,
+                files: 40,
+                bytes: 900,
+                copied_bytes: 0,
+                reflink: true,
+                commit_ns: None,
+                staged_bytes: None,
+                reused_bytes: None,
+                dirty_bytes: None,
+                publish: None,
+                costly_hit: false,
+                remote_ns: None,
+                remote_bytes: 0,
+                remote_from: None,
+            },
+            CacheRecord {
+                name: "cc".into(),
+                class: 2,
+                outcome: "unavailable".into(),
+                lookup_ns: None,
+                lock_wait_ns: None,
+                clone_ns: None,
+                first_touch_ns: None,
+                files: 0,
+                bytes: 0,
+                copied_bytes: 0,
+                reflink: false,
+                commit_ns: None,
+                staged_bytes: None,
+                reused_bytes: None,
+                dirty_bytes: None,
+                publish: None,
+                costly_hit: false,
+                remote_ns: Some(900_000),
+                remote_bytes: 512,
+                remote_from: Some(256),
+            },
+        ],
         guest_image: Some(GuestImageRecord {
             digest: format!("sha256:{}", "1f".repeat(32)),
             rootfs_bytes: 4096,
@@ -860,6 +887,13 @@ fn an_attempt_summary_needs_cache_read_and_reports_cache_records() {
     assert_eq!(body["caches"][0]["name"], "deps");
     assert_eq!(body["caches"][0]["outcome"], "hit");
     assert_eq!(body["caches"][0]["files"], 40);
+    // A local hit reports no transfer; a hydration that did not finish reports what it spent.
+    assert!(body["caches"][0]["remote_ns"].is_null());
+    assert_eq!(body["caches"][0]["remote_bytes"], 0);
+    assert_eq!(body["caches"][1]["outcome"], "unavailable");
+    assert_eq!(body["caches"][1]["remote_ns"], 900_000);
+    assert_eq!(body["caches"][1]["remote_bytes"], 512);
+    assert_eq!(body["caches"][1]["remote_from"], 256);
     let (status, _) = call(
         &d.base,
         "GET",

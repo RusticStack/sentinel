@@ -696,6 +696,9 @@ impl Fixture {
                     dirty_bytes: None,
                     publish: None,
                     costly_hit: false,
+                    remote_ns: None,
+                    remote_bytes: 0,
+                    remote_from: None,
                 }],
                 ..AttemptSummary::default()
             },
