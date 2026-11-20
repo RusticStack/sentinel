@@ -15,7 +15,9 @@ interface TenantRow {
   slug: string; kind: string; active: boolean; members: number; usage_bytes: number;
   quota_bytes: number | null; quota_set: boolean; log_retention_ms?: number | null; artifact_retention_ms?: number | null;
   soft_percent?: number | null; hard_percent?: number | null;
-  // Against the tenant's own thresholds; `used_percent` is null for an unlimited tenant.
+  // Against the tenant's effective limit; `used_percent` is null only for an explicit unlimited
+  // (0), which `quota_set` distinguishes from a tenant that states no limit and inherits the
+  // deployment default.
   used_percent: number | null; state: "ok" | "soft" | "hard";
   soft_limit_bytes: number; hard_limit_bytes: number;
 }
@@ -96,7 +98,12 @@ export function Tenants({ initial }: { initial: TenantsLoad }) {
                         {t.state === "hard" ? "over" : t.state === "soft" ? "warned" : "ok"}
                       </Badge>
                       <span className="text-strong">{t.used_percent} %</span>
-                      <span className="text-muted">of {fmtBytes(t.quota_bytes)}</span>
+                      <span className="text-muted">
+                        of {fmtBytes(t.quota_bytes)}
+                        {t.quota_set ? null : (
+                          <> <span title="The deployment's default limit for this kind of namespace; the tenant states none of its own">(default)</span></>
+                        )}
+                      </span>
                     </span>
                   )}
                   <div className="mt-1 h-1.5 w-40 overflow-hidden rounded bg-elevated" aria-hidden="true">

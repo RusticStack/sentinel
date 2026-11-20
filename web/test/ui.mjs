@@ -924,7 +924,11 @@ await scenario("platform: tenants by percentage used", async () => {
     const text = await page.eval("document.querySelector('main').textContent.replace(/\\s+/g, ' ')");
     check("the platform lists each tenant by the percentage of its limit used",
       acme.used_percent !== null && text.includes(`${acme.used_percent} %`) && text.includes(`of ${fmtStorage(quota)}`), { text: text.slice(0, 300), acme });
-    check("a tenant with no limit is marked as such rather than as 0 %", beta.used_percent === null && text.includes("no limit"), beta);
+    // Since L01 an unset limit inherits the deployment's sized default, so the page reports a real
+    // percentage and says the limit is the default rather than the tenant's own.
+    check("a tenant that states no limit is measured against the deployment default, and says so",
+      beta.used_percent !== null && beta.quota_set === false
+        && text.includes(`of ${fmtStorage(beta.quota_bytes)} (default)`), beta);
 
     await page.click('[aria-label="Storage policy of acme"]');
     await page.waitFor("!!document.querySelector('#tenant-acme-soft')", 8000, "the tenant's threshold fields");
