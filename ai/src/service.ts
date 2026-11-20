@@ -252,7 +252,15 @@ const attemptOne = (
     if (decision.decision.state === "refused") {
       return { ok: false, reason: decision.decision.reason } as Attempt;
     }
-    const answer = yield* ask(admitted, evidence.text, config, instructions);
+    // A request with no time left is not worth a provider call: the sweep has ended it or is about
+    // to, so the answer would be discarded and the operator charged by their provider for nothing.
+    if (request.deadline_ms <= Date.now()) {
+      return {
+        ok: false,
+        reason: "provider: the request deadline passed before the provider was asked",
+      } as Attempt;
+    }
+    const answer = yield* ask(admitted, evidence.text, config, instructions, request.deadline_ms);
     if (!answer.ok) {
       return answer;
     }
@@ -317,11 +325,25 @@ const searchAttempt = (
     if (decision.decision.state === "refused") {
       return { ok: false, reason: decision.decision.reason } as Attempt;
     }
+    // The same rule as an analysis: a request with no time left is not worth a provider call, so
+    // neither the plan nor the answer is asked for once the deadline has passed.
+    const late = (): Attempt | null =>
+      request.deadline_ms <= Date.now()
+        ? {
+            ok: false,
+            reason: "provider: the request deadline passed before the provider was asked",
+          }
+        : null;
+    const beforePlan = late();
+    if (beforePlan !== null) {
+      return beforePlan;
+    }
     const drafted = yield* ask(
       { ...admitted, maxOutputTokens: PLAN_OUTPUT_TOKENS },
       planPrompt,
       config,
       SEARCH_PLANNER,
+      request.deadline_ms,
     );
     if (!drafted.ok) {
       return drafted;
@@ -346,11 +368,18 @@ const searchAttempt = (
       return { ok: false, reason: executed.result.reason } as Attempt;
     }
     const results = `The question was: ${JSON.stringify(question)}\n\nThe reads Sentinel performed:\n${executed.result.results}`;
+    // Executing the plan took time of its own, so the deadline is read again before the second call:
+    // a row the sweep ended while its reads ran gets no answer bought for it.
+    const beforeAnswer = late();
+    if (beforeAnswer !== null) {
+      return beforeAnswer;
+    }
     const answer = yield* ask(
       { ...admitted, maxOutputTokens: model.maxOutputTokens - PLAN_OUTPUT_TOKENS },
       results,
       config,
       instructions,
+      request.deadline_ms,
     );
     if (!answer.ok) {
       return answer;
@@ -424,6 +453,7 @@ const ask = (
   evidence: string,
   config: Config,
   instructions: string,
+  deadlineMs: number,
 ): Effect.Effect<Spoke, never, HttpClient> =>
   Effect.gen(function* () {
     const assistant = yield* Assistant;
@@ -431,6 +461,16 @@ const ask = (
     return { ok: true, text: answer.text, answer } as Spoke;
   }).pipe(
     Effect.provide(Layer.provide(assistantLayer, modelLayer(admitted, config.endpoints))),
+    // The request's own deadline bounds the call: a provider that accepts the connection and never
+    // answers must cost this request and nothing else. Without it the poll would never return, and
+    // every request behind it would expire unserved while the process sat in one call.
+    Effect.timeout(Duration.millis(Math.max(0, deadlineMs - Date.now()))),
+    Effect.catchTag("TimeoutError", () =>
+      Effect.succeed({
+        ok: false,
+        reason: "provider: the request deadline passed before the provider answered",
+      } as Spoke),
+    ),
     Effect.catch((error) =>
       Effect.succeed({ ok: false, reason: `provider: ${error.reason}` } as Spoke),
     ),

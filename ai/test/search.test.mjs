@@ -33,7 +33,7 @@ const row = {
   outcome: null,
   reused: false,
   created_ms: 1_700_000_000_000,
-  deadline_ms: 1_700_000_900_000,
+  deadline_ms: Date.now() + 600_000,
 };
 
 /** One result document, as the controller serves a plan's reads. */
@@ -255,4 +255,46 @@ test("a request that states no question is refused before any provider call", as
   assert.equal(providerCalls, 0);
   assert.equal(plans.length, 0);
   assert.equal(settled[0].reason, "plan: the request states no question");
+});
+
+test("a question past its deadline buys no provider call", async () => {
+  // The same rule an analysis has had since Y10: the sweep ends a request at its deadline, so a
+  // search that asks a provider after it would pay for an answer nobody receives.
+  const settled = [];
+  const plans = [];
+  let providerCalls = 0;
+  const fake = recording(() => {
+    providerCalls += 1;
+    return { body: speaks(PLAN) };
+  });
+  const past = { ...row, deadline_ms: Date.now() - 1 };
+  const served = await Effect.runPromise(
+    serve(config).pipe(
+      Effect.provideService(Controller, {
+        next: Effect.succeed(past),
+        claim: () =>
+          Effect.succeed({
+            request: past,
+            evidence: `/api/v1/attempts/${ATTEMPT}/ai-context`,
+            token: { access: "delegated", expires_ms: past.deadline_ms, scopes: ["logs:read"] },
+          }),
+        evidence: () => Effect.die("a log-search request reads no evidence bundle"),
+        reserve: () => Effect.succeed(reserved()),
+        plan: (id, delegation, plan) =>
+          Effect.sync(() => {
+            plans.push(plan);
+            return { state: "ready", results: JSON.stringify(RESULTS) };
+          }),
+        settle: (id, outcome, analysis, reason, usage) =>
+          Effect.sync(() => {
+            settled.push({ outcome, analysis, reason, usage });
+          }),
+      }),
+      Effect.provideService(HttpClient.HttpClient, fake.client),
+    ),
+  );
+  assert.equal(served.outcome, "unavailable");
+  assert.equal(providerCalls, 0, "the deadline passed before the planner was asked");
+  assert.equal(plans.length, 0);
+  assert.match(settled[0].reason, /^provider: the request deadline passed/);
 });

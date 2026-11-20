@@ -1204,7 +1204,17 @@ fn close(tx: &Transaction<'_>, id: AiRequestId, ending: Ending<'_>, now: UnixMil
             reused
         ])?;
     if settled == 0 {
-        return Err(Error::Conflict);
+        // Either it was already ended, or it is gone altogether: a disable deletes a tenant's rows,
+        // and the process that was settling one is told the row is not here rather than that its
+        // ending was refused.
+        let exists: bool = tx
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM ai_requests WHERE id = ?1)")?
+            .query_row([id.as_bytes()], |r| r.get(0))?;
+        return Err(if exists {
+            Error::Conflict
+        } else {
+            Error::NotFound
+        });
     }
     tx.prepare_cached(
         "UPDATE api_tokens SET revoked_ms = ?1

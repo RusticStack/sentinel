@@ -165,12 +165,23 @@ is on it.
 5. `POST /ai/requests/{id}/complete` settles the row exactly once, with the answer or the reason
    there is none and what the provider reported, and revokes the delegation in the same write. A
    settled request's delegation no longer authenticates; a request past its deadline has none left
-   either.
+   either. A second settlement is `409`, and a settlement for a row that is gone — a disable
+   deleted the tenant's queue — is `not_found`, so a process that was working when either happened
+   learns which it was and neither leaves a half-settled row behind.
 
 The row moves `queued` → `claimed` → `settled` and never back. `GET /api/v1/ai/requests/{id}`
 answers a member who can read its repository, so the answer the process stored is where Y05 reads
 it from, and `crates/sentinel-api/tests/ai_requests.rs` proves the two halves the row's gate names:
 a delegation cannot read past the requester, and a `local_only` request reaches no public host.
+
+**The provider call is bounded by the request's own deadline.** `sentinel-ai` gives the model the
+time the row has left and no more, and a request whose deadline has already passed is never sent to
+a provider at all. A provider that accepts the connection and never answers therefore ends one
+request `unavailable` with `provider: the request deadline passed before the provider answered`,
+rather than holding the poll: the loop that was waiting is free to take the next request, which is
+the difference between losing one request and losing the tenant's whole queue for as long as the
+provider misbehaves. `ai/test/isolation.test.mjs` proves both halves with a fake client that never
+completes.
 
 ## Budgets
 
@@ -483,25 +494,34 @@ because the evidence it cites does.
 
 ## What is built and what is not
 
-A prompt registry and an evaluation set are Y09; the prompt this build ships is `analysis-1`, whose
-version is part of every cache key, and the evaluation set is built from seeded failures on the
-pilots, and the log-search assistant ships a second prompt, `search-1`, which plans the reads a
-question becomes. The features after Y07 — flaky-test summaries, migration suggestions, the
-read-only MCP tools that expose analyses — are [plan
-16.6](../plan.md#166-ai-assistance) and [backlog Part 22](backlog.md).
+A prompt registry and an evaluation set are Y09: the evaluation set is built from seeded failures on
+the pilots, and it does not exist yet. Two prompts ship, each with its version in every cache key —
+`analysis-1` for a failure analysis and `search-1` for the reads a question becomes. The features
+after Y10 — flaky-test summaries, migration suggestions, the read-only MCP tools that expose
+analyses — are [plan 16.6](../plan.md#166-ai-assistance) and [backlog Part 22](backlog.md).
 
 Verification of this package is local: `pnpm typecheck` and
 `cd ai && node --import ./test/ts-register.mjs --test test/*.test.mjs`, both of which contact no
 provider — the provider tests run against a recording fake HTTP client, and the controller tests
-run over the API in `crates/sentinel-api/tests/ai_requests.rs`, `ai_budget.rs`, `ai_analysis.rs` and
-`ai_search.rs`. The log-search assistant's gates are `crates/sentinel-api/tests/ai_search.rs`: a
-question's plan is executed under the request's delegation and its lines are the ones a citation
-resolves to, a plan past its reads, needle, run window, match count or result bytes is refused with
-its field and the row settled, a plan naming another repository's attempt is refused and that
-attempt stays unreadable to the delegation, and an answer citing nothing that resolves is refused
-rather than stored; `ai/test/search.test.mjs` proves the process's half — the plan reaches the
-controller before any answer is asked for, the answer's prompt carries the result document and
-nothing else, an out-of-bounds plan never leaves the process, and one hold covers both calls. The budget's own
+run over the API in `crates/sentinel-api/tests/ai_requests.rs`, `ai_budget.rs`, `ai_analysis.rs`,
+`ai_search.rs` and `ai_isolation.rs`.
+
+The failure drills are the Y10 set: `crates/sentinel-api/tests/ai_isolation.rs` drives a provider
+outage, a slow provider, an exhausted budget, a disable mid-processing and a killed process over the
+real routes, and compares every deterministic surface of a failing and a passing run with AI on
+against the same run with AI off through a real worker session; `ai/test/isolation.test.mjs` drives
+the process's half of the slow provider and a delegation the controller has revoked. What each drill
+leaves simulated is stated in [resilience](resilience.md#what-is-not-covered): the provider and the
+signal that kills the process.
+
+The log-search assistant's gates are `crates/sentinel-api/tests/ai_search.rs`: a question's plan is
+executed under the request's delegation and its lines are the ones a citation resolves to, a plan
+past its reads, needle, run window, match count or result bytes is refused with its field and the
+row settled, a plan naming another repository's attempt is refused and that attempt stays unreadable
+to the delegation, and an answer citing nothing that resolves is refused rather than stored;
+`ai/test/search.test.mjs` proves the process's half — the plan reaches the controller before any
+answer is asked for, the answer's prompt carries the result document and nothing else, an
+out-of-bounds plan never leaves the process, and one hold covers both calls. The budget's own
 gates are `crates/sentinel-store/tests/ai_budget.rs`: budget and cost are charged from reported
 usage, an unreported component settles at its hold, an unsettled reservation expires with its
 request and frees the month, 24 concurrent reservations against a budget of eight admit exactly
