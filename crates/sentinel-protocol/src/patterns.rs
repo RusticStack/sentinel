@@ -397,10 +397,7 @@ mod tests {
 
     #[test]
     fn a_pem_block_cut_before_its_end_marker_is_rewritten_to_the_end() {
-        let cut = format!(
-            "{}",
-            pem_text("RSA PRIVATE KEY", "MIIEowIBAAKCAQEAfakeBody")
-        );
+        let cut = pem_text("RSA PRIVATE KEY", "MIIEowIBAAKCAQEAfakeBody");
         let (out, hits) = rewritten(&cut);
         assert!(hits.contains(Kind::PemBlock));
         assert_eq!(out.trim_end(), "***");
