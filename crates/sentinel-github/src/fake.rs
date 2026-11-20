@@ -93,6 +93,23 @@ struct Inner {
     /// Where the install confirm returns to: the setup URL of the last confirmed manifest.
     setup_url: Option<String>,
     next_installation: u64,
+    /// `GET /repositories/{id}` bodies, the repository an installation token is scoped to.
+    repositories: HashMap<u64, String>,
+    /// The default branch of each `owner/repo`, which a migration proposes into.
+    defaults: HashMap<String, String>,
+    /// Workflow files per `owner/repo@commit`, by name.
+    workflows: HashMap<String, Vec<(String, String)>>,
+    /// The tree each commit the fake holds was made from.
+    commits: HashMap<String, String>,
+    /// Branch refs: `refs/heads/<branch>` to the commit it holds.
+    refs: HashMap<String, String>,
+    /// Branches whose protection declines a create or an update.
+    protected: Vec<String>,
+    /// Pull requests, oldest first.
+    pulls: Vec<Pull>,
+    /// The files every commit posted to the fake wrote, oldest first.
+    written: Vec<(String, String)>,
+    next_pull: u64,
     /// Every manifest text posted to a create page.
     posted: Vec<String>,
     /// `METHOD /path` of each web request, never a query or body.
@@ -114,6 +131,7 @@ impl FakeGithub {
         let inner = Arc::new(Mutex::new(Inner {
             serial: 1,
             next_installation: 9001,
+            next_pull: 1,
             ..Inner::default()
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -230,6 +248,77 @@ impl FakeGithub {
         });
     }
 
+    /// `GET /repositories/{id}`: the repository an installation token is scoped to.
+    pub fn add_repository(&self, id: u64, body: &str) {
+        self.lock().repositories.insert(id, body.to_owned());
+    }
+
+    /// A repository a migration may propose into: its default branch and the workflows it holds at
+    /// one commit. The commit exists from then on, with a tree the fake names itself.
+    pub fn set_workflows(&self, owner: &str, repo: &str, commit: &str, files: &[(&str, &str)]) {
+        let mut state = self.lock();
+        state
+            .defaults
+            .entry(format!("{owner}/{repo}"))
+            .or_insert_with(|| "main".to_owned());
+        let key = format!("{owner}/{repo}@{commit}");
+        let tree = sha(&format!("tree:{key}"));
+        state.commits.insert(commit.to_owned(), tree);
+        state.workflows.insert(
+            key,
+            files
+                .iter()
+                .map(|(name, text)| ((*name).to_owned(), (*text).to_owned()))
+                .collect(),
+        );
+    }
+
+    /// The default branch a repository proposes into.
+    pub fn set_default_branch(&self, owner: &str, repo: &str, branch: &str) {
+        self.lock()
+            .defaults
+            .insert(format!("{owner}/{repo}"), branch.to_owned());
+    }
+
+    /// Protect a branch: GitHub declines a create or an update of it, as a protection rule does.
+    pub fn protect(&self, branch: &str) {
+        self.lock().protected.push(branch.to_owned());
+    }
+
+    /// Every branch ref the fake holds after the calls a test made.
+    pub fn refs(&self) -> Vec<(String, String)> {
+        let mut refs: Vec<(String, String)> = self
+            .lock()
+            .refs
+            .iter()
+            .map(|(name, sha)| (name.clone(), sha.clone()))
+            .collect();
+        refs.sort();
+        refs
+    }
+
+    /// The files a migration's commits wrote, oldest first.
+    pub fn written(&self) -> Vec<(String, String)> {
+        self.lock().written.clone()
+    }
+
+    /// The pull requests the fake holds, oldest first.
+    pub fn pull_requests(&self) -> Vec<Published> {
+        self.lock()
+            .pulls
+            .iter()
+            .map(|pull| Published {
+                number: pull.number,
+                state: pull.state.clone(),
+                branch: pull.branch.clone(),
+                base: pull.base.clone(),
+                head: pull.head.clone(),
+                title: pull.title.clone(),
+                body: pull.body.clone(),
+            })
+            .collect()
+    }
+
     /// Each manifest text a create page received, oldest first.
     pub fn manifests_posted(&self) -> Vec<String> {
         self.lock().posted.clone()
@@ -284,6 +373,40 @@ fn encode(value: &str) -> String {
     out
 }
 
+/// A pull request the fake holds: what a migration opened or updated.
+struct Pull {
+    number: u64,
+    state: String,
+    branch: String,
+    base: String,
+    head: String,
+    title: String,
+    body: String,
+    url: String,
+}
+
+/// A pull request as a test reads it back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Published {
+    pub number: u64,
+    pub state: String,
+    pub branch: String,
+    pub base: String,
+    pub head: String,
+    pub title: String,
+    pub body: String,
+}
+
+/// A Git object id the fake mints: hex of the same input is the same id, as Git's own is.
+fn sha(of: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, of.as_bytes());
+    let mut out = String::with_capacity(40);
+    for byte in &digest.as_ref()[..20] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 type Answer = (u16, Option<String>, String);
 
 fn not_found() -> Answer {
@@ -296,12 +419,15 @@ fn app_route(
     state: &mut Inner,
     request_line: &str,
     path: &str,
+    query: &str,
+    port: u16,
     authorization: Option<String>,
     body: &str,
 ) -> Option<Answer> {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    let post = request_line.starts_with("POST ");
-    let get = request_line.starts_with("GET ");
+    let method = request_line.split(' ').next().unwrap_or_default();
+    let post = method == "POST";
+    let get = method == "GET";
     let jwt = authorization
         .as_deref()
         .is_some_and(|t| t.starts_with("ey"));
@@ -368,8 +494,313 @@ fn app_route(
                 None => not_found(),
             }
         }
+        _ => return migration_route(state, method, &parts, query, body, port),
+    })
+}
+
+/// Guided migration's GitHub calls: the repository a token is scoped to, the workflows a commit
+/// holds, the git objects a migration commits, and its pull request. The rules the client relies
+/// on are the fake's too: a protected branch declines a create and an update, and a branch that
+/// already has an open pull request gets an update instead of a second one.
+fn migration_route(
+    state: &mut Inner,
+    method: &str,
+    parts: &[&str],
+    query: &str,
+    body: &str,
+    port: u16,
+) -> Option<Answer> {
+    let get = method == "GET";
+    let post = method == "POST";
+    let patch = method == "PATCH";
+    let sent: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let text = |value: &serde_json::Value, key: &str| {
+        value[key].as_str().map(str::to_owned).unwrap_or_default()
+    };
+    Some(match parts {
+        ["repositories", id] if get => {
+            match id
+                .parse()
+                .ok()
+                .and_then(|id: u64| state.repositories.get(&id))
+            {
+                Some(found) => (200, None, found.clone()),
+                None => not_found(),
+            }
+        }
+        ["repos", owner, repo] if get => match state.defaults.get(&format!("{owner}/{repo}")) {
+            Some(branch) => (
+                200,
+                None,
+                serde_json::json!({"id": 1, "full_name": format!("{owner}/{repo}"),
+                                   "default_branch": branch})
+                .to_string(),
+            ),
+            None => not_found(),
+        },
+        ["repos", owner, repo, "contents", directory, workflows] if get => {
+            debug_assert_eq!((*directory, *workflows), (".github", "workflows"));
+            let commit = params(query).get("ref").cloned().unwrap_or_default();
+            let key = format!("{owner}/{repo}@{commit}");
+            match state.workflows.get(&key) {
+                Some(files) => {
+                    let listing: Vec<serde_json::Value> = files
+                        .iter()
+                        .map(|(name, text)| {
+                            serde_json::json!({
+                                "type": "file",
+                                "name": name,
+                                "path": format!(".github/workflows/{name}"),
+                                "size": text.len(),
+                            })
+                        })
+                        .collect();
+                    (200, None, serde_json::Value::Array(listing).to_string())
+                }
+                None => not_found(),
+            }
+        }
+        ["repos", owner, repo, "contents", directory, workflows, name] if get => {
+            debug_assert_eq!((*directory, *workflows), (".github", "workflows"));
+            let commit = params(query).get("ref").cloned().unwrap_or_default();
+            let key = format!("{owner}/{repo}@{commit}");
+            let found = state.workflows.get(&key).and_then(|files| {
+                files
+                    .iter()
+                    .find(|(file, _)| file == name)
+                    .map(|(_, text)| text)
+            });
+            match found {
+                Some(text) => (
+                    200,
+                    None,
+                    serde_json::json!({
+                        "type": "file",
+                        "name": name,
+                        "path": format!(".github/workflows/{name}"),
+                        "size": text.len(),
+                        "encoding": "base64",
+                        "content": base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD, text.as_bytes()),
+                    })
+                    .to_string(),
+                ),
+                None => not_found(),
+            }
+        }
+        ["repos", owner, repo, "git", "commits", commit] if get => {
+            debug_assert!(!owner.is_empty() && !repo.is_empty());
+            match state.commits.get(*commit) {
+                Some(tree) => (
+                    200,
+                    None,
+                    serde_json::json!({"sha": commit, "tree": {"sha": tree}}).to_string(),
+                ),
+                None => not_found(),
+            }
+        }
+        ["repos", owner, repo, "git", "trees"] if post => {
+            let base = text(&sent, "base_tree");
+            let mut identity = format!("{owner}/{repo}:{base}");
+            for entry in sent["tree"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                let path = text(entry, "path");
+                let content = text(entry, "content");
+                identity.push('\0');
+                identity.push_str(&path);
+                identity.push('\0');
+                identity.push_str(&content);
+                state.written.push((path, content));
+            }
+            let tree = sha(&identity);
+            (
+                201,
+                None,
+                serde_json::json!({"sha": tree, "tree": []}).to_string(),
+            )
+        }
+        ["repos", owner, repo, "git", "commits"] if post => {
+            let tree = text(&sent, "tree");
+            let mut identity = format!("{owner}/{repo}:{tree}");
+            for parent in sent["parents"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                identity.push('\0');
+                identity.push_str(parent.as_str().unwrap_or_default());
+            }
+            let commit = sha(&format!("{identity}\0{}", text(&sent, "message")));
+            state.commits.insert(commit.clone(), tree.clone());
+            (
+                201,
+                None,
+                serde_json::json!({"sha": commit, "tree": {"sha": tree}}).to_string(),
+            )
+        }
+        ["repos", owner, repo, "git", "ref", "heads", rest @ ..] if get => {
+            debug_assert!(!owner.is_empty() && !repo.is_empty());
+            let reference = format!("refs/heads/{}", rest.join("/"));
+            match state.refs.get(&reference) {
+                Some(commit) => (
+                    200,
+                    None,
+                    serde_json::json!({"ref": reference, "object": {"sha": commit}}).to_string(),
+                ),
+                None => not_found(),
+            }
+        }
+        ["repos", owner, repo, "git", "refs"] if post => {
+            let reference = text(&sent, "ref");
+            let branch = reference.trim_start_matches("refs/heads/").to_owned();
+            if state.protected.contains(&branch) {
+                return Some(protection_declined());
+            }
+            if state.refs.contains_key(&reference) {
+                return Some((
+                    422,
+                    None,
+                    r#"{"message":"Reference already exists"}"#.to_owned(),
+                ));
+            }
+            state.refs.insert(reference.clone(), text(&sent, "sha"));
+            (
+                201,
+                None,
+                serde_json::json!({"ref": reference, "object": {"sha": text(&sent, "sha")}})
+                    .to_string(),
+            )
+        }
+        ["repos", owner, repo, "git", "refs", "heads", rest @ ..] if patch => {
+            debug_assert!(!owner.is_empty() && !repo.is_empty());
+            let branch = rest.join("/");
+            if state.protected.contains(&branch) {
+                return Some(protection_declined());
+            }
+            let reference = format!("refs/heads/{branch}");
+            if !state.refs.contains_key(&reference) {
+                return Some(not_found());
+            }
+            state.refs.insert(reference.clone(), text(&sent, "sha"));
+            (
+                200,
+                None,
+                serde_json::json!({"ref": reference, "object": {"sha": text(&sent, "sha")}})
+                    .to_string(),
+            )
+        }
+        ["repos", owner, repo, "pulls"] if get => {
+            debug_assert!(!owner.is_empty() && !repo.is_empty());
+            let asked = params(query);
+            // GitHub's `head` filter is `owner:branch`; the branch alone is what a pull names.
+            let head = asked.get("head").cloned().unwrap_or_default();
+            let head = head
+                .split_once(':')
+                .map_or(head.clone(), |(_owner, branch)| branch.to_owned());
+            let state_filter = asked.get("state").cloned().unwrap_or_default();
+            let matching: Vec<serde_json::Value> = state
+                .pulls
+                .iter()
+                .filter(|pull| {
+                    (head.is_empty() || pull.branch == head)
+                        && (state_filter.is_empty() || pull.state == state_filter)
+                })
+                .map(pull_json)
+                .collect();
+            (200, None, serde_json::Value::Array(matching).to_string())
+        }
+        ["repos", owner, repo, "pulls"] if post => {
+            let branch = text(&sent, "head");
+            let base = text(&sent, "base");
+            if !state.defaults.contains_key(&format!("{owner}/{repo}")) || base == branch {
+                return Some((422, None, r#"{"message":"Validation Failed"}"#.to_owned()));
+            }
+            if state
+                .pulls
+                .iter()
+                .any(|pull| pull.branch == branch && pull.state == "open")
+            {
+                return Some((
+                    422,
+                    None,
+                    r#"{"message":"A pull request already exists"}"#.to_owned(),
+                ));
+            }
+            let number = state.next_pull;
+            state.next_pull += 1;
+            let head = state
+                .refs
+                .get(&format!("refs/heads/{branch}"))
+                .cloned()
+                .unwrap_or_default();
+            let pull = Pull {
+                number,
+                state: "open".to_owned(),
+                branch,
+                base,
+                head,
+                title: text(&sent, "title"),
+                body: text(&sent, "body"),
+                url: format!("http://127.0.0.1:{port}/repos/{owner}/{repo}/pull/{number}"),
+            };
+            let answered = pull_json(&pull).to_string();
+            state.pulls.push(pull);
+            (201, None, answered)
+        }
+        ["repos", owner, repo, "pulls", number] if patch => {
+            debug_assert!(!owner.is_empty() && !repo.is_empty());
+            let Ok(number) = number.parse::<u64>() else {
+                return Some(not_found());
+            };
+            let Some(index) = state.pulls.iter().position(|pull| pull.number == number) else {
+                return Some(not_found());
+            };
+            let head = state
+                .refs
+                .get(&format!("refs/heads/{}", state.pulls[index].branch))
+                .cloned()
+                .unwrap_or_default();
+            let pull = &mut state.pulls[index];
+            pull.head = head;
+            for (key, field) in [
+                ("title", &mut pull.title),
+                ("body", &mut pull.body),
+                ("base", &mut pull.base),
+                ("state", &mut pull.state),
+            ] {
+                if let Some(value) = sent[key].as_str() {
+                    *field = value.to_owned();
+                }
+            }
+            let answered = pull_json(&state.pulls[index]).to_string();
+            (200, None, answered)
+        }
         _ => return None,
     })
+}
+
+/// A pull request as the API states it: the number, the page, and the head commit it proposes.
+fn pull_json(pull: &Pull) -> serde_json::Value {
+    serde_json::json!({
+        "number": pull.number,
+        "html_url": pull.url,
+        "state": pull.state,
+        "title": pull.title,
+        "body": pull.body,
+        "head": {"ref": pull.branch, "sha": pull.head},
+        "base": {"ref": pull.base},
+    })
+}
+
+fn protection_declined() -> Answer {
+    (
+        422,
+        None,
+        r#"{"message":"protected branch hook declined"}"#.to_owned(),
+    )
 }
 
 /// One answer: status, `Location`, content type, body.
@@ -812,7 +1243,15 @@ fn serve(
         port,
     ) {
         reply
-    } else if let Some(answer) = app_route(&mut state, &request_line, path, authorization, &body) {
+    } else if let Some(answer) = app_route(
+        &mut state,
+        &request_line,
+        path,
+        query,
+        port,
+        authorization,
+        &body,
+    ) {
         Reply::json(answer)
     } else {
         Reply::json((404, None, "{}".to_owned()))

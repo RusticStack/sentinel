@@ -31,7 +31,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    Outbound, State,
+    Outbound, OutboundSlot, State,
     auth::{Identity, Via},
     http::Request,
     routes::{Route, body_limit, err, identify, ok, parse, store_error},
@@ -132,6 +132,16 @@ impl Runtime {
         }
     }
 
+    /// The App in force, for a route whose write acts as it, or `None` when none is configured.
+    pub(crate) fn app(&self) -> Option<&Arc<App>> {
+        self.setup.current.get()
+    }
+
+    /// One outbound call to GitHub, so a route's own calls share the App's bound.
+    pub(crate) fn take_call(&self) -> Option<OutboundSlot<'_>> {
+        self.calls.take()
+    }
+
     fn webhook_url(&self) -> Option<String> {
         self.public_url
             .as_deref()
@@ -195,7 +205,7 @@ impl Runtime {
     }
 }
 
-fn busy() -> ApiError {
+pub(crate) fn busy() -> ApiError {
     err(
         ErrorCode::RateLimited,
         "another GitHub request is in flight; retry shortly",

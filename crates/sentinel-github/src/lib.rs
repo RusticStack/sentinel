@@ -8,6 +8,7 @@ pub mod checks;
 pub mod fake;
 pub mod http;
 pub mod manifest;
+pub mod migration;
 pub mod oauth;
 pub mod runner;
 pub mod webhook;
@@ -29,6 +30,9 @@ pub enum Error {
     Denied(String),
     Transport(String),
     Response(&'static str),
+    /// GitHub answered a write with the refusal a person's setting, not a retry, decides: branch
+    /// protection declining the update. Nothing is forced and nothing is retried.
+    Refused(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -39,6 +43,7 @@ impl fmt::Display for Error {
             Self::Denied(code) => write!(f, "authorization denied: {code}"),
             Self::Transport(what) => write!(f, "github request failed: {what}"),
             Self::Response(what) => write!(f, "unexpected github response: {what}"),
+            Self::Refused(what) => write!(f, "github refused the write: {what}"),
         }
     }
 }

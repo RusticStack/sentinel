@@ -191,7 +191,7 @@ pub(crate) fn valid_login(login: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn valid_path_part(part: &str) -> bool {
+pub(crate) fn valid_path_part(part: &str) -> bool {
     !part.is_empty()
         && part.len() <= 100
         && part != "."

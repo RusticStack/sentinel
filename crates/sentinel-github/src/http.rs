@@ -3,6 +3,8 @@ use std::time::Duration;
 use crate::{Error, Result};
 
 const MAX_BODY: u64 = 64 * 1024;
+/// The largest request body a caller that does not state its own may send.
+const MAX_REQUEST: usize = 64 * 1024;
 const MAX_HEADERS: usize = 16 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -122,16 +124,27 @@ impl Client {
         body: Option<&serde_json::Value>,
         max_body: u64,
     ) -> Result<Reply> {
+        self.send_json_at_most(method, url, token, body, MAX_REQUEST, max_body)
+    }
+
+    /// The same call with the request's own bound stated by the caller: a migration's commit
+    /// carries the workflow files it rewrites, so one request is larger than a status update.
+    pub fn send_json_at_most(
+        &self,
+        method: &str,
+        url: &str,
+        token: &str,
+        body: Option<&serde_json::Value>,
+        max_request: usize,
+        max_body: u64,
+    ) -> Result<Reply> {
         let encoded = match body {
             Some(value) => {
                 Some(serde_json::to_vec(value).map_err(|_| Error::Config("request body"))?)
             }
             None => None,
         };
-        if encoded
-            .as_ref()
-            .is_some_and(|b| b.len() > MAX_BODY as usize)
-        {
+        if encoded.as_ref().is_some_and(|b| b.len() > max_request) {
             return Err(Error::Config("request size"));
         }
         if !matches!(method, "GET" | "POST" | "PATCH" | "DELETE") {
