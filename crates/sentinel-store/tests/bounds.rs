@@ -202,6 +202,34 @@ fn a_panicking_read_returns_its_connection_to_the_pool() {
 }
 
 #[test]
+fn a_shared_store_drains_while_another_handle_is_alive() {
+    // A controller shares one store with every lane and session, so a stop can never wait for
+    // exclusive ownership: an outstanding handle used to make the drain report a stall without
+    // waiting for the writer at all, and the process exited non-zero on a clean signal.
+    let (dir, store) = store();
+    let path = dir.path().join("metadata.sqlite");
+    let shared = Arc::new(store);
+    let other = Arc::clone(&shared);
+    let tenant = TenantId::new();
+    shared
+        .writer()
+        .write(move |tx| jobs::insert_tenant(tx, tenant, "queued", UnixMillis(1)))
+        .unwrap();
+    assert_eq!(shared.shutdown(Duration::from_secs(5)), Shutdown::Drained);
+    // The handle that outlived the drain refuses work instead of queueing it behind a stop.
+    assert!(matches!(
+        other
+            .writer()
+            .write(|tx| jobs::insert_tenant(tx, TenantId::new(), "after", UnixMillis(2))),
+        Err(Error::WriterUnavailable)
+    ));
+    drop(other);
+    drop(shared);
+    let reopened = Store::open(&path, Durability::Normal).unwrap();
+    assert_eq!(tenant_count(&reopened), 1);
+}
+
+#[test]
 fn shutdown_drains_accepted_work_and_reports_a_stall_honestly() {
     let (dir, store) = store();
     let path = dir.path().join("metadata.sqlite");

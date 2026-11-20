@@ -3703,10 +3703,8 @@ fn initialize_and_wait(
             drop(lane);
             let sessions_drained = controller.shutdown(LINK_SHUTDOWN);
             let store_drained = matches!(
-                Arc::try_unwrap(store)
-                    .map(|store| store.shutdown(STORE_SHUTDOWN))
-                    .map_err(|_| ()),
-                Ok(sentinel_store::Shutdown::Drained)
+                store.shutdown(STORE_SHUTDOWN),
+                sentinel_store::Shutdown::Drained
             );
             tracing::info!(event = "link_stopped", sessions_drained, store_drained);
             if store_drained {
