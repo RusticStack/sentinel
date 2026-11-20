@@ -154,13 +154,14 @@ pub enum SpecError {
     Decode,
 }
 
-/// Format 12 adds a job's `checkout` history and its additional `checkouts`; format 11 adds a
-/// pipeline's name and declared inputs with the values a run was given; format 10 adds `on.schedule`;
-/// format 9 adds `artifacts[].when: step:<id>`; format 8 adds `artifacts[].class`; format 7 adds
-/// `runs_on.os` and `runs_on.isolation`. A spec that states none of them is written as format 11, 10,
-/// 9, 8, 7 or 6, byte for byte what earlier controllers wrote, so a worker that predates the newer
-/// fields keeps running it.
-pub const SPEC_FORMAT: u8 = 12;
+/// Format 13 adds a job's `checkout` history and its additional `checkouts`; format 12 adds a step's
+/// `outputs`, a job's `outputs` and `finalize`, and a job's `handoff`; format 11 adds a pipeline's
+/// name and declared inputs with the values a run was given; format 10 adds `on.schedule`; format 9
+/// adds `artifacts[].when: step:<id>`; format 8 adds `artifacts[].class`; format 7 adds `runs_on.os`
+/// and `runs_on.isolation`. A spec that states none of them is written as format 12, 11, 10, 9, 8, 7
+/// or 6, byte for byte what earlier controllers wrote, so a worker that predates the newer fields
+/// keeps running it.
+pub const SPEC_FORMAT: u8 = 13;
 
 pub const SPEC_FORMAT_READ_MIN: u8 = 3;
 
@@ -183,16 +184,24 @@ impl RunSpec {
 
     /// The format `encode` writes for this spec: the lowest one that carries everything it states.
     pub fn format(&self) -> u8 {
-        let named = !self.inputs.is_empty()
-            || self.pipeline.name.is_some()
-            || !self.pipeline.inputs.is_empty();
-        if self
+        let states_checkouts = self
             .pipeline
             .jobs
             .iter()
-            .any(|j| j.spec.history != History::Shallow || !j.spec.checkouts.is_empty())
-        {
+            .any(|j| j.spec.history != History::Shallow || !j.spec.checkouts.is_empty());
+        let states_outputs = self.pipeline.jobs.iter().any(|j| {
+            j.spec.finalize.is_some()
+                || !j.spec.outputs.is_empty()
+                || !j.spec.handoff.is_empty()
+                || j.spec.steps.iter().any(|s| !s.outputs.is_empty())
+        });
+        let named = !self.inputs.is_empty()
+            || self.pipeline.name.is_some()
+            || !self.pipeline.inputs.is_empty();
+        if states_checkouts {
             SPEC_FORMAT
+        } else if states_outputs {
+            12
         } else if named {
             11
         } else if self.pipeline.on.schedule {
@@ -231,6 +240,7 @@ impl RunSpec {
             10 => postcard::to_allocvec(&RunSpecV9::from(self)),
             11 => postcard::to_allocvec(&RunSpecV10::from(self)),
             SPEC_FORMAT => postcard::to_allocvec(self),
+            12 => postcard::to_allocvec(&RunSpecV11::from(self)),
             _ => postcard::to_allocvec(&RunSpecV8::from(self)),
         };
         body.map(|body| {
@@ -250,10 +260,13 @@ impl RunSpec {
             }
         }
         match bytes.split_first() {
-            // Format 12 is this reader's own layout: a job carries its checkout history and every
+            // Format 13 is this reader's own layout: a job carries its checkout history and every
             // additional checkout.
             Some((&SPEC_FORMAT, body)) => whole::<RunSpec>(body),
+            Some((&12, body)) => whole::<RunSpecV11>(body).map(RunSpec::from),
             Some((&11, body)) => whole::<RunSpecV10>(body).map(RunSpec::from),
+            // Format 10 is format 8's layout plus the schedule trigger, which is why the format byte
+            // moves: a reader that predates it refuses such a spec at the leading byte.
             Some((&10, body)) => whole::<RunSpecV9>(body).map(RunSpec::from),
             // Format 9 is format 8's layout: the only difference is what `when` may hold, and this
             // reader takes both. A spec that states a newer field moves the byte, so a reader that
@@ -273,6 +286,13 @@ impl RunSpec {
         let j = &self.pipeline.jobs.get(job)?.spec;
         let s = j.steps.get(step)?;
         Some(StepCommand::new(j, s))
+    }
+
+    /// The command a job's finalizer runs, bounded by its own timeout and by nothing a step declares.
+    pub fn finalize_command(&self, job: usize) -> Option<StepCommand> {
+        let j = &self.pipeline.jobs.get(job)?.spec;
+        let f = j.finalize.as_ref()?;
+        Some(StepCommand::finalize(j, f))
     }
 }
 
@@ -410,6 +430,9 @@ impl From<RunSpecV6> for RunSpec {
                             registry_auth: j.spec.registry_auth,
                             history: History::Shallow,
                             checkouts: Vec::new(),
+                            outputs: Vec::new(),
+                            handoff: Vec::new(),
+                            finalize: None,
                         },
                     })
                     .collect(),
@@ -568,6 +591,9 @@ impl From<RunSpecV7> for RunSpec {
                             registry_auth: j.spec.registry_auth,
                             history: History::Shallow,
                             checkouts: Vec::new(),
+                            outputs: Vec::new(),
+                            handoff: Vec::new(),
+                            finalize: None,
                         },
                     })
                     .collect(),
@@ -663,6 +689,70 @@ impl From<RunSpecV9> for RunSpec {
     fn from(v9: RunSpecV9) -> RunSpec {
         let mut spec = RunSpec::from(v9.base);
         spec.pipeline.on = v9.on;
+        spec
+    }
+}
+
+/// Format 12: the format-11 layout plus what a job declares about its outputs, its finalizer and the artifacts it
+/// takes from the jobs it needs. The per-job lists are in job order, as the artifact classes are.
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSpecV11 {
+    base: RunSpecV10,
+    steps: Vec<Vec<Vec<String>>>,
+    jobs: Vec<Vec<String>>,
+    finalize: Vec<Option<crate::schema::Finalize>>,
+    handoff: Vec<Vec<crate::schema::Handoff>>,
+}
+
+impl From<&RunSpec> for RunSpecV11 {
+    fn from(spec: &RunSpec) -> RunSpecV11 {
+        RunSpecV11 {
+            base: RunSpecV10::from(spec),
+            steps: spec
+                .pipeline
+                .jobs
+                .iter()
+                .map(|j| j.spec.steps.iter().map(|s| s.outputs.clone()).collect())
+                .collect(),
+            jobs: spec
+                .pipeline
+                .jobs
+                .iter()
+                .map(|j| j.spec.outputs.clone())
+                .collect(),
+            finalize: spec
+                .pipeline
+                .jobs
+                .iter()
+                .map(|j| j.spec.finalize.clone())
+                .collect(),
+            handoff: spec
+                .pipeline
+                .jobs
+                .iter()
+                .map(|j| j.spec.handoff.clone())
+                .collect(),
+        }
+    }
+}
+
+impl From<RunSpecV11> for RunSpec {
+    fn from(v11: RunSpecV11) -> RunSpec {
+        let mut spec = RunSpec::from(v11.base);
+        let mut steps = v11.steps.into_iter();
+        let mut declared = v11.jobs.into_iter();
+        let mut finalize = v11.finalize.into_iter();
+        let mut handoff = v11.handoff.into_iter();
+        for job in &mut spec.pipeline.jobs {
+            if let Some(per_step) = steps.next() {
+                for (step, outputs) in job.spec.steps.iter_mut().zip(per_step) {
+                    step.outputs = outputs;
+                }
+            }
+            job.spec.outputs = declared.next().unwrap_or_default();
+            job.spec.finalize = finalize.next().flatten();
+            job.spec.handoff = handoff.next().unwrap_or_default();
+        }
         spec
     }
 }
@@ -861,6 +951,9 @@ impl From<JobV3> for Job {
             registry_auth: None,
             history: History::Shallow,
             checkouts: Vec::new(),
+            outputs: Vec::new(),
+            handoff: Vec::new(),
+            finalize: None,
         }
     }
 }
@@ -877,6 +970,7 @@ impl From<StepV4> for Step {
             secret_files: Vec::new(),
             workdir: old.workdir,
             timeout_secs: old.timeout_secs,
+            outputs: Vec::new(),
         }
     }
 }
@@ -914,6 +1008,9 @@ impl From<RunSpecV4> for RunSpec {
                             registry_auth: None,
                             history: History::Shallow,
                             checkouts: Vec::new(),
+                            outputs: Vec::new(),
+                            handoff: Vec::new(),
+                            finalize: None,
                         },
                     })
                     .collect(),
@@ -957,6 +1054,9 @@ impl From<RunSpecV5> for RunSpec {
                             registry_auth: None,
                             history: History::Shallow,
                             checkouts: Vec::new(),
+                            outputs: Vec::new(),
+                            handoff: Vec::new(),
+                            finalize: None,
                         },
                     })
                     .collect(),
@@ -1005,19 +1105,49 @@ pub struct StepCommand {
     pub timeout_secs: u64,
 }
 
+fn shell_argv(shell: Shell) -> Vec<String> {
+    match shell {
+        Shell::Sh => vec!["/bin/sh".to_owned(), "-e".to_owned(), "-c".to_owned()],
+        Shell::Bash => vec![
+            "bash".to_owned(),
+            "-e".to_owned(),
+            "-o".to_owned(),
+            "pipefail".to_owned(),
+            "-c".to_owned(),
+        ],
+    }
+}
+
 impl StepCommand {
-    fn new(job: &Job, step: &Step) -> Self {
-        let argv = match step.shell {
-            Shell::Sh => vec!["/bin/sh".to_owned(), "-e".to_owned(), "-c".to_owned()],
-            Shell::Bash => vec![
-                "bash".to_owned(),
-                "-e".to_owned(),
-                "-o".to_owned(),
-                "pipefail".to_owned(),
-                "-c".to_owned(),
-            ],
+    /// The finalizer's command: the job's environment and workdir, no secrets, no output file.
+    fn finalize(job: &Job, finalize: &crate::schema::Finalize) -> Self {
+        let mut argv = shell_argv(finalize.shell);
+        argv.push(finalize.run.clone());
+        let mut env: Vec<(String, String)> = job.env.clone();
+        for (k, v) in &finalize.env {
+            match env.iter_mut().find(|(name, _)| name == k) {
+                Some(slot) => slot.1 = v.clone(),
+                None => env.push((k.clone(), v.clone())),
+            }
+        }
+        let workdir = match (&job.workdir, &finalize.workdir) {
+            (None, None) => None,
+            (Some(j), None) => Some(j.clone()),
+            (None, Some(f)) => Some(f.clone()),
+            (Some(j), Some(f)) => Some(format!("{j}/{f}")),
         };
-        let mut argv = argv;
+        Self {
+            argv,
+            env,
+            secrets: Vec::new(),
+            secret_files: Vec::new(),
+            workdir,
+            timeout_secs: finalize.timeout_secs,
+        }
+    }
+
+    fn new(job: &Job, step: &Step) -> Self {
+        let mut argv = shell_argv(step.shell);
         argv.push(step.run.clone());
         let mut env: Vec<(String, String)> = job.env.clone();
         for (k, v) in &step.env {
@@ -1480,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn additional_checkouts_are_format_12_and_round_trip() {
+    fn additional_checkouts_are_format_13_and_round_trip() {
         let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    checkout:\n      history: full\n      repositories:\n        - {repo: shared, path: vendor/shared, ref: refs/heads/main, history: {depth: 25}}\n    steps:\n      - id: s\n        run: echo hi\n";
         let spec = RunSpec::new(
             PinnedSource::new("r", SHA, None).unwrap(),
@@ -1489,7 +1619,7 @@ mod tests {
         .unwrap();
         assert_eq!(spec.format(), SPEC_FORMAT);
         let bytes = spec.encode().unwrap();
-        assert_eq!(bytes[0], 12);
+        assert_eq!(bytes[0], 13);
         let decoded = RunSpec::decode(&bytes).unwrap();
         assert_eq!(decoded, spec);
         let job = &decoded.pipeline.jobs[0].spec;
@@ -1516,6 +1646,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(shallow.format(), 6);
+        // What this release's own fields cost is spent once: a job that also states outputs still
+        // writes one format byte, the newest, and reads back whole.
+        let both = RunSpec::new(
+            PinnedSource::new("r", SHA, None).unwrap(),
+            compile_str("schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    checkout: {history: full}\n    steps:\n      - {id: s, run: echo hi, outputs: [version]}\n    outputs: [version]\n")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(both.format(), SPEC_FORMAT);
+        let bytes = both.encode().unwrap();
+        assert_eq!(bytes[0], 13);
+        let decoded = RunSpec::decode(&bytes).unwrap();
+        assert_eq!(decoded, both);
+        assert_eq!(decoded.pipeline.jobs[0].spec.outputs, ["version"]);
+        assert_eq!(decoded.pipeline.jobs[0].spec.history, History::Full);
     }
 
     #[test]
@@ -1548,6 +1693,43 @@ mod tests {
             RunSpec::decode(&bytes[..bytes.len() - 1]),
             Err(SpecError::Decode)
         );
+    }
+
+    #[test]
+    fn declared_outputs_a_handoff_and_a_finalizer_are_format_12() {
+        let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    steps:\n      - {id: first, run: echo hi, outputs: [version]}\n    outputs: [version]\n    artifacts: [{name: dist, paths: [out]}]\n  b:\n    image: busybox\n    needs: [a]\n    steps: [{id: one, run: echo hi}]\n    handoff: [{from: a, artifact: dist, into: incoming}]\n    finalize: {run: echo done, timeout: 30s}\n";
+        let spec = RunSpec::new(
+            PinnedSource::new("r", SHA, None).unwrap(),
+            compile_str(text).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(spec.format(), 12);
+        let bytes = spec.encode().unwrap();
+        assert_eq!(bytes[0], 12);
+        assert_eq!(RunSpec::decode(&bytes).unwrap(), spec);
+        // The format byte is the whole reason a worker that predates this refuses rather than misreads it.
+        assert_eq!(
+            RunSpec::decode(&bytes[..bytes.len() - 1]),
+            Err(SpecError::Decode)
+        );
+        let decoded = RunSpec::decode(&bytes).unwrap();
+        assert_eq!(decoded.pipeline.jobs[1].spec.handoff[0].into, "incoming");
+        assert_eq!(
+            decoded.pipeline.jobs[1]
+                .spec
+                .finalize
+                .as_ref()
+                .map(|f| f.timeout_secs),
+            Some(30)
+        );
+        assert!(decoded.pipeline.jobs[0].spec.handoff.is_empty());
+        let command = decoded
+            .finalize_command(1)
+            .expect("the finalizer's command");
+        assert_eq!(command.argv[0], "/bin/sh");
+        assert_eq!(command.timeout_secs, 30);
+        assert!(command.secrets.is_empty());
+        assert!(decoded.finalize_command(0).is_none());
     }
 
     #[test]

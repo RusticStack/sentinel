@@ -187,6 +187,14 @@ object paths the authenticated routes use, including the transfer slot, the stat
 evicted entry streams back from the external copy exactly as it does there. A token may be redeemed repeatedly inside
 its window: nothing is consumed, because a redemption record would put a write on every anonymous download. The
 access-log line keeps a 16-hex digest of the token and never the text ([API](api.md#short-lived-download-links)).
+## Declared outputs
+
+A job's declared outputs are stored as plain text on its row (`jobs.outputs`, migration 86: the `name=value` lines the
+worker accepted, one per line, bounded at 16 KiB), written in the same fenced transaction that ends the attempt, so a
+report from a fence the attempt no longer holds writes nothing. They are public within the tenant by construction —
+the worker refuses a value that repeats a delivered secret — so nothing redacts them and they carry no charge. The jobs
+that `needs` the producer read them from their own context ([worker link](worker-link.md#protocol-14-declared-outputs-and-artifact-handoff)).
+
 ## Streaming publication
 
 An artifact declared `when: step:<id>` publishes at the end of that step, under the attempt's own lease, while the
@@ -254,6 +262,17 @@ Both gates are tests in `crates/sentinel-api/tests/archive.rs` and run with the 
 | Local entry time to first byte p95 < 100 ms over at least 20 calls | **4.0 ms p95 for tar, 2.0 ms p95 for zip**, 25 calls each after one warm call, an 8-entry 2 MiB artifact |
 
 The 4 GiB test runs the server as a separate process (the test binary re-executed with `SENTINEL_ARCHIVE_SERVE` set), so the resident set measured is the controller's, not the test's.
+
+## Handoff to a later job
+
+A job's `handoff` takes artifacts of jobs it `needs` ([pipeline schema](pipeline-schema.md#artifact-handoff)) from the
+publication itself: the controller resolves the producing job's captured row (refusing an artifact that is absent or
+past its retention, and a job that never declared the pair), reads the manifest the publication committed, and streams
+its entries over the worker link; the worker writes each entry under the directory the job named and verifies it
+against the digest in that manifest as its last body arrives. No second copy exists — not in a cache, not in a staging
+object, not in a second manifest — so a handoff changes nothing about the artifact's row, class, charge, pin or
+retention, and the item is served while its retention holds. An artifact an older controller would allow to expire
+before a consumer ran cannot be handed off at all: retention is checked at the moment the stream is planned.
 
 ## Segmented logs
 

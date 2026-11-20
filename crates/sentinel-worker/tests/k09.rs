@@ -136,6 +136,7 @@ fn make_job(worker_dir: &Path, repo_dir: &Path, sha: &str, repo: RepoId, trust: 
         digest: DIGEST.to_owned(),
         spec: RunSpec::new(source, compiled).unwrap(),
         context: JobContext {
+            outputs: Vec::new(),
             source: None,
             source_valid_until: None,
             checkouts: Vec::new(),

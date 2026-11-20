@@ -259,6 +259,7 @@ mod imp {
             digest,
             spec,
             context: JobContext {
+                outputs: Vec::new(),
                 source: None,
                 source_valid_until: None,
                 checkouts: Vec::new(),

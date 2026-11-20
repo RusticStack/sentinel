@@ -29,6 +29,7 @@ pub mod offload;
 pub mod operations;
 pub mod organizations;
 pub mod outcomes;
+pub mod outputs;
 pub mod parity;
 pub mod poll;
 pub mod provenance;

@@ -75,6 +75,9 @@ Enforced from declared lengths before any body is read; exceeding one is `payloa
 | OAuth form body (token, revocation, device authorization, consent) | 8 KiB |
 | Worker labels per profile | 16 |
 | One cache chunk payload | 48 KiB (must fit a control frame whole) |
+| One handoff artifact | 1 GiB (`handoff::MAX_BYTES`) and 4,096 entries |
+| One handoff body frame (`Handoff`) | 48 KiB |
+| Outputs one job context carries | 8 per producing job, 1,088 bytes per name and value |
 
 Invariants between limits are compile-time assertions. Raise a limit only with a measured need and a note here.
 
@@ -150,9 +153,18 @@ sensitive frame (`SecretChunk` is the first): its encode buffer is wiped after
 the write. `MAX_RUNNER_CONFIG_BYTES` (65,536) bounds it, beside the control
 message bound in [size limits](#size-limits).
 
-## Protocol 14 additional repository checkouts
+## Protocol 14 declared outputs and artifact handoff
 
-Protocol 14 appends `CheckoutSource { attempt, index, repo, revision, recorded, access }`
+Protocol 14 appends `Context3` (the protocol-6 context plus the declared outputs of the jobs this job needs),
+`HandoffNeed` (worker → controller: the producing job and the artifact name) and `Handoff` (controller → worker: one
+frame of an artifact's stream — its shape, an entry's header, that entry's bodies, or the end)
+([worker link](worker-link.md#protocol-14-declared-outputs-and-artifact-handoff)). It changes no earlier message: a
+session below 14 is sent `Context2` and never offered a job whose context carries outputs or whose job declares a
+handoff, and no handoff frame is sent to it, so its sessions behave exactly as before.
+
+## Protocol 15 additional repository checkouts
+
+Protocol 15 appends `CheckoutSource { attempt, index, repo, revision, recorded, access }`
 (controller → worker): one frame per additional checkout a job declares, in index
 order counting from 1 (index 0 is the run's own checkout), each carrying the
 repository the worker's mirror is keyed by, the commit the controller resolved and
@@ -163,7 +175,7 @@ list, because a bound access — its trust material and its credential — can b
 large as 48 KiB and does not share a 64 KiB frame with seven others. The worker
 refuses an index out of order, a repeat, more than `MAX_CHECKOUT_SOURCES` (8) and a
 revision that is not a full object id, so a checkout can never run under somebody
-else's access. `EXTRA_CHECKOUTS_MIN` is 14: a job that declares an additional
+else's access. `EXTRA_CHECKOUTS_MIN` is 15: a job that declares an additional
 checkout is served no spec at all to a session below it, because a worker that
 cannot be told about a repository must not check one out. The frames are a sensitive
 frame class, since each carries a credential. See [sources](sources.md#additional-checkouts).

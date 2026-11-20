@@ -199,7 +199,8 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (83, include_str!("migrations/083_ai_analysis.sql")),
     (84, include_str!("migrations/084_ai_search.sql")),
     (85, include_str!("migrations/085_named_pipelines.sql")),
-    (86, include_str!("migrations/086_run_sources.sql")),
+    (86, include_str!("migrations/086_job_outputs.sql")),
+    (87, include_str!("migrations/087_run_sources.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -221,6 +222,7 @@ pub const READABLE_BY: &[(u32, u32)] = &[
     (80, 79),
     (82, 81),
     (83, 82),
+    (86, 85),
 ];
 
 pub fn readable_by(version: u32) -> u32 {
@@ -354,8 +356,8 @@ mod tests {
             "an older controller claims a log-search request as a failure analysis of its attempt and settles it with an answer to a question it never read: it knows neither the question nor the plan the answer must be built from",
         ),
         (
-            86,
-            "an older controller cannot decode run spec format 12, so it refuses to serve a run whose pipeline declares a checkout history or an additional checkout, and it holds no source manifest: it could neither say what such a run built nor resolve its recorded revisions on a rerun",
+            87,
+            "an older controller cannot decode run spec format 13, so it refuses to serve a run whose pipeline declares a checkout history or an additional checkout, and it holds no source manifest: it could neither say what such a run built nor resolve its recorded revisions on a rerun",
         ),
     ];
 

@@ -118,6 +118,13 @@ pub enum CompileError {
         path: String,
         message: String,
     },
+    /// A job takes an artifact a job it does not need never declares.
+    Handoff {
+        job: String,
+        from: String,
+        artifact: String,
+        reason: &'static str,
+    },
     /// Canonical encoding failed. Hashing nothing instead would give two pipelines the same identity.
     Encoding,
     /// A namespace the document gives two meanings: the check a repository protects must name one.
@@ -167,6 +174,12 @@ impl fmt::Display for CompileError {
                 )
             }
             Self::TooManySteps { limit } => write!(f, "jobs: more than {limit} steps in total"),
+            Self::Handoff {
+                job,
+                from,
+                artifact,
+                reason,
+            } => write!(f, "jobs.{job}.handoff: `{from}/{artifact}` {reason}"),
             Self::Expression { path, message } => write!(f, "{path}: {message}"),
             Self::Encoding => f.write_str("jobs: cannot encode the canonical form for the digest"),
             Self::CheckNameConflict {
@@ -416,6 +429,35 @@ pub fn compile_pipeline(
         needs_idx.push(idx);
     }
 
+    // A handoff names an artifact of a job this job needs: the producer must have finished, and its artifact must
+    // be one the schema of that job declares. A name that resolves to no declaration would deliver nothing.
+    for (name, job) in &sorted {
+        for handoff in &job.handoff {
+            let Some(&from) = index_of(&handoff.from).as_ref() else {
+                return Err(CompileError::UnknownDependency {
+                    job: name.clone(),
+                    needs: handoff.from.clone(),
+                });
+            };
+            if name == &handoff.from {
+                return Err(CompileError::SelfDependency { job: name.clone() });
+            }
+            let producer = &sorted[from].1;
+            if !producer
+                .artifacts
+                .iter()
+                .any(|a| a.name == handoff.artifact)
+            {
+                return Err(CompileError::Handoff {
+                    job: name.clone(),
+                    from: handoff.from.clone(),
+                    artifact: handoff.artifact.clone(),
+                    reason: "is not an artifact the producing job declares",
+                });
+            }
+        }
+    }
+
     // Smallest ready name first: the order is a pure function of the DAG.
     let mut indegree: Vec<u16> = needs_idx.iter().map(|d| d.len() as u16).collect();
     let mut dependents: Vec<Vec<u16>> = vec![Vec::new(); n];
@@ -541,6 +583,14 @@ fn digest_step(d: &mut Digest, s: &Step) -> Result<(), CompileError> {
     }
     d.opt_str(s.workdir.as_deref());
     d.u64(s.timeout_secs.unwrap_or(0));
+    // Only when stated, so the digests of pipelines written before outputs existed stay the same.
+    if !s.outputs.is_empty() {
+        d.str("outputs");
+        d.u64(s.outputs.len() as u64);
+        for name in &s.outputs {
+            d.str(name);
+        }
+    }
     Ok(())
 }
 
@@ -678,6 +728,34 @@ fn digest_of(
                 d.str(&c.ref_name);
                 d.u64(c.history.depth().map_or(u64::MAX, u64::from));
             }
+        }
+        if !s.outputs.is_empty() {
+            d.str("job-outputs");
+            d.u64(s.outputs.len() as u64);
+            for name in &s.outputs {
+                d.str(name);
+            }
+        }
+        if !s.handoff.is_empty() {
+            d.str("handoff");
+            d.u64(s.handoff.len() as u64);
+            for h in &s.handoff {
+                d.str(&h.from);
+                d.str(&h.artifact);
+                d.str(&h.into);
+            }
+        }
+        if let Some(f) = &s.finalize {
+            d.str("finalize");
+            d.str(&f.run);
+            d.u64(f.shell as u64);
+            d.u64(f.env.len() as u64);
+            for (k, v) in &f.env {
+                d.str(k);
+                d.str(v);
+            }
+            d.opt_str(f.workdir.as_deref());
+            d.u64(f.timeout_secs);
         }
     }
     Ok(d.0)

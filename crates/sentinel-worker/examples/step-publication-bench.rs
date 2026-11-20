@@ -84,6 +84,7 @@ fn steps() -> [Step; 2] {
         secret_files: Vec::new(),
         workdir: None,
         timeout_secs: None,
+        outputs: Vec::new(),
     };
     [step("build"), step("later")]
 }

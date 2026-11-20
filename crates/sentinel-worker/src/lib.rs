@@ -11,6 +11,7 @@ pub mod checkout;
 pub mod context;
 #[cfg(target_os = "linux")]
 pub mod executor;
+pub mod handoff;
 pub mod host;
 #[cfg(target_os = "linux")]
 pub mod images;
@@ -18,6 +19,8 @@ pub mod images;
 pub mod logpipe;
 #[cfg(target_os = "linux")]
 pub mod microvm;
+/// Declared outputs: what a step wrote for the steps after it, bounded and plain text.
+pub mod outputs;
 #[cfg(target_os = "linux")]
 pub mod podman;
 #[cfg(target_os = "linux")]

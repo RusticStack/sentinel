@@ -430,11 +430,11 @@ fn an_unauthorized_additional_repository_is_refused_rather_than_fetched() {
 fn a_job_with_additional_checkouts_is_told_the_recorded_revision_and_its_manifest_is_complete() {
     let recorded = "2".repeat(40);
     let d = deployment(Shared::MainOnly, PIPELINE, Some(&recorded));
-    let (context, bytes) = first_spec(&d, 14);
-    let context = context.expect("protocol 14 must receive the spec");
+    let (context, bytes) = first_spec(&d, 15);
+    let context = context.expect("protocol 15 must receive the spec");
     // The spec itself still states the declaration, and names the format that carries it.
     let spec = RunSpec::decode(&bytes).unwrap();
-    assert_eq!(bytes[0], 12);
+    assert_eq!(bytes[0], 13);
     assert_eq!(spec.pipeline.jobs[0].spec.checkouts[0].repo, "shared");
     assert_eq!(context.checkouts.len(), 1);
     let checkout = &context.checkouts[0];
@@ -475,10 +475,10 @@ fn a_job_with_additional_checkouts_is_told_the_recorded_revision_and_its_manifes
 #[test]
 fn a_worker_below_the_additional_checkout_protocol_is_refused() {
     let d = deployment(Shared::MainOnly, PIPELINE, Some(&"2".repeat(40)));
-    let (context, bytes) = first_spec(&d, 13);
+    let (context, bytes) = first_spec(&d, 14);
     assert!(
         context.is_none(),
-        "protocol 13 cannot be told about an additional checkout"
+        "protocol 14 cannot be told about an additional checkout"
     );
     assert!(bytes.is_empty());
 }

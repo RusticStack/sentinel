@@ -25,6 +25,17 @@ Step processes are looked up in the container's cgroup **and every cgroup nested
 
 A cancel that lands during preparation ends the attempt as `canceled` too, with its (empty) log closed — and the preparation helpers do not run on: a Git fetch (direct or into the mirror) and a `podman pull` watch the attempt's cancel flag and have their whole process group killed within 50 ms of it, instead of running to their deadlines (10 and 15 min). Container preparation checks the flag before invoking `podman create`; both create and start watch it too, and a canceled or timed-out helper triggers best-effort removal in case the service already created the container. A pull shared with other attempts is killed only when its leader's attempt is cancelled, and its followers then pull for themselves rather than inherit a cancellation that was not theirs. Otherwise the step's `exec` returns as the process dies (signal 15, or the script's own exit); the attempt loop sees the flag, records the step `Signaled`/`NotRun` for the rest, finalizes as usual — workspace and container gone, log closed — and reports `Failed(Canceled)`. `Notice::Canceled { forced }` says which way it went.
 
+## Finalizers never own cleanup
+
+A job's bounded finalizer ([pipeline schema](pipeline-schema.md#bounded-finalizers)) is a step the job's own
+workspace runs, not a cleanup path. It never fences an attempt, never releases a lease and never decides a container
+is gone: cancellation and lease expiry end a job through the paths above and only those, so nothing a pipeline
+declares changes who owns cleanup or when a sandbox goes. A cancelled attempt does not run its finalizer at all —
+the flag is read before it starts — and one that is already running is stopped with the container, so a hanging
+finalizer cannot extend a cancelled job's life. A finalizer that hangs while the job is *not* cancelled is stopped at
+its own bound (at most 5m, and never past what is left of the job's budget) and recorded as `timed_out` on the
+attempt: an annotation, never a conclusion.
+
 ## Timeouts
 
 - **Execution:** the worker's, per step and bounded by the job's budget ([executor](executor.md#steps)); `ExecutionTimeout`, `timed_out`.

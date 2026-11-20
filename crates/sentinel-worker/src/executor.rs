@@ -1625,6 +1625,20 @@ impl Report for Inner {
     ) {
         (self.notify)(Notice::CacheFigures(CacheTotals::of(records)));
     }
+    fn fetch_handoff(
+        &self,
+        attempt: AttemptId,
+        from: &str,
+        artifact: &str,
+        deadline: std::time::Instant,
+        sink: &mut dyn sentinel_link::session::HandoffSink,
+    ) -> std::result::Result<(), sentinel_link::session::HandoffError> {
+        let reporter = self.state().reporter.clone();
+        match reporter {
+            Some(reporter) => reporter.fetch_handoff(attempt, from, artifact, deadline, sink),
+            None => Err(sentinel_link::session::HandoffError::Aborted),
+        }
+    }
     fn remote(&self) -> Option<std::sync::Arc<dyn sentinel_cache::remote::Remote>> {
         self.state()
             .reporter
@@ -2780,6 +2794,7 @@ mod bookkeeping_tests {
 
     fn context(tenant: Option<TenantId>) -> JobContext {
         JobContext {
+            outputs: Vec::new(),
             source: None,
             source_valid_until: None,
             checkouts: Vec::new(),

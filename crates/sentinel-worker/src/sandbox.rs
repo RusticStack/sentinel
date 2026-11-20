@@ -72,6 +72,23 @@ impl Sandbox {
         }
     }
 
+    /// Puts the host's output directory into the guest at the container path it is mounted at. A container has it
+    /// bind-mounted already.
+    pub fn deliver_outputs(&self, dir: &Path) -> Result<()> {
+        match self {
+            Sandbox::Container(_) => Ok(()),
+            Sandbox::Vm(vm) => vm.deliver_outputs(dir),
+        }
+    }
+
+    /// Brings the file the step wrote back to the host's output directory. A container wrote the host's file.
+    pub fn collect_outputs(&self, dir: &Path) -> Result<()> {
+        match self {
+            Sandbox::Container(_) => Ok(()),
+            Sandbox::Vm(vm) => vm.collect_outputs(dir),
+        }
+    }
+
     /// Takes what [`Sandbox::deliver_secrets`] put into the guest out of it again.
     pub fn retract_secrets(&self) -> Result<()> {
         match self {
@@ -101,15 +118,29 @@ impl Sandbox {
     /// Podman cannot bound, so the guard measures them ([`crate::quota`]); a microVM's disk is a scratch image of
     /// exactly the declared size.
     pub fn guard_storage(&self, workspace: &Path, limit: u64) -> Option<crate::quota::Guard> {
+        self.guard_storage_with(workspace, limit, None)
+    }
+
+    /// The same guard, also measuring an attempt's output directory: a step's output file is on the host's disk
+    /// beside the workspace, so it is charged to the same declared disk.
+    pub(crate) fn guard_storage_with(
+        &self,
+        workspace: &Path,
+        limit: u64,
+        also: Option<&crate::attempt::OutputDirectory>,
+    ) -> Option<crate::quota::Guard> {
         match self {
-            Sandbox::Container(c) => Some(crate::quota::Guard::start(
-                vec![
+            Sandbox::Container(c) => {
+                // A step's output file is on the host's disk beside the workspace, so it is measured with it.
+                let mut paths = vec![
                     workspace.to_path_buf(),
                     crate::workspace::tmp_beside(workspace),
-                ],
-                limit,
-                c.stopper(),
-            )),
+                ];
+                if let Some(dir) = also {
+                    paths.push(dir.dir().to_path_buf());
+                }
+                Some(crate::quota::Guard::start(paths, limit, c.stopper()))
+            }
             Sandbox::Vm(_) => None,
         }
     }
