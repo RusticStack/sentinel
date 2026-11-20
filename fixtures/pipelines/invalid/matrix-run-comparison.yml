@@ -1,0 +1,9 @@
+# expect: jobs.build.steps.build.run: `matrix.jdk` renders here only as `${{ matrix.jdk }}`
+schema: 1
+on: [push]
+jobs:
+  build:
+    matrix:
+      jdk: ["17"]
+    image: busybox
+    steps: [{id: build, run: "echo ${{ matrix.jdk == '17' }}"}]

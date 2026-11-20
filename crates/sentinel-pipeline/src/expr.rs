@@ -494,10 +494,12 @@ fn validate_path(path: &[String]) -> Result<(), &'static str> {
                 Err("needs.<job> must be a valid job name")
             }
         }
-        (Some("event" | "repo" | "run" | "job" | "needs" | "inputs"), _, _) => {
+        // A cell's value, known when the matrix is expanded; the pipeline checks the axis name.
+        (Some("matrix"), Some(axis), None) if crate::schema::valid_id(axis) => Ok(()),
+        (Some("event" | "repo" | "run" | "job" | "needs" | "inputs" | "matrix"), _, _) => {
             Err("unknown context field")
         }
-        _ => Err("unknown context; expected event, repo, run, job, needs or inputs"),
+        _ => Err("unknown context; expected event, repo, run, job, needs, inputs or matrix"),
     }
 }
 
@@ -505,6 +507,26 @@ const TY_STR: u8 = 1;
 const TY_INT: u8 = 2;
 const TY_BOOL: u8 = 4;
 const TY_NULL: u8 = 8;
+
+/// How a value reads as text: the same spelling a template renders, and the one a cell's name uses.
+pub(crate) fn value_text(value: &Value) -> String {
+    match value {
+        Value::Str(s) => s.clone(),
+        Value::Int(i) => i.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "null".to_owned(),
+    }
+}
+
+/// The types a declared matrix value can meet in a comparison.
+fn type_bits(value: &Value) -> u8 {
+    match value {
+        Value::Null => TY_NULL,
+        Value::Bool(_) => TY_BOOL,
+        Value::Int(_) => TY_INT,
+        Value::Str(_) => TY_STR,
+    }
+}
 
 impl Expr {
     pub fn parse(src: &str) -> Result<Expr, ParseError> {
@@ -536,13 +558,12 @@ impl Expr {
     pub fn min_phase(&self) -> Phase {
         match self {
             Expr::Lit(_) => Phase::Compile,
-            Expr::Path(p) => {
-                if p[0] == "needs" {
-                    Phase::Schedule
-                } else {
-                    Phase::Dispatch
-                }
-            }
+            Expr::Path(p) => match p[0].as_str() {
+                "needs" => Phase::Schedule,
+                // A cell's value is fixed by the declaration, so a matrix renders at compile time.
+                "matrix" => Phase::Compile,
+                _ => Phase::Dispatch,
+            },
             Expr::Not(e) => e.min_phase(),
             Expr::Bin(_, a, b) => a.min_phase().max(b.min_phase()),
             Expr::Call(f, args) => args
@@ -564,8 +585,12 @@ impl Expr {
         }
     }
 
-    fn types(&self, inputs: &crate::input::Inputs) -> Result<u8, String> {
-        let only = |e: &Expr, want: u8, message: &'static str| match e.types(inputs)? {
+    fn types(
+        &self,
+        inputs: &crate::input::Inputs,
+        matrix: &[crate::schema::MatrixAxis],
+    ) -> Result<u8, String> {
+        let only = |e: &Expr, want: u8, message: &'static str| match e.types(inputs, matrix)? {
             t if t == want => Ok(()),
             _ => Err(message.to_owned()),
         };
@@ -586,6 +611,17 @@ impl Expr {
                             ));
                         }
                     },
+                    ["matrix", name] => match matrix.iter().find(|axis| axis.name == *name) {
+                        Some(axis) => axis
+                            .values
+                            .iter()
+                            .fold(0u8, |types, value| types | type_bits(value)),
+                        None => {
+                            return Err(format!(
+                                "`matrix.{name}` names no matrix axis this job declares"
+                            ));
+                        }
+                    },
                     _ => TY_STR,
                 },
             ),
@@ -599,7 +635,10 @@ impl Expr {
                 Ok(TY_BOOL)
             }
             Expr::Bin(BinOp::Eq | BinOp::Ne, a, b) => {
-                let (a, b) = (a.types(inputs)? & !TY_NULL, b.types(inputs)? & !TY_NULL);
+                let (a, b) = (
+                    a.types(inputs, matrix)? & !TY_NULL,
+                    b.types(inputs, matrix)? & !TY_NULL,
+                );
                 if a != 0 && b != 0 && (a | b).count_ones() > 1 {
                     return Err("comparison between different types".to_owned());
                 }
@@ -619,10 +658,57 @@ impl Expr {
     }
 
     pub fn check_condition(&self, inputs: &crate::input::Inputs) -> Result<(), String> {
-        match self.types(inputs)? {
+        self.check_condition_with(inputs, &[])
+    }
+
+    /// The same check, with the axes a job that states a matrix declares: every value of an axis is a
+    /// type the comparison may meet, and one that cannot be met is refused here rather than at a cell.
+    pub fn check_condition_with(
+        &self,
+        inputs: &crate::input::Inputs,
+        matrix: &[crate::schema::MatrixAxis],
+    ) -> Result<(), String> {
+        match self.types(inputs, matrix)? {
             TY_BOOL => Ok(()),
             _ => Err("condition must be a boolean expression".to_owned()),
         }
+    }
+
+    /// Every `matrix.<axis>` this expression reads, deduplicated in first-use order.
+    pub fn referenced_matrix(&self, out: &mut Vec<String>) {
+        match self {
+            Expr::Path(p) if p[0] == "matrix" => {
+                if !out.contains(&p[1]) {
+                    out.push(p[1].clone());
+                }
+            }
+            Expr::Lit(_) | Expr::Path(_) => {}
+            Expr::Not(e) => e.referenced_matrix(out),
+            Expr::Bin(_, a, b) => {
+                a.referenced_matrix(out);
+                b.referenced_matrix(out);
+            }
+            Expr::Call(_, args) => args.iter().for_each(|a| a.referenced_matrix(out)),
+        }
+    }
+
+    /// One cell's expression: every `matrix.<axis>` becomes the value that cell declares. An axis the
+    /// cell does not carry is named back to the caller, never defaulted.
+    pub fn substitute_matrix(&self, cell: &dyn Fn(&str) -> Option<Value>) -> Result<Expr, String> {
+        let sub = |e: &Expr| e.substitute_matrix(cell);
+        Ok(match self {
+            Expr::Lit(v) => Expr::Lit(v.clone()),
+            Expr::Path(p) => match p[0].as_str() {
+                "matrix" => match cell(&p[1]) {
+                    Some(v) => Expr::Lit(v),
+                    None => return Err(p[1].clone()),
+                },
+                _ => Expr::Path(p.clone()),
+            },
+            Expr::Not(e) => Expr::Not(Box::new(sub(e)?)),
+            Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(sub(a)?), Box::new(sub(b)?)),
+            Expr::Call(f, args) => Expr::Call(*f, args.iter().map(sub).collect::<Result<_, _>>()?),
+        })
     }
 
     /// Every `inputs.<name>` this expression reads, deduplicated in first-use order.
@@ -910,6 +996,42 @@ impl Template {
         }
     }
 
+    pub fn referenced_matrix(&self, out: &mut Vec<String>) {
+        for p in &self.parts {
+            if let Part::Expr(e) = p {
+                e.referenced_matrix(out);
+            }
+        }
+    }
+
+    /// One cell's template: every `matrix.<axis>` becomes the value that cell declares. A part that
+    /// is that value and nothing else becomes text, so the key a cell renders is a key nothing has to
+    /// resolve again.
+    pub fn substitute_matrix(
+        &self,
+        cell: &dyn Fn(&str) -> Option<Value>,
+    ) -> Result<Template, String> {
+        let mut parts: Vec<Part> = Vec::with_capacity(self.parts.len());
+        for part in &self.parts {
+            let text = match part {
+                Part::Lit(s) => Some(s.clone()),
+                Part::Expr(e) => match e.substitute_matrix(cell)? {
+                    Expr::Lit(value) => Some(value_text(&value)),
+                    other => {
+                        parts.push(Part::Expr(other));
+                        continue;
+                    }
+                },
+            };
+            match (parts.last_mut(), text) {
+                (Some(Part::Lit(previous)), Some(text)) => previous.push_str(&text),
+                (_, Some(text)) => parts.push(Part::Lit(text)),
+                (_, None) => {}
+            }
+        }
+        Ok(Template { parts })
+    }
+
     pub fn render(&self, ctx: &dyn Context, max_bytes: usize) -> Result<String, EvalError> {
         let mut out = String::new();
         for p in &self.parts {
@@ -1182,7 +1304,7 @@ mod tests {
         }
         assert_eq!(
             Expr::parse("a.b").unwrap_err().message,
-            "unknown context; expected event, repo, run, job, needs or inputs"
+            "unknown context; expected event, repo, run, job, needs, inputs or matrix"
         );
         let t = Template::parse("k-${{ repo.id }}:${{ hash_files('x') }}").unwrap();
         assert_eq!(t.to_string(), "k-${{ repo.id }}:${{ hash_files('x') }}");

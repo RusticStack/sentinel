@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sentinel_protocol::cache::Class;
 
 use crate::{
-    expr::{Expr, Phase, Template},
+    expr::{Expr, Phase, Template, Value},
     input::{
         InputKind, InputSpec, InputValue, Inputs, MAX_CHOICE_BYTES, MAX_CHOICE_VALUES,
         MAX_INPUT_STRING_BYTES, MAX_INPUTS, valid_input_name,
@@ -32,6 +32,15 @@ pub const MAX_REPO_NAME_BYTES: usize = 256;
 pub const MAX_SECRETS: usize = 16;
 pub const MAX_LOCKS: usize = 4;
 pub const MAX_LOCK_NAME_BYTES: usize = 128;
+/// A job's matrix: at most four axes of at most sixteen values each, and at most thirty-two
+/// combinations — each cell is a job of its own, with its own container, budget and check. Past the
+/// bound the document is refused, never truncated. Not `workflow::MAX_MATRIX_AXES`: that bounds what
+/// the analyzer will inventory in a GitHub workflow, never what Sentinel will run.
+pub const MAX_AXES: usize = 4;
+pub const MAX_AXIS_VALUES: usize = 16;
+pub const MAX_CELLS_PER_JOB: usize = 32;
+/// One declared matrix value, before it renders into a job name, check name or container image.
+pub const MAX_MATRIX_VALUE_BYTES: usize = 64;
 pub const MAX_REUSE_INPUTS: usize = 16;
 pub const MAX_REUSE_PATHS: usize = 8;
 pub const MAX_RUN_BYTES: usize = 4096;
@@ -67,7 +76,24 @@ pub struct Pipeline {
     pub on: Triggers,
     pub concurrency: Option<Concurrency>,
     pub inputs: Inputs,
-    pub jobs: Vec<(String, Job)>,
+    pub jobs: Vec<(String, DeclaredJob)>,
+}
+
+/// A job as the document declares it: the job itself and the matrix it expands over.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredJob {
+    pub job: Job,
+    /// Empty means the job is one job. Otherwise the pipeline expands it into one job per combination
+    /// of the axes, and `matrix.<axis>` inside the job reads the combination's value.
+    pub matrix: Vec<MatrixAxis>,
+}
+
+/// One axis of a job's matrix: the name `matrix.<name>` reads, and the values it takes, in the order
+/// the document states them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatrixAxis {
+    pub name: String,
+    pub values: Vec<Value>,
 }
 
 /// Everything one `.sentinel.yml` declares: the unnamed pipeline of schema 1, and any named ones.
@@ -813,7 +839,7 @@ pub fn parse_bytes(s: &str) -> Option<u64> {
     n.checked_mul(mult)
 }
 
-fn condition(path: &str, node: &Node, inputs: &Inputs) -> Result<Expr> {
+fn condition(path: &str, node: &Node, inputs: &Inputs, matrix: &[MatrixAxis]) -> Result<Expr> {
     let s = expect_str(path, node, crate::expr::MAX_EXPR_BYTES)?;
     let inner = s
         .trim()
@@ -827,7 +853,7 @@ fn condition(path: &str, node: &Node, inputs: &Inputs) -> Result<Expr> {
         )
     })?;
     // Type errors are rejected here, so a condition can never fail with a type error at run time.
-    e.check_condition(inputs)
+    e.check_condition_with(inputs, matrix)
         .map_err(|m| err(path, SchemaErrorKind::Invalid(m)))?;
     Ok(e)
 }
@@ -991,7 +1017,7 @@ fn resources(path: &str, node: Option<&Node>, policy: &ResourcePolicy) -> Result
     Ok(r)
 }
 
-fn step(path: &str, node: &Node, inputs: &Inputs) -> Result<Step> {
+fn step(path: &str, node: &Node, inputs: &Inputs, matrix: &[MatrixAxis]) -> Result<Step> {
     let mut map = Map::new(path, node)?;
     let id = map
         .take("id")
@@ -1004,7 +1030,7 @@ fn step(path: &str, node: &Node, inputs: &Inputs) -> Result<Step> {
         .and_then(|n| expect_str(&map.child("run"), n, MAX_RUN_BYTES))?
         .to_owned();
     let condition = match map.take("if") {
-        Some(n) => Some(condition(&map.child("if"), n, inputs)?),
+        Some(n) => Some(condition(&map.child("if"), n, inputs, matrix)?),
         None => None,
     };
     let shell = match map.take("shell") {
@@ -1663,14 +1689,93 @@ pub fn valid_image(s: &str) -> bool {
         && !s.contains("..")
 }
 
-fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Result<Job> {
+/// A job's matrix: one entry per axis, each naming the values `matrix.<axis>` takes.
+fn matrix(path: &str, node: &Node) -> Result<Vec<MatrixAxis>> {
     let mut map = Map::new(path, node)?;
+    if map.entries.is_empty() {
+        return Err(err(path, SchemaErrorKind::Empty));
+    }
+    if map.entries.len() > MAX_AXES {
+        return Err(err(path, SchemaErrorKind::TooMany { limit: MAX_AXES }));
+    }
+    let mut out = Vec::with_capacity(map.entries.len());
+    for (name, node) in map.entries {
+        let axis = format!("{path}.{name}");
+        if !valid_id(name) {
+            return Err(err(
+                &axis,
+                SchemaErrorKind::Invalid(
+                    "matrix axis names must match [a-z0-9][a-z0-9_-]* and be at most 64 bytes"
+                        .into(),
+                ),
+            ));
+        }
+        let items = expect_seq(&axis, node, MAX_AXIS_VALUES)?;
+        let mut values = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let at = format!("{axis}[{i}]");
+            let value = match item {
+                // A value renders into a job name and a check name, so it stays on one line.
+                Node::Str(s) if s.is_empty() || s.len() > MAX_MATRIX_VALUE_BYTES => {
+                    return Err(err(
+                        &at,
+                        SchemaErrorKind::Invalid(format!(
+                            "a matrix value is 1 to {MAX_MATRIX_VALUE_BYTES} bytes on one line"
+                        )),
+                    ));
+                }
+                Node::Str(s) if s.contains(['\n', '\r', '\t']) => {
+                    return Err(err(
+                        &at,
+                        SchemaErrorKind::Invalid(format!(
+                            "a matrix value is 1 to {MAX_MATRIX_VALUE_BYTES} bytes on one line"
+                        )),
+                    ));
+                }
+                Node::Str(s) => Value::Str(s.clone()),
+                Node::Int(i) => Value::Int(*i),
+                Node::Bool(b) => Value::Bool(*b),
+                other => {
+                    return Err(err(
+                        &at,
+                        SchemaErrorKind::WrongType {
+                            expected: "string, integer or boolean",
+                            found: other.kind(),
+                        },
+                    ));
+                }
+            };
+            values.push(value);
+        }
+        map.take(name);
+        out.push(MatrixAxis {
+            name: name.clone(),
+            values,
+        });
+    }
+    Ok(out)
+}
+
+fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Result<DeclaredJob> {
+    let mut map = Map::new(path, node)?;
+    let matrix = match map.take("matrix") {
+        None => Vec::new(),
+        Some(n) => matrix(&map.child("matrix"), n)?,
+    };
     let image_path = map.child("image");
     let image = map
         .take("image")
         .ok_or_else(|| err(&image_path, SchemaErrorKind::Missing))
         .and_then(|n| expect_str(&image_path, n, 256))?;
-    if !valid_image(image) {
+    // An image naming a matrix value is an OCI reference only once the cell has rendered it; anything
+    // else is the reference it always was, refused here if it is not one.
+    let names_matrix = image.contains("${{")
+        && Template::parse(image).is_ok_and(|t| {
+            let mut used = Vec::new();
+            t.referenced_matrix(&mut used);
+            !used.is_empty()
+        });
+    if !names_matrix && !valid_image(image) {
         return Err(err(
             &image_path,
             SchemaErrorKind::Invalid("must be an OCI image reference".into()),
@@ -1689,7 +1794,7 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Res
         }
     };
     let condition = match map.take("if") {
-        Some(n) => Some(condition(&map.child("if"), n, inputs)?),
+        Some(n) => Some(condition(&map.child("if"), n, inputs, &matrix)?),
         None => None,
     };
     let runs_on = match map.take("runs_on") {
@@ -1720,7 +1825,7 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Res
         .and_then(|n| expect_seq(&steps_path, n, MAX_STEPS_PER_JOB))?
         .iter()
         .enumerate()
-        .map(|(i, n)| step(&format!("{steps_path}[{i}]"), n, inputs))
+        .map(|(i, n)| step(&format!("{steps_path}[{i}]"), n, inputs, &matrix))
         .collect::<Result<Vec<_>>>()?;
     let cache = match map.take("cache") {
         None => Vec::new(),
@@ -1887,27 +1992,30 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Res
         }
     };
     map.finish()?;
-    Ok(Job {
-        image: image.to_owned(),
-        needs,
-        condition,
-        runs_on,
-        resources,
-        timeout_secs,
-        env,
-        workdir,
-        steps,
-        cache,
-        artifacts,
-        locks,
-        secrets,
-        registry_auth,
-        outputs,
-        handoff,
-        finalize,
-        history,
-        checkouts,
-        reuse,
+    Ok(DeclaredJob {
+        job: Job {
+            image: image.to_owned(),
+            needs,
+            condition,
+            runs_on,
+            resources,
+            timeout_secs,
+            env,
+            workdir,
+            steps,
+            cache,
+            artifacts,
+            locks,
+            secrets,
+            registry_auth,
+            outputs,
+            handoff,
+            finalize,
+            history,
+            checkouts,
+            reuse,
+        },
+        matrix,
     })
 }
 

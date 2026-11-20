@@ -1,0 +1,28 @@
+# A job that states a matrix is one job per combination, at compile time: every cell renders its own
+# image, environment and command, publishes its own check, and a job that needs the matrix waits for
+# every cell. The bound is refused, never truncated, and a cell is an ordinary job to everything else.
+schema: 1
+on: [push]
+jobs:
+  build:
+    matrix:
+      jdk: ["17", "21", "25"]
+      target: [x86_64, aarch64]
+    image: "docker.io/library/maven:3.9-eclipse-temurin-${{ matrix.jdk }}"
+    env:
+      BUILD_TARGET: "${{ matrix.target }}"
+    cache:
+      - name: m2
+        key: "m2-${{ matrix.jdk }}-${{ matrix.target }}"
+        paths: [/cache/m2]
+    steps:
+      - id: build
+        run: mvn verify -Dtarget=${{ matrix.target }}
+        env: {JDK_MAJOR: "${{ matrix.jdk }}"}
+        if: ${{ matrix.jdk == '17' || matrix.target == 'x86_64' }}
+  deploy:
+    needs: [build]
+    image: busybox
+    steps:
+      - id: ship
+        run: echo shipped

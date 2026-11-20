@@ -38,6 +38,8 @@ jobs:                           # 1–64, names [a-z0-9][a-z0-9_-]{0,63}
   test:
     image: rust:1-bookworm      # required OCI reference
     needs: [other]              # ≤ 32 job names
+    matrix:                     # optional: one job per combination, see below
+      jdk: ["17", "21"]         # ≤ 4 axes of ≤ 16 values each, ≤ 32 combinations
     runs_on: {arch: amd64|arm64, labels: [linux], os: linux|windows, isolation: container|microvm|native}   # ≤ 8 labels; os and isolation optional, see below
     resources: {cpu: 4, memory: 8GiB, disk: 20GiB}  # see policy
     timeout: 20m                # default 1h, max 24h
@@ -216,7 +218,7 @@ The spec is persisted as one format byte plus a postcard-encoded blob in the sto
 `${{ … }}` in templates and the `if:` keys use one bounded grammar, parsed once at compile time into an AST stored with the run spec:
 
 - Literals: `'single quoted'` (`''` escapes a quote), integers, `true`, `false`, `null`.
-- Context paths: `event.name|ref|base_ref|sha|key|pr_number`, `repo.id|name`, `run.id`, `job.id|name`, `needs.<job>.result`, `inputs.<name>`. Any other root or field is a compile error, so a typo cannot evaluate to null, and `inputs.<name>` must name an input the pipeline declares.
+- Context paths: `event.name|ref|base_ref|sha|key|pr_number`, `repo.id|name`, `run.id`, `job.id|name`, `needs.<job>.result`, `inputs.<name>`, `matrix.<axis>`. Any other root or field is a compile error, so a typo cannot evaluate to null, `inputs.<name>` must name an input the pipeline declares, and `matrix.<axis>` must name an axis the job declares.
 - Operators: `==`, `!=` (same-type only, `null` compares with anything), `!`, `&&`, `||` (short-circuit, boolean operands only), parentheses. Comparisons do not chain.
 - Functions: `success()`, `failure()`, `always()`, `cancelled()`, `contains(a, b)`, `starts_with(a, b)`, `ends_with(a, b)`, `hash_files('pattern', …)`. Nothing else: no arithmetic, no string building, no user functions, no network.
 - Limits: 1,024 bytes, 256 tokens, depth 16, 8 arguments, 4 path segments.
@@ -234,7 +236,7 @@ The event paths are real values recorded as the run's immutable provenance
 | `event.key` | a short, stable key: the branch or tag name, `pr-<n>`, the queue branch's path for a merge group, `manual`, or the ref a scheduled occurrence read |
 | `inputs.<name>` | the value this run was given for a declared input: a string, a choice's string, a boolean or an integer |
 
-Evaluation is phased. Each path and function has a minimum phase, and an expression evaluated earlier yields an `Unresolved` error rather than a default: `event`, `repo`, `run`, `job`, `inputs.*` and `cancelled()` at **dispatch**; `needs.*`, `success()`, `failure()`, `always()` at **schedule** (once every dependency is terminal); `hash_files` at **worker** (after the pinned checkout). The compiler enforces placement: `concurrency.group` may only use dispatch context; a job `if` may not use `hash_files` and may only name jobs in its own `needs`; step `if` and cache keys may use everything but also only name jobs in `needs`. A condition must be a boolean: the compiler types every `if` — with `inputs.<name>` typed by its declaration — and rejects, with the path of the key, a comparison between types that can never match (`event.ref == 7`, `event.pr_number == 'x'`, `inputs.count == 'x'`), a boolean operator or function over a value that is not always a boolean (`!event.ref`, `event.base_ref || true`), and a result that is not a boolean (`if: event.ref`). `null` compares with anything. A condition that compiled therefore cannot fail with a type error when it is evaluated. `success()` and `failure()` summarise dependency outcomes (`failure()` is true when any dependency did not succeed, `success()` when all passed or were skipped by their own condition); `always()` is true unless the run is cancelled.
+Evaluation is phased. Each path and function has a minimum phase, and an expression evaluated earlier yields an `Unresolved` error rather than a default: `matrix.*` at **compile** (a cell's value is the declaration's, resolved before any run); `event`, `repo`, `run`, `job`, `inputs.*` and `cancelled()` at **dispatch**; `needs.*`, `success()`, `failure()`, `always()` at **schedule** (once every dependency is terminal); `hash_files` at **worker** (after the pinned checkout). The compiler enforces placement: `concurrency.group` may only use dispatch context; a job `if` may not use `hash_files` and may only name jobs in its own `needs`; step `if` and cache keys may use everything but also only name jobs in `needs`. A condition must be a boolean: the compiler types every `if` — with `inputs.<name>` typed by its declaration — and rejects, with the path of the key, a comparison between types that can never match (`event.ref == 7`, `event.pr_number == 'x'`, `inputs.count == 'x'`), a boolean operator or function over a value that is not always a boolean (`!event.ref`, `event.base_ref || true`), and a result that is not a boolean (`if: event.ref`). `null` compares with anything. A condition that compiled therefore cannot fail with a type error when it is evaluated. `success()` and `failure()` summarise dependency outcomes (`failure()` is true when any dependency did not succeed, `success()` when all passed or were skipped by their own condition); `always()` is true unless the run is cancelled.
 
 **Job conditions.** A job's `if` is evaluated by the controller at the schedule phase, once every job in `needs` is terminal, with the run's event, repository, run and job facts, `needs.<job>.result` and the dependency summary (the same values the worker later gives a step's `if`; `hash_files` is a compile error there). A job with an `if` always starts `Blocked`, even with no `needs`, and is decided as soon as its event is recorded. The decision:
 
@@ -428,6 +430,68 @@ pipelines:
   `${{ inputs.target }}` differs between them while a key that does not is the same
   ([cache](cache.md#the-manifest)).
 
+## Matrices
+
+A job may declare a matrix: named axes, and the values each takes. The job compiles into one job per
+combination, and `matrix.<axis>` reads the combination's value.
+
+```yaml
+jobs:
+  build:
+    matrix:
+      jdk: ["17", "21", "25"]        # ≤ 4 axes, ≤ 16 values each, ≤ 32 combinations
+      target: [x86_64, aarch64]
+    image: "docker.io/library/maven:3.9-eclipse-temurin-${{ matrix.jdk }}"
+    env:
+      BUILD_TARGET: "${{ matrix.target }}"
+    cache:
+      - {name: m2, key: "m2-${{ matrix.jdk }}-${{ matrix.target }}", paths: [/cache/m2]}
+    steps:
+      - id: build
+        run: mvn verify -Dtarget=${{ matrix.target }}
+        if: ${{ matrix.jdk == '21' }}
+```
+
+- **The bound.** A job expands into its axes' product: at most 32 cells (`MAX_CELLS_PER_JOB`), inside a
+  pipeline of at most 64 jobs (`MAX_JOBS`) and 1,024 steps in total. Past a bound the document is
+  refused — `jobs.build.matrix: 64 combinations exceeds the bound of 32` — never cut down, because a cell
+  dropped to fit is a check that never reports.
+- **One cell, one job, one check.** A cell is an ordinary compiled job named `<job> (<values>)`, the
+  values in the order the axes are declared (`build (17, x86_64)`), and it publishes
+  `sentinel / build (17, x86_64)` — `sentinel / <pipeline> / build (17, x86_64)` in a named pipeline
+  ([checks](checks.md#what-is-published)). The name is the declaration's values and nothing else, so it
+  is the same on every run. A declared job name is an id (`[a-z0-9][a-z0-9_-]*`), which holds no space
+  and no bracket, so no document can write a cell's name and two cells cannot share a check; two
+  combinations that would render the same name — one value stating the `, ` another splits on — are
+  refused instead.
+- **Where a value reads.** `matrix.<axis>` is a compile-phase value. It renders in a job's `image`, `env`
+  values and `run`, in a job's and a step's `if`, and in a cache `key`; anywhere else — `secrets`,
+  `registry_auth`, `workdir`, `runs_on.labels`, artifact and cache names, paths and classes, `checkout`,
+  `locks`, `finalize`, `reuse`, step ids and outputs — the document is refused with the path, because a
+  field that would take the value as text is a value nobody reads. In `image`, `env` and `run` it renders
+  only as the bare `${{ matrix.<axis> }}`: a comparison there is an `if`, not a command. Every other
+  `${{ … }}` in those fields stays the text the shell sees, exactly as before.
+- **A dependency on a matrix is a dependency on every cell.** `needs: [build]` waits for every cell of
+  `build`, and each cell is an ordinary job in the order, so nothing else about the DAG changes. A matrix
+  job is several jobs and so has no single result or artifact to address: `needs.build.result` in an
+  expression and `handoff.from: build` are refused, naming the cells, because naming one of them is what
+  the document would have to do.
+- **A cell is exactly the declared job.** Its container, isolation, resources, secrets, locks and cache
+  names, classes and paths are the ones the declaration states, byte for byte: a matrix gives a cell
+  nothing the declaration did not already give it, adds no way to reach another tenant's cache or another
+  repository's secret, and takes no sandbox the caller does not have. Only the fields the document
+  rendered and `needs` read differently.
+- **No run spec format is added.** Cells compile into the jobs a hand-written document would state, so a
+  matrix is stored as the run spec format its pipeline would otherwise have
+  ([compatibility](compatibility.md)), and the store, the worker and an older controller read it as the
+  plain pipeline it is. A worker that predates this page reads a cell's jobs exactly as any other job; a
+  job that opts into `reuse` is the one exception, below.
+
+Task-result reuse keeps one directory per job, so a cell that opts into `reuse` is named there by an id
+derived from its own name (`.sentinel-cache` directory names are ids). A worker older than this release
+cannot derive that id and executes the cell instead of serving a result — the same outcome as a miss
+([cache](cache.md#task-results)).
+
 ## Shell semantics
 
 `sh` runs `/bin/sh -e -c <script>` so the first failing command fails the step. `bash` runs `bash -e -o pipefail -c <script>` and requires an image that provides bash. Failure classes are identical for both: exit 0 passes; any other exit status is `command_failed`; death by signal is `command_signaled`; exceeding the step or job timeout is `execution_timeout`; a cgroup memory kill is `out_of_memory`. Output is captured for diagnostics and never interpreted for the verdict. Environment precedence is job `env`, then step `env` overriding by name, then the worker's own `SENTINEL_*` context variables appended last so a pipeline cannot spoof them. A step `workdir` is joined under the job `workdir`; both are validated relative paths so the join cannot escape the workspace. Steps of one job run sequentially in one container and workspace; jobs share nothing implicitly.
@@ -442,4 +506,33 @@ A repository's GitHub Actions workflows are read by a separate, bounded analyzer
 
 Unit tests cover secret-name validation, registry-auth delivery requirements, and the explanation model (requirements, unresolved inputs, no invented values), the expression grammar (precedence, rejected constructs, phase gating, typing, templates), the `hash_files` resolver (globbing, ordering, sensitivity, cross-root stability), scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Fixture tests compile every valid fixture, check the invalid fixtures against their expected messages, evaluate the conditions example across dispatch, schedule and worker phases, decode every field of the full example, and prove determinism on a diamond DAG under reordering. `crates/sentinel-pipeline/tests/named.rs` covers two named pipelines of one repository keeping their own triggers, concurrency policies, digests and check namespaces; the refusal of a document that gives one check name two meanings while any name a repository chooses is otherwise accepted; every input type's bound and refusal message; the loading bounds of a declaration; the required-input rule; the typing of `inputs.<name>`; the digest covering declarations and not values; a cache key changing with an input only when it names one; and an unnamed pipeline keeping its check names, digest and run spec format.
 
-Not in this schema version: matrices and service containers (Part 16 and later parts). Files using them fail at `unknown key`. A run spec whose pipeline states `on.schedule` and no named pipeline and no input is stored as run spec format 10; one that names a pipeline or states an input is stored as format 11; one whose steps or jobs declare outputs or a handoff is stored as format 12; one whose job states a checkout history or an additional checkout is stored as format 13; and one whose jobs state `reuse` is stored as format 14 ([compatibility](compatibility.md)).
+`crates/sentinel-pipeline/tests/matrix.rs` covers the expansion: one job per combination named after its values, the check identity stable across compilations and namespaced by pipeline, cell names that cannot collide with a declared job or with each other, a cell equal field for field to the declared job (sandbox, resources, secrets, locks, cache scopes) with two cells differing only in the rendered key, a matrix compiled to the plain run spec format with nothing of its own stored, a dependency read as every cell, a condition reading its own cell's value, the combination and job bounds refused rather than truncated, a matrix value refused outside the five fields that render it, and a matrix job refused as a single result or a single handoff artifact. Its fixtures are `matrix.yml` (valid) and one invalid fixture per refusal: the combination bound, the pipeline's job bound, an axis no matrix declares, a value in a field that cannot hold one, a comparison in a `run`, a handoff and a `needs.<job>.result` from a matrix, two combinations with one name, a value past its byte bound, a null value and an over-wide axis.
+
+Not in this schema version: service containers, a call to a pipeline in another repository,
+deployment environments with OIDC tokens, and multi-arch build orchestration. Each is left out
+because a repository can already do it, and each states below what would have to be true to build
+it; a `.sentinel.yml` that writes `services:`, `uses:` or `environment:` fails at `unknown key`.
+
+- **Service containers.** A step can start a daemon in its own container and reach it on `localhost`, so
+  a job that needs a database beside it runs one inside the job. A second container needs a Docker
+  daemon, which only a microVM sandbox serves ([executor](executor.md), [16.8](../plan.md#168-microvm-execution-on-kvm-hosts)),
+  so a declarative `services:` entry would have to publish ports into a job's network namespace and be
+  part of the sandbox contract. Build it when a pilot lane declares one
+  ([workflow analysis](workflow-analysis.md) lists `services` as unsupported for the same reason).
+- **Reusable pipelines.** A job already runs another repository's code at a pinned revision:
+  `checkout.repositories` places it in the workspace ([sources](sources.md#additional-checkouts)). Calling
+  another repository's *pipeline* is a second authority — its inputs, secrets and cache scopes checked on
+  the caller's side as well as the callee's, a run that belongs to two repositories — and no repository in
+  this tree invokes one. Build it when a pilot's workflow calls one (`jobs.<id>.uses`,
+  `on: workflow_call`).
+- **Deployment environments and OIDC.** Sentinel issues no ambient publishing token: a job publishes with
+  a secret the repository was granted ([secrets](secrets.md)). An OIDC token a cloud provider trusts is a
+  credential minted per job and bound to a named environment — a new authority to review, not a schema
+  key — and every pilot's release lane is external today ([pilots](pilot-repositories.md)).
+- **Multi-arch builds.** `runs_on.arch` already routes a job to an `amd64` or an `arm64` worker, and an
+  image build is a repository command inside that job (`buildx build --platform`, `podman build
+  --manifest`), which is where the plan places it ([plan](../plan.md#2-decisions-against-the-original-plan)).
+  Orchestrating a manifest natively would need to join two jobs' publications into one registry write;
+  no pilot publishes images.
+
+A run spec whose pipeline states `on.schedule` and no named pipeline and no input is stored as run spec format 10; one that names a pipeline or states an input is stored as format 11; one whose steps or jobs declare outputs or a handoff is stored as format 12; one whose job states a checkout history or an additional checkout is stored as format 13; and one whose jobs state `reuse` is stored as format 14 ([compatibility](compatibility.md)). A matrix adds no format: its cells are the jobs a hand-written document states.

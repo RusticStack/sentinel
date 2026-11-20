@@ -1,0 +1,14 @@
+# expect: jobs.deploy: `needs.build.result` names 2 jobs: build (17), build (21); name one of them
+schema: 1
+on: [push]
+jobs:
+  build:
+    matrix:
+      jdk: ["17", "21"]
+    image: busybox
+    steps: [{id: s, run: echo}]
+  deploy:
+    needs: [build]
+    if: ${{ needs.build.result == 'passed' }}
+    image: busybox
+    steps: [{id: s, run: echo}]

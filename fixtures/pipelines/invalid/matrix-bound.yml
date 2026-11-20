@@ -1,0 +1,10 @@
+# expect: jobs.build.matrix: 64 combinations exceeds the bound of 32; declare fewer axes or values
+schema: 1
+on: [push]
+jobs:
+  build:
+    matrix:
+      a: [1, 2, 3, 4, 5, 6, 7, 8]
+      b: [1, 2, 3, 4, 5, 6, 7, 8]
+    image: busybox
+    steps: [{id: s, run: echo}]

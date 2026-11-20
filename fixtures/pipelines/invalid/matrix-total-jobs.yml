@@ -1,0 +1,16 @@
+# expect: jobs: 72 jobs after expanding matrices exceeds the bound of 64
+schema: 1
+on: [push]
+jobs:
+  a:
+    matrix: {x: [1, 2, 3, 4], y: [1, 2, 3, 4, 5, 6]}
+    image: busybox
+    steps: [{id: s, run: echo}]
+  b:
+    matrix: {x: [1, 2, 3, 4], y: [1, 2, 3, 4, 5, 6]}
+    image: busybox
+    steps: [{id: s, run: echo}]
+  c:
+    matrix: {x: [1, 2, 3, 4], y: [1, 2, 3, 4, 5, 6]}
+    image: busybox
+    steps: [{id: s, run: echo}]

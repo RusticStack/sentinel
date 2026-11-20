@@ -143,6 +143,12 @@ pub enum CompileError {
         path: String,
         input: String,
     },
+    /// A matrix the pipeline cannot honour: a bound it exceeds, a field a value cannot reach, or a
+    /// reference to a job that is several jobs and so has no single identity to name.
+    Matrix {
+        path: String,
+        message: String,
+    },
 }
 
 impl fmt::Display for CompileError {
@@ -206,6 +212,7 @@ impl fmt::Display for CompileError {
                     "{path}: `inputs.{input}` names no input this pipeline declares"
                 )
             }
+            Self::Matrix { path, message } => write!(f, "{path}: {message}"),
         }
     }
 }
@@ -380,6 +387,9 @@ pub fn compile_pipeline(
         inputs,
         jobs,
     } = pipeline;
+    // One job per matrix cell, before any bound or reference is judged: a check identity, a dependency
+    // and a step budget are all per cell, and nothing below this line knows a matrix existed.
+    let jobs = crate::matrix::expand(jobs)?;
     // An event-driven or scheduled run has no caller to ask for a value, so a required input there
     // could only fail the run; the declaration is refused instead, before any run exists.
     if !on.manual_only()
