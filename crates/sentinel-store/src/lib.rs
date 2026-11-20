@@ -60,7 +60,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
     },
     thread,
@@ -330,6 +330,13 @@ pub fn migrate(conn: &mut Connection) -> Result<u32> {
 
 type Job = Box<dyn FnOnce(&mut Connection, &Changes) + Send>;
 
+/// What the writer thread takes from its queue: one unit of work, or the end of the queue. A stop
+/// travels behind the work already queued, so a drain finishes that work before the thread exits.
+enum Message {
+    Run(Job),
+    Stop,
+}
+
 #[derive(Debug, Default)]
 pub struct Changes {
     generation: AtomicU64,
@@ -398,15 +405,20 @@ fn lock_path(db: &Path) -> PathBuf {
 }
 
 pub struct Writer {
-    sender: SyncSender<Job>,
-    thread: Option<thread::JoinHandle<()>>,
+    sender: SyncSender<Message>,
+    /// Held behind a lock so a drain can join the thread through `&self`: the store is shared, and
+    /// a shutdown must not require that no other handle is alive.
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Set by a drain before it queues the stop, so work submitted afterwards is refused instead of
+    /// queueing behind a stop that will never consume it.
+    stopping: AtomicBool,
     drained: Arc<(Mutex<bool>, Condvar)>,
     changes: Arc<Changes>,
 }
 
 impl Writer {
     fn start(mut conn: Connection, capacity: usize) -> Writer {
-        let (sender, receiver) = mpsc::sync_channel::<Job>(capacity);
+        let (sender, receiver) = mpsc::sync_channel::<Message>(capacity);
         let drained = Arc::new((Mutex::new(false), Condvar::new()));
         let signal = Arc::clone(&drained);
         let changes = Arc::new(Changes::default());
@@ -414,8 +426,11 @@ impl Writer {
         let thread = thread::Builder::new()
             .name("sentinel-store-writer".into())
             .spawn(move || {
-                for job in receiver {
-                    job(&mut conn, &notifier);
+                for message in receiver {
+                    match message {
+                        Message::Run(job) => job(&mut conn, &notifier),
+                        Message::Stop => break,
+                    }
                 }
                 let (flag, wake) = &*signal;
                 *flag.lock().unwrap_or_else(|p| p.into_inner()) = true;
@@ -424,7 +439,8 @@ impl Writer {
             .expect("spawn writer thread");
         Writer {
             sender,
-            thread: Some(thread),
+            thread: Mutex::new(Some(thread)),
+            stopping: AtomicBool::new(false),
             drained,
             changes,
         }
@@ -459,7 +475,10 @@ impl Writer {
             }
             let _ = reply.send(result);
         });
-        match self.sender.try_send(job) {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(Error::WriterUnavailable);
+        }
+        match self.sender.try_send(Message::Run(job)) {
             Ok(()) => match done.recv_timeout(WRITE_WAIT) {
                 Ok(result) => result,
                 Err(RecvTimeoutError::Timeout) => Err(Error::WriteAmbiguous),
@@ -471,17 +490,41 @@ impl Writer {
         }
     }
 
-    fn drain(&mut self, timeout: Duration) -> bool {
-        let (dead, _) = mpsc::sync_channel(0);
-        drop(std::mem::replace(&mut self.sender, dead));
+    /// Ends the writer through a shared handle: refuse new work, queue the stop behind the work
+    /// already queued, and wait for the thread to finish it. The store is shared by every lane and
+    /// session, so a drain cannot wait for exclusive ownership — an outstanding handle must not turn
+    /// a clean stop into a stall.
+    fn drain(&self, timeout: Duration) -> bool {
+        self.stopping.store(true, Ordering::Release);
+        let deadline = Instant::now() + timeout;
+        let mut stop = Message::Stop;
+        loop {
+            match self.sender.try_send(stop) {
+                Ok(()) => break,
+                // The queue is full of work the writer is still taking: wait for room, which
+                // arrives because nothing new may be queued now.
+                Err(TrySendError::Full(returned)) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    stop = returned;
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+        }
         let (flag, wake) = &*self.drained;
         let guard = flag.lock().unwrap_or_else(|p| p.into_inner());
         let (guard, _) = wake
-            .wait_timeout_while(guard, timeout, |done| !*done)
+            .wait_timeout_while(
+                guard,
+                deadline.saturating_duration_since(Instant::now()),
+                |done| !*done,
+            )
             .unwrap_or_else(|p| p.into_inner());
         let drained = *guard;
         drop(guard);
-        if drained && let Some(t) = self.thread.take() {
+        if drained && let Some(t) = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take() {
             let _ = t.join();
         }
         drained
@@ -508,7 +551,10 @@ pub struct Store {
     writer: Writer,
     readers: Mutex<Readers>,
     freed: Condvar,
-    _owner: std::fs::File,
+    /// The lock file that makes this process the database's only owner. Behind a lock so a
+    /// shutdown can give it up through a shared handle: a drained store releases ownership, and a
+    /// stalled one keeps it.
+    owner: Mutex<Option<std::fs::File>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -591,7 +637,7 @@ impl Store {
                 open: 0,
             }),
             freed: Condvar::new(),
-            _owner: owner,
+            owner: Mutex::new(Some(owner)),
         })
     }
 
@@ -656,16 +702,15 @@ impl Store {
         Ok(c)
     }
 
-    pub fn shutdown(self, timeout: Duration) -> Shutdown {
-        let Store {
-            mut writer, _owner, ..
-        } = self;
-        if writer.drain(timeout) {
+    pub fn shutdown(&self, timeout: Duration) -> Shutdown {
+        let owner = self.owner.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if self.writer.drain(timeout) {
+            drop(owner);
             return Shutdown::Drained;
         }
-        // Keep the lock: unfinished work still runs here, and a second controller must not open the database beneath it.
-        std::mem::forget(_owner);
-        std::mem::forget(writer);
+        // Unfinished work still runs here, and a second controller must not open the database
+        // beneath it: the lock file outlives this call.
+        std::mem::forget(owner);
         Shutdown::Stalled
     }
 

@@ -624,17 +624,19 @@ placement_order = '{order}'",
                         .success()
                 );
                 let deadline = Instant::now() + Duration::from_secs(5);
-                loop {
+                let status = loop {
                     if let Some(status) = child.0.try_wait().unwrap() {
-                        assert!(status.success(), "{role} {signal}: {status}");
-                        break;
+                        break status;
                     }
                     assert!(Instant::now() < deadline, "shutdown timed out");
                     thread::sleep(Duration::from_millis(10));
-                }
+                };
                 reader.join().unwrap();
                 lines.extend(receiver.try_iter());
                 let tail = lines.join("\n");
+                // The process's own account of its shutdown, so a failure names the lane or the
+                // phase that did not stop instead of only the exit status.
+                assert!(status.success(), "{role} {signal}: {status}\n{tail}");
                 assert!(tail.contains("shutdown requested"));
                 assert!(tail.contains(&format!("{role} stopped")));
                 assert_eq!(fs::read_to_string(marker).unwrap(), "retained");
