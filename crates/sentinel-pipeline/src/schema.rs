@@ -26,6 +26,8 @@ pub const MAX_ARTIFACTS: usize = 8;
 pub const MAX_PATHS: usize = 32;
 pub const MAX_LABELS: usize = 8;
 pub const MAX_SECRETS: usize = 16;
+pub const MAX_REUSE_INPUTS: usize = 16;
+pub const MAX_REUSE_OUTPUTS: usize = 8;
 pub const MAX_RUN_BYTES: usize = 4096;
 pub const MAX_ID_BYTES: usize = 64;
 pub const MAX_CLASS_NAME: usize = 32;
@@ -33,6 +35,10 @@ pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 60 * 60;
 /// The `when` value that publishes an artifact behind a named step: `step:<id>`.
 pub const STEP_TRIGGER_PREFIX: &str = "step:";
+
+/// The workspace directory the worker owns (`sentinel_cache::attach::PRIVATE_DIR`): cache views live in it,
+/// so no declared outcome may name it.
+pub const PRIVATE_WORKSPACE_DIR: &str = ".sentinel-cache";
 
 /// One pipeline of a document: what `on:`/`concurrency:`/`jobs:` state at the top level, or one
 /// entry of `pipelines:`.
@@ -81,6 +87,20 @@ pub struct Job {
     pub secrets: Vec<String>,
     /// Never exposed to a step: it authorizes only this job's image pull.
     pub registry_auth: Option<String>,
+    /// Opt-in task-result reuse. Absent, the job always executes.
+    pub reuse: Option<Reuse>,
+}
+
+/// A job's opt-in to reusing its own result. The key covers every declared input, the command, the declared
+/// environment, the resolved image digest and the toolchain identity, so editing anything the pipeline
+/// declares for the job changes the key; anything it does not declare is refused by the loader rather than
+/// guessed at ([cache](docs/cache.md#task-results)).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reuse {
+    /// `hash_files` patterns: the job's declared inputs, by digest.
+    pub inputs: Vec<String>,
+    /// Workspace directories the job's result consists of, captured recursively.
+    pub outputs: Vec<String>,
 }
 
 impl Job {
@@ -1398,6 +1418,14 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Res
                 .collect::<Result<Vec<_>>>()?
         }
     };
+    let reuse = match map.take("reuse") {
+        None => None,
+        Some(n) => {
+            let child = map.child("reuse");
+            let declared = reuse(&child, n, &condition, &steps, &artifacts, &secrets)?;
+            Some(declared)
+        }
+    };
     map.finish()?;
     Ok(Job {
         image: image.to_owned(),
@@ -1413,7 +1441,122 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Res
         artifacts,
         secrets,
         registry_auth,
+        reuse,
     })
+}
+
+/// ```yaml
+/// reuse:
+///   inputs: [Cargo.toml, Cargo.lock, "crates/**/src/**.rs"]   # by digest, in the key
+///   outputs: [target/release]                                 # directories the result consists of
+/// ```
+///
+/// Reuse is opt-in and narrow on purpose: a task whose inputs the document cannot name completely is not
+/// reusable, so every shape that would make the key a guess is refused here instead of at the worker.
+fn reuse(
+    path: &str,
+    node: &Node,
+    condition: &Option<Expr>,
+    steps: &[Step],
+    artifacts: &[Artifact],
+    secrets: &[String],
+) -> Result<Reuse> {
+    let mut map = Map::new(path, node)?;
+    let inputs_path = map.child("inputs");
+    let inputs = map
+        .take("inputs")
+        .ok_or_else(|| err(&inputs_path, SchemaErrorKind::Missing))
+        .and_then(|n| string_list(&inputs_path, n, MAX_REUSE_INPUTS, 256))?;
+    for (i, pattern) in inputs.iter().enumerate() {
+        if !valid_hash_pattern(pattern) {
+            return Err(err(
+                &format!("{inputs_path}[{i}]"),
+                SchemaErrorKind::Invalid(
+                    "must be a relative hash_files pattern without `..`, an empty segment or a leading `/`"
+                        .into(),
+                ),
+            ));
+        }
+    }
+    let outputs_path = map.child("outputs");
+    let outputs = map
+        .take("outputs")
+        .ok_or_else(|| err(&outputs_path, SchemaErrorKind::Missing))
+        .and_then(|n| string_list(&outputs_path, n, MAX_REUSE_OUTPUTS, 256))?;
+    for (i, output) in outputs.iter().enumerate() {
+        if !valid_relative_path(output) {
+            return Err(err(
+                &format!("{outputs_path}[{i}]"),
+                SchemaErrorKind::Invalid(
+                    "must be a normalised relative workspace directory without `..`".into(),
+                ),
+            ));
+        }
+        // The worker keeps cache and result views in one private workspace directory; an output declared
+        // inside it could never be captured, so it is refused here instead of silently never reusing.
+        if output.split('/').next() == Some(PRIVATE_WORKSPACE_DIR) {
+            return Err(err(
+                &format!("{outputs_path}[{i}]"),
+                SchemaErrorKind::Invalid(format!(
+                    "must not be inside `{PRIVATE_WORKSPACE_DIR}`, which the worker owns"
+                )),
+            ));
+        }
+    }
+    map.finish()?;
+    // A secret value is never read into a key, so a job that needs one cannot state a complete identity.
+    if let Some(name) = secrets.first() {
+        return Err(err(
+            path,
+            SchemaErrorKind::Invalid(format!(
+                "a job that opts into reuse cannot declare secrets: `{name}` has no place in the key"
+            )),
+        ));
+    }
+    // A served result cannot evaluate a condition, because nothing of the job runs to reach it.
+    if condition.is_some() {
+        return Err(err(
+            path,
+            SchemaErrorKind::Invalid(
+                "a job that opts into reuse cannot state `if`; a served result is never re-decided"
+                    .into(),
+            ),
+        ));
+    }
+    if let Some(step) = steps.iter().find(|step| step.condition.is_some()) {
+        return Err(err(
+            path,
+            SchemaErrorKind::Invalid(format!(
+                "a job that opts into reuse cannot state a step `if`, found one on `{}`",
+                step.id
+            )),
+        ));
+    }
+    // A step-triggered artifact publishes as its step completes, and a served result has no such completion.
+    if artifacts
+        .iter()
+        .any(|artifact| artifact.when.step().is_some())
+    {
+        return Err(err(
+            path,
+            SchemaErrorKind::Invalid(
+                "a job that opts into reuse cannot publish an artifact behind `when: step:<id>`"
+                    .into(),
+            ),
+        ));
+    }
+    Ok(Reuse { inputs, outputs })
+}
+
+/// Whether a string is a `hash_files` pattern the resolver accepts: relative, no empty segment, no `..`.
+/// Globs are the resolver's business; a pattern that matches nothing is a runtime miss, not a schema error.
+fn valid_hash_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern.len() <= 256
+        && !pattern.starts_with('/')
+        && pattern
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
 fn job_env_has_name(env: &[(String, String)], name: &str) -> bool {

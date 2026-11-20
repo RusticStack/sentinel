@@ -63,6 +63,14 @@ pub struct JobExplanation {
     pub caches: Vec<CacheExplanation>,
     pub artifacts: Vec<String>,
     pub secrets: Vec<String>,
+    /// The task-result reuse declaration, when the job opted in: what a served result covers and restores.
+    pub reuse: Option<ReuseExplanation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReuseExplanation {
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -267,6 +275,10 @@ impl Explanation {
                 caches,
                 artifacts: s.artifacts.iter().map(|a| a.name.clone()).collect(),
                 secrets: s.secrets.clone(),
+                reuse: s.reuse.as_ref().map(|r| ReuseExplanation {
+                    inputs: r.inputs.clone(),
+                    outputs: r.outputs.clone(),
+                }),
             });
         }
         requires.secrets.sort();
@@ -396,6 +408,14 @@ impl Explanation {
             }
             if !j.secrets.is_empty() {
                 let _ = writeln!(s, "  secrets: {}", j.secrets.join(", "));
+            }
+            if let Some(reuse) = &j.reuse {
+                let _ = writeln!(
+                    s,
+                    "  reuse: inputs [{}] outputs [{}]",
+                    reuse.inputs.join(", "),
+                    reuse.outputs.join(", ")
+                );
             }
         }
         let _ = writeln!(s, "\nrequires:");

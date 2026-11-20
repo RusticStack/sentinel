@@ -396,6 +396,8 @@ pub enum ServerMessage {
         lease: [u8; 16],
         config: sentinel_protocol::secrets::SecretBytes,
     },
+    /// Protocol 14: `Context2` plus the run's forced-refresh flag.
+    Context3(WireContext3),
     /// Protocol 13: leases the worker no longer holds — ended, idle, or released by the controller.
     RunnerStop {
         leases: Vec<[u8; 16]>,
@@ -580,6 +582,28 @@ pub struct WireContext2 {
     pub trust: u8,
 }
 
+/// Protocol 14: `Context2` plus the run's forced-refresh flag for task-result reuse.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WireContext3 {
+    pub attempt: [u8; 16],
+    pub run: [u8; 16],
+    pub repo: [u8; 16],
+    pub repo_name: String,
+    pub job: [u8; 16],
+    pub job_name: String,
+    pub sha: String,
+    pub cancelled: bool,
+    pub needs: Vec<(String, u8)>,
+    pub event: String,
+    pub event_ref: String,
+    pub base_ref: Option<String>,
+    pub pr_number: Option<u64>,
+    pub event_key: String,
+    pub tenant: [u8; 16],
+    pub trust: u8,
+    pub reuse_fresh: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventContext {
     pub name: String,
@@ -606,6 +630,8 @@ pub struct JobContext {
     pub needs: Vec<(String, Outcome)>,
     pub tenant: Option<TenantId>,
     pub trust: Trust,
+    /// This run asked for fresh execution of every reusable task, so no sealed result may be served to it.
+    pub reuse_fresh: bool,
 }
 
 pub const SOURCE_ACCESS_WINDOW_MS: i64 = 12 * 60 * 1000;
@@ -684,6 +710,29 @@ impl JobContext {
         }
     }
 
+    pub(crate) fn to_wire3(&self, attempt: AttemptId) -> WireContext3 {
+        let wire = self.to_wire2(attempt);
+        WireContext3 {
+            attempt: wire.attempt,
+            run: wire.run,
+            repo: wire.repo,
+            repo_name: wire.repo_name,
+            job: wire.job,
+            job_name: wire.job_name,
+            sha: wire.sha,
+            cancelled: wire.cancelled,
+            needs: wire.needs,
+            event: wire.event,
+            event_ref: wire.event_ref,
+            base_ref: wire.base_ref,
+            pr_number: wire.pr_number,
+            event_key: wire.event_key,
+            tenant: wire.tenant,
+            trust: wire.trust,
+            reuse_fresh: self.reuse_fresh,
+        }
+    }
+
     fn from_wire(wire: WireContext) -> Result<(AttemptId, JobContext)> {
         Ok((
             AttemptId::from_bytes(wire.attempt).map_err(|_| Error::Protocol("id"))?,
@@ -708,8 +757,33 @@ impl JobContext {
                 // The wire could not say it: the safest scope is the one a pull request would get.
                 tenant: None,
                 trust: Trust::PullRequest,
+                // A format that cannot state it never asked for a fresh run.
+                reuse_fresh: false,
             },
         ))
+    }
+
+    fn from_wire3(wire: WireContext3) -> Result<(AttemptId, JobContext)> {
+        let mut context = JobContext::from_wire2(WireContext2 {
+            attempt: wire.attempt,
+            run: wire.run,
+            repo: wire.repo,
+            repo_name: wire.repo_name,
+            job: wire.job,
+            job_name: wire.job_name,
+            sha: wire.sha,
+            cancelled: wire.cancelled,
+            needs: wire.needs,
+            event: wire.event,
+            event_ref: wire.event_ref,
+            base_ref: wire.base_ref,
+            pr_number: wire.pr_number,
+            event_key: wire.event_key,
+            tenant: wire.tenant,
+            trust: wire.trust,
+        })?;
+        context.1.reuse_fresh = wire.reuse_fresh;
+        Ok(context)
     }
 
     fn from_wire2(wire: WireContext2) -> Result<(AttemptId, JobContext)> {
@@ -741,6 +815,8 @@ impl JobContext {
                 needs: decode_needs(wire.needs)?,
                 tenant,
                 trust,
+                // A format below 14 cannot state the run's forced refresh, so it never asked for one.
+                reuse_fresh: false,
             },
         ))
     }
@@ -765,7 +841,11 @@ pub(crate) fn context_message(
     context: &JobContext,
     attempt: AttemptId,
 ) -> ServerMessage {
-    if protocol >= 6 {
+    if protocol >= 14 {
+        let mut wire = context.to_wire3(attempt);
+        wire.trust = context.trust.for_protocol(protocol).to_u8();
+        ServerMessage::Context3(wire)
+    } else if protocol >= 6 {
         let mut wire = context.to_wire2(attempt);
         wire.trust = context.trust.for_protocol(protocol).to_u8();
         ServerMessage::Context2(wire)
@@ -2918,7 +2998,8 @@ pub fn connect(
         | ServerMessage::Prefetch { .. }
         | ServerMessage::SecretBegin { .. }
         | ServerMessage::SecretChunk { .. }
-        | ServerMessage::Cancel { .. } => Err(Error::Protocol("message before welcome")),
+        | ServerMessage::Cancel { .. }
+        | ServerMessage::Context3(_) => Err(Error::Protocol("message before welcome")),
     }
 }
 
@@ -3643,6 +3724,10 @@ fn handle_bulk_message(
             let (attempt, context) = JobContext::from_wire2(wire)?;
             state.contexts.insert(attempt, context);
         }
+        ServerMessage::Context3(wire) => {
+            let (attempt, context) = JobContext::from_wire3(wire)?;
+            state.contexts.insert(attempt, context);
+        }
         ServerMessage::Source { attempt, access } => {
             let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
             if !access.well_formed() {
@@ -4259,6 +4344,7 @@ mod tests {
             needs: vec![("build".to_string(), Outcome::Passed)],
             tenant,
             trust,
+            reuse_fresh: false,
         }
     }
 

@@ -1,0 +1,10 @@
+# expect: jobs.build.reuse: a job that opts into reuse cannot state a step `if`, found one on `s`
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: busybox
+    steps: [{id: s, run: echo hi, if: event.ref == 'refs/heads/main'}]
+    reuse:
+      inputs: [src/**]
+      outputs: [out]

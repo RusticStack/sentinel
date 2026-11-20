@@ -667,6 +667,18 @@ fn digest_of(
             d.u64(u64::from(a.required));
             d.opt_str(a.class.as_deref());
         }
+        // Only when stated, so the digest of a pipeline that never opted in stays exactly as it was.
+        if let Some(reuse) = &s.reuse {
+            d.str("reuse");
+            d.u64(reuse.inputs.len() as u64);
+            for pattern in &reuse.inputs {
+                d.str(pattern);
+            }
+            d.u64(reuse.outputs.len() as u64);
+            for output in &reuse.outputs {
+                d.str(output);
+            }
+        }
     }
     Ok(d.0)
 }

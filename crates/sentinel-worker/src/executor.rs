@@ -1017,6 +1017,7 @@ impl Executor {
             );
             return;
         };
+        let context_fresh = context.reuse_fresh;
         let mut job = Job {
             worker: self.worker,
             attempt: offer.attempt,
@@ -1027,6 +1028,8 @@ impl Executor {
             context,
             images: self.images.clone(),
             caches: Vec::new(),
+            reuse_seal: None,
+            reuse_fresh: context_fresh,
             cache_budget_bytes,
             mirrors: self.mirrors.clone(),
             prepare_hold,
@@ -2799,6 +2802,7 @@ mod bookkeeping_tests {
             needs: Vec::new(),
             tenant,
             trust: Trust::Protected,
+            reuse_fresh: false,
         }
     }
 

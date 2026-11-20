@@ -432,7 +432,27 @@ pub fn rerun_job(
     reset_terminal_job(tx, tenant, job, &row, next, now, false)?;
     crate::checks::record_job(tx, tenant, job, now)?;
     revive_skipped_dependents(tx, tenant, job, now)?;
+    // A rerun exists to execute again: it never serves a result sealed by an earlier attempt of the same task.
+    let run: Option<RunId> = tx
+        .prepare_cached("SELECT run_id FROM jobs WHERE id = ?1 AND tenant_id = ?2")?
+        .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| {
+            RunId::from_bytes(r.get::<_, [u8; 16]>(0)?).map_err(|_| rusqlite::Error::InvalidQuery)
+        })
+        .optional()?;
+    if let Some(run) = run {
+        force_fresh(tx, tenant, run)?;
+    }
     Ok(next)
+}
+
+/// Marks a run as asking for fresh execution of every task it carries. Idempotent, and scoped to the run:
+/// no entry another run sealed is touched, and nothing is re-sealed by the forced run itself.
+pub fn force_fresh(tx: &Transaction<'_>, tenant: TenantId, run: RunId) -> Result<()> {
+    tx.execute(
+        "UPDATE runs SET reuse_fresh = 1 WHERE id = ?1 AND tenant_id = ?2",
+        params![run.as_bytes(), tenant.as_bytes()],
+    )?;
+    Ok(())
 }
 
 /// Reset one observed terminal job without rewriting its attempt history.

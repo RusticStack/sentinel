@@ -11,7 +11,8 @@ use crate::{
     expr::{Expr, Template},
     policy::{RefFilter, Triggers},
     schema::{
-        Arch, Artifact, ArtifactWhen, Cache, Concurrency, Job, Resources, RunsOn, Shell, Step,
+        Arch, Artifact, ArtifactWhen, Cache, Concurrency, Job, Resources, Reuse, RunsOn, Shell,
+        Step,
     },
 };
 
@@ -153,12 +154,16 @@ pub enum SpecError {
     Decode,
 }
 
-/// Format 11 adds a pipeline's name and declared inputs with the values a run was given; format 10
-/// adds `on.schedule`; format 9 adds `artifacts[].when: step:<id>`; format 8 adds `artifacts[].class`;
-/// format 7 adds `runs_on.os` and `runs_on.isolation`. A spec that states none of them is written as
-/// 10, 9, 8, 7 or 6, byte for byte what earlier controllers wrote, so a worker that predates the
-/// newer fields keeps running it.
-pub const SPEC_FORMAT: u8 = 11;
+/// Format 12 adds a job's opt-in task-result reuse (`jobs.<name>.reuse`); format 11 adds a pipeline's
+/// name and declared inputs with the values a run was given; format 10 adds `on.schedule`; format 9
+/// adds `artifacts[].when: step:<id>`; format 8 adds `artifacts[].class`; format 7 adds `runs_on.os`
+/// and `runs_on.isolation`. A spec that states none of them is written as 11, 10, 9, 8, 7 or 6, byte
+/// for byte what earlier controllers wrote, so a worker that predates the newer fields keeps running it.
+pub const SPEC_FORMAT: u8 = 12;
+
+/// The format a spec that names a pipeline or states inputs takes; a worker below it refuses the spec
+/// rather than run a pipeline it cannot tell apart from the unnamed one.
+const SPEC_FORMAT_NAMED: u8 = 11;
 
 pub const SPEC_FORMAT_READ_MIN: u8 = 3;
 
@@ -181,11 +186,13 @@ impl RunSpec {
 
     /// The format `encode` writes for this spec: the lowest one that carries everything it states.
     pub fn format(&self) -> u8 {
-        if !self.inputs.is_empty()
+        if self.pipeline.jobs.iter().any(|j| j.spec.reuse.is_some()) {
+            SPEC_FORMAT
+        } else if !self.inputs.is_empty()
             || self.pipeline.name.is_some()
             || !self.pipeline.inputs.is_empty()
         {
-            SPEC_FORMAT
+            SPEC_FORMAT_NAMED
         } else if self.pipeline.on.schedule {
             10
         } else if self
@@ -217,6 +224,7 @@ impl RunSpec {
     pub fn encode(&self) -> Result<Vec<u8>, SpecError> {
         let format = self.format();
         let body = match format {
+            SPEC_FORMAT => postcard::to_allocvec(&RunSpecV11::from(self)),
             6 => postcard::to_allocvec(&RunSpecV6::from(self)),
             7 => postcard::to_allocvec(&RunSpecV7::from(self)),
             10 => postcard::to_allocvec(&RunSpecV9::from(self)),
@@ -240,7 +248,8 @@ impl RunSpec {
             }
         }
         match bytes.split_first() {
-            Some((&SPEC_FORMAT, body)) => whole::<RunSpecV10>(body).map(RunSpec::from),
+            Some((&SPEC_FORMAT, body)) => whole::<RunSpecV11>(body).map(RunSpec::from),
+            Some((&SPEC_FORMAT_NAMED, body)) => whole::<RunSpecV10>(body).map(RunSpec::from),
             Some((&10, body)) => whole::<RunSpecV9>(body).map(RunSpec::from),
             // Format 9 is format 8's layout: the only difference is what `when` may hold, and this
             // reader takes both. A spec that states a newer field moves the byte, so a reader that
@@ -393,6 +402,7 @@ impl From<RunSpecV6> for RunSpec {
                             steps: j.spec.steps,
                             cache: j.spec.cache,
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
+                            reuse: None,
                             secrets: j.spec.secrets,
                             registry_auth: j.spec.registry_auth,
                         },
@@ -549,6 +559,7 @@ impl From<RunSpecV7> for RunSpec {
                             steps: j.spec.steps,
                             cache: j.spec.cache,
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
+                            reuse: None,
                             secrets: j.spec.secrets,
                             registry_auth: j.spec.registry_auth,
                         },
@@ -597,6 +608,49 @@ impl From<RunSpecV8> for RunSpec {
 
 /// Format 11: the format-9 layout plus the pipeline's name, its declared inputs and the values this
 /// run was given. A reader that predates it refuses the leading byte instead of misreading a name.
+/// Format 12: format 11's layout plus each opted-in job's reuse declaration, by job index.
+///
+/// The declarations ride beside the job graph rather than inside it, so the jobs themselves keep the
+/// format-8 layout a worker below this format still reads. `reuse` is ascending by job index and names
+/// no job twice; a spec that states none is written as format 11.
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSpecV11 {
+    base: RunSpecV10,
+    reuse: Vec<(u32, Reuse)>,
+}
+
+impl From<&RunSpec> for RunSpecV11 {
+    fn from(spec: &RunSpec) -> RunSpecV11 {
+        RunSpecV11 {
+            base: RunSpecV10::from(spec),
+            reuse: spec
+                .pipeline
+                .jobs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, job)| {
+                    job.spec
+                        .reuse
+                        .clone()
+                        .map(|declared| (u32::try_from(index).unwrap_or(u32::MAX), declared))
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<RunSpecV11> for RunSpec {
+    fn from(v11: RunSpecV11) -> RunSpec {
+        let mut spec = RunSpec::from(v11.base);
+        for (index, reuse) in v11.reuse {
+            if let Some(job) = spec.pipeline.jobs.get_mut(index as usize) {
+                job.spec.reuse = Some(reuse);
+            }
+        }
+        spec
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RunSpecV10 {
     base: RunSpecV9,
@@ -842,6 +896,7 @@ impl From<JobV3> for Job {
             artifacts: v3.artifacts.into_iter().map(Artifact::from).collect(),
             secrets: v3.secrets,
             registry_auth: None,
+            reuse: None,
         }
     }
 }
@@ -891,6 +946,7 @@ impl From<RunSpecV4> for RunSpec {
                             steps: j.spec.steps.into_iter().map(Step::from).collect(),
                             cache: j.spec.cache,
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
+                            reuse: None,
                             secrets: j.spec.secrets,
                             registry_auth: None,
                         },
@@ -932,6 +988,7 @@ impl From<RunSpecV5> for RunSpec {
                             steps: j.spec.steps,
                             cache: j.spec.cache,
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
+                            reuse: None,
                             secrets: j.spec.secrets,
                             registry_auth: None,
                         },

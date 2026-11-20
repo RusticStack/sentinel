@@ -2209,6 +2209,8 @@ pub struct JobContext {
     pub trust: sentinel_protocol::cache::Trust,
     pub cancelled: bool,
     pub needs: Vec<(String, Outcome)>,
+    /// The run asked for fresh execution of every reusable task.
+    pub reuse_fresh: bool,
 }
 
 type ContextRow = (
@@ -2221,6 +2223,7 @@ type ContextRow = (
     String,
     i64,
     i64,
+    i64,
 );
 
 /// Nothing that could start work leaves before the acknowledgement is durable, so a lapsed offer never also runs.
@@ -2228,7 +2231,7 @@ pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> R
     let row: Option<ContextRow> = conn
         .prepare_cached(
             "SELECT j.tenant_id, j.run_id, r.repo_id, p.name, j.id, j.name, r.source_sha,
-                    j.cancel_requested, j.spec_index
+                    j.cancel_requested, j.spec_index, r.reuse_fresh
              FROM attempts a JOIN jobs j ON j.id = a.job_id JOIN runs r ON r.id = j.run_id
              JOIN repos p ON p.id = r.repo_id JOIN workers w ON w.id = a.worker_id
              WHERE a.id = ?1 AND a.worker_id = ?2 AND a.acked_ms IS NOT NULL
@@ -2245,10 +2248,12 @@ pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> R
                 r.get(6)?,
                 r.get(7)?,
                 r.get(8)?,
+                r.get(9)?,
             ))
         })
         .optional()?;
-    let Some((tenant, run, repo, repo_name, job, job_name, sha, cancel, index)) = row else {
+    let Some((tenant, run, repo, repo_name, job, job_name, sha, cancel, index, reuse_fresh)) = row
+    else {
         return Err(Error::NotFound);
     };
     let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?;
@@ -2290,6 +2295,7 @@ pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> R
         event,
         cancelled: cancel != 0,
         needs,
+        reuse_fresh: reuse_fresh != 0,
     })
 }
 

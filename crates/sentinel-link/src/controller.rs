@@ -3858,6 +3858,7 @@ fn resolve_spec(
             needs: c.needs,
             tenant: Some(c.tenant),
             trust: c.trust,
+            reuse_fresh: c.reuse_fresh,
         };
         let spec = sentinel_pipeline::RunSpec::decode(&bytes)
             .map_err(|_| StoreError::Corrupt("run spec"))?;

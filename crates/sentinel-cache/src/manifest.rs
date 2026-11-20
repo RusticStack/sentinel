@@ -58,6 +58,10 @@ pub enum Compat {
     },
     /// A stable toolchain namespace; the store pins the flags entries were written under.
     Compiler { flags: String },
+    /// A task result: the exact identity every declared input rendered. It is its own variant so a result
+    /// can never be read as a build artifact of the same scope, and the key is carried in full so a result
+    /// sealed under an older rule is a miss rather than a guess.
+    Results { key: [u8; 32] },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +180,7 @@ impl Manifest {
             Compat::Compiler { flags } => {
                 class == Class::Compiler && flags.len() <= MAX_FIELD_BYTES
             }
+            Compat::Results { .. } => class == Class::Results,
         };
         if ok { Ok(()) } else { Err(bad()) }
     }
@@ -244,6 +249,11 @@ impl Manifest {
                 }
                 if flags != want_flags {
                     return Err(Miss::Incompatible);
+                }
+            }
+            (Compat::Results { key }, Compat::Results { key: want_key }) => {
+                if key != want_key || self.key != want.key {
+                    return Err(Miss::WrongKey);
                 }
             }
             _ => return Err(Miss::Incompatible),

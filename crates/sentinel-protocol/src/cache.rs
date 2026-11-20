@@ -8,10 +8,19 @@ pub enum Class {
     #[default]
     Dependencies = 1,
     Compiler = 2,
+    /// A task's reported result, not a build artifact: the job's success plus its declared output trees.
+    /// Served only to a job whose declared inputs, command, environment, image and toolchain render the
+    /// same key in the same isolation class.
+    Results = 3,
 }
 
 impl Class {
-    pub const ALL: [Class; 3] = [Self::Downloads, Self::Dependencies, Self::Compiler];
+    pub const ALL: [Class; 4] = [
+        Self::Downloads,
+        Self::Dependencies,
+        Self::Compiler,
+        Self::Results,
+    ];
 
     pub const fn to_u8(self) -> u8 {
         self as u8
@@ -21,6 +30,7 @@ impl Class {
             0 => Some(Self::Downloads),
             1 => Some(Self::Dependencies),
             2 => Some(Self::Compiler),
+            3 => Some(Self::Results),
             _ => None,
         }
     }
@@ -29,6 +39,7 @@ impl Class {
             Self::Downloads => "downloads",
             Self::Dependencies => "dependencies",
             Self::Compiler => "compiler",
+            Self::Results => "results",
         }
     }
     pub fn of_name(name: &str) -> Option<Class> {
@@ -135,7 +146,7 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", class.as_str()));
             assert_eq!(serde_json::from_str::<Class>(&json).unwrap(), class);
         }
-        assert_eq!(Class::from_u8(3), None);
+        assert_eq!(Class::from_u8(4), None);
         assert_eq!(Class::of_name("Compiler"), None, "lowercase only");
         assert_eq!(Class::of_name(""), None);
         assert_eq!(Class::default(), Class::Dependencies);

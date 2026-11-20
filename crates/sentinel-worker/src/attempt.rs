@@ -45,6 +45,11 @@ pub struct Job {
     pub secret_bundle: sentinel_protocol::secrets::DeliveryBundle,
     pub images: Images,
     pub caches: Vec<sentinel_cache::attach::Attached>,
+    /// The task-result entry this attempt seals once it passes, when the job opts into reuse and the key
+    /// resolved. Never set when a result was served, and never set when nothing of the job ran.
+    pub reuse_seal: Option<Box<sentinel_cache::attach::Attached>>,
+    /// The run asked for fresh execution of every task, so this attempt ignores any sealed result.
+    pub reuse_fresh: bool,
     pub cache_budget_bytes: u64,
     pub mirrors: Option<checkout::Mirrors>,
     pub prepare_hold: std::time::Duration,
@@ -495,19 +500,35 @@ pub fn run(
             report.event(job.attempt, job.fence, Event::StepsStarted);
             let started = Instant::now();
             let mut publications = artifacts::StepPublications::default();
-            let verdict = execute(
-                job,
-                report,
-                &prepared.sandbox,
-                prepared.workspace.path(),
-                prepared.secret_directory.as_ref(),
-                &output,
-                &sink,
-                &mut publications,
-                cancel,
-                &mut summary,
-            );
-            summary.steps_ns = ns(started);
+            let (verdict, workspace, sandbox, secret_directory, served) = match prepared {
+                // A served result runs nothing: no step, no container, no cache restore. The declared output
+                // trees are already in the workspace, so finalization publishes artifacts from them.
+                Prepared::Served { workspace, record } => {
+                    summary.reuse = Some(record);
+                    summary.steps_ns = ns(started);
+                    (Verdict::Passed, workspace, None, None, true)
+                }
+                Prepared::Executed {
+                    workspace,
+                    sandbox,
+                    secret_directory,
+                } => {
+                    let verdict = execute(
+                        job,
+                        report,
+                        &sandbox,
+                        workspace.path(),
+                        secret_directory.as_ref(),
+                        &output,
+                        &sink,
+                        &mut publications,
+                        cancel,
+                        &mut summary,
+                    );
+                    summary.steps_ns = ns(started);
+                    (verdict, workspace, Some(sandbox), secret_directory, false)
+                }
+            };
             report.event(job.attempt, job.fence, Event::FinalizationStarted);
             let started = Instant::now();
             let declared = job
@@ -526,6 +547,7 @@ pub fn run(
             let views: Vec<String> = job
                 .caches
                 .iter()
+                .chain(job.reuse_seal.iter().map(Box::as_ref))
                 .flat_map(|attached| attached.targets.iter())
                 .filter(|target| !target.mount)
                 .filter_map(|target| target.dir.strip_prefix(&target.root).ok())
@@ -541,27 +563,38 @@ pub fn run(
             );
             // A cache sealed from a view that could not be brought back would hold a truncated tree, so
             // none is published then.
-            let synced = match prepared
-                .sandbox
-                .sync_out(prepared.workspace.path(), &paths, &views)
-            {
-                Ok(()) => true,
-                Err(e) => {
-                    summary.detail = format!("copying results out of the microVM: {e}");
-                    false
-                }
+            let synced = match &sandbox {
+                Some(sandbox) => match sandbox.sync_out(workspace.path(), &paths, &views) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        summary.detail = format!("copying results out of the microVM: {e}");
+                        false
+                    }
+                },
+                None => true,
             };
             // Both run: a step-triggered publication that failed says nothing about the declarations the verdict
             // decides, and they publish here whether or not it did.
             let captured = capture_artifacts(
                 job.attempt,
-                prepared.workspace.path(),
+                workspace.path(),
                 declared,
                 matches!(verdict, Verdict::Passed),
                 &*sink,
             );
             let artifact_failure = step_failure.or(captured);
-            sealed = finalize(root, job, &verdict, synced, report, prepared, cancel);
+            sealed = finalize(
+                root,
+                job,
+                &verdict,
+                synced,
+                report,
+                workspace,
+                sandbox,
+                secret_directory,
+                served,
+                cancel,
+            );
             let published = output.complete();
             if published {
                 recovery::mark_ended(root, job.attempt);
@@ -637,7 +670,7 @@ fn prepare(
     cancel: &Cancel,
     summary: &mut AttemptSummary,
     remote: Option<&dyn sentinel_cache::remote::Remote>,
-) -> Result<PreparedExecution> {
+) -> Result<Prepared> {
     let compiled = job
         .spec
         .pipeline
@@ -663,7 +696,8 @@ fn prepare(
             }
         }
     };
-    let outcome = (|| {
+    let mut served: Option<sentinel_protocol::summary::ReuseRecord> = None;
+    let outcome: Result<Option<Sandbox>> = (|| {
         // Everything that can fail on a plain error happens before the checkout thread exists: a return after
         // the spawn would destroy the workspace under a git process still writing into it.
         let registry_auth = job.secret_bundle.targets.iter().find(|target| {
@@ -767,6 +801,31 @@ fn prepare(
             return Err(Error::Preparation("canceled".into()));
         }
         checked_out.and(pulled)?;
+        let isolation = job.runtime.for_job(stated_isolation);
+        let platform = sentinel_cache::Platform {
+            os: sentinel_cache::Os::Linux,
+            arch: if cfg!(target_arch = "aarch64") {
+                Arch::Aarch64
+            } else {
+                Arch::X86_64
+            },
+        };
+        // The result decision comes before a cache is restored or a container exists: a served result runs
+        // nothing at all, and the job's own caches have nothing to feed it.
+        match crate::reuse::prepare(root, job, workspace.path(), &image, isolation, platform)? {
+            crate::reuse::Decision::Served(hit) => {
+                served = Some(hit.record);
+                return Ok(None);
+            }
+            crate::reuse::Decision::Execute { seal, note } => {
+                job.reuse_seal = seal;
+                if crate::reuse::declared(job).is_some()
+                    && !matches!(note, crate::reuse::Note::Miss)
+                {
+                    summary.detail = format!("task-result reuse: {}", note.as_str());
+                }
+            }
+        }
         let store = job.store.clone();
         let mut mounts = restore_caches(root, job, &declared, workspace.path(), &image, remote);
         let (mut files, mut env) = (false, false);
@@ -796,7 +855,6 @@ fn prepare(
                 });
             }
         }
-        let isolation = job.runtime.for_job(stated_isolation);
         if matches!(isolation, Isolation::Container) {
             // The job's `/tmp` lives on the workspace disk, under the same disk budget, not in memory.
             mounts.push(podman::Mount {
@@ -850,19 +908,42 @@ fn prepare(
             }
         };
         summary.container_start_ns = ns(started);
-        Ok(sandbox)
+        Ok(Some(sandbox))
     })();
     match outcome {
-        Ok(sandbox) => Ok(PreparedExecution {
+        Ok(Some(sandbox)) => Ok(Prepared::Executed {
             workspace,
             sandbox,
             secret_directory,
         }),
+        Ok(None) => {
+            // Holding the served entry's pin any longer would keep a generation a sweep could evict.
+            match served {
+                Some(record) => Ok(Prepared::Served { workspace, record }),
+                None => {
+                    discard_workspace(report, job.attempt, workspace);
+                    Err(Error::Preparation("result decision".into()))
+                }
+            }
+        }
         Err(e) => {
             discard_workspace(report, job.attempt, workspace);
             Err(e)
         }
     }
+}
+
+/// What preparation produced: a sandbox to run in, or a result already served into the workspace.
+enum Prepared {
+    Executed {
+        workspace: Workspace,
+        sandbox: Sandbox,
+        secret_directory: Option<SecretDirectory>,
+    },
+    Served {
+        workspace: Workspace,
+        record: sentinel_protocol::summary::ReuseRecord,
+    },
 }
 
 type CheckoutThread = std::thread::JoinHandle<Result<(checkout::Outcome, Option<u64>)>>;
@@ -1476,38 +1557,78 @@ fn publish_caches(
     sealed
 }
 
-struct PreparedExecution {
-    workspace: Workspace,
-    sandbox: Sandbox,
-    secret_directory: Option<SecretDirectory>,
-}
-
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     root: &Path,
     job: &mut Job,
     verdict: &Verdict,
     synced: bool,
     report: &dyn Report,
-    prepared: PreparedExecution,
+    workspace: Workspace,
+    sandbox: Option<Sandbox>,
+    secret_directory: Option<SecretDirectory>,
+    served: bool,
     cancel: &Cancel,
 ) -> Vec<SealedCache> {
-    let PreparedExecution {
-        workspace,
-        sandbox,
-        secret_directory,
-    } = prepared;
     // Stop the sandbox first: no job process may rewrite the views publication reads.
-    if let Err(error) = sandbox.destroy() {
+    if let Some(sandbox) = sandbox
+        && let Err(error) = sandbox.destroy()
+    {
         report.cleanup_failed(job.attempt, "sandbox", &error.to_string());
     }
     drop(secret_directory);
     let sealed = if synced && cache_worthy(verdict) {
-        publish_caches(root, job, report, cancel)
+        let sealed = publish_caches(root, job, report, cancel);
+        // A served result is already sealed; re-sealing it would walk the trees it just restored to learn
+        // nothing. A result that ran is sealed here, over the same output trees, for the next run.
+        if !served {
+            publish_result(root, job, report, cancel);
+        }
+        sealed
     } else {
+        // A failed attempt seals no result: the entry it may have served is untouched, and a job that ran
+        // and failed leaves nothing that a later run could mistake for a passing result.
+        job.reuse_seal = None;
         Vec::new()
     };
     discard_workspace(report, job.attempt, workspace);
     sealed
+}
+
+/// Seals this attempt's task result, so the next run of the same task serves it instead of running.
+fn publish_result(root: &Path, job: &mut Job, report: &dyn Report, cancel: &Cancel) {
+    let Some(attached) = job.reuse_seal.take() else {
+        return;
+    };
+    let cache_root = root.join(sentinel_cache::CACHE_DIR);
+    let deadline = Instant::now() + sentinel_cache::publish::CACHE_PUBLISH_TIMEOUT;
+    let canceled = || cancel.load(Ordering::Acquire);
+    let outcome = match sentinel_cache::publish::commit_with_budget(
+        &cache_root,
+        job.cache_budget_bytes,
+        &attached,
+        job.context.trust,
+        sentinel_core::UnixMillis::now(),
+        deadline,
+        &canceled,
+    ) {
+        Ok(sentinel_cache::publish::Published::Sealed {
+            generation, bytes, ..
+        }) => CacheOutcome::Sealed {
+            generation,
+            bytes,
+            reused_bytes: 0,
+        },
+        Ok(sentinel_cache::publish::Published::Skipped(why)) => CacheOutcome::Skipped(why.as_str()),
+        Err(e) => CacheOutcome::Failed(e.to_string()),
+    };
+    report.cache_note(
+        job.attempt,
+        CacheNote {
+            name: attached.name.clone(),
+            outcome,
+        },
+    );
 }
 
 /// Removes an attempt's workspace and job `/tmp`; what stays behind is reported, and the executor retries it.
@@ -1783,9 +1904,12 @@ mod tests {
                 needs: Vec::new(),
                 tenant: None,
                 trust: Trust::Protected,
+                reuse_fresh: false,
             },
             images: Images::with_download(|_, _, _, _, _| Ok(false)),
             caches: Vec::new(),
+            reuse_seal: None,
+            reuse_fresh: false,
             cache_budget_bytes: sentinel_cache::gc::DEFAULT_BUDGET_BYTES,
             mirrors: None,
             prepare_hold: Duration::ZERO,

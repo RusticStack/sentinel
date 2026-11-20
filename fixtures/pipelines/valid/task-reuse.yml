@@ -1,0 +1,24 @@
+# Task-result reuse is opt-in per job: the key covers the inputs, the commands, the declared environment,
+# the image digest and the toolchain, and the outputs are the trees a served result restores.
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: rust:1-bookworm
+    env: {RUSTFLAGS: -Dwarnings}
+    workdir: crates/app
+    steps:
+      - id: compile
+        run: cargo build --release
+      - id: verify
+        run: ./target/release/app --self-test
+        shell: bash
+        env: {RUST_BACKTRACE: "1"}
+    reuse:
+      inputs: [Cargo.toml, Cargo.lock, "crates/**/src/**.rs"]
+      outputs: [target/release]
+  report:
+    image: busybox
+    needs: [build]
+    steps:
+      - {id: say, run: echo done}

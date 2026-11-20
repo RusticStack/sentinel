@@ -1516,3 +1516,105 @@ jobs:
     assert_eq!(queued[0].0.attempt, attempt);
     assert_eq!((queued[0].0.run, queued[0].0.job), (run, ids[0]));
 }
+
+#[test]
+fn a_forced_run_carries_its_fresh_request_into_every_job_context() {
+    let f = fixture();
+    let w = worker(
+        &f,
+        f.pool,
+        Capacity {
+            cpu_millis: 8_000,
+            memory_bytes: 16 << 30,
+            disk_bytes: 0,
+        },
+    );
+    let yaml = "schema: 1
+on: [push]
+jobs:
+  build:
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }]
+";
+    let (run_id, _) = run(&f, yaml, at(4_000));
+    // The default is that no task of the run is forced: every declared reuse may serve its result.
+    let offer = place(&f, w, f.pool, at(4_100)).unwrap();
+    let (attempt, fence) = (offer.attempt, offer.fence);
+    f.store
+        .writer()
+        .write(move |tx| dispatch::acknowledge(tx, w, attempt, fence, at(4_150)))
+        .unwrap();
+    assert!(
+        !f.store
+            .read(|c| dispatch::job_context(c, w, attempt))
+            .unwrap()
+            .reuse_fresh
+    );
+    let (tenant, run_id2) = (f.tenant, run_id);
+    f.store
+        .writer()
+        .write(move |tx| sentinel_store::runs::force_fresh(tx, tenant, run_id2))
+        .unwrap();
+    assert!(
+        f.store
+            .read(|c| dispatch::job_context(c, w, attempt))
+            .unwrap()
+            .reuse_fresh,
+        "the flag is durable and reaches the job that is about to run"
+    );
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::StepsStarted,
+                None,
+                at(4_200),
+                None,
+            )?;
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::FinalizationStarted,
+                None,
+                at(4_300),
+                None,
+            )?;
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::Passed,
+                Some(&[]),
+                at(4_400),
+                None,
+            )
+        })
+        .unwrap();
+    // A rerun exists to execute again, so it forces a fresh run of its own without anyone asking.
+    let (tenant, job) = (f.tenant, offer.job);
+    f.store
+        .writer()
+        .write(move |tx| sentinel_store::runs::rerun_job(tx, tenant, job, at(4_500)))
+        .map(|_| ())
+        .unwrap();
+    let next = place(&f, w, f.pool, at(4_600)).unwrap();
+    let (attempt, fence) = (next.attempt, next.fence);
+    f.store
+        .writer()
+        .write(move |tx| dispatch::acknowledge(tx, w, attempt, fence, at(4_650)))
+        .unwrap();
+    assert!(
+        f.store
+            .read(|c| dispatch::job_context(c, w, attempt))
+            .unwrap()
+            .reuse_fresh,
+        "a rerun never serves a result sealed by an earlier attempt"
+    );
+}
