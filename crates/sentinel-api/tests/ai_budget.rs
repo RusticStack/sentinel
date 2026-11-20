@@ -144,6 +144,7 @@ fn deployment() -> Deployment {
                     enabled: true,
                     data_policy: sentinel_store::ai::DataPolicy::LocalOnly,
                     budgets: sentinel_store::ai::Budgets::default(),
+                    auto_analysis: false,
                 },
                 now,
             )
@@ -396,19 +397,31 @@ fn reserve(
             "cost_micros": cost,
             "digest": digest,
             "fingerprint": print,
-            "prompt_version": "skeleton-1",
+            "prompt_version": "analysis-1",
             "model": "fake/model",
         })),
         &[("authorization", &d.service)],
     )
 }
 
-fn complete(d: &Deployment, id: &str, text: &str, usage: Value) -> Reply {
+/// The service settles a request with one `sentinel.ai-analysis/1` claim citing the fixture's log.
+fn complete(d: &Deployment, id: &str, claim: &str, usage: Value) -> Reply {
     call(
         d,
         "POST",
         &format!("/api/v1/ai/requests/{id}/complete"),
-        Some(&json!({ "outcome": "completed", "text": text, "usage": usage })),
+        Some(&json!({
+            "outcome": "completed",
+            "analysis": {
+                "schema": "sentinel.ai-analysis/1",
+                "summary": "the unit step failed",
+                "claims": [{
+                    "text": claim,
+                    "citations": [{ "attempt": d.attempt.to_string(), "evidence": "log-1" }],
+                }],
+            },
+            "usage": usage,
+        })),
         &[("authorization", &d.service)],
     )
 }
@@ -510,11 +523,17 @@ fn a_repeated_evidence_digest_is_served_without_a_provider_call() {
     let body = reused.json();
     assert_eq!(body["state"], "reused");
     assert_eq!(body["by"], "evidence");
-    assert_eq!(body["text"], "the unit step failed: left != right");
+    assert_eq!(
+        body["analysis"]["claims"][0]["text"],
+        "the unit step failed: left != right"
+    );
     assert_eq!(body["request"]["state"], "settled");
     let row = request(&d, &again);
     assert_eq!(row["reused"], true, "a reused answer is marked as one");
-    assert_eq!(row["result"], "the unit step failed: left != right");
+    assert_eq!(
+        row["analysis"]["claims"][0]["text"],
+        "the unit step failed: left != right"
+    );
 
     // The month was charged once, by the request that actually asked the provider.
     let month = usage(&d);

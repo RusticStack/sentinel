@@ -12,6 +12,7 @@ import * as HttpClientRequest from "effect/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/http/HttpClientResponse";
 import * as HttpIncomingMessage from "effect/http/HttpIncomingMessage";
 
+import type { Analysis } from "./analysis.ts";
 import { isReadOnly } from "./policy.ts";
 
 /** A durable request row, as the controller stores and returns it. */
@@ -22,6 +23,8 @@ export const RequestRow = Schema.Struct({
   data_policy: Schema.String,
   state: Schema.String,
   outcome: Schema.NullOr(Schema.String),
+  /** Who asked: a member, or the controller for a failed job the tenant asked about. */
+  origin: Schema.String,
   /** Whether the answer was an analysis the ledger had already paid for. */
   reused: Schema.Boolean,
   created_ms: Schema.Int,
@@ -62,7 +65,8 @@ export type Decision =
   | {
       readonly state: "reused";
       readonly by: "evidence" | "fingerprint";
-      readonly text: string;
+      /** The stored `sentinel.ai-analysis/1` document, as the controller decoded it. */
+      readonly analysis: unknown;
     }
   | { readonly state: "refused"; readonly reason: string };
 
@@ -71,7 +75,7 @@ const Decision = Schema.Union([
   Schema.Struct({
     state: Schema.Literal("reused"),
     by: Schema.Literals(["evidence", "fingerprint"]),
-    text: Schema.String,
+    analysis: Schema.Unknown,
   }),
   Schema.Struct({ state: Schema.Literal("refused"), reason: Schema.String }),
 ]);
@@ -119,11 +123,15 @@ export interface ControllerShape {
     id: string,
     reservation: Reservation,
   ) => Effect.Effect<Decision, ControllerError>;
-  /** Settle `id`: the answer text, or the reason there is none, and what the provider reported. */
+  /**
+   * Settle `id`: the decoded analysis, or the reason there is none, and what the provider reported.
+   * The controller decodes the document again before it stores it, so an answer that does not
+   * decode is refused there rather than kept as text.
+   */
   readonly settle: (
     id: string,
     outcome: Outcome,
-    text: string | null,
+    analysis: Analysis | null,
     reason: string | null,
     usage: ReportedUsage | null,
   ) => Effect.Effect<void, ControllerError>;
@@ -231,9 +239,9 @@ export const httpLayer = (base: string, grant: Redacted.Redacted<string>) =>
             Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(MAX_DECISION_BYTES)),
             Effect.mapError((error) => annotate(error, "an undecodable reservation")),
           ),
-        settle: (id, outcome, text, reason, usage) =>
+        settle: (id, outcome, analysis, reason, usage) =>
           Effect.flatMap(
-            HttpClientRequest.bodyJson({ outcome, text, reason, usage })(
+            HttpClientRequest.bodyJson({ outcome, analysis, reason, usage })(
               HttpClientRequest.post(url(`/api/v1/ai/requests/${encodeURIComponent(id)}/complete`)).pipe(
                 HttpClientRequest.setHeader("authorization", `Bearer ${Redacted.value(grant)}`),
                 HttpClientRequest.acceptJson,

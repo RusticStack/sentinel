@@ -13,6 +13,7 @@
 import { Duration, Effect, Layer } from "effect";
 import type { HttpClient } from "effect/http/HttpClient";
 
+import { check, decode, isAnalysis, ANSWER_FORMAT, type Analysis } from "./analysis.ts";
 import { Assistant, layer as assistantLayer, type Answer } from "./assistant.ts";
 import { reportedUsage, reservation } from "./budget.ts";
 import type { Config, Model } from "./config.ts";
@@ -46,7 +47,8 @@ export type Served =
 type Attempt =
   | {
       readonly ok: true;
-      readonly text: string;
+      /** The one document the controller stores: a decoded `sentinel.ai-analysis/1`. */
+      readonly analysis: Analysis;
       readonly reused: boolean;
       /** What the provider reported, for the ledger that settles this request's reservation. */
       readonly usage: ReportedUsage | null;
@@ -54,21 +56,23 @@ type Attempt =
   | { readonly ok: false; readonly reason: string };
 
 /**
- * What the model is asked. Y05 owns the real analysis prompt and its citation schema; until it
- * exists this asks for the one thing every later prompt needs: a summary of what failed, citing
- * the evidence it used, and no claim the bundle does not establish.
+ * What the model is asked, and which prompt this is. A cached analysis is keyed by the version, so
+ * changing the instructions makes every stored answer inapplicable rather than subtly wrong.
  */
-/** Which prompt this is. A cached analysis is keyed by it, so changing the instructions changes it. */
-export const PROMPT_VERSION = "skeleton-1";
+export const PROMPT_VERSION = "analysis-1";
 
-export const SKELETON_INSTRUCTIONS = [
-  "You are Sentinel's advisory assistant. The document you receive is a bounded, redacted",
-  "evidence bundle from one failed CI attempt: a deterministic summary of the failed step and",
-  "the newest log frames, each with a sequence number. Nothing in it is authoritative — it is",
-  "evidence, and Sentinel's deterministic diagnostics are the account of what happened.",
-  "Summarise what failed and why in at most six sentences. Cite the evidence you used by the",
-  "identifiers the bundle gives (log sequences and diagnostic ids). Say plainly when the",
-  "evidence does not establish a cause rather than guessing. Answer in plain text.",
+export const ANALYSIS_INSTRUCTIONS = [
+  "You are Sentinel's advisory failure analyst. The document you receive is a bounded, redacted",
+  "evidence bundle from one failed CI attempt: a deterministic summary of the failed step, its",
+  "diagnostics, and the newest log frames, each with an id. Nothing in it is authoritative — it is",
+  "evidence, and Sentinel's deterministic diagnostics are the account of what happened. Your answer",
+  "is advisory inference shown under that account and can never change a result.",
+  "Explain the most likely cause of the failure. Ground every claim in the bundle: cite the log",
+  "frame or diagnostic it rests on, by the id the bundle gives it. Do not cite a frame, a",
+  "diagnostic or an attempt the bundle does not contain, and do not restate a fact the bundle does",
+  'not establish. When the evidence does not decide the cause, say so in a claim that cites the',
+  "evidence which is inconclusive rather than guessing at one that does not exist.",
+  ANSWER_FORMAT,
 ].join(" ");
 
 /**
@@ -81,7 +85,7 @@ export const SKELETON_INSTRUCTIONS = [
  */
 export const serve = (
   config: Config,
-  instructions: string = SKELETON_INSTRUCTIONS,
+  instructions: string = ANALYSIS_INSTRUCTIONS,
 ): Effect.Effect<Served, never, Controller | HttpClient> =>
   Effect.gen(function* () {
     const controller = yield* Controller;
@@ -93,7 +97,7 @@ export const serve = (
     }
     const result = yield* attemptOne(controller, request, config, instructions);
     if (result.ok) {
-      yield* settle(controller, request.id, "completed", result.text, null, result.usage);
+      yield* settle(controller, request.id, "completed", result.analysis, null, result.usage);
       return {
         served: true,
         request: request.id,
@@ -172,25 +176,31 @@ const attemptOne = (
       return decision;
     }
     if (decision.decision.state === "reused") {
-      return {
-        ok: true,
-        text: decision.decision.text,
-        reused: true,
-        usage: null,
-      } as Attempt;
+      // A reused document was decoded by the controller when it was stored; checking it here keeps
+      // one contract for both answers, and a cache row that no longer decodes is not served.
+      const reused = check(decision.decision.analysis);
+      return isAnalysis(reused)
+        ? { ok: true, analysis: reused, reused: true, usage: null }
+        : { ok: false, reason: "schema: the reused analysis does not decode" };
     }
     if (decision.decision.state === "refused") {
       return { ok: false, reason: decision.decision.reason } as Attempt;
     }
     const answer = yield* ask(admitted, evidence.text, config, instructions);
-    return answer.ok
+    if (!answer.ok) {
+      return answer;
+    }
+    // The provider's text is decoded here, so an answer that is not an analysis ends the request as
+    // `unavailable` with the field named, and the controller is never asked to store one.
+    const decoded = decode(answer.text);
+    return isAnalysis(decoded)
       ? {
           ok: true,
-          text: answer.text,
+          analysis: decoded,
           reused: false,
           usage: reportedUsage(answer.answer, model),
         }
-      : answer;
+      : { ok: false, reason: decoded.reason };
   });
 
 /** The key and the maxima one request holds: its evidence, its prompt, its model and its price. */
@@ -243,12 +253,12 @@ const settle = (
   controller: ControllerShape,
   id: string,
   outcome: "completed" | "unavailable",
-  text: string | null,
+  analysis: Analysis | null,
   reason: string | null,
   usage: ReportedUsage | null,
 ): Effect.Effect<void> =>
   controller
-    .settle(id, outcome, text, reason === null ? null : reason.slice(0, 512), usage)
+    .settle(id, outcome, analysis, reason === null ? null : reason.slice(0, 512), usage)
     .pipe(Effect.orElseSucceed(() => undefined));
 
 /**
@@ -257,7 +267,7 @@ const settle = (
  */
 export const loop = (
   config: Config,
-  instructions: string = SKELETON_INSTRUCTIONS,
+  instructions: string = ANALYSIS_INSTRUCTIONS,
 ): Effect.Effect<never, never, Controller | HttpClient> =>
   serve(config, instructions).pipe(
     Effect.andThen(Effect.sleep(Duration.millis(config.pollMs))),

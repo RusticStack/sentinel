@@ -735,6 +735,11 @@ fn database_at_latest_without_classes(path: &Path) {
          DROP INDEX provenance_by_group_ref;
          ALTER TABLE run_provenance DROP COLUMN group_ref;
          DROP TABLE merge_deliveries;
+         DROP INDEX ai_requests_automatic;
+         DROP INDEX ai_requests_by_attempt;
+         DROP INDEX jobs_failed_on;
+         ALTER TABLE ai_requests DROP COLUMN origin;
+         ALTER TABLE tenant_ai DROP COLUMN auto_analysis;
          DROP TABLE tenant_ai;
          ALTER TABLE deployment_policy DROP COLUMN ai_providers;
          ALTER TABLE deployment_policy DROP COLUMN ai_enabled;

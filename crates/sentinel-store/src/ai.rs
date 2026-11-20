@@ -16,6 +16,12 @@
 //! per-request caps and its concurrency limit, and what it holds if it does. A refusal and a reuse
 //! settle the request in that same commit, so a refused request is never queued and a reused one
 //! costs nothing.
+//!
+//! Y05 adds the answer's shape and where it comes from: a settled request carries one
+//! `sentinel.ai-analysis/1` document, a cached analysis expires with the log it cites rather than
+//! with the cache's own bound, and a tenant that asks for one gets a request for every job that
+//! ended failed — written by [`enqueue_automatic`], which the AI process's own poll runs, so no
+//! attempt, dispatch, log acknowledgement or check publication is ever on that path.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::secret::Secret;
@@ -282,6 +288,9 @@ pub struct Tenant {
     pub enabled: bool,
     pub data_policy: DataPolicy,
     pub budgets: Budgets,
+    /// Whether a failed job gets an analysis nobody asked for (Y05). Off in every fresh deployment
+    /// and every upgraded one, and read by the sweep that writes those requests.
+    pub auto_analysis: bool,
 }
 
 /// `None` until the tenant's administrator opts in: no row is off. The budget is part of the same
@@ -290,14 +299,19 @@ pub fn tenant(conn: &Connection, tenant: TenantId) -> Result<Option<Tenant>> {
     let row = conn
         .prepare_cached(
             "SELECT enabled, data_policy, monthly_tokens, monthly_cost_micros, input_tokens_cap,
-                output_tokens_cap, cost_micros_cap, concurrency
+                output_tokens_cap, cost_micros_cap, concurrency, auto_analysis
              FROM tenant_ai WHERE tenant_id = ?1",
         )?
         .query_row([tenant.as_bytes()], |r| {
-            Ok((r.get::<_, bool>(0)?, r.get::<_, i64>(1)?, budgets_at(r, 2)?))
+            Ok((
+                r.get::<_, bool>(0)?,
+                r.get::<_, i64>(1)?,
+                budgets_at(r, 2)?,
+                r.get::<_, bool>(8)?,
+            ))
         })
         .optional()?;
-    let (enabled, code, budgets) = match row {
+    let (enabled, code, budgets, auto_analysis) = match row {
         Some(row) => row,
         None => return Ok(None),
     };
@@ -305,6 +319,7 @@ pub fn tenant(conn: &Connection, tenant: TenantId) -> Result<Option<Tenant>> {
         enabled,
         data_policy: DataPolicy::from_code(code).ok_or(Error::Corrupt("tenant_ai.data_policy"))?,
         budgets,
+        auto_analysis,
     }))
 }
 
@@ -368,12 +383,12 @@ pub fn set_tenant(
     tx.prepare_cached(
         "INSERT INTO tenant_ai(tenant_id, enabled, data_policy, monthly_tokens, monthly_cost_micros,
             input_tokens_cap, output_tokens_cap, cost_micros_cap, concurrency, updated_ms,
-            updated_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            updated_by, auto_analysis)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(tenant_id) DO UPDATE SET enabled = ?2, data_policy = ?3,
             monthly_tokens = ?4, monthly_cost_micros = ?5, input_tokens_cap = ?6,
             output_tokens_cap = ?7, cost_micros_cap = ?8, concurrency = ?9, updated_ms = ?10,
-            updated_by = ?11",
+            updated_by = ?11, auto_analysis = ?12",
     )?
     .execute(params![
         tenant.as_bytes(),
@@ -390,7 +405,8 @@ pub fn set_tenant(
             .map_err(|_| Error::InvalidInput("ai budget"))?,
         i64::from(budgets.concurrency),
         now.0,
-        principal.user.as_bytes()
+        principal.user.as_bytes(),
+        policy.auto_analysis
     ])?;
     if !policy.enabled {
         drop_requests(tx, Some(tenant), now)?;
@@ -399,7 +415,8 @@ pub fn set_tenant(
     // detail: monthly tokens and cost, the per-request maxima and the concurrency limit.
     let detail = format!(
         "tenant={tenant} ai={} data_policy={} monthly_tokens={} monthly_cost_micros={} \
-         max_input_tokens={} max_output_tokens={} max_cost_micros={} concurrency={}",
+         max_input_tokens={} max_output_tokens={} max_cost_micros={} concurrency={} \
+         auto_analysis={}",
         if policy.enabled { "on" } else { "off" },
         policy.data_policy.as_str(),
         budgets.monthly_tokens,
@@ -407,7 +424,8 @@ pub fn set_tenant(
         budgets.max_input_tokens,
         budgets.max_output_tokens,
         budgets.max_cost_micros,
-        budgets.concurrency
+        budgets.concurrency,
+        if policy.auto_analysis { "on" } else { "off" }
     );
     audit(
         tx,
@@ -484,7 +502,8 @@ pub const REQUEST_LIFETIME_MS: i64 = 10 * 60 * 1000;
 pub const DELEGATION_MS: i64 = 10 * 60 * 1000;
 /// How long a claim holds a row before the sweep may settle it as unavailable.
 pub const CLAIM_LEASE_MS: i64 = 60 * 1000;
-/// The answer's bound. A model's answer is advisory text; Y05 replaces it with a cited analysis.
+/// The answer's bound, which is also `sentinel.ai-analysis/1`'s: an analysis is stored whole or not
+/// at all, never truncated, because a citation cut off the end is a claim nobody can check.
 pub const MAX_RESULT_BYTES: usize = 8 << 10;
 /// The bound on a stated reason, which is a sentence, never a payload.
 pub const MAX_REASON_BYTES: usize = 512;
@@ -544,6 +563,32 @@ impl Outcome {
     }
 }
 
+/// Who asked for a request (Y05): a member, or the controller for a failed job a tenant asked to
+/// have analysed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Origin {
+    Member = 1,
+    Automatic = 2,
+}
+
+impl Origin {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Member => "member",
+            Self::Automatic => "automatic",
+        }
+    }
+
+    fn from_code(code: i64) -> Option<Self> {
+        Some(match code {
+            1 => Self::Member,
+            2 => Self::Automatic,
+            _ => return None,
+        })
+    }
+}
+
 /// One durable request, as every reader of it sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -554,10 +599,12 @@ pub struct Request {
     pub requester: UserId,
     pub provider: Provider,
     pub data_policy: DataPolicy,
+    pub origin: Origin,
     pub state: State,
     pub outcome: Option<Outcome>,
     pub reason: Option<String>,
-    pub result: Option<String>,
+    /// The settled answer: `sentinel.ai-analysis/1`'s stored document (Y05), or nothing.
+    pub analysis: Option<String>,
     /// Whether the answer was an analysis the ledger already paid for (Y04), rather than one this
     /// request's own provider call produced. It is a property of the answer, not of its text.
     pub reused: bool,
@@ -565,7 +612,7 @@ pub struct Request {
     pub deadline: UnixMillis,
 }
 const REQUEST_COLUMNS: &str = "id, tenant_id, repo_id, attempt_id, requester_id, provider,
-     data_policy, state_code, outcome, reason, result, reused, created_ms, deadline_ms";
+     data_policy, origin, state_code, outcome, reason, result, reused, created_ms, deadline_ms";
 
 /// One row's bytes, as the store holds them. Decoded once, outside the query closure.
 type Raw = (
@@ -574,6 +621,7 @@ type Raw = (
     [u8; 16],
     [u8; 16],
     [u8; 16],
+    i64,
     i64,
     i64,
     i64,
@@ -601,6 +649,7 @@ fn raw(row: &rusqlite::Row<'_>) -> rusqlite::Result<Raw> {
         row.get(11)?,
         row.get(12)?,
         row.get(13)?,
+        row.get(14)?,
     ))
 }
 
@@ -613,10 +662,11 @@ fn decode(raw: Raw) -> Result<Request> {
         requester,
         provider,
         policy,
+        origin,
         state,
         outcome,
         reason,
-        result,
+        analysis,
         reused,
         created,
         deadline,
@@ -633,6 +683,7 @@ fn decode(raw: Raw) -> Result<Request> {
             .ok_or(Error::Corrupt("ai_requests.provider"))?,
         data_policy: DataPolicy::from_code(policy)
             .ok_or(Error::Corrupt("ai_requests.data_policy"))?,
+        origin: Origin::from_code(origin).ok_or(Error::Corrupt("ai_requests.origin"))?,
         state: State::from_code(state).ok_or(Error::Corrupt("ai_requests.state_code"))?,
         outcome: match outcome {
             None => None,
@@ -641,7 +692,7 @@ fn decode(raw: Raw) -> Result<Request> {
             }
         },
         reason,
-        result,
+        analysis,
         reused,
         created: UnixMillis(created),
         deadline: UnixMillis(deadline),
@@ -734,14 +785,104 @@ pub fn enqueue(
         requester: principal.user,
         provider,
         data_policy,
+        origin: Origin::Member,
         state: State::Queued,
         outcome: None,
         reason: None,
-        result: None,
+        analysis: None,
         reused: false,
         created: now,
         deadline: UnixMillis(deadline),
     })
+}
+
+/// How long after a job's failure an automatic request may still be written. The sweep runs on every
+/// poll, so this only bounds a controller that never polled through the failure — it never turns a
+/// tenant's backlog of old failures into a bill the moment the switch is turned on.
+pub const AUTOMATIC_WINDOW_MS: i64 = REQUEST_LIFETIME_MS;
+
+/// Writes the automatic requests a tenant asked for: one per failed attempt of a job that ended
+/// `failed` — Sentinel has no advisory job, so every job is a required one — inside the window, for a
+/// tenant that turned automatic analysis on and whose policy still admits a provider. The requester is
+/// the administrator whose decision turned it on, so the delegation minted at claim reads exactly what
+/// they could.
+///
+/// Idempotent by the one automatic row an attempt may have, so a sweep that runs twice writes once.
+/// The provider is the first the deployment allows that the tenant's data policy permits, in the
+/// providers' own order, so two sweeps over one policy choose alike.
+pub fn enqueue_automatic(tx: &Transaction<'_>, now: UnixMillis, limit: u32) -> Result<usize> {
+    let (enabled, bits) = tx
+        .prepare_cached("SELECT ai_enabled, ai_providers FROM deployment_policy WHERE id = 1")?
+        .query_row([], |r| Ok((r.get::<_, bool>(0)?, r.get::<_, i64>(1)?)))?;
+    if !enabled {
+        return Ok(0);
+    }
+    let providers = Providers::from_bits(bits)?;
+    let mut found = Vec::new();
+    let mut statement = tx.prepare_cached(
+        "SELECT j.tenant_id, r.repo_id, a.id, t.data_policy, t.updated_by
+           FROM jobs j
+           JOIN runs r ON r.id = j.run_id
+           JOIN attempts a ON a.job_id = j.id AND a.fence = (
+                SELECT MAX(fence) FROM attempts WHERE job_id = j.id)
+           JOIN tenant_ai t ON t.tenant_id = j.tenant_id
+          WHERE j.state_code = 20
+            AND t.enabled = 1 AND t.auto_analysis = 1 AND t.updated_by IS NOT NULL
+            AND j.terminal_ms >= ?1
+          ORDER BY j.terminal_ms, j.id
+          LIMIT ?2",
+    )?;
+    let mut rows = statement.query(params![
+        now.0.saturating_sub(AUTOMATIC_WINDOW_MS),
+        i64::from(limit)
+    ])?;
+    while let Some(row) = rows.next()? {
+        found.push((
+            row.get::<_, [u8; 16]>(0)?,
+            row.get::<_, [u8; 16]>(1)?,
+            row.get::<_, [u8; 16]>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, [u8; 16]>(4)?,
+        ));
+    }
+    drop(rows);
+    drop(statement);
+    let mut written = 0;
+    for (tenant, repo, attempt, policy, requester) in found {
+        let Some(policy) = DataPolicy::from_code(policy) else {
+            return Err(Error::Corrupt("tenant_ai.data_policy"));
+        };
+        let Some(provider) = providers.list().find(|p| policy.allows(*p)) else {
+            continue;
+        };
+        let (tenant, repo, attempt, requester) = (
+            TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?,
+            RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?,
+            AttemptId::from_bytes(attempt).map_err(|_| Error::Corrupt("attempt_id"))?,
+            UserId::from_bytes(requester).map_err(|_| Error::Corrupt("requester_id"))?,
+        );
+        let id = AiRequestId::new();
+        written += tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO ai_requests(id, tenant_id, repo_id, attempt_id,
+                    requester_id, requester_scopes, provider, data_policy, origin, created_ms,
+                    deadline_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 2, ?9, ?10)",
+            )?
+            .execute(params![
+                id.as_bytes(),
+                tenant.as_bytes(),
+                repo.as_bytes(),
+                attempt.as_bytes(),
+                requester.as_bytes(),
+                Scopes::READ_ONLY.bits(),
+                provider as u8,
+                policy as u8,
+                now.0,
+                now.0.saturating_add(REQUEST_LIFETIME_MS)
+            ])?;
+    }
+    Ok(written)
 }
 
 /// The oldest queued requests: what the AI process consumes, one page at a time.
@@ -756,6 +897,89 @@ pub fn queued(conn: &Connection, limit: u32) -> Result<Vec<Request>> {
         found.push(decode(raw(row)?)?);
     }
     Ok(found)
+}
+
+/// The analysis an attempt has (Y05), as the route that serves it reads it: none, one still being
+/// produced, or the settled document of the newest answered request about this attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// Nobody has asked about this attempt, and the controller was not asked to.
+    None,
+    /// A request is queued or claimed: an answer may still arrive before its deadline.
+    Pending,
+    Analysis {
+        /// `sentinel.ai-analysis/1`'s document, exactly as it was decoded and stored.
+        document: String,
+        /// Whether the ledger already paid for it, so it may describe an earlier attempt.
+        reused: bool,
+        settled: UnixMillis,
+        origin: Origin,
+    },
+}
+
+/// The newest answered request about one attempt, or the fact that one is still in flight. Both are
+/// index probes: the newest settled answer first, because a request asked twice is answered twice.
+pub fn answer(conn: &Connection, attempt: AttemptId, now: UnixMillis) -> Result<Answer> {
+    let settled = conn
+        .prepare_cached(
+            "SELECT result, reused, settled_ms, origin FROM ai_requests
+              WHERE attempt_id = ?1 AND state_code = 3 AND outcome = 2 AND result IS NOT NULL
+              ORDER BY settled_ms DESC, id DESC LIMIT 1",
+        )?
+        .query_row(params![attempt.as_bytes()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, bool>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })
+        .optional()?;
+    if let Some((document, reused, settled, origin)) = settled {
+        return Ok(Answer::Analysis {
+            document,
+            reused,
+            settled: UnixMillis(settled),
+            origin: Origin::from_code(origin).ok_or(Error::Corrupt("ai_requests.origin"))?,
+        });
+    }
+    let pending: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM ai_requests
+              WHERE attempt_id = ?1 AND state_code != 3 AND deadline_ms > ?2)",
+        )?
+        .query_row(params![attempt.as_bytes(), now.0], |r| r.get(0))?;
+    Ok(if pending {
+        Answer::Pending
+    } else {
+        Answer::None
+    })
+}
+
+/// What an attempt's stored evidence has left: the log retention it was written under, and whether
+/// retention has already removed it. A citation resolves only while `expired` is false, and an
+/// analysis expires no later than `expires` — so nothing it cites outlives the log itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retention {
+    /// When the log expires. `None` while no retention is recorded for the attempt, which is not the
+    /// same as gone: an analysis then keeps the cache's own bound.
+    pub expires: Option<UnixMillis>,
+    /// Whether retention removed the log, which makes every citation into it drop.
+    pub expired: bool,
+}
+
+/// `None` for an attempt the store does not know.
+pub fn retention(conn: &Connection, attempt: AttemptId) -> Result<Option<Retention>> {
+    let row = conn
+        .prepare_cached("SELECT log_expires_ms, log_expired_ms FROM attempts WHERE id = ?1")?
+        .query_row(params![attempt.as_bytes()], |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+        })
+        .optional()?;
+    Ok(row.map(|(expires, expired)| Retention {
+        expires: expires.map(UnixMillis),
+        expired: expired.is_some(),
+    }))
 }
 
 /// A claim: the row's lease, and the delegation that reads its evidence.
@@ -846,19 +1070,21 @@ pub fn settle(
     tx: &Transaction<'_>,
     id: AiRequestId,
     outcome: Outcome,
-    text: Option<&str>,
+    analysis: Option<&str>,
     reason: Option<&str>,
     now: UnixMillis,
     usage: Option<Usage>,
 ) -> Result<Request> {
-    if text.is_some_and(|t| t.len() > MAX_RESULT_BYTES) {
-        return Err(Error::InvalidInput("ai request result"));
+    // The document was decoded before it reached here; the store holds it within the bound its column
+    // states, because an analysis is stored only when the whole of it is.
+    if analysis.is_some_and(|a| a.is_empty() || a.len() > MAX_RESULT_BYTES) {
+        return Err(Error::InvalidInput("ai request analysis"));
     }
     if reason.is_some_and(|r| r.is_empty() || r.len() > MAX_REASON_BYTES) {
         return Err(Error::InvalidInput("ai request reason"));
     }
-    let (outcome, text, reason) = match outcome {
-        Outcome::Completed => (outcome, text, None),
+    let (outcome, analysis, reason) = match outcome {
+        Outcome::Completed => (outcome, analysis, None),
         Outcome::Unavailable => (outcome, None, reason.or(Some("unavailable"))),
     };
     close(
@@ -866,7 +1092,7 @@ pub fn settle(
         id,
         Ending {
             outcome,
-            text,
+            analysis,
             reason,
             reused: false,
             usage,
@@ -879,7 +1105,8 @@ pub fn settle(
 /// How a request ends and what it is charged, as one value the two writers of a settlement share.
 struct Ending<'a> {
     outcome: Outcome,
-    text: Option<&'a str>,
+    /// `sentinel.ai-analysis/1`'s document, as the cache holds it and the row publishes it.
+    analysis: Option<&'a str>,
     reason: Option<&'a str>,
     /// Whether the answer was an analysis the cache already held, which the row states.
     reused: bool,
@@ -892,7 +1119,7 @@ struct Ending<'a> {
 fn close(tx: &Transaction<'_>, id: AiRequestId, ending: Ending<'_>, now: UnixMillis) -> Result<()> {
     let Ending {
         outcome,
-        text,
+        analysis,
         reason,
         reused,
         usage,
@@ -906,7 +1133,7 @@ fn close(tx: &Transaction<'_>, id: AiRequestId, ending: Ending<'_>, now: UnixMil
         .execute(params![
             id.as_bytes(),
             outcome as u8,
-            text,
+            analysis,
             reason,
             now.0,
             reused
@@ -920,7 +1147,7 @@ fn close(tx: &Transaction<'_>, id: AiRequestId, ending: Ending<'_>, now: UnixMil
               SELECT delegation_id FROM ai_requests WHERE id = ?2 AND delegation_id IS NOT NULL)",
     )?
     .execute(params![now.0, id.as_bytes()])?;
-    release(tx, id, text, now, usage)
+    release(tx, id, analysis, now, usage)
 }
 
 /// Whether `token` is the live delegation of the request about `attempt`: the check the evidence
@@ -1035,8 +1262,9 @@ pub struct Reservation {
 pub enum Admitted {
     /// The maxima are held until `expires`: the provider may be contacted.
     Reserved { expires: UnixMillis },
-    /// This question or this failure was already answered; the request is settled with that answer.
-    Reused { text: String, by: Reuse },
+    /// This question or this failure was already answered; the request is settled with that answer,
+    /// the `sentinel.ai-analysis/1` document the cache holds.
+    Reused { analysis: String, by: Reuse },
     /// It does not fit. The request is settled `unavailable` carrying `reason`, and nothing is held.
     Refused { reason: String },
 }
@@ -1131,20 +1359,20 @@ pub fn reserve(
         return Err(Error::Conflict);
     }
     let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?;
-    if let Some((text, by)) = cached(tx, tenant, asked, now)? {
+    if let Some((analysis, by)) = cached(tx, tenant, asked, now)? {
         close(
             tx,
             id,
             Ending {
                 outcome: Outcome::Completed,
-                text: Some(&text),
+                analysis: Some(&analysis),
                 reason: None,
                 reused: true,
                 usage: None,
             },
             now,
         )?;
-        return Ok(Admitted::Reused { text, by });
+        return Ok(Admitted::Reused { analysis, by });
     }
     let budgets = budgets(tx, tenant)?;
     if let Some(reason) = budgets.refusal(asked) {
@@ -1231,7 +1459,7 @@ fn refuse(
         id,
         Ending {
             outcome: Outcome::Unavailable,
-            text: None,
+            analysis: None,
             reason: Some(reason),
             reused: false,
             usage: None,
@@ -1370,7 +1598,7 @@ pub fn month(conn: &Connection, tenant: TenantId, now: UnixMillis) -> Result<Mon
 fn release(
     tx: &Transaction<'_>,
     id: AiRequestId,
-    text: Option<&str>,
+    analysis: Option<&str>,
     now: UnixMillis,
     usage: Option<Usage>,
 ) -> Result<()> {
@@ -1416,7 +1644,9 @@ fn release(
         charged(usage.output_tokens, output),
         charged(usage.cost_micros, cost)
     ])?;
-    if let Some(text) = text.filter(|text| !text.is_empty()) {
+    if let Some(analysis) = analysis.filter(|analysis| !analysis.is_empty())
+        && let Some(expires) = evidence_expiry(tx, id, now)?
+    {
         tx.prepare_cached(
             "INSERT INTO ai_analyses(tenant_id, digest, prompt_version, model, fingerprint, text,
                 created_ms, expires_ms)
@@ -1431,12 +1661,43 @@ fn release(
             version,
             model,
             fingerprint.as_slice(),
-            text,
+            analysis,
             now.0,
-            now.0.saturating_add(ANALYSIS_TTL_MS)
+            expires.0
         ])?;
     }
     Ok(())
+}
+
+/// When the analysis of `id` stops being servable: with the logs of the attempt it was computed from
+/// (Y05), or with the cache's own 30-day bound, whichever is first. Nothing an analysis cites outlives
+/// its evidence, so a reused answer can never cite a log the tenant no longer holds. `None` when the
+/// evidence is already gone, which is a document there is no point caching.
+fn evidence_expiry(
+    tx: &Transaction<'_>,
+    id: AiRequestId,
+    now: UnixMillis,
+) -> Result<Option<UnixMillis>> {
+    let found = tx
+        .prepare_cached(
+            "SELECT a.log_expires_ms, a.log_expired_ms FROM ai_requests q
+               JOIN attempts a ON a.id = q.attempt_id
+              WHERE q.id = ?1",
+        )?
+        .query_row(params![id.as_bytes()], |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+        })
+        .optional()?;
+    let Some((expires, expired)) = found else {
+        return Ok(None);
+    };
+    if expired.is_some() {
+        return Ok(None);
+    }
+    let ttl = now.0.saturating_add(ANALYSIS_TTL_MS);
+    Ok(expires.map_or(Some(UnixMillis(ttl)), |expires| {
+        Some(UnixMillis(expires.min(ttl))).filter(|at| at.0 > now.0)
+    }))
 }
 
 /// What one component settles at: what the provider reported, or the reservation's maximum when it

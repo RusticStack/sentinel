@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod analysis;
 pub mod cache;
 pub mod cursor;
 pub mod diagnostics;

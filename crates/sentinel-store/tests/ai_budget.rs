@@ -118,6 +118,7 @@ fn opt_in(f: &Fixture, budgets: Budgets) {
                     enabled: true,
                     data_policy: DataPolicy::LocalOnly,
                     budgets,
+                    auto_analysis: false,
                 },
                 NOW,
             )
@@ -158,7 +159,7 @@ fn asked(input: u64, output: u64, cost: u64, digest: u8, fingerprint: u8) -> Res
         cost_micros: cost,
         digest: [digest; 32],
         fingerprint: [fingerprint; 32],
-        prompt_version: "skeleton-1".into(),
+        prompt_version: "analysis-1".into(),
         model: "fake/model".into(),
     }
 }
@@ -171,8 +172,20 @@ fn reserve(f: &Fixture, id: AiRequestId, asked: &Reservation, now: UnixMillis) -
         .unwrap()
 }
 
-fn settle(f: &Fixture, id: AiRequestId, text: &str, usage: Usage, now: UnixMillis) {
-    let text = text.to_owned();
+/// The stored form of an answer: one `sentinel.ai-analysis/1` claim citing one frame of the fixture's
+/// attempt. The store keeps the document whole and never reads inside it; the controller decodes it
+/// before it gets here.
+fn document(f: &Fixture, claim: &str) -> String {
+    format!(
+        "{{\"schema\":\"sentinel.ai-analysis/1\",\"summary\":\"the unit step failed\",\
+         \"claims\":[{{\"text\":\"{claim}\",\"citations\":[{{\"attempt\":\"{}\",\
+         \"evidence\":\"log-1\"}}]}}]}}",
+        f.attempt
+    )
+}
+
+fn settle(f: &Fixture, id: AiRequestId, claim: &str, usage: Usage, now: UnixMillis) {
+    let text = document(f, claim);
     Arc::clone(&f.store)
         .writer()
         .write(move |tx| {
@@ -247,7 +260,7 @@ fn a_settled_request_is_charged_what_the_provider_reported_and_its_answer_is_reu
     assert_eq!(
         reused,
         Admitted::Reused {
-            text: "the unit step failed on an assertion".into(),
+            analysis: document(&f, "the unit step failed on an assertion"),
             by: Reuse::Evidence,
         }
     );
@@ -497,7 +510,7 @@ fn a_failure_fingerprint_is_reused_across_reruns_but_a_new_prompt_or_model_is_no
     assert_eq!(
         reused,
         Admitted::Reused {
-            text: "the unit step failed: left != right".into(),
+            analysis: document(&f, "the unit step failed: left != right"),
             by: Reuse::Fingerprint,
         }
     );
@@ -578,6 +591,7 @@ fn a_disable_takes_the_analyses_and_the_reservations_with_the_queue() {
                     enabled: false,
                     data_policy: DataPolicy::LocalOnly,
                     budgets: Budgets::default(),
+                    auto_analysis: false,
                 },
                 NOW,
             )?;

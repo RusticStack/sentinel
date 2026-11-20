@@ -78,8 +78,18 @@ export const model = (id, maxOutputTokens = 1_024) => ({
 /** The controller's decision before the provider is called: the maximum is held. */
 export const reserved = (expires_ms = 1_700_000_900_000) => ({ state: "reserved", expires_ms });
 
+/** The attempt every fake document cites. A real attempt id, because the schema checks it. */
+export const ATTEMPT = "att_11111111-1111-4111-8111-111111111111";
+
+/** A `sentinel.ai-analysis/1` document: one claim citing one log frame. */
+export const analysis = (text, evidence = "log-1") => ({
+  schema: "sentinel.ai-analysis/1",
+  summary: text,
+  claims: [{ text, citations: [{ attempt: ATTEMPT, evidence }] }],
+});
+
 /** The controller's decision when it already has the analysis. */
-export const reused = (text, by = "evidence") => ({ state: "reused", by, text });
+export const reused = (text, by = "evidence") => ({ state: "reused", by, analysis: analysis(text) });
 
 /** The controller's decision when the request does not fit. */
 export const refused = (reason) => ({ state: "refused", reason });

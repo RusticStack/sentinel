@@ -23,6 +23,7 @@ const row = {
   attempt: "att_00000000-0000-4000-8000-000000000001",
   provider: "local",
   data_policy: "local_only",
+  origin: "member",
   state: "claimed",
   outcome: null,
   reused: false,
@@ -92,16 +93,26 @@ test("the service grant lists, claims and settles; only the delegation reads evi
   );
 });
 
-test("a settlement carries the answer text and never a credential", async () => {
+test("a settlement carries the decoded analysis and never a credential", async () => {
+  const document = {
+    schema: "sentinel.ai-analysis/1",
+    summary: "the failed step timed out",
+    claims: [
+      {
+        text: "the failed step timed out",
+        citations: [{ attempt: row.attempt, evidence: "log-7" }],
+      },
+    ],
+  };
   const { calls } = await runWith(READ_ONLY, function* (controller) {
     const claimed = yield* controller.claim(row.id);
     yield* controller.evidence(claimed);
-    yield* controller.settle(row.id, "completed", "the failed step timed out", null);
+    yield* controller.settle(row.id, "completed", document, null);
   });
   const settlement = JSON.parse(calls.at(-1).body);
   assert.deepEqual(settlement, {
     outcome: "completed",
-    text: "the failed step timed out",
+    analysis: document,
     reason: null,
   });
   assert.equal(calls.at(-1).body.includes("delegated-access-token"), false);

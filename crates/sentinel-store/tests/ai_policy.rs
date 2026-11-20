@@ -137,6 +137,7 @@ fn set_tenant(
                 enabled,
                 data_policy: policy,
                 budgets: Budgets::default(),
+                auto_analysis: false,
             },
             NOW,
         )
@@ -402,6 +403,7 @@ fn a_tenant_opts_in_only_with_a_step_up_and_the_deployment_allowing_it() {
             enabled: true,
             data_policy: DataPolicy::ZeroRetention,
             budgets: Budgets::default(),
+            auto_analysis: false,
         })
     );
     assert_eq!(
@@ -517,6 +519,7 @@ fn disabling_takes_effect_at_the_next_request_and_is_audited() {
             enabled: false,
             data_policy: DataPolicy::ZeroRetention,
             budgets: Budgets::default(),
+            auto_analysis: false,
         }),
         "the tenant's data policy is kept for the next opt-in"
     );
