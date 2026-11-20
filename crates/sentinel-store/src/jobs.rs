@@ -98,9 +98,11 @@ pub struct JobRow {
     pub cancel_requested: bool,
     pub failure_class: Option<FailureClass>,
     pub timestamps: AttemptTimestamps,
+    /// How many external resources the job declares; zero for every job that declares none.
+    pub locks: i64,
 }
 
-type RawJob = (i64, i64, i64, Option<i64>, AttemptTimestamps);
+type RawJob = (i64, i64, i64, Option<i64>, AttemptTimestamps, i64);
 
 fn raw_job(r: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<RawJob> {
     let ms = |i: usize| -> rusqlite::Result<Option<UnixMillis>> {
@@ -119,10 +121,11 @@ fn raw_job(r: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<RawJob> {
             finalizing: ms(8)?,
             terminal: ms(9)?,
         },
+        r.get::<_, i64>(offset + 10)?,
     ))
 }
 
-fn decode_job((code, fence, cancel, class, timestamps): RawJob) -> Result<JobRow> {
+fn decode_job((code, fence, cancel, class, timestamps, locks): RawJob) -> Result<JobRow> {
     Ok(JobRow {
         state: decode_state(code).ok_or(Error::Corrupt("state_code"))?,
         fence: decode_fence(fence).ok_or(Error::Corrupt("fence"))?,
@@ -134,13 +137,14 @@ fn decode_job((code, fence, cancel, class, timestamps): RawJob) -> Result<JobRow
             }
         },
         timestamps,
+        locks,
     })
 }
 
 fn read_job(conn: &Connection, tenant: TenantId, job: JobId) -> Result<JobRow> {
     conn.prepare_cached(
         "SELECT state_code, fence, cancel_requested, failure_class,
-                queued_ms, leased_ms, preparing_ms, running_ms, finalizing_ms, terminal_ms
+                queued_ms, leased_ms, preparing_ms, running_ms, finalizing_ms, terminal_ms, locks
          FROM jobs WHERE id = ?1 AND tenant_id = ?2",
     )?
     .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| {
@@ -154,7 +158,7 @@ fn read_job(conn: &Connection, tenant: TenantId, job: JobId) -> Result<JobRow> {
 pub fn for_run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<(JobId, JobRow)>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, state_code, fence, cancel_requested, failure_class,
-                queued_ms, leased_ms, preparing_ms, running_ms, finalizing_ms, terminal_ms
+                queued_ms, leased_ms, preparing_ms, running_ms, finalizing_ms, terminal_ms, locks
          FROM jobs WHERE run_id = ?1 AND tenant_id = ?2 ORDER BY spec_index",
     )?;
     let rows = stmt.query_map(params![run.as_bytes(), tenant.as_bytes()], |r| {
@@ -216,6 +220,7 @@ fn transition_from(
         Event::ConditionFailed => Some(encode_failure(FailureClass::Preparation)),
         Event::CancelBeforeStart => Some(encode_failure(FailureClass::Canceled)),
         Event::QueueTimedOut => Some(encode_failure(FailureClass::QueueTimeout)),
+        Event::LockTimedOut => Some(encode_failure(FailureClass::ResourceLock)),
         _ => None,
     };
     let mut stmt = tx.prepare_cached(sql)?;
@@ -336,6 +341,11 @@ pub fn lease_reserved(
 ) -> Result<(AttemptId, Fence)> {
     let row = read_job(tx, tenant, job)?;
     let fence = row.fence.next();
+    let attempt = AttemptId::new();
+    // Before the lease advances, so a resource this job cannot have leaves it queued rather than started.
+    if row.locks > 0 {
+        crate::locks::acquire(tx, tenant, job, attempt, fence, now)?;
+    }
     transition_from(
         tx,
         tenant,
@@ -345,7 +355,6 @@ pub fn lease_reserved(
         Event::Leased(fence),
         now,
     )?;
-    let attempt = AttemptId::new();
     tx.prepare_cached(
         "INSERT INTO attempts(id, tenant_id, job_id, fence, worker_id, lease_until_ms,
                               cpu_millis, memory_bytes, disk_bytes, offered_ms, repo_id)

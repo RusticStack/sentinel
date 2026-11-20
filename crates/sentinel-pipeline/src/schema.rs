@@ -30,11 +30,15 @@ pub const MAX_CHECKOUT_DEPTH: u32 = 10_000;
 /// A repository's name in its tenant, as the API stores it.
 pub const MAX_REPO_NAME_BYTES: usize = 256;
 pub const MAX_SECRETS: usize = 16;
+pub const MAX_LOCKS: usize = 4;
+pub const MAX_LOCK_NAME_BYTES: usize = 128;
 pub const MAX_RUN_BYTES: usize = 4096;
 pub const MAX_ID_BYTES: usize = 64;
 pub const MAX_CLASS_NAME: usize = 32;
 pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 60 * 60;
+/// How long a job waits for an external resource it declares no `wait` for.
+pub const DEFAULT_LOCK_WAIT_SECS: u64 = 10 * 60;
 /// The outputs one step may declare, and the most a job's steps may declare together.
 pub const MAX_STEP_OUTPUTS: usize = 8;
 pub const MAX_JOB_OUTPUTS: usize = 8;
@@ -80,6 +84,19 @@ pub struct Concurrency {
     pub cancel_in_progress: bool,
 }
 
+/// One named external resource — a database, a staging host, a device — a job needs to itself.
+///
+/// This is not a concurrency group. A group orders the runs of one repository and lets a younger run
+/// supersede an older one; a lock holds a thing outside Sentinel for one job at a time, across every
+/// repository of the tenant, and it is released when the attempt holding it ends, is cancelled or
+/// lets its lease lapse.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lock {
+    pub name: String,
+    /// How long the job may wait for the resource before it fails naming it.
+    pub wait_secs: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     pub image: String,
@@ -93,6 +110,13 @@ pub struct Job {
     pub steps: Vec<Step>,
     pub cache: Vec<Cache>,
     pub artifacts: Vec<Artifact>,
+    /// Named things outside Sentinel this job needs to itself while it runs. Deliberately absent from
+    /// the run spec's bytes: the store writes one `job_locks` row per resource when it creates the run,
+    /// so a spec is what a release without external resources writes for the same document and no
+    /// worker has to understand a lock. The digest covers the declaration, which is the pipeline's
+    /// identity; a decoded spec states none, and nothing after run creation reads them.
+    #[serde(skip)]
+    pub locks: Vec<Lock>,
     /// Values never appear in YAML; the worker injects a secret only if the repository was granted it.
     pub secrets: Vec<String>,
     /// Never exposed to a step: it authorizes only this job's image pull.
@@ -1689,6 +1713,10 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Res
         None => Vec::new(),
         Some(n) => secret_names(&map.child("secrets"), n)?,
     };
+    let locks = match map.take("locks") {
+        None => Vec::new(),
+        Some(n) => locks(&map.child("locks"), n)?,
+    };
     let registry_auth = match map.take("registry_auth") {
         None => None,
         Some(n) => {
@@ -1827,6 +1855,7 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Res
         steps,
         cache,
         artifacts,
+        locks,
         secrets,
         registry_auth,
         outputs,
@@ -1835,6 +1864,92 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Res
         history,
         checkouts,
     })
+}
+
+/// ```yaml
+/// locks: [db/staging]                              # shorthand for the default wait
+/// locks:
+///   - {name: db/staging, wait: 30m}
+/// ```
+fn locks(path: &str, node: &Node) -> Result<Vec<Lock>> {
+    let items = expect_seq(path, node, MAX_LOCKS)?;
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let at = format!("{path}[{i}]");
+        let (name, wait) = match item {
+            Node::Str(_) => (expect_str(&at, item, MAX_LOCK_NAME_BYTES)?, None),
+            Node::Map(_) => {
+                let mut map = Map::new(&at, item)?;
+                let name_path = map.child("name");
+                let name = map
+                    .take("name")
+                    .ok_or_else(|| err(&name_path, SchemaErrorKind::Missing))
+                    .and_then(|n| expect_str(&name_path, n, MAX_LOCK_NAME_BYTES))?;
+                let wait = match map.take("wait") {
+                    None => None,
+                    Some(n) => Some(wait_bound(&map.child("wait"), n)?),
+                };
+                map.finish()?;
+                (name, wait)
+            }
+            other => {
+                return Err(err(
+                    &at,
+                    SchemaErrorKind::WrongType {
+                        expected: "string",
+                        found: other.kind(),
+                    },
+                ));
+            }
+        };
+        if !valid_lock_name(name) {
+            return Err(err(
+                &at,
+                SchemaErrorKind::Invalid(
+                    "must name a resource in [A-Za-z0-9._:/-], at most 128 bytes, without a leading, \
+trailing or doubled `/`"
+                        .into(),
+                ),
+            ));
+        }
+        if out.iter().any(|lock: &Lock| lock.name == name) {
+            return Err(err(
+                &at,
+                SchemaErrorKind::Invalid(format!("duplicate lock `{name}`")),
+            ));
+        }
+        out.push(Lock {
+            name: name.to_owned(),
+            wait_secs: wait.unwrap_or(DEFAULT_LOCK_WAIT_SECS),
+        });
+    }
+    Ok(out)
+}
+
+fn wait_bound(path: &str, node: &Node) -> Result<u64> {
+    let s = expect_str(path, node, 32)?;
+    match parse_duration_secs(s) {
+        Some(0) | None => Err(err(
+            path,
+            SchemaErrorKind::Invalid("expected a positive duration such as 20m or 1h30m".into()),
+        )),
+        Some(secs) if secs > MAX_TIMEOUT_SECS => Err(err(
+            path,
+            SchemaErrorKind::Invalid(format!("exceeds the maximum of {MAX_TIMEOUT_SECS} seconds")),
+        )),
+        Some(secs) => Ok(secs),
+    }
+}
+
+/// A resource name identifies a thing outside Sentinel, so it is literal: no template, no expansion.
+fn valid_lock_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_LOCK_NAME_BYTES
+        && !s.starts_with('/')
+        && !s.ends_with('/')
+        && !s.contains("//")
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-' | b'/'))
 }
 
 fn job_env_has_name(env: &[(String, String)], name: &str) -> bool {

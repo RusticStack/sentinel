@@ -1,6 +1,6 @@
 # Cancellation, termination, timeouts and lease expiry
 
-Implemented in `sentinel-store::dispatch` (`cancel`, `cancel_run`, `cancel_requested`, `expired`, `expire`, `sweep_queue_timeouts`), the controller's dispatch pass, the `cancel` list on the heartbeat's `Pong`, `sentinel-worker::podman::terminate_named` and the executor's cancel and lease watchdog, with migration **16** (the two sweep indexes) and `sentinel admin cancel`.
+Implemented in `sentinel-store::dispatch` (`cancel`, `cancel_run`, `cancel_requested`, `expired`, `expire`, `sweep_queue_timeouts`, `locks::sweep_waits`), the controller's dispatch pass, the `cancel` list on the heartbeat's `Pong`, `sentinel-worker::podman::terminate_named` and the executor's cancel and lease watchdog, with migration **16** (the two sweep indexes) and `sentinel admin cancel`.
 
 ## Cancellation is desired state
 

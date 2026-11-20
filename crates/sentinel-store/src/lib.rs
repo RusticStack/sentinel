@@ -18,6 +18,7 @@ pub mod intake;
 pub mod jobs;
 pub mod known_sources;
 pub mod local_auth;
+pub mod locks;
 pub mod logs;
 pub mod lookup;
 pub mod mfa;
@@ -78,6 +79,8 @@ use rusqlite::{OpenFlags, TransactionBehavior};
 pub enum Error {
     Sqlite(rusqlite::Error),
     Conflict,
+    /// A named external resource a job needs is held by another job's live attempt.
+    Locked,
     NotFound,
     Forbidden,
     StepUpRequired,
@@ -115,6 +118,7 @@ impl fmt::Display for Error {
         match self {
             Self::Sqlite(e) => write!(f, "sqlite: {e}"),
             Self::Conflict => f.write_str("concurrent modification; retry from a fresh read"),
+            Self::Locked => f.write_str("external resource held by another job"),
             Self::NotFound => f.write_str("not found"),
             Self::Forbidden => f.write_str("forbidden"),
             Self::StepUpRequired => f.write_str("step-up required"),
@@ -198,6 +202,7 @@ impl Error {
         match self {
             Self::Sqlite(_) => "sqlite",
             Self::Conflict => "conflict",
+            Self::Locked => "locked",
             Self::NotFound => "not_found",
             Self::Forbidden => "forbidden",
             Self::StepUpRequired => "step_up_required",

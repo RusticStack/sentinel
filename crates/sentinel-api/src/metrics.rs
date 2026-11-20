@@ -315,6 +315,7 @@ pub(crate) fn render(state: &State) -> String {
         ("log_refused", &s.log_refused),
         ("expired", &s.expired),
         ("queue_timeouts", &s.queue_timeouts),
+        ("lock_timeouts", &s.lock_timeouts),
         ("abandoned", &s.abandoned),
         ("artifacts", &s.artifacts),
         ("bulk_attached", &s.bulk_attached),

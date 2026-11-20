@@ -1,0 +1,5 @@
+# expect: expected a positive duration
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, locks: [{name: db/staging, wait: 0s}], steps: [{id: s, run: x}]}
