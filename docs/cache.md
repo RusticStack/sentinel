@@ -76,7 +76,7 @@ A cache must degrade a build to a rebuild, never break it: every failure mode ab
 
 A sealed generation is immutable forever — a job never writes into the store. Preparation (`attempt.rs`, after checkout and image pull, before container start) gives every declared `cache:` entry a private writable view:
 
-1. The key renders against the fresh checkout — `hash_files` reads real bytes — with a 1024-byte cap (`attach::MAX_KEY_BYTES`). A key that will not render is an explainable miss, not a failure.
+1. The key renders against the fresh checkout — `hash_files` reads real bytes — with a 1024-byte cap (`attach::MAX_KEY_BYTES`). A key that will not render is an explainable miss, not a failure. A key that names `${{ inputs.<name> }}` renders this run's value, so a dispatch with a different value gets a different entry; a key that names no input is the same for every value of one pipeline ([pipeline schema](pipeline-schema.md#inputs)).
 2. `entry/current` names the live generation; it is read bounded (128 bytes) and must name a `gen-<unix_ms>-<rand>`-shaped directory.
 3. `manifest::lookup` reads the manifest and applies the request's boundary — the `Miss` vocabulary above is the whole answer set.
 4. An entry that has a `current` is pinned with a `lease` (`Lease::acquire`, the attempt id as owner, `DEFAULT_TTL`) *before* the pointer is trusted: `current` is read again under the pin, so a sweep can never take the generation between the lookup and the clone (an entry without `current` is the common miss and takes no pin). The `files` blob's BLAKE3 digest is verified against the manifest — that one digest is the trust anchor for the whole payload, so materialization skips per-file hashing (re-reading every byte would defeat reflinking).

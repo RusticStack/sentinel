@@ -159,7 +159,11 @@ impl Fetch for GitFetch {
 
 /// A compiled pipeline pinned at one revision and ready to create a run from — or the outcome that
 /// says why this revision cannot run.
-type Pinned = std::result::Result<(RunSpec, Vec<(String, String)>), Outcome>;
+/// Every pipeline of one document the event matched, with its images resolved.
+type Pinned = std::result::Result<Vec<(RunSpec, Vec<(String, String)>)>, Outcome>;
+
+/// A pinned pipeline with the provenance its run records, ready to create.
+type Part = (RunSpec, Vec<(String, String)>, Provenance);
 
 pub struct Resolver {
     store: Arc<Store>,
@@ -444,7 +448,7 @@ impl Resolver {
                 now,
             );
         };
-        let (spec, images) = match self.pinned_run(
+        let ready = match self.pinned_runs(
             &binding,
             &text,
             &fetched.commit,
@@ -454,19 +458,25 @@ impl Resolver {
             Ok(ready) => ready,
             Err(outcome) => return self.settle(delivery, outcome, now),
         };
-
-        let provenance = plan.provenance(delivery, &binding, &spec, &fetched.commit);
+        let parts: Vec<Part> = ready
+            .into_iter()
+            .map(|(spec, images)| {
+                let provenance = plan.provenance(delivery, &binding, &spec, &fetched.commit);
+                (spec, images, provenance)
+            })
+            .collect();
         let dispatched = delivery.clone();
         // `now` predates the pipeline fetch: stamping jobs with it would count the fetch as queue time.
         let run = match self.store.writer().write(move |tx| {
-            intake::dispatch(
-                tx,
-                &dispatched,
-                &spec,
-                &images,
-                &provenance,
-                UnixMillis::steady(),
-            )
+            let parts: Vec<intake::Part<'_>> = parts
+                .iter()
+                .map(|(spec, images, provenance)| intake::Part {
+                    spec,
+                    images,
+                    provenance,
+                })
+                .collect();
+            intake::dispatch_all(tx, &dispatched, &parts, UnixMillis::steady())
         }) {
             Ok(run) => run,
             Err(StoreError::Conflict) => return Ok(Outcome::Skipped),
@@ -475,11 +485,14 @@ impl Resolver {
         Ok(Outcome::Dispatched { run })
     }
 
-    /// Compile the pipeline text fetched at `commit` and pin it, or say why it cannot run.
+    /// Compile the pipeline document fetched at `commit` and pin every pipeline it declares that
+    /// matches the event, or say why none of them can run.
     ///
-    /// A class the deployment does not define is refused before a run exists: the artifact could
-    /// never be recorded, so running the pipeline would only spend the work to fail it.
-    fn pinned_run(
+    /// Each pipeline is independent: its own triggers decide whether it runs, its own jobs are
+    /// pinned, and its own checks are published, so one pipeline refusing an artifact class or an
+    /// unpinned image never decides another's fate — everything here is resolved before any run
+    /// exists, so a refusal that touches one pipeline fails the delivery alone.
+    fn pinned_runs(
         &self,
         binding: &source::Binding,
         text: &str,
@@ -487,7 +500,7 @@ impl Resolver {
         checkout_ref: &str,
         event: &Event<'_>,
     ) -> Result<Pinned, StoreError> {
-        let compiled = match sentinel_pipeline::compile_str(text) {
+        let compiled = match sentinel_pipeline::compile_document(text) {
             Ok(compiled) => compiled,
             Err(e) => {
                 return Ok(Err(Outcome::Failed {
@@ -496,15 +509,19 @@ impl Resolver {
                 }));
             }
         };
-        if !compiled.on.admits(event) {
+        let admitted: Vec<_> = compiled
+            .into_iter()
+            .filter(|pipeline| pipeline.on.admits(event))
+            .collect();
+        if admitted.is_empty() {
             return Ok(Err(Outcome::Ignored("no_trigger")));
         }
         let classes = self
             .store
             .read(sentinel_store::retention::artifact_classes)?;
-        let declared = compiled
-            .jobs
+        let declared = admitted
             .iter()
+            .flat_map(|pipeline| pipeline.jobs.iter())
             .flat_map(|job| job.spec.artifacts.iter())
             .filter_map(|a| a.class.as_deref());
         if sentinel_store::retention::unknown_class(&classes, declared).is_some() {
@@ -521,19 +538,24 @@ impl Resolver {
                 detail: None,
             }));
         };
-        let Ok(spec) = RunSpec::new(source, compiled) else {
-            return Ok(Err(Outcome::Failed {
-                reason: "pipeline_invalid",
-                detail: None,
-            }));
-        };
-        let Ok(images) = runs::pinned_images(&spec) else {
-            return Ok(Err(Outcome::Failed {
-                reason: "image_unpinned",
-                detail: None,
-            }));
-        };
-        Ok(Ok((spec, images)))
+        let mut ready = Vec::with_capacity(admitted.len());
+        for pipeline in admitted {
+            let source = source.clone();
+            let Ok(spec) = RunSpec::new(source, pipeline) else {
+                return Ok(Err(Outcome::Failed {
+                    reason: "pipeline_invalid",
+                    detail: None,
+                }));
+            };
+            let Ok(images) = runs::pinned_images(&spec) else {
+                return Ok(Err(Outcome::Failed {
+                    reason: "image_unpinned",
+                    detail: None,
+                }));
+            };
+            ready.push((spec, images));
+        }
+        Ok(Ok(ready))
     }
 
     /// One occurrence of a stored schedule: read the ref the schedule names, pin the commit it holds
@@ -627,7 +649,7 @@ impl Resolver {
             return self.settle_scheduled(claim, "pipeline_invalid", now);
         };
         let event = Event::schedule(&claim.schedule.ref_name);
-        let (spec, images) = match self.pinned_run(
+        let ready = match self.pinned_runs(
             &binding,
             &text,
             &fetched.commit,
@@ -641,35 +663,42 @@ impl Resolver {
             }
             Err(_) => return self.settle_scheduled(claim, "pipeline_invalid", now),
         };
-        let provenance = Provenance {
-            tenant,
-            repo,
-            trigger: "schedule".into(),
-            delivery: None,
-            provider: None,
-            ref_name: Some(claim.schedule.ref_name.clone()),
-            old_sha: None,
-            new_sha: Some(fetched.commit.clone()),
-            head_sha: None,
-            base_sha: None,
-            merge_sha: None,
-            pipeline_sha: fetched.commit.clone(),
-            pipeline_path: Some(binding.metadata.binding.pipeline_path.clone()),
-            pipeline_digest: spec.pipeline.digest.to_le_bytes(),
-            pr_number: None,
-            group_ref: None,
-        };
+        let parts: Vec<Part> = ready
+            .into_iter()
+            .map(|(spec, images)| {
+                let provenance = Provenance {
+                    tenant,
+                    repo,
+                    trigger: "schedule".into(),
+                    delivery: None,
+                    provider: None,
+                    ref_name: Some(claim.schedule.ref_name.clone()),
+                    old_sha: None,
+                    new_sha: Some(fetched.commit.clone()),
+                    head_sha: None,
+                    base_sha: None,
+                    merge_sha: None,
+                    pipeline_sha: fetched.commit.clone(),
+                    pipeline_path: Some(binding.metadata.binding.pipeline_path.clone()),
+                    pipeline_digest: spec.pipeline.digest.to_le_bytes(),
+                    pr_number: None,
+                    group_ref: None,
+                };
+                (spec, images, provenance)
+            })
+            .collect();
         let dispatched = claim.clone();
         // `now` predates the resolution: stamping jobs with it would count the fetch as queue time.
         match self.store.writer().write(move |tx| {
-            sentinel_store::schedule::dispatch(
-                tx,
-                &dispatched,
-                &spec,
-                &images,
-                &provenance,
-                UnixMillis::steady(),
-            )
+            let parts: Vec<intake::Part<'_>> = parts
+                .iter()
+                .map(|(spec, images, provenance)| intake::Part {
+                    spec,
+                    images,
+                    provenance,
+                })
+                .collect();
+            sentinel_store::schedule::dispatch_all(tx, &dispatched, &parts, UnixMillis::steady())
         }) {
             Ok(run) => Ok(Outcome::Dispatched { run }),
             Err(StoreError::Conflict) => Ok(Outcome::Skipped),

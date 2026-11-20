@@ -37,7 +37,7 @@ ownership on each request.
 | `get_analysis` | One attempt's stored AI analysis with every claim's citations resolved; labelled inference | `logs:read` plus repository read |
 | `get_logs` | At most 10 frames from one log page | `logs:read` plus repository read |
 | `explain_queue` | Bounded tenant queue and placement reasons | `runs:read` plus tenant membership |
-| `validate_pipeline` | Local bounded YAML decode and compile | Local; no credential scope |
+| `validate_pipeline` | Local bounded YAML decode and compile; one `sentinel.explain/1` object for a document with one pipeline, and `{"schema":"sentinel.explain/1","pipelines":[…]}` for a document that declares several | Local; no credential scope |
 | `suggest_workflow_change` | One whole-line rewrite for a construct the workflow rule table marks unsupported, validated before it is offered | Local; no credential scope |
 | `dispatch` | Compile, pin and dispatch an exact source revision | `runs:write` plus repository run permission |
 | `rerun_job`, `cancel` | Start an attempt or request cancellation | `runs:write` plus repository run permission |

@@ -4,18 +4,72 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     expr::{Phase, Template},
+    input::Inputs,
     policy::Triggers,
-    schema::{ArtifactWhen, Job, Pipeline, Step},
+    schema::{ArtifactWhen, Document, Job, Pipeline, Step},
 };
 
 pub const MAX_STEPS_TOTAL: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledPipeline {
+    /// `None` is the document's unnamed pipeline, whose check identity is the one schema 1 published.
+    pub name: Option<String>,
     pub on: Triggers,
     pub concurrency: Option<crate::schema::Concurrency>,
+    pub inputs: Inputs,
     pub jobs: Vec<CompiledJob>,
     pub digest: u128,
+}
+
+impl CompiledPipeline {
+    /// The aggregate check this pipeline publishes: `sentinel / ci` unnamed, `sentinel / <name>` named.
+    pub fn aggregate_check(&self) -> String {
+        aggregate_check_name(self.name.as_deref())
+    }
+
+    /// One job's check. A named pipeline namespaces its jobs, so two pipelines of one repository
+    /// can both have a `test` job without publishing over each other.
+    pub fn job_check(&self, job: &str) -> String {
+        job_check_name(self.name.as_deref(), job)
+    }
+}
+
+/// `sentinel / ci` — the aggregate schema 1 has always published, kept byte for byte for a document
+/// that declares no named pipelines.
+pub const AGGREGATE_PREFIX: &str = "sentinel / ";
+pub const DEFAULT_AGGREGATE: &str = "sentinel / ci";
+
+pub fn aggregate_check_name(pipeline: Option<&str>) -> String {
+    match pipeline {
+        None => DEFAULT_AGGREGATE.to_owned(),
+        Some(name) => {
+            let mut out = String::with_capacity(AGGREGATE_PREFIX.len() + name.len());
+            out.push_str(AGGREGATE_PREFIX);
+            out.push_str(name);
+            out
+        }
+    }
+}
+
+pub fn job_check_name(pipeline: Option<&str>, job: &str) -> String {
+    let mut out = match pipeline {
+        None => {
+            let mut out = String::with_capacity(AGGREGATE_PREFIX.len() + job.len());
+            out.push_str(AGGREGATE_PREFIX);
+            out
+        }
+        Some(name) => {
+            let mut out =
+                String::with_capacity(AGGREGATE_PREFIX.len() + name.len() + job.len() + 3);
+            out.push_str(AGGREGATE_PREFIX);
+            out.push_str(name);
+            out.push_str(" / ");
+            out
+        }
+    };
+    out.push_str(job);
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,10 +116,26 @@ pub enum CompileError {
     },
     Expression {
         path: String,
-        message: &'static str,
+        message: String,
     },
     /// Canonical encoding failed. Hashing nothing instead would give two pipelines the same identity.
     Encoding,
+    /// A namespace the document gives two meanings: the check a repository protects must name one.
+    CheckNameConflict {
+        name: String,
+        first: String,
+        second: String,
+    },
+    /// An event-driven or scheduled run cannot supply a value, so a required input would leave it invalid.
+    RequiredInputWithoutDefault {
+        pipeline: Option<String>,
+        input: String,
+    },
+    /// An expression names an input its pipeline declares nothing about.
+    UnknownInput {
+        path: String,
+        input: String,
+    },
 }
 
 impl fmt::Display for CompileError {
@@ -99,6 +169,30 @@ impl fmt::Display for CompileError {
             Self::TooManySteps { limit } => write!(f, "jobs: more than {limit} steps in total"),
             Self::Expression { path, message } => write!(f, "{path}: {message}"),
             Self::Encoding => f.write_str("jobs: cannot encode the canonical form for the digest"),
+            Self::CheckNameConflict {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "{second}: check `{name}` is also {first}; name one of them differently"
+            ),
+            Self::RequiredInputWithoutDefault { pipeline, input } => match pipeline {
+                Some(p) => write!(
+                    f,
+                    "pipelines.{p}.inputs.{input}: a required input needs a default unless the pipeline runs only from a manual dispatch"
+                ),
+                None => write!(
+                    f,
+                    "inputs.{input}: a required input needs a default unless the pipeline runs only from a manual dispatch"
+                ),
+            },
+            Self::UnknownInput { path, input } => {
+                write!(
+                    f,
+                    "{path}: `inputs.{input}` names no input this pipeline declares"
+                )
+            }
         }
     }
 }
@@ -109,7 +203,7 @@ fn check_refs(path: String, refs: &[String], needs: &[String]) -> Result<(), Com
         None => Ok(()),
         Some(_) => Err(CompileError::Expression {
             path,
-            message: "needs.<job> may only name a job listed in this job's `needs`",
+            message: "needs.<job> may only name a job listed in this job's `needs`".to_owned(),
         }),
     }
 }
@@ -118,25 +212,35 @@ fn check_template(
     path: String,
     t: &Template,
     needs: &[String],
+    inputs: &Inputs,
     max: Phase,
 ) -> Result<(), CompileError> {
     if t.min_phase() > max {
         return Err(CompileError::Expression {
             path,
-            message: "uses context that is not available where this value is rendered",
+            message: "uses context that is not available where this value is rendered".to_owned(),
         });
     }
     let mut refs = Vec::new();
     t.referenced_needs(&mut refs);
-    check_refs(path, &refs, needs)
+    check_refs(path.clone(), &refs, needs)?;
+    let mut used = Vec::new();
+    t.referenced_inputs(&mut used);
+    if let Some(input) = used.iter().find(|name| inputs.get(name).is_none()) {
+        return Err(CompileError::UnknownInput {
+            path,
+            input: input.clone(),
+        });
+    }
+    Ok(())
 }
 
-fn check_job(name: &str, job: &Job) -> Result<(), CompileError> {
+fn check_job(name: &str, job: &Job, inputs: &Inputs) -> Result<(), CompileError> {
     if let Some(cond) = &job.condition {
         if cond.min_phase() > Phase::Schedule {
             return Err(CompileError::Expression {
                 path: format!("jobs.{name}.if"),
-                message: "job conditions cannot use hash_files; use a step condition",
+                message: "job conditions cannot use hash_files; use a step condition".to_owned(),
             });
         }
         let mut refs = Vec::new();
@@ -167,6 +271,7 @@ fn check_job(name: &str, job: &Job) -> Result<(), CompileError> {
             format!("jobs.{name}.cache.{}.key", c.name),
             &c.key,
             &job.needs,
+            inputs,
             Phase::Worker,
         )?;
         if job.cache[..i].iter().any(|o| o.name == c.name) {
@@ -187,12 +292,91 @@ fn check_job(name: &str, job: &Job) -> Result<(), CompileError> {
     Ok(())
 }
 
-pub fn compile(pipeline: Pipeline) -> Result<CompiledPipeline, CompileError> {
+/// Every pipeline one document declares, in a fixed order: the unnamed one first, then the named
+/// ones ascending by name.
+pub fn compile_document(document: Document) -> Result<Vec<CompiledPipeline>, CompileError> {
+    let Document { default, named } = document;
+    let mut compiled: Vec<CompiledPipeline> = Vec::with_capacity(named.len() + 1);
+    if let Some(pipeline) = default {
+        compiled.push(compile_pipeline(None, pipeline)?);
+    }
+    for (name, pipeline) in named {
+        compiled.push(compile_pipeline(Some(name), pipeline)?);
+    }
+    check_identities(&compiled)?;
+    Ok(compiled)
+}
+
+/// A check name means one thing in a repository: two declarations cannot give it two meanings.
+///
+/// The rule reads nothing but the document. No name is reserved — a repository may call a pipeline
+/// anything `[a-z0-9][a-z0-9_-]*` allows — because the only collision that exists is one the
+/// document makes itself, between a named pipeline's aggregate and another pipeline's job, or
+/// between the unnamed pipeline's `sentinel / ci` and a pipeline named `ci`.
+fn check_identities(pipelines: &[CompiledPipeline]) -> Result<(), CompileError> {
+    // The unnamed pipeline keeps the names it has always published, its own aggregate included: a
+    // document that compiled before this schema reads the same way, so nothing it declared moves.
+    let mut seen: Vec<(String, Option<String>, String)> = Vec::new();
+    let mut record = |name: String,
+                      pipeline: Option<&str>,
+                      owner: String|
+     -> Result<(), CompileError> {
+        match seen.iter().find(|(existing, _, _)| *existing == name) {
+            None => {
+                seen.push((name, pipeline.map(str::to_owned), owner));
+                Ok(())
+            }
+            Some((_, first_pipeline, first)) if *first_pipeline == pipeline.map(str::to_owned) => {
+                Ok(())
+            }
+            Some((_, _, first)) => Err(CompileError::CheckNameConflict {
+                name,
+                first: first.clone(),
+                second: owner,
+            }),
+        }
+    };
+    for pipeline in pipelines {
+        let owner = match &pipeline.name {
+            Some(name) => format!("pipelines.{name}"),
+            None => "the unnamed pipeline".to_owned(),
+        };
+        record(
+            pipeline.aggregate_check(),
+            pipeline.name.as_deref(),
+            owner.clone(),
+        )?;
+        for job in &pipeline.jobs {
+            record(
+                pipeline.job_check(&job.name),
+                pipeline.name.as_deref(),
+                format!("{owner}'s job `{}`", job.name),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub fn compile_pipeline(
+    name: Option<String>,
+    pipeline: Pipeline,
+) -> Result<CompiledPipeline, CompileError> {
     let Pipeline {
         on,
         concurrency,
+        inputs,
         jobs,
     } = pipeline;
+    // An event-driven or scheduled run has no caller to ask for a value, so a required input there
+    // could only fail the run; the declaration is refused instead, before any run exists.
+    if !on.manual_only()
+        && let Some(input) = inputs.iter().find(|(_, spec)| spec.default.is_none())
+    {
+        return Err(CompileError::RequiredInputWithoutDefault {
+            pipeline: name.clone(),
+            input: input.0.clone(),
+        });
+    }
     let total_steps: usize = jobs.iter().map(|(_, j)| j.steps.len()).sum();
     if total_steps > MAX_STEPS_TOTAL {
         return Err(CompileError::TooManySteps {
@@ -205,22 +389,24 @@ pub fn compile(pipeline: Pipeline) -> Result<CompiledPipeline, CompileError> {
 
     let n = sorted.len();
     let mut needs_idx: Vec<Vec<u16>> = Vec::with_capacity(n);
-    for (name, job) in &sorted {
-        check_job(name, job)?;
+    for (job_name, job) in &sorted {
+        check_job(job_name, job, &inputs)?;
         let mut idx = Vec::with_capacity(job.needs.len());
         for dep in &job.needs {
-            if dep == name {
-                return Err(CompileError::SelfDependency { job: name.clone() });
+            if dep == job_name {
+                return Err(CompileError::SelfDependency {
+                    job: job_name.clone(),
+                });
             }
             let Some(i) = index_of(dep) else {
                 return Err(CompileError::UnknownDependency {
-                    job: name.clone(),
+                    job: job_name.clone(),
                     needs: dep.clone(),
                 });
             };
             if idx.contains(&(i as u16)) {
                 return Err(CompileError::DuplicateDependency {
-                    job: name.clone(),
+                    job: job_name.clone(),
                     needs: dep.clone(),
                 });
             }
@@ -284,10 +470,12 @@ pub fn compile(pipeline: Pipeline) -> Result<CompiledPipeline, CompileError> {
         });
     }
     let jobs: Vec<CompiledJob> = compiled.into_iter().map(|j| j.expect("placed")).collect();
-    let digest = digest_of(&on, concurrency.as_ref(), &jobs)?;
+    let digest = digest_of(name.as_deref(), &on, concurrency.as_ref(), &inputs, &jobs)?;
     Ok(CompiledPipeline {
+        name,
         on,
         concurrency,
+        inputs,
         jobs,
         digest,
     })
@@ -357,12 +545,34 @@ fn digest_step(d: &mut Digest, s: &Step) -> Result<(), CompileError> {
 }
 
 fn digest_of(
+    name: Option<&str>,
     on: &Triggers,
     concurrency: Option<&crate::schema::Concurrency>,
+    inputs: &Inputs,
     jobs: &[CompiledJob],
 ) -> Result<u128, CompileError> {
     let mut d = Digest::new();
     d.str("sentinel.pipeline/5");
+    // Only when stated, so the digests a pipeline had before named pipelines stay the same.
+    if let Some(name) = name {
+        d.str("pipeline");
+        d.str(name);
+    }
+    if !inputs.is_empty() {
+        d.str("inputs");
+        d.u64(inputs.len() as u64);
+        for (input, spec) in inputs.iter() {
+            d.str(input);
+            d.encoded(&spec.kind)?;
+            match &spec.default {
+                None => d.u64(0),
+                Some(value) => {
+                    d.u64(1);
+                    d.encoded(value)?;
+                }
+            }
+        }
+    }
     d.u64(u64::from(on.push.is_some()));
     d.u64(u64::from(on.pull_request.is_some()));
     d.u64(u64::from(on.merge_group.is_some()));

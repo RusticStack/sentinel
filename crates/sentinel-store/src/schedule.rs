@@ -538,15 +538,13 @@ pub fn settle(
     Ok(())
 }
 
-/// Turn a claimed occurrence into a run of the pipeline pinned at `spec`'s revision, in the same
-/// transaction that records the occurrence, so a crash leaves neither a run without its occurrence
-/// nor an occurrence that claims a run it never created.
-pub fn dispatch(
+/// Turn a claimed occurrence into the runs of every pipeline it matches, in the same transaction
+/// that records the occurrence, so a crash leaves neither a run without its occurrence nor an
+/// occurrence that claims a run it never created. The occurrence names the first run.
+pub fn dispatch_all(
     tx: &Transaction<'_>,
     claim: &Claim,
-    spec: &sentinel_pipeline::RunSpec,
-    images: &[(String, String)],
-    provenance: &Provenance,
+    parts: &[crate::intake::Part<'_>],
     now: UnixMillis,
 ) -> Result<RunId> {
     let changed = tx.execute(
@@ -558,15 +556,25 @@ pub fn dispatch(
         return Err(Error::Conflict);
     }
     let (tenant, repo) = (claim.schedule.tenant, claim.schedule.repo);
-    let run = RunId::new();
-    let jobs = crate::runs::create_run(tx, tenant, repo, run, spec, now)?;
-    for (job, (digest, platform)) in jobs.iter().zip(images) {
-        crate::runs::resolve_image(tx, tenant, *job, digest, platform)?;
+    let mut first: Option<RunId> = None;
+    for part in parts {
+        if part.images.len() != part.spec.pipeline.jobs.len() {
+            return Err(Error::InvalidInput("resolved images"));
+        }
+        let run = RunId::new();
+        let jobs = crate::runs::create_run(tx, tenant, repo, run, part.spec, now)?;
+        for (job, (digest, platform)) in jobs.iter().zip(part.images) {
+            crate::runs::resolve_image(tx, tenant, *job, digest, platform)?;
+        }
+        crate::provenance::insert(tx, part.provenance, run, now)?;
+        crate::runs::apply_concurrency(tx, tenant, run, now)?;
+        crate::dispatch::release_dependents(tx, tenant, run, now)?;
+        crate::checks::record_run(tx, tenant, run, now)?;
+        first = first.or(Some(run));
     }
-    crate::provenance::insert(tx, provenance, run, now)?;
-    crate::runs::apply_concurrency(tx, tenant, run, now)?;
-    crate::dispatch::release_dependents(tx, tenant, run, now)?;
-    crate::checks::record_run(tx, tenant, run, now)?;
+    let run = first.ok_or(Error::InvalidInput(
+        "a scheduled occurrence runs a pipeline",
+    ))?;
     let changed = tx.execute(
         "UPDATE schedule_occurrences SET state = 2, run_id = ?3
          WHERE schedule_id = ?1 AND at_ms = ?2 AND state = 1",
@@ -580,6 +588,26 @@ pub fn dispatch(
         params![repo.as_bytes(), claim.at_ms, run.as_bytes(), now.0],
     )?;
     Ok(run)
+}
+
+pub fn dispatch(
+    tx: &Transaction<'_>,
+    claim: &Claim,
+    spec: &sentinel_pipeline::RunSpec,
+    images: &[(String, String)],
+    provenance: &Provenance,
+    now: UnixMillis,
+) -> Result<RunId> {
+    dispatch_all(
+        tx,
+        claim,
+        &[crate::intake::Part {
+            spec,
+            images,
+            provenance,
+        }],
+        now,
+    )
 }
 
 /// Settled occurrence rows older than `before`, a bounded batch at a time.

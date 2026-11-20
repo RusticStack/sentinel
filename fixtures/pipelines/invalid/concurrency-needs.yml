@@ -1,4 +1,4 @@
-# expect: concurrency.group: may only use event, repo and run context
+# expect: concurrency.group: may only use event, repo, run and inputs context
 schema: 1
 on: [push]
 concurrency: {group: "${{ hash_files('x') }}"}

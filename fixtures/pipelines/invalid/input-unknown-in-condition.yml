@@ -1,0 +1,12 @@
+# expect: `inputs.verbose` names no input this pipeline declares
+schema: 1
+pipelines:
+  focus:
+    on: [manual]
+    inputs:
+      full: {type: boolean, default: false}
+    jobs:
+      a:
+        image: busybox
+        if: ${{ inputs.verbose }}
+        steps: [{id: s, run: echo}]

@@ -323,22 +323,26 @@ fn aggregate_content(
 struct RunFacts {
     repo: RepoId,
     head_sha: String,
+    /// The named pipeline the run belongs to; `None` is the document's unnamed one.
+    pipeline: Option<String>,
 }
 
 fn run_facts(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Option<RunFacts>> {
-    let row: Option<(String, [u8; 16], i64, Option<String>)> = conn
+    /// `(head sha, repository, forge association, trigger, pipeline)`.
+    type Row = (String, [u8; 16], i64, Option<String>, Option<String>);
+    let row: Option<Row> = conn
         .prepare_cached(
-            "SELECT COALESCE(p.head_sha, r.source_sha), r.repo_id, (b.installation_id IS NOT NULL), p.trigger
+            "SELECT COALESCE(p.head_sha, r.source_sha), r.repo_id, (b.installation_id IS NOT NULL), p.trigger, r.pipeline
              FROM runs r
              LEFT JOIN source_bindings b ON b.repo_id = r.repo_id AND b.revoked = 0
              LEFT JOIN run_provenance p ON p.run_id = r.id
              WHERE r.id = ?1 AND r.tenant_id = ?2",
         )?
         .query_row(params![run.as_bytes(), tenant.as_bytes()], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })
         .optional()?;
-    let Some((head_sha, repo, forge, trigger)) = row else {
+    let Some((head_sha, repo, forge, trigger, pipeline)) = row else {
         return Ok(None);
     };
     let event_driven = matches!(
@@ -351,6 +355,7 @@ fn run_facts(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Option<R
     Ok(Some(RunFacts {
         repo: RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?,
         head_sha,
+        pipeline,
     }))
 }
 
@@ -454,7 +459,7 @@ pub fn record_run(
                 run: Some(run),
                 delivery: None,
                 scope: &scope,
-                name: &qualified_name(job_name),
+                name: &qualified_name_for(facts.pipeline.as_deref(), job_name),
                 head_sha: &facts.head_sha,
                 external: external_id(run, &scope),
                 status,
@@ -475,6 +480,17 @@ pub fn qualified_name(job: &str) -> String {
     name.push_str(JOB_PREFIX);
     name.push_str(job);
     name
+}
+
+/// The check a job of a run publishes: namespaced by its pipeline when that pipeline is named, and
+/// exactly the name schema 1 published when it is not.
+pub fn qualified_name_for(pipeline: Option<&str>, job: &str) -> String {
+    sentinel_pipeline::job_check_name(pipeline, job)
+}
+
+/// The aggregate a run publishes: `sentinel / ci` unnamed, `sentinel / <name>` named.
+pub fn aggregate_name(pipeline: Option<&str>) -> String {
+    sentinel_pipeline::compile::aggregate_check_name(pipeline)
 }
 
 fn record_aggregate(
@@ -509,6 +525,7 @@ fn record_aggregate(
         return Err(e);
     }
     let (status, conclusion, title, summary) = content?;
+    let name = aggregate_name(facts.pipeline.as_deref());
     upsert(
         tx,
         Draft {
@@ -517,7 +534,7 @@ fn record_aggregate(
             run: Some(run),
             delivery: None,
             scope: AGGREGATE_SCOPE,
-            name: AGGREGATE_NAME,
+            name: &name,
             head_sha: &facts.head_sha,
             external: external_id(run, AGGREGATE_SCOPE),
             status,
@@ -569,7 +586,7 @@ pub fn record_job(
             run: Some(run),
             delivery: None,
             scope: &scope,
-            name: &qualified_name(&name),
+            name: &qualified_name_for(facts.pipeline.as_deref(), &name),
             head_sha: &facts.head_sha,
             external: external_id(run, &scope),
             status,

@@ -381,11 +381,10 @@ impl Backend for Stdio<'_> {
     }
 
     fn validate_pipeline(&mut self, pipeline: &str) -> Result<Value, Value> {
-        match sentinel_pipeline::compile_str(pipeline) {
-            Ok(compiled) => serde_json::to_value(sentinel_pipeline::Explanation::of(&compiled))
-                .map_err(|_| {
-                    local_error("internal", "could not serialize the pipeline explanation")
-                }),
+        match sentinel_pipeline::compile_document(pipeline) {
+            Ok(pipelines) => explain_document(&pipelines).map_err(|_| {
+                local_error("internal", "could not serialize the pipeline explanation")
+            }),
             Err(error) => Err(pipeline_error(&error)),
         }
     }
@@ -487,6 +486,20 @@ impl Backend for Stdio<'_> {
     }
 }
 
+/// One pipeline answers the explanation it always did; a document with several answers them as a list.
+fn explain_document(
+    pipelines: &[sentinel_pipeline::CompiledPipeline],
+) -> std::result::Result<Value, serde_json::Error> {
+    let values: Vec<Value> = pipelines
+        .iter()
+        .map(|p| serde_json::to_value(sentinel_pipeline::Explanation::of(p)))
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(match values.len() {
+        1 => values.into_iter().next().unwrap_or(Value::Null),
+        _ => json!({"schema": "sentinel.explain/1", "pipelines": values}),
+    })
+}
+
 fn pipeline_error(error: &sentinel_pipeline::Error) -> Value {
     let (stage, position) = match error {
         sentinel_pipeline::Error::Yaml(error) => (
@@ -495,6 +508,7 @@ fn pipeline_error(error: &sentinel_pipeline::Error) -> Value {
         ),
         sentinel_pipeline::Error::Schema(_) => ("schema", None),
         sentinel_pipeline::Error::Compile(_) => ("compile", None),
+        sentinel_pipeline::Error::Ambiguous { .. } => ("compile", None),
     };
     let message = match stage {
         "yaml" => "pipeline YAML is invalid",
