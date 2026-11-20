@@ -1,0 +1,22 @@
+[package]
+name = "sentinel-registry"
+description = "Worker-host registry pull-through cache: an OCI distribution endpoint answering image pulls from verified local disk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+blake3 = "1.8"
+ring = "0.17"
+sentinel-protocol = { path = "../sentinel-protocol" }
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+ring = "0.17"
+tempfile = "3.20"
+
+[lints]
+workspace = true
