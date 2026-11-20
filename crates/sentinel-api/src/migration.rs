@@ -33,12 +33,16 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::http::Request;
-use crate::routes::{Route, body, body_limit, err, identify, ok, parse, store_error};
+use crate::routes::{Route, body, body_limit, err, identify, ok, parse, query_param, store_error};
 use crate::{State, auth};
 
 /// The answer a migration write states: a versioned contract, so a client can branch on it
 /// ([compatibility](../../../docs/compatibility.md)).
 pub const PULL_REQUEST_SCHEMA: &str = "sentinel.migration-pull-request/1";
+
+/// The answer the workflow read states: the bytes the preview is made from, so a client that
+/// cannot read a repository itself can still analyse one.
+pub const WORKFLOWS_SCHEMA: &str = "sentinel.migration-workflows/1";
 
 /// What a preview takes: the commit, the workflow files read at it, and whether the native
 /// plan is wanted.
@@ -181,6 +185,105 @@ fn workflow_json(workflow: &workflow::WorkflowPlan) -> Value {
         })),
         "native_refused": workflow.native_refused,
     })
+}
+
+/// `GET /api/v1/tenants/{slug}/repos/{name}/migration/workflows?commit=` — the workflow files the
+/// repository holds at a commit, as GitHub holds them, read through the App's migration token.
+/// The preview takes the files its caller read, so a client that holds no repository credential of
+/// its own — the web interface — analyses a repository through this read and then posts exactly
+/// these bytes back at the same commit ([workflow analysis](../../../docs/workflow-analysis.md)).
+/// Without a `commit` the read starts at the default branch's head and states which.
+pub(crate) fn workflows(
+    state: &State,
+    request: &Request,
+    slug: &str,
+    name: &str,
+    query: &str,
+) -> Route {
+    let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::TENANT_ADMIN)?;
+    let asked = query_param(query, "commit").map(str::to_ascii_lowercase);
+    if asked
+        .as_deref()
+        .is_some_and(|commit| !remote::commit_id(commit))
+    {
+        return Err(err(
+            ErrorCode::InvalidRequest,
+            "commit is not a full commit id",
+        ));
+    }
+    // The repository, its bound remote and the installation the read's token is minted for. A read
+    // writes nothing, so it records nothing and takes no gate beyond the tenant's administrator.
+    let (slug, name) = (slug.to_owned(), name.to_owned());
+    let principal = who.principal;
+    let (installation, account, forge_repo, bound_remote) = state
+        .store
+        .read(move |c| {
+            let tenant = authz::member_tenant_by_slug(c, principal, &slug)?;
+            let repo = lookup::repo_by_name(c, tenant, &name)?;
+            authz::require_tenant_admin(c, principal, tenant)?;
+            let grant = sources_forge::grant(c, tenant, repo)?;
+            let remote = sources::load_metadata(c, repo)?.binding.remote;
+            Ok((grant.installation, grant.account, grant.repo, remote))
+        })
+        .map_err(store_error)?;
+    let Some(app) = state.github_app.app() else {
+        return Err(err(
+            ErrorCode::Conflict,
+            "the controller has no GitHub App in force",
+        )
+        .with_detail("reason", "not_configured"));
+    };
+    let _slot = state
+        .github_app
+        .take_call()
+        .ok_or_else(crate::github_app::busy)?;
+    let (owner, repository) =
+        sentinel_github::checks::repository_path(&bound_remote).ok_or_else(|| {
+            err(
+                ErrorCode::Conflict,
+                "the repository is bound to a remote that is not a GitHub repository",
+            )
+            .with_detail("reason", "remote")
+        })?;
+    let token = match app.migration_token(
+        installation,
+        account,
+        forge_repo,
+        &bound_remote,
+        UnixMillis::now().0,
+    ) {
+        Ok(token) => token,
+        Err(sentinel_github::Error::Denied(_)) => {
+            return Err(err(
+                ErrorCode::Conflict,
+                "the GitHub App's installations do not grant what a migration reads with",
+            )
+            .with_detail("reason", "not_permitted"));
+        }
+        Err(error) => return Err(upstream(error)),
+    };
+    let (branch, commit) = match asked {
+        Some(commit) => (None, commit),
+        None => {
+            let branch = app
+                .branch_workflows(&token, &owner, &repository)
+                .map_err(upstream)?;
+            (Some(branch.name), branch.head)
+        }
+    };
+    let files = app
+        .workflows(&token, &owner, &repository, &commit)
+        .map_err(upstream)?;
+    ok(json!({
+        "schema": WORKFLOWS_SCHEMA,
+        "branch": branch,
+        "commit": commit,
+        "workflows": files.iter().map(|file| json!({
+            "path": file.path,
+            "text": file.text,
+        })).collect::<Vec<Value>>(),
+    }))
 }
 
 /// The parity report's shape ([compatibility](../docs/compatibility.md)).

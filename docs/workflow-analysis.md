@@ -134,6 +134,13 @@ same deployment showed. A file the analyzer would refuse — a closed workflow v
 document — is `invalid_request` with the analyzer's own message, and a commit with no workflow at all
 is `409` with `details.reason: "no_workflows"`.
 
+**What the interface reads.** The same files are what the wizard in the web interface analyses:
+`GET /api/v1/tenants/{slug}/repos/{name}/migration/workflows?commit=` answers them, at the commit
+named or at the default branch's head, through the same token — a browser holds no repository
+credential and the preview takes its files from the caller, so the read is what lets one analyse a
+repository. It answers `sentinel.migration-workflows/1` and writes nothing
+([API](api.md#routes)).
+
 **What it writes.** One commit, whose parent is the analysed commit and whose tree is that commit's
 tree with exactly the files the diff rewrote replaced, so the change is the label lines and nothing
 else. The branch name is a constant and the client refuses any other ref before it makes a request:
