@@ -596,13 +596,10 @@ mod tests {
             rewritten(sql(81)),
             ["storage_policies", "storage_policies_previous"]
         );
-        // The newest migration rebuilds the provenance table to drop its per-delivery uniqueness, so
-        // it visits every provenance row; a migration that only creates tables visits none.
-        assert_eq!(
-            rewritten(sql(schema::LATEST)),
-            ["run_provenance_084", "run_provenance"]
-        );
-        assert_eq!(rewritten(sql(schema::LATEST - 1)), Vec::<&str>::new());
+        // Migration 85 rebuilds the provenance table to drop its per-delivery uniqueness, so it
+        // visits every provenance row; the newest migration adds one column and visits none.
+        assert_eq!(rewritten(sql(85)), ["run_provenance_084", "run_provenance"]);
+        assert_eq!(rewritten(sql(schema::LATEST)), Vec::<&str>::new());
         // The OAuth scope rebuild copies every row into a `_v73` table and drops the original.
         let oauth = rewritten(sql(73));
         for table in ["oauth_clients", "oauth_grants", "oauth_access_tokens"] {

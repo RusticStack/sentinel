@@ -1,0 +1,8 @@
+# expect: jobs.a.finalize: unknown key `outputs`
+schema: 1
+on: [push]
+jobs:
+  a:
+    image: busybox
+    steps: [{id: one, run: x}]
+    finalize: {run: echo done, outputs: [version]}

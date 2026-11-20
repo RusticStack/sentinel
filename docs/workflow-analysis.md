@@ -96,7 +96,7 @@ The class is always a label the worker vocabulary accepts: `RunnerClass::parse` 
 | `container` | unsupported | needs a Docker daemon, which only a microVM sandbox offers (I08) |
 | `services` | unsupported | needs a Docker daemon (I08); service containers (I10) |
 | `environment` | unsupported | deployment environments are not modelled |
-| `outputs` | unsupported | declared outputs and artifact handoff (I04) |
+| `outputs` | with change | a job's outputs become each step's declared `outputs` and the job's re-exported `outputs`, plain text in the run's record |
 | `jobs.<id>.uses` | unsupported | reusable pipelines (I10) |
 | `continue-on-error` | unsupported | a failing step fails its job |
 | `shell: sh`, `shell: bash` | translatable | — |

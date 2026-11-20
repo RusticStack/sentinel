@@ -1,0 +1,28 @@
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: busybox
+    steps:
+      - id: version
+        run: printf 'version=%s\n' 1.4.0 >> "$SENTINEL_OUTPUT"
+        outputs: [version]
+      - id: package
+        run: tar czf dist.tgz app
+    outputs: [version]
+    artifacts:
+      - name: dist
+        paths: [dist.tgz]
+  publish:
+    image: busybox
+    needs: [build]
+    steps:
+      - id: upload
+        run: ./upload "dist.tgz"
+    handoff:
+      - from: build
+        artifact: dist
+        into: incoming
+    finalize:
+      run: echo "publish finished"
+      timeout: 30s

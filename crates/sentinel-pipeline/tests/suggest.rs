@@ -84,7 +84,7 @@ fn applied(text: &str, suggestion: &sentinel_pipeline::workflow::Suggestion) -> 
 
 #[test]
 fn every_offered_rewrite_applies_cleanly_and_leaves_every_other_fact_alone() {
-    let cases: [(&str, Option<&str>, Option<usize>, &str); 6] = [
+    let cases: [(&str, Option<&str>, Option<usize>, &str); 5] = [
         ("on", None, None, "pull_request"),
         (
             "continue-on-error",
@@ -93,7 +93,6 @@ fn every_offered_rewrite_applies_cleanly_and_leaves_every_other_fact_alone() {
             "continue-on-error",
         ),
         ("environment", Some("build"), None, "environment"),
-        ("outputs", Some("build"), None, "outputs"),
         ("shell", Some("build"), Some(0), "shell"),
         (
             "continue-on-error",
@@ -140,7 +139,24 @@ fn every_offered_rewrite_applies_cleanly_and_leaves_every_other_fact_alone() {
         assert_eq!(after.name, before.name);
         covered += 1;
     }
-    assert_eq!(covered, 6);
+    assert_eq!(covered, 5);
+}
+
+#[test]
+fn a_jobs_outputs_now_translate_rather_than_being_deleted() {
+    // I04 made `outputs` native: a step writes values under the names it declares and the job
+    // re-exports them, so no line can be dropped to port it. The refusal states that change
+    // instead of offering a rewrite that would silently lose the values.
+    let refused = suggest(&request(WORKFLOW, Some("build"), None, "outputs")).unwrap_err();
+    assert!(
+        matches!(refused, Refusal::Translates(Rule::WithChange { .. })),
+        "{refused:?}"
+    );
+    assert!(
+        refused.message().contains("plain text in the run's record"),
+        "{}",
+        refused.message()
+    );
 }
 
 #[test]

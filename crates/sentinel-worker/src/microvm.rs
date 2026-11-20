@@ -1917,6 +1917,25 @@ impl Vm {
         Ok(())
     }
 
+    /// Puts the host's output directory into the guest, at the path the container would mount it at.
+    pub fn deliver_outputs(&self, dir: &Path) -> Result<()> {
+        self.client
+            .put_dir(dir, &guest_path(crate::outputs::MOUNT), &[])?;
+        Ok(())
+    }
+
+    /// Brings the file the step wrote back into the host's output directory. A step that wrote none leaves the
+    /// host's empty file as it is: the file is skipped, not an error.
+    pub fn collect_outputs(&self, dir: &Path) -> Result<()> {
+        let mut budget = crate::outputs::MAX_FILE_BYTES as u64 + 4096;
+        self.client.get_into(
+            &guest_path(crate::outputs::MOUNT),
+            vec![crate::outputs::FILE.to_owned()],
+            dir,
+            &mut budget,
+        )
+    }
+
     /// Empties the guest's secret directories: nothing a step was given stays for the next one to read.
     pub fn retract_secrets(&self) -> Result<()> {
         self.client.send(&Request::Wipe {
