@@ -1,0 +1,59 @@
+# The runner image a worker starts in runner mode: the pinned official `actions/runner` and the
+# entry point the sandbox execs (docs/runner-mode.md#the-runner-image-and-its-update-policy).
+#
+#   podman build -f examples/Containerfile.runner -t sentinel-runner:2.338.2 .
+#
+# A worker takes this image by digest ([runner] image, docs/configuration.md#runner-image), so what it
+# runs is the digest the operator recorded, never a tag that moved. x86_64 (TARGETARCH=amd64) and
+# arm64 are the two architectures with a runner artifact: any other architecture fails the build
+# rather than producing an image whose runner cannot start.
+ARG BASE=docker.io/library/ubuntu@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289
+FROM ${BASE}
+
+# The version and the checksums are the release's own (actions/runner v2.338.2). Bumping the version
+# means moving its checksums in the same commit: the build refuses a tarball that does not match.
+ARG RUNNER_VERSION=2.338.2
+ARG RUNNER_SHA256_X64=baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40
+ARG RUNNER_SHA256_ARM64=670adb2f268fe21dcbb58b3db0e0aa9d5b3bddfe2c651481336e561ff86de945
+
+LABEL org.opencontainers.image.title="sentinel-runner" \
+      org.opencontainers.image.description="GitHub Actions runner for Sentinel runner mode" \
+      org.opencontainers.image.source="https://github.com/rusticstack/sentinel" \
+      io.sentinel.runner.version="${RUNNER_VERSION}"
+
+ARG DEBIAN_FRONTEND=noninteractive
+# Declared so BuildKit's per-target value (`amd64` or `arm64`) reaches the download below.
+ARG TARGETARCH
+# What the runner itself needs to run a job of any kind: a shell, git to check out, curl and jq for a
+# step, tar/gzip/unzip for an archive, and the CA bundle it dials GitHub with. Toolchains a workflow
+# expects are AR05's, not this image's.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bash ca-certificates curl git gzip jq libicu74 tar unzip \
+ && rm -rf /var/lib/apt/lists/*
+
+# The uid the sandbox runs as, with a home the runner owns: uid 1001, "runner", HOME=/home/runner.
+RUN groupadd --gid 1001 runner \
+ && useradd --uid 1001 --gid runner --create-home --home-dir /home/runner --shell /bin/bash runner
+
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+        amd64) arch=x64; sha="${RUNNER_SHA256_X64}" ;; \
+        arm64) arch=arm64; sha="${RUNNER_SHA256_ARM64}" ;; \
+        *) echo "unsupported TARGETARCH '${TARGETARCH}': only amd64 and arm64 carry a runner" >&2; exit 1 ;; \
+    esac; \
+    url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${arch}-${RUNNER_VERSION}.tar.gz"; \
+    curl -fsSL --retry 3 -o /tmp/runner.tar.gz "$url"; \
+    echo "${sha}  /tmp/runner.tar.gz" | sha256sum --strict --check -; \
+    tar -xzf /tmp/runner.tar.gz -C /home/runner; \
+    rm -f /tmp/runner.tar.gz; \
+    chown -R runner:runner /home/runner
+
+COPY --chmod=0755 examples/runner/sentinel-runner /usr/local/bin/sentinel-runner
+
+USER runner
+ENV HOME=/home/runner
+WORKDIR /home/runner
+# The sandbox execs this image's entry point by path and mounts /home/runner/_diag and /tmp as its own
+# tmpfs, so the entry point is also what a plain `docker run` with the configuration on stdin does.
+ENTRYPOINT ["/usr/local/bin/sentinel-runner"]

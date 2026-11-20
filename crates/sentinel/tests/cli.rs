@@ -345,6 +345,65 @@ placement_order = '{order}'",
     }
 
     #[test]
+    fn runner_mode_config_needs_a_pinned_image_an_endpoint_and_the_network() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("config.toml");
+        let data = temp.path().join("data");
+        let pinned = format!(
+            "ghcr.io/rusticstack/sentinel-runner@sha256:{}",
+            "ab".repeat(32)
+        );
+        let link = format!(
+            "controller = '127.0.0.1:7443'\ncontroller_fingerprint = '{}'\n",
+            "ab".repeat(32)
+        );
+        let check = |body: &str| {
+            fs::write(
+                &file,
+                format!("data_dir = '{}'\n{link}{body}", data.display()),
+            )
+            .unwrap();
+            let output = invoke(&["worker", "--config", file.to_str().unwrap(), "--check"]);
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        };
+        if cfg!(feature = "worker") {
+            // A tag names whatever the registry serves today, and this image is the code a job's
+            // steps run under.
+            let (code, stderr) = check(
+                "job_network = 'egress'\n[runner]\nimage = 'ghcr.io/rusticstack/sentinel-runner:latest'",
+            );
+            assert_eq!(code, Some(2));
+            assert!(stderr.contains("must be pinned by digest"), "{stderr}");
+            // A runner registers with GitHub and fetches its job from it, so a sandbox with no
+            // network can never come online: the registration would be spent for nothing.
+            for body in [
+                format!("[runner]\nimage = '{pinned}'"),
+                format!("job_network = 'none'\n[runner]\nimage = '{pinned}'"),
+            ] {
+                let (code, stderr) = check(&body);
+                assert_eq!(code, Some(2), "{body}");
+                assert!(
+                    stderr.contains("runner mode needs the network"),
+                    "{body}: {stderr}"
+                );
+            }
+            let (code, stderr) = check(&format!(
+                "job_network = 'egress'\n[runner]\nimage = '{pinned}'\nactions_address = 'not-an-address'"
+            ));
+            assert_eq!(code, Some(2));
+            assert!(stderr.contains("must be an IPv4 address"), "{stderr}");
+            let (code, stderr) = check(&format!(
+                "job_network = 'egress'\n[runner]\nimage = '{pinned}'\nactions_address = '10.0.2.2'"
+            ));
+            assert_eq!(code, Some(0), "{stderr}");
+        }
+        assert!(!data.exists());
+    }
+
+    #[test]
     fn rotation_fingerprints_are_bounded_worker_link_settings() {
         let temp = tempdir().unwrap();
         let file = temp.path().join("config.toml");

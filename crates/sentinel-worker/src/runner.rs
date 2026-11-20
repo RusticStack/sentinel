@@ -1,22 +1,25 @@
 //! Runner mode's sandbox on a worker (AR03's start, AR09's guarantees): one ephemeral GitHub Actions
 //! runner, in one container, with the just-in-time configuration GitHub issued for it.
 //!
-//! The configuration is a credential and this module is where it is spent. It never reaches a
-//! command line, an environment listing, a host file or the job's workspace: it is written to the
-//! runner's standard input, and the image's entry point ([`START`]) reads one line of it into a
-//! tmpfs inside the container ([`CONFIG_MOUNT`]) that no host path backs, then execs the runner with
-//! `--jitconfig`. Nothing on the host can read it, and the container is removed with it.
+//! The configuration is a credential and this module is where it is spent. It reaches the runner on
+//! its standard input and nowhere else on the host's side: the image's entry point ([`START`]) reads
+//! one line of it and execs the runner with `--jitconfig`, which is the one place the runner accepts
+//! it. The runner then writes its own settings (`.runner`, `.credentials`) into its installation
+//! directory **inside the container** — that is the runner's own design, and it is why the sandbox
+//! cannot have a read-only root — so the credential lives in the container's ephemeral layer, which
+//! is removed with the container and is never a path this worker manages, a log, a record or the
+//! job's workspace.
 //!
 //! The sandbox is what makes the rest of AR09 true:
 //!
-//! - **One runner per job.** The configuration is single-use at GitHub and at the store, and the
-//!   container runs the runner with `--ephemeral`, so the runner takes one job and exits by itself.
-//!   Killing it is therefore always safe: the job cannot come back to it.
-//! - **Nothing writable survives.** The image's root filesystem is read-only, every writable path
-//!   is a tmpfs or the scratch directory this module makes under the worker's data root, and
-//!   [`Plan::destroy`] removes the container and that directory. A worker that died leaves a named
-//!   container whose keepalive ends it and `--rm` removes it, plus one directory under the worker's
-//!   data root for the sweep to find; neither holds the configuration.
+//! - **One runner per job.** The configuration is single-use at GitHub and at the store, and a
+//!   just-in-time runner takes exactly one job and de-registers itself, so the runner exits by
+//!   itself. Killing it is therefore always safe: the job cannot come back to it.
+//! - **Nothing writable survives.** Everything a job can write is the container's own layer (gone
+//!   with the container, which is created `--rm`), a tmpfs, or the scratch directory this module
+//!   makes under the worker's data root; [`Plan::destroy`] removes the container and that
+//!   directory. A worker that died leaves a named container whose keepalive ends it, plus one
+//!   directory under the worker's data root for the sweep to find.
 //! - **No route to the host.** A granted egress is the operator's (`job_network = "egress"`), and
 //!   even then the container's namespace gets nftables refusals installed before the runner starts
 //!   (`rules_for`): the host's own addresses, loopback off `lo`, link-local and cloud metadata
@@ -57,15 +60,20 @@ pub const WORK_MOUNT: &str = "/home/runner/_work";
 pub const DIAG_MOUNT: &str = "/home/runner/_diag";
 pub const DIAG_BYTES: u64 = 64 << 20;
 
-/// The tmpfs the configuration is read into, inside the container and nowhere else. It is 0700,
-/// `noexec` and unmounted when the container goes, so the credential outlives neither.
-pub const CONFIG_MOUNT: &str = "/runner";
-pub const CONFIG_BYTES: u64 = 128 * 1024;
+/// Where a job's own temporary files go: a tmpfs, because the container's layer is the only other
+/// writable place and a job that fills its memory budget should not fill the worker's disk.
+pub const TMP_MOUNT: &str = "/tmp";
 
-/// The image's entry point: read one line of the encoded configuration from standard input into
-/// [`CONFIG_MOUNT`], unlink it, and exec the runner as `run.sh --jitconfig <config> --ephemeral`, so
-/// the runner takes one job and exits. The flags are the image's contract (AR05); the worker never
-/// passes the configuration as an argument.
+/// The uid and gid the runner image's user has, and the contract the image keeps (`USER runner`).
+/// The sandbox maps that user onto the worker's own account (`--userns keep-id`), so the host path
+/// this module mounts for the job's work is owned by exactly the identity the runner writes as,
+/// and nothing of the host is reachable under another one.
+pub const RUNNER_UID: u32 = 1001;
+pub const RUNNER_GID: u32 = 1001;
+
+/// The image's entry point: read one line of the encoded configuration from standard input and exec
+/// the runner with it. It is the image's contract (AR05); what it does with the value is described
+/// in [runner mode](../../../docs/runner-mode.md#the-configuration-is-a-credential).
 pub const START: &str = "/usr/local/bin/sentinel-runner";
 
 /// Where a sandbox's cache and artifact endpoint lives inside it: the anchor a client's Node runtime is
@@ -242,7 +250,6 @@ impl Plan {
             text(&mut args, value);
         }
         for pair in [
-            "--read-only",
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -260,13 +267,18 @@ impl Plan {
         ] {
             text(&mut args, pair.to_owned());
         }
-        if limits.disk_bytes > 0 {
-            text(&mut args, "--ulimit".to_owned());
-            text(&mut args, format!("fsize={0}:{0}", limits.disk_bytes));
-        }
+        text(&mut args, "--userns".to_owned());
+        text(
+            &mut args,
+            format!("keep-id:uid={RUNNER_UID},gid={RUNNER_GID}"),
+        );
+        // No host path backs either tmpfs, so neither a job's output nor the runner's settings
+        // reach the worker's disk. They keep the runtime's default mode (1777 inside a container
+        // whose only user is the runner): `--tmpfs` refuses `uid=` and `gid=`, which is why the
+        // runner's own directory is the image's and the mounts are not owned by it explicitly.
         for tmpfs in [
-            format!("{CONFIG_MOUNT}:rw,nosuid,nodev,noexec,mode=0700,size={CONFIG_BYTES}"),
             format!("{DIAG_MOUNT}:rw,nosuid,nodev,size={DIAG_BYTES}"),
+            format!("{TMP_MOUNT}:rw,nosuid,nodev,size={}", limits.memory_bytes),
         ] {
             text(&mut args, "--tmpfs".to_owned());
             text(&mut args, tmpfs);
@@ -772,17 +784,54 @@ mod tests {
     fn the_runner_takes_one_job_and_its_configuration_is_not_on_the_command_line() {
         let plan = plan(Network::None, &guard());
         let args = joined(plan.args());
-        // The container is removed with the runner, and its writable paths are tmpfs or scratch.
+        // The container is removed with the runner, and every writable path a job gets is a tmpfs or
+        // this lease's own scratch directory.
         assert!(args.contains("--rm"), "{args}");
-        assert!(args.contains("--read-only"), "{args}");
-        assert!(args.contains(CONFIG_MOUNT), "{args}");
         assert!(args.contains(&format!("{WORK_MOUNT}:rw")), "{args}");
+        assert!(args.contains(&format!("{DIAG_MOUNT}:rw")), "{args}");
+        assert!(args.contains(&format!("{TMP_MOUNT}:rw")), "{args}");
         assert!(args.contains("--network none"), "{args}");
         assert!(args.contains("--entrypoint /bin/sh"), "{args}");
         assert!(!args.contains("--env-file"), "{args}");
         assert!(!args.contains("--jitconfig"), "{args}");
         // The container's keepalive is bounded, so a sandbox nobody stops cannot outlive it.
         assert!(args.ends_with("sentinel-runner-keepalive 21600"), "{args}");
+    }
+
+    /// The runner's user is the worker's own account inside the sandbox — so the host directory this
+    /// lease gets is writable by the runner and its files belong to the worker that removes them —
+    /// and both tmpfs mounts are bounded, with no ownership options the runtime refuses.
+    #[test]
+    fn the_sandbox_maps_the_runner_user_onto_the_worker_and_bounds_its_tmpfs() {
+        let plan = plan(Network::None, &guard());
+        let args = plan.args();
+        assert!(
+            args.windows(2).any(|pair| pair
+                == [
+                    "--userns",
+                    &format!("keep-id:uid={RUNNER_UID},gid={RUNNER_GID}")
+                ]),
+            "{args:?}"
+        );
+        let mut tmpfs: Vec<&str> = Vec::new();
+        for (i, value) in args.iter().enumerate() {
+            if value == "--tmpfs" {
+                tmpfs.push(&args[i + 1]);
+            }
+        }
+        assert_eq!(tmpfs.len(), 2, "{tmpfs:?}");
+        for spec in tmpfs {
+            // Podman answers `unknown mount option "uid=…"` for `--tmpfs`, so ownership inside the
+            // container is the image's business and the mounts are only bounded.
+            assert!(spec.contains("size="), "{spec}");
+            assert!(!spec.contains("uid=") && !spec.contains("gid="), "{spec}");
+        }
+        // The configuration is not staged on a mount of its own: the runner's directory inside the
+        // container is where it writes the settings it derives from it.
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("/runner:")),
+            "{args:?}"
+        );
     }
 
     /// A sandbox resolves the cache and result hosts to its own worker and carries one anchor — its

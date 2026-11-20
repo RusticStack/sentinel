@@ -1,0 +1,50 @@
+#!/bin/sh
+# Runner mode's entry point (docs/runner-mode.md#the-configuration-is-a-credential): the worker execs
+# this with exactly one line of the just-in-time configuration on standard input and nothing else —
+# no arguments, no environment value, no terminal and no host file.
+set -eu
+# Lengths are bytes: a base64 configuration has one encoding, and the bound is counted in it.
+LC_ALL=C
+export LC_ALL
+
+# The most this accepts: twice the 64 KiB the worker's frame carries, so a value the worker would never
+# send is still refused rather than buffered — reading a line has no bound of its own.
+BOUND=131072
+LISTENER=/home/runner/bin/Runner.Listener
+
+refuse() {
+	printf 'sentinel-runner: %s\n' "$1" >&2
+	exit "${2:-2}"
+}
+
+[ -x "$LISTENER" ] || refuse "no runner at $LISTENER" 3
+# A configuration typed at a person's terminal is not the one the worker handed over.
+if [ -t 0 ]; then
+	refuse "the configuration is read from standard input, not from a terminal"
+fi
+
+# `head` stops one byte past the bound, so a caller that is not the worker cannot make this buffer an
+# unbounded stream; the newline it or the shell's own substitution may leave is not part of the value.
+config=$(head -c $((BOUND + 1))) || refuse "the configuration could not be read"
+newline='
+'
+case $config in
+*"$newline"*) refuse "the input is more than one line" ;;
+esac
+[ -n "$config" ] || refuse "an empty configuration"
+[ "${#config}" -le "$BOUND" ] || refuse "the configuration is larger than $BOUND bytes"
+
+# The runner takes a just-in-time configuration only as `run --jitconfig <value>`: `--ephemeral` and
+# `--disableupdate` are config-time flags that `run` rejects, and ephemerality is a property of the
+# configuration GitHub issued. `run.sh` is not used, because it copies its helper script into its own
+# installation directory before starting anything.
+#
+# The listener writes the settings it derives from the configuration (`.runner`, `.credentials`) into
+# its own directory, which lives in this container's layer and goes with the container. `sh` cannot
+# scrub a string's storage, so the only name holding the value is emptied and dropped before the exec
+# leaves it in the runner's argv alone.
+cd /home/runner
+set -- run --jitconfig "$config"
+config=
+unset config
+exec "$LISTENER" "$@"
