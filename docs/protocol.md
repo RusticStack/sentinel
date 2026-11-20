@@ -75,6 +75,9 @@ Enforced from declared lengths before any body is read; exceeding one is `payloa
 | OAuth form body (token, revocation, device authorization, consent) | 8 KiB |
 | Worker labels per profile | 16 |
 | One cache chunk payload | 48 KiB (must fit a control frame whole) |
+| One handoff artifact | 1 GiB (`handoff::MAX_BYTES`) and 4,096 entries |
+| One handoff body frame (`Handoff`) | 48 KiB |
+| Outputs one job context carries | 8 per producing job, 1,088 bytes per name and value |
 
 Invariants between limits are compile-time assertions. Raise a limit only with a measured need and a note here.
 
@@ -149,6 +152,15 @@ quietly skipped. The configuration frame is the worker protocol's second
 sensitive frame (`SecretChunk` is the first): its encode buffer is wiped after
 the write. `MAX_RUNNER_CONFIG_BYTES` (65,536) bounds it, beside the control
 message bound in [size limits](#size-limits).
+
+## Protocol 14 declared outputs and artifact handoff
+
+Protocol 14 appends `Context3` (the protocol-6 context plus the declared outputs of the jobs this job needs),
+`HandoffNeed` (worker → controller: the producing job and the artifact name) and `Handoff` (controller → worker: one
+frame of an artifact's stream — its shape, an entry's header, that entry's bodies, or the end)
+([worker link](worker-link.md#protocol-14-declared-outputs-and-artifact-handoff)). It changes no earlier message: a
+session below 14 is sent `Context2` and never offered a job whose context carries outputs or whose job declares a
+handoff, and no handoff frame is sent to it, so its sessions behave exactly as before.
 
 ## Versioning policy
 

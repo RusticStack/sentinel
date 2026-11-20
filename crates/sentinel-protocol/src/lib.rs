@@ -4,6 +4,7 @@ pub mod cache;
 pub mod cursor;
 pub mod diagnostics;
 pub mod error;
+pub mod handoff;
 pub mod idempotency;
 pub mod intake;
 pub mod limits;

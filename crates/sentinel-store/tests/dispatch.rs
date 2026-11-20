@@ -7,6 +7,7 @@ use sentinel_core::{
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
 use sentinel_protocol::cache::Trust;
 use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
+use sentinel_protocol::summary::{AttemptSummary, StepOutcome, StepRecord};
 use sentinel_store::{
     Durability, Error, Store,
     auth::{self, Authority, NamespaceKind, provisioning},
@@ -594,6 +595,155 @@ jobs:
         .unwrap();
     assert_eq!(context.needs, vec![("build".to_owned(), Outcome::Passed)]);
     assert_eq!(context.job_name, "test");
+}
+
+#[test]
+fn declared_outputs_are_plain_text_in_the_run_record_and_reach_the_job_that_needs_them() {
+    let f = fixture();
+    let w = worker(
+        &f,
+        f.pool,
+        Capacity {
+            cpu_millis: 8_000,
+            memory_bytes: 16 << 30,
+            disk_bytes: 0,
+        },
+    );
+    let (run, ids) = run(
+        &f,
+        "schema: 1
+on: [push]
+jobs:
+  build:
+    image: alpine:3
+    steps: [{ id: version, run: 'true', outputs: [version] }]
+    outputs: [version]
+  test:
+    image: alpine:3
+    needs: [build]
+    steps: [{ id: s, run: 'true' }]
+",
+        at(2_000),
+    );
+    let (build, test) = (ids[0], ids[1]);
+    let offer = place(&f, w, f.pool, at(2_100)).unwrap();
+    let (attempt, fence) = (offer.attempt, offer.fence);
+    f.store
+        .writer()
+        .write(move |tx| dispatch::acknowledge(tx, w, attempt, fence, at(2_150)))
+        .unwrap();
+    let summary = AttemptSummary {
+        steps: vec![StepRecord {
+            index: 0,
+            id: "version".into(),
+            outcome: StepOutcome::Passed,
+            duration_ns: Some(1),
+        }],
+        outputs: vec![("version".to_owned(), "1.4.0".to_owned())],
+        ..AttemptSummary::default()
+    }
+    .encode()
+    .unwrap();
+    let bytes = summary.clone();
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::StepsStarted,
+                None,
+                at(2_300),
+                None,
+            )?;
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::FinalizationStarted,
+                None,
+                at(2_400),
+                None,
+            )?;
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::Passed,
+                Some(&bytes),
+                at(2_500),
+                None,
+            )
+        })
+        .unwrap();
+
+    // What the run's record holds is exactly what the step wrote, as plain text.
+    let stored: Option<String> = f
+        .store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT outputs FROM jobs WHERE id = ?1",
+                [build.as_bytes()],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(stored.as_deref(), Some("version=1.4.0\n"));
+    let published = f
+        .store
+        .read(move |c| sentinel_store::outputs::of_job(c, f.tenant, build))
+        .unwrap();
+    assert_eq!(published, vec![("version".to_owned(), "1.4.0".to_owned())]);
+
+    // The job that needs it reads it in its context, and nothing else does.
+    let next = place(&f, w, f.pool, at(2_700)).unwrap();
+    assert_eq!(next.job, test);
+    f.store
+        .writer()
+        .write(move |tx| dispatch::acknowledge(tx, w, next.attempt, next.fence, at(2_750)))
+        .unwrap();
+    let context = f
+        .store
+        .read(|c| dispatch::job_context(c, w, next.attempt))
+        .unwrap();
+    assert_eq!(
+        context.outputs,
+        vec![("build".to_owned(), "version".to_owned(), "1.4.0".to_owned())],
+        "an output is public within the tenant: the dependent job reads it as plain text"
+    );
+    assert_eq!(context.needs, vec![("build".to_owned(), Outcome::Passed)]);
+    assert_eq!(
+        f.store
+            .read(move |c| dispatch::latest_attempt(c, f.tenant, build))
+            .unwrap(),
+        Some(attempt)
+    );
+    let _ = run;
+
+    // A report from a fence the attempt no longer holds writes nothing.
+    let late = AttemptSummary {
+        outputs: vec![("version".to_owned(), "9.9.9".to_owned())],
+        ..AttemptSummary::default()
+    }
+    .encode()
+    .unwrap();
+    assert!(matches!(
+        f.store.writer().write(move |tx| dispatch::report(
+            tx,
+            WorkerId::new(),
+            attempt,
+            fence,
+            Event::Passed,
+            Some(&late),
+            at(2_800),
+            None,
+        )),
+        Err(Error::NotFound)
+    ));
 }
 
 #[test]

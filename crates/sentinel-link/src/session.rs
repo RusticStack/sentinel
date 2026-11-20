@@ -187,6 +187,13 @@ pub enum ClientMessage {
         lease: [u8; 16],
         accepted: bool,
     },
+    /// Protocol 14, appended last so every earlier variant keeps its index: one artifact of a job this attempt
+    /// needs, by its producing job and name.
+    HandoffNeed {
+        attempt: [u8; 16],
+        from: String,
+        artifact: String,
+    },
 }
 
 struct LogRef<'a> {
@@ -358,6 +365,7 @@ pub enum ServerMessage {
     },
     /// Appended last: postcard encodes enum variants positionally.
     Context2(WireContext2),
+
     CacheGrant(Grant),
     CacheChunk(Chunk),
     CacheEnd(End),
@@ -399,6 +407,14 @@ pub enum ServerMessage {
     /// Protocol 13: leases the worker no longer holds — ended, idle, or released by the controller.
     RunnerStop {
         leases: Vec<[u8; 16]>,
+    },
+    /// Protocol 14, appended last so every earlier variant keeps its index: the job's context with the declared
+    /// outputs of the jobs it needs.
+    Context3(WireContext3),
+    /// One frame of a handoff artifact's stream (protocol 14 and later).
+    Handoff {
+        attempt: [u8; 16],
+        part: sentinel_protocol::handoff::Part,
     },
 }
 
@@ -580,6 +596,14 @@ pub struct WireContext2 {
     pub trust: u8,
 }
 
+/// `outputs` arrives at protocol 14 and later: the declared outputs of the jobs this job needs, as
+/// `(producing job, name, value)`. They are plain text and public within the tenant, so nothing redacts them.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WireContext3 {
+    pub base: WireContext2,
+    pub outputs: Vec<(String, String, String)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventContext {
     pub name: String,
@@ -606,6 +630,8 @@ pub struct JobContext {
     pub needs: Vec<(String, Outcome)>,
     pub tenant: Option<TenantId>,
     pub trust: Trust,
+    /// The declared outputs of the jobs in `needs`, by producing job and name: bounded, plain text, never secrets.
+    pub outputs: Vec<(String, String, String)>,
 }
 
 pub const SOURCE_ACCESS_WINDOW_MS: i64 = 12 * 60 * 1000;
@@ -684,6 +710,13 @@ impl JobContext {
         }
     }
 
+    pub(crate) fn to_wire3(&self, attempt: AttemptId) -> WireContext3 {
+        WireContext3 {
+            base: self.to_wire2(attempt),
+            outputs: self.outputs.clone(),
+        }
+    }
+
     fn from_wire(wire: WireContext) -> Result<(AttemptId, JobContext)> {
         Ok((
             AttemptId::from_bytes(wire.attempt).map_err(|_| Error::Protocol("id"))?,
@@ -708,6 +741,7 @@ impl JobContext {
                 // The wire could not say it: the safest scope is the one a pull request would get.
                 tenant: None,
                 trust: Trust::PullRequest,
+                outputs: Vec::new(),
             },
         ))
     }
@@ -741,9 +775,34 @@ impl JobContext {
                 needs: decode_needs(wire.needs)?,
                 tenant,
                 trust,
+                outputs: Vec::new(),
             },
         ))
     }
+}
+
+impl JobContext {
+    fn from_wire3(wire: WireContext3) -> Result<(AttemptId, JobContext)> {
+        let (attempt, mut context) = JobContext::from_wire2(wire.base)?;
+        context.outputs = decode_outputs(wire.outputs)?;
+        Ok((attempt, context))
+    }
+}
+
+/// The outputs a context may carry: every job in `needs` at its declared maximum, each value at the schema's own
+/// bound. A frame past this did not come from a controller this worker talks to, and is refused as a whole.
+fn decode_outputs(wire: Vec<(String, String, String)>) -> Result<Vec<(String, String, String)>> {
+    use sentinel_protocol::summary::{MAX_OUTPUT_RECORD_BYTES, MAX_OUTPUT_RECORDS};
+    if wire.len() > MAX_LIST_ITEMS * MAX_OUTPUT_RECORDS {
+        return Err(Error::Protocol("outputs list"));
+    }
+    if wire
+        .iter()
+        .any(|(job, name, value)| job.len() + name.len() + value.len() > MAX_OUTPUT_RECORD_BYTES)
+    {
+        return Err(Error::Protocol("output size"));
+    }
+    Ok(wire)
 }
 
 fn decode_needs(wire: Vec<(String, u8)>) -> Result<Vec<(String, Outcome)>> {
@@ -765,7 +824,14 @@ pub(crate) fn context_message(
     context: &JobContext,
     attempt: AttemptId,
 ) -> ServerMessage {
-    if protocol >= 6 {
+    if protocol >= 14 {
+        let mut wire = context.to_wire3(attempt).base;
+        wire.trust = context.trust.for_protocol(protocol).to_u8();
+        ServerMessage::Context3(WireContext3 {
+            base: wire,
+            outputs: context.outputs.clone(),
+        })
+    } else if protocol >= 6 {
         let mut wire = context.to_wire2(attempt);
         wire.trust = context.trust.for_protocol(protocol).to_u8();
         ServerMessage::Context2(wire)
@@ -1031,6 +1097,31 @@ pub trait SessionHandler: Send + Sync {
     fn cache_budget(&self) -> u64 {
         sentinel_cache::remote::STORE_BUDGET_BYTES
     }
+    /// The artifact a job this attempt needs published, ready to stream: its shape and a way to open each entry.
+    fn handoff_need(
+        &self,
+        _worker: WorkerId,
+        _attempt: AttemptId,
+        _from: &str,
+        _artifact: &str,
+    ) -> std::result::Result<HandoffPlan, sentinel_protocol::handoff::Refusal> {
+        Err(sentinel_protocol::handoff::Refusal::NotDeclared)
+    }
+}
+
+/// Opens one entry of a handoff artifact: the object store behind the producer's manifest.
+pub type EntryOpener = Box<
+    dyn Fn(&sentinel_protocol::handoff::Entry) -> std::io::Result<Box<dyn std::io::Read + Send>>
+        + Send
+        + Sync,
+>;
+
+/// What the controller streams for one handoff: the producer's manifest entries and the object store behind them.
+pub struct HandoffPlan {
+    pub entries: Vec<sentinel_protocol::handoff::Entry>,
+    pub bytes: u64,
+    /// A closed closure keeps the store alive for the thread that streams the entries.
+    pub open: EntryOpener,
 }
 
 /// Held only while bytes move between the connection and a buffer, never across a socket call.
@@ -1474,6 +1565,7 @@ pub struct LinkRemote {
     bulk: Mutex<BulkSlot>,
     fences: Mutex<HashMap<AttemptId, Fence>>,
     router: Arc<CacheRouter>,
+    handoffs: Arc<HandoffRouter>,
     protocol: u16,
 }
 
@@ -1579,6 +1671,163 @@ impl LinkRemote {
 
     fn answer(&self, attempt: AttemptId, answer: CacheAnswer) {
         self.router.route(attempt, answer);
+    }
+}
+
+/// The handoff router: one fetch at a time per attempt, its frames on a bounded channel so a controller that
+/// streams faster than the workspace is written waits in the framing rather than in memory.
+#[derive(Default)]
+pub struct HandoffRouter {
+    waiting: Mutex<HashMap<AttemptId, HandoffSlot>>,
+}
+
+#[derive(Default)]
+struct HandoffSlot {
+    sender: Option<mpsc::SyncSender<sentinel_protocol::handoff::Part>>,
+}
+
+impl HandoffRouter {
+    fn register(
+        &self,
+        attempt: AttemptId,
+    ) -> Result<mpsc::Receiver<sentinel_protocol::handoff::Part>> {
+        let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
+        if waiting.contains_key(&attempt) {
+            return Err(Error::Protocol("handoff already in flight"));
+        }
+        let (tx, rx) = mpsc::sync_channel(HANDOFF_QUEUE);
+        waiting.insert(attempt, HandoffSlot { sender: Some(tx) });
+        Ok(rx)
+    }
+
+    fn route(&self, attempt: AttemptId, part: sentinel_protocol::handoff::Part) {
+        let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
+        let drop_slot = match waiting.get_mut(&attempt) {
+            None => false,
+            Some(slot) => match slot.sender.as_ref() {
+                None => true,
+                Some(sender) => match sender.try_send(part) {
+                    Ok(()) => false,
+                    Err(_) => {
+                        slot.sender = None;
+                        false
+                    }
+                },
+            },
+        };
+        if drop_slot {
+            waiting.remove(&attempt);
+        }
+    }
+
+    fn forget(&self, attempt: AttemptId) {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&attempt);
+    }
+}
+
+/// A handoff frame queue deep enough to keep a stream moving and shallow enough that a stalled workspace stops it.
+const HANDOFF_QUEUE: usize = 8;
+
+/// Where a handoff artifact's verified entries are written as the controller streams them. The consumer's worker
+/// writes them straight into the job's workspace, verifying each entry against the digest the publication recorded.
+pub trait HandoffSink {
+    /// The artifact's shape: how many entries and how many bytes follow.
+    fn begin(&mut self, entries: u32, bytes: u64) -> bool;
+    fn entry(&mut self, entry: &sentinel_protocol::handoff::Entry) -> bool;
+    fn body(&mut self, seq: u32, bytes: &[u8]) -> bool;
+    /// The artifact is complete and every entry verified.
+    fn end(&mut self) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandoffError {
+    /// The controller refused it, with the reason the consuming job's failure names.
+    Refused(sentinel_protocol::handoff::Refusal),
+    /// The stream stopped before the artifact was complete.
+    Aborted,
+    /// The sink refused what the stream held: a past-bound entry, a digest that did not match, a write that failed.
+    Sink,
+}
+
+impl HandoffError {
+    /// Why a consuming job's preparation failed, naming nothing the artifact held.
+    pub fn reason(self) -> &'static str {
+        match self {
+            HandoffError::Refused(refusal) => refusal.reason(),
+            HandoffError::Aborted => "the controller stopped before the artifact was complete",
+            HandoffError::Sink => "the artifact could not be written or did not verify",
+        }
+    }
+}
+
+impl LinkRemote {
+    /// Fetches one handoff artifact from the controller, bounded by `deadline`, writing its verified entries
+    /// through `sink`. One at a time per attempt: a job's handoffs are taken in declaration order.
+    pub fn fetch_handoff(
+        &self,
+        attempt: AttemptId,
+        from: &str,
+        artifact: &str,
+        deadline: Instant,
+        sink: &mut dyn HandoffSink,
+    ) -> std::result::Result<(), HandoffError> {
+        let frames = self
+            .handoffs
+            .register(attempt)
+            .map_err(|_| HandoffError::Aborted)?;
+        let send = self.send(&ClientMessage::HandoffNeed {
+            attempt: *attempt.as_bytes(),
+            from: from.to_owned(),
+            artifact: artifact.to_owned(),
+        });
+        if send.is_err() {
+            self.handoffs.forget(attempt);
+            return Err(HandoffError::Aborted);
+        }
+        let outcome = loop {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                break Err(HandoffError::Aborted);
+            }
+            let part = match frames.recv_timeout(wait) {
+                Ok(part) => part,
+                Err(_) => break Err(HandoffError::Aborted),
+            };
+            match part {
+                sentinel_protocol::handoff::Part::Begin { entries, bytes } => {
+                    if !sink.begin(entries, bytes) {
+                        break Err(HandoffError::Sink);
+                    }
+                }
+                sentinel_protocol::handoff::Part::Entry(entry) => {
+                    if !sink.entry(&entry) {
+                        break Err(HandoffError::Sink);
+                    }
+                }
+                sentinel_protocol::handoff::Part::Body { seq, bytes, .. } => {
+                    if !bytes.is_empty() && !sink.body(seq, &bytes) {
+                        break Err(HandoffError::Sink);
+                    }
+                }
+                sentinel_protocol::handoff::Part::End { .. } => {
+                    break match sink.end() {
+                        true => Ok(()),
+                        false => Err(HandoffError::Sink),
+                    };
+                }
+                sentinel_protocol::handoff::Part::Refused(code) => {
+                    break match sentinel_protocol::handoff::Refusal::from_code(code) {
+                        Some(refusal) => Err(HandoffError::Refused(refusal)),
+                        None => Err(HandoffError::Aborted),
+                    };
+                }
+            }
+        };
+        self.handoffs.forget(attempt);
+        outcome
     }
 }
 
@@ -2571,6 +2820,38 @@ fn serve_connection(
                     }
                 }
             }
+            ClientMessage::HandoffNeed {
+                attempt,
+                from,
+                artifact,
+            } => {
+                if protocol < sentinel_protocol::negotiate::HANDOFF_MIN.0 {
+                    return Err(Error::Protocol("handoff needs protocol 14"));
+                }
+                let Some(attempt) = well_formed_attempt(&attempt) else {
+                    continue;
+                };
+                if from.len() > sentinel_protocol::limits::MAX_NAME_BYTES
+                    || artifact.len() > sentinel_protocol::limits::MAX_ARTIFACT_NAME_BYTES
+                {
+                    continue;
+                }
+                let plan = handler.handoff_need(worker, attempt, &from, &artifact);
+                let sender = tx.clone();
+                let spawned = thread::Builder::new()
+                    .name("sentinel-handoff-serve".into())
+                    .spawn(move || {
+                        let _ = serve_handoff(&sender, attempt, plan);
+                    });
+                if spawned.is_err() {
+                    let _ = tx.send(&ServerMessage::Handoff {
+                        attempt: *attempt.as_bytes(),
+                        part: sentinel_protocol::handoff::Part::Refused(
+                            sentinel_protocol::handoff::Refusal::Unavailable.code(),
+                        ),
+                    });
+                }
+            }
             ClientMessage::CacheOffer(upload) => {
                 if protocol < PROFILE_MIN.0 {
                     return Err(Error::Protocol("cache needs protocol 7"));
@@ -2689,6 +2970,110 @@ impl Drop for TransferPermit {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// Streams one handoff artifact: its shape, then each entry with its bodies, then its end. Every bound is checked
+/// before a byte moves, so a receiver never holds more than the publication itself may.
+fn serve_handoff(
+    sender: &Sender,
+    attempt: AttemptId,
+    plan: std::result::Result<HandoffPlan, sentinel_protocol::handoff::Refusal>,
+) -> Result<()> {
+    use sentinel_protocol::handoff::{self, Part};
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(refusal) => {
+            return sender.send(&ServerMessage::Handoff {
+                attempt: *attempt.as_bytes(),
+                part: Part::Refused(refusal.code()),
+            });
+        }
+    };
+    if plan.entries.len() > handoff::MAX_ENTRIES
+        || plan.bytes > handoff::MAX_BYTES
+        || plan.entries.iter().any(|entry| !entry.well_formed())
+    {
+        return sender.send(&ServerMessage::Handoff {
+            attempt: *attempt.as_bytes(),
+            part: Part::Refused(handoff::Refusal::Unavailable.code()),
+        });
+    }
+    sender.send(&ServerMessage::Handoff {
+        attempt: *attempt.as_bytes(),
+        part: Part::Begin {
+            entries: plan.entries.len() as u32,
+            bytes: plan.bytes,
+        },
+    })?;
+    let mut manifest = blake3::Hasher::new();
+    let mut buf = vec![0u8; handoff::CHUNK_BYTES];
+    let mut bytes = 0u64;
+    for entry in &plan.entries {
+        manifest.update(&[entry.mode as u8]);
+        manifest.update(entry.digest.as_slice());
+        manifest.update(&entry.len.to_le_bytes());
+        manifest.update(entry.path.as_bytes());
+        sender.send(&ServerMessage::Handoff {
+            attempt: *attempt.as_bytes(),
+            part: Part::Entry(entry.clone()),
+        })?;
+        let mut file = match (plan.open)(entry) {
+            Ok(file) => file,
+            Err(_) => {
+                return sender.send(&ServerMessage::Handoff {
+                    attempt: *attempt.as_bytes(),
+                    part: Part::Refused(handoff::Refusal::Unavailable.code()),
+                });
+            }
+        };
+        let mut left = entry.len;
+        let mut seq = 0u32;
+        while left > 0 {
+            use std::io::Read;
+            let take = left.min(buf.len() as u64) as usize;
+            let read = match file.read(&mut buf[..take]) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Ok(0) | Err(_) => 0,
+                Ok(read) => read,
+            };
+            if read == 0 {
+                // The object is shorter than its manifest states: a damaged publication is never delivered as one.
+                return sender.send(&ServerMessage::Handoff {
+                    attempt: *attempt.as_bytes(),
+                    part: Part::Refused(handoff::Refusal::Unavailable.code()),
+                });
+            }
+            seq += 1;
+            left -= read as u64;
+            bytes += read as u64;
+            sender.send(&ServerMessage::Handoff {
+                attempt: *attempt.as_bytes(),
+                part: Part::Body {
+                    seq: seq - 1,
+                    last: left == 0,
+                    bytes: buf[..read].to_vec(),
+                },
+            })?;
+        }
+        if entry.len == 0 {
+            sender.send(&ServerMessage::Handoff {
+                attempt: *attempt.as_bytes(),
+                part: Part::Body {
+                    seq: 0,
+                    last: true,
+                    bytes: Vec::new(),
+                },
+            })?;
+        }
+    }
+    sender.send(&ServerMessage::Handoff {
+        attempt: *attempt.as_bytes(),
+        part: Part::End {
+            entries: plan.entries.len() as u32,
+            bytes,
+            manifest: *manifest.finalize().as_bytes(),
+        },
+    })
 }
 
 fn serve_cache_need(
@@ -2884,6 +3269,7 @@ pub fn connect(
                 bulk: Mutex::new(BulkSlot::default()),
                 fences: Mutex::new(HashMap::new()),
                 router: Arc::new(CacheRouter::default()),
+                handoffs: Arc::new(HandoffRouter::default()),
                 protocol: negotiated.protocol.0,
             }),
             transport: None,
@@ -2904,6 +3290,7 @@ pub fn connect(
         | ServerMessage::NoSpec { .. }
         | ServerMessage::Context(_)
         | ServerMessage::Context2(_)
+        | ServerMessage::Context3(_)
         | ServerMessage::Source { .. }
         | ServerMessage::LogAck { .. }
         | ServerMessage::LogRefused { .. }
@@ -2918,6 +3305,7 @@ pub fn connect(
         | ServerMessage::Prefetch { .. }
         | ServerMessage::SecretBegin { .. }
         | ServerMessage::SecretChunk { .. }
+        | ServerMessage::Handoff { .. }
         | ServerMessage::Cancel { .. } => Err(Error::Protocol("message before welcome")),
     }
 }
@@ -2944,6 +3332,24 @@ impl Reporter {
 
     pub fn route(&self) -> Route {
         self.bulk.as_ref().map(|r| r.route()).unwrap_or_default()
+    }
+
+    /// Fetches one handoff artifact from the controller into `sink`; a session without a bulk channel has none.
+    pub fn fetch_handoff(
+        &self,
+        attempt: AttemptId,
+        from: &str,
+        artifact: &str,
+        deadline: Instant,
+        sink: &mut dyn HandoffSink,
+    ) -> std::result::Result<(), HandoffError> {
+        if self.protocol < sentinel_protocol::negotiate::HANDOFF_MIN.0 {
+            return Err(HandoffError::Aborted);
+        }
+        match &self.bulk {
+            Some(remote) => remote.fetch_handoff(attempt, from, artifact, deadline, sink),
+            None => Err(HandoffError::Aborted),
+        }
     }
 
     pub fn remote_cache(&self) -> Option<Arc<dyn sentinel_cache::remote::Remote>> {
@@ -3643,6 +4049,14 @@ fn handle_bulk_message(
             let (attempt, context) = JobContext::from_wire2(wire)?;
             state.contexts.insert(attempt, context);
         }
+        ServerMessage::Context3(wire) => {
+            let (attempt, context) = JobContext::from_wire3(wire)?;
+            state.contexts.insert(attempt, context);
+        }
+        ServerMessage::Handoff { attempt, part } => {
+            let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+            remote.handoffs.route(attempt, part);
+        }
         ServerMessage::Source { attempt, access } => {
             let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
             if !access.well_formed() {
@@ -3986,6 +4400,7 @@ mod tests {
             bulk: Mutex::new(BulkSlot::default()),
             fences: Mutex::new(HashMap::new()),
             router: Arc::new(CacheRouter::default()),
+            handoffs: Arc::new(HandoffRouter::default()),
             protocol: CACHE_CANCEL_MIN.0,
         };
         let cancel = ClientMessage::CacheCancel { attempt: [3; 16] };
@@ -4240,6 +4655,7 @@ mod tests {
 
     fn context(tenant: Option<TenantId>, trust: Trust) -> JobContext {
         JobContext {
+            outputs: Vec::new(),
             source: None,
             source_valid_until: None,
             run: RunId::new(),
@@ -4354,6 +4770,42 @@ mod tests {
             context_message(7, &context, attempt),
             ServerMessage::Context2(_)
         ));
+        assert!(matches!(
+            context_message(13, &context, attempt),
+            ServerMessage::Context2(_)
+        ));
+        assert!(
+            matches!(
+                context_message(14, &context, attempt),
+                ServerMessage::Context3(_)
+            ),
+            "protocol 14 carries the dependencies' declared outputs"
+        );
+    }
+
+    #[test]
+    fn a_context_past_the_output_bounds_is_refused_by_the_worker() {
+        use sentinel_protocol::summary::{MAX_OUTPUT_RECORD_BYTES, MAX_OUTPUT_RECORDS};
+        let attempt = AttemptId::new();
+        let mut context = context(Some(TenantId::new()), Trust::Protected);
+        context.outputs = vec![("build".into(), "version".into(), "1.2.3".into())];
+        let ServerMessage::Context3(wire) = context_message(14, &context, attempt) else {
+            panic!("protocol 14 sends Context3");
+        };
+        let (decoded_attempt, decoded) = JobContext::from_wire3(wire).unwrap();
+        assert_eq!(decoded_attempt, attempt);
+        assert_eq!(decoded.outputs, context.outputs);
+
+        let too_big = vec![(
+            "build".to_owned(),
+            "version".to_owned(),
+            "v".repeat(MAX_OUTPUT_RECORD_BYTES),
+        )];
+        assert!(decode_outputs(too_big).is_err(), "one value past its bound");
+        let too_many: Vec<(String, String, String)> = (0..MAX_LIST_ITEMS * MAX_OUTPUT_RECORDS + 1)
+            .map(|i| ("build".to_owned(), format!("n{i}"), "v".to_owned()))
+            .collect();
+        assert!(decode_outputs(too_many).is_err(), "a list past its bound");
     }
 
     #[test]
@@ -4465,6 +4917,7 @@ mod tests {
             bulk: Mutex::new(BulkSlot::default()),
             fences: Mutex::new(HashMap::new()),
             router: Arc::new(CacheRouter::default()),
+            handoffs: Arc::new(HandoffRouter::default()),
             protocol: 10,
         };
         let attempt = AttemptId::new();

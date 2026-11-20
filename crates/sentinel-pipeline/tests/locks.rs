@@ -63,11 +63,11 @@ jobs:
         6,
         "the digest and format of a job with no lock are unchanged"
     );
-    assert_eq!(declared.format(), 12);
+    assert_eq!(declared.format(), 13);
 }
 
 #[test]
-fn a_spec_with_resources_is_format_12_and_round_trips_them() {
+fn a_spec_with_resources_is_format_13_and_round_trips_them() {
     let spec = spec_for(
         "schema: 1
 on: [push]
@@ -83,7 +83,7 @@ jobs:
 ",
     );
     let bytes = spec.encode().unwrap();
-    assert_eq!(bytes[0], 12);
+    assert_eq!(bytes[0], 13);
     let decoded = RunSpec::decode(&bytes).unwrap();
     assert_eq!(decoded, spec);
     assert_eq!(decoded.pipeline.jobs[0].spec.locks.len(), 2);

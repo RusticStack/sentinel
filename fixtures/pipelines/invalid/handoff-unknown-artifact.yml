@@ -1,0 +1,13 @@
+# expect: jobs.b.handoff: `a/release` is not an artifact the producing job declares
+schema: 1
+on: [push]
+jobs:
+  a:
+    image: busybox
+    steps: [{id: one, run: x}]
+    artifacts: [{name: dist, paths: [dist]}]
+  b:
+    image: busybox
+    needs: [a]
+    steps: [{id: one, run: y}]
+    handoff: [{from: a, artifact: release, into: incoming}]

@@ -199,7 +199,8 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (83, include_str!("migrations/083_ai_analysis.sql")),
     (84, include_str!("migrations/084_ai_search.sql")),
     (85, include_str!("migrations/085_named_pipelines.sql")),
-    (86, include_str!("migrations/086_resource_locks.sql")),
+    (86, include_str!("migrations/086_job_outputs.sql")),
+    (87, include_str!("migrations/087_resource_locks.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -221,6 +222,7 @@ pub const READABLE_BY: &[(u32, u32)] = &[
     (80, 79),
     (82, 81),
     (83, 82),
+    (86, 85),
 ];
 
 pub fn readable_by(version: u32) -> u32 {
@@ -346,16 +348,16 @@ mod tests {
             "an older controller derives a check's name from the job alone, so on a run of a named pipeline it publishes `sentinel / <job>` and `sentinel / ci` where this one publishes `sentinel / <name> / <job>` and `sentinel / <name>` — a required check the repository protects under the pipeline's name would stay pending while a namespace it does not protect moves; it also cannot decode run spec format 11",
         ),
         (
-            86,
-            "an older controller never takes a hold on a named external resource, so two jobs it places could run against one staging database, host or device at once; it also cannot decode the failure class `resource_lock` or run spec format 12",
-        ),
-        (
             81,
             "an older controller holds no sized default per tenant: its unset `tenant_quota_bytes` is 0, which it writes to `storage_defaults` at every start, so one restart of a rolled-back release lifts the limit the upgrade applied to every tenant that states none; it also refuses the explicit unlimited a newer platform administrator can store, and it keeps no default for personal namespaces",
         ),
         (
             84,
             "an older controller claims a log-search request as a failure analysis of its attempt and settles it with an answer to a question it never read: it knows neither the question nor the plan the answer must be built from",
+        ),
+        (
+            87,
+            "an older controller never takes a hold on a named external resource, so two jobs it places could run against one staging database, host or device at once; it also cannot decode the failure class `resource_lock` or run spec format 12",
         ),
     ];
 

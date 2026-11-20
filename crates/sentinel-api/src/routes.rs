@@ -1109,6 +1109,10 @@ fn run_json(view: &status::RunStatus) -> Value {
             "attempt": j.attempt.map(|a| a.to_string()),
             "log_state": j.log_state.map(|s| s.as_str()),
             "fence": j.fence,
+            // Declared outputs are public within the tenant: plain text the worker refused to store
+            // if it repeated a delivered secret ([pipeline schema](../docs/pipeline-schema.md)).
+            "outputs": j.outputs.iter().map(|(name, value)| (name.clone(), Value::String(value.clone())))
+                .collect::<serde_json::Map<String, Value>>(),
             "lock_wait": j.lock_wait,
             "timestamps": {
                 "queued_ms": j.timestamps.queued.map(|t| t.0),

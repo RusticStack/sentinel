@@ -132,9 +132,41 @@ The verdict keeps these distinctions, and the summary records them per step:
 
 OOM is read from the host's view of the container's cgroup (`/sys/fs/cgroup<CgroupPath>/memory.events`, path from `podman inspect`), before and after a failed step: after an OOM the pages that caused it stay charged, so a process exec'd inside to read the counter could be the next victim and the OOM would be misreported as a signal.
 
-**Timings.** Every phase is measured with a monotonic clock in nanoseconds: checkout, image pull, container start, all steps, finalization, and each step. Absent means not measured. They travel in the `AttemptSummary` (`sentinel-protocol::summary`, format byte 4, at most 32 KiB) with the terminal `Report` and are stored once on the attempt row (migration 15; the trigger refuses a replacement). A summary over the cap is not an error: the controller drops it, keeps the verdict, and the session stays open. `checkout_ns` stays the whole checkout; `checkout_fetch_ns` and `checkout_materialize_ns` split the mirror update from the worktree materialization, and `checkout_route` says which path produced it ([mirrors](mirrors.md)). `image_present` records whether the pinned image was already held locally before the required scoped registry authorization pull, and `caches` carries one bounded record per declared `cache:` entry: restore outcome and phase timings (`lookup`/`lock_wait`/`clone`/`first_touch`), file/byte/copied counts, the commit's `commit_ns` and staged/reused/dirty split with its publish answer, and the `costly_hit` flag ([cache](cache.md)). `dispatch::attempt_summary` reads it back.
+**Timings.** Every phase is measured with a monotonic clock in nanoseconds: checkout, image pull, container start, all steps, finalization, and each step. Absent means not measured. They travel in the `AttemptSummary` (`sentinel-protocol::summary`, format byte 5, at most 32 KiB: format 5 adds the job's declared outputs and the finalizer's record, and formats 1 to 4 stay decodable) with the terminal `Report` and are stored once on the attempt row (migration 15; the trigger refuses a replacement). A summary over the cap is not an error: the controller drops it, keeps the verdict, and the session stays open. `checkout_ns` stays the whole checkout; `checkout_fetch_ns` and `checkout_materialize_ns` split the mirror update from the worktree materialization, and `checkout_route` says which path produced it ([mirrors](mirrors.md)). `image_present` records whether the pinned image was already held locally before the required scoped registry authorization pull, and `caches` carries one bounded record per declared `cache:` entry: restore outcome and phase timings (`lookup`/`lock_wait`/`clone`/`first_touch`), file/byte/copied counts, the commit's `commit_ns` and staged/reused/dirty split with its publish answer, and the `costly_hit` flag ([cache](cache.md)). `dispatch::attempt_summary` reads it back.
 
 **Worker availability.** The same bounded sweep that reclaims the cache root — at worker start and after every attempt's finalization, never on a timer — ends by emitting `Notice::Availability`, a compact snapshot of what this worker could serve: the sorted digests its image store is known to hold (`images::held`, bounded by `MAX_HELD`), pulls in flight, and cache-root occupancy (entries, generations, payload bytes held, `truncated` when the pass hit its work bound) and the settled per-class restore and rebuild cost estimates of the worker's cost book ([cache](cache.md)). The pass computed those counts already, so the snapshot costs no second walk; the digest list never reaches a log line — only counts do. Each attempt that declared cache entries also emits `Notice::CacheFigures`, its entries' summed lock-wait, restore, first-touch, commit and byte figures, which feed the worker metrics. A nominal hit whose restore paid rebuild-scale cost is flagged separately as `Notice::CostlyCacheHit` under the documented rule in [cache](cache.md) — a warning, never a verdict.
+
+## Declared outputs
+
+A job that declares an output — its own `outputs`, a step's `outputs`, or an output a job it `needs` published — gets
+one host directory for the attempt, mounted read-write at `/run/sentinel-output` in a container and put into a
+microVM's guest at the same path before each step ([pipeline schema](pipeline-schema.md#declared-outputs)). Before a
+step starts the worker writes `values.sh` (the values its earlier steps and its dependencies published, quoted so a
+value cannot run anything) and truncates `step.out`; `SENTINEL_OUTPUT` names `step.out` for the step, and the
+wrapper the worker already uses for a secret environment file also sources `values.sh` when there is one. A container
+writes the host's file directly; a microVM's file is brought back after the step (`get_into`, with the file's own
+bound as the transfer budget). The directory is charged to the job's declared disk in a container, as the workspace
+and `/tmp` are.
+
+The file is read as soon as the step ends, bounded at `1 KiB × 16 + 4 KiB` so the worker never carries what a step
+wrote, and the values are parsed by name: one the step does not declare, a name written twice, a value past 1 KiB, a
+value that is not text and a value that repeats a delivered secret each fail the step with `CommandFailed` and a
+message naming the name and the limit. A step that passed and then wrote a bad output is recorded `Failed { code: -1
+}` so the summary says which step it was. The values a job re-exports travel in the attempt summary (format 5) and
+the controller stores them, in the same fenced transaction that ends the attempt, as plain text on the job's row.
+
+## Finalizers
+
+A job's `finalize` runs once its steps have ended — passed, failed or cancelled — in the same container and
+workspace, after the last step and before publication, so files it writes are there for an `always` or `failure`
+artifact. It is bounded twice: its own timeout (at most 5m) and what is left of the job's budget, whichever is
+smaller. It runs the job's environment and workdir and nothing else, takes no secrets, declares no outputs and has no
+`if`. What it did is an annotation and nothing more: the attempt's record carries its outcome, its duration and one
+bounded line naming an exit status or a bound, never what it printed, and the job's conclusion is the steps'
+conclusion whatever the finalizer does. A finalizer is not a cleanup path — it never fences, never releases a lease
+and never decides a container is gone; the worker's own cancel and lease-expiry paths end the job exactly as they did
+before it existed, and a cancelled attempt does not run it at all, so nothing here can extend a cancelled job's life
+([cancellation](cancellation.md#finalizers-never-own-cleanup)).
 
 ## MicroVMs
 
@@ -185,6 +217,8 @@ Cancellation, graceful/forced termination, timeouts and lease expiry are in [can
 ## Verification
 
 Tests of this area live in `crates/sentinel-worker`:
+
+- `src/attempt/output_provisioning.rs` (any Linux, no Podman, a real `/bin/sh`) is I04's sandbox-free canary: a step writes `version=1.4.0` into the file `SENTINEL_OUTPUT` names, the worker reads and parses it, and the next step sees `SENTINEL_OUTPUT_VERSION` through the wrapper's values file; a dependency's output reaches a step as `SENTINEL_OUTPUT_BUILD_VERSION`; an undeclared name, a value past 1 KiB, a file past `1 KiB × 16 + 4 KiB` and a value that repeats a delivered secret are each refused; a finalizer that hangs is stopped at its own 30 s bound with the annotation naming it and without what it printed; its timeout is clamped to what is left of the job's budget; a cancelled attempt runs none and records `skipped`; and a job without one records none. The container and microVM legs (the bind mount, and `get_into` for a guest's output file) are covered by `tests/end_to_end.rs` under `SENTINEL_PODMAN_TESTS=1`.
 
 - `tests/checkout.rs` (any Linux, needs `git`): the pinned commit is checked out even when it is not the branch head and only it is fetched; a workspace is never reused; an unknown revision is a `Preparation` failure; a transport Git refuses and an option-shaped repository are refused in bounded time; a bound source access for another repository or for a ref its binding excludes is `source access refused` before Git runs or a connection opens, while the bound repository and an allowed ref do reach the remote; a credential delivered through askpass leaves neither the helper nor the secret behind.
 - `tests/images.rs` (any Linux, needs `git`, no registry): the pull begins before the checkout finishes; a tag-only reference is refused on the shared path. A present digest-pinned image skips the pull and unpack, while a missing one, one `podman image exists` cannot confirm (damaged) and any credentialed pull do not (a `podman` shim stands in for the registry). The unit tests of `src/images.rs` cover single-flight pulls, followers' errors and retries, early cancel and the bounded held record.
