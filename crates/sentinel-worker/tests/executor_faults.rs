@@ -29,8 +29,23 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 const SHIM: &str = r#"#!/bin/sh
 dir="$(dirname "$0")"
-if [ "$1" = create ]; then echo "$*" >> "$dir/creates"; fi
-case "$1 $2" in
+line="$*"
+# Global flags (`--log-level=error` and, for a private store, `--root` and `--runroot`) precede the subcommand, so
+# find it instead of assuming the first argument is it. The arguments are left untouched for the real runtime below.
+sub=""
+after=""
+expect=""
+for arg in "$@"; do
+  if [ -n "$expect" ]; then expect=""; continue; fi
+  if [ -n "$sub" ]; then after="$arg"; break; fi
+  case "$arg" in
+    --root|--runroot) expect=x ;;
+    -*) ;;
+    *) sub="$arg" ;;
+  esac
+done
+if [ "$sub" = create ]; then echo "$line" >> "$dir/creates"; fi
+case "$sub $after" in
   "exec --workdir")
     # A step's exec, not the runtime's own: held while asked, so a cancel
     # can land while the step is still starting.
@@ -39,7 +54,7 @@ case "$1 $2" in
       i=0
       while [ -e "$dir/hold-exec" ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done
     fi ;;
-  rm*)
+  "rm "*|rm)
     if [ -e "$dir/slow-rm" ]; then sleep 3; fi ;;
 esac
 exec REAL "$@"
