@@ -257,6 +257,16 @@ second one. A protection rule that declines the update is reported (`409`,
 repository's settings refuse. The route, the bounds and what is recorded are in
 [workflow analysis](workflow-analysis.md#the-pull-request).
 
+**Rollback's one extra permission.** Taking a migration back applies the same three, plus
+`administration` write for the native path's settings step, which reads a branch's protection and
+puts its required status checks back ([workflow analysis](workflow-analysis.md#rollback)). It is
+asked for only when a rollback request carries a `settings` object, so a runner-mode rollback — the
+revert pull request — needs nothing beyond the three and an installation that never approved
+administration keeps working. GitHub mints a token carrying what the installation grants: a token
+that comes back without the permission is refused before any read or write is attempted, and the
+answer says `reason: "not_permitted"` with the change still stated, which is the path where a person
+applies it by hand.
+
 **The lifecycle is the existing one.** A permission change arrives as an `installation` delivery,
 which queues a refresh; the reconciliation pass reads the installation again and applies the
 snapshot (`github_events::apply_installation`), which is where the three bits are recorded. A

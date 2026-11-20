@@ -219,3 +219,73 @@ not a commit id and a commit whose workflows already name their classes refused;
 without the tenant's administration refused `403`.
 
 The change generator has three gates. **The label diff touches no other line**: every diff on every fixture is parsed back and applied to the input, the result must equal the input line for line except at the `runs-on:` lines, every added line must be a `runs-on:` naming a Sentinel class, and analyzing the result must leave every job either moved or listed as kept and produce an empty diff the second time. **Every native pipeline validates**: each generated text compiles, its jobs are exactly the mapping's, its triggers are the workflow's, and every stub it names is one the pipeline runs. **Identical input gives byte-identical output**: the same files planned twice, and in another order, produce the same diff, mapping and bytes; the native fixture's text is compared to a recorded file.
+
+## Rollback
+
+`POST /tenants/{slug}/repos/{name}/migration/rollback` takes a migration back in one action
+([plan 16.5](../plan.md#165-guided-github-actions-migration)). It restores a state rather than
+composing a change: the workflow bytes are GitHub's own at the revision the caller names, and the
+required checks are the document the switch's preview promised, compared against the branch's
+protection as GitHub states it now. Nothing is stored — GitHub holds the bytes and the branch holds
+the pull request — so a rollback cannot apply anything it did not read.
+
+**Two actions, one write.** `{"action": "revert", "commit": "<pre-switch revision>"}` puts the labels
+back in runner mode and re-enables the replaced jobs on the native path; `{"action": "shadow",
+"commit": "<shadow revision>"}` puts a shadow revision's workflows back and re-enters shadow mode, as
+often as a person likes. Both are committed to `sentinel/migrate` — the same branch and single pull
+request a migration leaves — so a rollback never pushes to a default branch, a re-run updates the
+pull request it found, and re-entering the same state twice writes no second commit.
+
+**What the revision must be.** The revision is checked against itself before anything is written: a
+revert names a state the migration would still move, so a revision whose jobs already name Sentinel
+classes is `409` with `details.reason: "not_pre_switch"`; a shadow re-entry names a state holding a
+copy named `sentinel / <job>`, and one that holds none is `409` with `"no_shadow"`. A revision with
+no workflow at all is `"no_workflows"`.
+
+**What it restores.** The commit's parent is the default branch's head, read from GitHub, so the pull
+request proposes today's state with the pre-switch workflows in it instead of undoing whatever merged
+since the switch. Its tree is that parent's with the named revision's workflow files written whole
+and every workflow file the parent holds that the revision does not deleted, so the branch ends up
+holding that revision's file set byte for byte. The bounds are the migration write's own — at most 64
+workflow files of 256 KiB each — and a protection rule that declines the update is reported as
+`branch_protected` with the ref untouched.
+
+**The native path's settings.** With a `settings` object the same call also handles the branch's
+required status checks. The body states the pre-switch document the switch's preview promised —
+`{"required_checks": {"strict": bool, "checks": [{"context", "app_id"}]}, "apply": bool}` — and the
+answer states what the branch holds now, the document to put back, the checks to remove and restore,
+and what became of it. Reading it needs repository administration, so the step mints its own token
+asking for `administration: write` on top of the migration's three; an installation that does not
+grant it answers `reason: "not_permitted"` with the change still stated, which is the path where a
+person applies it. `apply: false` shows the change and writes nothing (`"not_requested"`), a
+protection that waits for nothing is `"not_protected"`, and a branch already holding the document is
+`"unchanged"`. Applying writes the whole document in one statement and then reads the branch again:
+`verified: true` is what GitHub states afterwards, and a write that did not land is `"mismatch"` with
+`verified: false`. A required check held by a ruleset is not visible through branch protection, so a
+repository that keeps its checks in a ruleset keeps that half by hand.
+
+**What is recorded.** Every step that reached GitHub is one row in the repository's source audit
+trail — `migration_rollback_revert` for the revert pull request, `migration_shadow_enter` for a shadow
+re-entry, `migration_rollback_settings` for a change shown, `_settings_applied` for one applied and
+verified, `_settings_failed` for one refused or not matching, and `migration_rollback_refused` when
+GitHub declined the pull request. The gate's own refusal is written before any step, as on every
+migration write.
+
+The gate is on the bytes and on the settings, never on the intention.
+[`crates/sentinel-github/tests/rollback.rs`](../crates/sentinel-github/tests/rollback.rs) is the
+client against `sentinel_github::fake`: the restore built on the default branch's own head, the
+committed text equal to the revision's text, one branch and one pull request across a re-run, a
+workflow the revision does not hold stated as a deletion in the tree, a path outside the workflows
+directory or one both written and removed refused before a request, the required checks read and put
+back as one document, `administration` refused for an installation that never listed it, a branch
+with no protection answered apart from a permission refusal, and the checks bound.
+[`crates/sentinel-api/tests/migration_rollback.rs`](../crates/sentinel-api/tests/migration_rollback.rs)
+is the route: the revert answering `opened` with the branch holding the pre-switch bytes and one
+`migration_rollback_revert` row, a second call answering `updated` with one pull request and one
+branch, an already-migrated revision refused `not_pre_switch` with nothing written, shadow re-entry
+committing the shadow revision's bytes and recording `migration_shadow_enter`, a revision without a
+copy refused `no_shadow`, the settings step shown and then applied so the branch's protection equals
+the pre-switch document exactly (`verified: true`) and `unchanged` on a third call, the same step
+without `administration` stating `not_permitted` with the protection untouched and the revert pull
+request still opened, and the gate's own refusals — switch off, a withdrawn `workflows` permission,
+and a credential without the tenant's administration — each before any request reaches GitHub.

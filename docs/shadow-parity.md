@@ -60,6 +60,10 @@ count rather than implying more.
 
 ## The route, and what it costs
 
+Shadow mode is re-enterable after a switch: a rollback whose action is `shadow` puts a recorded
+shadow revision's workflows back on the migration branch, so the copies run beside the originals
+again and this report has pairs to compare ([rollback](workflow-analysis.md#rollback)).
+
 `POST /tenants/{slug}/repos/{name}/migration/parity` ([API](api.md#routes)) answers the report. It is
 a read: it writes nothing, contacts nothing, and every figure it answers with is either what the
 caller's Actions pages stated or what Sentinel recorded. The controller holds no Actions client for

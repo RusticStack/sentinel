@@ -396,7 +396,7 @@ fn spread_json(spread: parity::Spread) -> Value {
 
 /// The deployment's own fact about Docker: a job that needs a daemon can only move where a
 /// micro-VM guest serves its class.
-fn docker_hosts(state: &State) -> Result<DockerHosts, ApiError> {
+pub(crate) fn docker_hosts(state: &State) -> Result<DockerHosts, ApiError> {
     let microvm = state
         .store
         .read(|c| {

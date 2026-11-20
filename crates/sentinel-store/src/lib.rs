@@ -35,6 +35,7 @@ pub mod registration;
 pub mod replicate;
 pub mod reseal;
 pub mod retention;
+pub mod rollback;
 pub mod runner;
 pub mod runner_provision;
 pub mod runs;

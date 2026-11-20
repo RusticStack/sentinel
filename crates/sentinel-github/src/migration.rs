@@ -17,6 +17,7 @@ use serde_json::json;
 use crate::{
     Error, Result,
     app::{App, Token, valid_path_part},
+    rollback::Restore,
 };
 
 /// The one branch a migration commits to.
@@ -116,7 +117,7 @@ fn workflow_name(name: &str) -> bool {
 
 /// The path of one workflow file under the workflows directory, when the name is one this module
 /// can address and the file is one the analyzer reads.
-fn workflow_path(name: &str) -> Option<String> {
+pub(crate) fn workflow_path(name: &str) -> Option<String> {
     let yaml = name.ends_with(".yml") || name.ends_with(".yaml");
     (yaml && workflow_name(name)).then(|| format!("{WORKFLOWS}/{name}"))
 }
@@ -244,33 +245,21 @@ impl App {
         repo: &str,
         request: &Migrate<'_>,
     ) -> Result<Outcome> {
-        self.checked(owner, repo, request)?;
-        let base = self.default_branch(token, owner, repo)?;
-        let parent = self
-            .tree_of(token, owner, repo, request.commit)?
-            .ok_or(Error::Response("commit tree"))?;
-        let tree = self.write_tree(token, owner, repo, &parent, request.files)?;
-        // A re-run at a commit nothing has changed at writes no commit: the branch already holds
-        // this tree, so the history stays one commit per analysis that changed something.
-        let head = self.branch_head(token, owner, repo)?;
-        let unchanged = match &head {
-            Some(commit) => self.tree_of(token, owner, repo, commit)?.as_deref() == Some(&tree),
-            None => false,
-        };
-        let commit = match (&head, unchanged) {
-            (Some(commit), true) => commit.clone(),
-            _ => {
-                let commit = self.write_commit(token, owner, repo, request, &tree)?;
-                self.move_branch(token, owner, repo, &commit, head.is_none())?;
-                commit
-            }
-        };
-        let pull = self.publish(token, owner, repo, &base, &commit, request)?;
-        Ok(if head.is_some() {
-            Outcome::Updated(pull)
-        } else {
-            Outcome::Opened(pull)
-        })
+        self.restore(
+            token,
+            owner,
+            repo,
+            &Restore {
+                write: Migrate {
+                    commit: request.commit,
+                    files: request.files,
+                    message: request.message,
+                    title: request.title,
+                    body: request.body,
+                },
+                remove: &[],
+            },
+        )
     }
 
     /// Close the migration branch's open pull request, leaving the branch in place: what a tenant
@@ -302,7 +291,7 @@ impl App {
     }
 
     /// What this module sends, bounded before any request is made.
-    fn checked(&self, owner: &str, repo: &str, request: &Migrate<'_>) -> Result<()> {
+    pub(crate) fn checked(&self, owner: &str, repo: &str, request: &Migrate<'_>) -> Result<()> {
         if !valid_path_part(owner) || !valid_path_part(repo) {
             return Err(Error::Config("repository"));
         }
@@ -338,7 +327,7 @@ impl App {
 
     /// The branch a pull request proposes into. It is read, never assumed, and a repository whose
     /// default branch is the migration branch has nowhere to open one.
-    fn default_branch(&self, token: &Token, owner: &str, repo: &str) -> Result<String> {
+    pub(crate) fn default_branch(&self, token: &Token, owner: &str, repo: &str) -> Result<String> {
         let reply = self.http.send_json(
             "GET",
             &self.api(&format!("/repos/{owner}/{repo}")),
@@ -362,7 +351,7 @@ impl App {
 
     /// The tree one commit holds. `None` for a commit the repository no longer holds, which a
     /// branch someone deleted leaves behind.
-    fn tree_of(
+    pub(crate) fn tree_of(
         &self,
         token: &Token,
         owner: &str,
@@ -388,11 +377,17 @@ impl App {
             .ok_or(Error::Response("commit tree"))
     }
 
-    /// The commit `sentinel/migrate` holds, if the branch exists at all.
-    fn branch_head(&self, token: &Token, owner: &str, repo: &str) -> Result<Option<String>> {
+    /// The commit one branch holds, if the branch exists at all.
+    pub(crate) fn branch_head(
+        &self,
+        token: &Token,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<String>> {
         let reply = self.http.send_json(
             "GET",
-            &self.api(&format!("/repos/{owner}/{repo}/git/ref/heads/{BRANCH}")),
+            &self.api(&format!("/repos/{owner}/{repo}/git/ref/heads/{branch}")),
             &token.secret,
             None,
         )?;
@@ -411,15 +406,16 @@ impl App {
 
     /// One tree over `base_tree` with the rewritten files in it, so the commit replaces exactly the
     /// workflows the diff changed and every other path stays as it was.
-    fn write_tree(
+    pub(crate) fn write_tree(
         &self,
         token: &Token,
         owner: &str,
         repo: &str,
         base_tree: &str,
         files: &[Rewritten<'_>],
+        remove: &[&str],
     ) -> Result<String> {
-        let mut entries = Vec::with_capacity(files.len());
+        let mut entries = Vec::with_capacity(files.len() + remove.len());
         for file in files {
             entries.push(json!({
                 "path": file.path,
@@ -427,6 +423,11 @@ impl App {
                 "type": "blob",
                 "content": file.text,
             }));
+        }
+        // A path stated with a null sha is deleted from the tree: a restore of a state that held
+        // fewer workflow files than the commit it builds on.
+        for path in remove {
+            entries.push(json!({"path": path, "mode": "100644", "type": "blob", "sha": null}));
         }
         let reply = self.http.send_json_at_most(
             "POST",
@@ -448,7 +449,7 @@ impl App {
             .ok_or(Error::Response("tree"))
     }
 
-    fn write_commit(
+    pub(crate) fn write_commit(
         &self,
         token: &Token,
         owner: &str,
@@ -480,7 +481,7 @@ impl App {
 
     /// Point `sentinel/migrate` at the new commit, creating it the first time. A refusal is the
     /// protection rule's answer, reported as such and never forced past.
-    fn move_branch(
+    pub(crate) fn move_branch(
         &self,
         token: &Token,
         owner: &str,
@@ -565,7 +566,7 @@ impl App {
 
     /// Open the pull request, or update the one this branch already has. The base is the
     /// repository's default branch and the head is the migration branch, never the reverse.
-    fn publish(
+    pub(crate) fn publish(
         &self,
         token: &Token,
         owner: &str,
@@ -629,7 +630,7 @@ impl App {
         })
     }
 
-    fn api(&self, path: &str) -> String {
+    pub(crate) fn api(&self, path: &str) -> String {
         let mut url = String::with_capacity(self.endpoint.len() + path.len());
         url.push_str(&self.endpoint);
         url.push_str(path);
