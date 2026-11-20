@@ -80,7 +80,7 @@ fn check(grant: &Grant<'_>) -> Result<()> {
     Ok(())
 }
 
-fn insert(tx: &Transaction<'_>, grant: &Grant<'_>, now: UnixMillis) -> Result<Granted> {
+pub(crate) fn insert(tx: &Transaction<'_>, grant: &Grant<'_>, now: UnixMillis) -> Result<Granted> {
     check(grant)?;
     let id = TokenId::new();
     let secret = Secret::generate();

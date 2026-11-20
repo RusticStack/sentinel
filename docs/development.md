@@ -63,6 +63,20 @@ cargo release-linux
 
 `cargo run -p sentinel -- pipeline validate <file>` and `pipeline explain <file> [--json]` check a `.sentinel.yml` offline on any platform (see [pipeline schema](pipeline-schema.md#bindings-and-offline-validation)). `cargo bench-noop --help` runs the benchmark runner in release mode; see [Benchmarking](benchmarking.md). `cargo probe --help` runs the feasibility probes; see [feasibility probes](feasibility-probes.md).
 
+For the AI process (`ai/`) — Effect 4 with exact pins, so a dependency change is a code change:
+
+```sh
+pnpm install
+pnpm -C ai typecheck
+pnpm -C ai test:unit
+```
+
+Its tests contact no provider: the provider paths run against a recording fake HTTP client (the
+fake is the only client in the context, so every request the process made is one the fake saw),
+and the controller side runs over the API in `crates/sentinel-api/tests/ai_requests.rs`. Both
+packages are members of the repository's pnpm workspace, so one `pnpm install` at the root resolves
+both and `pnpm typecheck` checks both.
+
 After renaming a heading or moving a file under `docs/`, run `scripts/check-doc-links.sh` (no build needed): it fails on any Markdown link to a missing file or heading anchor in `README.md`, `CLAUDE.md`, `plan.md`, `TODO.md` and `docs/*.md`. Name headings for what they describe, not for the tracker item that introduced them; anchors are public.
 
 The role tests cover each feature independently and together, including unavailable-role errors in single-role builds. `test-cli` runs with default features, which currently exclude both roles. `--all-targets` in the lint aliases checks package tests/examples as well as the binary; it does not cross-compile for every operating system. Cross-target checks are documented in [Rust foundation](rust-foundation.md).

@@ -5,9 +5,11 @@ is optional advisory text on top of them: a model reads a bounded, redacted evid
 built from logs and diagnostics the controller already stored, and writes a summary that cites
 the lines it used. This page states the guarantees that hold whether AI is on or off, the
 deployment and tenant policy that decides whether it may run at all, what the bundle holds, and
-what each data policy commits to. What is built today is the policy, its routes, its gate and the
-evidence bundle the controller serves; the process that talks to a provider is
-[plan 16.6](../plan.md#166-ai-assistance) and the backlog items after Y02.
+what each data policy commits to. What is built today is the policy, its routes, its gate, the
+evidence bundle the controller serves, and the separate process that talks to a provider,
+`sentinel-ai`, with the durable requests it consumes and the request-scoped credential it reads
+evidence with. Budgets (Y04), the analyses themselves (Y05) and everything after are
+[plan 16.6](../plan.md#166-ai-assistance) and the backlog items after Y03.
 
 ## The guarantees
 
@@ -73,22 +75,94 @@ while either side is off — without a step-up. Every change is audited as
 | Data policy | What it commits to |
 |---|---|
 | `local_only` | Only an allow-listed endpoint inside the operator's own network. The controller refuses a hosted provider outright, so a request cannot leave the host. |
-| `zero_retention` | Only providers that keep neither the prompt nor the answer after the response. OpenRouter is called with `provider.zdr: true` and `data_collection: deny`; a provider that cannot honour it is refused rather than called (Y03). |
+| `zero_retention` | Only providers that keep neither the prompt nor the answer after the response. OpenRouter is called with `provider.zdr: true` always and `data_collection: deny` under this policy; a provider that cannot honour it is refused rather than called ([below](#the-process-and-its-providers)). |
 | `provider_terms` | The provider's own retention terms, which the operator accepts for this tenant. |
 
-`local_only` is a property of the provider the controller knows, so it is enforced at admission
-today. `zero_retention` is a property of the request Y03 sends; until that exists the tenant's
-choice is stored and enforced by the gate that refuses everything else.
+`local_only` is a property of the provider the controller knows, so it is enforced at admission.
+`zero_retention` is a property of the request `sentinel-ai` sends, so it is enforced there as well
+as here: OpenRouter always carries `provider.zdr: true`, `data_collection: deny` is added under
+this policy, and the two direct APIs — which have no per-request retention switch Sentinel could
+enforce — are refused for it rather than trusted.
+
+## The process and its providers
+
+`sentinel-ai` is a separate optional Node process in the repository's pnpm workspace (`ai/`, beside
+`web/`), written against Effect 4 with exact pins — `effect` and its four AI provider packages at
+the same version, because `effect/ai` is tagged `@stability unstable` and a range would let a
+minor release change it under a deployment. It is not part of the controller and it never holds a
+sentinel secret other than the two credentials below.
+
+**One interface.** Effect's `LanguageModel` is named in exactly one module
+(`ai/src/assistant.ts`). Everything else talks to Sentinel's `Assistant`, which asks one question
+of one evidence bundle and answers with text and the usage the provider reported — an unreported
+count is `null`, never zero. An upstream change to the AI modules therefore moves that one file.
+
+| Provider | Endpoint | What a request carries |
+|---|---|---|
+| `local` | an OpenAI-compatible endpoint: Ollama, vLLM or a LiteLLM gateway | nothing beyond the prompt; the endpoint is the operator's own, and it is refused at startup unless it stays inside their network (loopback, a private address, or a single-label name only their resolver knows) |
+| `openrouter` | `https://openrouter.ai/api/v1` | `provider.zdr: true` always, and `provider.data_collection: deny` under `zero_retention`. Both are layer defaults, so no request path can leave them out |
+| `anthropic` | `https://api.anthropic.com` | the bearer key; no retention switch exists to send |
+| `openai` | `https://api.openai.com` | the bearer key; no retention switch exists to send |
+
+Only `local` has a configurable address, which is what makes the two rules structural rather than
+checked before use: a `local_only` tenant is never given a hosted provider
+(`policy.allows` refuses it), and a hosted provider has no configurable host to be pointed at. The
+provider-policy tests run the whole path against a recording fake client, and their assertion is
+about every request the process made: for a `local_only` request naming a hosted provider, there
+are none at all.
+
+```sh
+SENTINEL_AI_CONTROLLER=http://127.0.0.1:8080   # the controller's API base
+SENTINEL_AI_TOKEN=sntl_…                      # the ai:context grant, shown once when issued
+SENTINEL_AI_MODEL_OPENROUTER=…                # one model per provider the deployment allows;
+SENTINEL_AI_MODEL_LOCAL=…                     # a provider with no model is refused, not guessed at
+SENTINEL_AI_LOCAL_URL=http://127.0.0.1:11434/v1
+SENTINEL_AI_LOCAL_KEY=…                       # vLLM and LiteLLM need one; Ollama does not
+SENTINEL_AI_OPENROUTER_KEY=…
+SENTINEL_AI_POLL_MS=2000                      # at least 100; a request is claimed per poll
+```
+
+A configuration it cannot use stops the process before the first poll and names the variable, never
+its value.
+
+## Requests and their delegations
+
+A member asks, the controller stores a row, and `sentinel-ai` consumes it through the API. Nothing
+in this path waits: no run, job, attempt, dispatch, log acknowledgement, check or GitHub delivery
+is on it.
+
+1. `POST /api/v1/tenants/{slug}/ai/requests` writes one durable row — the attempt, the provider,
+   the data policy it was admitted under, and its deadline, ten minutes out. A tenant whose policy
+   cannot use that provider gets the same `403` as a tenant with AI off, so a row that would have
+   reached a host the policy forbids is never written.
+2. The process polls `GET /api/v1/ai/requests`, oldest first. That call is also the sweep: a
+   request past its deadline is settled `unavailable` there, so nothing stays pending when a
+   provider is down, a tenant is disabled or the process is killed.
+3. `POST /ai/requests/{id}/claim` leases the row and mints its **delegation**: an `sntl_`
+   credential for the requester's own identity, capped to the read-only scopes, bound to that
+   request and its attempt, expiring after ten minutes or the row's deadline, whichever is first.
+   It is shown once, to the process, and it is what reads the evidence bundle — so the credential
+   that sees a bundle can read nothing the requester could not read, and it reads no other
+   attempt's bundle even inside a repository the requester can read.
+4. `POST /ai/requests/{id}/complete` settles the row exactly once, with the answer or the reason
+   there is none, and revokes the delegation in the same write. A settled request's delegation no
+   longer authenticates; a request past its deadline has none left either.
+
+The row moves `queued` → `claimed` → `settled` and never back. `GET /api/v1/ai/requests/{id}`
+answers a member who can read its repository, so the answer the process stored is where Y05 reads
+it from, and `crates/sentinel-api/tests/ai_requests.rs` proves the two halves the row's gate names:
+a delegation cannot read past the requester, and a `local_only` request reaches no public host.
 
 ## Disabling
 
-Turning AI off — for the tenant or for the deployment — takes effect at once: the gate below
-reads the policy on every request, so the next request that would have been made is refused, and
-no queued request survives a disable. The request queue arrives with Y03, and its rows are
-deleted in the same writer transaction that clears the flag, before the controller could dispatch
-one. Today there is no queue table and nothing that could fill it, so a disabled tenant provably
-has no request in flight or pending; `crates/sentinel-store/tests/ai_policy.rs` asserts that and
-is the tripwire that makes Y03 replace it with a test of the deletion.
+Turning AI off — for the tenant or for the deployment — takes effect at once: the gate below reads
+the policy on every request, so the next request that would have been made is refused, and no
+queued request survives a disable. The request queue is deleted in the same writer transaction
+that clears the flag, and the delegations those rows minted are revoked there too, so a request
+being processed at the moment of the disable loses its evidence read and ends `unavailable`.
+A policy change that withdraws a provider deletes the queued rows naming it, and leaves a claimed
+one to its own deadline. `crates/sentinel-store/tests/ai_policy.rs` proves the deletion and the
+revocation, both in the one write.
 
 ## The gate
 
@@ -153,12 +227,12 @@ none of them in the bundle the route serves.
 Only a credential whose scopes list `ai:context`. No permission set implies it
 ([OAuth](oauth.md#tokens-scopes-and-lifetimes)), so a browser session, an `sntl_` API credential and
 the shipped CLI's token can never read a bundle even though they read the log and the failure
-context; the grant is issued to the AI service's own account, and from Y03 a request's delegated
-token carries the requester's read-only scopes for exactly the life of that request.
+context; the grant is issued to the AI service's own account.
 
-Until Y03 registers the AI service, no shipped client is capped at `ai:context`: the deployment
-registers the client the grant is issued through. That is a gate with no caller yet, and it is
-deliberate — the process that would read a bundle does not exist.
+The one other credential that may read a bundle is a request's delegation, and only for its own
+request's attempt while that request is claimed and before its deadline ([above](#requests-and-their-delegations)).
+A delegation is read-only by construction, so it can never widen what a person may see: it *is*
+that person, minus every write.
 
 ## What data it reads
 
@@ -171,7 +245,14 @@ because the evidence it cites does.
 
 ## What is not built yet
 
-No provider client, budget ledger or analysis exists in the workspace, and no process contacts a
-provider: `sentinel-ai` is Y03, budgets and caching Y04, failure analyses Y05.
+No budget ledger and no analysis exists: `sentinel-ai` settles a request with the model's answer as
+plain text, which Y04 replaces with a reserved-and-settled budget and Y05 with an answer decoded
+against a schema and cited to the evidence it used. The skeleton has no prompt registry, no
+analysis cache and no evaluation set; those are Y04, Y05 and Y09.
 [Backlog Part 22](backlog.md) carries the rest, including the later flaky tests, the log-search
 assistant and the MCP read-only tools that expose them.
+
+Verification of this package is local: `pnpm typecheck` and
+`cd ai && node --import ./test/ts-register.mjs --test test/*.test.mjs`, both of which contact no
+provider — the provider tests run against a recording fake HTTP client, and the controller tests
+run over the API in `crates/sentinel-api/tests/ai_requests.rs`.

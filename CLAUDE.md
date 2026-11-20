@@ -39,6 +39,7 @@ Aliases live in `.cargo/config.toml`, all `--locked` (a dependency change commit
 | Linux roles | `cargo lint-linux`, `cargo test-server`, `cargo test-worker`, `cargo test-linux`, `cargo release-linux` |
 | Benchmarks | `cargo bench-noop --runtime direct --warm-state warm`; `sentinel-bench --contract <file> --lane <id> --condition <c>` |
 | Web | `pnpm -C web install`, `typecheck`, `build`, `test:unit`; browser test `cargo test -p sentinel-api --test web_browser -- --ignored` |
+| pnpm workspace | `pnpm install` at the root (members `web` and `ai`), `pnpm typecheck`, `pnpm test:unit` |
 
 Podman suites need `SENTINEL_PODMAN_TESTS=1` as the rootless account; microVM suites need `SENTINEL_MICROVM_TESTS=1` on `kvm-host`.
 
@@ -59,6 +60,7 @@ Podman suites need `SENTINEL_PODMAN_TESTS=1` as the rootless account; microVM su
 | `crates/sentinel` | CLI, host-local `admin`, Linux `server`/`worker` roles |
 | `crates/sentinel-bench`, `-probes` | benchmark runner and B11 harness, feasibility probes |
 | `web/` | `sentinel-web` (TanStack Start, React, Tailwind v4, pnpm), its own Node process |
+| `ai/` | `sentinel-ai` (Effect 4, exact pins), its own Node process: consumes AI requests and speaks to a provider |
 | `bench/` | benchmark records, frozen contracts, harnesses, host setup |
 | `examples/` | sanitized configs, deployment examples, pilot pipelines |
 

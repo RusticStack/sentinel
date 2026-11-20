@@ -4,7 +4,7 @@ use sentinel_auth::{
     secret::Secret,
 };
 use sentinel_core::{
-    GrantId, UnixMillis, UserId,
+    GrantId, TokenId, UnixMillis, UserId,
     auth::{Audience, Permissions, Principal, Scopes},
 };
 use sentinel_protocol::error::{ApiError, ErrorCode};
@@ -26,6 +26,9 @@ pub struct Identity {
     pub csrf: Option<sentinel_auth::secret::Digest>,
     pub scopes: Scopes,
     pub grant: Option<GrantId>,
+    /// The `sntl_` credential this identity presented, when it presented one. It is what a request's
+    /// delegation is recognised by: an AI request binds the one credential it minted.
+    pub credential: Option<TokenId>,
     pub expires: Option<UnixMillis>,
     /// Display only: privileged changes are authorized through `authority`, not this flag.
     pub stepped_up: bool,
@@ -85,6 +88,7 @@ pub fn identify(
                     csrf: None,
                     scopes: Scopes::from_permissions(principal.permissions),
                     grant: None,
+                    credential: Some(authenticated.token),
                     expires: None,
                     stepped_up: false,
                     authority: Authority::credential(principal),
@@ -121,6 +125,7 @@ pub fn identify(
         csrf: Some(session.csrf),
         scopes: Scopes::from_permissions(principal.permissions),
         grant: None,
+        credential: None,
         expires: None,
         stepped_up: session.stepped_up_within(sessions, now),
         authority: Authority::live_session(&session, secret.digest(), sessions),
@@ -152,6 +157,7 @@ fn oauth_identity(authenticated: sentinel_store::oauth::Authenticated) -> Identi
         csrf: None,
         scopes: authenticated.scopes,
         grant: Some(authenticated.grant),
+        credential: None,
         expires: Some(authenticated.expires),
         stepped_up: false,
         authority: Authority::credential(principal),

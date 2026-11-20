@@ -114,6 +114,11 @@ impl Scopes {
             | Self::CACHE_READ.0
             | Self::SECRETS_METADATA.0,
     );
+
+    /// The read-only half of the set: every scope `Permissions::READ` implies and no other. An AI
+    /// request's delegated token holds exactly this, and a requester must hold all of it before a
+    /// request is made on their behalf, so the delegation can never read past the requester.
+    pub const READ_ONLY: Self = Self::READS;
     const RUNS: Self = Self(Self::RUNS_WRITE.0 | Self::CACHE_WRITE.0 | Self::ARTIFACTS_WRITE.0);
 
     pub const fn bits(self) -> u32 {

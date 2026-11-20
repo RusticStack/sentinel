@@ -757,6 +757,7 @@ fn database_at_latest_without_classes(path: &Path) {
          ALTER TABLE storage_policies DROP COLUMN hard_percent;
          ALTER TABLE artifacts DROP COLUMN failure;
          DROP TABLE storage_notices;
+         DROP TABLE ai_requests;
          DELETE FROM schema_migrations WHERE version >= 65;",
     )
     .unwrap();
