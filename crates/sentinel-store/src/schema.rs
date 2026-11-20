@@ -354,8 +354,8 @@ mod tests {
             "an older controller claims a log-search request as a failure analysis of its attempt and settles it with an answer to a question it never read: it knows neither the question nor the plan the answer must be built from",
         ),
         (
-            85,
-            "an older controller cannot decode run spec format 11, so it refuses to serve a run whose pipeline declares a checkout history or an additional checkout, and it holds no source manifest: it could neither say what such a run built nor resolve its recorded revisions on a rerun",
+            86,
+            "an older controller cannot decode run spec format 12, so it refuses to serve a run whose pipeline declares a checkout history or an additional checkout, and it holds no source manifest: it could neither say what such a run built nor resolve its recorded revisions on a rerun",
         ),
     ];
 

@@ -118,16 +118,12 @@ fn the_check_reports_the_upgrade_without_migrating_and_exits_two_when_it_blocks(
         report["blocking"].as_array().unwrap().is_empty(),
         "{report}"
     );
-    // The newest migration rebuilds the provenance table so one delivery may produce every run it
-    // matched, and this database holds no run to carry over.
+    // The newest migration adds the run source manifest and carries no row over, so the one pending
+    // step rewrites nothing.
     let steps = report["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 1, "{report}");
     assert_eq!(steps[0]["migration"], schema::LATEST);
-    assert_eq!(
-        steps[0]["rewrites"],
-        serde_json::json!([{ "table": "run_provenance", "rows": 0 }]),
-        "{report}"
-    );
+    assert_eq!(steps[0]["rewrites"], serde_json::json!([]), "{report}");
     // The per-tenant defaults the upgrade applies are sized from the data file system and reported, and
     // this tenant is under them, so nothing is capped.
     let defaults = &report["tenant_defaults"];
