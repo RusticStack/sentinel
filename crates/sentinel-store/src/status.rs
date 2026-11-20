@@ -25,6 +25,8 @@ pub struct JobStatus {
     /// What the job declared and re-exported, in declaration order; empty for a job that declared
     /// none, which is every job until it reports them. Plain text, public within the tenant.
     pub outputs: Vec<(String, String)>,
+    /// The external resource the job waited out its bound for, on the job that failed for it.
+    pub lock_wait: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,7 +111,7 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
     let mut stmt = conn.prepare_cached(
         "SELECT j.id, j.name, j.state_code, j.failure_class, j.cancel_requested, j.fence,
                 j.queued_ms, j.leased_ms, j.preparing_ms, j.running_ms, j.finalizing_ms, j.terminal_ms,
-                a.id, a.log_state, j.outputs
+                a.id, a.log_state, j.outputs, j.lock_wait
          FROM jobs j
          LEFT JOIN attempts a ON a.id = (
             SELECT a2.id FROM attempts a2 WHERE a2.job_id = j.id ORDER BY a2.fence DESC LIMIT 1)
@@ -137,11 +139,24 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
             r.get::<_, Option<[u8; 16]>>(12)?,
             r.get::<_, Option<i64>>(13)?,
             r.get::<_, Option<String>>(14)?,
+            r.get::<_, Option<String>>(15)?,
         ))
     })?;
     let mut jobs = Vec::new();
     for row in rows {
-        let (id, name, code, class, cancel, fence, timestamps, attempt, log_state, outputs) = row?;
+        let (
+            id,
+            name,
+            code,
+            class,
+            cancel,
+            fence,
+            timestamps,
+            attempt,
+            log_state,
+            outputs,
+            lock_wait,
+        ) = row?;
         jobs.push(JobStatus {
             id: JobId::from_bytes(id).map_err(|_| Error::Corrupt("job_id"))?,
             name,
@@ -160,6 +175,7 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
             outputs: outputs
                 .map(|text| crate::outputs::decode(&text))
                 .unwrap_or_default(),
+            lock_wait,
         });
     }
     let state = aggregate(jobs.iter().map(|j| j.state));

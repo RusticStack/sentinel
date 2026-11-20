@@ -49,8 +49,11 @@ pub fn create_run(
     let mut mark_index = tx.prepare_cached(
         "UPDATE jobs SET spec_index = ?1, cpu_millis = ?3, memory_bytes = ?4, timeout_ms = ?5,
                 disk_bytes = ?6, arch = ?7, labels = ?8, concurrency_group = ?9,
-                requires_secret_delivery = ?10, runtime = ?11
+                requires_secret_delivery = ?10, runtime = ?11, locks = ?12
          WHERE id = ?2",
+    )?;
+    let mut insert_lock = tx.prepare_cached(
+        "INSERT INTO job_locks(tenant_id, job_id, name, wait_ms) VALUES (?1, ?2, ?3, ?4)",
     )?;
     for (index, job) in spec.pipeline.jobs.iter().enumerate() {
         let id = JobId::new();
@@ -79,7 +82,20 @@ pub fn create_run(
             group,
             job.spec.requires_secret_delivery(),
             dispatch::job_runtime(&job.spec.runs_on),
+            job.spec.locks.len() as i64,
         ])?;
+        // The resources outlive this transaction only as rows: the placement statement and the bound
+        // sweep read them, never the spec.
+        for lock in &job.spec.locks {
+            insert_lock.execute(params![
+                tenant.as_bytes(),
+                id.as_bytes(),
+                lock.name,
+                i64::try_from(lock.wait_secs)
+                    .map_err(|_| Error::InvalidInput("lock wait"))?
+                    .saturating_mul(1000),
+            ])?;
+        }
         if let Ok(image) = sentinel_pipeline::run::ImageRef::parse(&job.spec.image) {
             let name = dispatch::prefetch_name(&image.name).then_some(image.name.as_str());
             if image.digest.is_some() || name.is_some() {
@@ -451,7 +467,7 @@ pub(crate) fn reset_terminal_job(
         return Err(Error::InvalidInput("terminal job reset"));
     }
     let changed = tx.execute(
-        "UPDATE jobs SET state_code = ?1, failure_class = NULL, queued_ms = ?2,
+        "UPDATE jobs SET state_code = ?1, failure_class = NULL, lock_wait = NULL, queued_ms = ?2,
             leased_ms = NULL, preparing_ms = NULL, running_ms = NULL, finalizing_ms = NULL,
             terminal_ms = NULL, cancel_requested = ?3
          WHERE id = ?4 AND tenant_id = ?5 AND state_code = ?6 AND fence = ?7

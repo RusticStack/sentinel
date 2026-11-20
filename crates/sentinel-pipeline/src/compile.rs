@@ -717,6 +717,15 @@ fn digest_of(
             d.u64(u64::from(a.required));
             d.opt_str(a.class.as_deref());
         }
+        // Only when stated, so a pipeline that declares no lock keeps the digest it always had.
+        if !s.locks.is_empty() {
+            d.str("locks");
+            d.u64(s.locks.len() as u64);
+            for lock in &s.locks {
+                d.str(&lock.name);
+                d.u64(lock.wait_secs);
+            }
+        }
         // Only when stated, so the digests of pipelines written before these fields stay the same.
         if s.history != crate::schema::History::Shallow || !s.checkouts.is_empty() {
             d.str("checkout");

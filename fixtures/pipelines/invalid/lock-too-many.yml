@@ -1,0 +1,5 @@
+# expect: more than 4 entries
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, locks: [a, b, c, d, e], steps: [{id: s, run: x}]}

@@ -1,0 +1,11 @@
+schema: 1
+on: [push, manual]
+jobs:
+  migrate:
+    image: postgres:16
+    # A thing outside Sentinel that one job at a time may run against. The shorthand waits the
+    # default ten minutes; the long form declares its own bound, after which the job fails naming it.
+    locks: [db/staging, {name: "device:rig-1", wait: 30m}]
+    steps:
+      - id: migrate
+        run: ./migrate.sh

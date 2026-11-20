@@ -40,6 +40,7 @@ Outcomes, in aggregation precedence from lowest to highest: `passed`, `skipped`,
 | `ConditionFailed` | controller | blocked | infra_failed (class `preparation`) |
 | `CancelBeforeStart` | controller | blocked, queued | canceled |
 | `QueueTimedOut` | controller | blocked, queued | timed_out |
+| `LockTimedOut` | controller | blocked, queued | timed_out (class `resource_lock`) |
 | `Leased(fence)` | controller | queued | leased (fence must increase) |
 | `OfferLapsed` | controller | leased | queued (fence unchanged; the attempt was declined or never acknowledged) |
 | `PreparationStarted` | worker | leased | preparing |
@@ -65,11 +66,11 @@ Each class maps to exactly one outcome, so storage can never hold a contradictor
 | Outcome | Classes |
 |---|---|
 | failed | `command_failed`, `command_signaled`, `out_of_memory` |
-| timed_out | `execution_timeout`, `queue_timeout` |
+| timed_out | `execution_timeout`, `queue_timeout`, `resource_lock` |
 | canceled | `canceled` |
 | infra_failed | `preparation`, `lease_expired`, `worker_lost`, `reconciled`, `publication`, `runtime` |
 
-`runtime` is the container runtime failing to run a step — the exec never started or the runtime errored — as opposed to the command failing. `infra_failed` is never attributed to the repository and is what the CLI, GitHub check and MCP diagnostics distinguish from a real test failure.
+`runtime` is the container runtime failing to run a step — the exec never started or the runtime errored — as opposed to the command failing. `resource_lock` is a job that waited out the bound it declared for an external resource another job still held, and the job row names the resource in `lock_wait` ([storage](storage.md#external-resources)). `infra_failed` is never attributed to the repository and is what the CLI, GitHub check and MCP diagnostics distinguish from a real test failure.
 
 ## Cancellation
 
