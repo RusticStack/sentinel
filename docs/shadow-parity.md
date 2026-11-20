@@ -19,6 +19,10 @@ non-required by construction: no branch protection requires a `sentinel / …` c
 original's required check keeps its name and its authority. A matrix job's copy is expanded the way
 GitHub expands the original, so `build (1.24)` is paired with `sentinel / build (1.24)`.
 
+A pair stops existing at the switch, which drops every copy and leaves the original on a Sentinel
+label ([migration switch](migration-switch.md)); until then both sides run on every commit the report
+covers.
+
 The pairs are stated, not guessed: a native job is named per matrix cell
 (`build-1-24`), which no rule can reverse, and the wizard holds the mapping the preview generated.
 Each pair names its commit, its original and its copy. A copy Sentinel holds at one of the report's

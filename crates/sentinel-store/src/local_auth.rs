@@ -125,6 +125,7 @@ pub enum Event {
     MigrationModeChanged = 100,
     RunnerForkPrsChanged = 101,
     PoolForkChanged = 102,
+    MigrationSettingsChanged = 103,
 }
 
 impl Event {
@@ -213,6 +214,7 @@ impl Event {
             Event::StorageNotice => "storage-threshold-notified",
             Event::RunnerForkPrsChanged => "runner-fork-prs-changed",
             Event::PoolForkChanged => "pool-fork-changed",
+            Event::MigrationSettingsChanged => "migration-settings-changed",
         }
     }
 
@@ -301,6 +303,7 @@ impl Event {
             100 => Event::MigrationModeChanged,
             101 => Event::RunnerForkPrsChanged,
             102 => Event::PoolForkChanged,
+            103 => Event::MigrationSettingsChanged,
             _ => return None,
         })
     }
@@ -1195,9 +1198,9 @@ mod tests {
                 assert!(names.insert(event.name()), "name {} reused", event.name());
             }
         }
-        // 62 contiguous codes plus the 70..=77 and 90..=102 blocks; a new event must be added to
+        // 62 contiguous codes plus the 70..=77 and 90..=103 blocks; a new event must be added to
         // `from_code` too.
-        assert_eq!(known, 62 + 8 + 13, "an event is missing from from_code");
+        assert_eq!(known, 62 + 8 + 14, "an event is missing from from_code");
         assert!(Event::from_code(0).is_none() && Event::from_code(63).is_none());
     }
 

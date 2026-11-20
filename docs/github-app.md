@@ -267,6 +267,27 @@ that comes back without the permission is refused before any read or write is at
 answer says `reason: "not_permitted"` with the change still stated, which is the path where a person
 applies it by hand.
 
+**The switch's settings write.** The last step of a native migration changes the required status
+checks that gate a merge, which is a write to the repository's protection rather than to its files,
+and it is the one write Sentinel does not make on its own. Reading protection and rulesets and
+changing the required check set both need repository `administration` — already in the one App's
+manifest, because runner mode registers a runner in a personal namespace through `administration`
+write — and the token is minted asking for it, so a mint that comes back without it is GitHub saying
+the installation does not grant it.
+
+Whether Sentinel makes the change at all is the tenant's decision, kept apart from the migration
+switch on purpose: `tenants.migration_settings` (migration **77**, off by default) says a tenant lets
+Sentinel apply it. Off, the switch answers the preview and a person applies the change, and the next
+request with `verify` compares the result. On, `sentinel_store::migration::authorize_settings` admits
+the write in the same statement that reads the migration switch and the installation's snapshot, so a
+withdrawal on GitHub or a switch turned off refuses the very next write, and a refusal is written to
+the repository's audit trail as `migration_settings_off` beside the `migration_off` and
+`migration_permissions` the migration gate already writes. Turning the opt-in on audits
+`migration-settings-changed` (event **103**) and never requires the installation to grant anything —
+the grant is checked where it is used, and a runner-mode switch that cannot read protection at all
+refuses its step rather than asserting the gate stood still.
+[Migration switch](migration-switch.md#applying-it-the-opt-in) is the whole of it.
+
 **The lifecycle is the existing one.** A permission change arrives as an `installation` delivery,
 which queues a refresh; the reconciliation pass reads the installation again and applies the
 snapshot (`github_events::apply_installation`), which is where the three bits are recorded. A

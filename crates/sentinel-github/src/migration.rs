@@ -326,8 +326,9 @@ impl App {
     }
 
     /// The branch a pull request proposes into. It is read, never assumed, and a repository whose
-    /// default branch is the migration branch has nowhere to open one.
-    pub(crate) fn default_branch(&self, token: &Token, owner: &str, repo: &str) -> Result<String> {
+    /// default branch is the migration branch has nowhere to open one. Public because the switch
+    /// reads the protection of the same branch a migration proposes into, from another crate.
+    pub fn default_branch(&self, token: &Token, owner: &str, repo: &str) -> Result<String> {
         let reply = self.http.send_json(
             "GET",
             &self.api(&format!("/repos/{owner}/{repo}")),

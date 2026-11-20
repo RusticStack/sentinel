@@ -19,7 +19,7 @@ use sentinel_github::migration::{self as remote, Migrate, Outcome, Rewritten};
 use sentinel_github::rollback::{
     self as settings, Protected, RequiredCheck, RequiredChecks, Restore, Set,
 };
-use sentinel_pipeline::workflow::{Images, Options, WorkflowFile, analyze, plan};
+use sentinel_pipeline::workflow::{Images, Options, Phase, WorkflowFile, analyze, plan};
 use sentinel_protocol::error::{ApiError, ErrorCode};
 use sentinel_store::{
     auth as authz, lookup, migration::Writes, parity, rollback::Step, sources, sources_forge,
@@ -208,6 +208,7 @@ pub(crate) fn rollback(state: &State, request: &mut Request, slug: &str, name: &
             docker,
             native: false,
             images: Images::default(),
+            phase: Phase::Label,
         },
     )
     .map_err(|error| err(ErrorCode::InvalidRequest, format!("preview: {error}")))?;

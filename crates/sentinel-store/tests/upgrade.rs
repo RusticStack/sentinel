@@ -431,7 +431,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     };
 
     let report = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(report.inspection.pending, vec![73, 74, 75, 76]);
+    assert_eq!(report.inspection.pending, vec![73, 74, 75, 76, 77]);
     assert!(report.inspection.openable() && report.inspection.integrity == "ok");
     assert_eq!(
         report.copy.as_deref(),
@@ -448,7 +448,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
             .iter()
             .map(|step| step.version)
             .collect::<Vec<_>>(),
-        vec![73, 74, 75, 76]
+        vec![73, 74, 75, 76, 77]
     );
     let rewrites = |step: usize| -> Vec<(String, u64)> {
         report.steps[step]
@@ -458,6 +458,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
             .collect()
     };
     let (oauth, runner, migration, fork) = (rewrites(0), rewrites(1), rewrites(2), rewrites(3));
+    let switch = rewrites(4);
     for (table, rows) in stored {
         assert!(rows > 0, "{table} is populated");
         assert!(
@@ -474,6 +475,10 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
         "migration 75 only adds shape: {migration:?}"
     );
     assert!(fork.is_empty(), "migration 76 only adds shape: {fork:?}");
+    assert!(
+        switch.is_empty(),
+        "migration 77 only adds shape: {switch:?}"
+    );
 
     // Every enrolled worker is listed with what it announces, and the one this build cannot serve is
     // marked rather than silently dropped.
@@ -566,14 +571,14 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
         .unwrap();
     }
     let report = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(report.inspection.pending, vec![71, 72, 73, 74, 75, 76]);
+    assert_eq!(report.inspection.pending, vec![71, 72, 73, 74, 75, 76, 77]);
     assert_eq!(
         report.copy.as_deref(),
         Some(upgrade::snapshot_path(&path, 70).as_path())
     );
     assert_eq!(
         report.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75, 76]
+        vec![71, 72, 73, 74, 75, 76, 77]
     );
     assert!(report.blocking.is_empty(), "{:?}", report.blocking);
 
@@ -600,7 +605,12 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
             )
             .unwrap()
     };
-    for release in [69, schema::LATEST - 2, schema::LATEST - 1] {
+    assert_eq!(
+        needs(&path, schema::LATEST - 1),
+        schema::LATEST - 1,
+        "migration 77 is readable by the release before it"
+    );
+    for release in [69, schema::LATEST - 2] {
         assert!(
             needs(&path, release) > release,
             "release {release} cannot run on the upgraded database"
@@ -642,10 +652,10 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     drop(restored);
     // A second preflight over the restored copy reports the same upgrade, not a migration half done.
     let again = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(again.inspection.pending, vec![71, 72, 73, 74, 75, 76]);
+    assert_eq!(again.inspection.pending, vec![71, 72, 73, 74, 75, 76, 77]);
     assert_eq!(
         again.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75, 76]
+        vec![71, 72, 73, 74, 75, 76, 77]
     );
 }
 
@@ -796,13 +806,13 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        76,
+        77,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
     assert_eq!(
         sources,
-        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 74, 75]
+        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 75, 76]
     );
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
@@ -827,8 +837,12 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         // The columns are fixed up to 75, and the newest migration is checked from the schema itself,
         // so this table does not have to grow a column every time one is added: nothing below LATEST
         // may run on a database at LATEST.
-        assert!(
-            !readable(&db, from, schema::LATEST),
+        // Migration 77 only adds a tenant switch no older statement reads, so it is declared
+        // readable by the release before it: that release runs on a database at LATEST and no other
+        // older release here does.
+        assert_eq!(
+            readable(&db, from, schema::LATEST),
+            from == schema::LATEST - 1,
             "release {from} runs on a database at {LATEST}",
             LATEST = schema::LATEST
         );
@@ -904,12 +918,8 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
                 true, true, true, true, true, true, true, true, true, true, true, true, true,
                 false, false,
             ],
-            74 => [
-                true, true, true, true, true, true, true, true, true, true, true, true, true, true,
-                false,
-            ],
-            // The newest release in the list runs on every column it is listed against.
-            75 => [
+            // The two newest releases in the list run on every column they are listed against.
+            75 | 76 => [
                 true, true, true, true, true, true, true, true, true, true, true, true, true, true,
                 true,
             ],

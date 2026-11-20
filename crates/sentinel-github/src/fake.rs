@@ -109,6 +109,10 @@ struct Inner {
     protected: Vec<String>,
     /// A branch's required status checks, per `owner/repo@branch`, as GitHub states them.
     protection: HashMap<String, String>,
+    /// Repository rulesets, in the order a test set them.
+    rulesets: Vec<Ruleset>,
+    /// A body the branch-rules read answers exactly, when a test states one.
+    rules_json: Option<String>,
     /// What each installation token was minted to carry, by token.
     installation_tokens: HashMap<String, serde_json::Value>,
     /// Pull requests, oldest first.
@@ -315,6 +319,36 @@ impl FakeGithub {
             .and_then(|required| serde_json::from_str(required).ok())
     }
 
+    /// One active repository ruleset requiring these contexts on every branch it covers.
+    pub fn set_ruleset(&self, id: u64, name: &str, contexts: &[&str]) {
+        self.lock().rulesets.push(Ruleset {
+            id,
+            name: name.to_owned(),
+            target: "branch".to_owned(),
+            enforcement: "active".to_owned(),
+            contexts: contexts
+                .iter()
+                .map(|context| (*context).to_owned())
+                .collect(),
+        });
+    }
+
+    /// The target and enforcement one ruleset states: a ruleset that is not an active branch rule
+    /// applies to no branch.
+    pub fn set_ruleset_state(&self, id: u64, target: &str, enforcement: &str) {
+        let mut state = self.lock();
+        let Some(ruleset) = state.rulesets.iter_mut().find(|ruleset| ruleset.id == id) else {
+            return;
+        };
+        target.clone_into(&mut ruleset.target);
+        enforcement.clone_into(&mut ruleset.enforcement);
+    }
+
+    /// Answer the branch-rules read with exactly this body, for an answer GitHub must never send.
+    pub fn set_rules_json(&self, body: &str) {
+        self.lock().rules_json = Some(body.to_owned());
+    }
+
     /// The default branch a repository proposes into.
     pub fn set_default_branch(&self, owner: &str, repo: &str, branch: &str) {
         self.lock()
@@ -437,6 +471,15 @@ pub struct Published {
     pub head: String,
     pub title: String,
     pub body: String,
+}
+
+/// A repository ruleset: what the listing names, and the contexts its branch rule requires.
+struct Ruleset {
+    id: u64,
+    name: String,
+    target: String,
+    enforcement: String,
+    contexts: Vec<String>,
 }
 
 /// A Git object id the fake mints: hex of the same input is the same id, as Git's own is.
@@ -618,6 +661,53 @@ fn migration_route(
             ),
             None => not_found(),
         },
+        ["repos", owner, repo, "rules", "branches", branch] if get => {
+            debug_assert!(!owner.is_empty() && !repo.is_empty() && !branch.is_empty());
+            if let Some(body) = &state.rules_json {
+                return Some((200, None, body.clone()));
+            }
+            let rules: Vec<serde_json::Value> = state
+                .rulesets
+                .iter()
+                .filter(|ruleset| {
+                    ruleset.target == "branch"
+                        && ruleset.enforcement == "active"
+                        && !ruleset.contexts.is_empty()
+                })
+                .map(|ruleset| {
+                    serde_json::json!({
+                        "type": "required_status_checks",
+                        "ruleset_id": ruleset.id,
+                        "ruleset_source": "Repository",
+                        "parameters": {
+                            "required_status_checks": ruleset
+                                .contexts
+                                .iter()
+                                .map(|context| serde_json::json!({"context": context}))
+                                .collect::<Vec<_>>(),
+                            "strict_required_status_checks_policy": false,
+                        },
+                    })
+                })
+                .collect();
+            (200, None, serde_json::Value::Array(rules).to_string())
+        }
+        ["repos", owner, repo, "rulesets"] if get => {
+            debug_assert!(!owner.is_empty() && !repo.is_empty());
+            let listed: Vec<serde_json::Value> = state
+                .rulesets
+                .iter()
+                .map(|ruleset| {
+                    serde_json::json!({
+                        "id": ruleset.id,
+                        "name": ruleset.name,
+                        "target": ruleset.target,
+                        "enforcement": ruleset.enforcement,
+                    })
+                })
+                .collect();
+            (200, None, serde_json::Value::Array(listed).to_string())
+        }
         ["repos", owner, repo, "contents", directory, workflows] if get => {
             debug_assert_eq!((*directory, *workflows), (".github", "workflows"));
             let commit = params(query).get("ref").cloned().unwrap_or_default();
