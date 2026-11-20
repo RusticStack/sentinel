@@ -1,0 +1,24 @@
+{
+  "name": "sentinel-ai",
+  "private": true,
+  "type": "module",
+  "description": "Sentinel's AI process: durable requests consumed from the controller, one provider policy, and Sentinel's Assistant over Effect's LanguageModel",
+  "scripts": {
+    "start": "node src/main.ts",
+    "test:unit": "node --import ./test/ts-register.mjs --test test/*.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@effect/ai-anthropic": "4.1.4",
+    "@effect/ai-openai": "4.1.4",
+    "@effect/ai-openai-compat": "4.1.4",
+    "@effect/ai-openrouter": "4.1.4",
+    "effect": "4.1.4"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.1",
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2"
+  },
+  "packageManager": "pnpm@12.15.0"
+}

@@ -8,9 +8,13 @@
 //! ([`context`]). It holds no provider and makes no call either; it exists so the process
 //! that will call one never holds a log, a secret or a credential, only a bounded,
 //! redacted document behind its own grant.
+//!
+//! Y03 adds the durable requests that process consumes ([`enqueue`], [`queued`], [`claim`],
+//! [`complete`]) and the delegation each one mints: the requester's own identity capped to reads,
+//! bound to that request and that attempt, ten minutes or the request's deadline at most.
 
 use sentinel_core::{
-    AttemptId, UnixMillis,
+    AiRequestId, AttemptId, UnixMillis,
     auth::{Permissions, Scopes},
 };
 use sentinel_protocol::{
@@ -30,7 +34,8 @@ use serde_json::{Value, json};
 use crate::evidence::{LogScope, Reports, json_len, log_reports, looks_binary, step_outcome_name};
 
 use super::{
-    Route, admin, auth, body, err, id, identify, ok, parse, query_param, store_error, stream_name,
+    Reply, Route, admin, auth, body, err, id, identify, ok, parse, query_param, store_error,
+    stream_name,
 };
 use crate::{State, http::Request};
 
@@ -48,6 +53,17 @@ pub(super) fn route(
         ("PUT", ["api", "v1", "tenants", slug, "ai"]) => set_tenant(state, request, slug),
         ("GET", ["api", "v1", "attempts", attempt, "ai-context"]) => {
             context(state, request, attempt, query)
+        }
+        ("POST", ["api", "v1", "tenants", slug, "ai", "requests"]) => enqueue(state, request, slug),
+        ("GET", ["api", "v1", "ai", "requests"]) => queued(state, request, query),
+        ("GET", ["api", "v1", "ai", "requests", request_id]) => {
+            require_request(state, request, request_id)
+        }
+        ("POST", ["api", "v1", "ai", "requests", request_id, "claim"]) => {
+            claim(state, request, request_id)
+        }
+        ("POST", ["api", "v1", "ai", "requests", request_id, "complete"]) => {
+            complete(state, request, request_id)
         }
         _ => return None,
     })
@@ -183,8 +199,23 @@ const MAX_BUNDLE_STEPS: usize = 8;
 /// it, so a provider receives evidence and never a credential.
 pub(super) fn context(state: &State, request: &Request, attempt: &str, query: &str) -> Route {
     let who = identify(state, request, false)?;
-    auth::require_scope(&who, Scopes::AI_CONTEXT)?;
     let attempt: AttemptId = id(attempt, "attempt")?;
+    // Two credentials may read a bundle: the AI service's own `ai:context` grant, and the
+    // read-only delegation of a live request about this very attempt. The delegation is the
+    // requester's own identity capped to reads, so it can read nothing the requester cannot, and
+    // its binding ends the moment the request settles or its deadline passes.
+    if !who.scopes.contains(Scopes::AI_CONTEXT) {
+        let delegated = match who.credential {
+            Some(token) => state
+                .store
+                .read(move |c| ai::delegates(c, token, attempt, UnixMillis::now()))
+                .map_err(store_error)?,
+            None => false,
+        };
+        if !delegated {
+            auth::require_scope(&who, Scopes::AI_CONTEXT)?;
+        }
+    }
     let budget = match query_param(query, "budget") {
         None => DEFAULT_BUNDLE_BYTES,
         Some(value) => value
@@ -608,4 +639,208 @@ fn shorten_diagnostic(body: &mut Value, excess: usize) -> bool {
     let omitted = body["bounds"]["omitted_diagnostics"].as_u64().unwrap_or(0);
     body["bounds"]["omitted_diagnostics"] = json!(omitted.saturating_add(1));
     true
+}
+
+// ---------------------------------------------------------------------------------------------
+// Durable requests (Y03): a member asks about one attempt, the AI service consumes the row through
+// the API, and the row ends exactly once. The controller calls no provider and the AI process
+// holds no log, no secret and no run.
+// ---------------------------------------------------------------------------------------------
+
+/// A page of queued requests. The service asks one poll at a time; a smaller page is a deliberate
+/// cap, because a request that waits is a request that will expire.
+const QUEUE_PAGE: u32 = 32;
+const MAX_QUEUE_PAGE: u32 = 128;
+/// How many expired rows one poll settles. Bounded like every other sweep in the controller.
+const EXPIRE_PER_POLL: u32 = 32;
+
+fn request_json(request: &ai::Request, with_result: bool) -> Value {
+    let mut body = json!({
+        "id": request.id.to_string(),
+        "attempt": request.attempt.to_string(),
+        "provider": request.provider.as_str(),
+        "data_policy": request.data_policy.as_str(),
+        "state": request.state.as_str(),
+        "outcome": request.outcome.map(ai::Outcome::as_str),
+        "reason": request.reason.as_deref().filter(|_| with_result),
+        "created_ms": request.created.0,
+        "deadline_ms": request.deadline.0,
+    });
+    if with_result {
+        body["result"] = json!(request.result.as_deref());
+    }
+    body
+}
+
+fn ai_off() -> ApiError {
+    err(ErrorCode::Forbidden, "AI assistance is off for this tenant").with_detail("ai", "off")
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestBody {
+    attempt: String,
+    provider: String,
+}
+
+/// A member asks for one AI request about one attempt. It is a durable row from here on: the
+/// answer arrives through the request's own route, never in this response.
+fn enqueue(state: &State, request: &mut Request, slug: &str) -> Route {
+    let who = identify(state, request, true)?;
+    // The requester must hold every read-only scope: the delegation minted for this request is
+    // exactly that set, so a caller who holds less would get a credential wider than itself.
+    auth::require_scope(&who, Scopes::READ_ONLY)?;
+    let body: RequestBody = parse(&body(request)?)?;
+    let attempt: AttemptId = id(&body.attempt, "attempt")?;
+    let provider =
+        ai::Provider::parse(&body.provider).ok_or_else(|| unknown_provider(&body.provider))?;
+    let (principal, authority, scopes) = (who.principal, who.authority(), who.scopes);
+    let slug = slug.to_owned();
+    let row = state
+        .store
+        .writer()
+        .write(move |tx| {
+            let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
+            // The gate first, so a tenant that may send nothing is told that rather than told to
+            // read a repository it may already read. `enqueue` reads it again and stores it, so
+            // the row records the policy it was actually admitted under.
+            ai::admit(tx, tenant, provider)?.ok_or(StoreError::Forbidden)?;
+            let repo =
+                lookup::run_repo(tx, lookup::job_run(tx, lookup::attempt_job(tx, attempt)?)?)?;
+            ai::enqueue(
+                tx,
+                authority,
+                tenant,
+                repo,
+                attempt,
+                provider,
+                scopes,
+                UnixMillis::now(),
+            )
+        })
+        .map_err(|error| match error {
+            StoreError::Forbidden => ai_off(),
+            other => store_error(other),
+        })?;
+    Ok(Reply::Json(201, request_json(&row, false), Vec::new()))
+}
+
+/// The oldest queued requests, and the sweep that ends the ones nobody answered in time. The
+/// consumer's own poll is where expiry happens, so a controller with no AI process running has
+/// nothing to schedule and a request can never outlive its deadline.
+fn queued(state: &State, request: &Request, query: &str) -> Route {
+    let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::AI_CONTEXT)?;
+    let limit = match query_param(query, "limit") {
+        None => QUEUE_PAGE,
+        Some(value) => value
+            .parse::<u32>()
+            .ok()
+            .filter(|limit| (1..=MAX_QUEUE_PAGE).contains(limit))
+            .ok_or_else(|| {
+                err(
+                    ErrorCode::InvalidRequest,
+                    format!("limit must be 1..={MAX_QUEUE_PAGE}"),
+                )
+            })?,
+    };
+    let now = UnixMillis::now();
+    state
+        .store
+        .writer()
+        .write(move |tx| ai::sweep(tx, now, EXPIRE_PER_POLL))
+        .map_err(store_error)?;
+    let rows = state
+        .store
+        .read(move |c| ai::queued(c, limit))
+        .map_err(store_error)?;
+    // A full page may have more behind it; the service asks again for the next one.
+    let truncated = rows.len() == limit as usize;
+    let requests: Vec<Value> = rows.iter().map(|row| request_json(row, false)).collect();
+    ok(json!({ "requests": requests, "truncated": truncated }))
+}
+
+/// One request, read by a member who can read its repository.
+fn require_request(state: &State, request: &Request, request_id: &str) -> Route {
+    let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::RUNS_READ)?;
+    let id: AiRequestId = id(request_id, "request")?;
+    let principal = who.principal;
+    // Authorized through the request's repository: a member of another tenant gets the same
+    // `not_found` as for a request that does not exist.
+    let row = state
+        .store
+        .read(move |c| {
+            let row = ai::by_id(c, id)?;
+            let tenant = authz::require_repo(c, principal, row.repo, Permissions::READ)?;
+            ai::request(c, tenant, id)
+        })
+        .map_err(store_error)?;
+    ok(request_json(&row, true))
+}
+
+fn claim(state: &State, request: &mut Request, request_id: &str) -> Route {
+    let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::AI_CONTEXT)?;
+    let id: AiRequestId = id(request_id, "request")?;
+    let claimed = state
+        .store
+        .writer()
+        .write(move |tx| ai::claim(tx, id, UnixMillis::now()))
+        .map_err(store_error)?;
+    // Shown once, as every `sntl_` credential is: the controller holds only its digest.
+    ok(json!({
+        "request": request_json(&claimed.request, false),
+        "evidence": format!("/api/v1/attempts/{}/ai-context", claimed.request.attempt),
+        "token": {
+            "access": sentinel_auth::token::format(&claimed.access),
+            "expires_ms": claimed.expires.0,
+            "scopes": Scopes::READ_ONLY.names().collect::<Vec<_>>(),
+            "credential": claimed.token.to_string(),
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompleteBody {
+    outcome: String,
+    text: Option<String>,
+    reason: Option<String>,
+}
+
+/// The AI service settles a request: the answer, or the reason there is none. Exactly once, and
+/// the delegation it read evidence with is revoked in the same write.
+fn complete(state: &State, request: &mut Request, request_id: &str) -> Route {
+    let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::AI_CONTEXT)?;
+    let id: AiRequestId = id(request_id, "request")?;
+    let body: CompleteBody = parse(&body(request)?)?;
+    let outcome = match body.outcome.as_str() {
+        "completed" => ai::Outcome::Completed,
+        "unavailable" => ai::Outcome::Unavailable,
+        other => {
+            return Err(err(
+                ErrorCode::InvalidRequest,
+                "outcome must be completed or unavailable",
+            )
+            .with_detail("outcome", other));
+        }
+    };
+    let now = UnixMillis::now();
+    let row = state
+        .store
+        .writer()
+        .write(move |tx| {
+            ai::settle(
+                tx,
+                id,
+                outcome,
+                body.text.as_deref(),
+                body.reason.as_deref(),
+                now,
+            )
+        })
+        .map_err(store_error)?;
+    ok(request_json(&row, true))
 }

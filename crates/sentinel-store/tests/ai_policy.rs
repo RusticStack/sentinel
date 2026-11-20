@@ -1,12 +1,12 @@
 //! AI assistance policy (Part 22 Y01): off on both sides until two administrators say
 //! otherwise, the tenant's change needs a live step-up and is audited, and the gate every
 //! request passes reads the policy at the moment of the request, so a disable applies at once.
-//! No test here, and no code in the workspace yet, reaches a provider: there is no provider
-//! client until Y03, which is why a disabled tenant provably has no request in flight or queued.
+//! No test here, and no code in the controller, reaches a provider: the provider client lives in
+//! `ai/`, and these tests cover the queue a disable has to delete — Y03's own half of the promise.
 
 use sentinel_core::{
-    TenantId, UnixMillis, UserId,
-    auth::{Permissions as P, Principal, Role},
+    AttemptId, JobId, RepoId, RunId, TenantId, UnixMillis, UserId,
+    auth::{Permissions as P, Principal, Role, Scopes},
 };
 use sentinel_store::{
     Durability, Error, Store,
@@ -25,6 +25,9 @@ struct Fixture {
     platform: UserId,
     admin: UserId,
     member: UserId,
+    /// The repository and attempt a request is about: what the queue tests need and the policy
+    /// tests do not.
+    attempt: AttemptId,
 }
 
 fn fixture() -> Fixture {
@@ -32,6 +35,7 @@ fn fixture() -> Fixture {
     let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
     let (tenant, platform, admin, member) =
         (TenantId::new(), UserId::new(), UserId::new(), UserId::new());
+    let (repo, run, job, attempt) = (RepoId::new(), RunId::new(), JobId::new(), AttemptId::new());
     store
         .writer()
         .write(move |tx| {
@@ -41,7 +45,25 @@ fn fixture() -> Fixture {
             provisioning::insert_human(tx, member, "Mia", false, NOW)?;
             let root = Principal::new(platform, P::ALL, None, None);
             auth::set_membership(tx, root, tenant, admin, Role::TenantAdmin)?;
-            auth::set_membership(tx, root, tenant, member, Role::Reader)
+            auth::set_membership(tx, root, tenant, member, Role::Reader)?;
+            auth::create_repo(tx, root, tenant, repo, "app", NOW)?;
+            auth::set_repo_grant(tx, root, repo, member, P::READ)?;
+            jobs::insert_run(tx, tenant, repo, run, "abc123", NOW)?;
+            jobs::insert_job(tx, tenant, run, job, "alpha", 5, 0)?;
+            tx.execute(
+                "INSERT INTO attempts(id, tenant_id, job_id, fence, worker_id, lease_until_ms,
+                    repo_id, released_ms)
+                 VALUES (?1, ?2, ?3, 1, ?4, 0, ?5, ?6)",
+                (
+                    attempt.as_bytes(),
+                    tenant.as_bytes(),
+                    job.as_bytes(),
+                    [9u8; 16],
+                    repo.as_bytes(),
+                    NOW.0,
+                ),
+            )?;
+            Ok(())
         })
         .unwrap();
     Fixture {
@@ -51,6 +73,7 @@ fn fixture() -> Fixture {
         platform,
         admin,
         member,
+        attempt,
     }
 }
 
@@ -150,31 +173,145 @@ fn a_fresh_deployment_is_off_and_admits_no_provider() {
     assert!(!permits(&f));
 }
 
-/// Y03 adds the durable request queue and the consumer that fills it. Until then nothing can
-/// store a request, so a disabled tenant provably has none queued; this test is the tripwire
-/// that makes Y03 prove its disable deletes those rows in the same transaction.
+/// The tripwire Y01 left for Y03, now the thing it promised: the request queue exists, a disable
+/// deletes every row of it and revokes the delegation it minted, in the same write that turns the
+/// tenant off — and a tenant that is off cannot queue a row at all.
 #[test]
-fn no_ai_request_can_be_queued_yet() {
+fn a_disable_deletes_the_queue_and_revokes_its_delegation_in_one_transaction() {
     let f = fixture();
-    let queues: i64 = f
-        .store
-        .read(|c| {
+    let member = f.member;
+    let attempt = f.attempt;
+    let tenant = f.tenant;
+    let store = &f.store;
+
+    assert_eq!(queued_rows(store), 0, "a fresh deployment has no request");
+    set_deployment(
+        &f,
+        authority(f.platform, P::ALL, true),
+        &[Provider::Local],
+        true,
+    )
+    .unwrap();
+    set_tenant(
+        &f,
+        tenant_administrator(&f, true),
+        true,
+        DataPolicy::LocalOnly,
+    )
+    .unwrap();
+
+    let enqueue = |permissions: P| {
+        store.writer().write(move |tx| {
+            ai::enqueue(
+                tx,
+                Authority::Credential {
+                    principal: Principal::new(member, permissions, None, None),
+                    stepped_up: false,
+                },
+                tenant,
+                repo_of(tx, tenant)?,
+                attempt,
+                Provider::Local,
+                Scopes::READ_ONLY,
+                NOW,
+            )
+        })
+    };
+    let row = enqueue(P::READ).expect("a member who can read may ask");
+    assert_eq!(row.state, ai::State::Queued);
+    assert_eq!(row.data_policy, DataPolicy::LocalOnly);
+    assert_eq!(queued_rows(store), 1);
+
+    // A provider outside what the tenant's policy allows is refused, whatever the deployment
+    // allow-list says.
+    set_deployment(
+        &f,
+        authority(f.platform, P::ALL, true),
+        &[Provider::Local, Provider::OpenRouter],
+        true,
+    )
+    .unwrap();
+    assert!(matches!(
+        store.writer().write({
+            let tenant = f.tenant;
+            let attempt = f.attempt;
+            move |tx| {
+                ai::enqueue(
+                    tx,
+                    Authority::Credential {
+                        principal: Principal::new(member, P::READ, None, None),
+                        stepped_up: false,
+                    },
+                    tenant,
+                    repo_of(tx, tenant)?,
+                    attempt,
+                    Provider::OpenRouter,
+                    Scopes::READ_ONLY,
+                    NOW,
+                )
+            }
+        }),
+        Err(Error::Forbidden)
+    ));
+    assert_eq!(queued_rows(store), 1, "a refused request stores nothing");
+
+    // The service claims it, which mints the delegation; the disable then has both to deal with.
+    let claimed = store
+        .writer()
+        .write(move |tx| ai::claim(tx, row.id, UnixMillis(NOW.0 + 1)))
+        .expect("a queued request is claimable");
+    let delegation = claimed.token;
+    assert_eq!(queued_rows(store), 1, "a claimed row is still a row");
+
+    set_tenant(
+        &f,
+        tenant_administrator(&f, true),
+        false,
+        DataPolicy::LocalOnly,
+    )
+    .unwrap();
+    assert_eq!(queued_rows(store), 0, "the disable deleted the queue");
+    let revoked: bool = store
+        .read(move |c| {
             Ok(c.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'ai%'",
-                [],
+                "SELECT revoked_ms IS NOT NULL FROM api_tokens WHERE id = ?1",
+                [delegation.as_bytes()],
                 |r| r.get(0),
             )?)
         })
         .unwrap();
-    assert_eq!(
-        queues, 0,
-        "an AI request queue exists: Y03 must replace this test with one proving a disable \
-         deletes its rows in the same transaction"
-    );
-    assert_eq!(
-        f.store.read(|c| ai::effective(c, f.tenant)).unwrap(),
-        (Providers::NONE, None)
-    );
+    assert!(revoked, "the delegation it minted was revoked with it");
+
+    // And with the tenant off, nothing can be queued at all.
+    let refused = store.writer().write(move |tx| {
+        ai::enqueue(
+            tx,
+            Authority::Credential {
+                principal: Principal::new(member, P::READ, None, None),
+                stepped_up: false,
+            },
+            f.tenant,
+            repo_of(tx, f.tenant)?,
+            attempt,
+            Provider::Local,
+            Scopes::READ_ONLY,
+            NOW,
+        )
+    });
+    assert!(matches!(refused, Err(Error::Forbidden)));
+}
+
+fn queued_rows(store: &Store) -> i64 {
+    store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM ai_requests", [], |r| r.get(0))?))
+        .unwrap()
+}
+
+/// The fixture repository, read through the tenant it belongs to.
+fn repo_of(c: &rusqlite::Connection, tenant: TenantId) -> Result<RepoId, Error> {
+    let mut statement = c.prepare("SELECT id FROM repos WHERE tenant_id = ?1")?;
+    let bytes: [u8; 16] = statement.query_row([tenant.as_bytes()], |r| r.get(0))?;
+    RepoId::from_bytes(bytes).map_err(|_| Error::Corrupt("repo_id"))
 }
 
 #[test]

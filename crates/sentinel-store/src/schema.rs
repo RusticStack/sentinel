@@ -188,6 +188,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (75, include_str!("migrations/075_migration_permissions.sql")),
     (76, include_str!("migrations/076_runner_fork_policy.sql")),
     (77, include_str!("migrations/077_migration_switch.sql")),
+    (78, include_str!("migrations/078_ai_requests.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -317,6 +318,10 @@ mod tests {
         (
             76,
             "an older controller records a fork pull request's job as demand and places a runner for it on any pool the tenant can use, because it reads neither the fork provenance nor the tenant's opt-in; it also cannot see a fork pool, so it would offer that pool's capacity to trusted jobs",
+        ),
+        (
+            78,
+            "an older controller serves no AI request route and holds no AI request row, so it would leave the rows a newer controller wrote unclaimed until every one of them timed out, and it neither mints nor revokes the request-scoped delegations those rows name",
         ),
     ];
 
