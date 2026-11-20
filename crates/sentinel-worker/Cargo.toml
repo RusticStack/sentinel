@@ -16,6 +16,7 @@ sentinel-git = { path = "../sentinel-git" }
 sentinel-link = { path = "../sentinel-link" }
 sentinel-pipeline = { path = "../sentinel-pipeline" }
 sentinel-protocol = { path = "../sentinel-protocol" }
+sentinel-registry = { path = "../sentinel-registry" }
 serde_json = "1.0"
 blake3 = "1.8"
 tar = { version = "0.4", default-features = false }

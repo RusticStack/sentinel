@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::{Error, Result, attempt::Cancel, microvm::GuestEntry, podman};
+use sentinel_protocol::cache::Trust;
 
 pub const MAX_HELD: usize = 1024;
 
@@ -20,8 +21,11 @@ pub const MAX_IMAGE_REMOVALS: usize = 16;
 
 const FOLLOW_POLL: Duration = Duration::from_millis(50);
 
-type Download =
-    Arc<dyn Fn(&str, &Path, &podman::Store, Duration, &AtomicBool) -> Result<bool> + Send + Sync>;
+type Download = Arc<
+    dyn Fn(&str, &Path, Option<&Path>, &podman::Store, Duration, &AtomicBool) -> Result<bool>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct PullKey {
@@ -201,6 +205,9 @@ struct Inner {
     state: Mutex<State>,
     download: Download,
     anonymous_authfile: PathBuf,
+    /// The worker's registry pull-through cache, set once at start. Present means every pull names it
+    /// in a per-scope `registries.conf`, so a second pull of a digest is answered from local disk.
+    registry: std::sync::OnceLock<sentinel_registry::PullThrough>,
 }
 
 #[derive(Clone)]
@@ -213,9 +220,9 @@ impl Images {
         let anonymous = anonymous_authfile.clone();
         Self::with_authfile_and_download(
             anonymous_authfile,
-            move |image, authfile, store, timeout, cancel| {
+            move |image, authfile, registry, store, timeout, cancel| {
                 let recheck = podman::registry_check_needed(authfile == anonymous, store);
-                podman::pull_checked(image, authfile, store, timeout, cancel, recheck)
+                podman::pull_checked(image, authfile, registry, store, timeout, cancel, recheck)
             },
         )
     }
@@ -230,7 +237,14 @@ impl Images {
 
     #[doc(hidden)]
     pub fn with_download(
-        download: impl Fn(&str, &Path, &podman::Store, Duration, &AtomicBool) -> Result<bool>
+        download: impl Fn(
+            &str,
+            &Path,
+            Option<&Path>,
+            &podman::Store,
+            Duration,
+            &AtomicBool,
+        ) -> Result<bool>
         + Send
         + Sync
         + 'static,
@@ -240,7 +254,14 @@ impl Images {
 
     fn with_authfile_and_download(
         anonymous_authfile: PathBuf,
-        download: impl Fn(&str, &Path, &podman::Store, Duration, &AtomicBool) -> Result<bool>
+        download: impl Fn(
+            &str,
+            &Path,
+            Option<&Path>,
+            &podman::Store,
+            Duration,
+            &AtomicBool,
+        ) -> Result<bool>
         + Send
         + Sync
         + 'static,
@@ -257,14 +278,46 @@ impl Images {
                 }),
                 download: Arc::new(download),
                 anonymous_authfile,
+                registry: std::sync::OnceLock::new(),
             }),
+        }
+    }
+
+    /// Hands the worker's registry pull-through cache to every pull from now on. Set once at start:
+    /// a pull already under way keeps the configuration it began with.
+    pub fn set_registry_cache(&self, cache: sentinel_registry::PullThrough) {
+        let _ = self.inner.registry.set(cache);
+    }
+
+    pub fn registry_cache(&self) -> Option<&sentinel_registry::PullThrough> {
+        self.inner.registry.get()
+    }
+
+    /// The pull configuration for one scope, when this worker runs a cache. A cache that cannot write
+    /// its configuration fails the pull rather than silently going direct: a `507` on a full disk is
+    /// then the job's answer, not a bypass of the worker's bound.
+    fn registry_conf(&self, scope: sentinel_registry::Scope) -> Result<Option<PathBuf>> {
+        match self.inner.registry.get() {
+            Some(cache) => cache
+                .mirror_conf(scope)
+                .map(Some)
+                .map_err(|error| Error::Preparation(error.to_string())),
+            None => Ok(None),
         }
     }
 
     pub fn pull(&self, image: &str, timeout: Duration, cancel: &Cancel) -> Result<bool> {
         validate_pinned_reference(image)?;
         let key = PullKey::anonymous(image);
-        self.pull_keyed(key, image, &self.inner.anonymous_authfile, timeout, cancel)
+        let conf = self.registry_conf(sentinel_registry::Scope::Anonymous)?;
+        self.pull_keyed(
+            key,
+            image,
+            &self.inner.anonymous_authfile,
+            conf.as_deref(),
+            timeout,
+            cancel,
+        )
     }
 
     /// The key includes tenant, credential and store, so no tenant or rotated credential inherits another's auth check.
@@ -276,6 +329,7 @@ impl Images {
         &self,
         image: &str,
         tenant: [u8; 16],
+        trust: Trust,
         credential: [u8; 32],
         authfile: &Path,
         store: &podman::Store,
@@ -286,22 +340,26 @@ impl Images {
         let anonymous = credential == [0; 32]
             && *store == podman::Store::Shared
             && authfile == self.inner.anonymous_authfile;
-        self.pull_keyed(
-            if anonymous {
-                PullKey::anonymous(image)
-            } else {
-                PullKey {
-                    image: image.into(),
-                    tenant: Some(tenant),
-                    credential,
-                    store: store.clone(),
-                }
-            },
-            image,
-            authfile,
-            timeout,
-            cancel,
-        )
+        let key = if anonymous {
+            PullKey::anonymous(image)
+        } else {
+            PullKey {
+                image: image.into(),
+                tenant: Some(tenant),
+                credential,
+                store: store.clone(),
+            }
+        };
+        // A credentialled pull is cached in its own tenant scope, split by the job's trust class: the
+        // anonymous scope holds only what an unauthenticated pull could fetch, and a fork's pull
+        // request never shares a directory with a protected build.
+        let scope = if anonymous {
+            sentinel_registry::Scope::Anonymous
+        } else {
+            sentinel_registry::Scope::Tenant { tenant, trust }
+        };
+        let conf = self.registry_conf(scope)?;
+        self.pull_keyed(key, image, authfile, conf.as_deref(), timeout, cancel)
     }
 
     fn pull_keyed(
@@ -309,6 +367,7 @@ impl Images {
         key: PullKey,
         image: &str,
         authfile: &Path,
+        conf: Option<&Path>,
         timeout: Duration,
         cancel: &Cancel,
     ) -> Result<bool> {
@@ -327,7 +386,7 @@ impl Images {
             }
         };
         if leader {
-            return self.lead(&key, image, authfile, &slot, timeout, cancel);
+            return self.lead(&key, image, authfile, conf, &slot, timeout, cancel);
         }
         slot.waiters.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + timeout;
@@ -337,7 +396,7 @@ impl Images {
                 drop(result);
                 if matches!(outcome, Err(Shared::Abandoned)) {
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    return self.pull_keyed(key.clone(), image, authfile, remaining, cancel);
+                    return self.pull_keyed(key.clone(), image, authfile, conf, remaining, cancel);
                 }
                 if outcome.is_ok() && key.store == podman::Store::Shared {
                     self.record(image);
@@ -367,11 +426,13 @@ impl Images {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lead(
         &self,
         key: &PullKey,
         image: &str,
         authfile: &Path,
+        conf: Option<&Path>,
         slot: &Arc<Pull>,
         timeout: Duration,
         cancel: &Cancel,
@@ -383,7 +444,7 @@ impl Images {
             slot,
             answered: false,
         };
-        let outcome = (self.inner.download)(image, authfile, &key.store, timeout, cancel);
+        let outcome = (self.inner.download)(image, authfile, conf, &key.store, timeout, cancel);
         if outcome.is_ok() && key.store == podman::Store::Shared {
             self.record(image);
         }
@@ -415,10 +476,15 @@ impl Images {
             slot
         };
         let key = PullKey::anonymous(image);
+        let conf = self
+            .registry_conf(sentinel_registry::Scope::Anonymous)
+            .ok()
+            .flatten();
         Some(self.lead(
             &key,
             image,
             &self.inner.anonymous_authfile,
+            conf.as_deref(),
             &slot,
             timeout,
             cancel,
@@ -736,7 +802,7 @@ mod tests {
                 Arc::clone(&self.release),
                 self.outcome,
             );
-            Images::with_download(move |_, _, _, _, _| {
+            Images::with_download(move |_, _, _, _, _, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 let _ = entered.send(());
                 release.wait();
@@ -785,7 +851,7 @@ mod tests {
         let go = Arc::new(AtomicBool::new(false));
         let images = Images::with_download({
             let (calls, go) = (Arc::clone(&calls), Arc::clone(&go));
-            move |_, _, _, _, _| {
+            move |_, _, _, _, _, _| {
                 if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     while !go.load(Ordering::Acquire) {
                         thread::yield_now();
@@ -832,7 +898,7 @@ mod tests {
         let gates = Arc::new(Mutex::new(vec![rx_b, rx_a]));
         let images = Images::with_download({
             let (calls, gates) = (Arc::clone(&calls), Arc::clone(&gates));
-            move |_, _, _, _, _| {
+            move |_, _, _, _, _, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 let gate = gates.lock().unwrap().pop();
                 if let Some(gate) = gate {
@@ -893,7 +959,7 @@ mod tests {
         let release = Arc::new(AtomicBool::new(false));
         let images = Images::with_download({
             let (calls, release) = (Arc::clone(&calls), Arc::clone(&release));
-            move |_, _, _, _, _| {
+            move |_, _, _, _, _, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 while !release.load(Ordering::Acquire) {
                     thread::yield_now();
@@ -915,6 +981,7 @@ mod tests {
                     images.pull_for_tenant(
                         IMAGE,
                         tenant,
+                        sentinel_protocol::cache::Trust::PullRequest,
                         [0; 32],
                         &anonymous,
                         &podman::Store::Shared,
@@ -946,7 +1013,7 @@ mod tests {
         let release = Arc::new(AtomicBool::new(false));
         let images = Images::with_download({
             let (calls, release) = (Arc::clone(&calls), Arc::clone(&release));
-            move |_, _, _, _, _| {
+            move |_, _, _, _, _, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 while !release.load(Ordering::Acquire) {
                     thread::yield_now();
@@ -965,6 +1032,7 @@ mod tests {
                 images.pull_for_tenant(
                     IMAGE,
                     [tenant; 16],
+                    sentinel_protocol::cache::Trust::PullRequest,
                     [0; 32],
                     &authfile,
                     &store,
@@ -996,7 +1064,7 @@ mod tests {
             let images = Images::with_download({
                 let (calls, release, entered_tx) =
                     (Arc::clone(&calls), Arc::clone(&release), entered_tx);
-                move |_, authfile, _, _, _| {
+                move |_, authfile, _, _, _, _| {
                     calls.fetch_add(1, Ordering::SeqCst);
                     entered_tx.send(authfile.to_path_buf()).unwrap();
                     while !release.load(Ordering::Acquire) {
@@ -1011,6 +1079,7 @@ mod tests {
                     images.pull_for_tenant(
                         IMAGE,
                         tenants[0],
+                        sentinel_protocol::cache::Trust::PullRequest,
                         credentials[0],
                         Path::new("auth-first.json"),
                         &podman::Store::Shared,
@@ -1029,6 +1098,7 @@ mod tests {
                     images.pull_for_tenant(
                         IMAGE,
                         tenants[1],
+                        sentinel_protocol::cache::Trust::PullRequest,
                         credentials[1],
                         Path::new("auth-second.json"),
                         &podman::Store::Shared,
@@ -1119,7 +1189,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let images = Images::with_download({
             let calls = Arc::clone(&calls);
-            move |_, _, _, _, _| {
+            move |_, _, _, _, _, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(true)
             }
@@ -1138,7 +1208,7 @@ mod tests {
 
     #[test]
     fn the_held_record_is_bounded_and_evicts_the_oldest() {
-        let images = Images::with_download(|_, _, _, _, _| Ok(false));
+        let images = Images::with_download(|_, _, _, _, _, _| Ok(false));
         let flag = cancel();
         for i in 0..MAX_HELD + 1 {
             let image = format!("example.test/i@sha256:{i:064}");
@@ -1172,7 +1242,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let images = Images::with_download({
             let calls = Arc::clone(&calls);
-            move |_, _, _, _, _| {
+            move |_, _, _, _, _, _| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(false)
             }
@@ -1186,6 +1256,7 @@ mod tests {
             images.pull_for_tenant(
                 image,
                 [0; 16],
+                sentinel_protocol::cache::Trust::PullRequest,
                 [0; 32],
                 authfile.path(),
                 &podman::Store::Shared,

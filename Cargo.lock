@@ -1194,6 +1194,7 @@ dependencies = [
  "sentinel-mail",
  "sentinel-pipeline",
  "sentinel-protocol",
+ "sentinel-registry",
  "sentinel-s3",
  "sentinel-store",
  "sentinel-worker",
@@ -1455,6 +1456,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-registry"
+version = "0.1.0-dev"
+dependencies = [
+ "blake3",
+ "ring",
+ "sentinel-protocol",
+ "tempfile",
+ "ureq",
+]
+
+[[package]]
 name = "sentinel-s3"
 version = "0.1.0-dev"
 dependencies = [
@@ -1504,6 +1516,7 @@ dependencies = [
  "sentinel-link",
  "sentinel-pipeline",
  "sentinel-protocol",
+ "sentinel-registry",
  "sentinel-store",
  "serde_json",
  "tar",

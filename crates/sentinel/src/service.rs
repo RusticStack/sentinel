@@ -94,6 +94,7 @@ struct FileConfig {
     cache_budget_bytes: Option<u64>,
     mirror_budget_bytes: Option<u64>,
     image_budget_bytes: Option<u64>,
+    registry_cache: Option<RegistryCacheFile>,
     git_mirrors: Option<bool>,
     metrics_listen: Option<String>,
     storage: Option<StorageFile>,
@@ -160,6 +161,28 @@ struct RemoteCacheFile {
     enabled: Option<bool>,
     budget_bytes: Option<u64>,
 }
+
+/// The worker's registry pull-through cache (AR07): the registries jobs pull from, and how much of the
+/// data disk the cache may hold. Absent, the worker runs no cache and pulls go straight to the registry.
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryCacheFile {
+    budget_bytes: Option<u64>,
+    registries: Option<Vec<String>>,
+}
+
+/// What the worker starts from `[registry_cache]`: a stated budget (or the default sizing), and the
+/// registries it answers for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RegistryCacheSetting {
+    budget_bytes: Option<u64>,
+    registries: Vec<String>,
+}
+
+/// The registries a cache answers for when the operator does not say. Docker Hub is what almost every
+/// image reference in a pipeline names; anything else pulls directly until it is listed.
+const DEFAULT_REGISTRY_CACHE: &str = "docker.io";
+const MAX_CACHE_REGISTRIES: usize = 8;
 
 impl RemoteCacheFile {
     fn on(&self) -> bool {
@@ -737,6 +760,7 @@ struct WorkerLink {
     spool_reserve_bytes: Option<u64>,
     spool_quota_bytes: Option<u64>,
     budgets: [Option<u64>; 3],
+    registry_cache: Option<RegistryCacheSetting>,
     tailcat: Option<TailcatFile>,
     tailcat_address: Option<String>,
     remote_cache: bool,
@@ -889,11 +913,12 @@ impl Config {
                 || file.cache_budget_bytes.is_some()
                 || file.mirror_budget_bytes.is_some()
                 || file.image_budget_bytes.is_some()
+                || file.registry_cache.is_some()
                 || file.tailcat_address.is_some()
                 || file.metrics_listen.is_some()
             {
                 return Err(Error::config(
-                    "controller, controller_fingerprint, controller_fingerprint_also, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, job_network, isolation, microvm, runner, disk_bytes, spool_reserve_bytes, spool_quota_bytes, cache_budget_bytes, mirror_budget_bytes, image_budget_bytes, tailcat_address and metrics_listen apply to the worker role only",
+                    "controller, controller_fingerprint, controller_fingerprint_also, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, job_network, isolation, microvm, runner, disk_bytes, spool_reserve_bytes, spool_quota_bytes, cache_budget_bytes, mirror_budget_bytes, image_budget_bytes, registry_cache, tailcat_address and metrics_listen apply to the worker role only",
                 ));
             }
             let listen: SocketAddr = file
@@ -1006,6 +1031,7 @@ impl Config {
                         || file.disk_bytes.is_some()
                         || file.spool_reserve_bytes.is_some()
                         || file.spool_quota_bytes.is_some()
+                        || file.registry_cache.is_some()
                         || file.tailcat.is_some()
                         || file.tailcat_address.is_some()
                         || file.remote_cache.is_some()
@@ -1137,6 +1163,43 @@ impl Config {
                             MIN_BUDGET_BYTES >> 20
                         )));
                     }
+                    let registry_cache = match &file.registry_cache {
+                        None => None,
+                        Some(cache) => {
+                            if let Some(bytes) = cache.budget_bytes
+                                && bytes < sentinel_registry::MIN_BUDGET_BYTES
+                            {
+                                return Err(Error::config(format!(
+                                    "[registry_cache] budget_bytes must be at least {} MiB when set",
+                                    sentinel_registry::MIN_BUDGET_BYTES >> 20
+                                )));
+                            }
+                            let registries = match cache.registries.clone() {
+                                None => vec![DEFAULT_REGISTRY_CACHE.to_owned()],
+                                Some(registries) => {
+                                    if registries.is_empty()
+                                        || registries.len() > MAX_CACHE_REGISTRIES
+                                    {
+                                        return Err(Error::config(format!(
+                                            "[registry_cache] registries must list 1 to {MAX_CACHE_REGISTRIES} registry hosts"
+                                        )));
+                                    }
+                                    if let Some(bad) = registries.iter().find(|host| {
+                                        sentinel_registry::conf::check_host(host).is_err()
+                                    }) {
+                                        return Err(Error::config(format!(
+                                            "[registry_cache] registries entry {bad:?} is not a lower-case registry host with an optional port, as in [\"docker.io\", \"ghcr.io\"]"
+                                        )));
+                                    }
+                                    registries
+                                }
+                            };
+                            Some(RegistryCacheSetting {
+                                budget_bytes: cache.budget_bytes,
+                                registries,
+                            })
+                        }
+                    };
                     if file.spool_quota_bytes == Some(0) {
                         return Err(Error::config(
                             "spool_quota_bytes must be positive when set: a zero quota would declare every line of output lost",
@@ -1198,6 +1261,7 @@ impl Config {
                             file.mirror_budget_bytes,
                             file.image_budget_bytes,
                         ],
+                        registry_cache,
                         tailcat: file.tailcat,
                         tailcat_address: file.tailcat_address,
                         remote_cache: file
@@ -2990,6 +3054,7 @@ mod worker_role {
         runner: sentinel_worker::runner::Policy,
         runtime: sentinel_worker::attempt::Runtime,
         metrics: Arc<crate::worker_metrics::Metrics>,
+        registry_cache: Option<RegistryCacheSetting>,
     ) -> Box<dyn LinkExecutor> {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
@@ -3100,6 +3165,11 @@ mod worker_role {
                 executor.set_storage_budgets(budgets);
                 executor.set_measured_disk(measured_disk);
                 executor.set_job_network(network);
+                if let Some(setting) = &registry_cache
+                    && let Some(cache) = start_registry_cache(data_dir, setting)
+                {
+                    executor.set_registry_cache(cache);
+                }
                 let runner_image = runner.image.as_ref().map(|image| image.as_str().to_owned());
                 executor.set_runner_policy(runner);
                 let microvm_egress = network == sentinel_worker::podman::Network::Egress
@@ -3219,6 +3289,52 @@ mod worker_role {
             kvm_absent = absent.as_ref().map(|a| a.0.as_str())
         );
         Ok(selection)
+    }
+
+    /// Opens and starts the worker's registry pull-through cache. A cache that cannot start leaves the
+    /// worker pulling directly, which is what a worker without one does: a listener that cannot bind is a
+    /// diagnostic, never a reason to refuse every job.
+    fn start_registry_cache(
+        data_dir: &Path,
+        setting: &RegistryCacheSetting,
+    ) -> Option<sentinel_registry::PullThrough> {
+        const GIB: u64 = 1 << 30;
+        let budget = setting.budget_bytes.unwrap_or_else(|| {
+            let total = sentinel_worker::spool::filesystem_bytes(data_dir).unwrap_or(0);
+            (total / 10).clamp(GIB, 50 * GIB)
+        });
+        let registries: Vec<sentinel_registry::Registry> = setting
+            .registries
+            .iter()
+            .map(|host| sentinel_registry::Registry::canonical(host))
+            .collect();
+        let settings = sentinel_registry::Settings::new(
+            data_dir.join(sentinel_registry::ROOT_DIR),
+            budget,
+            registries,
+        );
+        match sentinel_registry::PullThrough::open(settings)
+            .and_then(|cache| cache.start().map(|addr| (cache, addr)))
+        {
+            Ok((cache, addr)) => {
+                tracing::info!(
+                    event = "registry_cache_ready",
+                    address = %addr,
+                    budget_bytes = cache.budget_bytes(),
+                    registries = ?setting.registries,
+                    "job image pulls are answered from local disk when the digest is held"
+                );
+                Some(cache)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "registry_cache_unavailable",
+                    error = %error,
+                    "pulls go straight to the registries for this process"
+                );
+                None
+            }
+        }
     }
 
     fn capacity(link: &WorkerLink) -> Capacity {
@@ -3566,6 +3682,7 @@ mod worker_role {
             },
             runtime,
             Arc::clone(&metrics),
+            link.registry_cache.clone(),
         );
         if let Some(listen) = link.metrics_listen {
             let bound = crate::worker_metrics::serve(
@@ -4297,6 +4414,65 @@ credentials_file = '/etc/sentinel/s3'
             refused.message
         );
         assert!(at(MIN_BUDGET_BYTES).is_ok());
+    }
+
+    #[cfg(feature = "worker")]
+    #[test]
+    fn the_registry_cache_is_worker_only_defaults_to_docker_hub_and_is_bounded() {
+        let worker = |text: &str| {
+            let fingerprint = "ab".repeat(32);
+            load_config(
+                "worker",
+                &format!(
+                    "controller = '10.0.0.5:7443'\ncontroller_fingerprint = '{fingerprint}'\n{text}"
+                ),
+            )
+        };
+        let refused = load_config("server", "[registry_cache]\n")
+            .err()
+            .expect("the controller runs no cache for a worker's pulls");
+        assert!(
+            refused.message.contains("registry_cache"),
+            "{}",
+            refused.message
+        );
+
+        let low = worker(&format!(
+            "[registry_cache]\nbudget_bytes = {}\n",
+            sentinel_registry::MIN_BUDGET_BYTES - 1
+        ))
+        .err()
+        .expect("below the floor");
+        assert!(low.message.contains("registry_cache"), "{}", low.message);
+
+        let setting = |text: &str| match worker(text).ok().expect(text).role {
+            Role::Worker(Some(link)) => link.registry_cache,
+            _ => panic!("a worker role"),
+        };
+        assert_eq!(setting(""), None, "no table, no cache");
+        assert_eq!(
+            setting("[registry_cache]\n"),
+            Some(RegistryCacheSetting {
+                budget_bytes: None,
+                registries: vec!["docker.io".to_owned()],
+            })
+        );
+        assert_eq!(
+            setting(
+                "[registry_cache]\nbudget_bytes = 1073741824\nregistries = [\"ghcr.io\", \"quay.io\"]\n"
+            ),
+            Some(RegistryCacheSetting {
+                budget_bytes: Some(1 << 30),
+                registries: vec!["ghcr.io".to_owned(), "quay.io".to_owned()],
+            })
+        );
+        for bad in [
+            "[registry_cache]\nregistries = []\n",
+            "[registry_cache]\nregistries = [\"ghcr.io:http\"]\n",
+            "[registry_cache]\nregistries = [\"Docker.io\"]\n",
+        ] {
+            assert!(worker(bad).is_err(), "{bad}");
+        }
     }
 
     #[cfg(feature = "worker")]

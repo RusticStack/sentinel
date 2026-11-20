@@ -297,7 +297,7 @@ mod tests {
                 checkouts: Vec::new(),
                 reuse_fresh: false,
             },
-            images: Images::with_download(|_, _, _, _, _| Ok(false)),
+            images: Images::with_download(|_, _, _, _, _, _| Ok(false)),
             caches: Vec::new(),
             reuse_seal: None,
             reuse_fresh: false,

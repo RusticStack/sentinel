@@ -1243,6 +1243,12 @@ impl Inner {
         &self.runtime
     }
 
+    /// The registry pull-through cache every pull from now on names. Set once at start, before any offer
+    /// is accepted: an attempt that begins without one pulls directly, as a worker without a cache does.
+    pub fn set_registry_cache(&self, cache: sentinel_registry::PullThrough) {
+        self.images.set_registry_cache(cache);
+    }
+
     pub fn images(&self) -> &Images {
         &self.images
     }
@@ -2708,7 +2714,7 @@ mod bookkeeping_tests {
         }
         let notices = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&notices);
-        let images = Images::with_download(|_, _, _, _, _| Ok(false));
+        let images = Images::with_download(|_, _, _, _, _, _| Ok(false));
         let prefetch = crate::prefetch::Prefetcher::new(
             images.clone(),
             crate::prefetch::Bounds::default(),

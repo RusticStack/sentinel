@@ -61,6 +61,8 @@ class Runner(unittest.TestCase):
         self.pressure = os.path.join(self.d, "pressure")
         self.set_pressure(0.5, 0.5)
         self.out = os.path.join(self.d, "out.jsonl")
+        self.second_out = os.path.join(self.d, "second.jsonl")
+        self.third_out = os.path.join(self.d, "third.jsonl")
 
     def set_pressure(self, avg10, avg60):
         with open(self.pressure, "w") as f:
@@ -148,6 +150,32 @@ class Runner(unittest.TestCase):
         r = self.run_runner(contract(), "--out", self.out, env=self.env(SENTINEL_PRESSURE_FILE=os.path.join(self.d, "none")))
         self.assertEqual(r.returncode, 3, r.stderr)
         self.assertEqual(self.lines(), [])
+
+    def test_unreadable_pressure_is_recorded_as_an_unproven_start_when_asked(self):
+        unreadable = self.env(SENTINEL_PRESSURE_FILE=os.path.join(self.d, "none"))
+        r = self.run_runner(contract(), "--out", self.out, "--unproven-quiet-start", env=unreadable)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        (rec,) = self.lines()
+        self.assertEqual(rec["quiet_start"], "unverified")
+        self.assertEqual(rec["args"], "--full 1")
+        self.assertEqual(rec["lock_state"], "held", "the lock is taken for an unproven run too")
+        self.assertIn("build", rec)
+        self.assertIn("host", rec)
+        # A readable but busy host still refuses: that is a busy host, not an unprovable one.
+        self.set_pressure(0.0, 5.0)
+        busy = self.run_runner(contract(), "--out", self.second_out, "--unproven-quiet-start", env=self.env())
+        self.assertEqual(busy.returncode, 3, busy.stderr)
+        self.assertIn("not quiet", busy.stderr)
+        self.assertEqual(self.lines(self.second_out), [])
+        # And a proven run carries no quiet_start field at all.
+        self.set_pressure(0.0, 0.5)
+        self.assertEqual(self.run_runner(contract(), "--out", self.third_out).returncode, 0)
+        self.assertNotIn("quiet_start", self.lines(self.third_out)[0])
+
+    def test_the_unproven_flag_is_not_a_smoke_option(self):
+        r = self.run_runner(contract(), "--smoke", "--unproven-quiet-start", env=self.env())
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--unproven-quiet-start", r.stderr)
 
     def test_a_missing_or_malformed_host_label_refuses_before_the_bench_runs(self):
         marker = os.path.join(self.d, "ran")

@@ -79,6 +79,12 @@ kernel = "/var/lib/sentinel-microvm/vmlinux" # pinned Linux guest kernel; the x8
 agent = "/usr/local/bin/sentinel-agent"      # static Linux guest agent executable
 snapshots = true                             # start VMs from snapshots of a booted guest of their shape (default true); false boots every VM cold ([executor](executor.md#snapshot-warm-start-m06))
 
+# worker only: a registry pull-through cache for the registries job images are pulled from; absent, pulls
+# go straight to the registry ([cache](cache.md#registry-pull-through-cache))
+[registry_cache]
+budget_bytes = 21474836480         # what the cache may hold on disk, across every tenant and trust scope (at least 64 MiB; default a tenth of the data file system, 1-50 GiB)
+registries = ["docker.io", "ghcr.io"]  # 1-8 registry hosts whose pulls are cached (default ["docker.io"]); anything else pulls directly
+
 # either role: the optional pinned Tailcat transport; absent or `enabled = false` = direct TLS
 [tailcat]
 enabled = false                    # default
@@ -144,7 +150,7 @@ max_age_secs = 7776000
 weight = 2
 ```
 
-The three common fields are optional in the file; `listen`, `api_listen`, `public_url`, `placement_order` and `[storage]` are refused for the worker and the worker keys (`controller`, `controller_fingerprint`, `controller_fingerprint_also`, `worker_name`, `enrollment_file`, `cpu_millis`, `memory_bytes`, `git_mirrors`, `labels`, `job_network`, `isolation`, `disk_bytes`, `spool_reserve_bytes`, `spool_quota_bytes`, `cache_budget_bytes`, `mirror_budget_bytes`, `image_budget_bytes`, `tailcat_address`, `metrics_listen`) and `[microvm]` for the server, as are `[remote_cache] budget_bytes`, `[s3]` and `[backup]` for the worker; `[tailcat]` is accepted by both roles; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys (including `controller_fingerprint_also`) need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
+The three common fields are optional in the file; `listen`, `api_listen`, `public_url`, `placement_order` and `[storage]` are refused for the worker and the worker keys (`controller`, `controller_fingerprint`, `controller_fingerprint_also`, `worker_name`, `enrollment_file`, `cpu_millis`, `memory_bytes`, `git_mirrors`, `labels`, `job_network`, `isolation`, `disk_bytes`, `spool_reserve_bytes`, `spool_quota_bytes`, `cache_budget_bytes`, `mirror_budget_bytes`, `image_budget_bytes`, `tailcat_address`, `metrics_listen`), and `[microvm]` and `[registry_cache]` for the server, as are `[remote_cache] budget_bytes`, `[s3]` and `[backup]` for the worker; `[tailcat]` is accepted by both roles; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys (including `controller_fingerprint_also`) need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
 
 - Server: `/var/lib/sentinel`
 - Worker: `/var/lib/sentinel-worker`

@@ -56,7 +56,7 @@ Podman suites need `SENTINEL_PODMAN_TESTS=1` as the rootless account; microVM su
 | `crates/sentinel-link` | worker link (mutual TLS, framing, controller dispatch loop, worker reconnect, Tailcat) |
 | `crates/sentinel-worker` | Linux executor: workspaces, checkout, rootless Podman, Firecracker microVMs, log spool |
 | `crates/sentinel-agent` | static guest agent for microVMs |
-| `crates/sentinel-git`, `-intake`, `-github`, `-checks`, `-mail`, `-s3`, `-cache` | Git, run intake, GitHub sign-in, Checks outbox, email, S3, worker cache |
+| `crates/sentinel-git`, `-intake`, `-github`, `-checks`, `-mail`, `-s3`, `-cache`, `-registry` | Git, run intake, GitHub sign-in, Checks outbox, email, S3, worker cache, registry pull-through cache |
 | `crates/sentinel` | CLI, host-local `admin`, Linux `server`/`worker` roles |
 | `crates/sentinel-bench`, `-probes` | benchmark runner and B11 harness, feasibility probes |
 | `web/` | `sentinel-web` (TanStack Start, React, Tailwind v4, pnpm), its own Node process |

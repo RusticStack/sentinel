@@ -235,6 +235,91 @@ A `class: compiler` entry is a stable toolchain namespace whose tool owns per-in
 
 **A `cache:` hit is never a cached verdict.** A compiler-cache hit restores *bytes* — the writable view the job's steps read — and nothing else. `execute` runs every declared step unconditionally; `job.caches` is consulted only by restore during preparation and publish during finalization, and the `Outcome::Hit` type itself carries only a manifest and a byte count. Go's documented build-cache/test-result distinction applies: forcing fresh test execution (`-count=1`) does not require discarding compiler reuse. A cache hit can never suppress a test, skip a step, or inherit a previous run's verdict. The one thing that can suppress a step is a *task result*, and only for a job that declared `reuse:` and named its whole identity ([task results](#task-results)): that is a different feature with its own class, its own opt-in and its own reported provenance, and no `cache:` declaration can turn it on. The Linux fixture `fixtures/compiler/fakecc.sh` — a content-keyed compiler stand-in — exercises this through real container mounts and restore/publish round-trips in `sentinel-worker/tests/compiler_cache.rs` and `sentinel-cache/tests/compiler.rs`.
 
+## Registry pull-through cache
+
+A worker can answer a job's image pull from local disk. `[registry_cache]` in its configuration
+([configuration](configuration.md)) turns on a registry endpoint that speaks the read half of the OCI
+distribution API, listens on `127.0.0.1` on an ephemeral port, and keeps what it fetches under
+`<data_dir>/registry`.
+
+**What it serves.** `GET /v2/` for the API check; a manifest by tag and by digest, and a blob by digest,
+`GET` and `HEAD`; a single `bytes=` range on a stored blob (`416` for a range outside it). That is the
+whole surface. A push (`/blobs/uploads/…`, any non-`GET`/`HEAD` method), a tag list, a `_catalog`, a
+reference that is neither a tag nor a `sha256:` digest, a path that does not name a scope and registry the
+worker knows, and a repository name that is not a valid reference path are answered with an OCI error
+(`404`/`405` and a JSON body) and never forwarded to a registry. A registry the worker does not cache is
+refused the same way, so the endpoint is not an open proxy.
+
+**Wiring.** containers/image reads one configuration file, named by the `CONTAINERS_REGISTRIES_CONF`
+environment variable; Podman resolves a pull through it exactly as its own tools do. For every pull the
+worker writes `<data_dir>/registry/conf/<scope>/registries.conf` (an empty `registries.conf.d` beside it,
+so a host's drop-ins cannot apply) and names that file on the `podman pull` command, in place of any
+ambient value. Each configured registry gets a block whose mirror is
+`127.0.0.1:<cache port>/<scope token>/<registry>`, `insecure = true`, because the endpoint is plain HTTP on
+loopback; the upstream itself is still whatever the registry block says. A mirror location's path becomes
+the first components of the repository a mirror is asked for, which is how one listener tells scopes apart;
+a registry that states a port writes it with an underscore there (`127.0.0.1_5000`), because a repository
+path cannot hold a colon. `docker.io` is fetched from `registry-1.docker.io`; every other host from itself;
+a loopback upstream is fetched over plain HTTP and marked `insecure` in its own block.
+
+**Scopes.** An anonymous pull is cached in one shared scope: it holds only what an unauthenticated pull
+could fetch, and a digest names immutable content. A pull that carries a tenant's `registry_auth` is cached
+in that tenant's scope, split again by the job's trust class (`protected`/`pull_request`/`unprotected`), so
+a fork's pull request can never occupy a directory a protected build reads and the two never share a layer.
+A scope's token is 16 random bytes minted once and kept in `<data_dir>/registry/scopes/<scope key>`
+(directories `0700`, files `0600`), so a restarted worker still answers from what the previous one cached
+and a pull configuration stays valid for its lifetime. A token the process did not mint is `404`.
+
+**Credentials.** The cache holds none. A miss forwards the client's `Authorization` header to the upstream
+it names, for that request only; a `401`/`403` is relayed with its `WWW-Authenticate` challenge verbatim, so
+the client performs its own token exchange and retries, and the cache never mints, decodes or stores a
+credential. A private image therefore needs the tenant's own `registry_auth` on the pull that first fetches
+it: without the credential the upstream refuses and nothing enters any scope. A repeat pull of that image is
+answered from the tenant's scope with no upstream request and no credential, because that scope's token is
+in the pull configuration the worker wrote for that tenant's attempt and nowhere else — another tenant's
+pull path cannot name it. A job's own `registry_auth` never reaches the job's steps, as before
+([secrets](secrets.md)); it reaches the cache only as the header of the pull it authorized.
+
+**Correctness.** A manifest is hashed before it is stored and again before it is served; one that does not
+match its name is removed and answered as a miss. Every blob is written under `registry/tmp/` while it is
+hashed, and renamed into place only once its size and digest both match, so a partial or mismatched body
+never becomes readable; a body that does not hash to the digest it was requested by is answered `502`. A
+blob is hashed again while it is served, in the same loop that copies it out: the chunked response's
+terminating chunk is written only after the whole body verified, so a stored blob that changed on disk ends
+the response without a complete message, fails the pull, and is deleted for the next one to fetch again. A
+range read verifies the whole file before cutting the slice, so the bytes it hands out are known to belong
+to the digest. A tag is revalidated against the upstream once its record is older than `TAG_TTL` (60 s): the
+fresh manifest replaces the record when the tag moved, and the record's timestamp is refreshed when it did
+not. A digest is immutable and never revalidated — it is kept until eviction.
+
+**Bounds.** One budget covers every scope: `[registry_cache] budget_bytes`, defaulting to a tenth of the
+data filesystem clamped to 1–50 GiB, at least 64 MiB. Stored blobs, manifests and tag records all count.
+When a body would push the store past the budget, the cache evicts by last use — oldest last-served first,
+never an entry served within the keep window (10 minutes) — and tag records only after content, because
+losing one costs one revalidation. If nothing is evictable the pull is refused with `507` and nothing lands,
+so the cache never fills the disk to make room for itself. Serving bumps the file's modification time, which
+is the whole LRU record.
+
+**Not wired.** A microVM's root file system is an ext4 image the worker builds and boots, not a registry
+pull, so microVM jobs do not go through this cache. Neither does a runner-mode job's Docker daemon inside a
+guest (AR04), nor a pull a job runs itself inside its container: the cache answers the worker's own pulls.
+
+**Verification.** `crates/sentinel-registry/tests/cache.rs` drives real HTTP against a loopback registry
+double that counts every request: a first pull populates the store and a second pull of the same digest
+reaches the upstream zero times; a tag is answered from disk inside its window and revalidated after it; a
+component of a stored blob flipped in place is never served whole, is removed, and the next pull fetches the
+real bytes; an upstream body that does not hash to its digest is refused and leaves nothing stored; a pull
+that would exceed the budget is `507` with the earlier copy intact; with the keep window disabled the least
+recently served layer is the one evicted; a fork's `pull_request` scope and a `protected` scope of the same
+tenant keep separate copies, a corrupted copy in the fork's scope cannot change what the protected scope
+serves, and a tag resolved in the fork's scope is not what the protected scope reads; a private registry
+refuses a credential-less pull, the challenge is relayed, the pull with the credential is stored, the repeat
+is served from disk, and the credential appears in no file the cache wrote; ranges, `HEAD` and the refusals
+above are covered too. `crates/sentinel-registry/tests/containers_image.rs` (gated on
+`SENTINEL_CONTAINERS_IMAGE_TESTS=1`, needing `docker` and the skopeo image) runs the real client: skopeo in
+a container copies through the generated `registries.conf`, and the second copy of the same digest makes no
+upstream request.
+
 ## Recipe library
 
 [recipes](recipes.md) publishes nine tested pipelines — a custom compiler tool, Go, Rust, npm, pnpm, Bun, Python, Maven and Gradle — showing how each toolchain's stores map onto these classes, which environment variables wire the mounts, how lockfile and toolchain changes move through the key and scope, and the measured cold/warm/small-edit/changed-dependency/changed-toolchain behavior.
