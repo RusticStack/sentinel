@@ -1,14 +1,18 @@
-//! The guided migration's two reads: at a pinned commit, the `runs-on:` diff a repository would
-//! receive and, on request, the native pipeline plan its workflows become; and the shadow parity
-//! of the job pairs a migration is running, compared over the commits they ran on.
+//! The guided migration's two writes of an analysis: the preview at a pinned commit — the
+//! `runs-on:` diff a repository would receive and, on request, the native pipeline plan its
+//! workflows become — and the pull request that applies that diff.
 //!
-//! The controller does not read repository content at a revision yet — a Contents client and
-//! the migration permissions are H01's and H04's — so the caller sends the workflow files it
-//! read at the pinned commit, exactly what the analyzer takes. Everything the response holds
-//! is computed here from those files, the versioned tables and this deployment's own facts;
-//! no model, no guess and no value the workflow states.
+//! The preview takes the workflow files from its caller, because it reads nothing from GitHub. The
+//! write reads them itself, at the commit it is told, through the App's migration token: the branch
+//! it commits is built from the bytes GitHub holds, so the diff it applies is the diff it described
+//! ([workflow analysis](../../../docs/workflow-analysis.md#verification)).
+//!
+//! Everything either answer holds is computed here from the workflows, the versioned tables and this
+//! deployment's own facts; no model, no guess and no value the workflow states.
 
 use sentinel_core::auth::{Permissions, Scopes};
+use sentinel_core::{RepoId, TenantId, UnixMillis, UserId};
+use sentinel_github::migration::{self as remote, Migrate, Outcome, Rewritten};
 use sentinel_pipeline::workflow::{
     self, DockerHosts, Images, MAX_WORKFLOW_FILES, Options, WorkflowFile, analyze, plan,
 };
@@ -18,13 +22,21 @@ use sentinel_protocol::{
     error::{ApiError, ErrorCode},
     limits::MAX_PIPELINE_FILE_BYTES,
 };
-use sentinel_store::{auth as authz, lookup, parity};
+use sentinel_store::{
+    auth as authz, lookup,
+    migration::{PullRequest as Recorded, Writes},
+    parity, sources, sources_forge,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::http::Request;
 use crate::routes::{Route, body, body_limit, err, identify, ok, parse, store_error};
 use crate::{State, auth};
+
+/// The answer a migration write states: a versioned contract, so a client can branch on it
+/// ([compatibility](../../../docs/compatibility.md)).
+pub const PULL_REQUEST_SCHEMA: &str = "sentinel.migration-pull-request/1";
 
 /// What a preview takes: the commit, the workflow files read at it, and whether the native
 /// plan is wanted.
@@ -78,28 +90,18 @@ pub(crate) fn preview(state: &State, request: &mut Request, slug: &str, name: &s
                 .with_detail("limit_bytes", MAX_PIPELINE_FILE_BYTES));
         }
     }
-    // The repository's read path, and the deployment's own fact about Docker: a job that needs
-    // a daemon can only move where a micro-VM guest serves its class.
+    // The repository's read path, then the deployment's own fact about Docker.
     let (slug, name) = (slug.to_owned(), name.to_owned());
     let principal = who.principal;
-    let microvm = state
+    state
         .store
         .read(move |c| {
             let tenant = lookup::tenant_by_slug(c, &slug)?;
             let repo = lookup::repo_by_name(c, tenant, &name)?;
-            authz::require_repo(c, principal, repo, Permissions::READ)?;
-            Ok(c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM workers WHERE revoked_ms IS NULL AND (capabilities & ?1) != 0)",
-                [Capabilities::ISOLATION_MICROVM.0 as i64],
-                |row| row.get::<_, bool>(0),
-            )?)
+            authz::require_repo(c, principal, repo, Permissions::READ)
         })
         .map_err(store_error)?;
-    let docker = if microvm {
-        DockerHosts::MicrovmGuests
-    } else {
-        DockerHosts::ContainerOnly
-    };
+    let docker = docker_hosts(state)?;
     let files: Vec<WorkflowFile<'_>> = asked
         .workflows
         .iter()
@@ -390,4 +392,452 @@ fn side_json(side: &parity::Side) -> Value {
 
 fn spread_json(spread: parity::Spread) -> Value {
     json!({ "p50_ms": spread.p50_ms, "p95_ms": spread.p95_ms })
+}
+
+/// The deployment's own fact about Docker: a job that needs a daemon can only move where a
+/// micro-VM guest serves its class.
+fn docker_hosts(state: &State) -> Result<DockerHosts, ApiError> {
+    let microvm = state
+        .store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workers WHERE revoked_ms IS NULL AND (capabilities & ?1) != 0)",
+                [Capabilities::ISOLATION_MICROVM.0 as i64],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .map_err(store_error)?;
+    Ok(if microvm {
+        DockerHosts::MicrovmGuests
+    } else {
+        DockerHosts::ContainerOnly
+    })
+}
+
+/// What a migration write takes: open the pull request at a commit, or close the one it opened.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Start {
+    action: Action,
+    #[serde(default)]
+    commit: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Action {
+    /// Create the `sentinel/migrate` branch and its pull request, or update what it already has.
+    Open,
+    /// Close the open pull request, leaving the branch in place.
+    Close,
+}
+
+/// What the gate and the write facts of one repository are: the switch and the installation the
+/// gate read, then everything a write names. Read in the transaction that records a refusal.
+enum Gate {
+    Refused(Writes),
+    Open {
+        tenant: TenantId,
+        repo: RepoId,
+        installation: u64,
+        account: u64,
+        forge_repo: u64,
+        remote: String,
+    },
+}
+
+/// The route that applies a migration: the branch named `sentinel/migrate` from the analysed
+/// commit, the diff as one commit, and the pull request against the default branch — or the close
+/// of that pull request. Re-running it updates the branch and the pull request instead of opening a
+/// second one, and a protection rule that declines the update is reported, never forced.
+pub(crate) fn pull_request(state: &State, request: &mut Request, slug: &str, name: &str) -> Route {
+    let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::TENANT_ADMIN)?;
+    let asked: Start = parse(&body(request)?)?;
+    let action = asked.action;
+    let commit = match (action, asked.commit) {
+        (Action::Open, Some(commit)) => {
+            let commit = commit.to_ascii_lowercase();
+            if !remote::commit_id(&commit) {
+                return Err(err(
+                    ErrorCode::InvalidRequest,
+                    "commit is not a full commit id",
+                ));
+            }
+            Some(commit)
+        }
+        (Action::Open, None) => {
+            return Err(err(
+                ErrorCode::InvalidRequest,
+                "opening a migration pull request needs the commit it is analysed at",
+            ));
+        }
+        (Action::Close, Some(_)) => {
+            return Err(err(
+                ErrorCode::InvalidRequest,
+                "closing a migration pull request takes no commit",
+            ));
+        }
+        (Action::Close, None) => None,
+    };
+
+    // The gate first: it reads the switch and the installation snapshot as they are now and records
+    // a refusal in the repository's own audit trail, so no request to GitHub is made for a write the
+    // tenant has not authorised.
+    let now = UnixMillis::now();
+    let (slug, name) = (slug.to_owned(), name.to_owned());
+    let principal = who.principal;
+    let gate = state
+        .store
+        .writer()
+        .write(move |tx| {
+            let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
+            let repo = lookup::repo_by_name(tx, tenant, &name)?;
+            // A migration writes to the tenant's repository, so it is the same authority the
+            // switch takes: the tenant's administrator.
+            authz::require_tenant_admin(tx, principal, tenant)?;
+            let writes =
+                sentinel_store::migration::authorize(tx, tenant, repo, Some(principal.user), now)?;
+            if writes != Writes::Permitted {
+                return Ok(Gate::Refused(writes));
+            }
+            let grant = sources_forge::grant(tx, tenant, repo)?;
+            let remote = sources::load_metadata(tx, repo)?.binding.remote;
+            Ok(Gate::Open {
+                tenant,
+                repo,
+                installation: grant.installation,
+                account: grant.account,
+                forge_repo: grant.repo,
+                remote,
+            })
+        })
+        .map_err(store_error)?;
+    let Gate::Open {
+        tenant,
+        repo,
+        installation,
+        account,
+        forge_repo,
+        remote: bound_remote,
+    } = gate
+    else {
+        let Gate::Refused(writes) = gate else {
+            unreachable!("the gate answers refused or open")
+        };
+        return Err(refused(writes));
+    };
+
+    // A write acts as the App: without one in force there is nothing to open a pull request with.
+    let Some(app) = state.github_app.app() else {
+        return Err(err(
+            ErrorCode::Conflict,
+            "the controller has no GitHub App in force",
+        )
+        .with_detail("reason", "not_configured"));
+    };
+    let _slot = state
+        .github_app
+        .take_call()
+        .ok_or_else(crate::github_app::busy)?;
+    let (owner, repository) =
+        sentinel_github::checks::repository_path(&bound_remote).ok_or_else(|| {
+            err(
+                ErrorCode::Conflict,
+                "the repository is bound to a remote that is not a GitHub repository",
+            )
+            .with_detail("reason", "remote")
+        })?;
+    let token = app
+        .migration_token(installation, account, forge_repo, &bound_remote, now.0)
+        .map_err(upstream)?;
+
+    let actor = who.principal.user;
+    match action {
+        Action::Close => {
+            let outcome = match app.close_migration(&token, &owner, &repository) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    record(state, tenant, repo, actor, Recorded::Refused)?;
+                    return Err(upstream(error));
+                }
+            };
+            match outcome {
+                Outcome::Closed(pull) => {
+                    record(state, tenant, repo, actor, Recorded::Closed)?;
+                    answered(None, Some((&pull, "closed")), None)
+                }
+                // Nothing was open: the answer states that, and nothing is recorded as closed that
+                // was not.
+                Outcome::Nothing => answered(None, None, None),
+                Outcome::Opened(_) | Outcome::Updated(_) => {
+                    Err(err(ErrorCode::Internal, "closing answered an open"))
+                }
+            }
+        }
+        Action::Open => {
+            let commit = commit.as_deref().unwrap_or_default();
+            let files = app
+                .workflows(&token, &owner, &repository, commit)
+                .map_err(upstream)?;
+            if files.is_empty() {
+                return Err(err(
+                    ErrorCode::Conflict,
+                    "the repository has no workflow to migrate at this commit",
+                )
+                .with_detail("reason", "no_workflows"));
+            }
+            let views: Vec<WorkflowFile<'_>> = files
+                .iter()
+                .map(|file| WorkflowFile {
+                    path: &file.path,
+                    text: &file.text,
+                })
+                .collect();
+            let docker = docker_hosts(state)?;
+            let inventory = analyze(commit, &views, docker)
+                .map_err(|error| err(ErrorCode::InvalidRequest, format!("workflows: {error}")))?;
+            let planned = plan(
+                &inventory,
+                &views,
+                &Options {
+                    docker,
+                    native: false,
+                    images: Images::default(),
+                },
+            )
+            .map_err(|error| err(ErrorCode::InvalidRequest, format!("preview: {error}")))?;
+            let applied: Vec<Rewritten<'_>> = planned
+                .workflows
+                .iter()
+                .filter_map(|workflow| {
+                    workflow.applied.as_deref().map(|text| Rewritten {
+                        path: &workflow.path,
+                        text,
+                    })
+                })
+                .collect();
+            if applied.is_empty() {
+                return Err(err(
+                    ErrorCode::Conflict,
+                    "no workflow's runs-on changes at this commit",
+                )
+                .with_detail("reason", "no_change"));
+            }
+            let (title, message, body) = describe(commit, &planned);
+            let outcome = match app.migrate(
+                &token,
+                &owner,
+                &repository,
+                &Migrate {
+                    commit,
+                    files: &applied,
+                    message: &message,
+                    title: &title,
+                    body: &body,
+                },
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    record(state, tenant, repo, actor, Recorded::Refused)?;
+                    return Err(upstream(error));
+                }
+            };
+            match outcome {
+                Outcome::Opened(pull) => {
+                    record(state, tenant, repo, actor, Recorded::Opened)?;
+                    answered(Some(commit), Some((&pull, "opened")), Some(&planned))
+                }
+                Outcome::Updated(pull) => {
+                    record(state, tenant, repo, actor, Recorded::Updated)?;
+                    answered(Some(commit), Some((&pull, "updated")), Some(&planned))
+                }
+                Outcome::Closed(_) | Outcome::Nothing => {
+                    Err(err(ErrorCode::Internal, "opening answered a close"))
+                }
+            }
+        }
+    }
+}
+
+/// The one answer both actions state: the branch, the pull request when there is one, the workflows
+/// the diff rewrote and the jobs it kept on GitHub's runners.
+fn answered(
+    commit: Option<&str>,
+    pull: Option<(&remote::Pull, &'static str)>,
+    planned: Option<&workflow::Plan>,
+) -> Route {
+    ok(json!({
+        "schema": PULL_REQUEST_SCHEMA,
+        "branch": remote::BRANCH,
+        "revision": commit,
+        "pull_request": pull.map(|(pull, state)| json!({
+            "number": pull.number,
+            "url": pull.url,
+            "head": pull.head,
+            "base": pull.base,
+            "state": state,
+        })),
+        "changed": planned.map(changed_json).unwrap_or_default(),
+        "kept": planned.map(kept_json).unwrap_or_default(),
+    }))
+}
+
+/// What became of an attempt goes in the repository's audit trail, so who ran a migration and when
+/// survives it.
+fn record(
+    state: &State,
+    tenant: TenantId,
+    repo: RepoId,
+    actor: UserId,
+    outcome: Recorded,
+) -> Result<(), ApiError> {
+    let now = UnixMillis::now();
+    state
+        .store
+        .writer()
+        .write(move |tx| {
+            sentinel_store::migration::record_pull_request(
+                tx,
+                tenant,
+                repo,
+                Some(actor),
+                outcome,
+                now,
+            )
+        })
+        .map_err(store_error)
+}
+
+fn refused(writes: Writes) -> ApiError {
+    match writes {
+        Writes::Permitted => err(ErrorCode::Internal, "the gate answered nothing"),
+        Writes::Off => err(
+            ErrorCode::Conflict,
+            "guided migration is off for this tenant",
+        )
+        .with_detail("reason", "off"),
+        Writes::Missing(missing) => err(
+            ErrorCode::Conflict,
+            "the GitHub App's installations do not grant what a migration writes with",
+        )
+        .with_detail("missing", missing),
+        Writes::Unbound => err(
+            ErrorCode::Conflict,
+            "the repository is bound through no live installation to write with",
+        )
+        .with_detail("reason", "unbound"),
+    }
+}
+
+/// GitHub's answer as the API states it: a refusal a person's setting decided is a `409` that names
+/// it, and a broken call is an upstream failure. Nothing GitHub said is echoed, so no workflow, path
+/// or credential text reaches a client from it.
+fn upstream(error: sentinel_github::Error) -> ApiError {
+    use sentinel_github::Error as Github;
+    match error {
+        Github::Refused("branch protection") => err(
+            ErrorCode::Conflict,
+            "the sentinel/migrate branch's protection declined the update",
+        )
+        .with_detail("reason", "branch_protected"),
+        Github::Refused(_) => err(
+            ErrorCode::Conflict,
+            "GitHub declined the migration pull request",
+        )
+        .with_detail("reason", "pull_request_refused"),
+        Github::Config(_) | Github::Callback(_) => {
+            err(ErrorCode::Internal, "the migration write was built wrong")
+        }
+        Github::Denied(_) | Github::Response(_) | Github::Transport(_) => err(
+            ErrorCode::UpstreamFailed,
+            "GitHub did not answer the migration write; retry shortly",
+        ),
+    }
+}
+
+/// What the commit and the pull request say: the same text for the same plan, so re-running a
+/// migration at one commit rewrites nothing a person did not re-analyse.
+fn describe(commit: &str, planned: &workflow::Plan) -> (String, String, String) {
+    let title = "Move workflow jobs to Sentinel runners".to_owned();
+    let message = format!(
+        "Move workflow jobs to Sentinel runners\n\nGuided migration at commit {commit}; only the runs-on lines change.\n"
+    );
+    let mut body = String::with_capacity(1024);
+    body.push_str("Guided migration of `");
+    body.push_str(commit);
+    body.push_str("` (label table ");
+    body.push_str(&planned.label_table.to_string());
+    body.push_str(
+        "): only `runs-on:` lines change.\n\n| Workflow | Job | Was | Now |\n|---|---|---|---|\n",
+    );
+    for workflow in &planned.workflows {
+        for change in &workflow.changes {
+            body.push_str("| `");
+            body.push_str(&workflow.path);
+            body.push_str("` | `");
+            body.push_str(&change.job);
+            body.push_str("` | `");
+            body.push_str(change.before.trim());
+            body.push_str("` | `");
+            body.push_str(change.after.trim());
+            body.push_str("` |\n");
+        }
+    }
+    let mut kept_any = false;
+    for workflow in &planned.workflows {
+        for kept in &workflow.kept {
+            if !kept_any {
+                body.push_str("\nJobs that stay on GitHub's runners:\n\n");
+                kept_any = true;
+            }
+            body.push_str("- `");
+            body.push_str(&workflow.path);
+            body.push_str("` `");
+            body.push_str(&kept.job);
+            body.push_str("`: ");
+            if kept.varies && kept.reasons.is_empty() {
+                body.push_str("its runs-on cells name different classes");
+            }
+            for (index, reason) in kept.reasons.iter().enumerate() {
+                if index > 0 {
+                    body.push_str(", ");
+                }
+                body.push_str(reason.note());
+            }
+            body.push('\n');
+        }
+    }
+    body.push_str("\nRe-running the migration updates this branch and this pull request.\n");
+    (title, message, body)
+}
+
+fn changed_json(planned: &workflow::Plan) -> Vec<Value> {
+    let mut out = Vec::with_capacity(planned.workflows.len());
+    for workflow in &planned.workflows {
+        if workflow.changes.is_empty() {
+            continue;
+        }
+        out.push(json!({
+            "path": workflow.path,
+            "jobs": workflow.changes.iter().map(|change| change.job.as_str()).collect::<Vec<&str>>(),
+        }));
+    }
+    out
+}
+
+fn kept_json(planned: &workflow::Plan) -> Vec<Value> {
+    let mut out = Vec::new();
+    for workflow in &planned.workflows {
+        for kept in &workflow.kept {
+            out.push(json!({
+                "path": workflow.path,
+                "job": kept.job,
+                "reasons": kept.reasons.iter().map(|reason| reason.as_str()).collect::<Vec<&str>>(),
+                "notes": kept.reasons.iter().map(|reason| reason.note()).collect::<Vec<&str>>(),
+                "varies": kept.varies,
+            }));
+        }
+    }
+    out
 }

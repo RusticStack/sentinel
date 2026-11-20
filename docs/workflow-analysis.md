@@ -112,6 +112,55 @@ The class is always a label the worker vocabulary accepts: `RunnerClass::parse` 
 
 Action classification reads the repository, case-insensitively, so `Swatinem/rust-cache@v2` and `swatinem/rust-cache@v2` agree. An action reference without a `@version` is refused by the decoder, because an unpinnable action cannot be recorded with its version.
 
+## The pull request
+
+`POST /tenants/{slug}/repos/{name}/migration/pull-request` applies the plan: the branch
+`sentinel/migrate` from the analysed commit, the `runs-on:` diff as one commit, and the pull request
+against the repository's default branch ([API](api.md#routes), which is where the request and
+response shapes are). The body names the action (`open` or `close`) and, for `open`, the commit;
+`{"action":"open","commit":"<40 or 64 hex digits>"}` and `{"action":"close"}` are the whole of it.
+The tenant's administrator is who may run it, the same authority the migration switch takes, and the
+write itself is what [`sentinel_store::migration::authorize`](github-app.md#migration-permissions)
+gates: the switch, and what the installation the repository is bound through was last reported to
+grant. A refusal is answered before any request reaches GitHub and leaves its audit row.
+
+**What it reads.** The workflow files come from GitHub, not from the caller: the route lists
+`.github/workflows` at the commit and reads each `*.yml`/`*.yaml` through the Contents API, using the
+App's migration token (contents, pull requests and workflows write, minted narrowed to the one
+repository and verified against its remote, [GitHub App](github-app.md#migration-permissions)). The
+file bytes a commit holds never change, the pinned commit is the id the analyzer takes, and the
+tables are versioned, so the plan this route applies is the plan a preview at the same commit and the
+same deployment showed. A file the analyzer would refuse — a closed workflow vocabulary, an oversized
+document — is `invalid_request` with the analyzer's own message, and a commit with no workflow at all
+is `409` with `details.reason: "no_workflows"`.
+
+**What it writes.** One commit, whose parent is the analysed commit and whose tree is that commit's
+tree with exactly the files the diff rewrote replaced, so the change is the label lines and nothing
+else. The branch name is a constant and the client refuses any other ref before it makes a request:
+a migration never pushes to a repository's default branch. The commit message and the pull request's
+title and body are built from the plan — the workflows and jobs it moved with the label each had and
+the class it gets, and the jobs that stay on GitHub's runners with their reasons — so re-running the
+same analysis at the same commit rewrites nothing a person did not re-analyse.
+
+**Re-running, closing, protection.** The branch a repository already has is fast-forwarded to the new
+commit, and the pull request it already has is updated instead of a second one being opened: the
+migration runs as often as a person likes and leaves one branch and one pull request behind. A re-run
+whose analysis is unchanged writes no commit at all — the branch already holds that tree — so the
+history holds one commit per change, not one per click. `close`
+closes that pull request and leaves the branch, so the next run finds it again; a close with nothing
+open answers `pull_request: null` and records nothing that did not happen. A protection rule that
+declines the update is **reported, never forced** — GitHub's refusal is the answer
+(`409` with `details.reason: "branch_protected"`), the ref stays where it was, and the attempt is
+recorded as refused.
+
+What became of each attempt is one row in the repository's own source audit trail —
+`migration_pull_request_open`, `_update`, `_close` or `_refused` — written after GitHub answered. The
+pull request's number and page are not stored: GitHub holds them, the branch is always
+`sentinel/migrate`, and a second copy could only go stale the first time someone closed the pull
+request by hand. The answer states the branch, the revision, the pull request (`number`, `url`,
+`head`, `base`, `state`), the workflows whose labels changed with their job ids, and the jobs kept,
+and it is `sentinel.migration-pull-request/1` ([compatibility](compatibility.md)).
+
 ## Verification
 
 Unit and fixture tests are in [`crates/sentinel-pipeline/tests/workflow.rs`](../crates/sentinel-pipeline/tests/workflow.rs); the fixtures are in [`fixtures/workflows`](../fixtures/workflows) — the documented pilot shapes (cli's Go matrix and a job needing `GH_TOKEN`, ripgrep's OS and toolchain matrices, gson's JDK matrix with a container and a service), a workflow already naming Blacksmith labels, one already migrated to Sentinel classes, and one using every key the analyzer records. Invalid fixtures carry the message they must fail with in a `# expect:` header.
@@ -147,12 +196,26 @@ On request the plan also carries a `.sentinel.yml` per workflow, built from the 
 - Caches and artifacts are declared from the recorded `key` and `paths`, an up-to-date artifact name being kept when the schema accepts it. A cache key with a GitHub expression the native language cannot evaluate is generated as `fill-me` and the notes say so; the native equivalents that do exist are `hashFiles` → `hash_files` and `github.ref|sha|event_name|base_ref|repository|run_id` → `event.ref|sha|name|base_ref`/`repo.name`/`run.id`.
 - Every job declares the secret **names** it referenced, and the plan lists them for the repository to provision. Values are never in the inventory and so never in the plan: a pipeline declares env in values, so `env` names (job and step) are listed in the mapping rather than written into the pipeline.
 
-The inventory holds no `run:` script, so each `run:` step becomes a stub at `scripts/ci/<workflow>/<job>/<step>.sh` and the pipeline runs it with `sh`; the mapping says which GitHub step each stub stands for (`script`, `image`, `checkout`, `cache`, `artifact`) so the person knows where the commands and the toolchain image go. The generated text is **always validated by the pipeline compiler** before it is returned: `compile_str` must accept it and produce exactly the jobs the mapping names, or the workflow has no native plan. Nothing is written to the repository in this stage; opening the pull request is H04's.
+The inventory holds no `run:` script, so each `run:` step becomes a stub at `scripts/ci/<workflow>/<job>/<step>.sh` and the pipeline runs it with `sh`; the mapping says which GitHub step each stub stands for (`script`, `image`, `checkout`, `cache`, `artifact`) so the person knows where the commands and the toolchain image go. The generated text is **always validated by the pipeline compiler** before it is returned: `compile_str` must accept it and produce exactly the jobs the mapping names, or the workflow has no native plan. The plan writes nothing: the pull request that applies it is [the next section](#the-pull-request).
 
 ## Verification
 
 Unit and fixture tests are in [`crates/sentinel-pipeline/tests/workflow.rs`](../crates/sentinel-pipeline/tests/workflow.rs) for the inventory and [`tests/plan.rs`](../crates/sentinel-pipeline/tests/plan.rs) for the change generator; the fixtures are in [`fixtures/workflows`](../fixtures/workflows) — the documented pilot shapes (cli's Go matrix and a job needing `GH_TOKEN`, ripgrep's OS and toolchain matrices, gson's JDK matrix with a container and a service), a workflow already naming Blacksmith labels, one already migrated to Sentinel classes, and one using every key the analyzer records. Invalid fixtures carry the message they must fail with in a `# expect:` header. `fixtures/workflows/native/` holds the native path's own: `ci.yml`, which the native plan serves whole down to a recorded `.sentinel.yml`, `mixed.yml`, where each job keeps its place for its own reason, and `block-labels.yml`, whose `runs-on:` is a block sequence the diff replaces whole.
 
 The inventory's gate is that no job and no construct is left undecided on the fixtures: every job has at least one cell whose destination is a class or one of the five reasons, and every recorded item — a trigger, a container, a service, a matrix, an `if`, a timeout, an output, a reusable call, a shell, a working directory, a `continue-on-error`, and each `uses:` action with its version — has its construct classified, so a classification cannot be satisfied by omission. The limits are proved by refusal: an oversized file, a document nested deeper than 16 levels, more than 256 jobs, an axis wider than 256 values, a `runs-on:` expansion past 256 cells and more than 64 workflow files each fail with the limit named. Determinism is proved by analyzing the same files in both orders and comparing, and the inventory's own rendering is asserted to hold no value: a token-shaped `env:` value and a `run:` script never appear in it.
+
+The pull request is proved against `sentinel_github::fake`, which holds a repository's workflow at a
+commit, its refs and its pull requests. [`crates/sentinel-github/tests/migration.rs`](../crates/sentinel-github/tests/migration.rs)
+is the client: the workflows read at a commit and nothing at a commit the fake does not hold, one
+commit carrying exactly the rewritten text, the branch it created and its pull request, a second run
+that updates that same pull request and moves that same branch, a close that leaves the branch and a
+second close that finds nothing, protection declining the update with the ref left where it was, and
+what is bounded before a request is made. [`crates/sentinel-api/tests/migration_pull_request.rs`](../crates/sentinel-api/tests/migration_pull_request.rs)
+is the route: the commit, the branch, the pull request and the audit row `open`; a second run that
+answers `updated` with one pull request and one branch; a close and the close that finds nothing; a
+withdrawn `workflows` permission refused `409` naming it with nothing written and no request made; a
+switch turned off refused the same way; protection reported as `branch_protected`; a commit that is
+not a commit id and a commit whose workflows already name their classes refused; and a credential
+without the tenant's administration refused `403`.
 
 The change generator has three gates. **The label diff touches no other line**: every diff on every fixture is parsed back and applied to the input, the result must equal the input line for line except at the `runs-on:` lines, every added line must be a `runs-on:` naming a Sentinel class, and analyzing the result must leave every job either moved or listed as kept and produce an empty diff the second time. **Every native pipeline validates**: each generated text compiles, its jobs are exactly the mapping's, its triggers are the workflow's, and every stub it names is one the pipeline runs. **Identical input gives byte-identical output**: the same files planned twice, and in another order, produce the same diff, mapping and bytes; the native fixture's text is compared to a recorded file.

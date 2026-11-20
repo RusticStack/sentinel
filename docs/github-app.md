@@ -245,8 +245,17 @@ said) and answers `permitted`, `off`, `missing(["workflows"])` or `unbound`; a r
 to the repository's source audit trail as `migration_off` or `migration_permissions`. A
 permission withdrawn on GitHub refuses the very next write — the snapshot that drops the bit is
 the one the gate reads, with no restart and no cache — and turning the switch off does the same in
-the transaction that writes it. The gate is the whole of the write surface this item adds: the
-pull request it guards is H04's.
+the transaction that writes it.
+
+**What the write does.** A permitted write mints an installation token narrowed to the three
+permissions above and to the one repository, verified against its binding's remote exactly as the
+source and checks tokens are, and then reads the repository's workflows at the analysed commit,
+commits the `runs-on:` diff to the `sentinel/migrate` branch — never to the default branch — and opens
+the pull request against it, updating the branch and pull request it already has rather than opening a
+second one. A protection rule that declines the update is reported (`409`,
+`details.reason: "branch_protected") and the ref is left alone: a migration never forces a write a
+repository's settings refuse. The route, the bounds and what is recorded are in
+[workflow analysis](workflow-analysis.md#the-pull-request).
 
 **The lifecycle is the existing one.** A permission change arrives as an `installation` delivery,
 which queues a refresh; the reconciliation pass reads the installation again and applies the

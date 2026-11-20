@@ -22,6 +22,34 @@ use crate::{
 pub const PERMISSIONS_REFUSED: &str = "migration_permissions";
 pub const OFF_REFUSED: &str = "migration_off";
 
+/// The audit actions of one attempt on the migration pull request, in the repository's own trail:
+/// the branch was created and the pull request opened, the branch and its pull request were
+/// updated, the pull request was closed, or GitHub declined the write.
+pub const PULL_REQUEST_OPENED: &str = "migration_pull_request_open";
+pub const PULL_REQUEST_UPDATED: &str = "migration_pull_request_update";
+pub const PULL_REQUEST_CLOSED: &str = "migration_pull_request_close";
+pub const PULL_REQUEST_REFUSED: &str = "migration_pull_request_refused";
+
+/// What became of one attempt on the migration pull request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullRequest {
+    Opened,
+    Updated,
+    Closed,
+    Refused,
+}
+
+impl PullRequest {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Opened => PULL_REQUEST_OPENED,
+            Self::Updated => PULL_REQUEST_UPDATED,
+            Self::Closed => PULL_REQUEST_CLOSED,
+            Self::Refused => PULL_REQUEST_REFUSED,
+        }
+    }
+}
+
 /// The tenant's switch, as a reader sees it.
 pub fn mode(conn: &Connection, tenant: TenantId) -> Result<bool> {
     let enabled: i64 = conn
@@ -139,6 +167,23 @@ pub fn authorize(
     };
     intake::audit(tx, tenant, repo, actor, action, now)?;
     Ok(verdict)
+}
+
+/// Records what became of one attempt on the migration pull request in the repository's source
+/// audit trail, in the caller's transaction, so who ran it and when survives the attempt.
+///
+/// The branch's name and the pull request's number are deliberately not copied here: GitHub holds
+/// them, the branch is always `sentinel/migrate`, and a second copy could only go stale when
+/// someone closes the pull request by hand.
+pub fn record_pull_request(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    repo: RepoId,
+    actor: Option<UserId>,
+    outcome: PullRequest,
+    now: UnixMillis,
+) -> Result<()> {
+    intake::audit(tx, tenant, repo, actor, outcome.as_str(), now)
 }
 
 /// Turn guided migration on or off. Enabling is refused while the tenant's live installations do

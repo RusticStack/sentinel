@@ -46,6 +46,9 @@ pub struct WorkflowPlan {
     pub path: String,
     /// A unified diff of the label lines; empty when no job's labels change.
     pub diff: String,
+    /// The workflow's text after the diff, and `None` when the workflow is unchanged: what a
+    /// migration commits, so the commit is this plan's output and not a second rewrite of it.
+    pub applied: Option<String>,
     pub changes: Vec<LabelChange>,
     /// The jobs that keep running on GitHub's runners, with the reasons.
     pub kept: Vec<KeptJob>,
@@ -137,6 +140,7 @@ pub fn plan(
         workflows.push(WorkflowPlan {
             path: workflow.path.clone(),
             diff: render_diff(&workflow.path, text, &rewritten.changes),
+            applied: rewritten.applied,
             changes: rewritten.changes,
             kept: kept_jobs(workflow),
             native: native.native,
@@ -191,6 +195,8 @@ fn kept_jobs(workflow: &super::Workflow) -> Vec<KeptJob> {
 
 struct Rewritten {
     changes: Vec<LabelChange>,
+    /// The text after the rewrite; `None` when there was nothing to rewrite.
+    applied: Option<String>,
 }
 
 /// Rewrites every job's label set to the class it resolves to, then proves the rewrite.
@@ -236,6 +242,7 @@ fn rewrite(
     verify(inventory, workflow, &rewritten, &expected, options)?;
     Ok(Rewritten {
         changes: edits.iter().map(|edit| edit.change()).collect(),
+        applied: (!edits.is_empty()).then_some(rewritten),
     })
 }
 

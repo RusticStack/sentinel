@@ -602,6 +602,19 @@ pub(crate) fn route(
                 "parity",
             ],
         ) => crate::migration::parity_report(state, request, slug, name),
+        (
+            "POST",
+            [
+                "api",
+                "v1",
+                "tenants",
+                slug,
+                "repos",
+                name,
+                "migration",
+                "pull-request",
+            ],
+        ) => crate::migration::pull_request(state, request, slug, name),
         ("GET", ["api", "v1", "runs", run, "wait"]) => run_wait(state, request, run, query),
         ("GET", ["api", "v1", "runs", run, "pipeline"]) => {
             let who = identify(state, request, false)?;
