@@ -1,8 +1,11 @@
 //! Redaction runs before any byte reaches the spool, so a stored log never holds a registered value.
+//! It lives here because two holders apply the same one: the worker before a byte reaches the spool,
+//! and the controller again over an AI evidence bundle (Y02), which must redact the way the log was
+//! redacted or not at all.
 
 use std::borrow::Cow;
 
-use sentinel_protocol::logs::Stream;
+use crate::logs::Stream;
 
 pub const MIN_SECRET_BYTES: usize = 4;
 pub const MAX_ENCODED_SOURCE_BYTES: usize = 16 * 1024;
@@ -549,7 +552,7 @@ mod tests {
 
     #[test]
     fn json_escaped_values_are_redacted_before_a_parser_can_decode_them() {
-        use sentinel_protocol::diagnostics::{StepReference, parse_go_test_json};
+        use crate::diagnostics::{StepReference, parse_go_test_json};
         let secret = b"pa&ss<word>\"q\\\x01";
         let mut r = Redactor::new();
         r.register(secret);
@@ -577,7 +580,7 @@ mod tests {
 
     #[test]
     fn multi_line_values_are_redacted_line_by_line() {
-        use sentinel_protocol::diagnostics::{StepReference, parse_go_test_json};
+        use crate::diagnostics::{StepReference, parse_go_test_json};
         let secret =
             b"-----BEGIN KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEF\nAASCBKcwggSjAgEAAoIBAQC7\n}\n";
         let mut r = Redactor::new();
