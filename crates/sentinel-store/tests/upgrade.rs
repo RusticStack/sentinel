@@ -431,7 +431,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     };
 
     let report = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(report.inspection.pending, vec![73, 74, 75, 76, 77, 78]);
+    assert_eq!(report.inspection.pending, vec![73, 74, 75, 76, 77, 78, 79]);
     assert!(report.inspection.openable() && report.inspection.integrity == "ok");
     assert_eq!(
         report.copy.as_deref(),
@@ -449,7 +449,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
             .iter()
             .map(|step| step.version)
             .collect::<Vec<_>>(),
-        vec![73, 74, 75, 76, 77, 78]
+        vec![73, 74, 75, 76, 77, 78, 79]
     );
     let rewrites = |step: usize| -> Vec<(String, u64)> {
         report.steps[step]
@@ -574,7 +574,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     let report = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         report.inspection.pending,
-        vec![71, 72, 73, 74, 75, 76, 77, 78]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79]
     );
     assert_eq!(
         report.copy.as_deref(),
@@ -582,7 +582,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     );
     assert_eq!(
         report.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75, 76, 77, 78]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79]
     );
     assert!(report.blocking.is_empty(), "{:?}", report.blocking);
 
@@ -596,8 +596,9 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     drop(store);
     assert_eq!(version(&path), schema::LATEST);
 
-    // The matrix: no release older than the current schema runs on the result, because migration 74 is
-    // readable by nothing below itself, so the copy (or a backup) is the only rollback.
+    // The matrix: no release older than the one the newest migration declares runs on the result, because
+    // migration 74 (and every migration after 70 but 77 and 79) is readable by nothing below itself, so the
+    // copy (or a backup) is the only rollback for anything older.
     let needs = |db: &std::path::Path, release: u32| -> u32 {
         Connection::open(db)
             .unwrap()
@@ -616,8 +617,8 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     );
     assert_eq!(
         schema::readable_by(schema::LATEST),
-        schema::LATEST,
-        "the newest migration is readable by nothing older, so the copy is the only rollback"
+        schema::LATEST - 1,
+        "the newest migration is readable by the release before it, and nothing older"
     );
     for release in [69, schema::LATEST - 2] {
         assert!(
@@ -663,11 +664,11 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     let again = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         again.inspection.pending,
-        vec![71, 72, 73, 74, 75, 76, 77, 78]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79]
     );
     assert_eq!(
         again.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![71, 72, 73, 74, 75, 76, 77, 78]
+        vec![71, 72, 73, 74, 75, 76, 77, 78, 79]
     );
 }
 
@@ -818,13 +819,13 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        78,
+        79,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
     assert_eq!(
         sources,
-        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 77]
+        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 77, 78]
     );
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
@@ -850,13 +851,15 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         // so this table does not have to grow a column every time one is added: nothing below LATEST
         // may run on a database at LATEST.
         // Migration 77 only adds a tenant switch no older statement reads, so it is declared
-        // readable by the release before it; migration 78 adds the AI request rows and the
-        // delegations they name and is readable by nothing older, so no release here runs on a
-        // database at LATEST.
-        assert!(
-            !readable(&db, from, schema::LATEST),
-            "release {from} runs on a database at {LATEST}",
-            LATEST = schema::LATEST
+        // readable by the release before it, and migration 79 only adds two tables no older
+        // statement reads or writes, so it is too; migration 78 adds the AI request rows and the
+        // delegations they name and is readable by nothing older. So the release before the newest
+        // reads a database at LATEST exactly when LATEST declares it readable.
+        assert_eq!(
+            readable(&db, from, schema::LATEST),
+            schema::readable_by(schema::LATEST) <= from,
+            "release {from} on a database at {}",
+            schema::LATEST
         );
         // 44, 47 and 48 cannot run on schema 53 (migrations 46, 49 and 50 need 46, 48 and 50); 51 can
         // (52 and 53 are readable by 51) but not on 55 (54 needs 54); 56 and 57 are the targets of
@@ -931,7 +934,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
                 false, false,
             ],
             // The newest releases in the list run on every column they are listed against.
-            75..=77 => [
+            75..=78 => [
                 true, true, true, true, true, true, true, true, true, true, true, true, true, true,
                 true,
             ],

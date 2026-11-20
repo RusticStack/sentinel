@@ -81,3 +81,13 @@ test("search parameters of the history views drop anything that is not an attemp
   const dropped = schema["~standard"].validate({ repo: "../x", base: "att_../../etc" }).value;
   assert.deepEqual(dropped, {});
 });
+
+test("the flaky list asks for its window and states a rate as the share of commits it is", async () => {
+  const { flakesPath, fmtRate } = await import("../src/lib/history.ts");
+  assert.equal(flakesPath("acme", "my repo", undefined), "/api/v1/tenants/acme/repos/my%20repo/flakes?days=14");
+  assert.equal(flakesPath("acme", "app", "30"), "/api/v1/tenants/acme/repos/app/flakes?days=30");
+  assert.equal(fmtRate(10_000), "100.00%");
+  assert.equal(fmtRate(3_333), "33.33%");
+  assert.equal(fmtRate(5), "0.05%");
+  assert.equal(fmtRate(0), "0.00%");
+});

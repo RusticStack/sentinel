@@ -10,7 +10,7 @@ use sentinel_protocol::{error::ErrorCode, limits::page_size};
 use sentinel_store::{
     Error as StoreError, auth as authz,
     history::{self, Phases},
-    logs, lookup,
+    logs, lookup, outcomes,
 };
 use serde_json::{Map, Value, json};
 
@@ -184,6 +184,72 @@ pub(super) fn compare(
 /// Attempts one search request looks at, however small their logs: a missing or expired log still costs a lookup.
 const MAX_SEARCH_ATTEMPTS: usize = 256;
 
+/// The longest window a flaky list may ask for, whatever the deployment's log retention is: a repository's
+/// outcomes never outlive its logs, so a longer window states the same rows.
+const MAX_FLAKE_DAYS: u32 = 366;
+const DAY_MS: i64 = 24 * 3_600_000;
+
+/// The flaky tests of one repository over a window: deterministic counts, never an inference. The window
+/// defaults to the deployment's log retention, because a test's outcomes are kept exactly as long as the log
+/// its report was read beside.
+pub(super) fn flakes(
+    state: &State,
+    request: &crate::http::Request,
+    slug: &str,
+    name: &str,
+    query: &str,
+) -> Route {
+    let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::RUNS_READ)?;
+    let retention_days = u32::try_from(state.objects.deployment().log_retention_ms / DAY_MS)
+        .unwrap_or(MAX_FLAKE_DAYS)
+        .clamp(1, MAX_FLAKE_DAYS);
+    let days = number::<u32>(query, "days")?
+        .filter(|days| (1..=MAX_FLAKE_DAYS).contains(days))
+        .unwrap_or(retention_days);
+    let limit = number::<usize>(query, "limit")?
+        .filter(|limit| (1..=outcomes::MAX_TESTS).contains(limit))
+        .unwrap_or(outcomes::DEFAULT_TESTS);
+    let since_ms = sentinel_core::UnixMillis::now()
+        .0
+        .saturating_sub(i64::from(days) * DAY_MS);
+    let (slug, name) = (slug.to_owned(), name.to_owned());
+    let (repository, found) = state
+        .store
+        .read(|c| {
+            let tenant = lookup::tenant_by_slug(c, &slug)?;
+            let repo = lookup::repo_by_name(c, tenant, &name)?;
+            authz::require_repo(c, who.principal, repo, Permissions::READ)?;
+            let found = outcomes::flakes(c, tenant, repo, since_ms, limit)?;
+            Ok((name, found))
+        })
+        .map_err(store_error)?;
+    ok(json!({
+        "repository": repository,
+        "window": {
+            "days": days,
+            "since_ms": since_ms,
+            "rows": found.rows,
+            "oldest_ms": found.oldest_ms,
+            "newest_ms": found.newest_ms,
+        },
+        "tests": found.tests.iter().map(|test| json!({
+            "identity": test.identity,
+            "suite": test.suite,
+            "name": test.name,
+            "attempts": test.attempts,
+            "failed": test.failed,
+            "passed": test.passed,
+            "skipped": test.skipped,
+            "commits": test.commits,
+            "flakes": test.flakes,
+            "rate_bps": test.rate_bps(),
+            "last_failed_ms": test.last_failed_ms,
+        })).collect::<Vec<_>>(),
+        "broken": found.broken,
+        "truncated": found.truncated,
+    }))
+}
 pub(super) fn log_search(
     state: &State,
     request: &crate::http::Request,

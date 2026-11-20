@@ -638,15 +638,7 @@ fn file_reports(
 }
 
 fn unreadable(format: ReportFormat) -> ParseResult {
-    ParseResult {
-        format,
-        diagnostics: Vec::new(),
-        complete: false,
-        malformed_records: 1,
-        omitted_diagnostics: 0,
-        bytes_scanned: 0,
-        tests: None,
-    }
+    ParseResult::unreadable(format)
 }
 
 fn fit_diagnostic_text(diagnostic: &mut Diagnostic, remaining: &mut usize) -> bool {

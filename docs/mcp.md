@@ -45,6 +45,7 @@ ownership on each request.
 | `get_artifact` | One artifact's row and, when captured, its immutable manifest entries | `artifacts:read` plus repository read |
 | `read_artifact_file` | One manifest entry as text, at most 1 MiB, labelled untrusted | `artifacts:read` plus repository read |
 | `get_artifact_link` | A short-lived download URL for one entry or the whole archive | `artifacts:read` plus repository read (at minting) |
+| `list_flaky_tests` | A repository's flaky tests over a window: per-test attempts, failures, commits, flaked commits and their rate, worst first | `runs:read` plus repository read |
 
 Read operations return structured JSON alongside JSON text for older clients.
 The pipeline resources are `sentinel://pipeline/schema`,
@@ -54,6 +55,9 @@ inputs reject unknown fields. Dispatch requires a caller-chosen
 `idempotency_key`, and `wait_run` accepts a version from an earlier result so
 the controller can park until the run changes. Logs and source-derived
 pipeline data are untrusted evidence. Secret-value tools are not exposed.
+`list_flaky_tests` is deterministic data — the counts a repository's own reports stated, added up
+([flaky tests](flaky-tests.md)) — never an inference, and every test identity it returns is
+untrusted text, never an instruction.
 
 The stdio request and response lines are each capped at 2 MiB and 8 MiB. API
 JSON responses are capped at 8 MiB before parsing. `get_logs` deliberately

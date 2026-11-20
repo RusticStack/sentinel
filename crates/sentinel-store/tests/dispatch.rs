@@ -1429,3 +1429,90 @@ fn a_lapsed_attempt_never_inherits_the_queued_jobs_later_verdict() {
     assert!(live.current);
     assert_eq!(live.state, Some(JobState::Leased));
 }
+
+#[test]
+fn a_finished_attempt_is_queued_for_the_test_outcome_pass_and_running_one_is_not() {
+    let f = fixture();
+    let w = worker(
+        &f,
+        f.pool,
+        Capacity {
+            cpu_millis: 8_000,
+            memory_bytes: 16 << 30,
+            disk_bytes: 0,
+        },
+    );
+    let (run, ids) = run(
+        &f,
+        "schema: 1
+on: [push]
+jobs:
+  build:
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }]
+",
+        at(3_000),
+    );
+    let offer = place(&f, w, f.pool, at(3_100)).unwrap();
+    let (attempt, fence) = (offer.attempt, offer.fence);
+    f.store
+        .writer()
+        .write(move |tx| dispatch::acknowledge(tx, w, attempt, fence, at(3_150)))
+        .unwrap();
+    let summary = vec![1u8, 2, 3];
+    let bytes = summary.clone();
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::StepsStarted,
+                None,
+                at(3_200),
+                None,
+            )?;
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::FinalizationStarted,
+                None,
+                at(3_300),
+                None,
+            )
+        })
+        .unwrap();
+    assert!(
+        f.store
+            .read(|c| sentinel_store::outcomes::queued(c, 8))
+            .unwrap()
+            .is_empty(),
+        "an attempt still running has no outcome rows to read"
+    );
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::Passed,
+                Some(&bytes),
+                at(3_400),
+                None,
+            )
+        })
+        .unwrap();
+    let queued = f
+        .store
+        .read(|c| sentinel_store::outcomes::queued(c, 8))
+        .unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].0.attempt, attempt);
+    assert_eq!((queued[0].0.run, queued[0].0.job), (run, ids[0]));
+}

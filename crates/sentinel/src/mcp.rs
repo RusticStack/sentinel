@@ -557,7 +557,7 @@ mod tests {
             &client,
         )
         .unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 18);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 19);
     }
 
     #[test]
@@ -673,7 +673,7 @@ mod tests {
         let tools: Value = serde_json::from_slice(lines[1]).unwrap();
         let resources: Value = serde_json::from_slice(lines[2]).unwrap();
         assert_eq!(initialize["result"]["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 18);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 19);
         assert_eq!(
             resources["result"]["resources"].as_array().unwrap().len(),
             3

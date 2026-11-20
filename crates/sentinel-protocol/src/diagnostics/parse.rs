@@ -2,8 +2,9 @@
 
 use super::{
     Diagnostic, EvidenceReference, FailureClass, MAX_DIAGNOSTIC_LABEL_BYTES,
-    MAX_DIAGNOSTIC_MESSAGE_BYTES, MAX_REPORT_DIAGNOSTICS, ReportFormat, ReportInput, Severity,
-    SourceReference, StepReference, TestCounts, TestReference,
+    MAX_DIAGNOSTIC_MESSAGE_BYTES, MAX_PARSER_TEST_OUTCOMES, MAX_REPORT_DIAGNOSTICS, ReportFormat,
+    ReportInput, Severity, SourceReference, StepReference, TestCounts, TestOutcome, TestReference,
+    TestStatus, go_test_name, normalise_test_name, test_identity,
 };
 use quick_xml::{
     XmlVersion,
@@ -39,6 +40,13 @@ pub struct ParseResult {
     /// that carries no test results at all (a compiler's output), never zero tests: a report that ran
     /// none says `Some(TestCounts::default())`.
     pub tests: Option<TestCounts>,
+    /// One entry per named test identity, at most [`MAX_PARSER_TEST_OUTCOMES`]: what flaky tracking
+    /// persists. A report of totals alone leaves this empty.
+    pub outcomes: Vec<TestOutcome>,
+    /// Test records past [`MAX_PARSER_TEST_OUTCOMES`], which are counted and not listed.
+    pub omitted_tests: u64,
+    /// Positions in `outcomes`, so a repeated identity is merged instead of listed twice.
+    identities: HashMap<String, usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,7 +72,18 @@ impl ParseResult {
             omitted_diagnostics: 0,
             bytes_scanned: 0,
             tests: None,
+            outcomes: Vec::new(),
+            omitted_tests: 0,
+            identities: HashMap::new(),
         }
+    }
+
+    /// A report nothing could read: one malformed record, no diagnostics, no outcomes.
+    pub fn unreadable(format: ReportFormat) -> Self {
+        let mut result = Self::new(format, 0);
+        result.complete = false;
+        result.malformed_records = 1;
+        result
     }
 
     fn push(&mut self, diagnostic: Diagnostic, range: Range<u64>) {
@@ -93,6 +112,42 @@ impl ParseResult {
         } else if skipped {
             counts.skipped = counts.skipped.saturating_add(1);
         }
+    }
+
+    /// One named outcome. A report may state the same identity more than once (a Go parent test and its
+    /// subtests, or a suite repeated across files), and the merged entry is decided by severity alone:
+    /// failed over passed over skipped, never by the order the records arrived in.
+    fn record_test(&mut self, suite: Option<&str>, name: &str, status: TestStatus) {
+        let identity = test_identity(suite, name);
+        if let Some(&at) = self.identities.get(&identity) {
+            let kept = &mut self.outcomes[at].status;
+            if severity(status) > severity(*kept) {
+                *kept = status;
+            }
+            return;
+        }
+        if self.outcomes.len() == MAX_PARSER_TEST_OUTCOMES {
+            self.omitted_tests = self.omitted_tests.saturating_add(1);
+            return;
+        }
+        let name = normalise_test_name(name);
+        let suite = suite.filter(|suite| !suite.is_empty());
+        self.identities
+            .insert(identity.clone(), self.outcomes.len());
+        self.outcomes.push(TestOutcome {
+            identity,
+            name: name.to_owned(),
+            suite: suite.map(str::to_owned),
+            status,
+        });
+    }
+}
+
+const fn severity(status: TestStatus) -> u8 {
+    match status {
+        TestStatus::Failed => 2,
+        TestStatus::Passed => 1,
+        TestStatus::Skipped => 0,
     }
 }
 
@@ -153,6 +208,11 @@ pub fn parse_go_test_json(input: &[u8], step: StepReference) -> ParseResult {
             "fail" => {
                 if !test.is_empty() {
                     result.count_test(true, false);
+                    result.record_test(
+                        (!package.is_empty()).then_some(package),
+                        go_test_name(test),
+                        TestStatus::Failed,
+                    );
                 }
                 if test.is_empty()
                     && let Some(failed_package) = failed_packages.get(&test_key(package, ""))
@@ -226,6 +286,15 @@ pub fn parse_go_test_json(input: &[u8], step: StepReference) -> ParseResult {
             "pass" | "skip" => {
                 if !test.is_empty() {
                     result.count_test(false, action == "skip");
+                    result.record_test(
+                        (!package.is_empty()).then_some(package),
+                        go_test_name(test),
+                        if action == "skip" {
+                            TestStatus::Skipped
+                        } else {
+                            TestStatus::Passed
+                        },
+                    );
                 }
                 output_by_test.remove(&key);
             }
@@ -952,6 +1021,15 @@ fn push_junit_case(
     step: Option<&StepReference>,
 ) {
     result.count_test(case.failure.is_some(), case.skipped);
+    result.record_test(
+        case.class_name.as_deref(),
+        &case.name,
+        match (case.failure.is_some(), case.skipped) {
+            (true, _) => TestStatus::Failed,
+            (false, true) => TestStatus::Skipped,
+            (false, false) => TestStatus::Passed,
+        },
+    );
     if let Some(failure) = case.failure {
         let message = if failure.message.is_empty() {
             format!("test failed: {}", case.name)
@@ -1167,6 +1245,94 @@ mod tests {
                 failed: 1,
                 skipped: 1
             })
+        );
+    }
+
+    #[test]
+    fn one_test_is_one_identity_however_its_report_spells_it() {
+        // The same test, run twice: once passing, once failing. Nothing about the run changes its identity.
+        let passing = parse_go_test_json(
+            b"{\"Action\":\"pass\",\"Package\":\"example/users\",\"Test\":\"TestCreate\"}\n",
+            step(),
+        );
+        let failing = parse_go_test_json(
+            b"{\"Action\":\"fail\",\"Package\":\"example/users\",\"Test\":\"TestCreate\"}\n",
+            step(),
+        );
+        assert_eq!(passing.outcomes.len(), 1);
+        assert_eq!(passing.outcomes[0].identity, failing.outcomes[0].identity);
+        assert_eq!(passing.outcomes[0].identity, "example/users::TestCreate");
+        assert_eq!(passing.outcomes[0].status, TestStatus::Passed);
+        assert_eq!(failing.outcomes[0].status, TestStatus::Failed);
+
+        // A subtest is its top-level function, and a parent and its subtests are one entry, never two.
+        let subtests = concat!(
+            "{\"Action\":\"fail\",\"Package\":\"p\",\"Test\":\"TestParse/case_one\"}\n",
+            "{\"Action\":\"pass\",\"Package\":\"p\",\"Test\":\"TestParse/case_two\"}\n",
+            "{\"Action\":\"fail\",\"Package\":\"p\",\"Test\":\"TestParse\"}\n"
+        );
+        let parsed = parse_go_test_json(subtests.as_bytes(), step());
+        assert_eq!(parsed.outcomes.len(), 1, "{:?}", parsed.outcomes);
+        assert_eq!(parsed.outcomes[0].identity, "p::TestParse");
+        assert_eq!(parsed.outcomes[0].name, "TestParse");
+        assert_eq!(parsed.outcomes[0].status, TestStatus::Failed);
+
+        // JUnit's parametrised names collapse to the test, with the class as the suite.
+        let xml = br#"<testsuite>
+            <testcase name="adds[case-1]" classname="com.acme.Calc"><failure message="no"/></testcase>
+            <testcase name="adds[case-2]" classname="com.acme.Calc"/>
+            <testcase name="subtracts(1, 2)" classname="com.acme.Calc"/>
+            <testcase name="plain" classname="com.acme.Other"/>
+            <testcase name="plain"/>
+        </testsuite>"#;
+        let parsed = parse_junit_xml(xml, None);
+        let identities: Vec<&str> = parsed
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.identity.as_str())
+            .collect();
+        assert_eq!(
+            identities,
+            [
+                "com.acme.Calc::adds",
+                "com.acme.Calc::subtracts",
+                "com.acme.Other::plain",
+                "plain"
+            ]
+        );
+        assert_eq!(parsed.outcomes[0].status, TestStatus::Failed);
+        assert_eq!(parsed.outcomes[1].status, TestStatus::Passed);
+    }
+
+    #[test]
+    fn an_identity_keeps_a_name_that_is_only_a_parameter() {
+        assert_eq!(normalise_test_name("adds[case-1]"), "adds");
+        assert_eq!(normalise_test_name("adds [case-1]  "), "adds");
+        assert_eq!(normalise_test_name("adds(int, int)"), "adds");
+        assert_eq!(normalise_test_name("adds[0][1]"), "adds");
+        assert_eq!(normalise_test_name("[a]"), "[a]");
+        assert_eq!(normalise_test_name("adds(f(x))"), "adds(f(x))");
+        assert_eq!(normalise_test_name("adds]"), "adds]");
+        assert_eq!(normalise_test_name("plain"), "plain");
+        assert_eq!(go_test_name("TestA/sub/1"), "TestA");
+        assert_eq!(go_test_name("TestA"), "TestA");
+    }
+
+    #[test]
+    fn named_outcomes_are_bounded_and_counted_past_the_bound() {
+        let mut go = String::new();
+        for i in 0..(MAX_PARSER_TEST_OUTCOMES + 3) {
+            go.push_str(&format!(
+                "{{\"Action\":\"pass\",\"Package\":\"p\",\"Test\":\"Test{i}\"}}\n"
+            ));
+        }
+        let parsed = parse_go_test_json(go.as_bytes(), step());
+        assert_eq!(parsed.outcomes.len(), MAX_PARSER_TEST_OUTCOMES);
+        assert_eq!(parsed.omitted_tests, 3);
+        assert_eq!(
+            parsed.tests.map(|counts| counts.total),
+            Some(MAX_PARSER_TEST_OUTCOMES as u32 + 3),
+            "the counts still state what the report ran"
         );
     }
 

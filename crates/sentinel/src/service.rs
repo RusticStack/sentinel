@@ -2576,6 +2576,7 @@ fn start_server(
         github_app: github_app_setup(github.current.clone(), github.source, on_activate),
         runner_classes,
         notices_every: None,
+        outcomes_every: None,
     };
     let api = sentinel_api::Server::start_with(
         sentinel_api::Config {

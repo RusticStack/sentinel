@@ -205,6 +205,7 @@ fn seed_history(f: &Fixture) -> serde_json::Value {
     ];
     let mut runs = Vec::new();
     let mut attempts = Vec::new();
+    let mut flaky: Vec<AttemptId> = Vec::new();
     for (age, tries, expired) in plan {
         let (run, job) = (RunId::new(), JobId::new());
         f.store
@@ -263,6 +264,7 @@ fn seed_history(f: &Fixture) -> serde_json::Value {
                 .unwrap();
             f.logs.finish(run, job, attempt, 1, &[]).unwrap();
             attempts.push(attempt.to_string());
+            flaky.push(attempt);
             if expired && fence == 1 {
                 f.store
                     .writer()
@@ -278,6 +280,64 @@ fn seed_history(f: &Fixture) -> serde_json::Value {
         }
         runs.push(run.to_string());
     }
+    // The middle run's two attempts of the one commit (the history runs share `abc1234`): the test failed on
+    // the first and passed on the rerun, which is what the flaky page lists. Written here rather than through
+    // the controller's pass, so the page's figures are exact and the page needs no waiting.
+    let (first, rerun) = (flaky[1], flaky[3]);
+    let status = sentinel_store::outcomes::Status::Failed;
+    f.store
+        .writer()
+        .write(move |tx| {
+            sentinel_store::outcomes::ingest(
+                tx,
+                &sentinel_store::outcomes::Attempt {
+                    tenant,
+                    repo,
+                    attempt: first,
+                    sha: "abc1234",
+                },
+                now.0 - 7_200_000,
+                &[
+                    sentinel_store::outcomes::Outcome {
+                        identity: "pkg::TestCheckout",
+                        suite: Some("pkg"),
+                        name: "TestCheckout",
+                        status,
+                    },
+                    sentinel_store::outcomes::Outcome {
+                        identity: "pkg::TestLogin",
+                        suite: Some("pkg"),
+                        name: "TestLogin",
+                        status: sentinel_store::outcomes::Status::Passed,
+                    },
+                ],
+            )?;
+            sentinel_store::outcomes::ingest(
+                tx,
+                &sentinel_store::outcomes::Attempt {
+                    tenant,
+                    repo,
+                    attempt: rerun,
+                    sha: "abc1234",
+                },
+                now.0 - 3_600_000,
+                &[
+                    sentinel_store::outcomes::Outcome {
+                        identity: "pkg::TestCheckout",
+                        suite: Some("pkg"),
+                        name: "TestCheckout",
+                        status: sentinel_store::outcomes::Status::Passed,
+                    },
+                    sentinel_store::outcomes::Outcome {
+                        identity: "pkg::TestLogin",
+                        suite: Some("pkg"),
+                        name: "TestLogin",
+                        status: sentinel_store::outcomes::Status::Failed,
+                    },
+                ],
+            )
+        })
+        .unwrap();
     json!({ "runs": runs, "attempts": attempts, "needle": HISTORY_NEEDLE })
 }
 

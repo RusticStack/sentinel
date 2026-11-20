@@ -176,6 +176,7 @@ const PAGES = {
   workers: ["/platform/workers", "!!document.querySelector('#w-add-h') && !!document.querySelector('#w-pool')"],
   history: ["/t/acme/history?repo=web&job=build", "document.querySelectorAll('main table tbody tr').length >= 4"],
   compare: [`/t/acme/history/compare?repo=web&base=${cfg.history.attempts[0]}&head=${cfg.history.attempts[2]}`, "document.querySelectorAll('main table tbody tr').length >= 8"],
+  flakes: ["/t/acme/history/flakes?repo=web&days=14", "document.querySelectorAll('main table tbody tr').length >= 1"],
   historySearch: [`/t/acme/history/search?repo=web&q=${cfg.history.needle}`, "document.querySelectorAll('main table tbody tr').length >= 2 && document.body.textContent.includes('lines found')"],
   github: ["/setup/github", "document.querySelector('h1') && document.querySelector('h1').textContent === 'GitHub App' && document.querySelectorAll('main [role=status], main section').length >= 1"],
 };
@@ -512,6 +513,18 @@ await scenario("log search, gaps and deep links", async () => {
   const link = await page.eval("location.pathname + location.search");
   await go(page, link, "!!document.querySelector('.log-row.hl')");
   check("log: the deep link reopens at the same line", (await page.eval("document.querySelector('.log-row.hl').textContent")).includes("TestCheckout"), link);
+});
+
+await scenario("flaky tests: the list, its rate and the commit it flaked on", async () => {
+  await go(page, ...PAGES.flakes);
+  const table = await page.eval(`[...document.querySelectorAll('main table tbody tr')].map((r) => [...r.children].map((c) => c.textContent.replace(/\s+/g, ' ').trim()))`);
+  check("flaky: the list names each flaked test with its suite", table.length === 1 && table[0][0].includes("TestCheckout") && table[0][0].includes("pkg"), table);
+  check("flaky: a fail-then-pass on a rerun of the same commit is a rate of one commit in one", table[0][1] === "100.00%" && table[0][2] === "1 of 1", table[0]);
+  check("flaky: a failure after the pass on the same commit is not listed", !table.some((r) => r[0].startsWith("TestLogin")), table);
+  check("flaky: the window states what makes a flake", (await page.eval("document.querySelector('#flaky-note').textContent")).includes("same commit"));
+  const active = await page.eval("document.querySelector('nav[aria-label=\'History views\'] a[aria-current=page]').textContent.trim()");
+  check("flaky: the history nav marks the flaky page", active === "Flaky tests", active);
+  await page.screenshot(join(cfg.out, "history-flaky.png"));
 });
 
 await scenario("history: durations, comparison and log search", async () => {

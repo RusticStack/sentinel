@@ -1,5 +1,6 @@
-// History views: the answers of the repository history routes (durations, compare, cross-run log search) and the
-// small pure helpers the views share. Unmeasured values are absent, never zero, and the views show them as an em dash.
+// History views: the answers of the repository history routes (durations, compare, cross-run log search, flaky tests)
+// and the small pure helpers the views share. Unmeasured values are absent, never zero, and the views show them as an
+// em dash.
 import { fmtNs } from "./format.ts";
 
 export interface Percentiles { count: number; p50_ns: number; p95_ns: number }
@@ -59,6 +60,33 @@ export interface Comparison {
   delta_ns: Partial<Record<PhaseKey | "total", number>>;
 }
 
+/** One test the flaky report lists: deterministic counts the controller read from stored report results. */
+export interface FlakyTest {
+  identity: string;
+  suite: string | null;
+  name: string;
+  attempts: number;
+  failed: number;
+  passed: number;
+  skipped: number;
+  /** Commits the test ran in: what its rate is a share of. */
+  commits: number;
+  /** Commits where it failed and then passed on a rerun of that same commit. */
+  flakes: number;
+  /** Flakes per 10,000 commits. */
+  rate_bps: number;
+  last_failed_ms: number | null;
+}
+
+export interface Flakes {
+  repository: string;
+  window: { days: number; since_ms: number; rows: number; oldest_ms: number | null; newest_ms: number | null };
+  tests: FlakyTest[];
+  /** Tests that failed on every attempt of the window: broken, never listed. */
+  broken: number;
+  truncated: boolean;
+}
+
 export interface Resume { run: string; attempt: string; after: number; carry: string | null; runs: number }
 
 export interface LogHit { run: string; job: string; attempt: string; seq: number; step: number; stream: "stdout" | "stderr"; text: string }
@@ -74,9 +102,17 @@ export interface LogSearch {
   complete: boolean;
 }
 
+export const flakesPath = (slug: string, repo: string, days: string | undefined) =>
+  `${repoPath(slug, repo)}/flakes?${new URLSearchParams({ days: days || "14" })}`;
+
+/** A flake rate as the share of commits it is: flakes per 10,000 commits, shown to a hundredth of a percent. */
+export const fmtRate = (bps: number) => `${(bps / 100).toFixed(2)}%`;
+
 /** The window sizes the views offer; the controller's ceilings are 500 runs for durations and 100 for log search. */
 export const DURATION_WINDOWS = ["25", "50", "100", "250", "500"];
 export const SEARCH_WINDOWS = ["5", "10", "20", "50", "100"];
+/** Days the flaky view offers; the controller serves at most the deployment's log retention, 366 at the ceiling. */
+export const FLAKE_WINDOWS = ["1", "7", "14", "30", "90"];
 
 const repoPath = (slug: string, repo: string) => `/api/v1/tenants/${encodeURIComponent(slug)}/repos/${encodeURIComponent(repo)}`;
 

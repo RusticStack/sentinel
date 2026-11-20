@@ -13,6 +13,7 @@ mod metrics;
 mod migration;
 mod notices;
 mod oauth;
+mod outcomes;
 mod preview;
 mod refresh;
 mod rollback;
@@ -145,6 +146,8 @@ pub struct Options {
     pub runner_classes: Arc<[RunnerClass]>,
     /// How often the storage-notice pass looks for a threshold crossing (default 60 s); a test shortens it.
     pub notices_every: Option<std::time::Duration>,
+    /// How often the test-outcome pass reads finished attempts' reports (default 60 s); a test shortens it.
+    pub outcomes_every: Option<std::time::Duration>,
 }
 
 /// A callback the embedding controller hands the API.
@@ -304,6 +307,12 @@ impl Server {
             Arc::clone(&config.objects),
             config.secret_key.clone(),
             options.notices_every.unwrap_or(notices::EVERY),
+        )?;
+        outcomes::start(
+            Arc::downgrade(&config.store),
+            Arc::clone(&config.logs),
+            Arc::clone(&config.objects),
+            options.outcomes_every.unwrap_or(outcomes::EVERY),
         )?;
         let state = Arc::new(State {
             auto_join: options.auto_join,

@@ -2178,6 +2178,9 @@ pub fn report(
     {
         tx.prepare_cached("UPDATE attempts SET summary = ?2 WHERE id = ?1 AND summary IS NULL")?
             .execute(params![attempt.as_bytes(), summary])?;
+        // The attempt is over and its reports are what the flaky list is built from: queue it for the pass
+        // that reads them, in this same transaction, so a restart between the report and the pass loses nothing.
+        crate::outcomes::enqueue(tx, attempt)?;
     }
     Ok(next)
 }
