@@ -153,6 +153,7 @@ fn describe(scope: &str) -> &'static str {
         "logs:read" => "read job logs",
         "artifacts:read" => "download artifacts",
         "artifacts:write" => "attach files to runs",
+        "ai:context" => "read redacted evidence bundles for an AI service",
         "cache:read" => "read cache records",
         "cache:write" => "write to caches",
         "secrets:metadata" => "list secret names (never values)",

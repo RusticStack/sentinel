@@ -20,7 +20,7 @@ export interface ServiceAccountsLoad { accounts: Load<Accounts>; repos: Load<Rep
 
 const ROLES = [{ label: "Operator (runs)", value: "operator" }, { label: "Reader", value: "reader" }];
 const ACCESS = [{ label: "Read", value: "read" }, { label: "Run", value: "run" }];
-const SCOPES = ["runs:read", "runs:write", "logs:read", "artifacts:read", "cache:read", "cache:write", "secrets:metadata", "secrets:write"]
+const SCOPES = ["runs:read", "runs:write", "logs:read", "artifacts:read", "cache:read", "cache:write", "secrets:metadata", "secrets:write", "ai:context"]
   .map((s) => ({ label: s, value: s }));
 const HOUR = 3600e3;
 const LIFETIMES = [

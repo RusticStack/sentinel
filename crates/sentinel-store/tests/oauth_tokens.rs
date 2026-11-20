@@ -239,7 +239,10 @@ fn expiry_revocation_and_audience_are_predicates_of_validation() {
 #[test]
 fn platform_scope_is_dropped_once_the_account_is_demoted() {
     let (_dir, store, i) = fixture();
-    let minted = issue(&store, login_grant(i.root, Scopes::ALL));
+    let minted = issue(
+        &store,
+        login_grant(i.root, Scopes::ALL.difference(Scopes::AI_CONTEXT)),
+    );
     let who = authenticate(&store, &minted.access, at(1)).unwrap();
     assert!(who.scopes.contains(Scopes::PLATFORM_ADMIN));
     assert!(who.principal.permissions.contains(P::PLATFORM_ADMIN));
@@ -375,8 +378,9 @@ fn the_database_refuses_ineligible_grants() {
     assert!(cli.first_party && cli.loopback && cli.device);
     assert_eq!(
         cli.max_scopes,
-        Scopes::ALL,
-        "the CLI client is capped at every scope the code defines"
+        Scopes::ALL.difference(Scopes::AI_CONTEXT),
+        "the CLI client is capped at every scope that existed when it was seeded; ai:context \
+         belongs to the AI service's own client, so the shipped CLI never carries it"
     );
     let reader = store.read(|c| oauth::client(c, "reader-app")).unwrap();
     for (client, uri, allowed) in [

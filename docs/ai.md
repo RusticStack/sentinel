@@ -4,9 +4,10 @@ Sentinel's deterministic diagnostics are the authority on why something failed. 
 is optional advisory text on top of them: a model reads a bounded, redacted evidence bundle
 built from logs and diagnostics the controller already stored, and writes a summary that cites
 the lines it used. This page states the guarantees that hold whether AI is on or off, the
-deployment and tenant policy that decides whether it may run at all, and what each data policy
-commits to. What is built today is the policy, its routes and its gate; the process that talks
-to a provider is [plan 16.6](../plan.md#166-ai-assistance) and the backlog items after Y01.
+deployment and tenant policy that decides whether it may run at all, what the bundle holds, and
+what each data policy commits to. What is built today is the policy, its routes, its gate and the
+evidence bundle the controller serves; the process that talks to a provider is
+[plan 16.6](../plan.md#166-ai-assistance) and the backlog items after Y02.
 
 ## The guarantees
 
@@ -29,7 +30,8 @@ to a provider is [plan 16.6](../plan.md#166-ai-assistance) and the backlog items
   grant, an installation credential or a job secret to a model provider. The evidence bundle is
   built by the controller from already-redacted logs and diagnostics, re-applying the attempt's
   registered secret values and the token, PEM, cloud-key and JWT scanners before anything is
-  served (Y02); `sentinel-ai` holds no secret value, no source credential and no whole log.
+  served ([below](#the-evidence-bundle)); `sentinel-ai` holds no secret value, no source
+  credential and no whole log.
 
 ## Deployment policy
 
@@ -98,19 +100,78 @@ costs one statement joining the deployment's row to the tenant's, and it allocat
 request path that does not call it is a bug: with no opt-in there is no bundle, no prompt and no
 provider call.
 
-## What data it would read
+`sentinel_store::ai::permits(conn, tenant)` is the same reading without a provider named, for the
+bundle: it is `admit` for whichever provider the tenant may use, so a tenant that could send
+nothing gets no bundle either. It is one statement and no cache, so a disable refuses the next
+bundle.
+
+## The evidence bundle
+
+`GET /api/v1/attempts/{id}/ai-context` is what an AI process reads instead of a log
+([API](api.md#routes)). It is one JSON document, `sentinel.ai-context/1`, built on request from
+what the controller already stored:
+
+- **The deterministic record**: the attempt's terminal summary — the failed step and its exit
+  code or signal, every step's outcome and duration, and the job's state and failure class while
+  this attempt still owns the job.
+- **Diagnostics**: what the attempt's stored log frames parse into as Go test or rustc JSON, with
+  the same parsers and the same evidence references the failure context uses
+  ([diagnostics](diagnostics.md)). Nothing is opened that a person could not read: no artifact,
+  no cache, no secret.
+- **The log**: the newest frames of the failed step, in order, each with its sequence so an
+  analysis can cite it.
+
+Each part is capped before the bound applies: at most 20 diagnostics, 8 steps (the failed one
+first) and 1,024 bytes of a diagnostic's message, the rest counted in `omitted_diagnostics` and
+`omitted_steps`. The bound is 32 KiB by default and 1,024–65,536 bytes by `budget`. A bundle that would exceed it
+is **truncated, never oversized**, and the truncation is visible in the document: `bounds.bytes`
+is the served body's exact length, `bounds.truncated` is set, frames and diagnostics dropped whole
+are counted, and a frame that lost bytes carries `cut` with the newest of its text — a failure is
+usually explained by what came last, so the oldest bytes go first.
+
+Two redaction passes run over every text field before anything is served:
+
+1. **The attempt's registered values.** The versions its secret delivery recorded using
+   (`secret_audit`), unsealed again for this one read, registered in the same
+   `sentinel_protocol::redact::Redactor` the worker runs before a byte reaches its spool — one
+   implementation, so the bundle redacts the way the log was redacted. Values are matched raw,
+   base64-encoded, percent-encoded and JSON-escaped, as at write time.
+2. **The credential-shaped scanners** (`sentinel_protocol::patterns`), because a token can reach a
+   log through a path no registered value covers: Sentinel `sntl_` credentials and access, refresh,
+   code and device tokens; GitHub `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` and `github_pat_`
+   credentials; PEM private-key blocks, including one cut before its end marker; AWS access key
+   IDs, Google API keys and Azure `AccountKey` values; and JWTs.
+
+`redaction` in the document states how many values were registered, how many text fields the
+values rewrote, and which patterns fired. A clean bundle reports `pattern_replacements: 0` and no
+patterns, and `crates/sentinel-api/tests/ai_context.rs` proves the other case end to end: a
+registered canary value, a GitHub token, a PEM block, an AWS key and a JWT in the stored log, and
+none of them in the bundle the route serves.
+
+## Who may read a bundle
+
+Only a credential whose scopes list `ai:context`. No permission set implies it
+([OAuth](oauth.md#tokens-scopes-and-lifetimes)), so a browser session, an `sntl_` API credential and
+the shipped CLI's token can never read a bundle even though they read the log and the failure
+context; the grant is issued to the AI service's own account, and from Y03 a request's delegated
+token carries the requester's read-only scopes for exactly the life of that request.
+
+Until Y03 registers the AI service, no shipped client is capped at `ai:context`: the deployment
+registers the client the grant is issued through. That is a gate with no caller yet, and it is
+deliberate — the process that would read a bundle does not exist.
+
+## What data it reads
 
 The evidence a request is built from is what Sentinel already stores under
 [retention](retention.md): a failed attempt's redacted log segments, its deterministic failure
 summary and diagnostics, and the step and test identities the pipeline and reports name. The
-bundle is bounded (32 KiB by default, Y02), never the whole log; artifacts, caches, secrets and
-source credentials are not part of it. An analysis expires with the attempt's logs, because the
-evidence it cites does.
+bundle is bounded and never the whole log; artifacts, caches, secrets and source credentials are
+not part of it ([above](#the-evidence-bundle)). An analysis expires with the attempt's logs,
+because the evidence it cites does.
 
 ## What is not built yet
 
-Y01 is policy only: no provider client, no evidence bundle, no budget ledger and no analysis
-exists in the workspace, and no process contacts a provider. [Backlog Part 22](backlog.md)
-carries the rest: Y02 the evidence bundle, Y03 the `sentinel-ai` process and its providers, Y04
-budgets and caching, Y05 failure analyses, and later flaky tests, the log-search assistant and the
-MCP read-only tools that expose them.
+No provider client, budget ledger or analysis exists in the workspace, and no process contacts a
+provider: `sentinel-ai` is Y03, budgets and caching Y04, failure analyses Y05.
+[Backlog Part 22](backlog.md) carries the rest, including the later flaky tests, the log-search
+assistant and the MCP read-only tools that expose them.

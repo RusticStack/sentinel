@@ -443,7 +443,8 @@ fn approval_only_narrows_what_the_account_and_client_may_hold() {
         )
         .is_ok()
     );
-    let widest = Scopes::ALL;
+    // The widest the client allows: the CLI's cap, which is every scope but `ai:context`.
+    let widest = Scopes::ALL.difference(Scopes::AI_CONTEXT);
     assert!(code::approve(&store, &approval(i.root, widest, &challenge), NOW).is_ok());
 }
 

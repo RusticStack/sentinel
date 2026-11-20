@@ -420,7 +420,7 @@ pub(crate) fn route(
     if let Some(reply) = admin::route(state, request, method, &parts, query) {
         return reply;
     }
-    if let Some(reply) = ai::route(state, request, method, &parts) {
+    if let Some(reply) = ai::route(state, request, method, &parts, query) {
         return reply;
     }
     if let Some(reply) = worker_enrollment::route(state, request, method, &parts, query) {

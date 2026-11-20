@@ -10,6 +10,8 @@ pub mod logs;
 pub mod mcp;
 pub mod negotiate;
 pub mod oauth;
+pub mod patterns;
+pub mod redact;
 pub mod secrets;
 pub mod source;
 pub mod summary;

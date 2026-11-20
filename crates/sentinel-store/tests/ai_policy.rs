@@ -123,6 +123,11 @@ fn admit(f: &Fixture, provider: Provider) -> Option<DataPolicy> {
     f.store.read(|c| ai::admit(c, f.tenant, provider)).unwrap()
 }
 
+/// The bundle's gate: `admit` for whichever provider the tenant may use.
+fn permits(f: &Fixture) -> bool {
+    f.store.read(|c| ai::permits(c, f.tenant)).unwrap()
+}
+
 fn audit(f: &Fixture) -> Vec<Event> {
     f.store
         .read(|c| local_auth::audit_page(c, None, 100))
@@ -140,6 +145,9 @@ fn a_fresh_deployment_is_off_and_admits_no_provider() {
     for provider in Provider::ALL {
         assert_eq!(admit(&f, provider), None, "{}", provider.as_str());
     }
+    // The bundle gate is the same reading without a provider: a tenant that could send nothing
+    // has no evidence bundle either (Y02).
+    assert!(!permits(&f));
 }
 
 /// Y03 adds the durable request queue and the consumer that fills it. Until then nothing can
@@ -349,6 +357,7 @@ fn disabling_takes_effect_at_the_next_request_and_is_audited() {
     )
     .unwrap();
     assert_eq!(admit(&f, Provider::OpenAi), Some(DataPolicy::ZeroRetention));
+    assert!(permits(&f));
     let before = audit(&f).len();
     set_tenant(
         &f,
@@ -362,6 +371,7 @@ fn disabling_takes_effect_at_the_next_request_and_is_audited() {
         None,
         "the disable was not immediate"
     );
+    assert!(!permits(&f), "a disabled tenant kept its bundle gate open");
     assert_eq!(
         f.store.read(|c| ai::tenant(c, f.tenant)).unwrap(),
         Some(Tenant {

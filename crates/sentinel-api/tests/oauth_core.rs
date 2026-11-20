@@ -321,7 +321,12 @@ fn metadata_documents_name_this_deployment_exactly() {
         json!(["none"])
     );
     assert_eq!(meta.body["response_types_supported"], json!(["code"]));
-    assert_eq!(meta.body["scopes_supported"].as_array().unwrap().len(), 11);
+    let advertised = meta.body["scopes_supported"].as_array().unwrap();
+    assert_eq!(
+        advertised.len(),
+        sentinel_core::auth::Scopes::ALL.names().count()
+    );
+    assert!(advertised.iter().any(|scope| scope == "ai:context"));
     assert_eq!(
         meta.body["authorization_response_iss_parameter_supported"],
         true

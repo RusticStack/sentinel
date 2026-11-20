@@ -692,3 +692,71 @@ fn a_delivery_authentication_never_changes_after_it_is_recorded() {
         "an unknown authentication level was stored"
     );
 }
+
+/// The AI evidence bundle's second pass (Y02) reads what an attempt was delivered, never what is
+/// current: a rotation or a revocation since cannot change the values a stored log may still hold.
+#[test]
+fn an_attempt_keeps_the_values_it_was_delivered_across_a_rotation_and_a_revocation() {
+    let f = fixture();
+    let (_, job) = create_run(&f, UnixMillis(2_000));
+    let first = next_offer(&f, UnixMillis(2_100));
+    assert_eq!(first.job, job);
+    acknowledge(&f, &first, UnixMillis(2_120));
+    let (_, delivered) = delivery(&f, &first, UnixMillis(2_130));
+    finish(&f, &first);
+
+    let admin = Principal::new(f.root, Permissions::ALL, None, None);
+    let (tenant, repo) = (f.tenant, f.repo);
+    f.store
+        .writer()
+        .write({
+            let key = f.key.clone();
+            move |tx| {
+                secrets::put(
+                    tx,
+                    admin,
+                    secrets::Update {
+                        scope: Scope::Repo(repo),
+                        name: "TOKEN",
+                        expected: 1,
+                        value: b"token-v2",
+                    },
+                    &key,
+                    UnixMillis(2_600),
+                )?;
+                secrets::revoke_version(
+                    tx,
+                    admin,
+                    Scope::Repo(repo),
+                    "CERT",
+                    1,
+                    UnixMillis(2_610),
+                )?;
+                runs::rerun_job(tx, tenant, job, UnixMillis(2_700))?;
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    let values = f
+        .store
+        .read(|c| secrets::attempt_values(c, &f.key, first.attempt))
+        .unwrap();
+    assert_eq!(values.len(), delivered.values.len());
+    let mut found: Vec<Vec<u8>> = values.iter().map(<[u8]>::to_vec).collect();
+    found.sort_unstable();
+    let mut expected: Vec<Vec<u8>> = delivered
+        .values
+        .iter()
+        .map(|value| value.expose().to_vec())
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(found, expected);
+
+    // An attempt that was never delivered a secret has nothing to scan for.
+    let none = f
+        .store
+        .read(|c| secrets::attempt_values(c, &f.key, sentinel_core::AttemptId::new()))
+        .unwrap();
+    assert!(none.is_empty());
+}
