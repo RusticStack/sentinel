@@ -738,6 +738,18 @@ fn digest_of(
                 d.u64(c.history.depth().map_or(u64::MAX, u64::from));
             }
         }
+        // Only when stated, so the digest of a pipeline that never opted in stays exactly as it was.
+        if let Some(reuse) = &s.reuse {
+            d.str("reuse");
+            d.u64(reuse.inputs.len() as u64);
+            for pattern in &reuse.inputs {
+                d.str(pattern);
+            }
+            d.u64(reuse.paths.len() as u64);
+            for path in &reuse.paths {
+                d.str(path);
+            }
+        }
         if !s.outputs.is_empty() {
             d.str("job-outputs");
             d.u64(s.outputs.len() as u64);

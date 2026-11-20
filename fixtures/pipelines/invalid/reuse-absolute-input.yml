@@ -1,0 +1,10 @@
+# expect: jobs.build.reuse.inputs[0]: must be a relative hash_files pattern without `..`, an empty segment or a leading `/`
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: busybox
+    steps: [{id: s, run: echo hi}]
+    reuse:
+      inputs: [/etc/passwd]
+      paths: [out]

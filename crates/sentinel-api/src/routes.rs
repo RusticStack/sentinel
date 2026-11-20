@@ -1447,6 +1447,10 @@ struct DispatchBody {
     /// Typed values for the pipeline's declared inputs, checked against their bounds here.
     #[serde(default)]
     inputs: std::collections::BTreeMap<String, Value>,
+    /// Run every task this run carries instead of serving a sealed result for it. A forced run seals
+    /// nothing, so it behaves exactly as a pipeline that declares no `reuse:`.
+    #[serde(default)]
+    fresh: bool,
 }
 
 /// The pipeline a manual dispatch names, or the document's only pipeline.
@@ -1617,6 +1621,9 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
             }
             let run = RunId::new();
             let jobs = authz::create_run(tx, principal, repo, run, &spec, steady)?;
+            if dispatch.fresh {
+                runs::force_fresh(tx, tenant, run)?;
+            }
             for (job, (digest, platform)) in jobs.iter().zip(&images) {
                 runs::resolve_image(tx, tenant, *job, digest, platform)?;
             }

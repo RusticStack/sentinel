@@ -34,6 +34,7 @@ pub mod quota;
 pub use process::Sink as OutputSink;
 #[cfg(target_os = "linux")]
 pub mod recovery;
+pub mod reuse;
 /// The worker's own redactor is the protocol crate's: a stored log never holds a registered value.
 pub use sentinel_protocol::redact;
 pub mod runner;

@@ -11,8 +11,8 @@ use crate::{
     expr::{Expr, Template},
     policy::{RefFilter, Triggers},
     schema::{
-        Arch, Artifact, ArtifactWhen, Cache, Concurrency, History, Job, Resources, RunsOn, Shell,
-        Step,
+        Arch, Artifact, ArtifactWhen, Cache, Concurrency, History, Job, Resources, Reuse, RunsOn,
+        Shell, Step,
     },
 };
 
@@ -154,14 +154,14 @@ pub enum SpecError {
     Decode,
 }
 
-/// Format 13 adds a job's `checkout` history and its additional `checkouts`; format 12 adds a step's
-/// `outputs`, a job's `outputs` and `finalize`, and a job's `handoff`; format 11 adds a pipeline's
-/// name and declared inputs with the values a run was given; format 10 adds `on.schedule`; format 9
-/// adds `artifacts[].when: step:<id>`; format 8 adds `artifacts[].class`; format 7 adds `runs_on.os`
-/// and `runs_on.isolation`. A spec that states none of them is written as format 12, 11, 10, 9, 8, 7
-/// or 6, byte for byte what earlier controllers wrote, so a worker that predates the newer fields
-/// keeps running it.
-pub const SPEC_FORMAT: u8 = 13;
+/// Format 14 adds a job's opt-in task-result reuse (`jobs.<name>.reuse`); format 13 adds a job's `checkout`
+/// history and its additional `checkouts`; format 12 adds a step's `outputs`, a job's `outputs` and
+/// `finalize`, and a job's `handoff`; format 11 adds a pipeline's name and declared inputs with the values a
+/// run was given; format 10 adds `on.schedule`; format 9 adds `artifacts[].when: step:<id>`; format 8 adds
+/// `artifacts[].class`; format 7 adds `runs_on.os` and `runs_on.isolation`. A spec that states none of them
+/// is written as format 13, 12, 11, 10, 9, 8, 7 or 6, byte for byte what earlier controllers wrote, so a
+/// worker that predates the newer fields keeps running it.
+pub const SPEC_FORMAT: u8 = 14;
 
 pub const SPEC_FORMAT_READ_MIN: u8 = 3;
 
@@ -198,8 +198,10 @@ impl RunSpec {
         let named = !self.inputs.is_empty()
             || self.pipeline.name.is_some()
             || !self.pipeline.inputs.is_empty();
-        if states_checkouts {
+        if self.pipeline.jobs.iter().any(|j| j.spec.reuse.is_some()) {
             SPEC_FORMAT
+        } else if states_checkouts {
+            13
         } else if states_outputs {
             12
         } else if named {
@@ -235,11 +237,12 @@ impl RunSpec {
     pub fn encode(&self) -> Result<Vec<u8>, SpecError> {
         let format = self.format();
         let body = match format {
+            SPEC_FORMAT => postcard::to_allocvec(&RunSpecV13::from(self)),
+            13 => postcard::to_allocvec(self),
             6 => postcard::to_allocvec(&RunSpecV6::from(self)),
             7 => postcard::to_allocvec(&RunSpecV7::from(self)),
             10 => postcard::to_allocvec(&RunSpecV9::from(self)),
             11 => postcard::to_allocvec(&RunSpecV10::from(self)),
-            SPEC_FORMAT => postcard::to_allocvec(self),
             12 => postcard::to_allocvec(&RunSpecV11::from(self)),
             _ => postcard::to_allocvec(&RunSpecV8::from(self)),
         };
@@ -260,9 +263,10 @@ impl RunSpec {
             }
         }
         match bytes.split_first() {
-            // Format 13 is this reader's own layout: a job carries its checkout history and every
-            // additional checkout.
-            Some((&SPEC_FORMAT, body)) => whole::<RunSpec>(body),
+            Some((&SPEC_FORMAT, body)) => whole::<RunSpecV13>(body).map(RunSpec::from),
+            // Format 13 is format 14's layout without the reuse declarations, which ride outside the job
+            // graph: a job carries its checkout history and every additional checkout.
+            Some((&13, body)) => whole::<RunSpec>(body),
             Some((&12, body)) => whole::<RunSpecV11>(body).map(RunSpec::from),
             Some((&11, body)) => whole::<RunSpecV10>(body).map(RunSpec::from),
             // Format 10 is format 8's layout plus the schedule trigger, which is why the format byte
@@ -427,6 +431,7 @@ impl From<RunSpecV6> for RunSpec {
                             cache: j.spec.cache,
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
                             locks: Vec::new(),
+                            reuse: None,
                             secrets: j.spec.secrets,
                             registry_auth: j.spec.registry_auth,
                             history: History::Shallow,
@@ -589,6 +594,7 @@ impl From<RunSpecV7> for RunSpec {
                             cache: j.spec.cache,
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
                             locks: Vec::new(),
+                            reuse: None,
                             secrets: j.spec.secrets,
                             registry_auth: j.spec.registry_auth,
                             history: History::Shallow,
@@ -640,8 +646,49 @@ impl From<RunSpecV8> for RunSpec {
     }
 }
 
-/// Format 11: the format-9 layout plus the pipeline's name, its declared inputs and the values this
-/// run was given. A reader that predates it refuses the leading byte instead of misreading a name.
+/// Format 14: format 13's layout plus each opted-in job's reuse declaration, by job index.
+///
+/// The declarations ride beside the job graph rather than inside it, so the jobs themselves keep the layout
+/// a worker below this format still reads. `reuse` is ascending by job index and names no job twice; a spec
+/// that states none is written as format 13.
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSpecV13 {
+    base: RunSpec,
+    reuse: Vec<(u32, Reuse)>,
+}
+
+impl From<&RunSpec> for RunSpecV13 {
+    fn from(spec: &RunSpec) -> RunSpecV13 {
+        RunSpecV13 {
+            base: spec.clone(),
+            reuse: spec
+                .pipeline
+                .jobs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, job)| {
+                    job.spec
+                        .reuse
+                        .clone()
+                        .map(|declared| (u32::try_from(index).unwrap_or(u32::MAX), declared))
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<RunSpecV13> for RunSpec {
+    fn from(v13: RunSpecV13) -> RunSpec {
+        let mut spec = v13.base;
+        for (index, reuse) in v13.reuse {
+            if let Some(job) = spec.pipeline.jobs.get_mut(index as usize) {
+                job.spec.reuse = Some(reuse);
+            }
+        }
+        spec
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RunSpecV10 {
     base: RunSpecV9,
@@ -957,6 +1004,7 @@ impl From<JobV3> for Job {
             outputs: Vec::new(),
             handoff: Vec::new(),
             finalize: None,
+            reuse: None,
         }
     }
 }
@@ -1008,6 +1056,7 @@ impl From<RunSpecV4> for RunSpec {
                             cache: j.spec.cache,
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
                             locks: Vec::new(),
+                            reuse: None,
                             secrets: j.spec.secrets,
                             registry_auth: None,
                             history: History::Shallow,
@@ -1055,6 +1104,7 @@ impl From<RunSpecV5> for RunSpec {
                             cache: j.spec.cache,
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
                             locks: Vec::new(),
+                            reuse: None,
                             secrets: j.spec.secrets,
                             registry_auth: None,
                             history: History::Shallow,
@@ -1622,7 +1672,7 @@ mod tests {
             compile_str(text).unwrap(),
         )
         .unwrap();
-        assert_eq!(spec.format(), SPEC_FORMAT);
+        assert_eq!(spec.format(), 13, "a checkout without reuse is format 13");
         let bytes = spec.encode().unwrap();
         assert_eq!(bytes[0], 13);
         let decoded = RunSpec::decode(&bytes).unwrap();
@@ -1659,7 +1709,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(both.format(), SPEC_FORMAT);
+        assert_eq!(both.format(), 13);
         let bytes = both.encode().unwrap();
         assert_eq!(bytes[0], 13);
         let decoded = RunSpec::decode(&bytes).unwrap();

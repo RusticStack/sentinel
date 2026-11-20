@@ -193,6 +193,15 @@ pub(super) fn attempt_steps(state: &State, request: &crate::http::Request, attem
         "timings_ns": timings,
         "image_present": summary.image_present,
         "guest_image": summary.guest_image,
+        "reuse": summary.reuse.map(|reuse| json!({
+            "entry": reuse.entry,
+            "key": reuse.key,
+            "generation": reuse.generation,
+            "sealed_ms": reuse.sealed_ms,
+            "files": reuse.files,
+            "bytes": reuse.bytes,
+            "restore_ns": reuse.restore_ns,
+        })),
         "steps": summary.steps.iter().map(|s| {
             let mut step = json!({
                 "index": s.index,

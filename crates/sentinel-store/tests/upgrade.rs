@@ -388,7 +388,7 @@ fn populated_at_72(path: &std::path::Path) -> [u8; 32] {
     .unwrap();
     for (name, protocol, software, fingerprint) in [
         ("old", 13, Some("sentinel-worker 0.1.0"), 0x21_u8),
-        ("next", 16, None, 0x22_u8),
+        ("next", 17, None, 0x22_u8),
     ] {
         conn.execute(
             "INSERT INTO workers(id, pool_id, fingerprint, name, arch, capabilities, protocol,
@@ -436,7 +436,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     assert_eq!(
         report.inspection.pending,
         vec![
-            73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88
+            73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
         ]
     );
     assert!(report.inspection.openable() && report.inspection.integrity == "ok");
@@ -451,7 +451,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     // 81 rebuilds the policy table with the one check relaxed (this database holds no policy row), and
     // migrations 74 to 88 add runner-mode, guided-migration, fork-policy, AI-request, AI-budget,
     // per-test-outcome, storage-default, schedule, failure-analysis, log-search, named-pipeline,
-    // declared-output, source-manifest and external-resource shape without visiting a row.
+    // declared-output, source-manifest, external-resource and fresh-run shape without visiting a row.
     assert_eq!(
         report
             .steps
@@ -459,7 +459,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
             .map(|step| step.version)
             .collect::<Vec<_>>(),
         vec![
-            73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88
+            73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
         ]
     );
     let rewrites = |step: usize| -> Vec<(String, u64)> {
@@ -529,7 +529,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     assert_eq!(
         workers,
         vec![
-            ("next", 16, None, true),
+            ("next", 17, None, true),
             ("old", 13, Some("sentinel-worker 0.1.0"), false)
         ]
     );
@@ -606,7 +606,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     assert_eq!(
         report.inspection.pending,
         vec![
-            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88
+            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
         ]
     );
     assert_eq!(
@@ -616,7 +616,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     assert_eq!(
         report.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
         vec![
-            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88
+            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
         ]
     );
     assert!(report.blocking.is_empty(), "{:?}", report.blocking);
@@ -637,7 +637,8 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     // row as a failure analysis of its attempt, name a check after the job alone on a named pipeline's
     // run, refuse to decode a run spec that declares a checkout history, or place a job whose external
     // resource another job holds — so the copy (or a backup) is the only rollback for anything older.
-    // Migration 86 only adds one nullable column, so release 85 runs on it.
+    // Migration 86 only adds one nullable column, so release 85 runs on it, and migration 89 adds one
+    // column with a default, so release 88 runs on a database at schema 89.
     let needs = |db: &std::path::Path, release: u32| -> u32 {
         Connection::open(db)
             .unwrap()
@@ -694,9 +695,15 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     assert_eq!(
         schema::readable_by(schema::LATEST),
         88,
-        "the newest migration adds the external-resource tables and names a failure class a release \
-         below it cannot decode, so two jobs it ran could hold one staging database at once and a \
-         job that waited out its bound would be stored with a reason it cannot read"
+        "migration 88 adds the external-resource tables and names a failure class a release below it \
+         cannot decode, so two jobs it ran could hold one staging database at once and a job that \
+         waited out its bound would be stored with a reason it cannot read"
+    );
+    assert_eq!(
+        schema::readable_by(schema::LATEST),
+        schema::LATEST - 1,
+        "migration 89 adds one column with a default, so the release before it runs on the result and \
+         only loses the ability to serve a job that opted into reuse and to ask for a fresh run"
     );
     for release in [69, schema::LATEST - 2] {
         assert!(
@@ -743,13 +750,13 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     assert_eq!(
         again.inspection.pending,
         vec![
-            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88
+            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
         ]
     );
     assert_eq!(
         again.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
         vec![
-            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88
+            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
         ]
     );
 }
@@ -889,7 +896,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     // docs/upgrades.md (tests/compat_doc.rs compares it with the code): a database at schema N
     // runs on release R only when no migration in (R, N] declares a readable_by above R. Rows
     // are R, columns are N = 53, 55, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
-    // 80, 81, 82, 83, 84, 86, 87 and LATEST.
+    // 80, 81, 82, 83, 84, 85, 86, 87, 88 and LATEST.
     let readable = |db: &Connection, release: u32, newest: u32| -> bool {
         let needs: u32 = db
             .query_row(
@@ -902,14 +909,14 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        88,
+        89,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
     assert_eq!(
         sources,
         vec![
-            44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 81, 82, 85, 86, 87
+            44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 81, 82, 85, 87, 88
         ]
     );
     for from in sources {
@@ -945,9 +952,10 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
         // the delegations they name), 79 (the budget ledger and reservations), 81 (the rebuilt
         // policy table with its unlimited quota), 84 (a request's kind and question, which decide
         // what its answer has to be built from), 85 (the rebuilt provenance table and the
-        // pipeline a run belongs to, which decide a check's name) and 86 (the external-resource
+        // pipeline a run belongs to, which decide a check's name) and 88 (the external-resource
         // tables a release below it never takes a hold in, and the failure class it cannot decode)
-        // are readable by nothing older. So the release
+        // are readable by nothing older, and 89 adds one column with a default that no older
+        // statement reads or writes, so it is readable by the release before it. So the release
         // before the newest reads a database at LATEST exactly when LATEST declares it readable.
         assert_eq!(
             readable(&db, from, schema::LATEST),
@@ -1028,7 +1036,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
                 false, false,
             ],
             // The newest releases in the list run on every column they are listed against.
-            75..=87 => [
+            75..=88 => [
                 true, true, true, true, true, true, true, true, true, true, true, true, true, true,
                 true,
             ],
@@ -1604,7 +1612,7 @@ fn the_upgrade_reports_the_tenants_the_new_default_caps_and_keeps_the_precedence
     let report = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         report.inspection.pending,
-        vec![81, 82, 83, 84, 85, 86, 87, schema::LATEST]
+        vec![81, 82, 83, 84, 85, 86, 87, 88, schema::LATEST]
     );
     assert_eq!(
         report.steps[0].rewrites,

@@ -8,6 +8,7 @@ pub(crate) mod glob;
 pub mod hash_files;
 pub mod input;
 pub mod policy;
+pub mod reuse;
 pub mod run;
 pub mod schema;
 pub mod workflow;

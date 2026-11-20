@@ -1,0 +1,12 @@
+# expect: jobs.build.reuse: a job that opts into reuse cannot publish an artifact behind `when: step:<id>`
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: busybox
+    steps: [{id: s, run: echo hi}]
+    artifacts:
+      - {name: out, paths: [out], when: "step:s"}
+    reuse:
+      inputs: [src/**]
+      paths: [out]

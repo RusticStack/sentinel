@@ -1,0 +1,9 @@
+# expect: jobs.build.reuse.inputs: required
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: busybox
+    steps: [{id: s, run: echo hi}]
+    reuse:
+      paths: [out]

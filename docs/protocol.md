@@ -180,6 +180,20 @@ checkout is served no spec at all to a session below it, because a worker that
 cannot be told about a repository must not check one out. The frames are a sensitive
 frame class, since each carries a credential. See [sources](sources.md#additional-checkouts).
 
+## Protocol 16 task-result reuse
+
+Protocol 16 appends one server variant, `Context4`: `Context3` plus `reuse_fresh`, the run's
+forced-refresh flag for task-result reuse ([cache](cache.md#task-results),
+[worker link](worker-link.md#protocol-16-task-result-reuse)). It is a new variant rather
+than a field because postcard decodes exactly the field list its reader knows (see
+[Protocol 7 additions](#protocol-7-additions)). `REUSE_MIN` is 16: a session below it is sent
+`Context3`, which cannot state the flag, so a worker more than one release behind is never told a run
+asked for fresh execution — and may therefore serve a result that run should have executed. That is
+the reason a deployment upgrades its controller before its workers here: the controller is what
+refuses the flag to a session that cannot carry it, and a run it created with `fresh: true` is only
+fresh for the workers that can read it. Nothing else on the wire changes: results themselves are
+worker-local and are never offered, fetched or pushed.
+
 ## Versioning policy
 
 The protocol version bumps on any incompatible change to messages, framing or semantics. A new message *variant* is additive; a new or changed *struct field* — optional or not — bumps the protocol, because postcard decodes exactly the field list its reader knows and `#[serde(default)]` never fires (see [Protocol 7 additions](#protocol-7-additions)). Error schema, cursor version byte and protocol version are independent so each can move alone. The JSON shapes of `ApiError`, `Hello` and `Rejected` are pinned by tests.

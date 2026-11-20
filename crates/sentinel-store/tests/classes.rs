@@ -786,6 +786,7 @@ fn database_at_latest_without_classes(path: &Path) {
          DROP TABLE resource_locks;
          ALTER TABLE jobs DROP COLUMN locks;
          ALTER TABLE jobs DROP COLUMN lock_wait;
+         ALTER TABLE runs DROP COLUMN reuse_fresh;
          DELETE FROM schema_migrations WHERE version >= 65;",
     )
     .unwrap();

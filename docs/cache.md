@@ -2,13 +2,14 @@
 
 Sentinel keeps its caches on the worker that runs the job: no network fetch on a warm hit, no shared mutable volume between tenants. This document is the metadata contract — which cache classes exist, what boundary a generation is sealed under, how a job receives its private writable view, and the vocabulary a lookup answers with. Publication, garbage collection, compiler persistence and remote hydration each have their own section below; everything here is what they share: paths, formats and reasons.
 
-## Why three classes
+## Why the classes differ
 
 A `cache:` entry declares a `class` (`sentinel_protocol::cache::Class`) because the classes have different validity rules, and a permissive rule must never loosen an exact one:
 
 - **`downloads`** — tool-addressed blobs: package registry responses, fetched archives. The installing tool validates content by its own digest or protocol, so an entry may serve a *different* key under the same stem (`cargo-<h1>` serving `cargo-<h2>`): lockfile edits that leave the stem intact can still hit. `Compat::Downloads { tool }` pins the installing tool's identity (`cargo`, `npm`, …).
 - **`dependencies`** — an exact materialization of a dependency set. It may serve only a request whose recorded inputs match completely: the rendered key, the lockfile digest, the installer identity, its flag string and the ABI tag (`Compat::Dependencies`). This is the default for a `class`-less document — the only rule that is never wrong to assume.
 - **`compiler`** — compiler intermediates in a stable toolchain namespace. The compiler performs input-level invalidation inside the namespace, so entries persist across source and lockfile edits; the store pins the key stem and the flags namespace (`Compat::Compiler`).
+- **`results`** — a task result, never a `cache:` entry: the job's success plus the output trees it declared ([task results](#task-results)). Its rule is the exact one: it serves only a request whose complete key matches (`Compat::Results`), and it is written only by a pipeline that opted in.
 
 ## The boundary
 
@@ -25,7 +26,7 @@ The cache directory name is `CACHE_DIR` (`"cache"`); `attach::ROOT_DIR` is an
 alias of the same constant.
 
 - `<repo>` leads: repository IDs are globally unique, so two tenants can never produce the same scope directory. The tenant is still recorded in every manifest — a moved directory fails `WrongTenant`, not the path check.
-- `<class>` and `<trust>` are the enum names: `downloads`/`dependencies`/`compiler` and `protected`/`pull_request`/`unprotected`.
+- `<class>` and `<trust>` are the enum names: `downloads`/`dependencies`/`compiler`/`results` and `protected`/`pull_request`/`unprotected`.
 - `<os>-<arch>` is one component (`linux-x86_64`); a second OS can never silently reuse a scope directory.
 - `<toolchain16>` is the first 8 bytes of the BLAKE3 digest of the toolchain descriptor — image digest, tool versions, whatever pins "the toolchain" — as 16 lowercase hex characters.
 - `<name>` is the pipeline's cache name, already `valid_id`-shaped; `Scope::new` re-checks rather than trusts.
@@ -97,6 +98,49 @@ Restore is total from the attempt's perspective: nothing on the cache path is fa
 **First touch.** After a hit's clone materializes, restore measures one bounded first-read sample per target (`attach::Stats::first_touch_ns`): open the largest listed file and read its first 4 KiB. The clone's wall time is per-file work — `FICLONE` returns without touching extents — while the first real read is what faults a cold extent, so that cost is measured separately rather than folded into `clone_ns`. At most one small read per target; a file that will not open is simply not measured, and a miss or an empty listing records `None`.
 
 The worker advertises `Capabilities::REFLINK` in its Hello exactly when `clone::detect(<data_dir>/cache)` reports `Backend::Reflink` — the same probe restore uses, so the advertised bit and the backend in use can never disagree.
+
+## Task results
+
+A **task result** is a job's success plus the workspace trees it declared as its outputs. A pipeline opts a job in with `reuse:` ([pipeline schema](pipeline-schema.md#task-results)); the worker then looks the result up in the same sealed-generation store the classes above use, as class `results`, and if it is there the job runs nothing at all — no cache restore, no container, no step — while preparation materialises the declared outputs into the fresh checkout. If it is not there, the job runs as it always would and — once it passes — seals its own result for the next run.
+
+**Nothing is reused by default.** A job without `reuse:` never touches the store: no lookup, no entry, no seal. There is no class, no key shape and no flag that makes an arbitrary shell command's success reusable. The boundary is the document's own declaration, so a pipeline that says nothing always executes, and the only way to opt in is to name the inputs the task has and the outputs it produces.
+
+**The key is the whole declared identity.** `sentinel_pipeline::reuse::key` hashes one length-prefixed record (`sentinel.task-result/1`) over:
+
+| Component | What it is |
+|---|---|
+| Isolation class | the sandbox the attempt actually runs in — `container` or `microvm`, after the worker's own preference is applied |
+| Platform | `linux-x86_64` or `linux-aarch64` |
+| Image digest | the digest the job was offered and the image store pulled (`jobs.image_digest`), not the reference text alone |
+| Image reference | the text the pipeline states, because a tag that moves keeps its text and changes its digest |
+| Toolchain identity | `Scope::toolchain_digest` of `name@digest` — the same 32 bytes the cache scope carries, so the two stores cannot disagree about "the toolchain" |
+| Command | per step: its id, its shell, its workdir, its timeout and the exact `run` text |
+| Declared environment | per step: the job's `env` with the step's `env` overriding by name, sorted, so the merged environment a step sees is exactly what the key covers |
+| Captured paths | each `reuse.paths` entry, in declaration order: a different capture set restores different trees |
+| Declared inputs | each `reuse.inputs` pattern with the digest `hash_files` resolved it to in the fresh checkout, in declaration order |
+
+The run, the attempt, the event, the source revision and the job's name are in no component: a result is a function of the task, not of the trigger that asked for it. Two runs of the same commit in the same pipeline render the same key, which is the point; a change to anything the pipeline declares for the job renders a different one.
+
+Everything the key cannot cover is refused by the loader rather than guessed at, so a key is never a partial one. A job that opts in cannot declare:
+
+- **`secrets`** or `registry_auth` — a secret value is never read into a key;
+- a job or step **`if`** — nothing of a served job runs, so no condition could be re-decided;
+- step or job **`outputs`** — the [declared output values](pipeline-schema.md#declared-outputs) are text a dependent job reads, and no step of a served job runs to write one;
+- **`handoff`** — another job's artifact bytes are an input the key cannot name, so a result sealed with one could be served for different bytes;
+- **`finalize`** — a finalizer runs when the job's steps end, and a served job runs none;
+- a step-triggered artifact (**`when: step:<id>`**) — it publishes at a completion a served result never reaches.
+
+`reuse.inputs` is 1–16 `hash_files` patterns and `reuse.paths` is 1–8 normalised relative workspace directories, captured recursively the way a `cache:` path is, and never inside `.sentinel-cache` (the worker's own view directory).
+
+**Sandbox rule.** The isolation class is part of the key, so a result serves only the class it was produced in: a result sealed by a `microvm` attempt is never served to a `container` job, and a container's is never served to a microVM either. The classes are not ranked here — `microvm` is stronger on a KVM host, but which bytes a host can trust across executors is the wrong question to answer by inference, so the rule is equality. An unstated `runs_on.isolation` does not escape it: the class the attempt *actually* ran in is what the worker keys and what it seals.
+
+**Provenance and the forced refresh.** A served result carries `AttemptSummary::reuse` (format 6): the entry name, the rendered key, the generation directory it was restored from, that generation's seal instant, its file and byte counts and the restore's duration. The attempt's `steps` are empty, because none of them ran, and its verdict is `Passed`. Its artifacts still publish, from the restored trees, exactly as `when: success` would publish them from a run.
+
+A run may be marked **fresh** (`POST …/runs` with `"fresh": true`, and every rerun), and then every task it carries executes: `runs.reuse_fresh` is delivered in the job context, and a fresh attempt does not look the store up at all. It seals nothing either, so a fresh run behaves exactly as a pipeline that declares no `reuse:` — a key that could produce different bytes for the same inputs is a key whose declared inputs were incomplete, and rewriting an entry from a fresh run would let an undeclared input become the reused result. A rerun of a job therefore always executes it: a rerun that served the earlier result would do nothing at all.
+
+**Worker-local.** A result is read and written through the same `Scope`, manifest, lease and generation machinery as the classes above, but it is never offered over the link: a result restored on another worker would have been produced under a sandbox that worker did not verify. Reclamation is the same sweep, and a result entry is evictable under the same budget, so declared results are a cache and never a store of record.
+
+**Reporting.** A served attempt says so in its summary: `reuse` names the entry, the key and the generation it was restored from, and `steps` is empty, so nothing has to be inferred from timings. A miss writes nothing extra — the job simply runs — and a passed attempt that seals its result lands one `cache_published` note named for the job, carrying `sealed`, a skip reason, or `failed`; a publication that fails is a diagnostic exactly as a cache's is, never the verdict.
 
 ## Publication
 
@@ -189,7 +233,7 @@ A `class: compiler` entry is a stable toolchain namespace whose tool owns per-in
 
 **`flags` is the recipe channel.** `Compat::Compiler { flags }` is a pin *inside* a stem for recipes that want a check tighter than the stem provides. A bare declaration leaves it `""`: the stem is the whole namespace — it already picks the entry directory and is re-verified in the manifest — so recording `key_stem(key)` there would only ever duplicate the check just run, and a stem longer than the 256-byte field bound would make the manifest unreadable for no benefit. A recipe that needs a flag-regime split under one stem pins a rendered token instead. Note that `current` is one pointer per entry directory: regimes that must not interleave belong in the stem, since two flag namespaces sharing a stem would contend on the pointer.
 
-**A hit is never a cached verdict.** A compiler-cache hit restores *bytes* — the writable view the job's steps read — and nothing else. `execute` runs every declared step unconditionally; `job.caches` is consulted only by restore during preparation and publish during finalization, and the `Outcome::Hit` type itself carries only a manifest and a byte count. Go's documented build-cache/test-result distinction applies: forcing fresh test execution (`-count=1`) does not require discarding compiler reuse. A cache hit can never suppress a test, skip a step, or inherit a previous run's verdict. The Linux fixture `fixtures/compiler/fakecc.sh` — a content-keyed compiler stand-in — exercises this through real container mounts and restore/publish round-trips in `sentinel-worker/tests/compiler_cache.rs` and `sentinel-cache/tests/compiler.rs`.
+**A `cache:` hit is never a cached verdict.** A compiler-cache hit restores *bytes* — the writable view the job's steps read — and nothing else. `execute` runs every declared step unconditionally; `job.caches` is consulted only by restore during preparation and publish during finalization, and the `Outcome::Hit` type itself carries only a manifest and a byte count. Go's documented build-cache/test-result distinction applies: forcing fresh test execution (`-count=1`) does not require discarding compiler reuse. A cache hit can never suppress a test, skip a step, or inherit a previous run's verdict. The one thing that can suppress a step is a *task result*, and only for a job that declared `reuse:` and named its whole identity ([task results](#task-results)): that is a different feature with its own class, its own opt-in and its own reported provenance, and no `cache:` declaration can turn it on. The Linux fixture `fixtures/compiler/fakecc.sh` — a content-keyed compiler stand-in — exercises this through real container mounts and restore/publish round-trips in `sentinel-worker/tests/compiler_cache.rs` and `sentinel-cache/tests/compiler.rs`.
 
 ## Recipe library
 
@@ -210,6 +254,7 @@ The adversarial tests live in `crates/sentinel-cache/tests/k09.rs` (store level,
 - **Collection during a publish**: `a_sweep_running_inside_a_publish_cannot_take_the_entry_being_written`. A one-byte-budget sweep runs from inside the commit (the plan-check poll, with the pin and writer marker held): it sees the commit's pin, evicts the unwritten sibling entry (the control), and leaves the written entry, its source generation and its staging alone, and the publish still seals a verifiable generation.
 - **A live writer and a busy loser**: `a_live_writer_keeps_its_entry_through_eviction_and_a_busy_loser_leaves_it_alone`. A loser skips `busy` without removing the holder's marker; a forcing sweep leaves the held entry whole; once the writer releases, the same sweep evicts it.
 - **Remote hydration**: `tests/remote.rs` drives the real miss path against an in-memory controller implementing the link's `Remote` seam. A cold transfer serves the job and installs a generation the store then serves locally, so a later attempt never calls the transport; an interrupted transfer resumes exactly at the offset it stopped; a corrupted chunk and a bundle sealed for another trust are typed misses (`corrupt`, `wrong_trust`) that materialize nothing and leave no `current`; a bundle cut short of the head it carries, or short of the payload that head promises, is `corrupt` with nothing left staged and the entry still takes a whole bundle afterwards; a bundle sealed for another tenant, moved under this entry's key, is `wrong_tenant` and its payload never crosses the link, because the boundary check runs on the prefix the transfer already holds; a controller without the bundle leaves the local miss, partial and pointer untouched. The same file drives the controller store itself (one bundle per entry, the byte budget, abandoned uploads, the per-bundle cap and the oversize-first sweep, verify-as-it-lands, proven resume prefixes, a kept partial on `busy`, one job deadline). `sentinel-link/tests/remote_cache.rs` runs the whole path over TLS against a real `Controller`: an offer after the terminal report is stored and hydrates the next attempt, an abandoned fetch is cancelled and the next fetch of that attempt is clean, a foreign worker's offer and its fetch of an attempt it does not hold are both `denied` (the gate binds a need to the attempt's own tenant and repository, so a bundle another tenant owns is never opened for it), and the profile carries and refreshes measured availability.
+- **Task results**: `sentinel-worker/src/reuse.rs`'s own tests drive the decision against a real store and a real workspace: a declared task seals on a miss and serves next time with the generation it came from, the entry's file and byte counts and its restore duration; changing the command, the job's environment, a step's environment, an input file's bytes, a declared input pattern, the image reference, the resolved image digest or the isolation class each forces a fresh run; a result sealed in one isolation class is never served in another; a job that does not opt in consults no store and creates no entry, twice in a row; a forced run bypasses a sealed result and seals nothing while the entry it bypassed still serves the next ordinary run; and an input pattern that resolves to nothing makes that run unkeyable, so it runs and seals nothing. `sentinel-pipeline/tests/reuse.rs` covers the loader's refusals and the run-spec round trip; `sentinel-worker/tests/reuse_run.rs` drives whole attempts through the executor and proves from the job's own output that a served attempt printed nothing and started no sandbox, that an unopted job printed its step output twice, and that a forced attempt did. The store-level test for the fresh flag is `sentinel-store/tests/dispatch.rs::a_forced_run_carries_its_fresh_request_into_every_job_context`.
 - **Confinement and bounds**: `tests/publish.rs` proves a symlink at any component (planted, raced between plan and copy, or checked in) is never followed, a refused entry publishes nothing, the byte cap refuses before staging, and a sparse file stays sparse. `sentinel-worker/tests/k09.rs::publish_runs_with_the_container_stopped` proves the container is gone when publication reads the views. `tests/gc.rs` proves currents are evicted least recently used under the budget, idle entries age out, an entry without a pointer ages by its newest generation, an at-cap generation survives a sweep at the same budget, and bounded passes resume to cover the whole tree while still enforcing the budget.
 
 K03 (atomic publication, leases, one bounded writer per entry, authorized promotion) is covered by the cases above: atomic swap by the torn-read and cancel cases, leases by the eviction cases, the writer bound by the serialization and live-writer cases, and promotion by the trust-pairing, pull-request and publish tests. Runner-mode cache writes (AR06) are not implemented, so their publication through these generations is not exercised.

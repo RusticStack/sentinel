@@ -2,12 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const SUMMARY_FORMAT: u8 = 5;
+pub const SUMMARY_FORMAT: u8 = 6;
 // Old formats stay decodable forever: keep their shadow structs when the format changes.
 const SUMMARY_FORMAT_V1: u8 = 1;
 const SUMMARY_FORMAT_V2: u8 = 2;
 const SUMMARY_FORMAT_V3: u8 = 3;
 const SUMMARY_FORMAT_V4: u8 = 4;
+const SUMMARY_FORMAT_V5: u8 = 5;
 /// The outputs one attempt may report: the job's own declared outputs, bounded by the schema.
 pub const MAX_OUTPUT_RECORDS: usize = 8;
 /// The bytes one output name and value may take in the record.
@@ -91,6 +92,24 @@ pub struct GuestImageRecord {
     pub build_ns: Option<u64>,
 }
 
+/// A task result served from the worker's local store instead of running the job: what it was reused from.
+/// The steps of such an attempt are empty, because none of them ran.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReuseRecord {
+    /// The cache entry the result was restored from: the job name it was sealed under.
+    pub entry: String,
+    /// The rendered reuse key, lower-case hex: the digest of every declared input.
+    pub key: String,
+    /// The sealed generation directory name, `gen-<unix_ms>-<rand>`.
+    pub generation: String,
+    /// When that generation was sealed, in wall-clock milliseconds: provenance only.
+    pub sealed_ms: u64,
+    pub files: u64,
+    pub bytes: u64,
+    /// Restoring the output trees cost this much monotonic time before finalization began.
+    pub restore_ns: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptSummary {
     pub checkout_ns: Option<u64>,
@@ -112,6 +131,51 @@ pub struct AttemptSummary {
     pub outputs: Vec<(String, String)>,
     /// What the job's finalizer did (format 5), when the job declares one.
     pub finalizer: Option<FinalizerRecord>,
+    /// Present when this attempt served a task result instead of running the job (format 6).
+    pub reuse: Option<ReuseRecord>,
+}
+
+/// Format 5: the shape before task-result reuse, still read for every attempt written by an older worker.
+#[derive(Deserialize, Serialize)]
+struct AttemptSummaryV5 {
+    checkout_ns: Option<u64>,
+    checkout_fetch_ns: Option<u64>,
+    checkout_materialize_ns: Option<u64>,
+    checkout_route: Option<CheckoutRoute>,
+    image_pull_ns: Option<u64>,
+    image_present: Option<bool>,
+    container_start_ns: Option<u64>,
+    steps_ns: Option<u64>,
+    finalize_ns: Option<u64>,
+    steps: Vec<StepRecord>,
+    caches: Vec<CacheRecord>,
+    guest_image: Option<GuestImageRecord>,
+    detail: String,
+    outputs: Vec<(String, String)>,
+    finalizer: Option<FinalizerRecord>,
+}
+
+impl From<AttemptSummaryV5> for AttemptSummary {
+    fn from(v5: AttemptSummaryV5) -> Self {
+        Self {
+            checkout_ns: v5.checkout_ns,
+            checkout_fetch_ns: v5.checkout_fetch_ns,
+            checkout_materialize_ns: v5.checkout_materialize_ns,
+            checkout_route: v5.checkout_route,
+            image_pull_ns: v5.image_pull_ns,
+            image_present: v5.image_present,
+            container_start_ns: v5.container_start_ns,
+            steps_ns: v5.steps_ns,
+            finalize_ns: v5.finalize_ns,
+            steps: v5.steps,
+            caches: v5.caches,
+            guest_image: v5.guest_image,
+            detail: v5.detail,
+            outputs: v5.outputs,
+            finalizer: v5.finalizer,
+            reuse: None,
+        }
+    }
 }
 
 /// Format 4: the summary before declared outputs and finalizers.
@@ -287,6 +351,9 @@ impl AttemptSummary {
             Some((&SUMMARY_FORMAT, body)) => {
                 postcard::from_bytes(body).map_err(|_| SummaryError::Decode)?
             }
+            Some((&SUMMARY_FORMAT_V5, body)) => AttemptSummary::from(
+                postcard::from_bytes::<AttemptSummaryV5>(body).map_err(|_| SummaryError::Decode)?,
+            ),
             Some((&SUMMARY_FORMAT_V4, body)) => AttemptSummary::from(
                 postcard::from_bytes::<AttemptSummaryV4>(body).map_err(|_| SummaryError::Decode)?,
             ),
@@ -396,6 +463,15 @@ mod tests {
                 outcome: StepOutcome::Failed { code: 2 },
                 duration_ns: Some(11),
                 annotation: "finalizer exited with 2".into(),
+            }),
+            reuse: Some(ReuseRecord {
+                entry: "test".into(),
+                key: "ab".repeat(32),
+                generation: "gen-1700000000000-0a1b2c3d".into(),
+                sealed_ms: 1_700_000_000_000,
+                files: 12,
+                bytes: 4_096,
+                restore_ns: Some(1_500_000),
             }),
         };
         let bytes = summary.encode().unwrap();

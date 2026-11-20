@@ -431,6 +431,9 @@ pub enum ServerMessage {
         recorded: bool,
         access: sentinel_protocol::source::Access,
     },
+    /// Protocol 16, appended last so every earlier variant keeps its index: `Context3` plus the run's
+    /// forced-refresh flag for task-result reuse.
+    Context4(WireContext4),
 }
 
 /// A runner lease as the wire states it: what the worker needs to accept or refuse one, and nothing
@@ -621,6 +624,13 @@ pub struct WireContext3 {
     pub outputs: Vec<(String, String, String)>,
 }
 
+/// Protocol 15: `Context3` plus the run's forced-refresh flag for task-result reuse.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WireContext4 {
+    pub base: WireContext3,
+    pub reuse_fresh: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventContext {
     pub name: String,
@@ -652,6 +662,8 @@ pub struct JobContext {
     pub trust: Trust,
     /// The declared outputs of the jobs in `needs`, by producing job and name: bounded, plain text, never secrets.
     pub outputs: Vec<(String, String, String)>,
+    /// This run asked for fresh execution of every reusable task, so no sealed result may be served to it.
+    pub reuse_fresh: bool,
 }
 
 /// A resolved revision as it travels: a full object id, so nothing else can be asked for by name.
@@ -780,6 +792,13 @@ impl JobContext {
         }
     }
 
+    pub(crate) fn to_wire4(&self, attempt: AttemptId) -> WireContext4 {
+        WireContext4 {
+            base: self.to_wire3(attempt),
+            reuse_fresh: self.reuse_fresh,
+        }
+    }
+
     fn from_wire(wire: WireContext) -> Result<(AttemptId, JobContext)> {
         Ok((
             AttemptId::from_bytes(wire.attempt).map_err(|_| Error::Protocol("id"))?,
@@ -806,6 +825,8 @@ impl JobContext {
                 tenant: None,
                 trust: Trust::PullRequest,
                 outputs: Vec::new(),
+                // A format that cannot state it never asked for a fresh run.
+                reuse_fresh: false,
             },
         ))
     }
@@ -841,6 +862,8 @@ impl JobContext {
                 tenant,
                 trust,
                 outputs: Vec::new(),
+                // A format below 15 cannot state the run's forced refresh, so it never asked for one.
+                reuse_fresh: false,
             },
         ))
     }
@@ -850,6 +873,12 @@ impl JobContext {
     fn from_wire3(wire: WireContext3) -> Result<(AttemptId, JobContext)> {
         let (attempt, mut context) = JobContext::from_wire2(wire.base)?;
         context.outputs = decode_outputs(wire.outputs)?;
+        Ok((attempt, context))
+    }
+
+    fn from_wire4(wire: WireContext4) -> Result<(AttemptId, JobContext)> {
+        let (attempt, mut context) = JobContext::from_wire3(wire.base)?;
+        context.reuse_fresh = wire.reuse_fresh;
         Ok((attempt, context))
     }
 }
@@ -889,13 +918,14 @@ pub(crate) fn context_message(
     context: &JobContext,
     attempt: AttemptId,
 ) -> ServerMessage {
-    if protocol >= 14 {
-        let mut wire = context.to_wire3(attempt).base;
-        wire.trust = context.trust.for_protocol(protocol).to_u8();
-        ServerMessage::Context3(WireContext3 {
-            base: wire,
-            outputs: context.outputs.clone(),
-        })
+    if protocol >= 16 {
+        let mut wire = context.to_wire4(attempt);
+        wire.base.base.trust = context.trust.for_protocol(protocol).to_u8();
+        ServerMessage::Context4(wire)
+    } else if protocol >= 14 {
+        let mut wire = context.to_wire3(attempt);
+        wire.base.trust = context.trust.for_protocol(protocol).to_u8();
+        ServerMessage::Context3(wire)
     } else if protocol >= 6 {
         let mut wire = context.to_wire2(attempt);
         wire.trust = context.trust.for_protocol(protocol).to_u8();
@@ -3372,7 +3402,8 @@ pub fn connect(
         | ServerMessage::SecretBegin { .. }
         | ServerMessage::SecretChunk { .. }
         | ServerMessage::Handoff { .. }
-        | ServerMessage::Cancel { .. } => Err(Error::Protocol("message before welcome")),
+        | ServerMessage::Cancel { .. }
+        | ServerMessage::Context4(_) => Err(Error::Protocol("message before welcome")),
     }
 }
 
@@ -4119,6 +4150,10 @@ fn handle_bulk_message(
             let (attempt, context) = JobContext::from_wire3(wire)?;
             state.contexts.insert(attempt, context);
         }
+        ServerMessage::Context4(wire) => {
+            let (attempt, context) = JobContext::from_wire4(wire)?;
+            state.contexts.insert(attempt, context);
+        }
         ServerMessage::Handoff { attempt, part } => {
             let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
             remote.handoffs.route(attempt, part);
@@ -4771,6 +4806,7 @@ mod tests {
             needs: vec![("build".to_string(), Outcome::Passed)],
             tenant,
             trust,
+            reuse_fresh: false,
         }
     }
 

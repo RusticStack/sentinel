@@ -72,6 +72,14 @@ pub struct JobExplanation {
     /// The run's own checkout: how much history it needs, and what is fetched beside it.
     pub history: String,
     pub checkouts: Vec<CheckoutExplanation>,
+    /// The task-result reuse declaration, when the job opted in: what a served result covers and restores.
+    pub reuse: Option<ReuseExplanation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReuseExplanation {
+    pub inputs: Vec<String>,
+    pub paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -342,6 +350,10 @@ impl Explanation {
                         history: c.history.label(),
                     })
                     .collect(),
+                reuse: s.reuse.as_ref().map(|r| ReuseExplanation {
+                    inputs: r.inputs.clone(),
+                    paths: r.paths.clone(),
+                }),
             });
         }
         requires.secrets.sort();
@@ -503,6 +515,14 @@ impl Explanation {
                     s,
                     "  checkout {} at {} ({}), history {}",
                     c.repo, c.path, c.ref_name, c.history
+                );
+            }
+            if let Some(reuse) = &j.reuse {
+                let _ = writeln!(
+                    s,
+                    "  reuse: inputs [{}] paths [{}]",
+                    reuse.inputs.join(", "),
+                    reuse.paths.join(", ")
                 );
             }
         }

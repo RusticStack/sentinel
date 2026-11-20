@@ -41,13 +41,21 @@ pub fn declared_compat(decl: &Cache, key: &str, platform: Platform) -> Compat {
         Class::Compiler => Compat::Compiler {
             flags: String::new(),
         },
+        Class::Results => Compat::Results {
+            key: *blake3::hash(key.as_bytes()).as_bytes(),
+        },
     }
+}
+
+/// The `cache:` class a task result is stored under: it is a result, never a declared build artifact.
+pub fn results_class() -> Class {
+    Class::Results
 }
 
 pub fn entry_key(class: Class, key: &str) -> &str {
     match class {
         Class::Downloads | Class::Compiler => key_stem(key),
-        Class::Dependencies => key,
+        Class::Dependencies | Class::Results => key,
     }
 }
 
