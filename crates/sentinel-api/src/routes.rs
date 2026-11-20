@@ -615,6 +615,19 @@ pub(crate) fn route(
                 "pull-request",
             ],
         ) => crate::migration::pull_request(state, request, slug, name),
+        (
+            "POST",
+            [
+                "api",
+                "v1",
+                "tenants",
+                slug,
+                "repos",
+                name,
+                "migration",
+                "rollback",
+            ],
+        ) => crate::rollback::rollback(state, request, slug, name),
         ("GET", ["api", "v1", "runs", run, "wait"]) => run_wait(state, request, run, query),
         ("GET", ["api", "v1", "runs", run, "pipeline"]) => {
             let who = identify(state, request, false)?;

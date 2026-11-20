@@ -15,6 +15,7 @@ mod notices;
 mod oauth;
 mod preview;
 mod refresh;
+mod rollback;
 mod routes;
 mod secret_routes;
 mod worker_bootstrap;

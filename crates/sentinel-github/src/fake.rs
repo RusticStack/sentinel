@@ -103,8 +103,14 @@ struct Inner {
     commits: HashMap<String, String>,
     /// Branch refs: `refs/heads/<branch>` to the commit it holds.
     refs: HashMap<String, String>,
+    /// Refs a test set that no write of its own moved: `refs/heads/<branch>` to its commit.
+    branches: HashMap<String, String>,
     /// Branches whose protection declines a create or an update.
     protected: Vec<String>,
+    /// A branch's required status checks, per `owner/repo@branch`, as GitHub states them.
+    protection: HashMap<String, String>,
+    /// What each installation token was minted to carry, by token.
+    installation_tokens: HashMap<String, serde_json::Value>,
     /// Pull requests, oldest first.
     pulls: Vec<Pull>,
     /// The files every commit posted to the fake wrote, oldest first.
@@ -271,6 +277,42 @@ impl FakeGithub {
                 .map(|(name, text)| ((*name).to_owned(), (*text).to_owned()))
                 .collect(),
         );
+    }
+
+    /// The commit one branch holds before any write of the test's own moves it: the default
+    /// branch's head is what a rollback builds its commit on.
+    pub fn set_branch(&self, owner: &str, repo: &str, branch: &str, commit: &str) {
+        let mut state = self.lock();
+        state
+            .defaults
+            .entry(format!("{owner}/{repo}"))
+            .or_insert_with(|| branch.to_owned());
+        state
+            .branches
+            .insert(format!("refs/heads/{branch}"), commit.to_owned());
+    }
+
+    /// A branch's required status checks, as `GET .../protection` states them: the
+    /// `required_status_checks` document, or `null` for a protection that waits for nothing. A
+    /// branch with no entry here has no protection rule and answers `404`.
+    pub fn set_protection(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        required: &serde_json::Value,
+    ) {
+        self.lock()
+            .protection
+            .insert(format!("{owner}/{repo}@{branch}"), required.to_string());
+    }
+
+    /// A branch's required status checks as the fake holds them now, after whatever a test wrote.
+    pub fn protection(&self, owner: &str, repo: &str, branch: &str) -> Option<serde_json::Value> {
+        self.lock()
+            .protection
+            .get(&format!("{owner}/{repo}@{branch}"))
+            .and_then(|required| serde_json::from_str(required).ok())
     }
 
     /// The default branch a repository proposes into.
@@ -468,13 +510,39 @@ fn app_route(
                 .format(&time::format_description::well_known::Rfc3339)
                 .expect("format expiry");
             let token = format!("ghs_{:016x}{:016x}", rand_u64(), rand_u64());
+            // GitHub mints a token carrying what the installation grants, so a token asked for
+            // repository administration is minted without it when the installation never listed
+            // that permission — the client's own scope check then refuses it, as it does live.
+            let mut permissions = asked["permissions"].clone();
+            if permissions.get("administration").is_some() {
+                let installation: serde_json::Value = serde_json::from_str(
+                    state
+                        .installations
+                        .get(&id.parse().unwrap_or_default())
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                )
+                .unwrap_or_default();
+                let granted = installation
+                    .get("permissions")
+                    .and_then(|list| list.get("administration"))
+                    .and_then(serde_json::Value::as_str);
+                if granted != Some("write")
+                    && let Some(asked_for) = permissions.as_object_mut()
+                {
+                    asked_for.remove("administration");
+                }
+            }
+            state
+                .installation_tokens
+                .insert(token.clone(), permissions.clone());
             (
                 201,
                 None,
                 serde_json::json!({
                     "token": token,
                     "expires_at": expires,
-                    "permissions": asked["permissions"],
+                    "permissions": permissions,
                 })
                 .to_string(),
             )
@@ -494,7 +562,17 @@ fn app_route(
                 None => not_found(),
             }
         }
-        _ => return migration_route(state, method, &parts, query, body, port),
+        _ => {
+            return migration_route(
+                state,
+                method,
+                &parts,
+                query,
+                body,
+                authorization.as_deref(),
+                port,
+            );
+        }
     })
 }
 
@@ -502,12 +580,14 @@ fn app_route(
 /// holds, the git objects a migration commits, and its pull request. The rules the client relies
 /// on are the fake's too: a protected branch declines a create and an update, and a branch that
 /// already has an open pull request gets an update instead of a second one.
+#[allow(clippy::too_many_arguments)]
 fn migration_route(
     state: &mut Inner,
     method: &str,
     parts: &[&str],
     query: &str,
     body: &str,
+    authorization: Option<&str>,
     port: u16,
 ) -> Option<Answer> {
     let get = method == "GET";
@@ -644,7 +724,11 @@ fn migration_route(
         ["repos", owner, repo, "git", "ref", "heads", rest @ ..] if get => {
             debug_assert!(!owner.is_empty() && !repo.is_empty());
             let reference = format!("refs/heads/{}", rest.join("/"));
-            match state.refs.get(&reference) {
+            match state
+                .refs
+                .get(&reference)
+                .or_else(|| state.branches.get(&reference))
+            {
                 Some(commit) => (
                     200,
                     None,
@@ -690,6 +774,69 @@ fn migration_route(
                 None,
                 serde_json::json!({"ref": reference, "object": {"sha": text(&sent, "sha")}})
                     .to_string(),
+            )
+        }
+        ["repos", owner, repo, "branches", branch, "protection"] if get => {
+            debug_assert!(!owner.is_empty() && !repo.is_empty());
+            // Reading protection is repository administration, as it is on GitHub.
+            if !carries(state, authorization, "administration") {
+                return Some((
+                    403,
+                    None,
+                    r#"{"message":"Resource not accessible by integration"}"#.to_owned(),
+                ));
+            }
+            match state.protection.get(&format!("{owner}/{repo}@{branch}")) {
+                Some(required) => (
+                    200,
+                    None,
+                    serde_json::json!({
+                        "required_status_checks": serde_json::from_str::<serde_json::Value>(required)
+                            .unwrap_or(serde_json::Value::Null),
+                    })
+                    .to_string(),
+                ),
+                None => not_found(),
+            }
+        }
+        [
+            "repos",
+            owner,
+            repo,
+            "branches",
+            branch,
+            "protection",
+            "required_status_checks",
+        ] if patch => {
+            debug_assert!(!owner.is_empty() && !repo.is_empty());
+            if !carries(state, authorization, "administration") {
+                return Some((
+                    403,
+                    None,
+                    r#"{"message":"Resource not accessible by integration"}"#.to_owned(),
+                ));
+            }
+            let key = format!("{owner}/{repo}@{branch}");
+            if !state.protection.contains_key(&key) {
+                return Some(not_found());
+            }
+            let mut required = serde_json::json!({
+                "strict": sent["strict"].as_bool().unwrap_or(false),
+                "checks": sent["checks"].clone(),
+            });
+            // GitHub states a context with no App as `app_id: null`.
+            if let Some(checks) = required["checks"].as_array_mut() {
+                for check in checks {
+                    if check.get("app_id").is_none() {
+                        check["app_id"] = serde_json::Value::Null;
+                    }
+                }
+            }
+            state.protection.insert(key, required.to_string());
+            (
+                200,
+                None,
+                serde_json::json!({"required_status_checks": required}).to_string(),
             )
         }
         ["repos", owner, repo, "pulls"] if get => {
@@ -793,6 +940,15 @@ fn pull_json(pull: &Pull) -> serde_json::Value {
         "head": {"ref": pull.branch, "sha": pull.head},
         "base": {"ref": pull.base},
     })
+}
+
+/// Whether the token a request carried was minted to include `permission`: GitHub scopes an
+/// installation token to what it was asked for and refuses the protected resources it lacks, so a
+/// token minted without repository administration cannot read or write branch protection.
+fn carries(state: &Inner, authorization: Option<&str>, permission: &str) -> bool {
+    authorization
+        .and_then(|token| state.installation_tokens.get(token))
+        .is_some_and(|permissions| permissions.get(permission).is_some())
 }
 
 fn protection_declined() -> Answer {
