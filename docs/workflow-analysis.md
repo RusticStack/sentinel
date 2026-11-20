@@ -133,6 +133,10 @@ The default output is a unified diff per workflow, and it changes label lines an
 
 The gate is on the bytes: the plan records every change as the whole lines it replaces (`before`) and produces (`after`), the diff is rendered from those records, and the generator applies them and **analyses the result again** before it answers. The re-analysis must show the same workflow with the intended class on the changed jobs and every other recorded fact of every job identical — steps, matrix, needs, secrets, constructs — or the plan is refused (`PlanError::Unverified`) rather than shown with a diff that landed somewhere it did not mean. A text whose label is not where the inventory read it is refused as `PlanError::Rewrite`. Tokens come from the YAML parser's own positions ([`yaml::spans`](../crates/sentinel-pipeline/src/yaml.rs)), so a `runs-on:` written inside a `run:` block is never mistaken for a label.
 
+The PR that would carry the diff is H04's; what proves the migration before it is switched is the
+shadow beside each migrated job and the parity of the pairs over a window of commits
+([shadow parity](shadow-parity.md)).
+
 ### The native pipeline
 
 On request the plan also carries a `.sentinel.yml` per workflow, built from the inventory and the rule table ([`rules.rs`](../crates/sentinel-pipeline/src/workflow/rules.rs)) — the tables are read, never copied:

@@ -3,7 +3,7 @@
 use super::{
     Diagnostic, EvidenceReference, FailureClass, MAX_DIAGNOSTIC_LABEL_BYTES,
     MAX_DIAGNOSTIC_MESSAGE_BYTES, MAX_REPORT_DIAGNOSTICS, ReportFormat, ReportInput, Severity,
-    SourceReference, StepReference, TestReference,
+    SourceReference, StepReference, TestCounts, TestReference,
 };
 use quick_xml::{
     XmlVersion,
@@ -35,6 +35,10 @@ pub struct ParseResult {
     pub malformed_records: u64,
     pub omitted_diagnostics: u64,
     pub bytes_scanned: u64,
+    /// What the report stated about the tests it ran, for the formats that say so. `None` is a report
+    /// that carries no test results at all (a compiler's output), never zero tests: a report that ran
+    /// none says `Some(TestCounts::default())`.
+    pub tests: Option<TestCounts>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +63,7 @@ impl ParseResult {
             malformed_records: 0,
             omitted_diagnostics: 0,
             bytes_scanned: 0,
+            tests: None,
         }
     }
 
@@ -78,10 +83,22 @@ impl ParseResult {
         self.malformed_records = self.malformed_records.saturating_add(1);
         self.complete = false;
     }
+
+    /// One test record: the terminal outcome a report states for a test, counted once.
+    fn count_test(&mut self, failed: bool, skipped: bool) {
+        let counts = self.tests.get_or_insert_with(TestCounts::default);
+        counts.total = counts.total.saturating_add(1);
+        if failed {
+            counts.failed = counts.failed.saturating_add(1);
+        } else if skipped {
+            counts.skipped = counts.skipped.saturating_add(1);
+        }
+    }
 }
 
 pub fn parse_go_test_json(input: &[u8], step: StepReference) -> ParseResult {
     let mut result = ParseResult::new(ReportFormat::GoTestJson, input.len());
+    result.tests = Some(TestCounts::default());
     let mut lines = JsonLines::new(input);
     let mut output_by_test: HashMap<u64, TestOutput> = HashMap::new();
     let mut failed_packages: HashMap<u64, String> = HashMap::new();
@@ -134,6 +151,9 @@ pub fn parse_go_test_json(input: &[u8], step: StepReference) -> ParseResult {
                 }
             }
             "fail" => {
+                if !test.is_empty() {
+                    result.count_test(true, false);
+                }
                 if test.is_empty()
                     && let Some(failed_package) = failed_packages.get(&test_key(package, ""))
                 {
@@ -204,6 +224,9 @@ pub fn parse_go_test_json(input: &[u8], step: StepReference) -> ParseResult {
                 );
             }
             "pass" | "skip" => {
+                if !test.is_empty() {
+                    result.count_test(false, action == "skip");
+                }
                 output_by_test.remove(&key);
             }
             _ => {}
@@ -320,6 +343,7 @@ pub fn parse_rust_compiler_json(input: &[u8], step: StepReference) -> ParseResul
 
 pub fn parse_junit_xml(input: &[u8], step: Option<StepReference>) -> ParseResult {
     let mut result = ParseResult::new(ReportFormat::JunitXml, input.len());
+    result.tests = Some(TestCounts::default());
     let bounded = &input[..input.len().min(MAX_PARSER_INPUT_BYTES)];
     let mut reader = Reader::from_reader(bounded);
     reader.config_mut().check_end_names = true;
@@ -927,6 +951,7 @@ fn push_junit_case(
     end: u64,
     step: Option<&StepReference>,
 ) {
+    result.count_test(case.failure.is_some(), case.skipped);
     if let Some(failure) = case.failure {
         let message = if failure.message.is_empty() {
             format!("test failed: {}", case.name)
@@ -1102,6 +1127,47 @@ mod tests {
 
         let unresolved = br#"<testsuite><testcase name="bad"><failure>&custom;</failure></testcase></testsuite>"#;
         assert!(!parse_junit_xml(unresolved, None).complete);
+    }
+
+    #[test]
+    fn a_report_states_the_tests_it_ran_and_one_that_ran_none_states_zero() {
+        let xml = br#"<testsuite><testcase name="Pass"/><testcase name="Fail"><failure message="broken"/></testcase><testcase name="Skip"><skipped/></testcase><testcase name="Empty"/></testsuite>"#;
+        let parsed = parse_junit_xml(xml, None);
+        assert_eq!(
+            parsed.tests,
+            Some(TestCounts {
+                total: 4,
+                failed: 1,
+                skipped: 1
+            })
+        );
+        // A suite with no test cases states zero tests; it is not a report that says nothing.
+        let empty = parse_junit_xml(b"<testsuite></testsuite>", None);
+        assert_eq!(empty.tests, Some(TestCounts::default()));
+        // A compiler's output carries no test results at all.
+        assert_eq!(
+            parse_rust_compiler_json(b"", step()).tests,
+            None,
+            "a report with no test records is not a report of zero tests"
+        );
+
+        let go = concat!(
+            "{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestA\"}\n",
+            "{\"Action\":\"pass\",\"Package\":\"p\",\"Test\":\"TestA\"}\n",
+            "{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestB\"}\n",
+            "{\"Action\":\"fail\",\"Package\":\"p\",\"Test\":\"TestB\"}\n",
+            "{\"Action\":\"skip\",\"Package\":\"p\",\"Test\":\"TestC\"}\n",
+            // A package-level failure is the package's own verdict, not another test.
+            "{\"Action\":\"fail\",\"Package\":\"p\"}\n"
+        );
+        assert_eq!(
+            parse_go_test_json(go.as_bytes(), step()).tests,
+            Some(TestCounts {
+                total: 3,
+                failed: 1,
+                skipped: 1
+            })
+        );
     }
 
     fn validates(parsed: &ParseResult) {

@@ -895,6 +895,7 @@ fn unreadable(format: ReportFormat) -> ParseResult {
         malformed_records: 1,
         omitted_diagnostics: 0,
         bytes_scanned: 0,
+        tests: None,
     }
 }
 
