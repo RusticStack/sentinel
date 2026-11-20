@@ -8,7 +8,10 @@ use sentinel_core::{
     PoolId, RepoId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Namespace, Permissions, Principal},
 };
-use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
+use sentinel_protocol::{
+    cache::Trust,
+    negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion},
+};
 use sentinel_store::{
     auth::{self, NamespaceKind, provisioning},
     dispatch::{self, Capacity},
@@ -417,6 +420,84 @@ fn a_job_binds_to_the_runner_the_lease_registered_and_completion_ends_it() {
     let row = runner_provision::get(&f.conn, lease.id).unwrap().unwrap();
     assert_eq!(row.reason.as_deref(), Some(JOB_COMPLETED));
     assert_eq!(row.job, Some(7));
+}
+
+/// AR06: the boundary the controller states for a lease comes from the row the delivery wrote — the
+/// tenant and repository the lease was minted for, the GitHub run and job, and the trust the fork flag
+/// decides — and a lease no job has taken states nothing, because nothing about its job is known.
+#[test]
+fn a_bound_lease_states_its_boundary_and_an_unclaimed_one_states_nothing() {
+    let f = fixture();
+    let w = worker(&f, 32_000, 64 << 30, &[CLASS]);
+    queued(&f, 7, CLASS);
+    // The fork fact is written once, by the delivery that created the row, and never rewritten.
+    let lease = place(&f, w, NOW).expect("demand");
+    accepting(&f, &lease, NOW);
+    // Nothing has taken it: a sandbox built now would serve no cache call.
+    assert!(
+        runner_provision::bound_scopes(&f.conn, w)
+            .unwrap()
+            .is_empty()
+    );
+    let tx = f.conn.unchecked_transaction().unwrap();
+    runner_provision::bind(&tx, f.tenant, f.repo, &lease.runner_name, 7, NOW).unwrap();
+    tx.commit().unwrap();
+
+    let scopes = runner_provision::bound_scopes(&f.conn, w).unwrap();
+    assert_eq!(scopes.len(), 1);
+    let scope = scopes[0];
+    assert_eq!(scope.lease, lease.id);
+    assert_eq!(scope.tenant, f.tenant);
+    assert_eq!(scope.repo, f.repo);
+    assert_eq!(scope.job, 7);
+    // `queued` wrote run 7 too, and the trust is the ordinary pool's.
+    assert_eq!(scope.run, 7);
+    assert_eq!(scope.trust, Trust::Protected);
+
+    // Another machine has nothing of this worker's leases to state.
+    let other = worker(&f, 32_000, 64 << 30, &[CLASS]);
+    assert!(
+        runner_provision::bound_scopes(&f.conn, other)
+            .unwrap()
+            .is_empty()
+    );
+
+    // A released lease states nothing either: its runner is gone.
+    let tx = f.conn.unchecked_transaction().unwrap();
+    runner_provision::complete(&tx, f.tenant, f.repo, 7, JOB_COMPLETED, at(9_000)).unwrap();
+    tx.commit().unwrap();
+    assert!(
+        runner_provision::bound_scopes(&f.conn, w)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A fork job's boundary is the untrusted one, and it is the delivery's own row that says so.
+#[test]
+fn a_fork_jobs_boundary_is_pull_request_and_a_trusted_jobs_is_protected() {
+    let f = fixture();
+    let tx = f.conn.unchecked_transaction().unwrap();
+    assert!(tenancy::set_pool_fork(&tx, Authority::HostLocal, f.pool, true).unwrap());
+    tx.commit().unwrap();
+    opt_in(&f);
+    let w = worker(&f, 32_000, 64 << 30, &[CLASS]);
+    f.conn
+        .execute(
+            "INSERT INTO runner_jobs(tenant_id, repo_id, job_id, run_id, class, state_code,
+                runner, conclusion, queued_ms, started_ms, completed_ms, fork_pr)
+             VALUES (?1, ?2, 9, 90, ?3, 0, NULL, NULL, ?4, NULL, NULL, 1)",
+            rusqlite::params![f.tenant.as_bytes(), f.repo.as_bytes(), CLASS, NOW.0],
+        )
+        .unwrap();
+    let lease = place(&f, w, NOW).expect("a fork job is demand on a fork pool");
+    accepting(&f, &lease, NOW);
+    let tx = f.conn.unchecked_transaction().unwrap();
+    runner_provision::bind(&tx, f.tenant, f.repo, &lease.runner_name, 9, NOW).unwrap();
+    tx.commit().unwrap();
+    let scope = runner_provision::bound_scopes(&f.conn, w).unwrap()[0];
+    assert_eq!(scope.trust, Trust::PullRequest);
+    assert_eq!((scope.run, scope.job), (90, 9));
 }
 
 #[test]

@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    fs,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -439,6 +440,72 @@ struct HeldRunner {
     memory_bytes: u64,
     /// Set while the sandbox runs: stopping the lease stops it.
     running: Option<Arc<AtomicBool>>,
+    /// The boundary the lease's job may read and write, once the controller states it. Absent, the
+    /// sandbox's endpoint refuses every cache and artifact call rather than serving a guessed scope.
+    scope: Option<sentinel_link::session::RunnerScopeWire>,
+    /// This sandbox's own cache and artifact endpoint, up while its runner is (AR06).
+    actions: Option<Arc<SandboxActions>>,
+}
+
+/// One sandbox's cache and artifact endpoint: its own authority, the anchor staged under its own
+/// directory, and the listener its resolver answer names.
+struct SandboxActions {
+    endpoint: sentinel_actions::Endpoint,
+}
+
+impl SandboxActions {
+    /// Binds the sandbox's endpoint and stages its anchor, on the first address of the worker's block
+    /// this sandbox can have. One listener serves one boundary, so two live sandboxes are two
+    /// addresses; a worker whose block is too small, or whose first address the host does not hold,
+    /// serves nothing rather than serving two jobs through one scope.
+    fn bind(
+        root: &Path,
+        dir: &Path,
+        lease: [u8; 16],
+        base: std::net::Ipv4Addr,
+    ) -> Option<(Self, std::net::Ipv4Addr)> {
+        use std::net::{IpAddr, SocketAddr};
+        let label = crate::runner::hex16(sentinel_core::RunnerLeaseId::from_bytes(lease).ok()?);
+        let ca = sentinel_actions::SandboxCa::generate(&label).ok()?;
+        fs::create_dir_all(dir).ok()?;
+        ca.write_anchor(dir).ok()?;
+        let store = Arc::new(sentinel_actions::Store::new(&root.join("actions")));
+        for step in 0..crate::runner::ACTIONS_ADDRESSES {
+            let octets = base.octets();
+            let last = u32::from(octets[3]) + u32::from(step);
+            if last > u32::from(u8::MAX) {
+                break;
+            }
+            let address = std::net::Ipv4Addr::from([octets[0], octets[1], octets[2], last as u8]);
+            let listener = SocketAddr::new(IpAddr::V4(address), crate::runner::ACTIONS_PORT);
+            if let Ok(endpoint) =
+                sentinel_actions::Endpoint::bind(&ca, Arc::clone(&store), listener)
+            {
+                return Some((SandboxActions { endpoint }, address));
+            }
+        }
+        None
+    }
+
+    fn scope(&self, wire: &sentinel_link::session::RunnerScopeWire) {
+        let Ok(tenant) = sentinel_core::TenantId::from_bytes(wire.tenant) else {
+            return;
+        };
+        let Ok(repo) = sentinel_core::RepoId::from_bytes(wire.repo) else {
+            return;
+        };
+        let Some(trust) = sentinel_protocol::cache::Trust::from_u8(wire.trust) else {
+            return;
+        };
+        let arch = if cfg!(target_arch = "aarch64") {
+            sentinel_protocol::negotiate::Arch::Aarch64
+        } else {
+            sentinel_protocol::negotiate::Arch::X86_64
+        };
+        self.endpoint.bind_scope(sentinel_actions::Scope::with_job(
+            tenant, repo, trust, arch, wire.run, wire.job,
+        ));
+    }
 }
 
 /// The most runner leases one worker holds at once.
@@ -1864,6 +1931,8 @@ impl LinkExecutor for Executor {
                 cpu_millis: lease.cpu_millis,
                 memory_bytes: lease.memory_bytes,
                 running: None,
+                scope: None,
+                actions: None,
             },
         );
         true
@@ -1874,9 +1943,9 @@ impl LinkExecutor for Executor {
     /// input, and the bytes are wiped when the runner ends. A configuration this worker cannot use
     /// is wiped here and the lease is dropped, so nothing can start later from it.
     fn runner_config(&self, lease: [u8; 16], mut config: Vec<u8>) {
-        let (image, guard) = match self.runner_policy.get() {
+        let (image, guard, address) = match self.runner_policy.get() {
             Some(policy) => match &policy.image {
-                Some(image) => (image.clone(), policy.guard.clone()),
+                Some(image) => (image.clone(), policy.guard.clone(), policy.actions),
                 None => {
                     wipe(&mut config);
                     return;
@@ -1887,6 +1956,12 @@ impl LinkExecutor for Executor {
                 return;
             }
         };
+        let Some(address) = address else {
+            // A worker that states no endpoint address starts no runner: its cache and artifacts would
+            // go to GitHub's storage, which is what AR06 exists to prevent.
+            wipe(&mut config);
+            return;
+        };
         let id = match sentinel_core::RunnerLeaseId::from_bytes(lease) {
             Ok(id) => id,
             Err(_) => {
@@ -1894,55 +1969,115 @@ impl LinkExecutor for Executor {
                 return;
             }
         };
-        let mut state = self.state();
+        let state = self.state();
         let network = state.network;
-        let Some(held) = state.runners.get_mut(&lease) else {
+        // What the sandbox is built from, read under the lock and then carried: the configuration is
+        // spent in one go, so nothing below needs a borrow of the held set.
+        let (cpu_millis, memory_bytes, scope) = match state.runners.get(&lease) {
             // A lease this worker no longer holds is not asked about: the configuration is a
             // credential, and one it cannot use is dropped rather than kept.
-            drop(state);
-            wipe(&mut config);
-            return;
+            None => {
+                drop(state);
+                wipe(&mut config);
+                return;
+            }
+            Some(held) if held.running.is_some() => {
+                drop(state);
+                wipe(&mut config);
+                return;
+            }
+            Some(held) => (held.cpu_millis, held.memory_bytes, held.scope),
         };
-        if held.running.is_some() {
-            drop(state);
-            wipe(&mut config);
-            return;
-        }
+        drop(state);
         let limits = podman::Limits {
-            cpu_millis: u32::try_from(held.cpu_millis).unwrap_or(u32::MAX),
-            memory_bytes: held.memory_bytes,
+            cpu_millis: u32::try_from(cpu_millis).unwrap_or(u32::MAX),
+            memory_bytes,
             pids: crate::runner::PIDS,
             disk_bytes: 0,
             lifetime_secs: 0,
         };
-        let plan =
-            crate::runner::Plan::new(&self.root, self.worker, id, &image, limits, network, &guard);
-        match plan {
-            Ok(plan) => {
-                let cancel = Arc::new(AtomicBool::new(false));
-                held.running = Some(Arc::clone(&cancel));
-                let inner = Arc::clone(&self.0);
-                drop(state);
-                let spawned = thread::Builder::new()
-                    .name(plan.name().to_owned())
-                    .spawn(move || inner.run_sandbox(id, plan, config, cancel));
-                if spawned.is_err() {
-                    // No thread, no runner: the configuration is wiped and the lease is dropped, so
-                    // the controller's idle bound retires it rather than leaving it live.
-                    (self.notify)(Notice::RunnerFailed {
-                        lease: id,
-                        error: "the worker could not start a thread for the runner".to_owned(),
-                    });
-                    self.state().runners.remove(&lease);
-                }
-            }
+        let dir = self.root.join("runners").join(crate::runner::hex16(id));
+        let Some((actions, address)) = SandboxActions::bind(&self.root, &dir, lease, address)
+            .map(|(actions, address)| (Arc::new(actions), address))
+        else {
+            wipe(&mut config);
+            (self.notify)(Notice::RunnerFailed {
+                lease: id,
+                error: "the sandbox's cache and artifact endpoint could not be bound".to_owned(),
+            });
+            self.state().runners.remove(&lease);
+            return;
+        };
+        // A boundary that arrived before the configuration is applied now, so a job's first cache
+        // call is already inside it.
+        if let Some(scope) = scope {
+            actions.scope(&scope);
+        }
+        let wiring = crate::runner::Actions {
+            address,
+            anchor: crate::runner::Actions::anchor_of(&dir),
+        };
+        let plan = match crate::runner::Plan::new(
+            &self.root,
+            self.worker,
+            id,
+            &image,
+            limits,
+            &crate::runner::Grant {
+                network,
+                guard: &guard,
+                actions: Some(&wiring),
+            },
+        ) {
+            Ok(plan) => plan,
             // A sandbox this worker cannot build is a lease it cannot serve: the configuration is
             // wiped and the lease dropped, so nothing can start from it later.
             Err(_) => {
-                drop(state);
                 wipe(&mut config);
                 self.state().runners.remove(&lease);
+                return;
             }
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = self.state();
+            let Some(held) = state.runners.get_mut(&lease) else {
+                drop(state);
+                wipe(&mut config);
+                return;
+            };
+            held.running = Some(Arc::clone(&cancel));
+            held.actions = Some(Arc::clone(&actions));
+        }
+        let inner = Arc::clone(&self.0);
+        let spawned = thread::Builder::new()
+            .name(plan.name().to_owned())
+            .spawn(move || {
+                let _endpoint = actions;
+                inner.run_sandbox(id, plan, config, cancel)
+            });
+        if spawned.is_err() {
+            // No thread, no runner: the configuration is wiped and the lease is dropped, so the
+            // controller's idle bound retires it rather than leaving it live.
+            (self.notify)(Notice::RunnerFailed {
+                lease: id,
+                error: "the worker could not start a thread for the runner".to_owned(),
+            });
+            self.state().runners.remove(&lease);
+        }
+    }
+
+    /// The boundary the lease's job may read and write, stated by the controller once GitHub names the
+    /// job. It reaches the sandbox's endpoint immediately when one is up, and is remembered when the
+    /// configuration has not arrived yet.
+    fn runner_scoped(&self, lease: [u8; 16], scope: sentinel_link::session::RunnerScopeWire) {
+        let mut state = self.state();
+        let Some(held) = state.runners.get_mut(&lease) else {
+            return;
+        };
+        held.scope = Some(scope);
+        if let Some(actions) = &held.actions {
+            actions.scope(&scope);
         }
     }
 

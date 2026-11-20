@@ -98,6 +98,29 @@ head repository the parser cannot read counts as a fork, because what cannot be 
 repository's own code is hostile. It is stored once, on the delivery and on the job, and never
 rewritten.
 
+## Cache and artifacts on the worker's own disk
+
+A runner-mode job's `actions/cache`, the `setup-*` actions' caches and `upload-artifact`/`download-artifact`
+are served from the worker host's NVMe, not from GitHub's storage: inside each sandbox the two service
+hosts resolve to a Sentinel endpoint on the worker, a certificate authority minted with that sandbox
+lets the endpoint terminate their TLS, and everything else GitHub's runner talks to is untouched
+([cache and artifacts](actions-cache.md)).
+
+- The sandbox is built with two `/etc/hosts` entries, one read-only mount of **its own** anchor at
+  `/sentinel-ca/ca.crt`, and `NODE_EXTRA_CA_CERTS` naming that path — a path, never a secret, so the
+  container still carries no secret of Sentinel's in its environment.
+- A worker serves runner mode only when its `[runner]` states `actions_address`, the address its
+  sandboxes reach that endpoint on. A worker that states the image and no address declines every
+  runner lease: its runners' caches and artifacts would go to GitHub's storage
+  ([configuration](configuration.md#runner-image)).
+- The boundary — tenant, repository, trust, platform — is the lease's, stated by the controller once a
+  delivery binds the job; a sandbox that has not been told refuses every cache and artifact call, and
+  a fork job's writes land in a scope no trusted job reads.
+
+This release serves the endpoint, the authority, the name answers and the boundary; that a real
+`actions/runner` in a rootless sandbox reaches it, and the pilots' measured restore and upload times,
+are AR03's host suite and the benchmark wave ([cache and artifacts](actions-cache.md#what-this-release-verifies-and-what-it-cannot)).
+
 ## The shadow, and parity
 
 A repository migrating by `runs-on:` first runs a non-required copy of each migrated job with a
@@ -116,12 +139,17 @@ Actions read and the self-hosted-runner grant ([GitHub App](github-app.md#runner
 nothing in the runner path calls a secrets endpoint, and a runner-mode job has no run spec and no
 delivery bundle, so no secret of any kind travels over the worker link for it. The secrets a workflow
 names exist only inside the runner process, for the life of the job, and die with the container.
-Sentinel records lifecycle and timing only; job logs, annotations and artifacts stay on GitHub, so it
-never stores what the runner masks.
+Sentinel records lifecycle and timing only; job logs and annotations stay on GitHub. Artifacts do not:
+`upload-artifact` is served from the worker's own disk ([cache and artifacts](actions-cache.md)), a
+zip of files the job chose to upload rather than anything the runner masks, and the version of it
+GitHub would have stored is never written there.
 
 ## What this release verifies, and what it cannot
 
-The tests named above, the fork-policy tests in
+The cache and artifact endpoint's own tests, named in
+[cache and artifacts](actions-cache.md#what-this-release-verifies-and-what-it-cannot), cover the
+sandbox's wiring and the boundary; the tests named here cover provisioning and the credential. The
+fork-policy tests in
 [`runner_provision`](../crates/sentinel-store/tests/runner_provision.rs),
 [`runner`](../crates/sentinel-intake/tests/runner.rs) and
 [`runner_admin`](../crates/sentinel/tests/runner_admin.rs), and the parser's fork cases cover the

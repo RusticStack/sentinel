@@ -296,6 +296,16 @@ Runner mode's capacity is leased over the same session as a pipeline job's, and 
 
 Its tests are `crates/sentinel-link/tests/runner_mode.rs` — a burst of queued jobs gets one runner each, a configuration is delivered once and never again, a worker that does not name the class is never offered one, a lost `queued` event is recovered by reconciliation, an idle runner is stopped and de-registered at its bound, and the configuration reaches no log, record, bundle, environment listing or workspace — over a real TLS session and a recorded GitHub fake. The lease's own lifecycle is `crates/sentinel-store/tests/runner_provision.rs`, and the App's calls are `crates/sentinel-github/tests/runner.rs`.
 
+## Protocol 17: the sandbox's boundary
+
+A runner-mode sandbox serves its job's `actions/cache` and artifact calls from the worker's own disk, and what it may read and write is the controller's statement, not the client's ([cache and artifacts](actions-cache.md)).
+
+- **Scope.** `RunnerScope { lease, scope }` names the boundary the lease's job may read and write: the tenant and repository the lease was minted for, the trust its provenance allows, and the GitHub run and job the delivery named. It is sent once a `workflow_job` delivery binds the job to the runner this store registered under that name — the first moment a fork is known — and it is a pulse rather than a queue: the controller states the bound leases of every live worker on each pass, and a frame that is missed is stated again on the next.
+- **What a worker does with it.** It hands it to the sandbox's endpoint before the job's first cache call, and remembers it when the configuration has not arrived yet. A sandbox that never receives one serves no cache or artifact call at all (`403`, `refusal: "unscoped"`): there is no scope that is always right to assume, and a refusal costs a rebuild where a guess costs a boundary.
+- **Version.** `ACTIONS_MIN` is 17. A session below it is never sent one, so its sandboxes refuse every call rather than write into a boundary nobody stated; a frame on such a session is a protocol error rather than a message quietly skipped. A trust byte that does not decode, or an id that is not an id, is a protocol error too.
+
+Its tests are in `crates/sentinel-actions/src/endpoint.rs` — the boundary a listener serves, a fork's write never reaching a trusted scope in either direction, an unscoped sandbox serving nothing, and the same rules over a real TLS session — and the query behind the pulse is `crates/sentinel-store/src/runner_provision.rs::bound_scopes`.
+
 ## Protocol 14: declared outputs and artifact handoff
 
 A job's dependencies' declared outputs reach it in its context, and an artifact of a job it needs is fetched over the

@@ -166,6 +166,32 @@ pub fn deliver(sender: &Sender, lease: RunnerLeaseId, config: Vec<u8>) -> Result
     sender.send_sensitive(&message)
 }
 
+/// Tell one worker the boundary the job its lease took may read and write. Sent once the delivery
+/// names the job, which is the first moment a fork is known; until then the sandbox serves nothing.
+pub fn scope_lease(
+    sender: &Sender,
+    lease: RunnerLeaseId,
+    tenant: TenantId,
+    repo: sentinel_core::RepoId,
+    trust: sentinel_protocol::cache::Trust,
+    run: u64,
+    job: u64,
+) -> Result<()> {
+    session::push(
+        sender,
+        &crate::session::ServerMessage::RunnerScope {
+            lease: *lease.as_bytes(),
+            scope: crate::session::RunnerScopeWire {
+                tenant: *tenant.as_bytes(),
+                repo: *repo.as_bytes(),
+                trust: trust.to_u8(),
+                run,
+                job,
+            },
+        },
+    )
+}
+
 /// Tell a worker which leases it no longer holds.
 pub fn stop(sender: &Sender, leases: &[RunnerLeaseId]) -> Result<()> {
     session::push(

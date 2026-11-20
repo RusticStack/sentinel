@@ -9,6 +9,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{RepoId, RunnerClass, RunnerLeaseId, TenantId, UnixMillis, WorkerId};
+use sentinel_protocol::cache::Trust;
 
 use crate::{Error, Result, dispatch};
 
@@ -689,6 +690,69 @@ pub fn bind(
     Ok(Some(
         RunnerLeaseId::from_bytes(id).map_err(|_| Error::Corrupt("runner lease id"))?,
     ))
+}
+
+/// The boundary one bound lease's job may read and write, as the controller states it to the worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoundScope {
+    pub lease: RunnerLeaseId,
+    pub tenant: TenantId,
+    pub repo: RepoId,
+    pub trust: Trust,
+    pub run: u64,
+    pub job: u64,
+}
+
+/// The most boundaries one pass states: a worker holds at most this many runners.
+const MAX_SCOPES: usize = 32;
+
+/// The leases of `worker` that a job has taken, with the boundary its provenance allows: the tenant and
+/// repository the lease was minted for, the trust the job's fork flag decides, and the GitHub run and
+/// job the delivery named. A lease nobody has taken is not here, because nothing about its job is known
+/// yet — and a sandbox with no boundary serves nothing rather than guessing one.
+pub fn bound_scopes(conn: &Connection, worker: WorkerId) -> Result<Vec<BoundScope>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT l.id, l.tenant_id, l.repo_id, l.job_id, j.run_id, j.fork_pr
+         FROM runner_leases l
+         JOIN runner_jobs j ON j.tenant_id = l.tenant_id AND j.repo_id = l.repo_id
+                           AND j.job_id = l.job_id
+         WHERE l.worker_id = ?1 AND l.job_id IS NOT NULL AND l.released_ms IS NULL
+         ORDER BY l.id
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![worker.as_bytes(), MAX_SCOPES as i64], |r| {
+        Ok((
+            r.get::<_, [u8; 16]>(0)?,
+            r.get::<_, [u8; 16]>(1)?,
+            r.get::<_, [u8; 16]>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, Option<i64>>(5)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (lease, tenant, repo, job, run, fork) = row?;
+        let Ok(lease) = RunnerLeaseId::from_bytes(lease) else {
+            continue;
+        };
+        let (Ok(tenant), Ok(repo)) = (TenantId::from_bytes(tenant), RepoId::from_bytes(repo))
+        else {
+            continue;
+        };
+        let (Ok(job), Ok(run)) = (u64::try_from(job), u64::try_from(run)) else {
+            continue;
+        };
+        out.push(BoundScope {
+            lease,
+            tenant,
+            repo,
+            trust: Trust::of_runner_job(fork.is_some_and(|f| f != 0)),
+            run,
+            job,
+        });
+    }
+    Ok(out)
 }
 
 /// The GitHub job finished (or was cancelled): end the lease that took it. A job no lease took —

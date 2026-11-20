@@ -312,6 +312,7 @@ its own configuration:
 ```toml
 [runner]
 image = "ghcr.io/rusticstack/sentinel-runner@sha256:0f2c…"
+actions_address = "10.0.2.2"
 ```
 
 - **The reference must be pinned by digest.** A tag — even one that looks immutable — is refused with
@@ -325,8 +326,14 @@ image = "ghcr.io/rusticstack/sentinel-runner@sha256:0f2c…"
   job's just-in-time configuration from standard input and execs the runner with `--jitconfig`. The
   configuration is never an argument, an environment value or a file on the host
   ([runner mode](runner-mode.md#the-configuration-is-a-credential)).
-- This key applies to the worker role only; `[runner]` beside the server role's configuration is
-  refused. An older worker refuses the key as unknown rather than ignoring it.
+- **`actions_address` is where a sandbox reaches this worker's cache and artifact endpoint**
+  ([cache and artifacts](actions-cache.md#operating-it)): the host address as the sandbox's network
+  spells it, an IPv4 address, refused as `runner.actions_address must be an IPv4 address, as in
+  10.0.2.2` otherwise. It is required for a worker to serve a runner: a worker that states the image
+  and no address declines every lease, because its runners' `actions/cache` and `upload-artifact`
+  traffic would otherwise land in GitHub's storage.
+- These keys apply to the worker role only; `[runner]` beside the server role's configuration is
+  refused. An older worker refuses them as unknown rather than ignoring them.
 
 ### Remote cache
 

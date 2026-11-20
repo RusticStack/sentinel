@@ -126,6 +126,10 @@ struct RunnerFile {
     /// `registry/repository@sha256:<64 hex>`: a tag is refused, because the same tag is another
     /// image tomorrow and this one runs the code a job's steps were written against.
     image: String,
+    /// The address a runner sandbox reaches this worker's cache and artifact endpoint on, as the
+    /// sandbox network spells it (the host's own address in the sandbox). Required: a worker that
+    /// states none serves no runner, because its runners' caches and artifacts would go to GitHub.
+    actions_address: Option<String>,
 }
 
 /// The microVM executor's setup (plan 16.8): Firecracker, the pinned guest kernel, the static guest agent.
@@ -727,6 +731,8 @@ struct WorkerLink {
     microvm: Option<MicrovmSetup>,
     /// The runner image this worker starts from, pinned by digest; absent, it serves no runner.
     runner_image: Option<String>,
+    /// The address a runner sandbox reaches this worker's cache and artifact endpoint on (AR06).
+    runner_actions: Option<std::net::Ipv4Addr>,
     disk_bytes: Option<u64>,
     spool_reserve_bytes: Option<u64>,
     spool_quota_bytes: Option<u64>,
@@ -1103,6 +1109,20 @@ impl Config {
                             }
                         })
                         .transpose()?;
+                    let runner_actions = file
+                        .runner
+                        .as_ref()
+                        .map(|runner| match runner.actions_address.as_deref() {
+                            Some(text) => text.parse::<std::net::Ipv4Addr>().map(Some).map_err(|_| {
+                                Error::config(
+                                    "runner.actions_address must be an IPv4 address, as in 10.0.2.2",
+                                )
+                            }),
+                            // No address is no runner: the sandbox would cache and archive at GitHub.
+                            None => Ok(None),
+                        })
+                        .transpose()?
+                        .flatten();
                     if [
                         file.cache_budget_bytes,
                         file.mirror_budget_bytes,
@@ -1163,6 +1183,7 @@ impl Config {
                         job_network,
                         isolation,
                         runner_image,
+                        runner_actions,
                         microvm: file.microvm.map(|m| MicrovmSetup {
                             firecracker: m.firecracker,
                             kernel: m.kernel,
@@ -3541,6 +3562,7 @@ mod worker_role {
                         vec![controller, link.controller]
                     },
                 },
+                actions: link.runner_actions,
             },
             runtime,
             Arc::clone(&metrics),
