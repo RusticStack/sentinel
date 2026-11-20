@@ -164,12 +164,23 @@ is on it.
 5. `POST /ai/requests/{id}/complete` settles the row exactly once, with the answer or the reason
    there is none and what the provider reported, and revokes the delegation in the same write. A
    settled request's delegation no longer authenticates; a request past its deadline has none left
-   either.
+   either. A second settlement is `409`, and a settlement for a row that is gone — a disable
+   deleted the tenant's queue — is `not_found`, so a process that was working when either happened
+   learns which it was and neither leaves a half-settled row behind.
 
 The row moves `queued` → `claimed` → `settled` and never back. `GET /api/v1/ai/requests/{id}`
 answers a member who can read its repository, so the answer the process stored is where Y05 reads
 it from, and `crates/sentinel-api/tests/ai_requests.rs` proves the two halves the row's gate names:
 a delegation cannot read past the requester, and a `local_only` request reaches no public host.
+
+**The provider call is bounded by the request's own deadline.** `sentinel-ai` gives the model the
+time the row has left and no more, and a request whose deadline has already passed is never sent to
+a provider at all. A provider that accepts the connection and never answers therefore ends one
+request `unavailable` with `provider: the request deadline passed before the provider answered`,
+rather than holding the poll: the loop that was waiting is free to take the next request, which is
+the difference between losing one request and losing the tenant's whole queue for as long as the
+provider misbehaves. `ai/test/isolation.test.mjs` proves both halves with a fake client that never
+completes.
 
 ## Budgets
 
@@ -429,7 +440,15 @@ suggestions, the read-only MCP tools that expose analyses — are [plan
 Verification of this package is local: `pnpm typecheck` and
 `cd ai && node --import ./test/ts-register.mjs --test test/*.test.mjs`, both of which contact no
 provider — the provider tests run against a recording fake HTTP client, and the controller tests
-run over the API in `crates/sentinel-api/tests/ai_requests.rs` and `ai_budget.rs`. The budget's own
+run over the API in `crates/sentinel-api/tests/ai_requests.rs` and `ai_budget.rs`.
+
+The failure drills are the Y10 set: `crates/sentinel-api/tests/ai_isolation.rs` drives a provider
+outage, a slow provider, an exhausted budget, a disable mid-processing and a killed process over the
+real routes, and compares every deterministic surface of a failing and a passing run with AI on
+against the same run with AI off through a real worker session; `ai/test/isolation.test.mjs` drives
+the process's half of the slow provider and a delegation the controller has revoked. What each drill
+leaves simulated is stated in [resilience](resilience.md#what-is-not-covered): the provider and the
+signal that kills the process. The budget's own
 gates are `crates/sentinel-store/tests/ai_budget.rs`: budget and cost are charged from reported
 usage, an unreported component settles at its hold, an unsettled reservation expires with its
 request and frees the month, 24 concurrent reservations against a budget of eight admit exactly
