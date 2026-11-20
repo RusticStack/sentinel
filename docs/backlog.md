@@ -52,7 +52,7 @@ These are deliberately not assumed dependencies for the first runnable engine or
 - [x] **I10** Bounded matrices, reusable pipelines, service containers, deployment/OIDC capabilities and native multi-arch build orchestration only as proven CI needs. Repository scripts may already cover them without core changes.
 - [x] **I11** GitHub merge-queue `merge_group` handling before migrating any repository that uses it; correct tested SHA and required-check semantics are a per-repo gate.
 - [ ] **I12** Multiple active controllers, external SSO providers or cloud autoscaling as separate designs; no unreviewed shared-SQLite HA mode. Windows workers were split out and promoted to Part 17 (N01–N10) on 2026-10-22.
-- [ ] **I13** Profile-driven advanced I/O/allocator/snapshot/boot improvements; retain only measurable wins with maintenance and portability costs recorded.
+- [x] **I13** Profile-driven advanced I/O/allocator/snapshot/boot improvements; retain only measurable wins with maintenance and portability costs recorded.
 
 ## Part 17 — Windows workers
 
