@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use sentinel_core::{
-    AttemptId, Event, FailureClass, Fence, JobId, PoolId, RepoId, RunId, TenantId, UnixMillis,
-    UserId, WorkerId,
-    auth::{Namespace, Permissions as P, Principal, Role},
+    AiRequestId, AttemptId, Event, FailureClass, Fence, JobId, PoolId, RepoId, RunId, TenantId,
+    UnixMillis, UserId, WorkerId,
+    auth::{Namespace, Permissions as P, Principal, Role, Scopes},
 };
 use sentinel_link::{controller::Controller, identity::Identity};
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
@@ -15,7 +15,7 @@ use sentinel_protocol::{
     summary::{AttemptSummary, CacheRecord, StepOutcome, StepRecord},
 };
 use sentinel_store::{
-    Durability, Store, artifacts,
+    Durability, Store, ai, artifacts,
     auth::{self as authz, Authority, NamespaceKind},
     checks, dispatch, jobs, local_auth,
     logs::LogStore,
@@ -1024,6 +1024,106 @@ impl Fixture {
             "standard",
             &[("dist/app.tar", b"not really a tarball\n".to_vec())],
         );
+    }
+
+    /// A stored failure analysis for the failed job (Y05), with the AI policy that admits it: one claim
+    /// citing the failure's own diagnostic and log frame, so the run page's failure view has something
+    /// real to resolve. `web/test/ui.mjs` drives the panel from it; it is kept out of `serving` because
+    /// AI is off there, which is the default a deployment starts with.
+    pub fn seed_analysis(&self) -> AttemptId {
+        use sentinel_protocol::analysis::{Analysis, Citation, Claim, Evidence};
+        let (attempt, _) = self.attempts["beta"];
+        let (diamond, job) = (self.diamond, self.jobs["beta"]);
+        // A frame of the failed step, which is the window the evidence bundle serves and the only
+        // place a citation can resolve: the newest frame the step wrote.
+        let page = self
+            .logs
+            .newest_page(
+                diamond,
+                job,
+                attempt,
+                sentinel_store::logs::Page {
+                    limit: 64,
+                    bytes: 1 << 20,
+                    scan: 1 << 20,
+                },
+                Some(1),
+            )
+            .unwrap();
+        let sequence = page.frames.iter().rev().map(|frame| frame.seq).next().unwrap_or(1);
+        let document = Analysis {
+            summary: "the checkout request returned 500 where its test expects 200.".into(),
+            claims: vec![Claim {
+                text: "TestCheckout failed on the status its request returned.".into(),
+                citations: vec![
+                    Citation {
+                        attempt,
+                        evidence: Evidence::Diagnostic { id: 1 },
+                    },
+                    Citation {
+                        attempt,
+                        evidence: Evidence::Log { sequence },
+                    },
+                ],
+            }],
+        }
+        .encode();
+        let (tenant, repo, root) = (self.acme, self.app, self.root);
+        let now = UnixMillis::now();
+        self.store
+            .writer()
+            .write(move |tx| {
+                let mut providers = ai::Providers::NONE;
+                providers.insert(ai::Provider::Local);
+                let platform = Principal::new(root, P::ALL, None, None);
+                ai::set_deployment(
+                    tx,
+                    Authority::Credential {
+                        principal: platform,
+                        stepped_up: true,
+                    },
+                    ai::Deployment {
+                        enabled: true,
+                        providers,
+                    },
+                    now,
+                )?;
+                ai::set_tenant(
+                    tx,
+                    Authority::Credential {
+                        principal: Principal::new(root, P::ALL, Some(tenant), None),
+                        stepped_up: true,
+                    },
+                    tenant,
+                    ai::Tenant {
+                        enabled: true,
+                        data_policy: ai::DataPolicy::LocalOnly,
+                        budgets: ai::Budgets::default(),
+                        auto_analysis: false,
+                    },
+                    now,
+                )?;
+                tx.execute(
+                    "INSERT INTO ai_requests(id, tenant_id, repo_id, attempt_id, requester_id,
+                        requester_scopes, provider, data_policy, origin, state_code, outcome,
+                        result, created_ms, deadline_ms, settled_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 1, 3, 2, ?7, ?8, ?9, ?8)",
+                    (
+                        AiRequestId::new().as_bytes().as_slice(),
+                        tenant.as_bytes(),
+                        repo.as_bytes(),
+                        attempt.as_bytes(),
+                        root.as_bytes(),
+                        Scopes::READ_ONLY.bits(),
+                        document.as_str(),
+                        now.0 - 1_000,
+                        now.0 + 60_000,
+                    ),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        attempt
     }
 
     /// Accounts for the step-up and shown-once browser checks (`web/test/ui.mjs`), kept out of `serving` because

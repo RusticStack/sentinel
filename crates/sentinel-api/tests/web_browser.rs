@@ -443,6 +443,8 @@ fn seed_storage_days(f: &Fixture) {
 fn the_web_interface_in_a_real_browser() {
     let (f, web, web_addr, origin) = deployment(64, true);
     f.seed_artifacts();
+    // The failure view's advisory analysis (Y05), which the panel below the deterministic summary reads.
+    f.seed_analysis();
     seed_storage_days(&f);
     let seed = f.seed_step_up_users();
     let stop = Arc::new(AtomicBool::new(false));

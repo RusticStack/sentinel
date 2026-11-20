@@ -18,10 +18,11 @@
 //! is refused there and settled in the same write: nothing waits, and no provider is contacted.
 
 use sentinel_core::{
-    AiRequestId, AttemptId, UnixMillis,
+    AiRequestId, AttemptId, TenantId, UnixMillis,
     auth::{Permissions, Scopes},
 };
 use sentinel_protocol::{
+    analysis::{Analysis, Evidence as CitationTarget},
     diagnostics::{Diagnostic, Severity, StepReference},
     error::{ApiError, ErrorCode},
     logs::Frame,
@@ -60,6 +61,9 @@ pub(super) fn route(
         ("GET", ["api", "v1", "attempts", attempt, "ai-context"]) => {
             context(state, request, attempt, query)
         }
+        ("GET", ["api", "v1", "attempts", attempt, "ai-analysis"]) => {
+            analysis(state, request, attempt)
+        }
         ("POST", ["api", "v1", "tenants", slug, "ai", "requests"]) => enqueue(state, request, slug),
         ("GET", ["api", "v1", "ai", "requests"]) => queued(state, request, query),
         ("GET", ["api", "v1", "ai", "requests", request_id]) => {
@@ -92,6 +96,7 @@ fn tenant_json(policy: Option<ai::Tenant>, providers: ai::Providers) -> Value {
         "data_policy": policy.map(|p| p.data_policy.as_str()),
         "providers": providers.list().map(ai::Provider::as_str).collect::<Vec<_>>(),
         "budgets": budgets_json(policy.map_or_else(Budgets::default, |p| p.budgets)),
+        "auto_analysis": policy.is_some_and(|p| p.auto_analysis),
     })
 }
 
@@ -158,6 +163,9 @@ struct TenantBody {
     /// Each field stated replaces what is stored; one left out keeps it, so a policy change never
     /// resets a budget by omission.
     budgets: Option<BudgetsBody>,
+    /// Whether a failed job gets an analysis nobody asked for (Y05). Left out, it keeps what the
+    /// tenant has, so stating a data policy never switches automatic analysis on or off.
+    auto_analysis: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -252,12 +260,14 @@ fn set_tenant(state: &State, request: &mut Request, slug: &str) -> Route {
         .writer()
         .write(move |tx| {
             let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
-            let current =
-                ai::tenant(tx, tenant)?.map_or_else(ai::Budgets::default, |row| row.budgets);
+            let current = ai::tenant(tx, tenant)?;
             let policy = ai::Tenant {
                 enabled: body.enabled,
                 data_policy,
-                budgets: stated.over(current),
+                budgets: stated.over(current.map_or_else(ai::Budgets::default, |row| row.budgets)),
+                auto_analysis: body
+                    .auto_analysis
+                    .unwrap_or_else(|| current.is_some_and(|row| row.auto_analysis)),
             };
             ai::set_tenant(tx, authority, tenant, policy, UnixMillis::now())?;
             Ok((policy, ai::effective(tx, tenant)?.0))
@@ -352,28 +362,11 @@ pub(super) fn context(state: &State, request: &Request, attempt: &str, query: &s
         .transpose()
         .map_err(|_| err(ErrorCode::Internal, "stored summary unreadable"))?
         .unwrap_or_default();
+    let evidence = attempt_evidence(state, run, job, attempt, &summary)?;
     let step = summary
         .steps
         .iter()
         .find(|record| is_failed(record.outcome));
-    let page = bundle_page(state, run, job, attempt, step.map(|record| record.index))?;
-    let mut reports = Reports::default();
-    log_reports(
-        &mut reports,
-        &page.frames,
-        0,
-        LogScope {
-            run,
-            job,
-            attempt,
-            step_index: step.map(|record| record.index),
-            step_reference: step.map(|record| StepReference {
-                index: record.index,
-                key: Some(record.id.clone()),
-            }),
-            complete: page.complete && page.gaps.is_empty(),
-        },
-    );
     let mut scrub = Scrub::new(&values);
     let mut steps = Vec::with_capacity(summary.steps.len().min(MAX_BUNDLE_STEPS));
     let mut omitted_steps = 0u64;
@@ -389,16 +382,9 @@ pub(super) fn context(state: &State, request: &Request, attempt: &str, query: &s
             steps.push(step_json(record, &mut scrub));
         }
     }
-    let mut flat = Vec::new();
-    for item in &mut reports.items {
-        flat.append(&mut item.report.diagnostics);
-    }
-    // Failures and errors before warnings and informational records, each group in the order the
-    // autopsy found it: a model reads the bundle, so its strongest evidence comes first.
-    flat.sort_by_key(|diagnostic| !is_failure(diagnostic.severity));
-    let mut omitted_diagnostics = reports.omitted;
+    let mut omitted_diagnostics = evidence.omitted_diagnostics;
     let mut diagnostics = Vec::with_capacity(MAX_BUNDLE_DIAGNOSTICS);
-    for diagnostic in flat {
+    for diagnostic in evidence.diagnostics {
         if diagnostics.len() == MAX_BUNDLE_DIAGNOSTICS {
             omitted_diagnostics = omitted_diagnostics.saturating_add(1);
             continue;
@@ -406,6 +392,7 @@ pub(super) fn context(state: &State, request: &Request, attempt: &str, query: &s
         let id = diagnostics.len() + 1;
         diagnostics.push(diagnostic_json(id, diagnostic, &mut scrub));
     }
+    let page = evidence.page;
     let mut frames = Vec::with_capacity(page.frames.len().min(64));
     let mut seeded = 0usize;
     for frame in page.frames.iter().rev() {
@@ -504,6 +491,59 @@ fn bundle_page(
             other => Err(other),
         })
         .map_err(store_error)
+}
+
+/// One attempt's stored evidence, as the bundle identifies it: the newest window of the failed step,
+/// and the diagnostics those frames parse into, failures and errors before warnings and informational
+/// records — each group in the order the autopsy found it, so a model reads its strongest evidence
+/// first. The bundle numbers that list `diag-1` .. `diag-n`, and a citation check reads the same list,
+/// so an analysis can only cite evidence the bundle could have shown it.
+struct Evidence {
+    page: logs::Tail,
+    /// In bundle order, before the bundle's own 20-diagnostic cap.
+    diagnostics: Vec<Diagnostic>,
+    omitted_diagnostics: u64,
+}
+
+fn attempt_evidence(
+    state: &State,
+    run: sentinel_core::RunId,
+    job: sentinel_core::JobId,
+    attempt: AttemptId,
+    summary: &AttemptSummary,
+) -> Result<Evidence, ApiError> {
+    let step = summary
+        .steps
+        .iter()
+        .find(|record| is_failed(record.outcome));
+    let page = bundle_page(state, run, job, attempt, step.map(|record| record.index))?;
+    let mut reports = Reports::default();
+    log_reports(
+        &mut reports,
+        &page.frames,
+        0,
+        LogScope {
+            run,
+            job,
+            attempt,
+            step_index: step.map(|record| record.index),
+            step_reference: step.map(|record| StepReference {
+                index: record.index,
+                key: Some(record.id.clone()),
+            }),
+            complete: page.complete && page.gaps.is_empty(),
+        },
+    );
+    let mut diagnostics = Vec::new();
+    for item in &mut reports.items {
+        diagnostics.append(&mut item.report.diagnostics);
+    }
+    diagnostics.sort_by_key(|diagnostic| !is_failure(diagnostic.severity));
+    Ok(Evidence {
+        page,
+        diagnostics,
+        omitted_diagnostics: reports.omitted,
+    })
 }
 
 /// One redaction pass over the bundle's text: the attempt's registered values first, then the
@@ -730,6 +770,239 @@ fn shorten_diagnostic(body: &mut Value, excess: usize) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Failure analysis (Y05): the answer a request settled with, decoded and checked before it is shown.
+// A citation that does not resolve is dropped, and an analysis whose every citation was dropped is
+// not shown at all — a claim nobody can check must not look like a finding. Nothing here writes
+// anything a run, a job, a check or a GitHub delivery reads.
+// ---------------------------------------------------------------------------------------------
+
+/// One cited attempt's stored evidence, as the citation check reads it: the frames the bundle could
+/// have shown, by sequence and step, each diagnostic the bundle numbers, and when the log expires.
+struct Cited {
+    run: sentinel_core::RunId,
+    steps: std::collections::BTreeMap<u64, u32>,
+    /// The step and the first evidence sequence of `diag-1` .. `diag-20`, in the bundle's order.
+    diagnostics: Vec<(Option<u32>, Option<u64>)>,
+    /// What the attempt's log has left: nothing resolves into a log retention removed.
+    retention: ai::Retention,
+}
+
+/// One attempt an analysis cites, located in the repository the request was made about.
+struct Located {
+    run: sentinel_core::RunId,
+    job: sentinel_core::JobId,
+    /// The attempt's terminal summary, from which the evidence page's failed step is read.
+    summary: Option<Vec<u8>>,
+}
+
+/// Where a cited attempt is, or nothing when the reader could not open it: another repository's
+/// attempt is not found, so an analysis can never cite evidence its reader has no access to.
+fn locate(
+    conn: &sentinel_store::Connection,
+    tenant: TenantId,
+    repo: sentinel_core::RepoId,
+    attempt: AttemptId,
+) -> sentinel_store::Result<Option<Located>> {
+    let job = match lookup::attempt_job(conn, attempt) {
+        Ok(job) => job,
+        Err(StoreError::NotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let run = lookup::job_run(conn, job)?;
+    if lookup::run_repo(conn, run)? != repo {
+        return Ok(None);
+    }
+    let summary = match dispatch::attempt_summary(conn, tenant, attempt) {
+        Ok(summary) => summary,
+        Err(StoreError::NotFound) => None,
+        Err(error) => return Err(error),
+    };
+    Ok(Some(Located { run, job, summary }))
+}
+
+/// The analysis one attempt has, decoded against `sentinel.ai-analysis/1`, with every citation
+/// resolved against the evidence the controller stored and labelled inference. `present: false` is
+/// the whole of every other answer: no analysis, one still being produced, AI off for the tenant, or
+/// an analysis whose every citation was dropped.
+///
+/// It is advisory and nothing else reads it: no run's state, no job's state, no failure class and no
+/// check publication is computed from this body, which is why serving it cannot change a conclusion.
+fn analysis(state: &State, request: &Request, attempt: &str) -> Route {
+    let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::LOGS_READ)?;
+    let attempt: AttemptId = id(attempt, "attempt")?;
+    let principal = who.principal;
+    let now = UnixMillis::now();
+    let (repo, tenant, permits, answer) = state
+        .store
+        .read(move |c| {
+            let repo = lookup::run_repo(c, lookup::job_run(c, lookup::attempt_job(c, attempt)?)?)?;
+            let tenant = authz::require_repo(c, principal, repo, Permissions::READ)?;
+            Ok((
+                repo,
+                tenant,
+                ai::permits(c, tenant)?,
+                ai::answer(c, attempt, now)?,
+            ))
+        })
+        .map_err(store_error)?;
+    if !permits {
+        return ok(json!({ "present": false, "reason": "off" }));
+    }
+    let (document, reused, settled, origin) = match answer {
+        ai::Answer::Analysis {
+            document,
+            reused,
+            settled,
+            origin,
+        } => (document, reused, settled, origin),
+        ai::Answer::Pending => return ok(json!({ "present": false, "reason": "pending" })),
+        ai::Answer::None => return ok(json!({ "present": false, "reason": "none" })),
+    };
+    let document = Analysis::decode(document.as_bytes())
+        .map_err(|_| err(ErrorCode::Internal, "stored analysis unreadable"))?;
+    let mut wanted: Vec<AttemptId> = Vec::with_capacity(MAX_CITED_ATTEMPTS);
+    for claim in &document.claims {
+        for citation in &claim.citations {
+            if !wanted.contains(&citation.attempt) && wanted.len() < MAX_CITED_ATTEMPTS {
+                wanted.push(citation.attempt);
+            }
+        }
+    }
+    let located = state
+        .store
+        .read(move |c| {
+            let mut found = Vec::with_capacity(wanted.len());
+            for cited in wanted {
+                found.push((cited, locate(c, tenant, repo, cited)?));
+            }
+            Ok(found)
+        })
+        .map_err(store_error)?;
+    let mut resolved: Vec<(AttemptId, Cited)> = Vec::with_capacity(located.len());
+    for (cited, found) in located {
+        let Some(located) = found else {
+            continue;
+        };
+        let summary = located.summary
+            .as_deref()
+            .map(AttemptSummary::decode)
+            .transpose()
+            .map_err(|_| err(ErrorCode::Internal, "stored summary unreadable"))?
+            .unwrap_or_default();
+        let evidence = attempt_evidence(state, located.run, located.job, cited, &summary)?;
+        let mut steps = std::collections::BTreeMap::new();
+        for frame in &evidence.page.frames {
+            steps.insert(frame.seq, frame.step);
+        }
+        let diagnostics = evidence
+            .diagnostics
+            .iter()
+            .take(MAX_BUNDLE_DIAGNOSTICS)
+            .map(|diagnostic| {
+                let first = diagnostic.evidence.first();
+                (
+                    diagnostic
+                        .step
+                        .as_ref()
+                        .map(|step| step.index)
+                        .or_else(|| first.map(|reference| reference.step_index)),
+                    first.map(|reference| reference.start.sequence),
+                )
+            })
+            .collect();
+        let retention = state
+            .store
+            .read(move |c| ai::retention(c, cited))
+            .map_err(store_error)?
+            .unwrap_or(ai::Retention {
+                expires: None,
+                expired: true,
+            });
+        resolved.push((
+            cited,
+            Cited {
+                run: located.run,
+                steps,
+                diagnostics,
+                retention,
+            },
+        ));
+    }
+    let mut dropped = 0u64;
+    let mut expires: Option<UnixMillis> = None;
+    let mut claims = Vec::with_capacity(document.claims.len());
+    for claim in &document.claims {
+        let mut citations = Vec::with_capacity(claim.citations.len());
+        for citation in &claim.citations {
+            let Some((_, target)) = resolved
+                .iter()
+                .find(|(cited, _)| *cited == citation.attempt)
+            else {
+                dropped = dropped.saturating_add(1);
+                continue;
+            };
+            let (step, sequence) = match citation.evidence {
+                CitationTarget::Log { sequence } => match target.steps.get(&sequence) {
+                    Some(step) => (Some(*step), Some(sequence)),
+                    None => {
+                        dropped = dropped.saturating_add(1);
+                        continue;
+                    }
+                },
+                CitationTarget::Diagnostic { id } => {
+                    match target.diagnostics.get(usize::from(id) - 1) {
+                        Some((step, sequence)) => (*step, *sequence),
+                        None => {
+                            dropped = dropped.saturating_add(1);
+                            continue;
+                        }
+                    }
+                }
+            };
+            // Evidence the retention removed resolves to nothing, so the citation goes with it.
+            if target.retention.expired {
+                dropped = dropped.saturating_add(1);
+                continue;
+            }
+            if let Some(until) = target.retention.expires {
+                expires = Some(expires.map_or(until, |seen| UnixMillis(seen.0.min(until.0))));
+            }
+            citations.push(json!({
+                "attempt": citation.attempt.to_string(),
+                "run": target.run.to_string(),
+                "evidence": citation.evidence.id(),
+                "step": step,
+                "sequence": sequence,
+            }));
+        }
+        if !citations.is_empty() {
+            claims.push(json!({ "text": claim.text, "citations": citations }));
+        }
+    }
+    if claims.is_empty() {
+        return ok(json!({
+            "present": false,
+            "reason": "dropped",
+            "dropped_citations": dropped,
+        }));
+    }
+    ok(json!({
+        "present": true,
+        "schema": sentinel_protocol::analysis::ANALYSIS_SCHEMA,
+        "inference": true,
+        "attempt": attempt.to_string(),
+        "origin": origin.as_str(),
+        "reused": reused,
+        "summary": document.summary,
+        "claims": claims,
+        "dropped_citations": dropped,
+        "settled_ms": settled.0,
+        "expires_ms": expires.map(|until| until.0),
+    }))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Durable requests (Y03): a member asks about one attempt, the AI service consumes the row through
 // the API, and the row ends exactly once. The controller calls no provider and the AI process
 // holds no log, no secret and no run.
@@ -741,6 +1014,13 @@ const QUEUE_PAGE: u32 = 32;
 const MAX_QUEUE_PAGE: u32 = 128;
 /// How many expired rows one poll settles. Bounded like every other sweep in the controller.
 const EXPIRE_PER_POLL: u32 = 32;
+/// How many automatic requests one poll writes. Bounded like the expiry sweep, so a controller that
+/// was away for a while catches up over several polls rather than in one write.
+const AUTOMATIC_PER_POLL: u32 = 8;
+/// How many distinct attempts one analysis may cite and have resolved. A model reads one attempt's
+/// bundle and a reused answer describes the one it was computed from, so this is a bound on the
+/// reading a single page view may do, never on what a model may write.
+const MAX_CITED_ATTEMPTS: usize = 4;
 
 fn request_json(request: &ai::Request, with_result: bool) -> Value {
     let mut body = json!({
@@ -748,6 +1028,7 @@ fn request_json(request: &ai::Request, with_result: bool) -> Value {
         "attempt": request.attempt.to_string(),
         "provider": request.provider.as_str(),
         "data_policy": request.data_policy.as_str(),
+        "origin": request.origin.as_str(),
         "state": request.state.as_str(),
         "outcome": request.outcome.map(ai::Outcome::as_str),
         "reused": request.reused,
@@ -756,7 +1037,13 @@ fn request_json(request: &ai::Request, with_result: bool) -> Value {
         "deadline_ms": request.deadline.0,
     });
     if with_result {
-        body["result"] = json!(request.result.as_deref());
+        // The stored document is the one the controller decoded, so it parses back into the same
+        // object a client sent; a row that does not is corruption, never an answer.
+        body["analysis"] = request
+            .analysis
+            .as_deref()
+            .and_then(|document| serde_json::from_str(document).ok())
+            .unwrap_or(Value::Null);
     }
     body
 }
@@ -837,7 +1124,14 @@ fn queued(state: &State, request: &Request, query: &str) -> Route {
     state
         .store
         .writer()
-        .write(move |tx| ai::sweep(tx, now, EXPIRE_PER_POLL))
+        .write(move |tx| {
+            ai::sweep(tx, now, EXPIRE_PER_POLL)?;
+            // The same poll is where a failed job a tenant asked to have analysed becomes a request.
+            // Nothing else in the controller writes one: no run, job, attempt, dispatch, log
+            // acknowledgement or check publication is on this path.
+            ai::enqueue_automatic(tx, now, AUTOMATIC_PER_POLL)?;
+            Ok(())
+        })
         .map_err(store_error)?;
     let rows = state
         .store
@@ -894,7 +1188,9 @@ fn claim(state: &State, request: &mut Request, request_id: &str) -> Route {
 #[serde(deny_unknown_fields)]
 struct CompleteBody {
     outcome: String,
-    text: Option<String>,
+    /// The model's answer, as `sentinel.ai-analysis/1` states it (Y05). It is decoded here before
+    /// anything is stored: an answer that does not decode is refused, never kept as text.
+    analysis: Option<Value>,
     reason: Option<String>,
     /// What the provider reported. A component left out settles at the reservation's maximum; it is
     /// absent because the provider did not report it, never because it was free.
@@ -937,6 +1233,11 @@ fn complete(state: &State, request: &mut Request, request_id: &str) -> Route {
             .with_detail("outcome", other));
         }
     };
+    let analysis = match (outcome, body.analysis) {
+        (ai::Outcome::Completed, Some(answer)) => Some(stored(&answer)?),
+        (ai::Outcome::Completed, None) => None,
+        (ai::Outcome::Unavailable, _) => None,
+    };
     let now = UnixMillis::now();
     let usage = body.usage.map(|usage| usage.usage());
     let row = state
@@ -947,7 +1248,7 @@ fn complete(state: &State, request: &mut Request, request_id: &str) -> Route {
                 tx,
                 id,
                 outcome,
-                body.text.as_deref(),
+                analysis.as_deref(),
                 body.reason.as_deref(),
                 now,
                 usage,
@@ -1022,10 +1323,10 @@ fn reserve(state: &State, request: &mut Request, request_id: &str) -> Route {
             "expires_ms": expires.0,
             "request": request_json(&row, false),
         }),
-        ai::Admitted::Reused { text, by } => json!({
+        ai::Admitted::Reused { analysis, by } => json!({
             "state": "reused",
             "by": by.as_str(),
-            "text": text,
+            "analysis": serde_json::from_str(&analysis).unwrap_or(Value::Null),
             "request": request_json(&row, false),
         }),
         ai::Admitted::Refused { reason } => json!({
@@ -1034,6 +1335,22 @@ fn reserve(state: &State, request: &mut Request, request_id: &str) -> Route {
             "request": request_json(&row, false),
         }),
     })
+}
+
+/// The one document the store keeps for an answer: the model's object decoded against
+/// `sentinel.ai-analysis/1` and re-encoded, so what is stored is exactly what every reader decodes.
+/// A refusal names the field and never echoes the text, which may have come from a log.
+fn stored(answer: &Value) -> Result<String, ApiError> {
+    let bytes = serde_json::to_vec(answer).map_err(|_| {
+        err(
+            ErrorCode::InvalidRequest,
+            "analysis must be a JSON document",
+        )
+    })?;
+    let analysis = Analysis::decode(&bytes).map_err(|error| {
+        err(ErrorCode::InvalidRequest, error.reason()).with_detail("field", error.field())
+    })?;
+    Ok(analysis.encode())
 }
 
 fn bad_digest(field: &'static str) -> ApiError {

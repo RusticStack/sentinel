@@ -412,11 +412,43 @@ await scenario("runs and filters", async () => {
   }))()`);
   check("run: four jobs in the table", run.rows === 4, run.rows);
   check("run: the failed job's summary names the failing step and message", run.failure.includes("unit") && run.failure.includes("expected 200, got 500"), run.failure.slice(0, 200));
+
+  // The failure analysis sits under the deterministic summary, labelled inference, every citation a
+  // link into the log it names (Y05).
+  await page.waitFor("!!document.querySelector('[aria-label=\"AI analysis\"]')", 10000, "the analysis panel");
+  const analysis = await page.eval(`(() => {
+    const summary = document.querySelector('[aria-label^="Failure of"]');
+    const panel = summary && summary.querySelector('[aria-label="AI analysis"]');
+    if (!panel) return null;
+    return {
+      labelled: panel.textContent.includes("inference"),
+      advisory: panel.textContent.includes("cannot change this run's result"),
+      // After the deterministic account's own children, which is what "under the summary" means.
+      below: panel.parentElement.lastElementChild === panel &&
+        [...panel.parentElement.children].some((el) => el.textContent.startsWith("Failed step")),
+      claims: panel.querySelectorAll("li").length,
+      text: panel.textContent.replace(/\\s+/g, " ").slice(0, 240),
+      citations: [...panel.querySelectorAll("a")].map((a) => a.getAttribute("href")),
+    };
+  })()`);
+  check("analysis: labelled inference, under the deterministic summary, carrying its claim",
+    !!analysis && analysis.labelled && analysis.advisory && analysis.below && analysis.claims === 1, analysis);
+  check("analysis: every citation links to the log line it names",
+    !!analysis && analysis.citations.length === 2 &&
+      analysis.citations.every((h) => /^\/runs\/run_[0-9a-f-]+\/logs\/att_[0-9a-f-]+\?step=\d+&seq=\d+$/.test(h)),
+    analysis?.citations);
   await page.waitFor("document.body.textContent.includes('reflink')", 10000, "caches");
   check("run: cache outcomes with backend", true);
   await page.eval(clickText("[aria-label^='Failure of'] a", "evidence"));
   await page.waitFor("!!document.querySelector('.log-row.hl')", 15000, "evidence highlighted");
   check("evidence link opens the log at the line", (await page.eval("location.search")).includes("seq="));
+
+  // A citation is a link to the line it names, not a label: following one lands on the log at it.
+  await go(page, PAGES.run[0], PAGES.run[1]);
+  await page.waitFor("!!document.querySelector('[aria-label=\"AI analysis\"] a')", 10000, "the analysis citations");
+  await page.eval("document.querySelector('[aria-label=\"AI analysis\"] a').click()");
+  await page.waitFor("location.pathname.includes('/logs/') && !!document.querySelector('.log-row.hl')", 15000, "the cited line");
+  check("analysis: a citation opens the log at the line it names", (await page.eval("location.search")).includes("seq="));
 });
 
 await scenario("artifacts", async () => {

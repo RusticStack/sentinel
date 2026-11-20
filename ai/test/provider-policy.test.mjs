@@ -17,7 +17,7 @@ import { Controller } from "../src/controller.ts";
 import { admit } from "../src/policy.ts";
 import { modelLayer } from "../src/providers.ts";
 import { serve } from "../src/service.ts";
-import { chatCompletion, model, recording, reserved } from "./fake.mjs";
+import { analysis, chatCompletion, model, recording, reserved } from "./fake.mjs";
 
 const BUNDLE = JSON.stringify({
   schema: "sentinel.ai-context/1",
@@ -31,6 +31,7 @@ const row = (overrides) => ({
   attempt: "att_00000000-0000-4000-8000-000000000001",
   provider: "openrouter",
   data_policy: "local_only",
+  origin: "member",
   state: "queued",
   outcome: null,
   created_ms: 1_700_000_000_000,
@@ -76,16 +77,20 @@ const controller = (request) => {
         }),
       evidence: () => Effect.succeed(BUNDLE),
       reserve: () => Effect.succeed(reserved()),
-      settle: (id, outcome, text, reason, usage) =>
+      settle: (id, outcome, settled_analysis, reason, usage) =>
         Effect.sync(() => {
-          settled.push({ id, outcome, text, reason, usage });
+          settled.push({ id, outcome, analysis: settled_analysis, reason, usage });
         }),
     },
   };
 };
 
 /** Serves one request against the fake provider, returning what happened and every call made. */
-const run = async (configuration, request, answer = () => ({ body: chatCompletion("the test failed") })) => {
+const run = async (
+  configuration,
+  request,
+  answer = () => ({ body: chatCompletion(JSON.stringify(analysis("the test failed", "log-7"))) }),
+) => {
   const fake = recording(answer);
   const memory = controller(request);
   const served = await Effect.runPromise(
@@ -107,7 +112,7 @@ test("a local_only request naming a hosted provider reaches no host at all", asy
     assert.match(served.reason, /^policy:/);
     assert.equal(settled.length, 1);
     assert.equal(settled[0].outcome, "unavailable");
-    assert.equal(settled[0].text, null);
+    assert.equal(settled[0].analysis, null);
   }
 });
 

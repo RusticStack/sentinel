@@ -58,8 +58,58 @@ export function FailureSummary({ job, run }: { job: JobStatus; run: string }) {
             {!f.failed_step && !diagnostics.length && !tail.length ? (
               <p className="text-sm">No diagnostics were found. <TextLink to={`/runs/${run}/logs/${job.attempt}`} className="underline">Open the log</TextLink></p>
             ) : null}
+            {/* The deterministic account above is the finding; this is only ever below it. */}
+            {job.attempt ? <Analysis attempt={job.attempt} /> : null}
           </>}
       </div>
+    </section>
+  );
+}
+
+/**
+ * The advisory analysis of one attempt (Y05), under the deterministic summary and nowhere else. It is
+ * always labelled inference, and every citation opens the log at the line it names. No analysis — AI
+ * off, nothing asked for yet, an answer whose every citation was dropped, or one whose log has gone —
+ * renders nothing at all: a claim nobody can check must not look like a finding.
+ */
+function Analysis({ attempt }: { attempt: string }) {
+  const [a, setA] = useState<any>(null);
+  useEffect(() => {
+    let live = true;
+    api<any>(`/api/v1/attempts/${attempt}/ai-analysis`).then((v) => { if (live) setA(v); }, () => { if (live) setA({ present: false }); });
+    return () => { live = false; };
+  }, [attempt]);
+  if (!a) return null;
+  if (!a.present) {
+    return a.reason === "pending" ? (
+      <p className="text-xs text-muted">An analysis was requested and is still being written.</p>
+    ) : null;
+  }
+  const cited = (c: any) =>
+    c.sequence == null ? "" : `/runs/${c.run}/logs/${c.attempt}?step=${c.step ?? 0}&seq=${c.sequence}`;
+  return (
+    <section aria-label="AI analysis" className="space-y-2 rounded-md border border-line bg-subtle p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="text-sm font-semibold text-strong">AI analysis</h3>
+        <Badge color="neutral" icon="sparkles">inference</Badge>
+      </div>
+      <p className="text-xs text-muted">A model's reading of this attempt's evidence, below the summary above. It is not evidence and it cannot change this run's result.</p>
+      <p className="text-sm">{a.summary}</p>
+      <ul className="space-y-1.5 text-sm">
+        {(a.claims || []).map((claim: any, i: number) => (
+          <li key={i} className="flex flex-wrap items-baseline gap-2">
+            <span className="break-words">{claim.text}</span>
+            <span className="flex flex-wrap gap-2">
+              {(claim.citations || []).map((c: any, j: number) => {
+                const to = cited(c);
+                return to ? <TextLink key={j} to={to} className="font-mono text-xs underline">{c.evidence}</TextLink> : null;
+              })}
+            </span>
+          </li>
+        ))}
+      </ul>
+      {a.reused ? <p className="text-xs text-muted">Computed from an earlier attempt of this same failure; its citations name that attempt's log.</p> : null}
+      {a.dropped_citations ? <p className="text-xs text-muted">{a.dropped_citations} citation{a.dropped_citations === 1 ? "" : "s"} did not resolve against the stored log and {a.dropped_citations === 1 ? "is" : "are"} not shown.</p> : null}
     </section>
   );
 }

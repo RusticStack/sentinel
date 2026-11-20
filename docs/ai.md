@@ -9,16 +9,19 @@ what each data policy commits to, and what one tenant's month may cost. What is 
 policy, its routes, its gate, the evidence bundle the controller serves, the separate process that
 talks to a provider, `sentinel-ai`, with the durable requests it consumes and the request-scoped
 credential it reads evidence with, the budget ledger every request reserves against before it goes
-anywhere, and the analysis cache a repeated question is answered from. The analyses themselves
-(Y05) and everything after are [plan 16.6](../plan.md#166-ai-assistance) and the backlog items after
-Y04.
+anywhere, the analysis cache a repeated question is answered from, and the analyses themselves: a
+model's answer decoded against a versioned schema, every claim cited to evidence the controller
+resolves, shown as inference under the deterministic summary, expiring with the logs it cites. What
+follows them — flaky-test summaries, the log-search assistant, migration suggestions — is
+[plan 16.6](../plan.md#166-ai-assistance) and the backlog items after Y05.
 
 ## The guarantees
 
-- **Advisory only.** Nothing an AI feature produces is evidence. Analyses are labelled
-  inference, carry citations to the evidence IDs they used, and a citation that does not exist
-  is dropped (Y05). The deterministic failure summary, the logs and the diagnostics stay the
-  account of what happened.
+- **Advisory only.** Nothing an AI feature produces is evidence. An analysis is labelled
+  inference, carries citations to the evidence IDs it used, and a citation that does not resolve
+  is dropped before anyone sees it — an answer whose every citation was dropped is not shown at
+  all ([below](#failure-analysis)). The deterministic failure summary, the logs and the
+  diagnostics stay the account of what happened, and sit above the analysis wherever it appears.
 - **Never on a check's path.** No run, job, attempt, dispatch, log acknowledgement, check
   publication or GitHub delivery waits on a model. A request is a durable row with its own
   deadline, processed asynchronously; a timeout, a provider error or a budget refusal ends it
@@ -64,9 +67,13 @@ A tenant administrator opts one tenant in, under a data policy:
 
 ```json
 PUT /api/v1/tenants/{slug}/ai
-{ "enabled": true, "data_policy": "zero_retention",
+{ "enabled": true, "data_policy": "zero_retention", "auto_analysis": false,
   "budgets": { "monthly_tokens": 2000000, "concurrency": 2 } }
 ```
+
+`auto_analysis` states whether a failed job gets an analysis nobody asked for
+([below](#automatic-analysis)); it is off in a fresh deployment and in an upgraded one, and a field
+left out keeps what the tenant had, so changing a data policy never turns it on or off.
 
 The route needs the tenant's `admin` role and a live step-up, and is refused while the
 deployment allows no provider. `GET /api/v1/tenants/{slug}/ai` answers the tenant's own choice,
@@ -240,10 +247,84 @@ it looks at any cap, limit or budget, because an answer already paid for costs n
 
 A served analysis settles the request `completed` with `reused` set and a `by` of `evidence` or
 `fingerprint`, and the member's row reports `reused: true`. Only a tenant's own analyses can answer
-its requests. An analysis is kept for 30 days and pruned by the sweep that expires requests; a
-disable deletes a tenant's analyses with its queue. A reused analysis cites the evidence of the
+its requests. An analysis is kept for the shorter of 30 days and the retention of the log it cites
+([expiry](#expiry)), and pruned by the sweep that expires requests; a disable deletes a tenant's
+analyses with its queue. A reused analysis cites the evidence of the
 attempt it was computed from — which is why the row says `reused` rather than the text pretending to
 describe this run's log.
+
+## Failure analysis
+
+The analysis is the point of all of it, and it is one document with one shape. `sentinel-ai` asks
+the model for `sentinel.ai-analysis/1`: a summary, and up to eight claims, each with one to eight
+citations. A citation names the attempt and the bundle's own identifier for what it rests on — a
+log frame (`log-<sequence>`) or a diagnostic (`diag-<n>`). The prompt states the schema, the bounds
+and the identifiers, and it says the thing that makes the rest of this possible: a claim the evidence
+does not support is a claim to leave out.
+
+**Decoded, never repaired.** The model's answer is a JSON document or it is nothing. `sentinel-ai`
+decodes it first, so a malformed answer ends the request `unavailable` with the field named instead
+of travelling on; the controller decodes it again in `POST /ai/requests/{id}/complete` and refuses
+(`invalid_request` with `details.field`) anything that does not match: another schema string, a
+missing or unknown field, a blank summary, more claims or citations than the bounds, a claim with no
+citation at all, an attempt that is not an attempt, an evidence identifier the bundle could not have
+assigned. A refused answer settles nothing — the request keeps its claim and its deadline — and only
+a whole document is ever stored. There is no truncation of an answer, because a citation cut off the
+end is a claim nobody can check.
+
+**Citations are resolved before the answer is shown.** The stored document is not served as it was
+written. For every citation the controller checks, against the evidence it stored: that the attempt
+it names is one of the same repository's, that a `log-<sequence>` is still a frame of the page the
+evidence bundle is built from, that a `diag-<n>` is one of the diagnostics that page parses into
+(failures and errors first, at most 20), and that retention has not removed the log. A citation that
+fails any of those is dropped and counted. A claim left with no citation is dropped with it. And an
+analysis whose every claim was dropped is **not shown as an analysis at all**: the route answers
+`present: false`. A claim nobody can check must not look like a finding.
+
+What a served analysis carries is the resolved form — each citation names the run, the attempt, the
+frame sequence and the step, so the interface can open the log at the line it cites — plus
+`inference: true`, whether the answer was reused, and `expires_ms`. Nothing else reads it: no run
+state, no job state, no failure class and no check conclusion is ever computed from an analysis,
+which `crates/sentinel-api/tests/ai_analysis.rs` proves by comparing a run's conclusion, its job's
+state and failure class and every published check before and after one is served.
+
+**Inference, under the deterministic summary.** The attempt's failure summary is the account; the
+analysis sits below it, labelled as inference, in the run page's failure view
+([interface](#where-it-appears)).
+
+### Automatic analysis
+
+A tenant administrator can ask for an analysis of every failed job: `auto_analysis` in the tenant's
+AI policy, off by default and off after an upgrade. Sentinel has no advisory job — every job is a
+required one, and a failed job's check is what fails its run — so the target is a job that ended
+`failed`; a passed, cancelled, skipped or timed-out job gets nothing.
+
+Nothing on the failure path writes that request. The AI process's own poll (`GET /ai/requests`,
+which is also the expiry sweep) writes it: a bounded batch per poll, one request per failed attempt
+(by a unique index, so a sweep that runs twice writes once), inside a ten-minute window of the
+failure — so turning the switch on never turns a tenant's history into a bill. The requester is the
+tenant administrator whose decision turned it on, so the delegation minted at claim reads exactly
+what they could. The provider is the first the deployment allows that the tenant's data policy
+permits, in the providers' own order, so two sweeps over one policy choose alike. From there it is
+an ordinary request: reserved against the month, refused if it does not fit, cached like any other.
+
+### Expiry
+
+An analysis expires with the logs it cites, not with a calendar of its own. The cache row's expiry
+is the earlier of the cache's 30 days and the attempt log's retention, and an analysis whose log is
+already gone is not cached at all (the request still carries its answer, which is not served). At
+read time a citation into a log retention removed does not resolve, so the answer stops being shown
+the moment its evidence does: nothing outlives what it cites.
+
+## Where it appears
+
+The run page's failure view — the same deterministic summary — gets the analysis underneath it,
+fetched from `GET /attempts/{id}/ai-analysis` after the page shows: a short panel labelled *AI
+analysis* and *inference*, never above the deterministic summary and never in place of it, with
+every citation a link to the log line it names. With AI off, or with no analysis yet, the panel is
+not there at all; a request still in flight says so in one line. The browser test drives this view
+with a stored analysis and a citation that opens the log at its line, and checks the label and the
+order ([web interface](web-ui.md)).
 
 ## Disabling
 
@@ -337,15 +418,13 @@ bundle is bounded and never the whole log; artifacts, caches, secrets and source
 not part of it ([above](#the-evidence-bundle)). An analysis expires with the attempt's logs,
 because the evidence it cites does.
 
-## What is not built yet
+## What is built and what is not
 
-No analysis assertion exists: `sentinel-ai` settles a request with the model's answer as plain
-text, which Y05 replaces with an answer decoded against a schema and cited to the evidence it used,
-so a cached answer is text and a citation is not yet something the controller checks. The skeleton
-has one prompt, whose version is `skeleton-1`; a prompt registry and an evaluation set are Y05 and
-Y09.
-[Backlog Part 22](backlog.md) carries the rest, including the later flaky tests, the log-search
-assistant and the MCP read-only tools that expose them.
+A prompt registry and an evaluation set are Y09; the prompt this build ships is `analysis-1`, whose
+version is part of every cache key, and the evaluation set is built from seeded failures on the
+pilots. The features after Y05 — flaky-test summaries, the log-search assistant, migration
+suggestions, the read-only MCP tools that expose analyses — are [plan
+16.6](../plan.md#166-ai-assistance) and [backlog Part 22](backlog.md).
 
 Verification of this package is local: `pnpm typecheck` and
 `cd ai && node --import ./test/ts-register.mjs --test test/*.test.mjs`, both of which contact no
@@ -357,4 +436,14 @@ request and frees the month, 24 concurrent reservations against a budget of eigh
 eight and settle every other request in the write that refused it, per-request caps and the
 concurrency limit refuse before anything is held, a fingerprint is reused across reruns and a
 different prompt version, model or failure is not, and a disable takes the analyses and the
-reservations with the queue.
+reservations with the queue. The analysis's own gates are `crates/sentinel-protocol`'s schema tests
+(a malformed, partial or unknown-field answer is refused whole, and every bound is enforced),
+`ai/test/analysis.test.mjs` for the process's half of the same decode, `ai/test/service.test.mjs`
+for a provider answer that is not an analysis ending the request `unavailable` with nothing stored,
+`crates/sentinel-store/tests/ai_analysis.rs` (automatic analysis only for a failed job, only when
+the tenant turned it on, one request per failure and none for a failure older than the window; an
+analysis cached for the shorter of 30 days and its log's retention, and not cached once the log is
+gone) and `crates/sentinel-api/tests/ai_analysis.rs` (decoded before it is stored, a citation that
+does not resolve dropped, an all-dropped answer not shown, a refusal naming the field and settling
+nothing, the run/job/check invariant, expiry with the logs, and the poll that writes the automatic
+request). The interface's gate is the browser test over the run page's failure view.

@@ -201,6 +201,7 @@ fn deployment(opted_in: bool) -> Deployment {
                         enabled: true,
                         data_policy: sentinel_store::ai::DataPolicy::LocalOnly,
                         budgets: sentinel_store::ai::Budgets::default(),
+                        auto_analysis: false,
                     },
                     now,
                 )?;
@@ -483,7 +484,17 @@ fn a_member_asks_and_the_service_answers_through_the_delegation() {
         &d,
         "POST",
         &format!("/api/v1/ai/requests/{id}/complete"),
-        Some(&json!({ "outcome": "completed", "text": "the unit step failed on an assertion" })),
+        Some(&json!({
+            "outcome": "completed",
+            "analysis": {
+                "schema": "sentinel.ai-analysis/1",
+                "summary": "the unit step failed on an assertion",
+                "claims": [{
+                    "text": "the unit step failed on an assertion",
+                    "citations": [{ "attempt": d.attempt.to_string(), "evidence": "log-1" }],
+                }],
+            },
+        })),
         &[("authorization", &d.service)],
     );
     assert_eq!(settled.status, 200, "{}", settled.text);
@@ -501,9 +512,10 @@ fn a_member_asks_and_the_service_answers_through_the_delegation() {
     assert_eq!(read.status, 200, "{}", read.text);
     assert_eq!(read.json()["state"], "settled");
     assert_eq!(
-        read.json()["result"],
+        read.json()["analysis"]["claims"][0]["text"],
         "the unit step failed on an assertion"
     );
+    assert_eq!(read.json()["analysis"]["schema"], "sentinel.ai-analysis/1");
 
     // And the delegation is dead: it was minted for that request, and the settlement revoked it in
     // the same write, so it no longer authenticates at all.
