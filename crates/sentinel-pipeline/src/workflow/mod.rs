@@ -18,6 +18,7 @@ mod change;
 mod labels;
 mod native;
 mod rules;
+mod suggest;
 
 pub use change::{
     COPY_PREFIX, KeptJob, LabelChange, Options, Phase, Plan, PlanError, SCHEMA as PLAN_SCHEMA,
@@ -31,6 +32,10 @@ pub use native::{
     StepMapping,
 };
 pub use rules::{Construct, RULE_TABLE_VERSION, Rule, RuleTable};
+pub use suggest::{
+    MAX_STEP_INDEX, Refusal, Request as SuggestRequest, SCHEMA as SUGGESTION_SCHEMA, Suggestion,
+    suggest,
+};
 
 /// The only directory GitHub reads workflows from; anything else is not an input.
 pub const WORKFLOW_DIRECTORY: &str = ".github/workflows";

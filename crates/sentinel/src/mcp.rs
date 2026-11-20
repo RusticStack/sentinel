@@ -4,7 +4,7 @@ use std::{
 };
 
 use clap::Args;
-use sentinel_protocol::mcp::{ApiCall, Backend, execute_tool};
+use sentinel_protocol::mcp::{ApiCall, Backend, SuggestWorkflow, execute_tool};
 use serde_json::{Map, Value, json};
 
 pub use sentinel_protocol::mcp::PROTOCOL_VERSION;
@@ -329,6 +329,9 @@ fn known_tool(name: &str) -> bool {
             | "get_artifact"
             | "read_artifact_file"
             | "get_artifact_link"
+            | "list_flaky_tests"
+            | "get_analysis"
+            | "suggest_workflow_change"
     )
 }
 
@@ -360,6 +363,21 @@ impl Backend for Stdio<'_> {
                 .post(&call.path, &call.body, call.idempotency_key.as_deref())
         };
         result.map_err(|error| error.document())
+    }
+
+    fn suggest_workflow(&mut self, request: &SuggestWorkflow) -> Result<Value, Value> {
+        sentinel_pipeline::workflow::suggest(&sentinel_pipeline::workflow::SuggestRequest {
+            path: &request.path,
+            text: &request.workflow,
+            job: request.job.as_deref(),
+            step: request.step,
+            construct: &request.construct,
+        })
+        .map(|suggestion| {
+            serde_json::to_value(suggestion)
+                .unwrap_or_else(|_| local_error("internal", "could not serialize the suggestion"))
+        })
+        .map_err(|refusal| local_error(refusal.code(), &refusal.message()))
     }
 
     fn validate_pipeline(&mut self, pipeline: &str) -> Result<Value, Value> {
@@ -571,7 +589,44 @@ mod tests {
             &client,
         )
         .unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 19);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 21);
+    }
+
+    #[test]
+    fn the_suggestion_tool_reaches_the_compiler_free_analyzer_over_stdio() {
+        let mut args = Map::new();
+        args.insert("path".into(), json!(".github/workflows/ci.yml"));
+        args.insert(
+            "workflow".into(),
+            json!("name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n        shell: pwsh\n"),
+        );
+        args.insert("job".into(), json!("build"));
+        args.insert("step".into(), json!(0));
+        args.insert("construct".into(), json!("shell"));
+        let client = Client::with_token("http://127.0.0.1:1", &test_token()).unwrap();
+        let mut stdio = Stdio { client: &client };
+        let suggestion = execute_tool(&mut stdio, "suggest_workflow_change", &args).unwrap();
+        assert_eq!(suggestion["schema"], "sentinel.migration-suggestion/1");
+        assert_eq!(suggestion["before"], "        shell: pwsh\n");
+        assert_eq!(suggestion["after"], "        shell: bash\n");
+        assert_eq!(suggestion["applied"], false);
+
+        // A construct with no rewrite is refused with the rule table's reason and no lines.
+        args.insert("construct".into(), json!("container"));
+        args.remove("step");
+        args.insert(
+            "workflow".into(),
+            json!("name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    container: node:20\n    steps:\n      - run: npm test\n"),
+        );
+        let refused = execute_tool(&mut stdio, "suggest_workflow_change", &args).unwrap_err();
+        assert_eq!(refused["code"], "not_found");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("Docker daemon")
+        );
+        assert!(refused.get("before").is_none());
     }
 
     #[test]
@@ -687,7 +742,7 @@ mod tests {
         let tools: Value = serde_json::from_slice(lines[1]).unwrap();
         let resources: Value = serde_json::from_slice(lines[2]).unwrap();
         assert_eq!(initialize["result"]["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 19);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 21);
         assert_eq!(
             resources["result"]["resources"].as_array().unwrap().len(),
             3

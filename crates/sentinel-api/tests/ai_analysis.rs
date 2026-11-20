@@ -965,3 +965,283 @@ fn the_services_poll_writes_the_automatic_request_for_a_failed_job() {
         .collect();
     assert_eq!(origins, ["automatic", "member"]);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Y08: the read-only MCP tools. An analysis read over MCP is the same analysis, labelled
+// inference and untrusted, behind the same scope; and neither it nor the flaky list writes
+// anything a run, a job or a check reads.
+// ---------------------------------------------------------------------------------------------
+
+/// An MCP-audience session for `d.member`, holding exactly `scopes`.
+fn mcp_session(d: &Deployment, client_id: &'static str, scopes: Scopes) -> (String, String) {
+    use sentinel_auth::oauth::{self as auth_oauth, Kind, pkce};
+
+    sentinel_store::oauth::register_mcp_client(
+        &d.store,
+        &sentinel_store::oauth::McpClientSpec {
+            id: client_id,
+            name: "Analysis reader",
+            max_scopes: Scopes::MCP,
+            kind: sentinel_store::oauth::McpRegistrationKind::Dynamic,
+            metadata_url: None,
+        },
+        &["http://127.0.0.1:49152/callback"],
+    )
+    .unwrap();
+    let verifier = pkce::verifier();
+    let challenge = pkce::challenge(&verifier);
+    let code = sentinel_store::oauth::code::approve(
+        &d.store,
+        &sentinel_store::oauth::code::Approval {
+            client_id,
+            redirect_uri: "http://127.0.0.1:49152/callback",
+            code_challenge: &challenge,
+            user: d.member,
+            scopes,
+            tenant: None,
+            repo: None,
+            audience: Audience::Mcp,
+        },
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let grant = sentinel_store::oauth::code::exchange(
+        &d.store,
+        client_id,
+        &code,
+        "http://127.0.0.1:49152/callback",
+        &verifier,
+        Some(Audience::Mcp),
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let authorization = format!("Bearer {}", auth_oauth::format(Kind::Access, &grant.access));
+    let (status, headers, body) = mcp_post(
+        d,
+        &json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize",
+            "params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"analysis-mcp","version":"1"}}
+        }),
+        &authorization,
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    let session = headers
+        .into_iter()
+        .find(|(key, _)| key == "mcp-session-id")
+        .unwrap()
+        .1;
+    let (status, _, body) = mcp_post(
+        d,
+        &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        &authorization,
+        &[
+            ("mcp-protocol-version", "2025-11-25"),
+            ("mcp-session-id", session.as_str()),
+        ],
+    );
+    assert_eq!(status, 202, "{body}");
+    (authorization, session)
+}
+
+fn mcp_post(
+    d: &Deployment,
+    body: &Value,
+    authorization: &str,
+    extra: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>, Value) {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build(),
+    );
+    let mut request = agent
+        .post(format!("{}/mcp", d.base))
+        .header("accept", "application/json, text/event-stream")
+        .header("authorization", authorization)
+        .header("content-type", "application/json");
+    for (name, value) in extra {
+        request = request.header(*name, *value);
+    }
+    let response = request.send(body.to_string().as_bytes()).unwrap();
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_ascii_lowercase(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let text = response.into_body().read_to_string().unwrap();
+    (
+        status,
+        headers,
+        serde_json::from_str(&text).unwrap_or(Value::Null),
+    )
+}
+
+fn mcp_tool(
+    d: &Deployment,
+    session: &(String, String),
+    name: &str,
+    arguments: Value,
+) -> (u16, Vec<(String, String)>, Value) {
+    mcp_post(
+        d,
+        &json!({
+            "jsonrpc":"2.0", "id":2, "method":"tools/call",
+            "params":{"name":name,"arguments":arguments}
+        }),
+        &session.0,
+        &[
+            ("mcp-protocol-version", "2025-11-25"),
+            ("mcp-session-id", session.1.as_str()),
+        ],
+    )
+}
+
+/// Every row of every table, as text: a write anywhere would change it.
+fn store_state(store: &Store) -> String {
+    store
+        .read(|c| {
+            let mut tables = c.prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                  ORDER BY name",
+            )?;
+            let names: Vec<String> = tables
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            let mut state = String::new();
+            for name in names {
+                let mut statement = c.prepare(&format!("SELECT * FROM \"{name}\""))?;
+                let columns = statement.column_count();
+                let mut rows = statement.query([])?;
+                while let Some(row) = rows.next()? {
+                    state.push_str(&name);
+                    for index in 0..columns {
+                        state.push_str(&format!("{:?}", row.get_ref(index)?));
+                    }
+                    state.push('\n');
+                }
+            }
+            Ok(state)
+        })
+        .unwrap()
+}
+
+#[test]
+fn mcp_serves_the_analysis_as_inference_under_logs_read_and_writes_nothing() {
+    let d = deployment(Scenario::OptedIn);
+    let mia = sign_in(&d, "mia", MEMBER);
+    let id = claimed(&d, &mia, d.attempt);
+    let settled = settle(
+        &d,
+        &id,
+        &answer(
+            d.attempt,
+            &[("the assertion wants 201 and got 500", "log-2")],
+        ),
+    );
+    assert_eq!(settled.status, 200, "{}", settled.text);
+
+    let reader = mcp_session(&d, "analysis-reader", Scopes::MCP);
+    let (status, _, listed) = mcp_post(
+        &d,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        &reader.0,
+        &[
+            ("mcp-protocol-version", "2025-11-25"),
+            ("mcp-session-id", reader.1.as_str()),
+        ],
+    );
+    assert_eq!(status, 200, "{listed}");
+    let tool = |name: &str| {
+        listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is advertised"))
+            .clone()
+    };
+    assert_eq!(tool("get_analysis")["annotations"]["inference"], true);
+    assert_eq!(tool("get_analysis")["annotations"]["untrusted"], true);
+    assert_eq!(tool("get_analysis")["annotations"]["readOnlyHint"], true);
+    assert_eq!(tool("list_flaky_tests")["annotations"]["untrusted"], true);
+    assert!(
+        tool("get_analysis")["description"]
+            .as_str()
+            .unwrap()
+            .contains("inference, never evidence")
+    );
+
+    let before = store_state(&d.store);
+    let (status, _, body) = mcp_tool(
+        &d,
+        &reader,
+        "get_analysis",
+        json!({"attempt":d.attempt.to_string()}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["isError"], false, "{body}");
+    let served = &body["result"]["structuredContent"];
+    assert_eq!(served["inference"], true);
+    assert_eq!(served["present"], true);
+    assert_eq!(served["attempt"], d.attempt.to_string());
+    assert_eq!(served["claims"][0]["citations"][0]["evidence"], "log-2");
+
+    // The flaky list is served through the same session shape, and both reads leave the store
+    // exactly as it was: no request, no analysis and no audit row is written by reading.
+    let (status, _, flaked) = mcp_tool(
+        &d,
+        &reader,
+        "list_flaky_tests",
+        json!({"tenant":"acme","repo":"app"}),
+    );
+    assert_eq!(status, 200, "{flaked}");
+    assert_eq!(flaked["result"]["isError"], false, "{flaked}");
+    assert_eq!(store_state(&d.store), before);
+}
+
+#[test]
+fn the_analysis_tool_is_refused_to_a_session_without_logs_read() {
+    let d = deployment(Scenario::OptedIn);
+    let mia = sign_in(&d, "mia", MEMBER);
+    let id = claimed(&d, &mia, d.attempt);
+    assert_eq!(
+        settle(&d, &id, &answer(d.attempt, &[("the assertion", "log-2")])).status,
+        200
+    );
+
+    let narrow = mcp_session(&d, "analysis-runs-only", Scopes::RUNS_READ);
+    let (status, headers, body) = mcp_tool(
+        &d,
+        &narrow,
+        "get_analysis",
+        json!({"attempt":d.attempt.to_string()}),
+    );
+    assert_eq!(status, 403, "{body}");
+    let challenge = headers
+        .iter()
+        .find(|(name, _)| name == "www-authenticate")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default();
+    assert!(challenge.contains("insufficient_scope"), "{challenge}");
+    assert!(challenge.contains("logs:read"), "{challenge}");
+
+    // The same scope the route itself asks for is the one the tool asks for: a session that
+    // holds it reads the analysis, and one that holds the repository alone does not.
+    let reader = mcp_session(&d, "analysis-logs-reader", Scopes::LOGS_READ);
+    let (status, _, body) = mcp_tool(
+        &d,
+        &reader,
+        "get_analysis",
+        json!({"attempt":d.attempt.to_string()}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["structuredContent"]["present"], true);
+}
