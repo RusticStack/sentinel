@@ -1,6 +1,7 @@
 //! Unsupported syntax is an error, never a silent no-op.
 
 pub mod compile;
+pub mod cron;
 pub mod explain;
 pub mod expr;
 pub(crate) mod glob;
@@ -14,6 +15,7 @@ pub mod yaml;
 use std::fmt;
 
 pub use compile::{CompileError, CompiledJob, CompiledPipeline};
+pub use cron::Cron;
 pub use explain::Explanation;
 pub use expr::{Context, Expr, Phase, Template, Value};
 pub use hash_files::hash_files;

@@ -577,9 +577,11 @@ mod tests {
         // The default-limit rebuild copies the policy table's rows into a replacement and drops the one it
         // replaces; the preflight reports it only for a table that exists to be counted.
         assert_eq!(
-            rewritten(sql(schema::LATEST)),
+            rewritten(sql(81)),
             ["storage_policies", "storage_policies_previous"]
         );
+        // The newest migration only creates tables nothing earlier holds, so it visits no row.
+        assert_eq!(rewritten(sql(schema::LATEST)), Vec::<&str>::new());
         // The OAuth scope rebuild copies every row into a `_v73` table and drops the original.
         let oauth = rewritten(sql(73));
         for table in ["oauth_clients", "oauth_grants", "oauth_access_tokens"] {

@@ -139,6 +139,7 @@ fn fixture() -> Fixture {
         Arc::from(vec!["https://github.com".to_owned()]),
         classes,
         Arc::new(NoFetch),
+        Arc::new(sentinel_intake::GitLister),
         dir.path().join("work"),
         Config {
             budget: Duration::from_secs(5),

@@ -950,6 +950,33 @@ pub fn ls_remote(
     max_refs: usize,
     timeout: Duration,
 ) -> Result<Vec<crate::RefTip>> {
+    ls_remote_asking(dir, remote, access, max_refs, None, timeout)
+}
+
+/// One ref's tip. `git ls-remote` takes the ref as an argument, so this asks for that ref alone
+/// instead of listing every head and tag, and the answer is bounded by one line.
+pub fn ls_remote_ref(
+    dir: &Path,
+    remote: &str,
+    access: Option<&Access>,
+    ref_name: &str,
+    timeout: Duration,
+) -> Result<Option<crate::RefTip>> {
+    if !advertised(ref_name) || ref_name.contains(',') || ref_name.contains('*') {
+        return Err(Error::Preparation("ref name looks like an option".into()));
+    }
+    let tips = ls_remote_asking(dir, remote, access, 1, Some(ref_name), timeout)?;
+    Ok(tips.into_iter().next())
+}
+
+fn ls_remote_asking(
+    dir: &Path,
+    remote: &str,
+    access: Option<&Access>,
+    max_refs: usize,
+    ref_name: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<crate::RefTip>> {
     if remote.starts_with('-') {
         return Err(Error::Preparation("repository looks like an option".into()));
     }
@@ -964,7 +991,10 @@ pub fn ls_remote(
     let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
     let mut cmd = git(dir);
     transport(&mut cmd, private.as_ref());
-    cmd.args(["ls-remote", "--heads", "--tags", "--", remote]);
+    match ref_name {
+        Some(ref_name) => cmd.args(["ls-remote", "--", remote, ref_name]),
+        None => cmd.args(["ls-remote", "--heads", "--tags", "--", remote]),
+    };
     let cap = max_refs.min(65_536).saturating_mul(1_200);
     let output = run_capped(cmd, deadline, "git ls-remote", Some(cap))?;
     drop(private);

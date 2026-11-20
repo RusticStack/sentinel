@@ -40,6 +40,7 @@ pub mod rollback;
 pub mod runner;
 pub mod runner_provision;
 pub mod runs;
+pub mod schedule;
 pub mod schema;
 pub mod secrets;
 pub mod setup;

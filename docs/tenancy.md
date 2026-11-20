@@ -14,6 +14,7 @@ Revoking authority also has to settle the work and connections that already hold
 | Credentials revoked | Every API credential and OAuth grant scoped to the tenant, which includes every one of its service accounts' (a service credential is confined to its home tenant). Deployment-wide human credentials survive: a person may belong to other tenants, and nothing they hold reaches this one. |
 | Invitations revoked | Unspent invitations into the tenant. |
 | Jobs canceled | Every live run and job gets the durable `cancel_requested` flag. Jobs nobody owns yet (blocked, queued) are moved to `Canceled` through the state machine, so the run aggregates honestly. Jobs a worker owns keep their state; the worker reads the flag, stops, and reports its own terminal outcome — never faked from the controller. |
+| Schedules stop | The schedule lane checks the tenant before it claims an occurrence, records the due occurrence `suspended` and moves its cursor past it, so a suspended tenant's pipelines do not fire and the suspended window is not replayed on reactivation ([schedules](schedules.md#suspension)). |
 | Subscriptions re-authorize | The tenant's authorization epoch moves (below). |
 
 Sessions are **not** revoked — they are deployment-wide, not tenant-scoped. Retained evidence — runs, logs, artifacts — is untouched: suspension is a stop, not a deletion, and [retention](retention.md) decides the rest. `Suspension` reports the counts, and the audit row carries them.

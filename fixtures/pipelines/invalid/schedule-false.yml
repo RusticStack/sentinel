@@ -1,0 +1,5 @@
+# expect: on.schedule: `schedule: true` or omit the key
+schema: 1
+on: {schedule: false}
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}]}

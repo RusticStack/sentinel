@@ -113,8 +113,9 @@ impl RuleTable {
         match construct {
             Construct::Trigger { event } => match event.as_str() {
                 "push" | "pull_request" | "merge_group" | "workflow_dispatch" => Rule::Translatable,
-                "schedule" => Rule::Unsupported {
-                    reason: "durable schedules do not exist yet (I02)",
+                "schedule" => Rule::WithChange {
+                    change: "the crons become a stored per-repository schedule; the translated \
+                             pipeline accepts a scheduled run",
                 },
                 "workflow_call" | "workflow_run" => Rule::Unsupported {
                     reason: "reusable pipelines and workflow chaining do not exist yet (I10)",

@@ -249,6 +249,10 @@ beside a stopped controller. The networked equivalent is `GET`/`POST /tenants/{s
 
 There is no separate inherit flag: `none` is the one way to clear a ceiling here, and an empty field is the way on the web page.
 
+## Host-local schedules
+
+`sentinel admin schedule set|disable|show --data-dir DIR --actor usr_... --repo repo_...` is a host-local `admin` command like `admin source poll`: no sign-in, authorized by access to the controller's data directory and the acting administrator's live authority, and it writes the schedule row directly, so it runs on the controller host and a running controller's schedule lane picks the change up on its next pass. `set` takes `--cron` (five UTC fields), `--ref` (default `refs/heads/main`) and `--overlap skip|cancel`, and prints the first occurrence as `next_at_ms`; `disable` stops firing while keeping the row; `show --repo` prints one row and `show --all` prints every schedule, oldest cursor first. The semantics — deduplicated occurrences, the overlap default, the missed-occurrence bound, pinned revisions and suspension — are in [schedules](schedules.md).
+
 ## Legacy `sentinel api`
 
 The `sentinel api` commands (`me`, `run`, `status`, `runs`, `cancel`, `rerun`, `logs`, `workers`, `queue`, `drain`, `undrain`; see [API](api.md#the-cli)) run on the shared client: `--token-file`, `--token` or `SENTINEL_TOKEN` may hold an `sntl_` credential or an `sntl_at_` access token, the server is taken as given (a trailing `/` dropped), and exits follow the table above — so `conflict` exits 5 and a busy or unreachable controller 6.

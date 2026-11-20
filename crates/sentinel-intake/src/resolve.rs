@@ -14,7 +14,10 @@ use sentinel_store::{
     runner, runs,
 };
 
-use crate::source;
+use crate::{
+    poll::{Lister, TipRequest},
+    source,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -154,6 +157,10 @@ impl Fetch for GitFetch {
     }
 }
 
+/// A compiled pipeline pinned at one revision and ready to create a run from — or the outcome that
+/// says why this revision cannot run.
+type Pinned = std::result::Result<(RunSpec, Vec<(String, String)>), Outcome>;
+
 pub struct Resolver {
     store: Arc<Store>,
     key: Option<Arc<Key>>,
@@ -163,6 +170,7 @@ pub struct Resolver {
     /// naming any other class is refused visibly, never silently run elsewhere.
     runner_classes: Arc<[RunnerClass]>,
     fetch: Arc<dyn Fetch>,
+    lister: Arc<dyn Lister>,
     work_root: PathBuf,
     config: Config,
 }
@@ -176,6 +184,7 @@ impl Resolver {
         destinations: Arc<[String]>,
         runner_classes: Arc<[RunnerClass]>,
         fetch: Arc<dyn Fetch>,
+        lister: Arc<dyn Lister>,
         work_root: PathBuf,
         config: Config,
     ) -> std::io::Result<Resolver> {
@@ -192,6 +201,7 @@ impl Resolver {
             destinations,
             runner_classes,
             fetch,
+            lister,
             work_root,
             config,
         })
@@ -434,94 +444,15 @@ impl Resolver {
                 now,
             );
         };
-        let compiled = match sentinel_pipeline::compile_str(&text) {
-            Ok(compiled) => compiled,
-            Err(e) => {
-                return self.settle(
-                    delivery,
-                    Outcome::Failed {
-                        reason: "pipeline_invalid",
-                        detail: Some(e.to_string().chars().take(200).collect()),
-                    },
-                    now,
-                );
-            }
-        };
-        if !compiled.on.admits(&plan.event()) {
-            return self.settle(delivery, Outcome::Ignored("no_trigger"), now);
-        }
-        // A class the deployment does not define is refused before a run exists: the artifact could
-        // never be recorded, so running the pipeline would only spend the work to fail it.
-        let classes = match self.store.read(sentinel_store::retention::artifact_classes) {
-            Ok(classes) => classes,
-            Err(_) => {
-                return self.retry(
-                    delivery,
-                    "store_unavailable",
-                    None,
-                    intake::Resolution::Failed("resolution_attempts"),
-                    now,
-                );
-            }
-        };
-        let declared = compiled
-            .jobs
-            .iter()
-            .flat_map(|job| job.spec.artifacts.iter())
-            .filter_map(|a| a.class.as_deref());
-        if sentinel_store::retention::unknown_class(&classes, declared).is_some() {
-            return self.settle(
-                delivery,
-                Outcome::Failed {
-                    reason: "artifact_class_unknown",
-                    detail: None,
-                },
-                now,
-            );
-        }
-
-        let source = match PinnedSource::new(
-            &binding.metadata.binding.remote,
+        let (spec, images) = match self.pinned_run(
+            &binding,
+            &text,
             &fetched.commit,
-            Some(&plan.checkout_ref),
-        ) {
-            Ok(source) => source,
-            Err(_) => {
-                return self.settle(
-                    delivery,
-                    Outcome::Failed {
-                        reason: "pipeline_invalid",
-                        detail: None,
-                    },
-                    now,
-                );
-            }
-        };
-        let spec = match RunSpec::new(source, compiled) {
-            Ok(spec) => spec,
-            Err(_) => {
-                return self.settle(
-                    delivery,
-                    Outcome::Failed {
-                        reason: "pipeline_invalid",
-                        detail: None,
-                    },
-                    now,
-                );
-            }
-        };
-        let images = match runs::pinned_images(&spec) {
-            Ok(images) => images,
-            Err(_) => {
-                return self.settle(
-                    delivery,
-                    Outcome::Failed {
-                        reason: "image_unpinned",
-                        detail: None,
-                    },
-                    now,
-                );
-            }
+            &plan.checkout_ref,
+            &plan.event(),
+        )? {
+            Ok(ready) => ready,
+            Err(outcome) => return self.settle(delivery, outcome, now),
         };
 
         let provenance = plan.provenance(delivery, &binding, &spec, &fetched.commit);
@@ -542,6 +473,232 @@ impl Resolver {
             Err(e) => return Err(e),
         };
         Ok(Outcome::Dispatched { run })
+    }
+
+    /// Compile the pipeline text fetched at `commit` and pin it, or say why it cannot run.
+    ///
+    /// A class the deployment does not define is refused before a run exists: the artifact could
+    /// never be recorded, so running the pipeline would only spend the work to fail it.
+    fn pinned_run(
+        &self,
+        binding: &source::Binding,
+        text: &str,
+        commit: &str,
+        checkout_ref: &str,
+        event: &Event<'_>,
+    ) -> Result<Pinned, StoreError> {
+        let compiled = match sentinel_pipeline::compile_str(text) {
+            Ok(compiled) => compiled,
+            Err(e) => {
+                return Ok(Err(Outcome::Failed {
+                    reason: "pipeline_invalid",
+                    detail: Some(e.to_string().chars().take(200).collect()),
+                }));
+            }
+        };
+        if !compiled.on.admits(event) {
+            return Ok(Err(Outcome::Ignored("no_trigger")));
+        }
+        let classes = self
+            .store
+            .read(sentinel_store::retention::artifact_classes)?;
+        let declared = compiled
+            .jobs
+            .iter()
+            .flat_map(|job| job.spec.artifacts.iter())
+            .filter_map(|a| a.class.as_deref());
+        if sentinel_store::retention::unknown_class(&classes, declared).is_some() {
+            return Ok(Err(Outcome::Failed {
+                reason: "artifact_class_unknown",
+                detail: None,
+            }));
+        }
+        let Ok(source) =
+            PinnedSource::new(&binding.metadata.binding.remote, commit, Some(checkout_ref))
+        else {
+            return Ok(Err(Outcome::Failed {
+                reason: "pipeline_invalid",
+                detail: None,
+            }));
+        };
+        let Ok(spec) = RunSpec::new(source, compiled) else {
+            return Ok(Err(Outcome::Failed {
+                reason: "pipeline_invalid",
+                detail: None,
+            }));
+        };
+        let Ok(images) = runs::pinned_images(&spec) else {
+            return Ok(Err(Outcome::Failed {
+                reason: "image_unpinned",
+                detail: None,
+            }));
+        };
+        Ok(Ok((spec, images)))
+    }
+
+    /// One occurrence of a stored schedule: read the ref the schedule names, pin the commit it holds
+    /// right now, and dispatch the pipeline from it.
+    ///
+    /// Two occurrences of one schedule therefore may run different commits, and each run carries the
+    /// revision its own occurrence resolved. Everything that is not a dispatch settles the occurrence
+    /// with its reason, so a pass over a repository that cannot be read costs one recorded row, never
+    /// an occurrence that disappears.
+    pub fn resolve_scheduled(
+        &self,
+        claim: &sentinel_store::schedule::Claim,
+        now: UnixMillis,
+    ) -> Result<Outcome, StoreError> {
+        let (tenant, repo) = (claim.schedule.tenant, claim.schedule.repo);
+        let binding = match source::classify(&self.store, repo)? {
+            source::Lookup::Bound(binding) if binding.tenant == tenant => binding,
+            source::Lookup::Bound(_) => return self.settle_scheduled(claim, "tenant_changed", now),
+            source::Lookup::Unbound => return self.settle_scheduled(claim, "binding_revoked", now),
+            source::Lookup::Unusable(reason) => return self.settle_scheduled(claim, reason, now),
+        };
+        if !source::destination_allowed(&self.destinations, &binding.metadata.binding.remote) {
+            return self.settle_scheduled(claim, "destination_refused", now);
+        }
+        let access = match source::issue(
+            &self.store,
+            self.key.as_deref(),
+            self.app.get(),
+            &binding,
+            now,
+        ) {
+            Ok(access) => access,
+            Err(source::Error::Refused(why)) => return self.settle_scheduled(claim, why, now),
+            Err(source::Error::Unavailable(why)) => {
+                return self.settle_scheduled(claim, why, now);
+            }
+        };
+        // A ref the binding narrowed itself out of since the schedule was configured is refused
+        // before the fetch, as every other read of the binding is.
+        if !binding
+            .metadata
+            .binding
+            .allowed_refs
+            .iter()
+            .any(|p| sentinel_protocol::source::ref_matches(p, &claim.schedule.ref_name))
+        {
+            return self.settle_scheduled(claim, "ref_not_allowed", now);
+        }
+
+        let work = self
+            .work_root
+            .join(format!("{}-{}", repo, claim.at_ms.div_euclid(60_000)));
+        let _scratch = Scratch(work.clone());
+        fs::create_dir(&work)?;
+        let tip = match self.lister.tip(&TipRequest {
+            dir: &work,
+            remote: &binding.metadata.binding.remote,
+            access: Some(&access),
+            ref_name: &claim.schedule.ref_name,
+            budget: self.config.budget,
+        }) {
+            Ok(Some(tip)) => tip.peeled.unwrap_or(tip.oid),
+            Ok(None) => return self.settle_scheduled(claim, "ref_missing", now),
+            Err(sentinel_git::Error::UnsupportedPlatform) => {
+                return self.settle_scheduled(claim, "source_unavailable", now);
+            }
+            Err(_) => return self.settle_scheduled(claim, "source_unreachable", now),
+        };
+        let fetched = match self.fetch.file_at(FileRequest {
+            work: &work,
+            remote: &binding.metadata.binding.remote,
+            access: Some(&access),
+            sha: &tip,
+            path: &binding.metadata.binding.pipeline_path,
+            max_bytes: self.config.max_pipeline_bytes,
+            budget: self.config.budget,
+        }) {
+            Ok(fetched) => fetched,
+            Err(sentinel_git::Error::Missing) => {
+                return self.settle_scheduled(claim, "no_pipeline", now);
+            }
+            Err(sentinel_git::Error::TooLarge(_)) => {
+                return self.settle_scheduled(claim, "pipeline_too_large", now);
+            }
+            Err(sentinel_git::Error::UnsupportedPlatform) => {
+                return self.settle_scheduled(claim, "source_unavailable", now);
+            }
+            Err(_) => return self.settle_scheduled(claim, "source_unreachable", now),
+        };
+        let Ok(text) = String::from_utf8(fetched.bytes) else {
+            return self.settle_scheduled(claim, "pipeline_invalid", now);
+        };
+        let event = Event::schedule(&claim.schedule.ref_name);
+        let (spec, images) = match self.pinned_run(
+            &binding,
+            &text,
+            &fetched.commit,
+            &claim.schedule.ref_name,
+            &event,
+        )? {
+            Ok(ready) => ready,
+            Err(Outcome::Ignored(reason)) => return self.settle_scheduled(claim, reason, now),
+            Err(Outcome::Failed { reason, .. }) => {
+                return self.settle_scheduled(claim, reason, now);
+            }
+            Err(_) => return self.settle_scheduled(claim, "pipeline_invalid", now),
+        };
+        let provenance = Provenance {
+            tenant,
+            repo,
+            trigger: "schedule".into(),
+            delivery: None,
+            provider: None,
+            ref_name: Some(claim.schedule.ref_name.clone()),
+            old_sha: None,
+            new_sha: Some(fetched.commit.clone()),
+            head_sha: None,
+            base_sha: None,
+            merge_sha: None,
+            pipeline_sha: fetched.commit.clone(),
+            pipeline_path: Some(binding.metadata.binding.pipeline_path.clone()),
+            pipeline_digest: spec.pipeline.digest.to_le_bytes(),
+            pr_number: None,
+            group_ref: None,
+        };
+        let dispatched = claim.clone();
+        // `now` predates the resolution: stamping jobs with it would count the fetch as queue time.
+        match self.store.writer().write(move |tx| {
+            sentinel_store::schedule::dispatch(
+                tx,
+                &dispatched,
+                &spec,
+                &images,
+                &provenance,
+                UnixMillis::steady(),
+            )
+        }) {
+            Ok(run) => Ok(Outcome::Dispatched { run }),
+            Err(StoreError::Conflict) => Ok(Outcome::Skipped),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Record what became of a scheduled occurrence that dispatched no run.
+    fn settle_scheduled(
+        &self,
+        claim: &sentinel_store::schedule::Claim,
+        reason: &'static str,
+        now: UnixMillis,
+    ) -> Result<Outcome, StoreError> {
+        let claim = claim.clone();
+        self.store.writer().write(move |tx| {
+            sentinel_store::schedule::settle(
+                tx,
+                claim.schedule.repo,
+                claim.at_ms,
+                sentinel_store::schedule::State::Failed,
+                Some(reason),
+                now,
+            )
+        })?;
+        Ok(Outcome::Failed {
+            reason,
+            detail: None,
+        })
     }
 
     /// One `workflow_job` delivery. Only a queued job is demand: it becomes one durable job of
@@ -870,6 +1027,8 @@ impl Plan {
             EventKind::PullRequest => Event::pull_request(&self.policy_ref),
             EventKind::MergeGroup => Event::merge_group(&self.policy_ref),
             EventKind::Manual => Event::manual(),
+            // A delivery never carries this kind: a schedule resolves its occurrence directly.
+            EventKind::Schedule => Event::schedule(&self.policy_ref),
         }
     }
 
