@@ -194,6 +194,50 @@ impl Reroot {
 /// The job controls the tree, so nothing may follow a link it plants: each step is relative to a held descriptor.
 /// What the worker account cannot remove itself, because another in-namespace user of the job owns it, is removed
 /// once from inside the user namespace ([`crate::podman::remove_in_namespace`]).
+/// Creates the directory chain an additional checkout lands in, one descriptor at a time, and refuses the
+/// path when any component is not a real directory: the run's own checkout has already written its tree, so
+/// a symlink or a file where a component belongs would otherwise place the repository outside the workspace.
+///
+/// `relative` is a normalised relative path — the compiled pipeline refuses anything else — and this is the
+/// second check, on the worker, so a spec that bypassed admission reaches no path the workspace does not own.
+pub fn checkout_dir(workspace: &Path, relative: &str) -> Result<PathBuf> {
+    if !sentinel_pipeline::schema::valid_relative_path(relative)
+        || relative == ".git"
+        || relative.starts_with(".git/")
+    {
+        return Err(Error::Preparation(
+            "an additional checkout has an unusable path".into(),
+        ));
+    }
+    let root = workspace
+        .canonicalize()
+        .map_err(|_| Error::Preparation("workspace is not a directory".into()))?;
+    let root = std::ffi::CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| Error::Preparation("workspace path".into()))?;
+    let mut dir = open_dir_nofollow(libc::AT_FDCWD, &root)
+        .ok_or_else(|| Error::Preparation("workspace is not a directory".into()))?;
+    for segment in relative.split('/') {
+        let name = std::ffi::CString::new(segment).map_err(|_| {
+            Error::Preparation("an additional checkout has an unusable path".into())
+        })?;
+        // SAFETY: `dir` is a live directory descriptor and `name` is NUL-terminated; the mode only applies
+        // to a directory this call creates.
+        let made = unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755) };
+        if made != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error.into());
+            }
+        }
+        dir = open_dir_nofollow(dir.as_raw_fd(), &name).ok_or_else(|| {
+            Error::Preparation(format!(
+                "an additional checkout's path `{relative}` passes through something that is not a directory"
+            ))
+        })?;
+    }
+    Ok(workspace.join(relative))
+}
+
 pub fn remove_tree(path: &Path) -> Result<()> {
     remove_tree_with(path, crate::podman::remove_in_namespace)
 }

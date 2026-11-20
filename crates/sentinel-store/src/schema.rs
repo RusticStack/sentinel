@@ -200,7 +200,8 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (84, include_str!("migrations/084_ai_search.sql")),
     (85, include_str!("migrations/085_named_pipelines.sql")),
     (86, include_str!("migrations/086_job_outputs.sql")),
-    (87, include_str!("migrations/087_task_result_reuse.sql")),
+    (87, include_str!("migrations/087_run_sources.sql")),
+    (88, include_str!("migrations/088_task_result_reuse.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -225,7 +226,7 @@ pub const READABLE_BY: &[(u32, u32)] = &[
     (86, 85),
     // A new column with a default: an older binary reads and writes every other column of `runs` and
     // simply never sets the flag, so the only thing it loses is the ability to ask for a fresh run.
-    (87, 86),
+    (88, 87),
 ];
 
 pub fn readable_by(version: u32) -> u32 {
@@ -357,6 +358,10 @@ mod tests {
         (
             84,
             "an older controller claims a log-search request as a failure analysis of its attempt and settles it with an answer to a question it never read: it knows neither the question nor the plan the answer must be built from",
+        ),
+        (
+            87,
+            "an older controller cannot decode run spec format 13, so it refuses to serve a run whose pipeline declares a checkout history or an additional checkout, and it holds no source manifest: it could neither say what such a run built nor resolve its recorded revisions on a rerun",
         ),
     ];
 

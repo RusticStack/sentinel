@@ -92,6 +92,7 @@ fn job(text: &str, outputs: Vec<(String, String, String)>) -> Job {
             tenant: None,
             trust: Trust::Protected,
             outputs,
+            checkouts: Vec::new(),
             reuse_fresh: false,
         },
         secret_bundle: sentinel_protocol::secrets::DeliveryBundle::empty(),

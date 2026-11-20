@@ -479,3 +479,126 @@ fn migration_preserves_legacy_repositories_without_inventing_bindings() {
         1
     );
 }
+
+fn manifest_run(f: &mut Fixture) -> sentinel_core::RunId {
+    let run = sentinel_core::RunId::new();
+    let (tenant, repo) = (f.tenant, f.repo);
+    let tx = f.conn.transaction().unwrap();
+    sentinel_store::jobs::insert_run(&tx, tenant, repo, run, &"a".repeat(40), NOW).unwrap();
+    tx.commit().unwrap();
+    run
+}
+
+fn resolved(
+    run_repo: RepoId,
+    job_index: u32,
+    checkout_index: u32,
+    revision: &str,
+) -> sources::ResolvedSource {
+    sources::ResolvedSource {
+        job_index,
+        checkout_index,
+        repo: run_repo,
+        name: "shared".into(),
+        path: if checkout_index == 0 {
+            String::new()
+        } else {
+            "vendor/shared".into()
+        },
+        ref_name: Some("refs/heads/main".into()),
+        revision: revision.into(),
+        history: "shallow".into(),
+        resolved: NOW,
+    }
+}
+
+#[test]
+fn the_source_manifest_lists_every_checkout_and_keeps_the_first_revision() {
+    let mut f = fixture();
+    let run = manifest_run(&mut f);
+    let (tenant, repo, other, other_repo) = (f.tenant, f.repo, f.other, f.other_repo);
+    let first = "1".repeat(40);
+    let extra = "2".repeat(40);
+    let changed = "3".repeat(40);
+    let tx = f.conn.transaction().unwrap();
+    // The run's own checkout is row 0 of the job's manifest; the declared one follows it.
+    assert!(sources::record_resolution(&tx, tenant, run, &resolved(repo, 0, 0, &first)).unwrap());
+    assert!(
+        sources::record_resolution(&tx, tenant, run, &resolved(other_repo, 0, 1, &extra)).unwrap()
+    );
+    tx.commit().unwrap();
+
+    let manifest = sources::manifest(&f.conn, tenant, run).unwrap();
+    assert_eq!(manifest.len(), 2, "{manifest:?}");
+    assert_eq!(
+        (
+            manifest[0].checkout_index,
+            manifest[0].path.as_str(),
+            manifest[0].revision.as_str()
+        ),
+        (0, "", first.as_str())
+    );
+    assert_eq!(
+        (
+            manifest[1].checkout_index,
+            manifest[1].repo,
+            manifest[1].path.as_str(),
+            manifest[1].revision.as_str()
+        ),
+        (1, other_repo, "vendor/shared", extra.as_str())
+    );
+    let job = sources::job_manifest(&f.conn, tenant, run, 0).unwrap();
+    assert_eq!(job.len(), 2);
+
+    // A rerun resolves the recorded revision: the second attempt's different tip is not stored.
+    let tx = f.conn.transaction().unwrap();
+    assert!(
+        !sources::record_resolution(&tx, tenant, run, &resolved(other_repo, 0, 1, &changed))
+            .unwrap()
+    );
+    tx.commit().unwrap();
+    assert_eq!(
+        sources::job_manifest(&f.conn, tenant, run, 0).unwrap()[1].revision,
+        extra
+    );
+
+    // Another tenant reads no rows of this run, and an edit is refused outright.
+    assert!(sources::manifest(&f.conn, other, run).unwrap().is_empty());
+    assert!(
+        f.conn
+            .execute(
+                "UPDATE run_sources SET revision = ?1 WHERE run_id = ?2",
+                rusqlite::params![changed, run.as_bytes()]
+            )
+            .is_err(),
+        "a recorded revision must not be editable"
+    );
+}
+
+#[test]
+fn a_source_manifest_row_is_bounded_and_names_a_commit() {
+    let mut f = fixture();
+    let run = manifest_run(&mut f);
+    let (tenant, repo) = (f.tenant, f.repo);
+    let tx = f.conn.transaction().unwrap();
+    for bad in [
+        resolved(repo, 0, 0, "not-a-commit"),
+        resolved(repo, 0, 0, "A".repeat(40).as_str()),
+    ] {
+        assert!(
+            matches!(
+                sources::record_resolution(&tx, tenant, run, &bad),
+                Err(Error::InvalidInput("source manifest"))
+            ),
+            "{bad:?}"
+        );
+    }
+    let mut long = resolved(repo, 0, 0, &"a".repeat(40));
+    long.name = "x".repeat(257);
+    assert!(matches!(
+        sources::record_resolution(&tx, tenant, run, &long),
+        Err(Error::InvalidInput("source manifest"))
+    ));
+    tx.commit().unwrap();
+    assert!(sources::manifest(&f.conn, tenant, run).unwrap().is_empty());
+}

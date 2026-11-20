@@ -579,17 +579,6 @@ mod tests {
     #[test]
     fn the_pending_migrations_report_the_tables_they_rewrite() {
         let sql = |version: u32| schema::MIGRATIONS[version as usize - 1].1;
-        let p84 = plain(sql(84));
-        let stmts: Vec<&str> = p84.split(';').take(3).collect();
-        eprintln!(
-            "DEBUG first stmt words: {:?}",
-            stmts[0].split_whitespace().take(3).collect::<Vec<_>>()
-        );
-        eprintln!(
-            "DEBUG second stmt words: {:?}",
-            stmts[1].split_whitespace().take(3).collect::<Vec<_>>()
-        );
-        eprintln!("DEBUG rewritten: {:?}", rewritten(sql(84)));
         // The default-limit rebuild copies the policy table's rows into a replacement and drops the one it
         // replaces; the preflight reports it only for a table that exists to be counted.
         assert_eq!(
@@ -597,7 +586,7 @@ mod tests {
             ["storage_policies", "storage_policies_previous"]
         );
         // Migration 85 rebuilds the provenance table to drop its per-delivery uniqueness, so it
-        // visits every provenance row; the newest migration adds one column and visits none.
+        // visits every provenance row; a migration that only creates tables visits none.
         assert_eq!(rewritten(sql(85)), ["run_provenance_084", "run_provenance"]);
         assert_eq!(rewritten(sql(schema::LATEST)), Vec::<&str>::new());
         // The OAuth scope rebuild copies every row into a `_v73` table and drops the original.

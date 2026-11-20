@@ -99,6 +99,21 @@ pub fn create_run(
     now: UnixMillis,
 ) -> Result<Vec<sentinel_core::JobId>> {
     let tenant = require_repo(tx, principal, repo, Permissions::RUN)?;
+    // An additional checkout is the same grant as the run's own: the repository is one of this tenant's and
+    // the principal may run work on it. A pipeline authorizes nothing by naming a repository.
+    for checkout in spec
+        .pipeline
+        .jobs
+        .iter()
+        .flat_map(|job| &job.spec.checkouts)
+    {
+        require_repo(
+            tx,
+            principal,
+            crate::lookup::repo_by_name(tx, tenant, &checkout.repo)?,
+            Permissions::RUN,
+        )?;
+    }
     // Only after authorization, so a refusal reveals nothing about the repository's binding.
     crate::sources::validate_manual(tx, repo, &spec.source)?;
     let jobs = crate::runs::create_run(tx, tenant, repo, run, spec, now)?;

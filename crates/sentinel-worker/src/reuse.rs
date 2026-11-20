@@ -272,6 +272,7 @@ mod tests {
                 tenant: Some(tenant),
                 trust: Trust::Protected,
                 outputs: Vec::new(),
+                checkouts: Vec::new(),
                 reuse_fresh: false,
             },
             images: Images::with_download(|_, _, _, _, _| Ok(false)),

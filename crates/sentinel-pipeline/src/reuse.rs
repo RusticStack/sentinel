@@ -174,6 +174,8 @@ mod tests {
             outputs: Vec::new(),
             handoff: Vec::new(),
             finalize: None,
+            history: crate::schema::History::Shallow,
+            checkouts: Vec::new(),
             reuse: Some(Reuse {
                 inputs: vec!["Cargo.lock".into()],
                 paths: vec!["target".into()],

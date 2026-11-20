@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct ProtocolVersion(pub u16);
 
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(15);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(16);
 
 /// Declared outputs in the job context, and artifact handoff between jobs: a worker below this version is never
 /// offered a job whose context holds outputs or whose job declares a handoff, so its sessions behave as before.
@@ -27,9 +27,18 @@ pub const CANCEL_PUSH_MIN: ProtocolVersion = ProtocolVersion(11);
 /// this version is never offered a runner, so its sessions behave exactly as before.
 pub const RUNNER_MIN: ProtocolVersion = ProtocolVersion(13);
 
+/// A job's additional repository checkouts: one `CheckoutSource` frame per checkout, naming the
+/// revision and the access of each declared checkout. A worker below this version is served no spec for
+/// a job that declares one, so it never checks out a repository it cannot be told about.
+pub const EXTRA_CHECKOUTS_MIN: ProtocolVersion = ProtocolVersion(15);
+
+/// The most additional checkouts one job may declare, `sentinel_pipeline::schema::MAX_CHECKOUTS`.
+pub const MAX_CHECKOUT_SOURCES: usize = 8;
+pub const MAX_CHECKOUT_REVISION_BYTES: usize = 64;
+
 /// Task-result reuse: the context carries the run's forced-refresh flag. A worker below this version is
 /// sent `Context3`, which cannot state it, so it never learns a run asked for fresh execution.
-pub const REUSE_MIN: ProtocolVersion = ProtocolVersion(15);
+pub const REUSE_MIN: ProtocolVersion = ProtocolVersion(16);
 
 pub const MAX_CANCEL_PUSH: usize = 1024;
 

@@ -141,6 +141,7 @@ fn make_job(worker_dir: &Path, repo_dir: &Path, sha: &str, repo: RepoId, yaml: &
             tenant: None,
             trust: Trust::Protected,
             outputs: Vec::new(),
+            checkouts: Vec::new(),
             reuse_fresh: false,
         },
         images: Images::for_worker_data_dir(worker_dir).unwrap(),

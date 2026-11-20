@@ -326,7 +326,7 @@ producer's entry with its own path and bytes, and a job that never declared the 
 `handoff` module's unit tests (an entry that does not hash to its digest, a path that leaves the directory, a
 directory that is a symlink, a body past the declared length and an artifact past its bounds are each refused).
 
-## Protocol 15: task-result reuse
+## Protocol 16: task-result reuse
 
 Reuse adds no message to the link: a task's result is sealed in the worker's own store and read back from it
 ([cache](cache.md#task-results)), so it is never offered, fetched or pushed to another worker.
@@ -334,7 +334,7 @@ Reuse adds no message to the link: a task's result is sealed in the worker's own
 - **Context.** `Context4` is `Context3` plus `reuse_fresh`, the byte saying this run asked for fresh execution
   (`"fresh": true` on a manual dispatch, and every rerun). It is a new variant rather than a field because postcard
   decodes exactly the field list its reader knows ([protocol](protocol.md#protocol-7-additions)).
-- **Order matters.** `REUSE_MIN` is 15: a session below it is sent `Context3` and is therefore never told a run asked
+- **Order matters.** `REUSE_MIN` is 16: a session below it is sent `Context3` and is therefore never told a run asked
   for fresh execution, and a worker that cannot be told runs its own reuse decision. Upgrade the controller before the
   workers, so the flag is refused to a session that cannot carry it instead of being silently dropped; a worker
   upgraded first keeps working on an older controller and simply never learns about the flag.

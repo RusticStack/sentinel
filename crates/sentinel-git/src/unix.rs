@@ -413,6 +413,7 @@ pub(crate) fn init(work: &Path, deadline: Instant) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fetch(
     work: &Path,
     remote: &str,
@@ -420,18 +421,16 @@ fn fetch(
     private: Option<&Private>,
     credential: Option<&Credential>,
     pin: Option<&str>,
+    depth: Option<u32>,
     deadline: Instant,
 ) -> Result<()> {
-    fetch_with(
-        work,
-        remote,
-        sha,
-        private,
-        credential,
-        pin,
-        &["--depth", "1"],
-        deadline,
-    )
+    // The whole history is the absence of a depth: Git then fetches every commit it can reach.
+    let deep = depth.map(|d| d.to_string());
+    let extra: &[&str] = match &deep {
+        Some(depth) => &["--depth", depth.as_str()],
+        None => &[],
+    };
+    fetch_with(work, remote, sha, private, credential, pin, extra, deadline)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -557,13 +556,40 @@ pub fn checkout(
     credential: Option<&Credential>,
     timeout: Duration,
 ) -> Result<Checkout> {
-    checkout_inner(workspace, source, credential, None, timeout)
+    checkout_inner(workspace, source, credential, None, SHALLOW, timeout)
 }
 
 pub fn checkout_authorized(
     workspace: &Path,
     source: &PinnedSource,
     access: &Access,
+    timeout: Duration,
+) -> Result<Checkout> {
+    checkout_authorized_at(workspace, source, access, SHALLOW, timeout)
+}
+
+/// The fetch depth of a checkout that asks for nothing but the pinned commit.
+pub const SHALLOW: Option<u32> = Some(1);
+
+/// A checkout of a manual source that fetches `depth` commits of the pinned revision's past, or the whole
+/// reachable history when `depth` is `None`.
+pub fn checkout_at(
+    workspace: &Path,
+    source: &PinnedSource,
+    credential: Option<&Credential>,
+    depth: Option<u32>,
+    timeout: Duration,
+) -> Result<Checkout> {
+    checkout_inner(workspace, source, credential, None, depth, timeout)
+}
+
+/// A checkout of a bound source that fetches `depth` commits of the pinned revision's past, or the whole
+/// reachable history when `depth` is `None`.
+pub fn checkout_authorized_at(
+    workspace: &Path,
+    source: &PinnedSource,
+    access: &Access,
+    depth: Option<u32>,
     timeout: Duration,
 ) -> Result<Checkout> {
     if !access.validate(UnixMillis::now().0)
@@ -575,7 +601,7 @@ pub fn checkout_authorized(
     {
         return Err(Error::Preparation("source access refused".into()));
     }
-    checkout_inner(workspace, source, None, Some(access), timeout)
+    checkout_inner(workspace, source, None, Some(access), depth, timeout)
 }
 
 fn checkout_inner(
@@ -583,6 +609,7 @@ fn checkout_inner(
     source: &PinnedSource,
     credential: Option<&Credential>,
     access: Option<&Access>,
+    depth: Option<u32>,
     timeout: Duration,
 ) -> Result<Checkout> {
     let deadline = Instant::now() + timeout;
@@ -609,6 +636,7 @@ fn checkout_inner(
         private.as_ref(),
         credential,
         pin.as_deref(),
+        depth,
         deadline,
     ) {
         Err(Error::Preparation(_)) if manual => {
@@ -681,7 +709,16 @@ pub fn file_at(
         )
         .is_ok();
     if !filtered {
-        fetch(work, remote, sha, private.as_ref(), None, None, deadline)?;
+        fetch(
+            work,
+            remote,
+            sha,
+            private.as_ref(),
+            None,
+            None,
+            SHALLOW,
+            deadline,
+        )?;
     }
     let commit = fetch_head(work, deadline, &secrets)?;
     if filtered
@@ -699,7 +736,16 @@ pub fn file_at(
         )
         .is_err()
     {
-        fetch(work, remote, sha, private.as_ref(), None, None, deadline)?;
+        fetch(
+            work,
+            remote,
+            sha,
+            private.as_ref(),
+            None,
+            None,
+            SHALLOW,
+            deadline,
+        )?;
     }
     drop(private);
     let bytes = read_path(work, &commit, path, max_bytes, deadline, &secrets)?;
@@ -812,6 +858,7 @@ pub fn file_at_merge(
                 private.as_ref(),
                 None,
                 None,
+                SHALLOW,
                 deadline,
             )
         };

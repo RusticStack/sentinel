@@ -162,13 +162,31 @@ frame of an artifact's stream — its shape, an entry's header, that entry's bod
 session below 14 is sent `Context2` and never offered a job whose context carries outputs or whose job declares a
 handoff, and no handoff frame is sent to it, so its sessions behave exactly as before.
 
-## Protocol 15 task-result reuse
+## Protocol 15 additional repository checkouts
 
-Protocol 15 appends one server variant, `Context4`: `Context3` plus `reuse_fresh`, the run's
+Protocol 15 appends `CheckoutSource { attempt, index, repo, revision, recorded, access }`
+(controller → worker): one frame per additional checkout a job declares, in index
+order counting from 1 (index 0 is the run's own checkout), each carrying the
+repository the worker's mirror is keyed by, the commit the controller resolved and
+the access that fetch runs under. `recorded` says the revision is the run's source
+manifest one, which is what makes a missing commit reportable as a vanished
+recorded revision instead of an unknown ref. One frame per checkout rather than one
+list, because a bound access — its trust material and its credential — can be as
+large as 48 KiB and does not share a 64 KiB frame with seven others. The worker
+refuses an index out of order, a repeat, more than `MAX_CHECKOUT_SOURCES` (8) and a
+revision that is not a full object id, so a checkout can never run under somebody
+else's access. `EXTRA_CHECKOUTS_MIN` is 15: a job that declares an additional
+checkout is served no spec at all to a session below it, because a worker that
+cannot be told about a repository must not check one out. The frames are a sensitive
+frame class, since each carries a credential. See [sources](sources.md#additional-checkouts).
+
+## Protocol 16 task-result reuse
+
+Protocol 16 appends one server variant, `Context4`: `Context3` plus `reuse_fresh`, the run's
 forced-refresh flag for task-result reuse ([cache](cache.md#task-results),
-[worker link](worker-link.md#protocol-15-task-result-reuse)). It is a new variant rather
+[worker link](worker-link.md#protocol-16-task-result-reuse)). It is a new variant rather
 than a field because postcard decodes exactly the field list its reader knows (see
-[Protocol 7 additions](#protocol-7-additions)). `REUSE_MIN` is 15: a session below it is sent
+[Protocol 7 additions](#protocol-7-additions)). `REUSE_MIN` is 16: a session below it is sent
 `Context3`, which cannot state the flag, so a worker more than one release behind is never told a run
 asked for fresh execution — and may therefore serve a result that run should have executed. That is
 the reason a deployment upgrades its controller before its workers here: the controller is what

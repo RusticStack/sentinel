@@ -836,6 +836,10 @@ fn prepare(
         .map_err(|_| Error::Preparation("image reference".into()))?;
     let image = format!("{}@{}", image.name, job.digest);
     let declared = compiled.spec.cache.clone();
+    // The job's additional checkouts: what the pipeline declares, matched to the accesses the controller
+    // delivered by the index it sent.
+    let declared_checkouts = compiled.spec.checkouts.clone();
+    let history = compiled.spec.history;
     let resources = compiled.spec.resources;
     let timeout_secs = compiled.spec.timeout_secs;
     let stated_isolation = compiled.spec.runs_on.isolation;
@@ -902,6 +906,8 @@ fn prepare(
                 let mirrors = job.mirrors.clone();
                 let repo = job.context.repo;
                 let lease = job.attempt.to_string();
+                let declared = declared_checkouts;
+                let extras = job.context.checkouts.clone();
                 let cancel = Arc::clone(cancel);
                 move || -> Result<(checkout::Outcome, Option<u64>)> {
                     #[cfg(test)]
@@ -911,6 +917,9 @@ fn prepare(
                         .push(lease.clone());
                     sentinel_git::cancel_scope(cancel, || {
                         let started = Instant::now();
+                        // One deadline covers the run's own checkout and every additional one, so a job can
+                        // never fetch past the checkout budget by declaring more repositories.
+                        let deadline = started + CHECKOUT_TIMEOUT;
                         let outcome = checkout::checkout_mirrored(
                             &path,
                             mirrors.as_ref(),
@@ -918,9 +927,40 @@ fn prepare(
                             &source,
                             access.as_ref(),
                             valid_until,
+                            history,
                             &lease,
-                            CHECKOUT_TIMEOUT,
+                            deadline.saturating_duration_since(Instant::now()),
                         )?;
+                        for extra in &extras {
+                            let index = extra.index as usize;
+                            // The controller numbers its frames from 1: 0 is the run's own checkout.
+                            let declaration = index
+                                .checked_sub(1)
+                                .and_then(|position| declared.get(position))
+                                .ok_or_else(|| {
+                                    Error::Preparation("checkout index outside the spec".into())
+                                })?;
+                            let destination =
+                                crate::workspace::checkout_dir(&path, &declaration.path)?;
+                            let extra_source = sentinel_pipeline::PinnedSource::new(
+                                &extra.access.binding.remote,
+                                &extra.revision,
+                                Some(&declaration.ref_name),
+                            )
+                            .map_err(|_| Error::Preparation("checkout revision".into()))?;
+                            checkout::checkout_extra(
+                                &destination,
+                                mirrors.as_ref(),
+                                &extra.repo,
+                                &extra_source,
+                                &extra.access,
+                                Some(extra.valid_until),
+                                declaration.history,
+                                extra.recorded,
+                                &format!("{lease}-{index}"),
+                                deadline.saturating_duration_since(Instant::now()),
+                            )?;
+                        }
                         Ok((outcome, ns(started)))
                     })
                 }
@@ -2263,6 +2303,7 @@ mod tests {
             context: JobContext {
                 source: None,
                 source_valid_until: None,
+                checkouts: Vec::new(),
                 run: RunId::new(),
                 repo: RepoId::new(),
                 repo_name: "app".into(),
