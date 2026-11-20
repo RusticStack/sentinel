@@ -793,6 +793,8 @@ struct Located {
     job: sentinel_core::JobId,
     /// The attempt's terminal summary, from which the evidence page's failed step is read.
     summary: Option<Vec<u8>>,
+    /// What the attempt's log has left: a citation into a log retention removed never resolves.
+    retention: ai::Retention,
 }
 
 /// Where a cited attempt is, or nothing when the reader could not open it: another repository's
@@ -817,7 +819,16 @@ fn locate(
         Err(StoreError::NotFound) => None,
         Err(error) => return Err(error),
     };
-    Ok(Some(Located { run, job, summary }))
+    let retention = ai::retention(conn, attempt)?.unwrap_or(ai::Retention {
+        expires: None,
+        expired: true,
+    });
+    Ok(Some(Located {
+        run,
+        job,
+        summary,
+        retention,
+    }))
 }
 
 /// The analysis one attempt has, decoded against `sentinel.ai-analysis/1`, with every citation
@@ -884,7 +895,8 @@ fn analysis(state: &State, request: &Request, attempt: &str) -> Route {
         let Some(located) = found else {
             continue;
         };
-        let summary = located.summary
+        let summary = located
+            .summary
             .as_deref()
             .map(AttemptSummary::decode)
             .transpose()
@@ -911,21 +923,13 @@ fn analysis(state: &State, request: &Request, attempt: &str) -> Route {
                 )
             })
             .collect();
-        let retention = state
-            .store
-            .read(move |c| ai::retention(c, cited))
-            .map_err(store_error)?
-            .unwrap_or(ai::Retention {
-                expires: None,
-                expired: true,
-            });
         resolved.push((
             cited,
             Cited {
                 run: located.run,
                 steps,
                 diagnostics,
-                retention,
+                retention: located.retention,
             },
         ));
     }
