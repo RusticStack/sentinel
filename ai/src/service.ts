@@ -186,7 +186,15 @@ const attemptOne = (
     if (decision.decision.state === "refused") {
       return { ok: false, reason: decision.decision.reason } as Attempt;
     }
-    const answer = yield* ask(admitted, evidence.text, config, instructions);
+    // A request with no time left is not worth a provider call: the sweep has ended it or is about
+    // to, so the answer would be discarded and the operator charged by their provider for nothing.
+    if (request.deadline_ms <= Date.now()) {
+      return {
+        ok: false,
+        reason: "provider: the request deadline passed before the provider was asked",
+      } as Attempt;
+    }
+    const answer = yield* ask(admitted, evidence.text, config, instructions, request.deadline_ms);
     if (!answer.ok) {
       return answer;
     }
@@ -233,6 +241,7 @@ const ask = (
   evidence: string,
   config: Config,
   instructions: string,
+  deadlineMs: number,
 ): Effect.Effect<Spoke, never, HttpClient> =>
   Effect.gen(function* () {
     const assistant = yield* Assistant;
@@ -240,6 +249,16 @@ const ask = (
     return { ok: true, text: answer.text, answer } as Spoke;
   }).pipe(
     Effect.provide(Layer.provide(assistantLayer, modelLayer(admitted, config.endpoints))),
+    // The request's own deadline bounds the call: a provider that accepts the connection and never
+    // answers must cost this request and nothing else. Without it the poll would never return, and
+    // every request behind it would expire unserved while the process sat in one call.
+    Effect.timeout(Duration.millis(Math.max(0, deadlineMs - Date.now()))),
+    Effect.catchTag("TimeoutError", () =>
+      Effect.succeed({
+        ok: false,
+        reason: "provider: the request deadline passed before the provider answered",
+      } as Spoke),
+    ),
     Effect.catch((error) =>
       Effect.succeed({ ok: false, reason: `provider: ${error.reason}` } as Spoke),
     ),

@@ -53,6 +53,28 @@ The first run (`1b1a0eb`, before the cancel push) agrees on every figure but can
 - **Cancel is pushed.** A committed cancel reaches the worker holding the attempt on the next dispatch pass instead of its next heartbeat ([worker link](worker-link.md#pushed-cancellation-protocol-11)); the heartbeat still repeats it.
 - **The default failure view is bounded as a whole** at 8 KiB ([API](api.md)): the oldest tail goes first, then long diagnostic messages are shortened, and a diagnostic is dropped only after that.
 
+## With AI on: not measured
+
+The [AI assistance](ai.md#the-guarantees) guarantee is that a run's timing is what these budgets
+say with AI on and its provider failing. **That comparison has not been made here**: it needs a
+controller and a worker built from the current tree on one of the verification hosts, with the
+fixture image resident in the worker's store, which this environment does not have. No number is
+claimed for it, and the tables above remain AI-off figures.
+
+What is established without a measurement is where AI code can run at all: the AI routes and the
+evidence bundle's policy read are the only places it is called, and
+[the Y10 drills](resilience.md#failure-drills) compare every deterministic surface of a run with AI
+on against the same run with AI off. Nothing on the check, dispatch, log or terminal path calls it,
+which is a statement about the code path rather than about a latency distribution.
+
+To make the comparison, run B03 as [above](#method) three times on the same host and the same
+build: AI off, AI enabled with no request queued, and AI enabled with `sentinel-ai` pointed at an
+endpoint that refuses every call (`SENTINEL_AI_LOCAL_URL` at a loopback listener that answers `503`)
+while a queued request is in flight. Compare the p95 of each budget across the three; the gate is
+that the AI-on figures stay inside the spread between the two runs recorded on 2026-10-22, which is
+the "no change beyond noise" the item asks for. `bench/b03-latency.py` already stamps the build and
+the host and records `isolation`, so the three records are directly comparable.
+
 ## First measurement (2026-09-29)
 
 ### Results
