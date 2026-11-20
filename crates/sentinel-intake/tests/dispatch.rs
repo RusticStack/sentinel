@@ -642,6 +642,103 @@ fn out_of_order_pushes_never_dispatch_behind_or_cancel_the_tip() {
     );
 }
 
+/// One push runs every named pipeline the document declares for it: each gets its own run, its own
+/// jobs and its own check namespace, and a pipeline declared for another trigger is untouched.
+#[test]
+fn one_push_runs_every_named_pipeline_it_matches() {
+    if !prerequisites() {
+        return;
+    }
+    let f = fixture();
+    let repo_git = Repo {
+        git: f.dir.path().join("repo"),
+    };
+    let document = format!(
+        "schema: 1
+pipelines:
+  build:
+    on: [push]
+    jobs:
+      test:
+        image: {IMAGE}
+        steps: [{{ id: s, run: 'true' }}]
+  docs:
+    on: [push]
+    jobs:
+      test:
+        image: {IMAGE}
+        steps: [{{ id: s, run: 'true' }}]
+  review:
+    on: [pull_request]
+    jobs:
+      test:
+        image: {IMAGE}
+        steps: [{{ id: s, run: 'true' }}]
+"
+    );
+    let base = repo_git.rev("HEAD");
+    let head = repo_git.commit("many", &[(".sentinel.yml", &document)]);
+    let delivery = f.accept_push("push-many", REF, &base, &head);
+    let _ = f.validate(delivery);
+    let (outcome, row) = f.resolve(delivery);
+    let Outcome::Dispatched { run: named_run } = outcome else {
+        panic!("a push the document declares dispatches: {outcome:?}");
+    };
+    assert_eq!(row.state, State::Dispatched);
+    assert_eq!(row.run, Some(named_run));
+
+    let runs: Vec<(sentinel_core::RunId, Option<String>)> = f
+        .store
+        .read(|c| {
+            Ok(
+                c.prepare("SELECT id, pipeline FROM runs ORDER BY pipeline")?
+                    .query_map([], |r| {
+                        Ok((
+                            sentinel_core::RunId::from_bytes(r.get(0)?).map_err(|_| {
+                                rusqlite::Error::InvalidColumnType(
+                                    0,
+                                    "id".into(),
+                                    rusqlite::types::Type::Blob,
+                                )
+                            })?,
+                            r.get(1)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?,
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        runs.iter()
+            .map(|(_, name)| name.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("build"), Some("docs")],
+        "the pull-request pipeline did not run"
+    );
+    for (run, _) in &runs {
+        let run = *run;
+        let recorded = f
+            .store
+            .read(move |c| provenance::of_run(c, run))
+            .unwrap()
+            .expect("every run carries provenance");
+        assert_eq!(
+            recorded.delivery,
+            Some(delivery),
+            "each run names the delivery that produced it"
+        );
+        assert_eq!(recorded.trigger, "push");
+        let view = f
+            .store
+            .read(move |c| status::run(c, f.tenant, run))
+            .unwrap();
+        assert_eq!(view.jobs.len(), 1);
+        assert_eq!(view.jobs[0].name, "test", "every pipeline ran its own jobs");
+    }
+    // The delivery names one of the runs it produced.
+    assert_eq!(runs[0].0, named_run);
+}
+
 /// A wildcard-admitted push is unprotected: anyone with push rights to any branch could produce it.
 #[test]
 fn a_push_is_protected_only_for_a_ref_the_binding_names_exactly() {

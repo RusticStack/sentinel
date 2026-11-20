@@ -317,10 +317,15 @@ fn rewritten(sql: &str) -> Vec<String> {
         let Some(head) = words.first() else {
             continue;
         };
+        // `CREATE [TEMP] TRIGGER` creates a body, which the statement's own text cannot show: a
+        // table may hold a column called `trigger`, so only the word after `CREATE` decides.
         if head.eq_ignore_ascii_case("CREATE")
-            && words
+            && words[1..]
                 .iter()
-                .any(|word| word.eq_ignore_ascii_case("TRIGGER"))
+                .find(|word| {
+                    !word.eq_ignore_ascii_case("TEMP") && !word.eq_ignore_ascii_case("TEMPORARY")
+                })
+                .is_some_and(|word| word.eq_ignore_ascii_case("TRIGGER"))
         {
             body = true;
             continue;
@@ -574,14 +579,30 @@ mod tests {
     #[test]
     fn the_pending_migrations_report_the_tables_they_rewrite() {
         let sql = |version: u32| schema::MIGRATIONS[version as usize - 1].1;
+        let p84 = plain(sql(84));
+        let stmts: Vec<&str> = p84.split(';').take(3).collect();
+        eprintln!(
+            "DEBUG first stmt words: {:?}",
+            stmts[0].split_whitespace().take(3).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "DEBUG second stmt words: {:?}",
+            stmts[1].split_whitespace().take(3).collect::<Vec<_>>()
+        );
+        eprintln!("DEBUG rewritten: {:?}", rewritten(sql(84)));
         // The default-limit rebuild copies the policy table's rows into a replacement and drops the one it
         // replaces; the preflight reports it only for a table that exists to be counted.
         assert_eq!(
             rewritten(sql(81)),
             ["storage_policies", "storage_policies_previous"]
         );
-        // The newest migration only creates tables nothing earlier holds, so it visits no row.
-        assert_eq!(rewritten(sql(schema::LATEST)), Vec::<&str>::new());
+        // The newest migration rebuilds the provenance table to drop its per-delivery uniqueness, so
+        // it visits every provenance row; a migration that only creates tables visits none.
+        assert_eq!(
+            rewritten(sql(schema::LATEST)),
+            ["run_provenance_084", "run_provenance"]
+        );
+        assert_eq!(rewritten(sql(schema::LATEST - 1)), Vec::<&str>::new());
         // The OAuth scope rebuild copies every row into a `_v73` table and drops the original.
         let oauth = rewritten(sql(73));
         for table in ["oauth_clients", "oauth_grants", "oauth_access_tokens"] {

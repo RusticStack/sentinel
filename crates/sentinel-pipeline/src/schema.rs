@@ -6,12 +6,17 @@ use sentinel_protocol::cache::Class;
 
 use crate::{
     expr::{Expr, Phase, Template},
+    input::{
+        InputKind, InputSpec, InputValue, Inputs, MAX_CHOICE_BYTES, MAX_CHOICE_VALUES,
+        MAX_INPUT_STRING_BYTES, MAX_INPUTS, valid_input_name,
+    },
     policy::{MAX_REF_PATTERN_BYTES, MAX_REF_PATTERNS, RefFilter, Triggers, valid_pattern},
     yaml::Node,
 };
 
 pub const SCHEMA_VERSION: i64 = 1;
 
+pub const MAX_PIPELINES: usize = 16;
 pub const MAX_JOBS: usize = 64;
 pub const MAX_STEPS_PER_JOB: usize = 64;
 pub const MAX_NEEDS: usize = 32;
@@ -29,11 +34,28 @@ pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 60 * 60;
 /// The `when` value that publishes an artifact behind a named step: `step:<id>`.
 pub const STEP_TRIGGER_PREFIX: &str = "step:";
 
+/// One pipeline of a document: what `on:`/`concurrency:`/`jobs:` state at the top level, or one
+/// entry of `pipelines:`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pipeline {
     pub on: Triggers,
     pub concurrency: Option<Concurrency>,
+    pub inputs: Inputs,
     pub jobs: Vec<(String, Job)>,
+}
+
+/// Everything one `.sentinel.yml` declares: the unnamed pipeline of schema 1, and any named ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Document {
+    pub default: Option<Pipeline>,
+    /// Ascending by name, so compilation and identity never depend on declaration order.
+    pub named: Vec<(String, Pipeline)>,
+}
+
+impl Document {
+    pub fn is_empty(&self) -> bool {
+        self.default.is_none() && self.named.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -651,7 +673,7 @@ pub fn parse_bytes(s: &str) -> Option<u64> {
     n.checked_mul(mult)
 }
 
-fn condition(path: &str, node: &Node) -> Result<Expr> {
+fn condition(path: &str, node: &Node, inputs: &Inputs) -> Result<Expr> {
     let s = expect_str(path, node, crate::expr::MAX_EXPR_BYTES)?;
     let inner = s
         .trim()
@@ -665,8 +687,8 @@ fn condition(path: &str, node: &Node) -> Result<Expr> {
         )
     })?;
     // Type errors are rejected here, so a condition can never fail with a type error at run time.
-    e.check_condition()
-        .map_err(|m| err(path, SchemaErrorKind::Invalid(m.into())))?;
+    e.check_condition(inputs)
+        .map_err(|m| err(path, SchemaErrorKind::Invalid(m)))?;
     Ok(e)
 }
 
@@ -829,7 +851,7 @@ fn resources(path: &str, node: Option<&Node>, policy: &ResourcePolicy) -> Result
     Ok(r)
 }
 
-fn step(path: &str, node: &Node) -> Result<Step> {
+fn step(path: &str, node: &Node, inputs: &Inputs) -> Result<Step> {
     let mut map = Map::new(path, node)?;
     let id = map
         .take("id")
@@ -842,7 +864,7 @@ fn step(path: &str, node: &Node) -> Result<Step> {
         .and_then(|n| expect_str(&map.child("run"), n, MAX_RUN_BYTES))?
         .to_owned();
     let condition = match map.take("if") {
-        Some(n) => Some(condition(&map.child("if"), n)?),
+        Some(n) => Some(condition(&map.child("if"), n, inputs)?),
         None => None,
     };
     let shell = match map.take("shell") {
@@ -1231,7 +1253,7 @@ pub fn valid_image(s: &str) -> bool {
         && !s.contains("..")
 }
 
-fn job(path: &str, node: &Node, policy: &ResourcePolicy) -> Result<Job> {
+fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Result<Job> {
     let mut map = Map::new(path, node)?;
     let image_path = map.child("image");
     let image = map
@@ -1257,7 +1279,7 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy) -> Result<Job> {
         }
     };
     let condition = match map.take("if") {
-        Some(n) => Some(condition(&map.child("if"), n)?),
+        Some(n) => Some(condition(&map.child("if"), n, inputs)?),
         None => None,
     };
     let runs_on = match map.take("runs_on") {
@@ -1284,7 +1306,7 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy) -> Result<Job> {
         .and_then(|n| expect_seq(&steps_path, n, MAX_STEPS_PER_JOB))?
         .iter()
         .enumerate()
-        .map(|(i, n)| step(&format!("{steps_path}[{i}]"), n))
+        .map(|(i, n)| step(&format!("{steps_path}[{i}]"), n, inputs))
         .collect::<Result<Vec<_>>>()?;
     let cache = match map.take("cache") {
         None => Vec::new(),
@@ -1398,7 +1420,252 @@ fn job_env_has_name(env: &[(String, String)], name: &str) -> bool {
     env.iter().any(|(env_name, _)| env_name == name)
 }
 
-pub fn decode(root: &Node, policy: &ResourcePolicy) -> Result<Pipeline> {
+/// ```yaml
+/// inputs:
+///   target: {type: string, max_length: 40}          # required of a manual dispatch
+///   worker_count: {type: integer, min: 1, max: 8, default: 2}
+///   full: {type: boolean, default: false}
+///   profile: {type: choice, values: [debug, release], default: debug}
+/// ```
+fn inputs(path: &str, node: &Node) -> Result<Inputs> {
+    let map = Map::new(path, node)?;
+    if map.entries.is_empty() {
+        return Err(err(path, SchemaErrorKind::Empty));
+    }
+    if map.entries.len() > MAX_INPUTS {
+        return Err(err(path, SchemaErrorKind::TooMany { limit: MAX_INPUTS }));
+    }
+    let mut out: Vec<(String, InputSpec)> = Vec::with_capacity(map.entries.len());
+    for (name, node) in map.entries {
+        let child = map.child(name);
+        if !valid_input_name(name) {
+            return Err(err(
+                &child,
+                SchemaErrorKind::Invalid(
+                    "input names must match [a-z][a-z0-9_]* and be at most 32 bytes".into(),
+                ),
+            ));
+        }
+        if out.iter().any(|(existing, _)| existing == name) {
+            return Err(err(
+                &child,
+                SchemaErrorKind::Invalid("duplicate input".into()),
+            ));
+        }
+        out.push((name.clone(), input(&child, node)?));
+    }
+    Ok(Inputs::new(out))
+}
+
+fn input(path: &str, node: &Node) -> Result<InputSpec> {
+    let mut map = Map::new(path, node)?;
+    let type_path = map.child("type");
+    let declared = map
+        .take("type")
+        .ok_or_else(|| err(&type_path, SchemaErrorKind::Missing))?;
+    let kind = match expect_str(&type_path, declared, 16)? {
+        "string" => {
+            let max_path = map.child("max_length");
+            let max_length = map
+                .take("max_length")
+                .ok_or_else(|| err(&max_path, SchemaErrorKind::Missing))
+                .and_then(|n| expect_int(&max_path, n, 1, MAX_INPUT_STRING_BYTES as i64))?
+                as u16;
+            let min_path = map.child("min_length");
+            let min_length = match map.take("min_length") {
+                None => 0,
+                Some(n) => expect_int(&min_path, n, 0, max_length as i64)? as u16,
+            };
+            InputKind::Str {
+                min_length,
+                max_length,
+            }
+        }
+        "choice" => {
+            let values_path = map.child("values");
+            let values = map
+                .take("values")
+                .ok_or_else(|| err(&values_path, SchemaErrorKind::Missing))
+                .and_then(|n| string_list(&values_path, n, MAX_CHOICE_VALUES, MAX_CHOICE_BYTES))?;
+            for (i, value) in values.iter().enumerate() {
+                if values[..i].iter().any(|previous| previous == value) {
+                    return Err(err(
+                        &format!("{values_path}[{i}]"),
+                        SchemaErrorKind::Invalid("duplicate value".into()),
+                    ));
+                }
+            }
+            InputKind::Choice { values }
+        }
+        "boolean" => InputKind::Bool,
+        "integer" => {
+            let min_path = map.child("min");
+            let min = map
+                .take("min")
+                .ok_or_else(|| err(&min_path, SchemaErrorKind::Missing))
+                .and_then(|n| expect_literal_int(&min_path, n))?;
+            let max_path = map.child("max");
+            let max = map
+                .take("max")
+                .ok_or_else(|| err(&max_path, SchemaErrorKind::Missing))
+                .and_then(|n| expect_literal_int(&max_path, n))?;
+            if min >= max {
+                return Err(err(
+                    &max_path,
+                    SchemaErrorKind::Invalid("must be greater than the minimum".into()),
+                ));
+            }
+            InputKind::Int { min, max }
+        }
+        _ => {
+            return Err(err(
+                &type_path,
+                SchemaErrorKind::Invalid("expected string, choice, boolean or integer".into()),
+            ));
+        }
+    };
+    let default = match map.take("default") {
+        None => None,
+        Some(n) => {
+            let default_path = map.child("default");
+            let value = match (&kind, n) {
+                (InputKind::Str { .. } | InputKind::Choice { .. }, Node::Str(s)) => {
+                    InputValue::Str(s.clone())
+                }
+                (InputKind::Bool, Node::Bool(b)) => InputValue::Bool(*b),
+                (InputKind::Int { .. }, Node::Int(i)) => InputValue::Int(*i),
+                _ => {
+                    return Err(err(
+                        &default_path,
+                        SchemaErrorKind::WrongType {
+                            expected: match kind.type_name() {
+                                "string" => "string",
+                                "choice" => "string",
+                                "boolean" => "boolean",
+                                _ => "integer",
+                            },
+                            found: n.kind(),
+                        },
+                    ));
+                }
+            };
+            if !kind.holds(&value) {
+                return Err(err(
+                    &default_path,
+                    SchemaErrorKind::Invalid(format!("must be {}", kind.bound())),
+                ));
+            }
+            Some(value)
+        }
+    };
+    map.finish()?;
+    Ok(InputSpec { kind, default })
+}
+
+fn expect_int(path: &str, node: &Node, lo: i64, hi: i64) -> Result<i64> {
+    match expect_literal_int(path, node) {
+        Ok(v) if v >= lo && v <= hi => Ok(v),
+        Ok(_) => Err(err(
+            path,
+            SchemaErrorKind::Invalid(format!("must be between {lo} and {hi}")),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+fn expect_literal_int(path: &str, node: &Node) -> Result<i64> {
+    match node {
+        Node::Int(v) => Ok(*v),
+        other => Err(err(
+            path,
+            SchemaErrorKind::WrongType {
+                expected: "integer",
+                found: other.kind(),
+            },
+        )),
+    }
+}
+
+/// The `on`, `concurrency`, `inputs` and `jobs` of one pipeline, at the document's root or under
+/// `pipelines.<name>`.
+fn pipeline(map: &mut Map<'_>, policy: &ResourcePolicy) -> Result<Pipeline> {
+    let on = match map.take("on") {
+        None => return Err(err(&map.child("on"), SchemaErrorKind::Missing)),
+        Some(node) => parse_triggers(&map.child("on"), node)?,
+    };
+    let concurrency = match map.take("concurrency") {
+        None => None,
+        Some(n) => {
+            let path = map.child("concurrency");
+            let mut c = Map::new(&path, n)?;
+            let group = c
+                .take("group")
+                .ok_or_else(|| err(&format!("{path}.group"), SchemaErrorKind::Missing))
+                .and_then(|n| template(&format!("{path}.group"), n, 256))?;
+            if group.min_phase() > Phase::Dispatch {
+                return Err(err(
+                    &format!("{path}.group"),
+                    SchemaErrorKind::Invalid(
+                        "may only use event, repo, run and inputs context (no needs or hash_files)"
+                            .into(),
+                    ),
+                ));
+            }
+            let cancel_in_progress = match c.take("cancel_in_progress") {
+                None => false,
+                Some(n) => expect_bool(&format!("{path}.cancel_in_progress"), n)?,
+            };
+            c.finish()?;
+            Some(Concurrency {
+                group,
+                cancel_in_progress,
+            })
+        }
+    };
+    let inputs = match map.take("inputs") {
+        None => Inputs::default(),
+        Some(n) => inputs(&map.child("inputs"), n)?,
+    };
+    let jobs = match map.take("jobs") {
+        None => return Err(err(&map.child("jobs"), SchemaErrorKind::Missing)),
+        Some(n) => {
+            let jobs_path = map.child("jobs");
+            let jobs_map = Map::new(&jobs_path, n)?;
+            if jobs_map.entries.is_empty() {
+                return Err(err(&jobs_path, SchemaErrorKind::Empty));
+            }
+            if jobs_map.entries.len() > MAX_JOBS {
+                return Err(err(
+                    &jobs_path,
+                    SchemaErrorKind::TooMany { limit: MAX_JOBS },
+                ));
+            }
+            let mut out = Vec::with_capacity(jobs_map.entries.len());
+            for (name, node) in jobs_map.entries {
+                let path = format!("{jobs_path}.{name}");
+                if !valid_id(name) {
+                    return Err(err(
+                        &path,
+                        SchemaErrorKind::Invalid(
+                            "job names must match [a-z0-9][a-z0-9_-]* and be at most 64 bytes"
+                                .into(),
+                        ),
+                    ));
+                }
+                out.push((name.clone(), job(&path, node, policy, &inputs)?));
+            }
+            out
+        }
+    };
+    Ok(Pipeline {
+        on,
+        concurrency,
+        inputs,
+        jobs,
+    })
+}
+
+pub fn decode(root: &Node, policy: &ResourcePolicy) -> Result<Document> {
     let mut map = Map::new("", root)?;
     match map.take("schema") {
         Some(Node::Int(v)) if *v == SCHEMA_VERSION => {}
@@ -1415,70 +1682,61 @@ pub fn decode(root: &Node, policy: &ResourcePolicy) -> Result<Pipeline> {
             ));
         }
     }
-    let on = match map.take("on") {
-        None => return Err(err("on", SchemaErrorKind::Missing)),
-        Some(node) => parse_triggers("on", node)?,
-    };
-    let concurrency = match map.take("concurrency") {
-        None => None,
+    let named = match map.take("pipelines") {
+        None => Vec::new(),
         Some(n) => {
-            let mut c = Map::new("concurrency", n)?;
-            let group = c
-                .take("group")
-                .ok_or_else(|| err("concurrency.group", SchemaErrorKind::Missing))
-                .and_then(|n| template("concurrency.group", n, 256))?;
-            if group.min_phase() > Phase::Dispatch {
+            let pipes = Map::new("pipelines", n)?;
+            if pipes.entries.is_empty() {
+                return Err(err("pipelines", SchemaErrorKind::Empty));
+            }
+            if pipes.entries.len() > MAX_PIPELINES {
                 return Err(err(
-                    "concurrency.group",
-                    SchemaErrorKind::Invalid(
-                        "may only use event, repo and run context (no needs or hash_files)".into(),
-                    ),
+                    "pipelines",
+                    SchemaErrorKind::TooMany {
+                        limit: MAX_PIPELINES,
+                    },
                 ));
             }
-            let cancel_in_progress = match c.take("cancel_in_progress") {
-                None => false,
-                Some(n) => expect_bool("concurrency.cancel_in_progress", n)?,
-            };
-            c.finish()?;
-            Some(Concurrency {
-                group,
-                cancel_in_progress,
-            })
-        }
-    };
-    let jobs = match map.take("jobs") {
-        None => return Err(err("jobs", SchemaErrorKind::Missing)),
-        Some(n) => {
-            let jobs_map = Map::new("jobs", n)?;
-            if jobs_map.entries.is_empty() {
-                return Err(err("jobs", SchemaErrorKind::Empty));
-            }
-            if jobs_map.entries.len() > MAX_JOBS {
-                return Err(err("jobs", SchemaErrorKind::TooMany { limit: MAX_JOBS }));
-            }
-            let mut out = Vec::with_capacity(jobs_map.entries.len());
-            for (name, node) in jobs_map.entries {
-                let path = format!("jobs.{name}");
+            let mut out: Vec<(String, Pipeline)> = Vec::with_capacity(pipes.entries.len());
+            for (name, node) in pipes.entries {
+                let path = format!("pipelines.{name}");
                 if !valid_id(name) {
                     return Err(err(
                         &path,
                         SchemaErrorKind::Invalid(
-                            "job names must match [a-z0-9][a-z0-9_-]* and be at most 64 bytes"
+                            "pipeline names must match [a-z0-9][a-z0-9_-]* and be at most 64 bytes"
                                 .into(),
                         ),
                     ));
                 }
-                out.push((name.clone(), job(&path, node, policy)?));
+                let mut inner = Map::new(&path, node)?;
+                let compiled = pipeline(&mut inner, policy)?;
+                inner.finish()?;
+                out.push((name.clone(), compiled));
             }
+            out.sort_by(|a, b| a.0.cmp(&b.0));
             out
         }
     };
+    // The unnamed pipeline of schema 1: absent only when the document declares named ones. Any of
+    // its keys means the root is that pipeline, and `pipeline` reports whichever one is missing.
+    let has_default = map
+        .entries
+        .iter()
+        .any(|(key, _)| matches!(key.as_str(), "on" | "concurrency" | "inputs" | "jobs"));
+    let default = if has_default {
+        Some(pipeline(&mut map, policy)?)
+    } else {
+        None
+    };
     map.finish()?;
-    Ok(Pipeline {
-        on,
-        concurrency,
-        jobs,
-    })
+    if default.is_none() && named.is_empty() {
+        return Err(err(
+            "pipelines",
+            SchemaErrorKind::Invalid("declares no pipeline".into()),
+        ));
+    }
+    Ok(Document { default, named })
 }
 
 #[cfg(test)]

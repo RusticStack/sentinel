@@ -1,0 +1,11 @@
+# expect: inputs.target: a required input needs a default unless the pipeline runs only from a manual dispatch
+schema: 1
+pipelines:
+  focus:
+    on: [push]
+    inputs:
+      target: {type: string, max_length: 8}
+    jobs:
+      a:
+        image: busybox
+        steps: [{id: s, run: echo}]

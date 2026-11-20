@@ -43,6 +43,16 @@ impl Triggers {
             && !self.schedule
     }
 
+    /// Whether a caller is the only way this pipeline can run: nothing but `manual` is declared.
+    pub fn manual_only(&self) -> bool {
+        self.manual
+            && self.push.is_none()
+            && self.pull_request.is_none()
+            && self.merge_group.is_none()
+            && self.tag.is_none()
+            && !self.schedule
+    }
+
     pub fn admits(&self, event: &Event<'_>) -> bool {
         match event.kind {
             EventKind::Push => self

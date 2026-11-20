@@ -66,6 +66,10 @@ impl Context for WorkerContext<'_> {
                 Some((_, outcome)) => Value::Str(outcome.as_str().to_owned()),
                 None => return Lookup::Unresolved,
             },
+            ["inputs", name] => match self.spec.inputs.iter().find(|(n, _)| n == name) {
+                Some((_, value)) => value.expr_value(),
+                None => return Lookup::Unresolved,
+            },
             _ => return Lookup::Unresolved,
         };
         Lookup::Value(value)
