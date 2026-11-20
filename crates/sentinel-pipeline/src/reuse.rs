@@ -169,6 +169,7 @@ mod tests {
             }],
             cache: Vec::new(),
             artifacts: Vec::new(),
+            locks: Vec::new(),
             secrets: Vec::new(),
             registry_auth: None,
             outputs: Vec::new(),

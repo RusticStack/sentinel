@@ -1,0 +1,5 @@
+# expect: duplicate lock `db/staging`
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, locks: [db/staging, {name: db/staging, wait: 5m}], steps: [{id: s, run: x}]}

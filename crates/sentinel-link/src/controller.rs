@@ -22,7 +22,7 @@ use sentinel_protocol::negotiate::{
     PROFILE_MIN, Profile, RUNNER_MIN,
 };
 use sentinel_store::{
-    Store, artifacts, classes, dispatch,
+    Store, artifacts, classes, dispatch, locks,
     logs::LogStore,
     objects::{self, Objects},
     retention, runner_provision as runner_store, skipped, workers,
@@ -114,6 +114,7 @@ pub struct Stats {
     pub log_refused: AtomicU64,
     pub expired: AtomicU64,
     pub queue_timeouts: AtomicU64,
+    pub lock_timeouts: AtomicU64,
     pub abandoned: AtomicU64,
     pub artifacts: AtomicU64,
     pub bulk_attached: AtomicU64,
@@ -1121,6 +1122,14 @@ impl Inner {
                     .fetch_add(count as u64, Ordering::Relaxed);
             }
             Err(e) => self.failed(false, "queue_timeout", &e),
+        }
+        match self.write_store(move |tx| locks::sweep_waits(tx, now)) {
+            Ok(count) => {
+                self.stats
+                    .lock_timeouts
+                    .fetch_add(count as u64, Ordering::Relaxed);
+            }
+            Err(e) => self.failed(false, "lock_wait", &e),
         }
         let deferred = self.deferred_attempts();
         match self.write_store(move |tx| {

@@ -44,6 +44,7 @@ pub enum FailureClass {
     Reconciled = 9,
     Publication = 10,
     Runtime = 11,
+    ResourceLock = 12,
 }
 
 impl FailureClass {
@@ -61,13 +62,14 @@ impl FailureClass {
             Self::Reconciled => "reconciled",
             Self::Publication => "publication",
             Self::Runtime => "runtime",
+            Self::ResourceLock => "resource_lock",
         }
     }
 
     pub const fn outcome(self) -> Outcome {
         match self {
             Self::CommandFailed | Self::CommandSignaled | Self::OutOfMemory => Outcome::Failed,
-            Self::ExecutionTimeout | Self::QueueTimeout => Outcome::TimedOut,
+            Self::ExecutionTimeout | Self::QueueTimeout | Self::ResourceLock => Outcome::TimedOut,
             Self::Canceled => Outcome::Canceled,
             Self::Preparation
             | Self::LeaseExpired
@@ -137,6 +139,8 @@ pub enum Event {
     Failed(FailureClass),
     CancelBeforeStart,
     QueueTimedOut,
+    /// A job waited out the bound it declared for an external resource it needs to itself.
+    LockTimedOut,
     LeaseExpired,
     WorkerLost,
     Reconciled,
@@ -202,6 +206,7 @@ impl JobControl {
                 Actor::Controller,
                 Event::CancelBeforeStart
                 | Event::QueueTimedOut
+                | Event::LockTimedOut
                 | Event::LeaseExpired
                 | Event::WorkerLost,
             )
@@ -235,7 +240,8 @@ impl JobControl {
             (JobState::Blocked | JobState::Queued, Event::CancelBeforeStart) => {
                 JobState::Terminal(Outcome::Canceled)
             }
-            (JobState::Blocked | JobState::Queued, Event::QueueTimedOut) => {
+            (JobState::Blocked | JobState::Queued, Event::QueueTimedOut)
+            | (JobState::Blocked | JobState::Queued, Event::LockTimedOut) => {
                 JobState::Terminal(Outcome::TimedOut)
             }
             (JobState::Queued, Event::Leased(fence)) => {
@@ -518,6 +524,7 @@ mod tests {
         assert_eq!(FailureClass::Canceled.outcome(), Outcome::Canceled);
         assert_eq!(FailureClass::Publication.outcome(), Outcome::InfraFailed);
         assert_eq!(FailureClass::Runtime.outcome(), Outcome::InfraFailed);
+        assert_eq!(FailureClass::ResourceLock.outcome(), Outcome::TimedOut);
     }
 
     #[test]

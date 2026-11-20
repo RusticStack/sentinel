@@ -62,6 +62,7 @@ pub struct JobExplanation {
     pub steps: Vec<StepExplanation>,
     pub caches: Vec<CacheExplanation>,
     pub artifacts: Vec<String>,
+    pub locks: Vec<LockExplanation>,
     pub secrets: Vec<String>,
     /// The step outputs this job publishes to the jobs that need it.
     pub outputs: Vec<String>,
@@ -91,6 +92,12 @@ pub struct HandoffExplanation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct FinalizerExplanation {
     pub timeout_secs: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LockExplanation {
+    pub name: String,
+    pub wait_secs: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -310,6 +317,14 @@ impl Explanation {
                 steps,
                 caches,
                 artifacts: s.artifacts.iter().map(|a| a.name.clone()).collect(),
+                locks: s
+                    .locks
+                    .iter()
+                    .map(|lock| LockExplanation {
+                        name: lock.name.clone(),
+                        wait_secs: lock.wait_secs,
+                    })
+                    .collect(),
                 secrets: s.secrets.clone(),
                 outputs: s.outputs.clone(),
                 handoff: s
@@ -468,6 +483,13 @@ impl Explanation {
             }
             if !j.artifacts.is_empty() {
                 let _ = writeln!(s, "  artifacts: {}", j.artifacts.join(", "));
+            }
+            for lock in &j.locks {
+                let _ = writeln!(
+                    s,
+                    "  lock {} (exclusive, waits at most {}s)",
+                    lock.name, lock.wait_secs
+                );
             }
             if !j.secrets.is_empty() {
                 let _ = writeln!(s, "  secrets: {}", j.secrets.join(", "));
