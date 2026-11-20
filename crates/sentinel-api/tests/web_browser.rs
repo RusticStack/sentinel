@@ -4,6 +4,8 @@
 mod fixture;
 #[path = "support/github_app.rs"]
 mod github_app;
+#[path = "support/migration.rs"]
+mod migration;
 
 use std::{
     net::TcpListener,
@@ -375,6 +377,101 @@ fn the_web_interface_in_a_real_browser() {
         );
     }
     assert!(status.success(), "ui.mjs failed: {status}");
+}
+
+/// The guided migration wizard (H08): a repository bound through a GitHub App the fake answers for,
+/// its workflows and its branch protection held by the fake, and `web/test/migration.mjs` driving
+/// connect, repositories, analysis, preview, the pull request, the shadow and its parity, the switch
+/// and the rollback — with one refused step on a repository whose jobs all stay on GitHub. After the
+/// browser is done the fake still holds the required checks the switch promised it would keep.
+static CI: &str = "name: ci
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo test
+  mac:
+    runs-on: macos-14
+    steps:
+      - run: cargo test
+";
+
+static MAC_ONLY: &str = "name: ci
+on: [push]
+jobs:
+  mac:
+    runs-on: macos-14
+    steps:
+      - run: cargo test
+";
+
+#[test]
+#[ignore = "needs Node, the built web interface and a Chromium-family browser"]
+fn the_migration_wizard_in_a_real_browser() {
+    let port = free_port();
+    let origin = format!("http://127.0.0.1:{port}");
+    let f = migration::MigrationFixture::start(CI, &["build", "mac"], Some(origin.clone()));
+    f.add_repository("mac-only", MAC_ONLY);
+    let out = match std::env::var_os("SENTINEL_UI_OUT") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => f.dir.path().join("ui"),
+    };
+    std::fs::create_dir_all(&out).unwrap();
+    let web_log = f.dir.path().join("web.log");
+    let web = Web::start_with(port, &f.base, &[], Some(&web_log));
+    let config_path = f.dir.path().join("migration.json");
+    std::fs::write(
+        &config_path,
+        json!({
+            "web": origin,
+            "password": migration::PASSWORD,
+            "slug": migration::SLUG,
+            "commit": migration::COMMIT,
+            "image": migration::IMAGE,
+            "out": out,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let status = Command::new(node())
+        .arg(repo_root().join("web/test/migration.mjs"))
+        .arg(&config_path)
+        .status()
+        .expect("run node");
+    drop(web);
+    if !status.success() {
+        let log = std::fs::read_to_string(&web_log).unwrap_or_default();
+        let tail: Vec<&str> = log.lines().rev().take(40).collect();
+        eprintln!(
+            "web process output (last lines):
+{}",
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+        );
+    }
+    assert!(status.success(), "migration.mjs failed: {status}");
+
+    // What the browser drove is what the controller did: the pull requests the fake holds, the
+    // repository's own audit trail, and a protection set the switch promised it would not move.
+    assert_eq!(
+        f.held(),
+        Some((vec!["build".to_owned(), "mac".to_owned()], true)),
+        "runner mode never moves a required check"
+    );
+    let audit = f.audit();
+    for expected in [
+        "migration_switch",
+        "migration_rollback_revert",
+        "migration_pull_request_open",
+    ] {
+        assert!(
+            audit.iter().any(|row| row == expected),
+            "{expected} in {audit:?}"
+        );
+    }
+    let pulls = f.github.pull_requests();
+    assert_eq!(pulls.len(), 1, "one pull request per migration: {pulls:?}");
+    assert_eq!(pulls[0].branch, "sentinel/migrate");
 }
 
 /// The first-run setup wizard (U10's seed): a controller with no administrator yet, its setup

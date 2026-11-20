@@ -172,6 +172,7 @@ const PAGES = {
   service: ["/t/acme/admin/service-accounts", "!!document.querySelector('#sa-new-h')"],
   organizations: ["/organizations", "!!document.querySelector('#ns-h') && !!document.querySelector('#new-org-h')"],
   settings: ["/t/acme/settings", "!!document.querySelector('#about-h') && !!document.querySelector('#members-h')"],
+  migration: ["/t/acme/migration", "!!document.querySelector('#connect-missing') && document.querySelectorAll('nav[aria-label=\"Migration steps\"] li').length === 8"],
   invitations: ["/t/acme/admin/invitations", "!!document.querySelector('#invite-h')"],
   workers: ["/platform/workers", "!!document.querySelector('#w-add-h') && !!document.querySelector('#w-pool')"],
   history: ["/t/acme/history?repo=web&job=build", "document.querySelectorAll('main table tbody tr').length >= 4"],
