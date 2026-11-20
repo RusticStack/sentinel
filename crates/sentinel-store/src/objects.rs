@@ -643,8 +643,10 @@ impl Objects {
         Ok(self.usage(conn, tenant)?.saturating_add(inflight))
     }
 
+    /// A tenant's quota, 0 being the explicit unlimited a platform administrator may state; both callers
+    /// that reach this are a platform administrator's, so the value is judged here only for its width.
     pub fn set_quota(&self, tx: &Transaction<'_>, tenant: TenantId, bytes: u64) -> Result<()> {
-        if bytes == 0 || bytes > i64::MAX as u64 {
+        if bytes > i64::MAX as u64 {
             return Err(Error::InvalidInput("quota"));
         }
         tx.execute(

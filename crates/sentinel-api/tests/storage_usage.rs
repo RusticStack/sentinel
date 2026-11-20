@@ -80,6 +80,13 @@ fn the_storage_report_names_each_class_the_trend_the_largest_artifacts_and_what_
     f.seed_artifacts();
     stamp_logs(&f);
     seed_snapshots(&f);
+    // A tenant the platform set unlimited: states no limit of its own and inherits none, which is the
+    // one reading with no threshold to be measured against.
+    f.objects.set_deployment(Deployment {
+        tenant_quota_bytes: 0,
+        personal_quota_bytes: 0,
+        ..Deployment::default()
+    });
 
     let (status, body) = get(&f, "/api/v1/tenants/acme/storage", &f.auth);
     assert_eq!(status, 200, "{body}");

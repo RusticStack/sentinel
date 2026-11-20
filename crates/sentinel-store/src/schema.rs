@@ -191,6 +191,10 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (78, include_str!("migrations/078_ai_requests.sql")),
     (79, include_str!("migrations/079_ai_budgets.sql")),
     (80, include_str!("migrations/080_test_outcomes.sql")),
+    (
+        81,
+        include_str!("migrations/081_default_storage_limits.sql"),
+    ),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -329,6 +333,10 @@ mod tests {
         (
             79,
             "an older controller contacts a provider without reserving anything: it reads no budget, holds no reservation and settles no ledger, so it would spend a tenant's month past the limit a newer one enforced and publish no analysis to the cache its requests read",
+        ),
+        (
+            81,
+            "an older controller holds no sized default per tenant: its unset `tenant_quota_bytes` is 0, which it writes to `storage_defaults` at every start, so one restart of a rolled-back release lifts the limit the upgrade applied to every tenant that states none; it also refuses the explicit unlimited a newer platform administrator can store, and it keeps no default for personal namespaces",
         ),
     ];
 

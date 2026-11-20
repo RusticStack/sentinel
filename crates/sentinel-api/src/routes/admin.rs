@@ -331,8 +331,8 @@ fn quota(state: &State, request: &mut Request, slug: &str, set: bool) -> Route {
     let who = platform(state, request, true)?;
     let bytes = if set {
         let body: QuotaBody = parse(&body(request)?)?;
-        if body.bytes == 0 || body.bytes > i64::MAX as u64 {
-            return Err(err(ErrorCode::InvalidRequest, "bytes must be positive"));
+        if body.bytes > i64::MAX as u64 {
+            return Err(err(ErrorCode::InvalidRequest, "bytes must fit in 63 bits"));
         }
         Some(body.bytes)
     } else {
@@ -480,10 +480,12 @@ fn set_storage(state: &State, request: &mut Request, slug: &str, repo: Option<&s
         platform(state, request, true)?
     };
     let body: StorageBody = parse(&body(request)?)?;
-    if body.quota_bytes == Some(0) || body.quota_bytes.is_some_and(|q| q > i64::MAX as u64) {
+    // 0 is the explicit unlimited a platform administrator may state on a tenant, and the store refuses it
+    // on a repository's row: the authority that makes it legal is the store's to judge, beside the value.
+    if body.quota_bytes.is_some_and(|q| q > i64::MAX as u64) {
         return Err(err(
             ErrorCode::InvalidRequest,
-            "quota_bytes must be positive",
+            "quota_bytes must fit in 63 bits",
         ));
     }
     let policy = retention::Policy {
@@ -660,6 +662,7 @@ fn deployment_storage(state: &State, request: &Request) -> Route {
         "stored_bytes": stored,
         "quota_bytes": d.quota_bytes,
         "tenant_quota_bytes": d.tenant_quota_bytes,
+        "personal_quota_bytes": d.personal_quota_bytes,
         "soft_percent": d.soft_percent,
         "hard_percent": d.hard_percent,
         "log_retention_ms": d.log_retention_ms,
