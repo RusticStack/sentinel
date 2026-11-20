@@ -261,6 +261,7 @@ fn a_fresh_deployment_states_ai_off_and_nothing_else() {
             "enabled": false,
             "data_policy": null,
             "providers": [],
+            "auto_analysis": false,
             "budgets": {
             "monthly_tokens": 0,
             "monthly_cost_micros": 0,
@@ -362,6 +363,7 @@ fn a_tenant_administrator_opts_in_behind_a_step_up_and_a_known_data_policy() {
             "enabled": true,
             "data_policy": "local_only",
             "providers": ["local"],
+            "auto_analysis": false,
             "budgets": {
             "monthly_tokens": 0,
             "monthly_cost_micros": 0,
@@ -381,6 +383,7 @@ fn a_tenant_administrator_opts_in_behind_a_step_up_and_a_known_data_policy() {
             "enabled": true,
             "data_policy": "local_only",
             "providers": ["local"],
+            "auto_analysis": false,
             "budgets": {
             "monthly_tokens": 0,
             "monthly_cost_micros": 0,
@@ -404,6 +407,7 @@ fn a_tenant_administrator_opts_in_behind_a_step_up_and_a_known_data_policy() {
             "enabled": false,
             "data_policy": "local_only",
             "providers": [],
+            "auto_analysis": false,
             "budgets": {
             "monthly_tokens": 0,
             "monthly_cost_micros": 0,
@@ -447,6 +451,7 @@ fn no_request_path_reaches_a_provider_while_the_tenant_is_off() {
             "enabled": false,
             "data_policy": null,
             "providers": [],
+            "auto_analysis": false,
             "budgets": {
             "monthly_tokens": 0,
             "monthly_cost_micros": 0,

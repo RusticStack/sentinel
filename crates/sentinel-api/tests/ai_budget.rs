@@ -523,11 +523,17 @@ fn a_repeated_evidence_digest_is_served_without_a_provider_call() {
     let body = reused.json();
     assert_eq!(body["state"], "reused");
     assert_eq!(body["by"], "evidence");
-    assert_eq!(body["text"], "the unit step failed: left != right");
+    assert_eq!(
+        body["analysis"]["claims"][0]["text"],
+        "the unit step failed: left != right"
+    );
     assert_eq!(body["request"]["state"], "settled");
     let row = request(&d, &again);
     assert_eq!(row["reused"], true, "a reused answer is marked as one");
-    assert_eq!(row["result"], "the unit step failed: left != right");
+    assert_eq!(
+        row["analysis"]["claims"][0]["text"],
+        "the unit step failed: left != right"
+    );
 
     // The month was charged once, by the request that actually asked the provider.
     let month = usage(&d);
