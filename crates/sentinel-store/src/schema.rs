@@ -200,7 +200,8 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (84, include_str!("migrations/084_ai_search.sql")),
     (85, include_str!("migrations/085_named_pipelines.sql")),
     (86, include_str!("migrations/086_job_outputs.sql")),
-    (87, include_str!("migrations/087_resource_locks.sql")),
+    (87, include_str!("migrations/087_run_sources.sql")),
+    (88, include_str!("migrations/088_resource_locks.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -357,7 +358,11 @@ mod tests {
         ),
         (
             87,
-            "an older controller never takes a hold on a named external resource, so two jobs it places could run against one staging database, host or device at once; it also cannot decode the failure class `resource_lock` or run spec format 12",
+            "an older controller cannot decode run spec format 13, so it refuses to serve a run whose pipeline declares a checkout history or an additional checkout, and it holds no source manifest: it could neither say what such a run built nor resolve its recorded revisions on a rerun",
+        ),
+        (
+            88,
+            "an older controller never takes a hold on a named external resource, so two jobs it places could run against one staging database, host or device at once; it also cannot decode the failure class `resource_lock` or run spec format 14",
         ),
     ];
 

@@ -19,6 +19,8 @@ Anchors, aliases, tags, non-string keys and duplicate keys are errors with line 
 
 ## Document shape
 
+The document is one mapping with three keys — `schema`, `on` and `jobs` — plus the optional `concurrency`.
+
 ```yaml
 schema: 1                       # required, exactly 1
 on: [push, pull_request, merge_group, tag, manual, schedule]   # 1–6 distinct kinds
@@ -41,6 +43,10 @@ jobs:                           # 1–64, names [a-z0-9][a-z0-9_-]{0,63}
     timeout: 20m                # default 1h, max 24h
     env: {NAME: value}          # ≤ 64, names [A-Za-z_][A-Za-z0-9_]*
     workdir: crates/app         # relative, normalised
+    checkout:                   # optional: history for the run's own checkout, and more repositories
+      history: shallow|full|{depth: N}          # default shallow (the pinned commit alone)
+      repositories:                             # ≤ 8 additional checkouts
+        - {repo: shared, path: vendor/shared, ref: refs/heads/main, history: {depth: 50}}
     steps:                      # required, 1–64
       - id: test                # unique within the job
         run: cargo test         # ≤ 4 KiB
@@ -72,6 +78,8 @@ A document may also declare *named* pipelines and typed *inputs* beside the pipe
 pipeline, and a document that declares no named pipeline compiles, digests and publishes exactly as it
 did before those keys existed.
 
+### Job keys
+
 Unknown keys anywhere are rejected with their path, for example `jobs.test: unknown key `imgae``. Durations are `<int>s|m|h` sums such as `1h30m`. Sizes use binary units only, `MiB` or `GiB`. CPU is whole cores or a quoted decimal such as `"0.5"`, stored as millicores: plain digits only (no sign), at most three decimals, so `"+4"`, `"0.+5"` and `"0.5555"` are errors rather than being read or truncated. Paths are normalised relative paths with no `..`, `//`, leading `./` or trailing `/`; cache paths may also be absolute inside the container but never `/`. `concurrency.group` and cache `key` are templates; job and step `if` are expressions (see below).
 
 **`on.merge_group`.** A merge-queue group: `checks_requested` when GitHub builds a
@@ -83,6 +91,12 @@ repository that requires `sentinel / ci` on its merge queue needs a pipeline wit
 this trigger as well as `on.pull_request`, because GitHub asks for the checks
 under the `merge_group` event, not under the pull request's. `destroyed` never
 runs anything: it cancels the run the group produced ([intake](intake.md#merge-groups)).
+
+**`checkout`.** A job's workspace is its run's own repository at the run's pinned commit; `checkout.history` says how much of that commit's past the job needs — `shallow` fetches only the pinned tree, `{depth: N}` fetches `N` commits of it (`N` ≤ 10,000) and `full` fetches everything reachable from it. A pipeline that states anything other than `shallow` is stored as run-spec format 13 ([compatibility](compatibility.md)).
+
+`checkout.repositories` adds up to eight further repositories beside it. Each names a repository of the run's tenant (`repo`, the name the repository has there, never a remote or URL), where it lands (`path`, a normalised relative path inside the workspace, so nothing can leave it), the branch or tag it resolves (`ref`, an exact `refs/heads/…` or `refs/tags/…` name its binding must allow) and optionally its own `history`. Paths must be distinct and must not nest inside one another, and no checkout may be placed in the workspace's own `.git`; the workspace root is the run's own checkout, so `path` is always inside it. An additional checkout is authorized exactly as the run's own is: the repository must belong to the run's tenant, hold a binding, and that binding's remote must be on the deployment's destination allowlist ([sources](sources.md#additional-checkouts)). A pipeline cannot authorize a repository; naming one it may not read fails closed, and nothing is fetched.
+
+The `ref` is resolved to a commit once, when the run's first attempt for that job starts, and the commit — never the ref — is what every attempt checks out. The run's [source manifest](sources.md#additional-checkouts) records that commit beside the run's own, so a rerun of a past run builds the same revisions even after the branch has moved.
 
 **`runs_on.os` and `runs_on.isolation`.** Unstated, a job is a Linux job run on whatever executor its worker uses by default (rootless Podman, or a microVM on a KVM host once that executor is set up; [plan 16.8](../plan.md#168-microvm-execution-on-kvm-hosts)), and any Linux worker may take it, including one that predates these fields. Stated, the job goes only to a worker that states it runs that OS and isolation; otherwise it waits with the reason `runtime_missing` ([API](api.md)). Linux jobs take `container` or `microvm`; Windows jobs take `microvm` (a Windows guest) or `native`, so `os: linux` with `native` and `os: windows` with `container` are errors. A spec with either field is stored as run spec format 7 ([compatibility](compatibility.md)).
 
@@ -401,8 +415,8 @@ A repository's GitHub Actions workflows are read by a separate, bounded analyzer
 
 ## Verification
 
-`crates/sentinel-pipeline/tests/locks.rs` covers the declaration: a name's default bound and a declared one, the digest and spec format of a job that declares none staying byte for byte, format 13 round-tripping per-job resources and refusing a list that does not match its jobs, and the explanation naming each resource with its bound.
+`crates/sentinel-pipeline/tests/locks.rs` covers the declaration: a name's default bound and a declared one, the resource in the digest while the spec's bytes stay what a pipeline without one writes and a decoded spec carries none, and the explanation naming each resource with its bound.
 
 Unit tests cover secret-name validation, registry-auth delivery requirements, and the explanation model (requirements, unresolved inputs, no invented values), the expression grammar (precedence, rejected constructs, phase gating, typing, templates), the `hash_files` resolver (globbing, ordering, sensitivity, cross-root stability), scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Fixture tests compile every valid fixture, check the invalid fixtures against their expected messages, evaluate the conditions example across dispatch, schedule and worker phases, decode every field of the full example, and prove determinism on a diamond DAG under reordering. `crates/sentinel-pipeline/tests/named.rs` covers two named pipelines of one repository keeping their own triggers, concurrency policies, digests and check namespaces; the refusal of a document that gives one check name two meanings while any name a repository chooses is otherwise accepted; every input type's bound and refusal message; the loading bounds of a declaration; the required-input rule; the typing of `inputs.<name>`; the digest covering declarations and not values; a cache key changing with an input only when it names one; and an unnamed pipeline keeping its check names, digest and run spec format.
 
-Not in this schema version: matrices, service containers and extra checkouts (Part 16 and later parts). Files using them fail at `unknown key`. A run spec whose pipeline states `on.schedule` and no named pipeline and no input is stored as run spec format 10; one that names a pipeline or states an input is stored as format 11, one whose jobs declare outputs, a handoff or a finalizer as format 12, and one whose jobs declare `locks` as format 13 ([compatibility](compatibility.md)).
+Not in this schema version: matrices and service containers (Part 16 and later parts). Files using them fail at `unknown key`. A run spec whose pipeline states `on.schedule` and no named pipeline and no input is stored as run spec format 10; one that names a pipeline or states an input is stored as format 11; one whose steps or jobs declare outputs or a handoff is stored as format 12, and one whose job states a checkout history or an additional checkout is stored as format 13 ([compatibility](compatibility.md)).

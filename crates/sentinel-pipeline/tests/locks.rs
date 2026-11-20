@@ -42,7 +42,7 @@ jobs:
 }
 
 #[test]
-fn a_job_that_declares_no_resource_keeps_its_digest_and_spec_format() {
+fn a_declared_resource_is_part_of_the_digest_and_not_of_the_spec() {
     let plain = spec_for(BASE);
     let declared = spec_for(
         "schema: 1
@@ -58,59 +58,15 @@ jobs:
         plain.pipeline.digest, declared.pipeline.digest,
         "a resource a job needs is part of what the pipeline is"
     );
-    assert_eq!(
-        plain.format(),
-        6,
-        "the digest and format of a job with no lock are unchanged"
-    );
-    assert_eq!(declared.format(), 13);
-}
-
-#[test]
-fn a_spec_with_resources_is_format_13_and_round_trips_them() {
-    let spec = spec_for(
-        "schema: 1
-on: [push]
-jobs:
-  migrate:
-    image: busybox
-    locks: [{name: db/staging, wait: 90s}, staging/host]
-    steps: [{id: s, run: echo}]
-  test:
-    image: busybox
-    needs: [migrate]
-    steps: [{id: s, run: echo}]
-",
-    );
-    let bytes = spec.encode().unwrap();
-    assert_eq!(bytes[0], 13);
-    let decoded = RunSpec::decode(&bytes).unwrap();
-    assert_eq!(decoded, spec);
-    assert_eq!(decoded.pipeline.jobs[0].spec.locks.len(), 2);
-    assert_eq!(decoded.pipeline.jobs[0].spec.locks[0].wait_secs, 90);
+    // The format is the one a release that knows no resource writes for the same document: the store
+    // writes the resources as rows when it creates the run, so no worker has to understand a lock.
+    assert_eq!(declared.format(), plain.format());
+    assert_eq!(declared.format(), 6);
+    let decoded = RunSpec::decode(&declared.encode().unwrap()).unwrap();
     assert!(
-        decoded.pipeline.jobs[1].spec.locks.is_empty(),
-        "a job that declares none carries none"
+        decoded.pipeline.jobs[0].spec.locks.is_empty(),
+        "the spec carries no resource, and nothing after run creation reads one"
     );
-}
-
-#[test]
-fn a_spec_whose_resource_list_does_not_match_its_jobs_is_refused() {
-    let spec = spec_for(
-        "schema: 1
-on: [push]
-jobs:
-  migrate:
-    image: busybox
-    locks: [db/staging]
-    steps: [{id: s, run: echo}]
-",
-    );
-    let bytes = spec.encode().unwrap();
-    // The count is the last field of the body: a damaged spec loses the resources of a job, so the
-    // reader refuses it instead of running the job without them.
-    let truncated = &bytes[..bytes.len() - 1];
-    assert!(RunSpec::decode(truncated).is_err());
 }
 
 #[test]

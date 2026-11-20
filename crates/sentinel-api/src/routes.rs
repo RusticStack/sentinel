@@ -672,6 +672,36 @@ pub(crate) fn route(
                 .map_err(store_error)?;
             ok(json!(sentinel_pipeline::Explanation::of(&spec.pipeline)))
         }
+        ("GET", ["api", "v1", "runs", run, "sources"]) => {
+            let who = identify(state, request, false)?;
+            auth::require_scope(&who, Scopes::RUNS_READ)?;
+            let run: RunId = id(run, "run")?;
+            let manifest = state
+                .store
+                .read(|c| {
+                    let repo = lookup::run_repo(c, run)?;
+                    let tenant = authz::require_repo(c, who.principal, repo, Permissions::READ)?;
+                    sentinel_store::sources::manifest(c, tenant, run)
+                })
+                .map_err(store_error)?;
+            ok(json!({
+                "run": run.to_string(),
+                "sources": manifest
+                    .iter()
+                    .map(|source| json!({
+                        "job_index": source.job_index,
+                        "checkout_index": source.checkout_index,
+                        "repo": source.repo.to_string(),
+                        "name": source.name,
+                        "path": source.path,
+                        "ref": source.ref_name,
+                        "revision": source.revision,
+                        "history": source.history,
+                        "resolved_ms": source.resolved.0,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))
+        }
         ("GET", ["api", "v1", "attempts", attempt, "logs", "search"]) => {
             log_search(state, request, attempt, query)
         }

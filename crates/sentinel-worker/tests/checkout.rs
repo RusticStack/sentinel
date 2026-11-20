@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sentinel_core::AttemptId;
+use sentinel_core::{AttemptId, RepoId};
 use sentinel_pipeline::PinnedSource;
 use sentinel_protocol::source::{Access, Binding, Credential as SourceCredential};
 use sentinel_worker::{
@@ -626,6 +626,167 @@ fn a_source_access_for_another_repository_or_another_ref_is_refused_before_any_i
     assert!(
         listener.accept().is_ok(),
         "an allowed access never reached the remote"
+    );
+    ws.destroy().unwrap();
+}
+
+/// A repository with three commits on one branch, so a depth tells how much of the past arrived.
+fn three_commits(root: &Path) -> (std::path::PathBuf, Vec<String>) {
+    let repo = root.join("origin");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "--initial-branch=main"]);
+    let mut shas = Vec::new();
+    for message in ["one", "two", "three"] {
+        fs::write(repo.join("file.txt"), format!("{message}\n")).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", message]);
+        shas.push(git(&repo, &["rev-parse", "HEAD"]));
+    }
+    (repo, shas)
+}
+
+fn commits_in(work: &Path) -> usize {
+    git(work, &["rev-list", "--count", "HEAD"]).parse().unwrap()
+}
+
+#[test]
+fn a_checkout_fetches_the_history_its_declaration_asks_for() {
+    use sentinel_pipeline::schema::History;
+    let temp = tempfile::tempdir().unwrap();
+    let (repo, shas) = three_commits(temp.path());
+    let tip = shas[2].clone();
+    for (history, expected) in [
+        (History::Shallow, 1),
+        (History::Depth(2), 2),
+        (History::Full, 3),
+    ] {
+        let attempt = AttemptId::new();
+        let ws = Workspace::create(temp.path(), attempt).unwrap();
+        let source = PinnedSource::new(repo.to_str().unwrap(), &tip, Some("main")).unwrap();
+        let out = checkout::checkout_at(ws.path(), &source, None, history, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(out.sha, tip);
+        assert_eq!(
+            commits_in(ws.path()),
+            expected,
+            "{history:?} fetched the wrong amount of history"
+        );
+        ws.destroy().unwrap();
+    }
+}
+
+#[test]
+fn an_additional_checkout_lands_where_it_declared_and_never_leaves_the_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    // The run's own checkout is the workspace root; an additional one lands in a directory below it.
+    let nested = sentinel_worker::workspace::checkout_dir(ws.path(), "vendor/shared").unwrap();
+    assert!(nested.is_dir() && nested.starts_with(ws.path()));
+
+    // A path the run's own repository planted as a link is refused: the checkout would leave the workspace.
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, ws.path().join("linked")).unwrap();
+    let error = sentinel_worker::workspace::checkout_dir(ws.path(), "linked/repo").unwrap_err();
+    assert!(
+        matches!(&error, Error::Preparation(what) if what.contains("not a directory")),
+        "{error:?}"
+    );
+    assert!(!outside.join("repo").exists(), "the link was followed");
+
+    // A file where a component belongs, an absolute path and a `..` segment are refused before any entry.
+    fs::write(ws.path().join("file.txt"), "x").unwrap();
+    for path in ["file.txt/repo", "/abs", "../escape", "a/../../b"] {
+        assert!(
+            sentinel_worker::workspace::checkout_dir(ws.path(), path).is_err(),
+            "{path}"
+        );
+    }
+    ws.destroy().unwrap();
+}
+
+/// A public HTTPS access to a listener that answers every request `404`, so Git fails on a real answer
+/// from the remote instead of hanging.
+fn refusing_access() -> Access {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+        }
+    });
+    Access {
+        binding: Binding {
+            remote: format!("https://127.0.0.1:{port}/team/repo.git"),
+            allowed_refs: vec!["refs/heads/main".into()],
+            pipeline_path: ".sentinel.yml".into(),
+            trust: String::new(),
+        },
+        version: 1,
+        expires_ms: sentinel_core::UnixMillis::now().0 + 60_000,
+        credential: SourceCredential::Public,
+    }
+}
+
+#[test]
+fn a_recorded_revision_that_cannot_be_fetched_is_reported_and_nothing_is_substituted() {
+    use sentinel_pipeline::schema::History;
+    let temp = tempfile::tempdir().unwrap();
+    let access = refusing_access();
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    // The run recorded this revision, and the remote no longer serves it: the checkout must say so rather
+    // than resolve the branch again, and it must not fall back to the access's allowed ref.
+    let recorded = "0123456789abcdef0123456789abcdef01234567";
+    let source =
+        PinnedSource::new(&access.binding.remote, recorded, Some("refs/heads/main")).unwrap();
+    let error = checkout::checkout_extra(
+        ws.path(),
+        None,
+        &RepoId::new(),
+        &source,
+        &access,
+        None,
+        History::Shallow,
+        true,
+        "att-recorded",
+        Duration::from_secs(2),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, Error::Preparation(what) if what.contains(recorded) && what.contains("no longer fetchable")),
+        "{error:?}"
+    );
+    assert!(
+        !ws.path().join("file.txt").exists(),
+        "nothing was substituted"
+    );
+    assert_eq!(git(ws.path(), &["ls-files"]), "", "no worktree was written");
+    // The same failure without a recorded revision keeps Git's own bounded excerpt.
+    let source =
+        PinnedSource::new(&access.binding.remote, recorded, Some("refs/heads/main")).unwrap();
+    let error = checkout::checkout_extra(
+        ws.path(),
+        None,
+        &RepoId::new(),
+        &source,
+        &access,
+        None,
+        History::Shallow,
+        false,
+        "att-fresh",
+        Duration::from_secs(20),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, Error::Preparation(what) if what.starts_with("git fetch")),
+        "{error:?}"
     );
     ws.destroy().unwrap();
 }

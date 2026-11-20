@@ -2,7 +2,7 @@ use crate::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::sealed::Key;
 use sentinel_core::{
-    AttemptId, InstallationId, RepoId, TenantId, UnixMillis, UserId, WorkerId,
+    AttemptId, InstallationId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Permissions, Principal},
 };
 use sentinel_protocol::source::{Access, Binding, Credential};
@@ -297,4 +297,169 @@ pub fn issue(
         return Err(Error::Corrupt("source access"));
     }
     Ok(access)
+}
+
+/// One checkout of a job in a run's source manifest: the repository, where it lands, the revision the
+/// controller resolved for it, and the history selection the compiled spec declared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedSource {
+    pub job_index: u32,
+    pub checkout_index: u32,
+    pub repo: RepoId,
+    pub name: String,
+    pub path: String,
+    pub ref_name: Option<String>,
+    pub revision: String,
+    /// `shallow`, `full`, or the depth as a decimal string.
+    pub history: String,
+    pub resolved: UnixMillis,
+}
+
+impl ResolvedSource {
+    fn check(&self) -> Result<()> {
+        let hex = |sha: &str| {
+            (sha.len() == 40 || sha.len() == 64)
+                && sha
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if !hex(&self.revision)
+            || self.name.is_empty()
+            || self.name.len() > 256
+            || self.path.len() > 256
+            || !self.history.is_empty() && self.history.len() > 16
+            || self
+                .ref_name
+                .as_ref()
+                .is_some_and(|r| r.is_empty() || r.len() > 1024)
+            || self
+                .name
+                .bytes()
+                .chain(self.path.bytes())
+                .chain(self.history.bytes())
+                .any(|b| b < 32 || b == 127)
+        {
+            return Err(Error::InvalidInput("source manifest"));
+        }
+        Ok(())
+    }
+}
+
+/// Records the revision a checkout resolved to for a job of a run. The row is written once — the first
+/// attempt's resolution is the run's, so a rerun checks out that revision and never the branch's current
+/// tip. Returns whether this call wrote it.
+pub fn record_resolution(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    run: RunId,
+    source: &ResolvedSource,
+) -> Result<bool> {
+    source.check()?;
+    if source.job_index > i64::MAX as u32 || source.checkout_index > i64::MAX as u32 {
+        return Err(Error::InvalidInput("source manifest"));
+    }
+    let changed = tx.execute(
+        "INSERT OR IGNORE INTO run_sources(tenant_id, run_id, job_index, checkout_index, repo_id,
+            name, path, ref_name, revision, history, resolved_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            tenant.as_bytes(),
+            run.as_bytes(),
+            source.job_index as i64,
+            source.checkout_index as i64,
+            source.repo.as_bytes(),
+            source.name,
+            source.path,
+            source.ref_name,
+            source.revision,
+            source.history,
+            source.resolved.0
+        ],
+    )?;
+    Ok(changed == 1)
+}
+
+/// One manifest row as SQLite returns it, before the ids are decoded.
+type ManifestRow = (
+    i64,
+    i64,
+    [u8; 16],
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    i64,
+);
+
+fn resolved_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManifestRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    ))
+}
+
+fn decode_source(
+    (job, checkout, repo, name, path, ref_name, revision, history, resolved): ManifestRow,
+) -> Result<ResolvedSource> {
+    let index =
+        |value: i64, what: &'static str| u32::try_from(value).map_err(|_| Error::Corrupt(what));
+    Ok(ResolvedSource {
+        job_index: index(job, "run_sources.job_index")?,
+        checkout_index: index(checkout, "run_sources.checkout_index")?,
+        repo: RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?,
+        name,
+        path,
+        ref_name,
+        revision,
+        history,
+        resolved: UnixMillis(resolved),
+    })
+}
+
+/// Every checkout of every job in a run, in job and checkout order: the run's source manifest.
+pub fn manifest(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<ResolvedSource>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT job_index, checkout_index, repo_id, name, path, ref_name, revision, history,
+                resolved_ms
+         FROM run_sources WHERE tenant_id = ?1 AND run_id = ?2
+         ORDER BY job_index, checkout_index",
+    )?;
+    let rows = stmt.query_map(params![tenant.as_bytes(), run.as_bytes()], resolved_source)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(decode_source(row?)?);
+    }
+    Ok(out)
+}
+
+/// One job's checkouts, in checkout order.
+pub fn job_manifest(
+    conn: &Connection,
+    tenant: TenantId,
+    run: RunId,
+    job_index: u32,
+) -> Result<Vec<ResolvedSource>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT job_index, checkout_index, repo_id, name, path, ref_name, revision, history,
+                resolved_ms
+         FROM run_sources WHERE tenant_id = ?1 AND run_id = ?2 AND job_index = ?3
+         ORDER BY checkout_index",
+    )?;
+    let rows = stmt.query_map(
+        params![tenant.as_bytes(), run.as_bytes(), i64::from(job_index)],
+        resolved_source,
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(decode_source(row?)?);
+    }
+    Ok(out)
 }

@@ -579,17 +579,6 @@ mod tests {
     #[test]
     fn the_pending_migrations_report_the_tables_they_rewrite() {
         let sql = |version: u32| schema::MIGRATIONS[version as usize - 1].1;
-        let p84 = plain(sql(84));
-        let stmts: Vec<&str> = p84.split(';').take(3).collect();
-        eprintln!(
-            "DEBUG first stmt words: {:?}",
-            stmts[0].split_whitespace().take(3).collect::<Vec<_>>()
-        );
-        eprintln!(
-            "DEBUG second stmt words: {:?}",
-            stmts[1].split_whitespace().take(3).collect::<Vec<_>>()
-        );
-        eprintln!("DEBUG rewritten: {:?}", rewritten(sql(84)));
         // The default-limit rebuild copies the policy table's rows into a replacement and drops the one it
         // replaces; the preflight reports it only for a table that exists to be counted.
         assert_eq!(
