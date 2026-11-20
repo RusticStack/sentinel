@@ -27,6 +27,12 @@ in a scratch directory, never takes the lock (it exits 75, "pending", when CPU p
 measurement holds the lock), writes records marked `"smoke": true` and refuses an output path inside the
 repository's bench/ directory, so a smoke record cannot be committed by accident. Exit 75 is never a pass.
 
+`--unproven-quiet-start` is for a host whose kernel exposes no `/proc/pressure/cpu`, where step 5 cannot run at all
+(a container, most cloud machines). It records such a run rather than refusing it: every line carries
+`"quiet_start": "unverified"`, and a host whose pressure is readable but above the bound still refuses, because that
+is a busy host and not an unprovable one. The lock and the stamp still apply; such a record is evidence of a shape
+and an order of magnitude, never a baseline.
+
 Test seams: SENTINEL_PRESSURE_FILE replaces /proc/pressure/cpu; SENTINEL_VERIFY_LOCK_HELD=1 says the caller already
 holds the verification lock (the verification helper does), so a smoke run does not report it as someone else's.
 """
@@ -257,7 +263,7 @@ def bench_command(c, args, binp, smoke, scratch):
     return cmd + args.extra
 
 
-def merge_record(line, c, sha, stamp, ordering, cond_start, cond_end, lock, smoke):
+def merge_record(line, c, sha, stamp, ordering, cond_start, cond_end, lock, smoke, quiet_start=None):
     rec = json.loads(line)
     if not isinstance(rec, dict):
         raise ValueError("a record line must be a JSON object")
@@ -275,6 +281,8 @@ def merge_record(line, c, sha, stamp, ordering, cond_start, cond_end, lock, smok
     rec["contract"] = {"id": c["id"], "revision": c["revision"], "sha256": sha}
     rec["ordering"] = ordering
     rec["conditions"] = {"start": cond_start, "end": cond_end}
+    if quiet_start:
+        rec["quiet_start"] = quiet_start
     if lock:
         rec["lock"] = lock
     if smoke:
@@ -286,6 +294,7 @@ def run_contract(args):
     c, sha = load(args.contract)
     smoke = args.smoke
     scratch = None
+    quiet_start = None
     binp = resolve_bin(c, args)
     if smoke:
         out = args.out
@@ -314,9 +323,11 @@ def run_contract(args):
         p60 = pressure("avg60")
         limit = c["quiet_start"]["max_cpu_pressure_avg60"]
         if p60 is None:
-            os.close(lock_fd)
-            raise Refused("cpu pressure is not readable on this host: cannot prove a quiet start", 3)
-        if p60 >= limit:
+            if not args.unproven_quiet_start:
+                os.close(lock_fd)
+                raise Refused("cpu pressure is not readable on this host: cannot prove a quiet start", 3)
+            quiet_start = "unverified"
+        if p60 is not None and p60 >= limit:
             os.close(lock_fd)
             raise Refused(f"the host is not quiet: cpu pressure avg60={p60} is at or above {limit}", 3)
     try:
@@ -360,7 +371,10 @@ def run_contract(args):
         if not lines:
             raise Refused("the bench printed no record; nothing was appended", 1)
         try:
-            merged = [merge_record(ln, c, sha, stamp, ordering, cond_start, cond_end, lock, smoke) for ln in lines]
+            merged = [
+                merge_record(ln, c, sha, stamp, ordering, cond_start, cond_end, lock, smoke, quiet_start)
+                for ln in lines
+            ]
         except ValueError as e:
             raise Refused(f"unusable bench output ({e}); nothing was appended", 1)
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
@@ -393,8 +407,21 @@ def main(argv=None):
     rn.add_argument("--bin")
     rn.add_argument("--source")
     rn.add_argument("--keep", action="store_true", help="keep the smoke scratch directory")
+    rn.add_argument(
+        "--unproven-quiet-start",
+        action="store_true",
+        help="record a run on a host with no readable CPU pressure, marking every line quiet_start: unverified",
+    )
     rn.add_argument("extra", nargs="*")
+    # `[-- extra bench args]` is split here, not left to argparse: Python 3.12's subparser rejects a `--` that
+    # follows an option, so the form the docstring and every bench wrapper promise would exit 2 instead.
+    argv = list(sys.argv[1:] if argv is None else argv)
+    extra = []
+    if "--" in argv:
+        cut = argv.index("--")
+        argv, extra = argv[:cut], argv[cut + 1 :]
     args = ap.parse_args(argv)
+    args.extra = extra + list(getattr(args, "extra", []))
     try:
         if args.cmd == "check":
             c, sha = load(args.contract)
@@ -402,6 +429,8 @@ def main(argv=None):
                 check_reference_host(c)
             print(f"{c['id']} revision {c['revision']} sha256 {sha}")
             return 0
+        if args.unproven_quiet_start and args.smoke:
+            raise Refused("a smoke run records no measurement: --unproven-quiet-start is for a measured run", 2)
         return run_contract(args)
     except Refused as e:
         print(f"micro-run: {e}", file=sys.stderr)
