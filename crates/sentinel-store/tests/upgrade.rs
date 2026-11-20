@@ -623,8 +623,8 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     assert_eq!(version(&path), schema::LATEST);
 
     // The matrix: no release older than the one the newest migration declares runs on the result, because
-    // migration 74 (and every migration after 70 but 77 and 79) is readable by nothing below itself, so the
-    // copy (or a backup) is the only rollback for anything older.
+    // migration 74 (and every migration after 70 but 77, 80, 82 and 83) is readable by nothing below
+    // itself, so the copy (or a backup) is the only rollback for anything older.
     let needs = |db: &std::path::Path, release: u32| -> u32 {
         Connection::open(db)
             .unwrap()
@@ -649,8 +649,9 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     );
     assert_eq!(
         schema::readable_by(schema::LATEST),
-        81,
-        "the newest migration only adds two tables no earlier statement reads or writes"
+        82,
+        "the newest migration only adds a column, a switch and two indexes no earlier statement \
+         names or writes"
     );
     for release in [69, schema::LATEST - 2] {
         assert!(
@@ -858,7 +859,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     let sources = upgrade_sources();
     assert_eq!(
         sources,
-        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 80, 81, 82]
+        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 81, 82]
     );
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
@@ -1545,7 +1546,7 @@ fn the_upgrade_reports_the_tenants_the_new_default_caps_and_keeps_the_precedence
     // What the operator reads before upgrading: the defaults the upgrade will apply, sized from this data
     // file system, and the tenants whose usage or stated limit is above them, heaviest first.
     let report = upgrade::preflight(dir.path()).unwrap();
-    assert_eq!(report.inspection.pending, vec![81, schema::LATEST]);
+    assert_eq!(report.inspection.pending, vec![81, 82, schema::LATEST]);
     assert_eq!(
         report.steps[0].rewrites,
         vec![upgrade::Rewrite {
