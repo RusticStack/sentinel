@@ -732,10 +732,10 @@ fn prepare(
                         )?;
                         for extra in &extras {
                             let index = extra.index as usize;
-                            let declaration = declared
-                                .get(index.checked_sub(1).ok_or_else(|| {
-                                    Error::Preparation("checkout index outside the spec".into())
-                                })?)
+                            // The controller numbers its frames from 1: 0 is the run's own checkout.
+                            let declaration = index
+                                .checked_sub(1)
+                                .and_then(|position| declared.get(position))
                                 .ok_or_else(|| {
                                     Error::Preparation("checkout index outside the spec".into())
                                 })?;
