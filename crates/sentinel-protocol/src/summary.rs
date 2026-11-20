@@ -2,13 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const SUMMARY_FORMAT: u8 = 6;
+pub const SUMMARY_FORMAT: u8 = 7;
 // Old formats stay decodable forever: keep their shadow structs when the format changes.
 const SUMMARY_FORMAT_V1: u8 = 1;
 const SUMMARY_FORMAT_V2: u8 = 2;
 const SUMMARY_FORMAT_V3: u8 = 3;
 const SUMMARY_FORMAT_V4: u8 = 4;
 const SUMMARY_FORMAT_V5: u8 = 5;
+const SUMMARY_FORMAT_V6: u8 = 6;
 /// The outputs one attempt may report: the job's own declared outputs, bounded by the schema.
 pub const MAX_OUTPUT_RECORDS: usize = 8;
 /// The bytes one output name and value may take in the record.
@@ -67,6 +68,63 @@ pub struct CacheRecord {
     pub dirty_bytes: Option<u64>,
     pub publish: Option<String>,
     pub costly_hit: bool,
+    /// What a hydration from the controller's store cost on the wire (format 7): monotonic time of the
+    /// transfer, absent when no transfer ran — a local hit leaves it `None`.
+    pub remote_ns: Option<u64>,
+    /// The bytes a hydration delivered (format 7): `0` when none, and never counting a resumed prefix.
+    pub remote_bytes: u64,
+    /// The offset a hydration resumed at (format 7): absent for a cold transfer and for no transfer at all.
+    pub remote_from: Option<u64>,
+}
+
+/// Format 6: a cache record before a hydration's cost was reported, still read for every attempt an
+/// older worker wrote.
+#[derive(Deserialize, Serialize)]
+struct CacheRecordV6 {
+    name: String,
+    class: u8,
+    outcome: String,
+    lookup_ns: Option<u64>,
+    lock_wait_ns: Option<u64>,
+    clone_ns: Option<u64>,
+    first_touch_ns: Option<u64>,
+    files: u64,
+    bytes: u64,
+    copied_bytes: u64,
+    reflink: bool,
+    commit_ns: Option<u64>,
+    staged_bytes: Option<u64>,
+    reused_bytes: Option<u64>,
+    dirty_bytes: Option<u64>,
+    publish: Option<String>,
+    costly_hit: bool,
+}
+
+impl From<CacheRecordV6> for CacheRecord {
+    fn from(v6: CacheRecordV6) -> Self {
+        Self {
+            name: v6.name,
+            class: v6.class,
+            outcome: v6.outcome,
+            lookup_ns: v6.lookup_ns,
+            lock_wait_ns: v6.lock_wait_ns,
+            clone_ns: v6.clone_ns,
+            first_touch_ns: v6.first_touch_ns,
+            files: v6.files,
+            bytes: v6.bytes,
+            copied_bytes: v6.copied_bytes,
+            reflink: v6.reflink,
+            commit_ns: v6.commit_ns,
+            staged_bytes: v6.staged_bytes,
+            reused_bytes: v6.reused_bytes,
+            dirty_bytes: v6.dirty_bytes,
+            publish: v6.publish,
+            costly_hit: v6.costly_hit,
+            remote_ns: None,
+            remote_bytes: 0,
+            remote_from: None,
+        }
+    }
 }
 
 /// What a job's bounded finalizer did. It never decides the verdict: the attempt's outcome is the steps' outcome
@@ -135,6 +193,51 @@ pub struct AttemptSummary {
     pub reuse: Option<ReuseRecord>,
 }
 
+/// Format 6: the shape before a cache record reported a hydration's cost, still read for every attempt
+/// written by an older worker.
+#[derive(Deserialize, Serialize)]
+struct AttemptSummaryV6 {
+    checkout_ns: Option<u64>,
+    checkout_fetch_ns: Option<u64>,
+    checkout_materialize_ns: Option<u64>,
+    checkout_route: Option<CheckoutRoute>,
+    image_pull_ns: Option<u64>,
+    image_present: Option<bool>,
+    container_start_ns: Option<u64>,
+    steps_ns: Option<u64>,
+    finalize_ns: Option<u64>,
+    steps: Vec<StepRecord>,
+    caches: Vec<CacheRecordV6>,
+    guest_image: Option<GuestImageRecord>,
+    detail: String,
+    outputs: Vec<(String, String)>,
+    finalizer: Option<FinalizerRecord>,
+    reuse: Option<ReuseRecord>,
+}
+
+impl From<AttemptSummaryV6> for AttemptSummary {
+    fn from(v6: AttemptSummaryV6) -> Self {
+        Self {
+            checkout_ns: v6.checkout_ns,
+            checkout_fetch_ns: v6.checkout_fetch_ns,
+            checkout_materialize_ns: v6.checkout_materialize_ns,
+            checkout_route: v6.checkout_route,
+            image_pull_ns: v6.image_pull_ns,
+            image_present: v6.image_present,
+            container_start_ns: v6.container_start_ns,
+            steps_ns: v6.steps_ns,
+            finalize_ns: v6.finalize_ns,
+            steps: v6.steps,
+            caches: v6.caches.into_iter().map(CacheRecord::from).collect(),
+            guest_image: v6.guest_image,
+            detail: v6.detail,
+            outputs: v6.outputs,
+            finalizer: v6.finalizer,
+            reuse: v6.reuse,
+        }
+    }
+}
+
 /// Format 5: the shape before task-result reuse, still read for every attempt written by an older worker.
 #[derive(Deserialize, Serialize)]
 struct AttemptSummaryV5 {
@@ -148,7 +251,7 @@ struct AttemptSummaryV5 {
     steps_ns: Option<u64>,
     finalize_ns: Option<u64>,
     steps: Vec<StepRecord>,
-    caches: Vec<CacheRecord>,
+    caches: Vec<CacheRecordV6>,
     guest_image: Option<GuestImageRecord>,
     detail: String,
     outputs: Vec<(String, String)>,
@@ -168,7 +271,7 @@ impl From<AttemptSummaryV5> for AttemptSummary {
             steps_ns: v5.steps_ns,
             finalize_ns: v5.finalize_ns,
             steps: v5.steps,
-            caches: v5.caches,
+            caches: v5.caches.into_iter().map(CacheRecord::from).collect(),
             guest_image: v5.guest_image,
             detail: v5.detail,
             outputs: v5.outputs,
@@ -191,7 +294,7 @@ struct AttemptSummaryV4 {
     steps_ns: Option<u64>,
     finalize_ns: Option<u64>,
     steps: Vec<StepRecord>,
-    caches: Vec<CacheRecord>,
+    caches: Vec<CacheRecordV6>,
     guest_image: Option<GuestImageRecord>,
     detail: String,
 }
@@ -208,7 +311,7 @@ struct AttemptSummaryV3 {
     steps_ns: Option<u64>,
     finalize_ns: Option<u64>,
     steps: Vec<StepRecord>,
-    caches: Vec<CacheRecord>,
+    caches: Vec<CacheRecordV6>,
     detail: String,
 }
 
@@ -250,7 +353,7 @@ impl From<AttemptSummaryV3> for AttemptSummary {
             steps_ns: v3.steps_ns,
             finalize_ns: v3.finalize_ns,
             steps: v3.steps,
-            caches: v3.caches,
+            caches: v3.caches.into_iter().map(CacheRecord::from).collect(),
             detail: v3.detail,
             guest_image: None,
             ..Self::default()
@@ -271,7 +374,7 @@ impl From<AttemptSummaryV4> for AttemptSummary {
             steps_ns: v4.steps_ns,
             finalize_ns: v4.finalize_ns,
             steps: v4.steps,
-            caches: v4.caches,
+            caches: v4.caches.into_iter().map(CacheRecord::from).collect(),
             guest_image: v4.guest_image,
             detail: v4.detail,
             ..Self::default()
@@ -351,6 +454,9 @@ impl AttemptSummary {
             Some((&SUMMARY_FORMAT, body)) => {
                 postcard::from_bytes(body).map_err(|_| SummaryError::Decode)?
             }
+            Some((&SUMMARY_FORMAT_V6, body)) => AttemptSummary::from(
+                postcard::from_bytes::<AttemptSummaryV6>(body).map_err(|_| SummaryError::Decode)?,
+            ),
             Some((&SUMMARY_FORMAT_V5, body)) => AttemptSummary::from(
                 postcard::from_bytes::<AttemptSummaryV5>(body).map_err(|_| SummaryError::Decode)?,
             ),
@@ -384,8 +490,8 @@ impl AttemptSummary {
 mod tests {
     use super::*;
 
-    fn full_cache_record() -> CacheRecord {
-        CacheRecord {
+    fn full_cache_record_v6() -> CacheRecordV6 {
+        CacheRecordV6 {
             name: "deps".into(),
             class: 1,
             outcome: "hit".into(),
@@ -403,6 +509,15 @@ mod tests {
             dirty_bytes: Some(150),
             publish: Some("sealed".into()),
             costly_hit: false,
+        }
+    }
+
+    fn full_cache_record() -> CacheRecord {
+        CacheRecord {
+            remote_ns: Some(31),
+            remote_bytes: 2_048,
+            remote_from: Some(512),
+            ..CacheRecord::from(full_cache_record_v6())
         }
     }
 
@@ -532,7 +647,7 @@ mod tests {
                 outcome: StepOutcome::Passed,
                 duration_ns: Some(1),
             }],
-            caches: vec![full_cache_record()],
+            caches: vec![full_cache_record_v6()],
             detail: "kept".into(),
         };
         let mut bytes = vec![SUMMARY_FORMAT_V3];
@@ -540,8 +655,52 @@ mod tests {
         let decoded = AttemptSummary::decode(&bytes).unwrap();
         assert_eq!(decoded.guest_image, None);
         assert_eq!(decoded.image_present, Some(true));
-        assert_eq!(decoded.caches, vec![full_cache_record()]);
+        assert_eq!(
+            decoded.caches,
+            vec![CacheRecord::from(full_cache_record_v6())]
+        );
         assert_eq!(decoded.detail, "kept");
+        assert_eq!(
+            AttemptSummary::decode(&bytes[..bytes.len() - 1]),
+            Err(SummaryError::Decode)
+        );
+    }
+
+    #[test]
+    fn format_six_blobs_decode_with_no_hydration_cost() {
+        let v6 = AttemptSummaryV6 {
+            checkout_ns: Some(1),
+            checkout_fetch_ns: Some(2),
+            checkout_materialize_ns: Some(3),
+            checkout_route: Some(CheckoutRoute::Direct),
+            image_pull_ns: Some(4),
+            image_present: Some(true),
+            container_start_ns: Some(5),
+            steps_ns: Some(6),
+            finalize_ns: Some(7),
+            steps: vec![StepRecord {
+                index: 0,
+                id: "s".into(),
+                outcome: StepOutcome::Passed,
+                duration_ns: Some(1),
+            }],
+            caches: vec![full_cache_record_v6()],
+            guest_image: None,
+            detail: "hydrated".into(),
+            outputs: Vec::new(),
+            finalizer: None,
+            reuse: None,
+        };
+        let mut bytes = vec![SUMMARY_FORMAT_V6];
+        bytes.extend(postcard::to_allocvec(&v6).unwrap());
+        let decoded = AttemptSummary::decode(&bytes).unwrap();
+        assert_eq!(decoded.detail, "hydrated");
+        let cache = &decoded.caches[0];
+        assert_eq!(cache.name, "deps");
+        assert_eq!(cache.bytes, 900);
+        assert_eq!(cache.remote_ns, None);
+        assert_eq!(cache.remote_bytes, 0);
+        assert_eq!(cache.remote_from, None);
         assert_eq!(
             AttemptSummary::decode(&bytes[..bytes.len() - 1]),
             Err(SummaryError::Decode)

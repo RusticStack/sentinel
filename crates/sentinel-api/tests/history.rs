@@ -453,6 +453,9 @@ fn big_summary(n: u64) -> Vec<u8> {
         dirty_bytes: None,
         publish: None,
         costly_hit: false,
+        remote_ns: None,
+        remote_bytes: 0,
+        remote_from: None,
     }];
     s.detail = "all steps passed".into();
     s.encode().unwrap()
