@@ -143,6 +143,7 @@ fn claimed(f: &Fixture, now: UnixMillis) -> AiRequestId {
                 repo,
                 attempt,
                 Provider::Local,
+                None,
                 Scopes::READ_ONLY,
                 now,
             )?;
@@ -630,6 +631,7 @@ fn a_reservation_needs_a_claimed_request_and_settles_once() {
                     repo,
                     attempt,
                     Provider::Local,
+                    None,
                     Scopes::READ_ONLY,
                     NOW,
                 )

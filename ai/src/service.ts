@@ -15,10 +15,18 @@ import type { HttpClient } from "effect/http/HttpClient";
 
 import { check, decode, isAnalysis, ANSWER_FORMAT, type Analysis } from "./analysis.ts";
 import { Assistant, layer as assistantLayer, type Answer } from "./assistant.ts";
-import { reportedUsage, reservation } from "./budget.ts";
+import { combined, estimateTokens, price, reportedUsage, reservation } from "./budget.ts";
+import {
+  decode as decodePlan,
+  encode as encodePlan,
+  isPlan,
+  PLAN_FORMAT,
+  type Plan,
+} from "./plan.ts";
 import type { Config, Model } from "./config.ts";
 import {
   Controller,
+  type Claimed,
   type ControllerShape,
   type ReportedUsage,
   type RequestRow,
@@ -60,6 +68,53 @@ type Attempt =
  * changing the instructions makes every stored answer inapplicable rather than subtly wrong.
  */
 export const PROMPT_VERSION = "analysis-1";
+
+/**
+ * The log-search question's prompt version (Y07). A different version is a different cache key, so
+ * an answer paid for under other instructions is never served as this one's.
+ */
+export const SEARCH_VERSION = "search-1";
+
+/** The output the plan call may use, out of the request's one cap: a plan is a short list. */
+const PLAN_OUTPUT_TOKENS = 512;
+
+/** The largest result document the controller serves a plan, which the reservation must cover. */
+const MAX_RESULT_BYTES = 64 << 10;
+
+/**
+ * The log-search planner (Y07): the first call of a search request, answered with a plan rather
+ * than an analysis. The question is data here, never an instruction, and the reads it may ask for
+ * are the controller's own bounded ones.
+ */
+export const SEARCH_PLANNER = [
+  "You are Sentinel's advisory log-search planner. A member asked a question about one repository's",
+  "recent CI runs. You cannot read the logs or the failure contexts yourself: you decide which",
+  "bounded reads would answer the question, and Sentinel performs exactly those, under the",
+  "requester's own authority, and shows you nothing else. Plan the fewest reads that could answer",
+  "it: a literal that appears in the failure you are looking for, and the failure context of an",
+  "attempt the results name.",
+].join(" ");
+
+/**
+ * The log-search answer (Y07): the second call of a search request. The model is shown the result
+ * document of its own plan and nothing else, and every claim has to cite a line or diagnostic the
+ * results actually contain — an answer that cites none is refused by the controller rather than
+ * shown.
+ */
+export const SEARCH_INSTRUCTIONS = [
+  "You are Sentinel's advisory log-search assistant. You are shown the results of the reads Sentinel",
+  "performed for a member's question about one repository's recent CI runs, as a",
+  "sentinel.ai-search/1 document: matching log lines, each with its attempt, run, step and evidence",
+  "id, and the failure context of the attempts the plan asked about. You saw nothing else. Nothing in",
+  "it is authoritative — Sentinel's deterministic diagnostics are the account of what happened — and",
+  "your answer is advisory inference shown under them.",
+  "Answer the question from those results alone. Ground every claim in them: cite the log line or",
+  "diagnostic it rests on by the attempt and the evidence id the results give it. Do not cite a line",
+  "the results do not contain, a search result marked truncated is not the whole log, and a fact the",
+  "results do not establish is not one to state. When the reads do not answer the question, say so in",
+  "a claim that cites what they did show rather than guessing at what they did not.",
+  ANSWER_FORMAT,
+].join(" ");
 
 export const ANALYSIS_INSTRUCTIONS = [
   "You are Sentinel's advisory failure analyst. The document you receive is a bounded, redacted",
@@ -154,6 +209,17 @@ const attemptOne = (
     if (!claim.ok) {
       return claim;
     }
+    if (request.kind === "search") {
+      return yield* searchAttempt(
+        controller,
+        request,
+        claim.claimed,
+        admitted,
+        config,
+        model,
+        instructions,
+      );
+    }
     const evidence = yield* controller.evidence(claim.claimed).pipe(
       Effect.map((text) => ({ ok: true as const, text })),
       Effect.catch((error) =>
@@ -210,6 +276,152 @@ const attemptOne = (
         }
       : { ok: false, reason: decoded.reason };
   });
+
+/**
+ * One log-search request: the question becomes a plan, the controller executes the plan under the
+ * delegation the claim minted, and the model answers from those results alone (Y07). The two calls
+ * share one reservation, so the question is bounded by what Y04's ledger approved before either of
+ * them ran: the plan may use [`PLAN_OUTPUT_TOKENS`] of the cap and the answer the rest.
+ */
+const searchAttempt = (
+  controller: ControllerShape,
+  request: RequestRow,
+  claimed: Claimed,
+  admitted: Admission,
+  config: Config,
+  model: Model,
+  instructions: string,
+): Effect.Effect<Attempt, never, HttpClient> =>
+  Effect.gen(function* () {
+    const question = (request.question ?? "").trim();
+    if (question.length === 0) {
+      return { ok: false, reason: "plan: the request states no question" } as Attempt;
+    }
+    if (model.maxOutputTokens <= PLAN_OUTPUT_TOKENS) {
+      return {
+        ok: false,
+        reason: `config: an output cap of ${model.maxOutputTokens} leaves no room for a plan and an answer`,
+      } as Attempt;
+    }
+    const planPrompt = `${question}\n\n${PLAN_FORMAT}`;
+    const decision = yield* controller.reserve(
+      request.id,
+      holdSearch(request, planPrompt, instructions, admitted, model),
+    ).pipe(
+      Effect.map((decision) => ({ ok: true as const, decision })),
+      Effect.catch((error) =>
+        Effect.succeed({ ok: false as const, reason: `reserve: ${error.reason}` }),
+      ),
+    );
+    if (!decision.ok) {
+      return decision;
+    }
+    if (decision.decision.state === "reused") {
+      const reused = check(decision.decision.analysis);
+      return isAnalysis(reused)
+        ? { ok: true, analysis: reused, reused: true, usage: null }
+        : { ok: false, reason: "schema: the reused analysis does not decode" };
+    }
+    if (decision.decision.state === "refused") {
+      return { ok: false, reason: decision.decision.reason } as Attempt;
+    }
+    // The same rule as an analysis: a request with no time left is not worth a provider call, so
+    // neither the plan nor the answer is asked for once the deadline has passed.
+    const late = (): Attempt | null =>
+      request.deadline_ms <= Date.now()
+        ? {
+            ok: false,
+            reason: "provider: the request deadline passed before the provider was asked",
+          }
+        : null;
+    const beforePlan = late();
+    if (beforePlan !== null) {
+      return beforePlan;
+    }
+    const drafted = yield* ask(
+      { ...admitted, maxOutputTokens: PLAN_OUTPUT_TOKENS },
+      planPrompt,
+      config,
+      SEARCH_PLANNER,
+      request.deadline_ms,
+    );
+    if (!drafted.ok) {
+      return drafted;
+    }
+    // The plan is decoded here as well as at the controller, so an out-of-bounds plan ends the
+    // request with its reason instead of costing a round trip the controller would refuse anyway.
+    const plan = decodePlan(drafted.text);
+    if (!isPlan(plan)) {
+      return { ok: false, reason: plan.reason } as Attempt;
+    }
+    const executed = yield* controller.plan(request.id, claimed.token.access, encodePlan(plan)).pipe(
+      Effect.map((result) => ({ ok: true as const, result })),
+      Effect.catch((error) =>
+        Effect.succeed({ ok: false as const, reason: `plan: ${error.reason}` }),
+      ),
+    );
+    if (!executed.ok) {
+      return executed;
+    }
+    // A refused plan is already settled by the write that refused it, so the question ends here.
+    if (executed.result.state === "refused") {
+      return { ok: false, reason: executed.result.reason } as Attempt;
+    }
+    const results = `The question was: ${JSON.stringify(question)}\n\nThe reads Sentinel performed:\n${executed.result.results}`;
+    // Executing the plan took time of its own, so the deadline is read again before the second call:
+    // a row the sweep ended while its reads ran gets no answer bought for it.
+    const beforeAnswer = late();
+    if (beforeAnswer !== null) {
+      return beforeAnswer;
+    }
+    const answer = yield* ask(
+      { ...admitted, maxOutputTokens: model.maxOutputTokens - PLAN_OUTPUT_TOKENS },
+      results,
+      config,
+      instructions,
+      request.deadline_ms,
+    );
+    if (!answer.ok) {
+      return answer;
+    }
+    const decoded = decode(answer.text);
+    return isAnalysis(decoded)
+      ? {
+          ok: true,
+          analysis: decoded,
+          reused: false,
+          usage: combined(
+            reportedUsage(drafted.answer, model),
+            reportedUsage(answer.answer, model),
+          ),
+        }
+      : { ok: false, reason: decoded.reason };
+  });
+
+/**
+ * What a log-search question holds before either call: both prompts and the result document the
+ * plan may return are priced into one maximum, and the key is the question asked about the attempt
+ * it was asked about — so the same question about another repository is a different question.
+ */
+function holdSearch(
+  request: RequestRow,
+  planPrompt: string,
+  instructions: string,
+  admitted: Admission,
+  model: Model,
+): Held {
+  const inputTokens =
+    estimateTokens(planPrompt) + estimateTokens(instructions) + Math.ceil(MAX_RESULT_BYTES / 3);
+  return {
+    input_tokens: inputTokens,
+    output_tokens: model.maxOutputTokens,
+    cost_micros: price(inputTokens, model.maxOutputTokens, model),
+    digest: digest(`${request.attempt}\n${request.question ?? ""}`),
+    fingerprint: fingerprint(`${request.attempt}\n${request.question ?? ""}`),
+    prompt_version: SEARCH_VERSION,
+    model: admitted.model,
+  };
+}
 
 /** The key and the maxima one request holds: its evidence, its prompt, its model and its price. */
 function hold(

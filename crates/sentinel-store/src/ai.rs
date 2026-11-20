@@ -30,6 +30,8 @@ use sentinel_core::{
     auth::{Permissions, Scopes},
 };
 
+use sentinel_protocol::plan::MAX_QUESTION_BYTES;
+
 use crate::{
     Error, Result,
     auth::{Authority, require_repo, require_tenant_admin},
@@ -589,6 +591,34 @@ impl Origin {
     }
 }
 
+/// What a request is asked for (Y07): one attempt's failure analysis, or a log-search question
+/// whose answer a bounded plan of reads has to establish first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Kind {
+    /// A failure analysis of the request's attempt (Y05).
+    Analysis = 1,
+    /// A log-search question about the request's repository (Y07).
+    Search = 2,
+}
+
+impl Kind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Analysis => "analysis",
+            Self::Search => "search",
+        }
+    }
+
+    fn from_code(code: i64) -> Option<Self> {
+        Some(match code {
+            1 => Self::Analysis,
+            2 => Self::Search,
+            _ => return None,
+        })
+    }
+}
+
 /// One durable request, as every reader of it sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -600,6 +630,10 @@ pub struct Request {
     pub provider: Provider,
     pub data_policy: DataPolicy,
     pub origin: Origin,
+    /// What the row asks for, which decides what its answer must be built from.
+    pub kind: Kind,
+    /// The member's question, present exactly on a [`Kind::Search`] row.
+    pub question: Option<String>,
     pub state: State,
     pub outcome: Option<Outcome>,
     pub reason: Option<String>,
@@ -612,7 +646,8 @@ pub struct Request {
     pub deadline: UnixMillis,
 }
 const REQUEST_COLUMNS: &str = "id, tenant_id, repo_id, attempt_id, requester_id, provider,
-     data_policy, origin, state_code, outcome, reason, result, reused, created_ms, deadline_ms";
+     data_policy, origin, kind, question, state_code, outcome, reason, result, reused, created_ms,
+     deadline_ms";
 
 /// One row's bytes, as the store holds them. Decoded once, outside the query closure.
 type Raw = (
@@ -624,6 +659,8 @@ type Raw = (
     i64,
     i64,
     i64,
+    i64,
+    Option<String>,
     i64,
     Option<i64>,
     Option<String>,
@@ -650,6 +687,8 @@ fn raw(row: &rusqlite::Row<'_>) -> rusqlite::Result<Raw> {
         row.get(12)?,
         row.get(13)?,
         row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
     ))
 }
 
@@ -663,6 +702,8 @@ fn decode(raw: Raw) -> Result<Request> {
         provider,
         policy,
         origin,
+        kind,
+        question,
         state,
         outcome,
         reason,
@@ -684,6 +725,8 @@ fn decode(raw: Raw) -> Result<Request> {
         data_policy: DataPolicy::from_code(policy)
             .ok_or(Error::Corrupt("ai_requests.data_policy"))?,
         origin: Origin::from_code(origin).ok_or(Error::Corrupt("ai_requests.origin"))?,
+        kind: Kind::from_code(kind).ok_or(Error::Corrupt("ai_requests.kind"))?,
+        question,
         state: State::from_code(state).ok_or(Error::Corrupt("ai_requests.state_code"))?,
         outcome: match outcome {
             None => None,
@@ -724,10 +767,12 @@ pub fn request(conn: &Connection, tenant: TenantId, id: AiRequestId) -> Result<R
     decode(raw)
 }
 
-/// A member's request about one attempt. It is refused unless the requester can read the
-/// repository, the tenant's policy admits `provider` right now, and the requester holds every
-/// read-only scope — which is what makes the delegation minted at claim time a subset of their
-/// own set rather than a substitute for it.
+/// A member's request about one attempt: its failure analysis, or — when `question` is stated — a
+/// log-search question about that attempt's repository (Y07). It is refused unless the requester can
+/// read the repository, the tenant's policy admits `provider` right now, and the requester holds
+/// every read-only scope — which is what makes the delegation minted at claim time a subset of
+/// their own set rather than a substitute for it. A question additionally needs `logs:read`: the
+/// plan it becomes searches logs, and a delegation that could not read one would answer nothing.
 #[allow(clippy::too_many_arguments)]
 pub fn enqueue(
     tx: &Transaction<'_>,
@@ -736,6 +781,7 @@ pub fn enqueue(
     repo: RepoId,
     attempt: AttemptId,
     provider: Provider,
+    question: Option<&str>,
     requester_scopes: Scopes,
     now: UnixMillis,
 ) -> Result<Request> {
@@ -743,6 +789,15 @@ pub fn enqueue(
     require_repo(tx, principal, repo, Permissions::READ)?;
     if !requester_scopes.contains(Scopes::READ_ONLY) {
         return Err(Error::Forbidden);
+    }
+    if let Some(question) = question {
+        if !requester_scopes.contains(Scopes::LOGS_READ) {
+            return Err(Error::Forbidden);
+        }
+        if question.is_empty() || question.trim().is_empty() || question.len() > MAX_QUESTION_BYTES
+        {
+            return Err(Error::InvalidInput("question"));
+        }
     }
     let data_policy = admit(tx, tenant, provider)?.ok_or(Error::Forbidden)?;
     let owned: bool = tx
@@ -760,10 +815,15 @@ pub fn enqueue(
     }
     let id = AiRequestId::new();
     let deadline = now.0.saturating_add(REQUEST_LIFETIME_MS);
+    let kind = if question.is_some() {
+        Kind::Search
+    } else {
+        Kind::Analysis
+    };
     tx.prepare_cached(
         "INSERT INTO ai_requests(id, tenant_id, repo_id, attempt_id, requester_id,
-            requester_scopes, provider, data_policy, created_ms, deadline_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            requester_scopes, provider, data_policy, kind, question, created_ms, deadline_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?
     .execute(params![
         id.as_bytes(),
@@ -774,6 +834,8 @@ pub fn enqueue(
         requester_scopes.bits(),
         provider as u8,
         data_policy as u8,
+        kind as u8,
+        question,
         now.0,
         deadline
     ])?;
@@ -786,6 +848,8 @@ pub fn enqueue(
         provider,
         data_policy,
         origin: Origin::Member,
+        kind,
+        question: question.map(str::to_owned),
         state: State::Queued,
         outcome: None,
         reason: None,
@@ -923,7 +987,8 @@ pub fn answer(conn: &Connection, attempt: AttemptId, now: UnixMillis) -> Result<
     let settled = conn
         .prepare_cached(
             "SELECT result, reused, settled_ms, origin FROM ai_requests
-              WHERE attempt_id = ?1 AND state_code = 3 AND outcome = 2 AND result IS NOT NULL
+              WHERE attempt_id = ?1 AND kind = 1 AND state_code = 3 AND outcome = 2
+                AND result IS NOT NULL
               ORDER BY settled_ms DESC, id DESC LIMIT 1",
         )?
         .query_row(params![attempt.as_bytes()], |r| {
@@ -946,7 +1011,7 @@ pub fn answer(conn: &Connection, attempt: AttemptId, now: UnixMillis) -> Result<
     let pending: bool = conn
         .prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM ai_requests
-              WHERE attempt_id = ?1 AND state_code != 3 AND deadline_ms > ?2)",
+              WHERE attempt_id = ?1 AND kind = 1 AND state_code != 3 AND deadline_ms > ?2)",
         )?
         .query_row(params![attempt.as_bytes(), now.0], |r| r.get(0))?;
     Ok(if pending {
@@ -1158,6 +1223,28 @@ fn close(tx: &Transaction<'_>, id: AiRequestId, ending: Ending<'_>, now: UnixMil
     )?
     .execute(params![now.0, id.as_bytes()])?;
     release(tx, id, analysis, now, usage)
+}
+
+/// Whether a request may still be executed: it is claimed, unsettled, and before its deadline. A
+/// `token` that is stated must be the delegation its claim minted, which is the credential the AI
+/// process reads a plan's evidence with; the service grant passes none.
+pub fn executing(
+    conn: &Connection,
+    id: AiRequestId,
+    token: Option<TokenId>,
+    now: UnixMillis,
+) -> Result<bool> {
+    let live: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM ai_requests
+              WHERE id = ?1 AND state_code = 2 AND settled_ms IS NULL AND deadline_ms > ?2
+                AND (?3 IS NULL OR delegation_id = ?3))",
+        )?
+        .query_row(
+            params![id.as_bytes(), now.0, token.as_ref().map(TokenId::as_bytes)],
+            |r| r.get(0),
+        )?;
+    Ok(live)
 }
 
 /// Whether `token` is the live delegation of the request about `attempt`: the check the evidence

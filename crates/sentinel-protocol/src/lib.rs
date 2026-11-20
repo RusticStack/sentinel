@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod negotiate;
 pub mod oauth;
 pub mod patterns;
+pub mod plan;
 pub mod redact;
 pub mod secrets;
 pub mod source;

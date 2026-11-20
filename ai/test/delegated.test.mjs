@@ -21,6 +21,8 @@ const SERVICE = "service-grant";
 const row = {
   id: "air_00000000-0000-4000-8000-000000000002",
   attempt: "att_00000000-0000-4000-8000-000000000001",
+  kind: "analysis",
+  question: null,
   provider: "local",
   data_policy: "local_only",
   origin: "member",

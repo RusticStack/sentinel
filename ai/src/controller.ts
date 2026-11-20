@@ -19,6 +19,10 @@ import { isReadOnly } from "./policy.ts";
 export const RequestRow = Schema.Struct({
   id: Schema.String,
   attempt: Schema.String,
+  /** `analysis` for one attempt's failure analysis, `search` for a log-search question (Y07). */
+  kind: Schema.String,
+  /** The member's question, present exactly on a `search` request. */
+  question: Schema.NullOr(Schema.String),
   provider: Schema.String,
   data_policy: Schema.String,
   state: Schema.String,
@@ -99,6 +103,20 @@ export interface Claimed {
   readonly token: Delegation;
 }
 
+/**
+ * What executing a plan gave back: the bounded `sentinel.ai-search/1` document the model reads, or
+ * the reason the controller refused to run it — in which case the request is already settled and
+ * nothing is left to answer.
+ */
+export type PlanResult =
+  | { readonly state: "ready"; readonly results: string }
+  | { readonly state: "refused"; readonly reason: string };
+
+const PlanDecision = Schema.Union([
+  Schema.Struct({ state: Schema.Literal("ready"), results: Schema.Unknown }),
+  Schema.Struct({ state: Schema.Literal("refused"), reason: Schema.String }),
+]);
+
 /** How a request ends. A request never ends any other way. */
 export type Outcome = "completed" | "unavailable";
 
@@ -124,6 +142,16 @@ export interface ControllerShape {
     reservation: Reservation,
   ) => Effect.Effect<Decision, ControllerError>;
   /**
+   * Execute `id`'s plan under its own delegation: the bounded result document, or the reason the
+   * controller refused it. The controller reads nothing the requester could not, and it settles the
+   * request itself when it refuses, so a refusal is the end of the question.
+   */
+  readonly plan: (
+    id: string,
+    delegation: string,
+    plan: string,
+  ) => Effect.Effect<PlanResult, ControllerError>;
+  /**
    * Settle `id`: the decoded analysis, or the reason there is none, and what the provider reported.
    * The controller decodes the document again before it stores it, so an answer that does not
    * decode is refused there rather than kept as text.
@@ -144,6 +172,9 @@ export class Controller extends Context.Service<Controller, ControllerShape>()(
 
 /** The evidence bundle's ceiling: the controller serves at most 64 KiB and we read no more. */
 const MAX_BUNDLE_BYTES = 128 << 10;
+
+/** A plan's result document's ceiling, which the controller keeps and this process reads no more of. */
+const MAX_RESULTS_BYTES = 96 << 10;
 
 /** A reservation's answer is a decision, not a payload: a few hundred bytes at most. */
 const MAX_DECISION_BYTES = 8 << 10;
@@ -223,6 +254,25 @@ export const httpLayer = (base: string, grant: Redacted.Redacted<string>) =>
             Effect.mapError((error) => annotate(error, "an unreadable evidence bundle")),
           );
         },
+        plan: (id, delegation, plan) =>
+          call(
+            HttpClientRequest.post(
+              url(`/api/v1/ai/requests/${encodeURIComponent(id)}/plan`),
+            ).pipe(
+              HttpClientRequest.setHeader("authorization", `Bearer ${delegation}`),
+              HttpClientRequest.acceptJson,
+              HttpClientRequest.bodyText(plan, "application/json"),
+            ),
+          ).pipe(
+            Effect.flatMap(HttpIncomingMessage.schemaBodyJson(PlanDecision)),
+            Effect.map((decision): PlanResult =>
+              decision.state === "ready"
+                ? { state: "ready", results: JSON.stringify(decision.results) }
+                : { state: "refused", reason: decision.reason },
+            ),
+            Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(MAX_RESULTS_BYTES)),
+            Effect.mapError((error) => annotate(error, "an undecodable plan result")),
+          ),
         reserve: (id, reservation) =>
           Effect.flatMap(
             HttpClientRequest.bodyJson(reservation)(
