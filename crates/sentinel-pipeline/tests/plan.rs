@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use sentinel_pipeline::workflow::{
-    self, DockerHosts, Images, Options, Plan, WorkflowFile, analyze, plan,
+    self, DockerHosts, Images, Options, Phase, Plan, WorkflowFile, analyze, plan,
 };
 
 const REVISION: &str = "0c87e0181c794fe2bbfeb15dc34e7b6aae375d8b";
@@ -68,6 +68,7 @@ fn plan_with(files: &[(String, String)], native: bool, images: Images<'static>) 
             docker: DockerHosts::MicrovmGuests,
             native,
             images,
+            phase: Phase::Label,
         },
     )
     .unwrap()
@@ -551,6 +552,7 @@ fn the_plan_refuses_files_it_was_not_built_from() {
         docker: DockerHosts::MicrovmGuests,
         native: false,
         images: Images::default(),
+        phase: Phase::Label,
     };
     let fewer = plan(&inventory, &borrowed[1..], &options).unwrap_err();
     assert!(matches!(fewer, workflow::PlanError::Files));

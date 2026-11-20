@@ -190,7 +190,8 @@ fn refusals(f: &Fixture) -> Vec<String> {
         .conn
         .prepare(
             "SELECT action FROM source_audit WHERE repo_id = ?1
-             AND action IN ('migration_off', 'migration_permissions') ORDER BY at_ms",
+             AND action IN ('migration_off', 'migration_permissions', 'migration_settings_off')
+             ORDER BY at_ms",
         )
         .unwrap();
     stmt.query_map([f.repo.as_bytes()], |r| r.get(0))
@@ -344,4 +345,134 @@ fn only_a_tenant_administrator_turns_the_switch() {
         ));
     }
     assert!(!migration::mode(&f.conn, f.tenant).unwrap());
+}
+
+fn opt_in(f: &mut Fixture, enabled: bool) -> Result<Switch, Error> {
+    let tx = f.conn.transaction().unwrap();
+    let outcome = migration::set_settings(&tx, Authority::HostLocal, f.tenant, enabled);
+    if outcome.is_ok() {
+        tx.commit().unwrap();
+    }
+    outcome
+}
+
+fn authorize_settings(f: &mut Fixture) -> Result<migration::SettingsWrite, Error> {
+    let tx = f.conn.transaction().unwrap();
+    let verdict = migration::authorize_settings(&tx, f.tenant, f.repo, Some(f.owner.user), NOW);
+    if verdict.is_ok() {
+        tx.commit().unwrap();
+    }
+    verdict
+}
+
+#[test]
+fn the_settings_write_needs_the_migration_switch_and_its_own_opt_in() {
+    let mut f = organization();
+    installation(&mut f, MigrationPermissions::ALL, false);
+    // The opt-in is off until an administrator gives it, and a tenant can give it before it starts
+    // a migration: an opt-in nothing reads yet changes nothing.
+    assert!(!migration::settings(&f.conn, f.tenant).unwrap());
+    assert_eq!(opt_in(&mut f, true).unwrap(), Switch::Set);
+    assert_eq!(opt_in(&mut f, true).unwrap(), Switch::Unchanged);
+    assert!(migration::settings(&f.conn, f.tenant).unwrap());
+
+    // A migration that never started refuses the write with its own reason, not the opt-in's.
+    assert_eq!(
+        authorize_settings(&mut f).unwrap(),
+        migration::SettingsWrite::Off
+    );
+    assert_eq!(refusals(&f), ["migration_off"]);
+
+    assert_eq!(switch(&mut f, true).unwrap(), Switch::Set);
+    assert_eq!(
+        authorize_settings(&mut f).unwrap(),
+        migration::SettingsWrite::Permitted
+    );
+
+    // Withdrawn at GitHub, the strict gate refuses the same way the plain one does.
+    installation(
+        &mut f,
+        MigrationPermissions::grants(true, true, false),
+        false,
+    );
+    assert_eq!(
+        authorize_settings(&mut f).unwrap(),
+        migration::SettingsWrite::Missing(vec!["workflows"])
+    );
+    installation(&mut f, MigrationPermissions::ALL, false);
+
+    // The switch turned off reaches the strict gate too.
+    assert_eq!(opt_in(&mut f, false).unwrap(), Switch::Set);
+    assert_eq!(
+        authorize_settings(&mut f).unwrap(),
+        migration::SettingsWrite::NotOpted
+    );
+    assert_eq!(
+        refusals(&f),
+        [
+            "migration_off",
+            "migration_permissions",
+            "migration_settings_off"
+        ]
+    );
+
+    // The plain gate is untouched by the opt-in: a migration's content write never reads it.
+    assert_eq!(authorize(&mut f).unwrap(), Writes::Permitted);
+}
+
+#[test]
+fn the_settings_opt_in_is_a_tenant_administrators_change() {
+    let mut f = organization();
+    installation(&mut f, MigrationPermissions::ALL, false);
+    let reader = Principal::new(f.owner.user, Permissions::READ, Some(f.tenant), None);
+    {
+        let tx = f.conn.transaction().unwrap();
+        assert!(matches!(
+            migration::set_settings(&tx, Authority::credential(reader), f.tenant, true),
+            Err(Error::Forbidden)
+        ));
+    }
+    assert!(!migration::settings(&f.conn, f.tenant).unwrap());
+}
+
+#[test]
+fn every_step_of_the_switch_leaves_its_own_audit_row() {
+    let mut f = organization();
+    installation(&mut f, MigrationPermissions::ALL, false);
+    for step in [
+        migration::Step::Switched,
+        migration::Step::SwitchedMoved,
+        migration::Step::Applied,
+        migration::Step::Moved,
+        migration::Step::Verified,
+        migration::Step::Refused,
+    ] {
+        let tx = f.conn.transaction().unwrap();
+        migration::record_step(&tx, f.tenant, f.repo, Some(f.owner.user), step, NOW).unwrap();
+        tx.commit().unwrap();
+    }
+    let mut stmt = f
+        .conn
+        .prepare(
+            "SELECT action FROM source_audit WHERE repo_id = ?1
+             AND action LIKE 'migration_switch%' OR action LIKE 'migration_settings%'
+             ORDER BY at_ms, seq",
+        )
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([f.repo.as_bytes()], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "migration_switch",
+            "migration_switch_settings_moved",
+            "migration_settings_applied",
+            "migration_settings_moved",
+            "migration_settings_verified",
+            "migration_settings_refused",
+        ]
+    );
 }

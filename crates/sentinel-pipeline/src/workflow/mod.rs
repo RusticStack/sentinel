@@ -20,7 +20,8 @@ mod native;
 mod rules;
 
 pub use change::{
-    KeptJob, LabelChange, Options, Plan, PlanError, SCHEMA as PLAN_SCHEMA, WorkflowPlan, plan,
+    COPY_PREFIX, KeptJob, LabelChange, Options, Phase, Plan, PlanError, SCHEMA as PLAN_SCHEMA,
+    ShadowJob, WorkflowPlan, plan,
 };
 pub use labels::{
     ClassTarget, Declared, Destination, DockerHosts, KeepReason, LABEL_TABLE_VERSION, LabelTable,

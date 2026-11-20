@@ -13,8 +13,10 @@
 use sentinel_core::auth::{Permissions, Scopes};
 use sentinel_core::{RepoId, TenantId, UnixMillis, UserId};
 use sentinel_github::migration::{self as remote, Migrate, Outcome, Rewritten};
+use sentinel_github::protection;
 use sentinel_pipeline::workflow::{
-    self, DockerHosts, Images, MAX_WORKFLOW_FILES, Options, WorkflowFile, analyze, plan,
+    self, DockerHosts, Images, Inventory, MAX_WORKFLOW_FILES, Options, Phase, WorkflowFile,
+    analyze, plan,
 };
 use sentinel_protocol::negotiate::Capabilities;
 use sentinel_protocol::{
@@ -24,7 +26,7 @@ use sentinel_protocol::{
 };
 use sentinel_store::{
     auth as authz, lookup,
-    migration::{PullRequest as Recorded, Writes},
+    migration::{PullRequest as Recorded, SettingsWrite, Step as RecordedStep, Writes},
     parity, sources, sources_forge,
 };
 use serde::Deserialize;
@@ -125,6 +127,7 @@ pub(crate) fn preview(state: &State, request: &mut Request, slug: &str, name: &s
             docker,
             native: images.is_some(),
             images: images.unwrap_or_default(),
+            phase: Phase::Label,
         },
     )
     .map_err(|error| err(ErrorCode::InvalidRequest, format!("preview: {error}")))?;
@@ -604,6 +607,7 @@ pub(crate) fn pull_request(state: &State, request: &mut Request, slug: &str, nam
                     docker,
                     native: false,
                     images: Images::default(),
+                    phase: Phase::Label,
                 },
             )
             .map_err(|error| err(ErrorCode::InvalidRequest, format!("preview: {error}")))?;
@@ -657,6 +661,818 @@ pub(crate) fn pull_request(state: &State, request: &mut Request, slug: &str, nam
                 }
             }
         }
+    }
+}
+
+/// What the switch route answers: a versioned contract, so a client can branch on it
+/// ([compatibility](../../../docs/compatibility.md)).
+pub const SWITCH_SCHEMA: &str = "sentinel.migration-switch/1";
+/// The most body one switch request may be: a commit id and two flags.
+const MAX_SWITCH_BODY_BYTES: usize = 4 << 10;
+
+/// What a switch request takes: the step, the analysed commit, and — on the native path — the plan
+/// the workflows become, whose digest-pinned images are what lets a job leave GitHub's runners.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SwitchRequest {
+    action: SwitchStep,
+    commit: String,
+    #[serde(default)]
+    native: Option<NativeRequest>,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SwitchStep {
+    /// Runner mode: the pull request that adds a non-required copy of every migrating job.
+    Shadow,
+    /// Runner mode: the pull request that drops those copies and moves the originals' labels, with
+    /// the branch protection read before it and after it compared.
+    Switch,
+    /// The native path: the exact required-check change, and whether this deployment may make it.
+    Preview,
+    /// The native path: make it, prove it, and open the pull request that disables the jobs it
+    /// replaced.
+    Apply,
+    /// The native path: compare the settings a person applied with the preview.
+    Verify,
+}
+
+impl SwitchStep {
+    const fn is_native(self) -> bool {
+        matches!(self, Self::Preview | Self::Apply | Self::Verify)
+    }
+}
+
+/// The gate and the write facts of one repository, as the switch reads them.
+enum SwitchGate {
+    Refused(Writes),
+    SettingsRefused(SettingsWrite),
+    Open(SwitchOpen),
+}
+
+struct SwitchOpen {
+    tenant: TenantId,
+    repo: RepoId,
+    installation: u64,
+    account: u64,
+    forge_repo: u64,
+    remote: String,
+    /// The tenant's opt-in to Sentinel making the settings change itself, read with the gate.
+    opt_in: bool,
+}
+
+/// One branch's settings as the route saw them: what it read, the change it computed, and what it
+/// read back after a write.
+struct Viewed {
+    branch: String,
+    before: protection::Required,
+    change: protection::Change,
+    after: Option<protection::Required>,
+}
+
+impl Viewed {
+    /// Whether the set read back is the set the change stated. A read that never happened states no
+    /// verdict, because a comparison nothing was compared against is not a pass.
+    fn equal(&self) -> Option<bool> {
+        let after = self.after.as_ref()?;
+        Some(
+            after.contexts == self.change.contexts() && after.strict == self.change.settings.strict,
+        )
+    }
+}
+
+fn settings_json(viewed: &Viewed) -> Value {
+    let expected = viewed.change.contexts();
+    let removed: Vec<&String> = viewed
+        .before
+        .contexts
+        .iter()
+        .filter(|context| !expected.contains(&context.as_str()))
+        .collect();
+    let added: Vec<&str> = expected
+        .iter()
+        .copied()
+        .filter(|context| !viewed.before.contexts.iter().any(|held| held == context))
+        .collect();
+    json!({
+        "branch": viewed.branch,
+        "before": {"required": viewed.before.contexts, "strict": viewed.before.strict},
+        "change": {
+            "added": added,
+            "removed": removed,
+            "replaced": viewed.change.replaced.iter().map(|(context, check)| json!({
+                "context": context,
+                "check": check,
+            })).collect::<Vec<Value>>(),
+        },
+        "expected": {
+            "required": expected,
+            "strict": viewed.change.settings.strict,
+        },
+        "protected": viewed.before.protected,
+        "after": viewed.after.as_ref().map(|after| json!({
+            "required": after.contexts,
+            "strict": after.strict,
+        })),
+        "verdict": match viewed.equal() {
+            Some(true) => "equal",
+            Some(false) => "moved",
+            None => "unread",
+        },
+        "rulesets": viewed.before.rulesets,
+        "from_rulesets": viewed.before.from_rulesets,
+    })
+}
+
+/// Whether a required context is the check a job of this name reports: its own name, or one of its
+/// matrix cells, which GitHub writes as `<job> (<values>)`.
+fn answers(contexts: &[String], name: &str) -> bool {
+    contexts.iter().any(|context| {
+        context == name
+            || context
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with(" ("))
+    })
+}
+
+/// The jobs a native plan replaced, as the required-check change needs them: the GitHub job id and
+/// the name its check carries, which is the job's own `name:` when it states one.
+fn replaced(inventory: &Inventory, planned: &workflow::Plan) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    for planned_workflow in &planned.workflows {
+        let Some(native) = planned_workflow.native.as_ref() else {
+            continue;
+        };
+        let jobs: &[workflow::Job] = inventory
+            .workflows
+            .iter()
+            .find(|found| found.path == planned_workflow.path)
+            .map_or(&[], |found| found.jobs.as_slice());
+        for mapping in native
+            .jobs
+            .iter()
+            .filter(|mapping| !mapping.jobs.is_empty())
+        {
+            let name = jobs
+                .iter()
+                .find(|job| job.id == mapping.github)
+                .and_then(|job| job.name.clone());
+            out.push((mapping.github.clone(), name));
+        }
+    }
+    out
+}
+
+/// What the switch's pull request says, per step: the same text for the same plan at the same
+/// commit, so a re-run rewrites nothing a person did not re-analyse.
+fn describe_switch(
+    commit: &str,
+    planned: &workflow::Plan,
+    step: SwitchStep,
+) -> (&'static str, String, String) {
+    let (title, lead) = match step {
+        SwitchStep::Shadow => (
+            "Run GitHub Actions jobs on Sentinel in parallel",
+            "Adds a non-required copy of each migrated job, on a Sentinel runner, beside the unchanged\noriginal: both run on the same commits while GitHub's runners stay authoritative.\n",
+        ),
+        SwitchStep::Switch => (
+            "Switch workflow jobs to Sentinel runners",
+            "Drops the shadow copies and moves the originals' `runs-on:` labels to Sentinel. Job names,\nand so the check names a required check names, are unchanged.\n",
+        ),
+        _ => (
+            "Disable the workflow jobs a Sentinel pipeline replaced",
+            "Disables, with `if: ${{ false }}`, every workflow job the native pipeline replaced. Job\nnames are unchanged, so the checks a required check names keep their names.\n",
+        ),
+    };
+    let message = format!("{title}\n\nGuided migration at commit {commit}.\n");
+    let mut body = String::with_capacity(512);
+    body.push_str(lead);
+    body.push_str("\nGuided migration of `");
+    body.push_str(commit);
+    body.push_str("` at label table ");
+    body.push_str(&planned.label_table.to_string());
+    if step.is_native() {
+        body.push_str(" and rule table ");
+        body.push_str(&planned.rule_table.to_string());
+    }
+    body.push_str(".\n\n| Workflow | Job | What |\n|---|---|---|\n");
+    for planned_workflow in &planned.workflows {
+        for change in &planned_workflow.changes {
+            body.push_str("| `");
+            body.push_str(&planned_workflow.path);
+            body.push_str("` | `");
+            body.push_str(&change.job);
+            body.push_str("` | ");
+            if step == SwitchStep::Shadow {
+                body.push_str("copy added");
+            } else if step == SwitchStep::Switch {
+                body.push_str("runs-on moved to `");
+                body.push_str(change.after.trim());
+                body.push('`');
+            } else {
+                body.push_str("disabled");
+            }
+            body.push_str(" |\n");
+        }
+    }
+    body.push_str("\nRe-running the migration updates this branch and this pull request.\n");
+    (title, message, body)
+}
+
+/// The native path's answer: the settings as read and written, what this deployment may do with
+/// them, the jobs it disabled and the pull request that carries the disabled workflows.
+fn native_answer(
+    commit: &str,
+    viewed: &Viewed,
+    opt_in: bool,
+    administration: bool,
+    pull: Option<(&remote::Pull, &'static str)>,
+    planned: &workflow::Plan,
+) -> Value {
+    json!({
+        "schema": SWITCH_SCHEMA,
+        "mode": "native",
+        "revision": commit,
+        "settings": settings_json(viewed),
+        "permitted": {"settings": opt_in, "administration": administration},
+        "pull_request": pull.map(|(pull, state)| json!({
+            "number": pull.number,
+            "url": pull.url,
+            "head": pull.head,
+            "base": pull.base,
+            "state": state,
+        })),
+        "disabled": planned.workflows.iter().flat_map(|workflow| workflow.disabled.clone()).collect::<Vec<String>>(),
+        "changed": changed_json(planned),
+        "kept": kept_json(planned),
+    })
+}
+
+/// `POST /api/v1/tenants/{slug}/repos/{name}/migration/switch` — the step that takes a repository
+/// from shadowed to switched. Runner mode's steps are the pull requests that add the copies and
+/// then drop them, with the branch protection read before and after; the native path's are the
+/// required-check change, which is a preview unless the tenant opted in and the App holds
+/// repository administration, and the pull request that disables the replaced jobs
+/// ([migration switch](../../../docs/migration-switch.md)).
+pub(crate) fn switch(state: &State, request: &mut Request, slug: &str, name: &str) -> Route {
+    let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::TENANT_ADMIN)?;
+    let asked: SwitchRequest = parse(&body_limit(request, MAX_SWITCH_BODY_BYTES)?)?;
+    let commit = asked.commit.to_ascii_lowercase();
+    if !remote::commit_id(&commit) {
+        return Err(err(
+            ErrorCode::InvalidRequest,
+            "commit is not a full commit id",
+        ));
+    }
+    let step = asked.action;
+    if asked.native.is_some() != step.is_native() {
+        return Err(err(
+            ErrorCode::InvalidRequest,
+            if step.is_native() {
+                "the native path's settings steps need the native plan"
+            } else {
+                "the runner-mode steps take no native plan"
+            },
+        ));
+    }
+
+    // The gate first, in the transaction that records a refusal: the settings write takes the
+    // strict one, which reads the tenant's opt-in beside the migration switch.
+    let now = UnixMillis::now();
+    let (slug, name) = (slug.to_owned(), name.to_owned());
+    let principal = who.principal;
+    let settings_write = step == SwitchStep::Apply;
+    let gate = state
+        .store
+        .writer()
+        .write(move |tx| {
+            let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
+            let repo = lookup::repo_by_name(tx, tenant, &name)?;
+            authz::require_tenant_admin(tx, principal, tenant)?;
+            if settings_write {
+                match sentinel_store::migration::authorize_settings(
+                    tx,
+                    tenant,
+                    repo,
+                    Some(principal.user),
+                    now,
+                )? {
+                    SettingsWrite::Permitted => {}
+                    refused => return Ok(SwitchGate::SettingsRefused(refused)),
+                }
+            } else {
+                match sentinel_store::migration::authorize(
+                    tx,
+                    tenant,
+                    repo,
+                    Some(principal.user),
+                    now,
+                )? {
+                    Writes::Permitted => {}
+                    refused => return Ok(SwitchGate::Refused(refused)),
+                }
+            }
+            let grant = sources_forge::grant(tx, tenant, repo)?;
+            let remote = sources::load_metadata(tx, repo)?.binding.remote;
+            let opt_in = sentinel_store::migration::settings(tx, tenant)?;
+            Ok(SwitchGate::Open(SwitchOpen {
+                tenant,
+                repo,
+                installation: grant.installation,
+                account: grant.account,
+                forge_repo: grant.repo,
+                remote,
+                opt_in,
+            }))
+        })
+        .map_err(store_error)?;
+    let open = match gate {
+        SwitchGate::Open(open) => open,
+        SwitchGate::Refused(writes) => return Err(refused(writes)),
+        SwitchGate::SettingsRefused(writes) => return Err(refused_settings(writes)),
+    };
+    let SwitchOpen {
+        tenant,
+        repo,
+        installation,
+        account,
+        forge_repo,
+        remote: bound_remote,
+        opt_in,
+    } = open;
+
+    let Some(app) = state.github_app.app() else {
+        return Err(err(
+            ErrorCode::Conflict,
+            "the controller has no GitHub App in force",
+        )
+        .with_detail("reason", "not_configured"));
+    };
+    let _slot = state
+        .github_app
+        .take_call()
+        .ok_or_else(crate::github_app::busy)?;
+    let (owner, repository) =
+        sentinel_github::checks::repository_path(&bound_remote).ok_or_else(|| {
+            err(
+                ErrorCode::Conflict,
+                "the repository is bound to a remote that is not a GitHub repository",
+            )
+            .with_detail("reason", "remote")
+        })?;
+
+    // The workflows are the commit's own, read through the App as the pull request route reads
+    // them, so the plan is computed from the bytes GitHub holds and never from what a caller sent.
+    let token = app
+        .migration_token(installation, account, forge_repo, &bound_remote, now.0)
+        .map_err(upstream)?;
+    let files = app
+        .workflows(&token, &owner, &repository, &commit)
+        .map_err(upstream)?;
+    if files.is_empty() {
+        return Err(err(
+            ErrorCode::Conflict,
+            "the repository has no workflow to switch at this commit",
+        )
+        .with_detail("reason", "no_workflows"));
+    }
+    let views: Vec<WorkflowFile<'_>> = files
+        .iter()
+        .map(|file| WorkflowFile {
+            path: &file.path,
+            text: &file.text,
+        })
+        .collect();
+    let docker = docker_hosts(state)?;
+    let inventory = analyze(&commit, &views, docker)
+        .map_err(|error| err(ErrorCode::InvalidRequest, format!("workflows: {error}")))?;
+    let images = asked.native.as_ref().map(|native| Images {
+        linux: native.images.linux.as_deref(),
+        linux_arm64: native.images.linux_arm64.as_deref(),
+        windows: native.images.windows.as_deref(),
+    });
+    let planned = plan(
+        &inventory,
+        &views,
+        &Options {
+            docker,
+            native: images.is_some(),
+            images: images.unwrap_or_default(),
+            phase: match step {
+                SwitchStep::Shadow => Phase::Shadow,
+                SwitchStep::Switch => Phase::Switch,
+                SwitchStep::Preview | SwitchStep::Apply | SwitchStep::Verify => Phase::Disable,
+            },
+        },
+    )
+    .map_err(|error| err(ErrorCode::InvalidRequest, format!("switch: {error}")))?;
+
+    // The settings as they are now. Reading a branch's protection is repository administration, so
+    // the one token that reads and writes it is minted once and its refusal is a fact the answer
+    // states rather than a failed route: GitHub mints a token carrying what the installation
+    // grants, and one that comes back without administration is that permission's answer.
+    let (protection_token, administration) =
+        match app.administration_token(installation, account, forge_repo, &bound_remote, now.0) {
+            Ok(token) => (Some(token), true),
+            Err(sentinel_github::Error::Denied(_)) => (None, false),
+            Err(error) => return Err(upstream(error)),
+        };
+    let mut viewed = match &protection_token {
+        Some(protection_token) => {
+            let before = app
+                .protection(protection_token, &owner, &repository)
+                .map_err(upstream)?;
+            let change = if step.is_native() {
+                protection::change(&before, &replaced(&inventory, &planned))
+            } else {
+                protection::Change {
+                    settings: before.checks.clone(),
+                    replaced: Vec::new(),
+                }
+            };
+            Some(Viewed {
+                branch: before.branch.clone(),
+                before,
+                change,
+                after: None,
+            })
+        }
+        None => None,
+    };
+
+    let actor = who.principal.user;
+    if !step.is_native() {
+        // The switch's whole promise is that the gate did not move, and that promise is kept by
+        // comparing two reads: without the permission to make them there is nothing to compare, so
+        // the step that carries it is refused rather than run on an assertion.
+        if step == SwitchStep::Switch && viewed.is_none() {
+            record_step(state, tenant, repo, actor, RecordedStep::Refused)?;
+            return Err(err(
+                ErrorCode::Conflict,
+                "the App's installation does not hold repository administration",
+            )
+            .with_detail("reason", "administration"));
+        }
+        // A required check one of the dropped copies answers would stop existing the moment the
+        // copies go. A merge gate that moves is a person's decision, so the switch is refused
+        // rather than run.
+        if let (SwitchStep::Switch, Some(viewed)) = (step, viewed.as_ref()) {
+            let moving: Vec<&str> = planned
+                .workflows
+                .iter()
+                .flat_map(|workflow| workflow.dropped.iter())
+                .filter(|copy| answers(&viewed.before.contexts, &copy.name))
+                .map(|copy| copy.name.as_str())
+                .collect();
+            if !moving.is_empty() {
+                record_step(state, tenant, repo, actor, RecordedStep::Refused)?;
+                return Err(err(
+                    ErrorCode::Conflict,
+                    "a required check names one of the copies the switch drops",
+                )
+                .with_detail("reason", "required_check")
+                .with_detail("checks", moving));
+            }
+        }
+        let applied: Vec<Rewritten<'_>> = planned
+            .workflows
+            .iter()
+            .filter_map(|workflow| {
+                workflow.applied.as_deref().map(|text| Rewritten {
+                    path: &workflow.path,
+                    text,
+                })
+            })
+            .collect();
+        if applied.is_empty() {
+            return Err(err(
+                ErrorCode::Conflict,
+                if step == SwitchStep::Shadow {
+                    "every migrating job already has its copy at this commit"
+                } else {
+                    "no copy to drop and no label to move at this commit"
+                },
+            )
+            .with_detail("reason", "no_change"));
+        }
+        let (title, message, body) = describe_switch(&commit, &planned, step);
+        let outcome = match app.migrate(
+            &token,
+            &owner,
+            &repository,
+            &Migrate {
+                commit: &commit,
+                files: &applied,
+                message: &message,
+                title,
+                body: &body,
+            },
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                record(state, tenant, repo, actor, Recorded::Refused)?;
+                return Err(upstream(error));
+            }
+        };
+        let (pull, opened) = match &outcome {
+            Outcome::Opened(pull) => (Recorded::Opened, pull),
+            Outcome::Updated(pull) => (Recorded::Updated, pull),
+            Outcome::Closed(_) | Outcome::Nothing => {
+                return Err(err(ErrorCode::Internal, "a switch answered a close"));
+            }
+        };
+        if let (SwitchStep::Switch, Some(viewed), Some(protection_token)) =
+            (step, viewed.as_mut(), protection_token.as_ref())
+        {
+            // The proof: the protection read after the pull request against the one read before it.
+            // Equal is what the switch promises; a difference is reported, never asserted away.
+            viewed.after = Some(
+                app.protection(protection_token, &owner, &repository)
+                    .map_err(upstream)?,
+            );
+            let equal = viewed.equal() == Some(true);
+            record_step(
+                state,
+                tenant,
+                repo,
+                actor,
+                if equal {
+                    RecordedStep::Switched
+                } else {
+                    RecordedStep::SwitchedMoved
+                },
+            )?;
+        }
+        record(state, tenant, repo, actor, pull)?;
+        return ok(json!({
+            "schema": SWITCH_SCHEMA,
+            "mode": "runner",
+            "revision": commit,
+            "settings": viewed.as_ref().map(settings_json),
+            "permitted": {"settings": opt_in, "administration": administration},
+            "pull_request": {
+                "number": opened.number,
+                "url": opened.url,
+                "head": opened.head,
+                "base": opened.base,
+                "state": if pull == Recorded::Opened { "opened" } else { "updated" },
+            },
+            "shadow": planned.workflows.iter().flat_map(|workflow| {
+                workflow.shadow.iter().map(|copy| json!({
+                    "job": copy.job,
+                    "original": copy.original,
+                    "name": copy.name,
+                    "class": copy.class,
+                }))
+            }).collect::<Vec<Value>>(),
+            "dropped": planned.workflows.iter().flat_map(|workflow| {
+                workflow.dropped.iter().map(|copy| json!({
+                    "job": copy.job,
+                    "original": copy.original,
+                    "name": copy.name,
+                    "class": copy.class,
+                }))
+            }).collect::<Vec<Value>>(),
+            "changed": changed_json(&planned),
+            "kept": kept_json(&planned),
+        }));
+    }
+
+    // Why this deployment may not make the settings write, or `None` when it may. The opt-in and
+    // the grant come first: a tenant that never opted in learns that rather than what a ruleset
+    // would have stopped.
+    let blocked = if !opt_in {
+        Some("settings")
+    } else if viewed.is_none() {
+        Some("administration")
+    } else {
+        let viewed = viewed.as_ref().expect("a read the grant admits");
+        if !viewed.before.protected {
+            Some("unprotected")
+        } else {
+            let expected = viewed.change.contexts();
+            let removed: Vec<String> = viewed
+                .before
+                .contexts
+                .iter()
+                .filter(|context| !expected.contains(&context.as_str()))
+                .cloned()
+                .collect();
+            viewed.before.editable(&removed).err()
+        }
+    };
+
+    if step == SwitchStep::Apply
+        && let Some(reason) = blocked
+    {
+        record_step(state, tenant, repo, actor, RecordedStep::Refused)?;
+        return Err(err(
+            ErrorCode::Conflict,
+            match reason {
+                "administration" => {
+                    "the App's installation does not hold repository administration"
+                }
+                "settings" => "the tenant has not opted into Sentinel changing its required checks",
+                "unprotected" => "the branch has no protection rule to change",
+                _ => {
+                    "a required check the change removes is stated by a ruleset this deployment does not edit"
+                }
+            },
+        )
+        .with_detail("reason", reason));
+    }
+
+    match step {
+        SwitchStep::Preview => {
+            let mut permitted = json!({"settings": opt_in, "administration": administration});
+            if let Some(reason) = blocked {
+                permitted["reason"] = json!(reason);
+            }
+            return ok(json!({
+                "schema": SWITCH_SCHEMA,
+                "mode": "native",
+                "revision": commit,
+                "settings": viewed.as_ref().map(settings_json),
+                "permitted": permitted,
+                "pull_request": Value::Null,
+                "disabled": planned.workflows.iter().flat_map(|workflow| workflow.disabled.clone()).collect::<Vec<String>>(),
+                "changed": changed_json(&planned),
+                "kept": kept_json(&planned),
+            }));
+        }
+        SwitchStep::Verify => {
+            let (Some(viewed), Some(protection_token)) =
+                (viewed.as_mut(), protection_token.as_ref())
+            else {
+                record_step(state, tenant, repo, actor, RecordedStep::Refused)?;
+                return Err(err(
+                    ErrorCode::Conflict,
+                    "the App's installation does not hold repository administration",
+                )
+                .with_detail("reason", "administration"));
+            };
+            viewed.after = Some(
+                app.protection(protection_token, &owner, &repository)
+                    .map_err(upstream)?,
+            );
+            let equal = viewed.equal() == Some(true);
+            record_step(
+                state,
+                tenant,
+                repo,
+                actor,
+                if equal {
+                    RecordedStep::Verified
+                } else {
+                    RecordedStep::Moved
+                },
+            )?;
+            let answer = native_answer(&commit, viewed, opt_in, administration, None, &planned);
+            return ok(answer);
+        }
+        _ => {}
+    }
+
+    // Apply: the settings write first, because the jobs it disables are only disabled once the
+    // checks that replace them are required. The same token that read the set writes it.
+    let (Some(viewed), Some(protection_token)) = (viewed.as_mut(), protection_token.as_ref())
+    else {
+        record_step(state, tenant, repo, actor, RecordedStep::Refused)?;
+        return Err(err(
+            ErrorCode::Conflict,
+            "the App's installation does not hold repository administration",
+        )
+        .with_detail("reason", "administration"));
+    };
+    if let Err(error) = app.set_required(
+        protection_token,
+        &owner,
+        &repository,
+        &viewed.branch,
+        &viewed.change.settings,
+    ) {
+        record_step(state, tenant, repo, actor, RecordedStep::Refused)?;
+        return Err(upstream(error));
+    }
+    viewed.after = Some(
+        app.protection(protection_token, &owner, &repository)
+            .map_err(upstream)?,
+    );
+    let equal = viewed.equal() == Some(true);
+    record_step(
+        state,
+        tenant,
+        repo,
+        actor,
+        if equal {
+            RecordedStep::Applied
+        } else {
+            RecordedStep::Moved
+        },
+    )?;
+    let applied: Vec<Rewritten<'_>> = planned
+        .workflows
+        .iter()
+        .filter_map(|workflow| {
+            workflow.applied.as_deref().map(|text| Rewritten {
+                path: &workflow.path,
+                text,
+            })
+        })
+        .collect();
+    let pull = if applied.is_empty() {
+        None
+    } else {
+        let (title, message, body) = describe_switch(&commit, &planned, SwitchStep::Apply);
+        let outcome = match app.migrate(
+            &token,
+            &owner,
+            &repository,
+            &Migrate {
+                commit: &commit,
+                files: &applied,
+                message: &message,
+                title,
+                body: &body,
+            },
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                record(state, tenant, repo, actor, Recorded::Refused)?;
+                return Err(upstream(error));
+            }
+        };
+        let (outcome, opened) = match &outcome {
+            Outcome::Opened(pull) => (Recorded::Opened, pull),
+            Outcome::Updated(pull) => (Recorded::Updated, pull),
+            Outcome::Closed(_) | Outcome::Nothing => {
+                return Err(err(ErrorCode::Internal, "a switch answered a close"));
+            }
+        };
+        record(state, tenant, repo, actor, outcome)?;
+        Some((
+            opened.clone(),
+            if outcome == Recorded::Opened {
+                "opened"
+            } else {
+                "updated"
+            },
+        ))
+    };
+    ok(native_answer(
+        &commit,
+        viewed,
+        opt_in,
+        administration,
+        pull.as_ref().map(|(pull, step)| (pull, *step)),
+        &planned,
+    ))
+}
+
+/// What became of one step of the switch goes in the repository's audit trail, so who switched a
+/// repository and when survives it.
+fn record_step(
+    state: &State,
+    tenant: TenantId,
+    repo: RepoId,
+    actor: UserId,
+    step: RecordedStep,
+) -> Result<(), ApiError> {
+    let now = UnixMillis::now();
+    state
+        .store
+        .writer()
+        .write(move |tx| {
+            sentinel_store::migration::record_step(tx, tenant, repo, Some(actor), step, now)
+        })
+        .map_err(store_error)
+}
+
+fn refused_settings(writes: SettingsWrite) -> ApiError {
+    match writes {
+        SettingsWrite::Permitted => err(ErrorCode::Internal, "the gate answered nothing"),
+        SettingsWrite::Off => err(
+            ErrorCode::Conflict,
+            "guided migration is off for this tenant",
+        )
+        .with_detail("reason", "off"),
+        SettingsWrite::Missing(missing) => err(
+            ErrorCode::Conflict,
+            "the GitHub App's installations do not grant what a migration writes with",
+        )
+        .with_detail("missing", missing),
+        SettingsWrite::Unbound => err(
+            ErrorCode::Conflict,
+            "the repository is bound through no live installation to write with",
+        )
+        .with_detail("reason", "unbound"),
+        SettingsWrite::NotOpted => err(
+            ErrorCode::Conflict,
+            "the tenant has not opted into Sentinel changing its required checks",
+        )
+        .with_detail("reason", "settings"),
     }
 }
 

@@ -333,11 +333,14 @@ fn starting_a_migration_is_refused_naming_what_is_missing_and_accepted_once_gran
 
     assert_eq!(
         switch(&d, true),
-        (200, serde_json::json!({"enabled": true}))
+        (200, serde_json::json!({"enabled": true, "settings": false}))
     );
     assert_eq!(
         switch(&d, false),
-        (200, serde_json::json!({"enabled": false}))
+        (
+            200,
+            serde_json::json!({"enabled": false, "settings": false})
+        )
     );
     assert_eq!(
         authorize(&d),
@@ -359,7 +362,7 @@ fn a_withdrawn_permission_shows_at_once_and_closes_the_write_gate() {
     let d = deployment(MigrationPermissions::ALL, false);
     assert_eq!(
         switch(&d, true),
-        (200, serde_json::json!({"enabled": true}))
+        (200, serde_json::json!({"enabled": true, "settings": false}))
     );
     assert_eq!(authorize(&d), Vec::<&str>::new());
 
@@ -433,7 +436,7 @@ fn a_credential_without_tenant_administration_cannot_read_or_write_the_switch() 
     .unwrap();
     assert_eq!(
         switch(&d, true),
-        (200, serde_json::json!({"enabled": true}))
+        (200, serde_json::json!({"enabled": true, "settings": false}))
     );
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()

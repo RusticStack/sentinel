@@ -128,6 +128,9 @@ pub struct Installation {
     pub pull_requests_write: bool,
     /// Workflows write: it may commit a change under `.github/workflows/`.
     pub workflows_write: bool,
+    /// Repository administration write: it may read a branch's protection and rulesets and
+    /// change the required status checks a merge waits on.
+    pub administration_write: bool,
 }
 
 pub struct Token {
@@ -707,6 +710,7 @@ fn parse_installation(v: &Value, app: u64, id: u64) -> Result<Installation> {
         contents_write: v["permissions"]["contents"].as_str() == Some("write"),
         pull_requests_write: v["permissions"]["pull_requests"].as_str() == Some("write"),
         workflows_write: v["permissions"]["workflows"].as_str() == Some("write"),
+        administration_write: v["permissions"]["administration"].as_str() == Some("write"),
     })
 }
 

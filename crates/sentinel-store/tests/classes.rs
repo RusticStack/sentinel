@@ -750,6 +750,7 @@ fn database_at_latest_without_classes(path: &Path) {
          ALTER TABLE tenants DROP COLUMN runner_mode;
          ALTER TABLE installations DROP COLUMN migration_permissions;
          ALTER TABLE tenants DROP COLUMN migration_mode;
+         ALTER TABLE tenants DROP COLUMN migration_settings;
          ALTER TABLE storage_defaults DROP COLUMN soft_percent;
          ALTER TABLE storage_defaults DROP COLUMN hard_percent;
          ALTER TABLE storage_policies DROP COLUMN soft_percent;

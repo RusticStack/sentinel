@@ -257,6 +257,17 @@ struct SwitchBody {
     enabled: bool,
 }
 
+/// What guided migration's switch takes: whether it reads on, and — because the two are one
+/// decision — whether Sentinel may make the required-check change itself. A tenant that may not
+/// still migrates; it applies each settings change by hand and Sentinel verifies it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationSwitchBody {
+    enabled: bool,
+    #[serde(default)]
+    settings: Option<bool>,
+}
+
 /// What runner mode reads: the tenant's switch, the classes this deployment serves (which is
 /// what a workflow's `runs-on:` may name), and what the installations still lack, so an
 /// administrator sees why enabling would be refused before trying.
@@ -329,17 +340,18 @@ fn tenant_migration(state: &State, request: &mut Request, slug: &str) -> Route {
     crate::auth::require_scope(&who, Scopes::TENANT_ADMIN)?;
     let slug = slug.to_owned();
     let principal = who.principal;
-    let (enabled, missing) = state
+    let (enabled, settings, missing) = state
         .store
         .read(move |c| {
             let tenant = authz::member_tenant_by_slug(c, principal, &slug)?;
             Ok((
                 stored_migration::mode(c, tenant)?,
+                stored_migration::settings(c, tenant)?,
                 stored_migration::missing(c, tenant)?,
             ))
         })
         .map_err(store_error)?;
-    ok(json!({ "enabled": enabled, "missing": missing }))
+    ok(json!({ "enabled": enabled, "settings": settings, "missing": missing }))
 }
 
 /// Starting a migration is refused while the App's installations do not grant what it writes
@@ -347,19 +359,29 @@ fn tenant_migration(state: &State, request: &mut Request, slug: &str) -> Route {
 fn set_tenant_migration(state: &State, request: &mut Request, slug: &str) -> Route {
     let who = identify(state, request, true)?;
     crate::auth::require_scope(&who, Scopes::TENANT_ADMIN)?;
-    let body: SwitchBody = parse(&body_limit(request, MAX_BODY_BYTES)?)?;
+    let body: MigrationSwitchBody = parse(&body_limit(request, MAX_BODY_BYTES)?)?;
     let authority = who.authority();
     let slug = slug.to_owned();
-    let switch = state
+    let (settings, enabled) = (body.settings, body.enabled);
+    let (switch, opted_in) = state
         .store
         .writer()
         .write(move |tx| {
             let tenant = authz::member_tenant_by_slug(tx, who.principal, &slug)?;
-            stored_migration::set_mode(tx, authority, tenant, body.enabled)
+            let switch = stored_migration::set_mode(tx, authority, tenant, enabled)?;
+            let granted = matches!(switch, Switch::Set | Switch::Unchanged);
+            let opted_in = match (settings, granted) {
+                (Some(settings), true) => {
+                    stored_migration::set_settings(tx, authority, tenant, settings)?;
+                    settings
+                }
+                _ => stored_migration::settings(tx, tenant)?,
+            };
+            Ok((switch, opted_in))
         })
         .map_err(store_error)?;
     match switch {
-        Switch::Set | Switch::Unchanged => ok(json!({ "enabled": body.enabled })),
+        Switch::Set | Switch::Unchanged => ok(json!({ "enabled": enabled, "settings": opted_in })),
         Switch::Missing(missing) => Err(err(
             ErrorCode::Conflict,
             "the GitHub App's installations do not grant what a migration writes with",

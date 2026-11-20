@@ -10,6 +10,7 @@ pub mod http;
 pub mod manifest;
 pub mod migration;
 pub mod oauth;
+pub mod protection;
 pub mod rollback;
 pub mod runner;
 pub mod webhook;

@@ -169,7 +169,7 @@ The gate is that no job and no construct is left undecided on the fixtures: ever
 
 ## The change generator
 
-[`crates/sentinel-pipeline/src/workflow/change.rs`](../crates/sentinel-pipeline/src/workflow/change.rs) turns an inventory into the change a migration would make, and [`native.rs`](../crates/sentinel-pipeline/src/workflow/native.rs) into the native pipeline plan. `plan(inventory, files, options)` produces one `WorkflowPlan` per workflow, and the output is versioned: `sentinel.migration-preview/1` (`workflow::PLAN_SCHEMA`), exposed by `POST /tenants/{slug}/repos/{name}/migration/preview` ([API](api.md#routes), which is also where the request and response shapes are).
+[`crates/sentinel-pipeline/src/workflow/change.rs`](../crates/sentinel-pipeline/src/workflow/change.rs) turns an inventory into the change a migration would make, and [`native.rs`](../crates/sentinel-pipeline/src/workflow/native.rs) into the native pipeline plan. `plan(inventory, files, options)` produces one `WorkflowPlan` per workflow, for the phase `Options::phase` names — `label`, `shadow`, `switch` or `disable` — and the output is versioned: `sentinel.migration-preview/1` (`workflow::PLAN_SCHEMA`), exposed by `POST /tenants/{slug}/repos/{name}/migration/preview` and, at the switch's steps, by `POST /tenants/{slug}/repos/{name}/migration/switch` ([API](api.md#routes), which is also where the request and response shapes are).
 
 ### The label diff
 
@@ -182,9 +182,16 @@ The default output is a unified diff per workflow, and it changes label lines an
 
 The gate is on the bytes: the plan records every change as the whole lines it replaces (`before`) and produces (`after`), the diff is rendered from those records, and the generator applies them and **analyses the result again** before it answers. The re-analysis must show the same workflow with the intended class on the changed jobs and every other recorded fact of every job identical — steps, matrix, needs, secrets, constructs — or the plan is refused (`PlanError::Unverified`) rather than shown with a diff that landed somewhere it did not mean. A text whose label is not where the inventory read it is refused as `PlanError::Rewrite`. Tokens come from the YAML parser's own positions ([`yaml::spans`](../crates/sentinel-pipeline/src/yaml.rs)), so a `runs-on:` written inside a `run:` block is never mistaken for a label.
 
-The PR that would carry the diff is H04's; what proves the migration before it is switched is the
+The PR that carries the diff is H04's; what proves the migration before it is switched is the
 shadow beside each migrated job and the parity of the pairs over a window of commits
-([shadow parity](shadow-parity.md)).
+([shadow parity](shadow-parity.md)), and the step that drops the copies and moves the labels is the
+[migration switch](migration-switch.md#the-plans-the-switch-is-made-of). Those are the generator's
+other three phases: `shadow` adds a non-required copy of every migrating job
+(`sentinel-<id>`, `name: sentinel / <original>`) and touches no original, `switch` drops those copies
+and moves the originals' labels so that its result is exactly this label diff of the unshadowed
+workflow, and `disable` writes `if: ${{ false }}` on every job a native pipeline replaced. Each one is
+proved the same way the diff is: the generated text is analysed again and a plan whose result is not
+what it stated is refused rather than shown.
 
 ### The native pipeline
 
