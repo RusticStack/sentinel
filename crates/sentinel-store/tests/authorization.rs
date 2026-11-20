@@ -894,6 +894,67 @@ fn dispatch_and_spec_read_derive_ownership_and_recheck_revoked_permissions() {
         .unwrap();
 }
 
+#[test]
+fn a_pipeline_cannot_check_out_a_repository_its_author_may_not_run() {
+    use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
+    let (_dir, store, i) = fixture();
+    let spec = |repo: &str| {
+        RunSpec::new(
+            PinnedSource::new(
+                "https://github.com/example/app",
+                "0123456789012345678901234567890123456789",
+                None,
+            )
+            .unwrap(),
+            compile_str(&format!(
+                "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    checkout: {{repositories: [{{repo: {repo}, path: vendor/shared, ref: refs/heads/main}}]}}\n    steps:\n      - id: s\n        run: echo\n"
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    // The bot may run this repository, not the tenant's other one, and no repository outside the tenant.
+    for repo in ["other", "app"] {
+        let input = spec(repo);
+        let actor = principal(i.bot);
+        let result = store
+            .writer()
+            .write(move |tx| auth::create_run(tx, actor, i.ar, RunId::new(), &input, NOW));
+        if repo == "other" {
+            missing(result);
+        } else {
+            assert_eq!(result.unwrap().len(), 1);
+        }
+    }
+    let input = spec("missing");
+    missing(
+        store.writer().write(move |tx| {
+            auth::create_run(tx, principal(i.bob), i.ar, RunId::new(), &input, NOW)
+        }),
+    );
+    // A tenant administrator runs the same pipeline against a repository of the same tenant.
+    let input = spec("other");
+    assert!(
+        store
+            .writer()
+            .write(move |tx| auth::create_run(
+                tx,
+                principal(i.alice),
+                i.ar,
+                RunId::new(),
+                &input,
+                NOW
+            ))
+            .is_ok()
+    );
+    assert_eq!(
+        store
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM runs", [], |r| { r.get::<_, i64>(0) })?))
+            .unwrap(),
+        2
+    );
+}
+
 // Refuse to demote or remove a tenant's last administrator: only the platform could recover it.
 #[test]
 fn the_last_tenant_administrator_keeps_the_role() {

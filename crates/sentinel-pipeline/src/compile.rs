@@ -717,6 +717,18 @@ fn digest_of(
             d.u64(u64::from(a.required));
             d.opt_str(a.class.as_deref());
         }
+        // Only when stated, so the digests of pipelines written before these fields stay the same.
+        if s.history != crate::schema::History::Shallow || !s.checkouts.is_empty() {
+            d.str("checkout");
+            d.u64(s.history.depth().map_or(u64::MAX, u64::from));
+            d.u64(s.checkouts.len() as u64);
+            for c in &s.checkouts {
+                d.str(&c.repo);
+                d.str(&c.path);
+                d.str(&c.ref_name);
+                d.u64(c.history.depth().map_or(u64::MAX, u64::from));
+            }
+        }
         if !s.outputs.is_empty() {
             d.str("job-outputs");
             d.u64(s.outputs.len() as u64);

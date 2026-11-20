@@ -54,6 +54,29 @@ pub fn cancel_scope<T>(
     f()
 }
 
+/// The fetch depth of a checkout that asks for nothing but the pinned commit.
+pub const SHALLOW: Option<u32> = Some(1);
+
+pub fn checkout_at(
+    _: &Path,
+    _: &PinnedSource,
+    _: Option<&Credential>,
+    _: Option<u32>,
+    _: Duration,
+) -> Result<Checkout> {
+    Err(Error::UnsupportedPlatform)
+}
+
+pub fn checkout_authorized_at(
+    _: &Path,
+    _: &PinnedSource,
+    _: &Access,
+    _: Option<u32>,
+    _: Duration,
+) -> Result<Checkout> {
+    Err(Error::UnsupportedPlatform)
+}
+
 pub fn checkout(
     _: &Path,
     _: &PinnedSource,

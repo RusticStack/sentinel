@@ -57,6 +57,15 @@ publishes packs and loose objects by rename), the rest is re-negotiated by
 the next fetch. `tmp_*` files an interrupted fetch leaves are never copied
 into a workspace and never counted.
 
+A mirror is what fills it: the event ref's history at whatever depth those
+fetches brought. A job that asks for more history than its pinned commit
+([`checkout.history`](pipeline-schema.md#job-keys) stated as `full` or
+`{depth: N}`) therefore checks out direct from the remote, and so does an
+additional checkout that asks for one; only a `shallow` checkout of a bound
+repository reads a mirror. Answering a `full` checkout from a mirror would
+hand the job less history than it declared, which is exactly the silent
+substitution a pinned checkout exists to prevent.
+
 ## Exact-commit verification
 
 After every fetch the mirror verifies the pinned SHA itself —

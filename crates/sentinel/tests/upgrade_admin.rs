@@ -118,8 +118,8 @@ fn the_check_reports_the_upgrade_without_migrating_and_exits_two_when_it_blocks(
         report["blocking"].as_array().unwrap().is_empty(),
         "{report}"
     );
-    // The newest migration only adds a nullable column, so it rewrites no table and visits no row,
-    // which is why the report names it with an empty rewrite list.
+    // The newest migration adds the run source manifest and carries no row over, so the one pending
+    // step rewrites nothing.
     let steps = report["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 1, "{report}");
     assert_eq!(steps[0]["migration"], schema::LATEST);

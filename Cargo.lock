@@ -1369,6 +1369,7 @@ dependencies = [
  "sentinel-auth",
  "sentinel-cache",
  "sentinel-core",
+ "sentinel-git",
  "sentinel-github",
  "sentinel-intake",
  "sentinel-link",

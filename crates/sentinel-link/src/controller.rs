@@ -12,8 +12,8 @@ use std::{
 use sentinel_auth::secret::{Digest, Secret};
 use sentinel_cache::remote::{Need, Upload};
 use sentinel_core::{
-    AttemptId, Event, Fence, JobId, Labelled, PoolId, RunId, RunnerClass, RunnerLeaseId, TenantId,
-    UnixMillis, WorkerId,
+    AttemptId, Event, Fence, JobId, Labelled, PoolId, RepoId, RunId, RunnerClass, RunnerLeaseId,
+    TenantId, UnixMillis, WorkerId,
 };
 use sentinel_protocol::limits::{MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES};
 use sentinel_protocol::logs::Frame;
@@ -3871,6 +3871,75 @@ enum SpecFault {
     Transient,
 }
 
+/// A job whose checkouts the controller is about to deliver: the run and tenant they belong to, the run's
+/// own checkout as the manifest's first row, and every additional checkout with its grant already checked.
+struct PendingJob {
+    tenant: TenantId,
+    run: RunId,
+    primary: sentinel_store::sources::ResolvedSource,
+    /// A manifest row for the run's own checkout is already recorded.
+    recorded_primary: bool,
+    pending: Vec<PendingCheckout>,
+}
+
+struct PendingCheckout {
+    /// Its position among the job's checkouts; 0 is the run's own.
+    index: u32,
+    repo: RepoId,
+    name: String,
+    path: String,
+    ref_name: String,
+    history: String,
+    /// The revision the run's manifest already records for it, which a rerun must resolve.
+    recorded: Option<sentinel_store::sources::ResolvedSource>,
+    binding: sentinel_intake::source::Binding,
+}
+
+/// One Git round trip that turns a checkout's ref into the commit the run records. Its own scratch directory
+/// holds the access's helper files and is removed on every path.
+fn resolve_checkout(
+    checkout: &PendingCheckout,
+    access: &sentinel_protocol::source::Access,
+    attempt: AttemptId,
+) -> std::result::Result<String, SpecFault> {
+    let dir = std::env::temp_dir().join(format!("sentinel-resolve-{}-{}", attempt, checkout.index));
+    let _ = std::fs::remove_dir_all(&dir);
+    let created = {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&dir)
+    };
+    if created.is_err() {
+        return Err(SpecFault::Transient);
+    }
+    let asked = sentinel_git::ls_remote_ref(
+        &dir,
+        &checkout.binding.metadata.binding.remote,
+        Some(access),
+        &checkout.ref_name,
+        CHECKOUT_RESOLVE_TIMEOUT,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    match asked {
+        // An annotated tag is peeled: the commit is what a run builds, not the tag object.
+        Ok(Some(tip)) => Ok(tip.peeled.unwrap_or(tip.oid)),
+        // The ref the pipeline names no longer exists at its remote: nothing to substitute, so refuse.
+        Ok(None) => Err(SpecFault::Refused),
+        Err(sentinel_git::Error::UnsupportedPlatform | sentinel_git::Error::Preparation(_)) => {
+            Err(SpecFault::Refused)
+        }
+        Err(_) => Err(SpecFault::Transient),
+    }
+}
+
+/// One checkout's ref resolved by one bounded `git ls-remote`, with no mirror and no history: nothing but
+/// the tip is asked for.
+const CHECKOUT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl From<sentinel_store::Error> for SpecFault {
     fn from(error: sentinel_store::Error) -> Self {
         use sentinel_store::Error as E;
@@ -3905,13 +3974,14 @@ fn resolve_spec(
     SpecFault,
 > {
     use sentinel_store::{Error as StoreError, secrets, sources};
-    let (mut context, bytes, binding, requires_secret_delivery) = store.read(|conn| {
+    let (mut context, bytes, binding, requires_secret_delivery, job) = store.read(|conn| {
         let tx = conn.unchecked_transaction()?;
         let c = dispatch::job_context(&tx, worker, attempt)?;
         let bytes = dispatch::spec_bytes(&tx, worker, attempt)?;
         let context = JobContext {
             source: None,
             source_valid_until: None,
+            checkouts: Vec::new(),
             run: c.run,
             repo: c.repo,
             repo_name: c.repo_name,
@@ -3933,12 +4003,13 @@ fn resolve_spec(
         };
         let spec = sentinel_pipeline::RunSpec::decode(&bytes)
             .map_err(|_| StoreError::Corrupt("run spec"))?;
-        let job_spec = spec
+        let job_index = spec
             .pipeline
             .jobs
             .iter()
-            .find(|job| job.name == context.job_name)
+            .position(|job| job.name == context.job_name)
             .ok_or(StoreError::Corrupt("job spec index"))?;
+        let job_spec = &spec.pipeline.jobs[job_index];
         let requires_secret_delivery = job_spec.spec.requires_secret_delivery();
         let binding = match sentinel_intake::source::lookup_conn(&tx, context.repo)? {
             None => None,
@@ -3957,7 +4028,66 @@ fn resolve_spec(
                 Some(binding)
             }
         };
-        Ok((context, bytes, binding, requires_secret_delivery))
+        // The run's own checkout is recorded as the manifest's first row, and each declared checkout is
+        // looked up in the same transaction as the primary's grant: a repository this tenant does not hold,
+        // one with no binding, or one the deployment's destination allowlist refuses is a refusal here.
+        let (tenant, run) = (c.tenant, c.run);
+        let history = job_spec.spec.history.label();
+        let primary = sources::ResolvedSource {
+            job_index: job_index as u32,
+            checkout_index: 0,
+            repo: context.repo,
+            name: context.repo_name.clone(),
+            path: String::new(),
+            ref_name: spec.source.ref_name.clone(),
+            revision: spec.source.sha.clone(),
+            history: history.clone(),
+            resolved: UnixMillis::steady(),
+        };
+        let manifest = sources::job_manifest(&tx, tenant, run, job_index as u32)?;
+        let mut pending = Vec::with_capacity(job_spec.spec.checkouts.len());
+        for (position, declared) in job_spec.spec.checkouts.iter().enumerate() {
+            let index = position as u32 + 1;
+            let repo = sentinel_store::lookup::repo_by_name(&tx, tenant, &declared.repo)?;
+            let binding =
+                sentinel_intake::source::lookup_conn(&tx, repo)?.ok_or(StoreError::Forbidden)?;
+            let authority = sentinel_protocol::source::remote(&binding.metadata.binding.remote)
+                .ok_or(StoreError::Forbidden)?;
+            if !destinations.iter().any(|d| d == authority)
+                || !binding.metadata.binding.allows(&declared.ref_name)
+            {
+                return Err(StoreError::Forbidden);
+            }
+            let recorded = manifest.iter().find(|row| row.checkout_index == index);
+            if let Some(row) = recorded
+                && (row.repo != repo || row.path != declared.path)
+            {
+                return Err(StoreError::Corrupt("run_sources"));
+            }
+            pending.push(PendingCheckout {
+                index,
+                repo,
+                name: declared.repo.clone(),
+                path: declared.path.clone(),
+                ref_name: declared.ref_name.clone(),
+                history: declared.history.label(),
+                recorded: recorded.cloned(),
+                binding,
+            });
+        }
+        Ok((
+            context,
+            bytes,
+            binding,
+            requires_secret_delivery,
+            PendingJob {
+                tenant,
+                run,
+                primary,
+                recorded_primary: !manifest.is_empty() && manifest[0].checkout_index == 0,
+                pending,
+            },
+        ))
     })?;
     if let Some(binding) = binding {
         let access =
@@ -3975,6 +4105,74 @@ fn resolve_spec(
             Ok(())
         })?;
         context.source = Some(access);
+    }
+    if !job.pending.is_empty() {
+        // A worker below the version that carries these never checks out a repository it was not told about.
+        if protocol < sentinel_protocol::negotiate::EXTRA_CHECKOUTS_MIN.0 {
+            return Err(SpecFault::Refused);
+        }
+        let mut resolved = Vec::with_capacity(job.pending.len());
+        let mut fresh = Vec::with_capacity(job.pending.len());
+        for checkout in &job.pending {
+            let access = sentinel_intake::source::issue(
+                store,
+                key.as_deref(),
+                app,
+                &checkout.binding,
+                UnixMillis::now(),
+            )
+            .map_err(|e| match e {
+                sentinel_intake::source::Error::Unavailable(_) => SpecFault::Transient,
+                sentinel_intake::source::Error::Refused(_) => SpecFault::Refused,
+            })?;
+            // One access serves both: the one Git round trip that resolves the ref, and the fetch the
+            // worker makes with it.
+            let revision = match &checkout.recorded {
+                Some(row) => row.revision.clone(),
+                None => resolve_checkout(checkout, &access, attempt)?,
+            };
+            if checkout.recorded.is_none() {
+                fresh.push(sources::ResolvedSource {
+                    job_index: job.primary.job_index,
+                    checkout_index: checkout.index,
+                    repo: checkout.repo,
+                    name: checkout.name.clone(),
+                    path: checkout.path.clone(),
+                    ref_name: Some(checkout.ref_name.clone()),
+                    revision: revision.clone(),
+                    history: checkout.history.clone(),
+                    resolved: UnixMillis::now(),
+                });
+            }
+            resolved.push(session::CheckoutSource::at_arrival(
+                checkout.index,
+                checkout.repo,
+                revision,
+                checkout.recorded.is_some(),
+                access,
+            ));
+        }
+        let (tenant, run, primary, recorded_primary) = (
+            job.tenant,
+            job.run,
+            job.primary.clone(),
+            job.recorded_primary,
+        );
+        // The fence is rechecked in the same transaction that writes the manifest, so an attempt that lost
+        // its lease records nothing.
+        store.writer().write(move |tx| {
+            if sources::attempt_repo(tx, worker, attempt, UnixMillis::steady())?.0 != tenant {
+                return Err(StoreError::Forbidden);
+            }
+            if !recorded_primary {
+                sources::record_resolution(tx, tenant, run, &primary)?;
+            }
+            for row in &fresh {
+                sources::record_resolution(tx, tenant, run, row)?;
+            }
+            Ok(())
+        })?;
+        context.checkouts = resolved;
     }
     let prepared = if requires_secret_delivery {
         if protocol < 10 {
@@ -4004,10 +4202,12 @@ fn send_resolved(
     )>,
 ) -> Result<()> {
     use session::ServerMessage;
-    let Some((context, bytes, delivery)) = spec.filter(|(_, b, delivery)| {
+    let Some((context, bytes, delivery)) = spec.filter(|(context, b, delivery)| {
         protocol >= 3
             && b.len() <= session::MAX_SPEC_BYTES
             && (delivery.is_none() || protocol >= 10)
+            && (context.checkouts.is_empty()
+                || protocol >= sentinel_protocol::negotiate::EXTRA_CHECKOUTS_MIN.0)
     }) else {
         return sender.send(&ServerMessage::NoSpec {
             attempt: *attempt.as_bytes(),
@@ -4018,6 +4218,16 @@ fn send_resolved(
         sender.send(&ServerMessage::Source {
             attempt: *attempt.as_bytes(),
             access,
+        })?;
+    }
+    for checkout in &context.checkouts {
+        sender.send(&ServerMessage::CheckoutSource {
+            attempt: *attempt.as_bytes(),
+            index: checkout.index,
+            repo: *checkout.repo.as_bytes(),
+            revision: checkout.revision.clone(),
+            recorded: checkout.recorded,
+            access: checkout.access.clone(),
         })?;
     }
     if let Some(prepared) = delivery {
