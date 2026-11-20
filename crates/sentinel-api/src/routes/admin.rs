@@ -635,6 +635,7 @@ fn tenant_storage(state: &State, request: &Request, slug: &str, query: &str) -> 
 }
 
 fn deployment_storage(state: &State, request: &Request) -> Route {
+    use std::sync::atomic::Ordering::Relaxed;
     platform(state, request, false)?;
     let d = state.objects.deployment();
     let (stored, classes) = state
@@ -643,6 +644,43 @@ fn deployment_storage(state: &State, request: &Request) -> Route {
         .map_err(store_error)?;
     let total = sentinel_store::space::total_bytes(state.objects.root()).ok();
     let admission = state.objects.admission();
+    // What the maintenance pass removed since start, so a lowered retention or a passed deadline is
+    // something an operator reads rather than something nobody sees.
+    let stats = state.controller.stats();
+    let removed = json!({
+        "artifacts": stats.artifacts_expired.load(Relaxed),
+        "logs": stats.logs_expired.load(Relaxed),
+        "objects": stats.objects_reclaimed.load(Relaxed),
+        "bytes": stats.bytes_reclaimed.load(Relaxed),
+    });
+    let s3 = state.objects.replication().map(|r| {
+        let at = |v: i64| (v > 0).then_some(v);
+        json!({
+            "state": r.state(),
+            "backlog_bytes": r.backlog_bytes.load(Relaxed),
+            "backlog_full": r.backlog_full.load(Relaxed),
+            "oldest_unreplicated_ms": at(r.oldest_unreplicated_ms.load(Relaxed)),
+            "unreplicated_logs": r.unreplicated_logs.load(Relaxed),
+            "local_bytes": r.local_bytes.load(Relaxed),
+            "last_success_ms": at(r.last_success_ms.load(Relaxed)),
+            "last_failure_ms": at(r.last_failure_ms.load(Relaxed)),
+            "consecutive_failures": r.consecutive_failures.load(Relaxed),
+            "last_error": r.last_error.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+            "last_local_fault": r.last_local_fault.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+            "replicated_objects": r.replicated_objects.load(Relaxed),
+            "replicated_bytes": r.replicated_bytes.load(Relaxed),
+            "replicated_logs": r.replicated_logs.load(Relaxed),
+            "evicted_objects": r.evicted_objects.load(Relaxed),
+            "fetched_objects": r.fetched_objects.load(Relaxed),
+            "deleted_copies": r.deleted_copies.load(Relaxed),
+            "aborted_uploads": r.aborted_uploads.load(Relaxed),
+            "local_faults": r.local_faults.load(Relaxed),
+            "parked_items": r.parked_items.load(Relaxed),
+            "parked_objects": r.parked_objects.load(Relaxed),
+            "parked_bytes": r.parked_bytes.load(Relaxed),
+            "last_refusal": r.last_refusal.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+        })
+    });
     ok(json!({
         "filesystem_bytes": total,
         "free_bytes": admission.map(|a| a.free()),
@@ -660,6 +698,7 @@ fn deployment_storage(state: &State, request: &Request) -> Route {
             })
         }),
         "stored_bytes": stored,
+        "removed": removed,
         "quota_bytes": d.quota_bytes,
         "tenant_quota_bytes": d.tenant_quota_bytes,
         "personal_quota_bytes": d.personal_quota_bytes,
@@ -676,35 +715,7 @@ fn deployment_storage(state: &State, request: &Request) -> Route {
                 "weight": c.weight,
             })).collect::<Vec<_>>(),
         },
-        "s3": state.objects.replication().map(|r| {
-            use std::sync::atomic::Ordering::Relaxed;
-            let at = |v: i64| (v > 0).then_some(v);
-            json!({
-                "state": r.state(),
-                "backlog_bytes": r.backlog_bytes.load(Relaxed),
-                "backlog_full": r.backlog_full.load(Relaxed),
-                "oldest_unreplicated_ms": at(r.oldest_unreplicated_ms.load(Relaxed)),
-                "unreplicated_logs": r.unreplicated_logs.load(Relaxed),
-                "local_bytes": r.local_bytes.load(Relaxed),
-                "last_success_ms": at(r.last_success_ms.load(Relaxed)),
-                "last_failure_ms": at(r.last_failure_ms.load(Relaxed)),
-                "consecutive_failures": r.consecutive_failures.load(Relaxed),
-                "last_error": r.last_error.lock().unwrap_or_else(|p| p.into_inner()).clone(),
-                "last_local_fault": r.last_local_fault.lock().unwrap_or_else(|p| p.into_inner()).clone(),
-                "replicated_objects": r.replicated_objects.load(Relaxed),
-                "replicated_bytes": r.replicated_bytes.load(Relaxed),
-                "replicated_logs": r.replicated_logs.load(Relaxed),
-                "evicted_objects": r.evicted_objects.load(Relaxed),
-                "fetched_objects": r.fetched_objects.load(Relaxed),
-                "deleted_copies": r.deleted_copies.load(Relaxed),
-                "aborted_uploads": r.aborted_uploads.load(Relaxed),
-                "local_faults": r.local_faults.load(Relaxed),
-                "parked_items": r.parked_items.load(Relaxed),
-                "parked_objects": r.parked_objects.load(Relaxed),
-                "parked_bytes": r.parked_bytes.load(Relaxed),
-                "last_refusal": r.last_refusal.lock().unwrap_or_else(|p| p.into_inner()).clone(),
-            })
-        }),
+        "s3": s3,
     }))
 }
 

@@ -73,6 +73,31 @@ pub struct StoragePolicy {
     pub interval_ms: i64,
 }
 
+/// What one maintenance pass removed: the artifacts whose retention had passed, the logs it expired and the
+/// objects it reclaimed once nothing referenced them, with the bytes those objects held.
+#[derive(Clone, Copy, Debug, Default)]
+struct Removed {
+    artifacts: u64,
+    logs: u64,
+    objects: u64,
+    bytes: u64,
+}
+
+impl Removed {
+    const fn any(self) -> bool {
+        self.artifacts + self.logs + self.objects + self.bytes > 0
+    }
+}
+
+impl std::ops::AddAssign for Removed {
+    fn add_assign(&mut self, other: Removed) {
+        self.artifacts += other.artifacts;
+        self.logs += other.logs;
+        self.objects += other.objects;
+        self.bytes += other.bytes;
+    }
+}
+
 /// The remote store's budget when none is configured: a tenth of the data file system, from 1 GiB up to the
 /// maximum every storage budget shares.
 /// The refusal an operator reads on the artifact row: what the tenant stores, the line it crossed, the bytes the
@@ -127,6 +152,12 @@ pub struct Stats {
     pub handed_back: AtomicU64,
     pub placement_errors: AtomicU64,
     pub sweep_errors: AtomicU64,
+    /// What the storage pass has removed since start: artifacts a retention passed, logs it expired, objects
+    /// it reclaimed and the bytes those held. The pass's own report, so lowered retention is visible.
+    pub artifacts_expired: AtomicU64,
+    pub logs_expired: AtomicU64,
+    pub objects_reclaimed: AtomicU64,
+    pub bytes_reclaimed: AtomicU64,
     pub prefetch_hints: AtomicU64,
     pub cancels_pushed: AtomicU64,
     pub revoked_sessions: AtomicU64,
@@ -2020,9 +2051,10 @@ impl Inner {
         let skipped = skipped::total();
         // A full batch means more is due: go on while the backlog lasts, a round at a time so the writer is free between them,
         // and leave what is left to the next pass.
+        let mut removed = Removed::default();
         for _ in 0..STORAGE_ROUNDS {
             let objects = Arc::clone(&self.objects);
-            let Ok((doomed, more)) = self.write(move |tx| {
+            let Ok((doomed, more, done)) = self.write(move |tx| {
                 let batch = STORAGE_BATCH as u32;
                 let uploads = objects.sweep_uploads(tx, now)?;
                 let leases = objects.sweep_leases(tx, now)?;
@@ -2036,10 +2068,20 @@ impl Inner {
                     || indexed >= batch
                     || i64::from(reclaimed.objects) >= STORAGE_BATCH;
                 doomed.extend(reclaimed.doomed);
-                Ok((doomed, more))
+                Ok((
+                    doomed,
+                    more,
+                    Removed {
+                        artifacts: artifacts as u64,
+                        objects: u64::from(reclaimed.objects),
+                        bytes: reclaimed.bytes,
+                        logs: 0,
+                    },
+                ))
             }) else {
                 break;
             };
+            removed += done;
             if !doomed.is_empty() {
                 let objects = Arc::clone(&self.objects);
                 let _ = self.write(move |tx| objects.unlink(tx, &doomed));
@@ -2058,8 +2100,30 @@ impl Inner {
             let _ = self.write(move |tx| objects.unlink(tx, &doomed));
         }
         self.logs.close_idle(sentinel_store::logs::WRITER_IDLE);
-        self.log_retention(now);
+        removed.logs = self.log_retention(now);
         self.class_snapshots(now);
+        if removed.any() {
+            self.stats
+                .artifacts_expired
+                .fetch_add(removed.artifacts, Ordering::Relaxed);
+            self.stats
+                .logs_expired
+                .fetch_add(removed.logs, Ordering::Relaxed);
+            self.stats
+                .objects_reclaimed
+                .fetch_add(removed.objects, Ordering::Relaxed);
+            self.stats
+                .bytes_reclaimed
+                .fetch_add(removed.bytes, Ordering::Relaxed);
+            tracing::info!(
+                event = "storage_removed",
+                artifacts = removed.artifacts,
+                logs = removed.logs,
+                objects = removed.objects,
+                bytes = removed.bytes,
+                "the storage pass removed what a retention had passed"
+            );
+        }
         let passed_over = skipped::total() - skipped;
         if passed_over > 0
             && let Some(row) = skipped::last()
@@ -2113,7 +2177,8 @@ impl Inner {
             .unwrap_or_else(|p| p.into_inner()) = after.map(|key| (day, key));
     }
 
-    fn log_retention(&self, now: UnixMillis) {
+    /// Expires the logs whose deadline passed and purges abandoned uploads; answers how many logs it expired.
+    fn log_retention(&self, now: UnixMillis) -> u64 {
         let deployment = self.objects.deployment();
         if let Some(admission) = self.objects.admission() {
             admission.set_metadata_bytes(self.store.metadata_bytes());
@@ -2149,6 +2214,7 @@ impl Inner {
                 break;
             }
         }
+        let mut expired = 0;
         for _ in 0..LOG_EXPIRE_ROUNDS {
             let skipped = skipped::total();
             let Ok(due) = self
@@ -2161,10 +2227,11 @@ impl Inner {
             if due.is_empty() {
                 break;
             }
-            let Ok(expired) = self.write(move |tx| retention::expire(tx, &due, now)) else {
+            let Ok(done) = self.write(move |tx| retention::expire(tx, &due, now)) else {
                 break;
             };
-            for log in expired {
+            expired += done.len() as u64;
+            for log in done {
                 let _ = self.logs.remove(log.run, log.job, log.attempt);
             }
             if !full {
@@ -2185,6 +2252,7 @@ impl Inner {
                 _ => break,
             }
         }
+        expired
     }
 
     fn maintenance_loop(&self) {

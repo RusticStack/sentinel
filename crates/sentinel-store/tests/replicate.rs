@@ -539,6 +539,107 @@ fn objects_are_copied_verified_evicted_and_fetched_back_verified() {
     assert!(report.missing.is_empty(), "{:?}", report.missing);
 }
 
+/// The tenant's own counted bytes and its class split, as the quota, the storage page and the metric read them.
+fn counted(
+    f: &Fixture,
+    tenant: TenantId,
+) -> (
+    u64,
+    sentinel_store::retention::Usage,
+    sentinel_store::classes::Classes,
+) {
+    f.store
+        .read(move |c| {
+            Ok((
+                c.query_row(
+                    "SELECT COALESCE(SUM(len), 0) FROM objects WHERE tenant_id = ?1",
+                    [tenant.as_bytes().as_slice()],
+                    |r| r.get::<_, i64>(0),
+                )? as u64,
+                sentinel_store::retention::tenant_usage(c, tenant)?,
+                sentinel_store::classes::tenant(c, tenant)?,
+            ))
+        })
+        .unwrap()
+}
+
+/// A replica is the same object, not a second one: replicating a byte, and then evicting the local copy that
+/// made the replica necessary, never changes what the tenant is charged. The drill asserts the arithmetic —
+/// the tenant's usage equals its object rows, the classes add up to it, and the deployment's total is the sum
+/// of the tenants' — rather than the absence of a duplicate row.
+#[test]
+fn a_replicated_byte_is_counted_once_in_the_tenants_usage_and_the_arithmetic_adds_up() {
+    let f = fixture();
+    let body = b"the bucket holds a second copy of exactly these bytes";
+    let len = body.len() as u64;
+    let replicated = f.put(body);
+    let kept = f.put(&[9u8; 200]);
+    let (rows, usage, classes) = counted(&f, f.tenant);
+    assert_eq!(
+        (rows, usage.object_bytes, usage.log_bytes),
+        (len + 200, len + 200, 0)
+    );
+    assert_eq!(
+        classes.artifacts + classes.uploads,
+        usage.object_bytes,
+        "nothing is counted that no object row holds"
+    );
+    assert_eq!(f.totals().local_bytes, len + 200);
+
+    // The copy lands, verified, and the tenant still holds one of every byte.
+    let r = f.replicator(SETTINGS);
+    assert_eq!(r.pass().unwrap().replicated, 2);
+    let (rows, usage, classes) = counted(&f, f.tenant);
+    assert_eq!((rows, usage.object_bytes), (len + 200, len + 200));
+    assert_eq!(classes.artifacts + classes.uploads, usage.object_bytes);
+    assert_eq!(
+        r.status().replicated_bytes.load(Ordering::Relaxed),
+        len + 200,
+        "the bucket's bytes are the replicator's own figure"
+    );
+    assert_eq!(
+        f.totals().local_bytes,
+        len + 200,
+        "and the local copy is still here"
+    );
+
+    // Evicting the local copy frees the disk and leaves the tenant's figure exactly where it was: the object
+    // in the bucket is the object the row names, so it is neither counted again nor dropped.
+    let r = f.replicator(Settings {
+        local_bytes: 200,
+        ..SETTINGS
+    });
+    r.pass().unwrap();
+    assert!(!f.local(replicated), "the oldest copy left first");
+    assert!(f.local(kept));
+    assert_eq!(f.totals().local_bytes, 200);
+    let (rows, usage, classes) = counted(&f, f.tenant);
+    assert_eq!(
+        (rows, usage.object_bytes),
+        (len + 200, len + 200),
+        "once each, not twice"
+    );
+    assert_eq!(classes.artifacts + classes.uploads, usage.object_bytes);
+    // The deployment's own figure is the tenants', and the S3 backlog is a different number: what is not
+    // local is not backlog either, so nothing double counts it there either.
+    assert_eq!(
+        f.store
+            .read(sentinel_store::retention::deployment_usage)
+            .unwrap(),
+        len + 200
+    );
+    assert_eq!(f.totals().unreplicated_bytes, 0);
+    assert_eq!(r.status().evicted_objects.load(Ordering::Relaxed), 1);
+
+    // Reading it back places the bytes locally again, and the pass that follows marks them local, and none
+    // of it charges a second time.
+    assert_eq!(f.read(replicated).unwrap(), body.to_vec());
+    f.replicator(SETTINGS).pass().unwrap();
+    let (rows, usage, _) = counted(&f, f.tenant);
+    assert_eq!((rows, usage.object_bytes), (len + 200, len + 200));
+    assert_eq!(f.totals().local_bytes, len + 200);
+}
+
 #[test]
 fn a_head_without_blake3_metadata_leaves_the_object_unreplicated_and_local() {
     let f = fixture();
