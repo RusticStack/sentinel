@@ -151,6 +151,20 @@ enum Deferred {
     },
 }
 
+impl Deferred {
+    /// Whether this is the same message again, not the next one of the attempt: a resend of a verdict the queue
+    /// already holds adds nothing, while the phase after it has to wait its turn behind it.
+    fn same(&self, other: &Deferred) -> bool {
+        match (self, other) {
+            (Deferred::Ack, Deferred::Ack) => true,
+            (Deferred::Report { event: mine, .. }, Deferred::Report { event: theirs, .. }) => {
+                mine == theirs
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct DeferredMessage {
     id: u64,
@@ -189,10 +203,10 @@ impl DeferredQueue {
         }
     }
 
-    fn has_report(&self, attempt: AttemptId) -> bool {
+    fn waiting(&self, attempt: AttemptId, what: &Deferred) -> bool {
         self.items
             .iter()
-            .any(|m| m.attempt == attempt && matches!(m.what, Deferred::Report { .. }))
+            .any(|m| m.attempt == attempt && m.what.same(what))
     }
 
     fn attempts(&self) -> HashSet<AttemptId> {
@@ -226,7 +240,7 @@ fn receive_with(
     {
         let mut q = queue.lock().unwrap_or_else(|p| p.into_inner());
         if q.holds(message.attempt) {
-            if matches!(message.what, Deferred::Report { .. }) && q.has_report(message.attempt) {
+            if q.waiting(message.attempt, &message.what) {
                 return Received::Copy;
             }
             return Received::Queued {
@@ -4775,6 +4789,15 @@ mod tests {
         });
         assert!(matches!(got, Received::Copy));
         assert_eq!(ids(&q), vec![1]);
+        let next = Deferred::Report {
+            event: Event::FinalizationStarted,
+            summary: None,
+        };
+        let got = receive_with(&q, &message(3, a, next), |_| {
+            panic!("a later event waits behind the one already queued")
+        });
+        assert!(matches!(got, Received::Queued { kept: true }));
+        assert_eq!(ids(&q), vec![1, 3]);
         let applied = std::cell::RefCell::new(Vec::new());
         let seen = std::cell::RefCell::new(0);
         retry_with(
@@ -4789,8 +4812,12 @@ mod tests {
                 *seen.borrow_mut() += 1;
             },
         );
-        assert_eq!(*applied.borrow(), vec![1]);
-        assert_eq!(*seen.borrow(), 1);
+        assert_eq!(
+            *applied.borrow(),
+            vec![1, 3],
+            "the queued later event follows it"
+        );
+        assert_eq!(*seen.borrow(), 2);
         assert!(ids(&q).is_empty());
         let mut sweep = due(&[a]);
         shield(&mut sweep, &q.lock().unwrap().attempts());
