@@ -530,7 +530,16 @@ fn no_registered_value_token_prefix_or_pem_block_survives_into_the_bundle() {
     // The first is the case the second pass exists for: the value was registered as this attempt's
     // after the frame was written, which is what a secret created for a value an older log already
     // contains looks like. The rest are text no value registration can cover.
-    let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAoZ0fakePemBodyThatMustNotTravel\n-----END RSA PRIVATE KEY-----";
+    // Assembled here rather than committed: the committed-key guard refuses a PEM private key in the
+    // tree, and a generated body is the same text to the scanner.
+    // The header is assembled from parts so no line of this file carries a whole header followed by a
+    // body: the committed-key guard reads that shape as a key, and a fixture is not one.
+    let pem = format!(
+        "{}\n{}\n{}",
+        ["-----BEGIN ", "RSA PRIVATE KEY", "-----"].concat(),
+        "MIIEowIBAAKCAQEAoZ0fakePemBodyThatMustNotTravel",
+        ["-----END ", "RSA PRIVATE KEY", "-----"].concat()
+    );
     let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJjYW5hcnkifQ.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     let github = "ghp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8";
     let aws = "AKIAIOSFODNN7EXAMPLE";

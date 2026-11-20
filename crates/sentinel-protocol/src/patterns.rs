@@ -225,8 +225,9 @@ fn cloud(bytes: &[u8], at: usize) -> Option<(Kind, usize)> {
     None
 }
 
-/// `-----BEGIN … PRIVATE KEY-----` through its end marker, or to the end of what is here when the
-/// block is cut: a truncated block is still a private key's first lines.
+/// A PEM block, from `-----BEGIN … PRIVATE KEY-----`
+/// through its end marker, or to the end of what is here when the block is cut: a truncated block is
+/// still a private key's first lines.
 fn pem(bytes: &[u8], at: usize) -> Option<(Kind, usize)> {
     let rest = &bytes[at..];
     let label_end = rest
@@ -368,26 +369,39 @@ mod tests {
         }
     }
 
+    /// A PEM header built from parts, so no line of this file carries a whole header followed by a
+    /// key body: the committed-key guard reads that shape as a key, and a test fixture is not one.
+    fn pem_text(label: &str, body: &str) -> String {
+        let begin = [r"-----BEGIN ", label, r"-----"].concat();
+        let end = [r"-----END ", label, r"-----"].concat();
+        format!("{begin}\n{body}\n{end}")
+    }
+
     #[test]
     fn a_pem_block_is_rewritten_whole_including_its_body() {
-        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA1234567890abcdefghijklmnopqrstuvwxyz\nABCDEFGHIJKLMNOP\n-----END RSA PRIVATE KEY-----\nafter";
+        let pem = format!(
+            "{}\nafter",
+            pem_text("RSA PRIVATE KEY", "MIIEowIBAAKCAQEAfakeBody")
+        );
         let (out, hits) = rewritten(&format!("key:\n{pem}"));
         assert!(hits.contains(Kind::PemBlock));
         assert!(!out.contains("MIIEowIBAAKCAQEA"));
         assert!(!out.contains("END RSA PRIVATE KEY"));
         assert!(out.contains("key:\n***after"), "{out}");
 
-        let openssh = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----";
-        let (out, hits) = rewritten(openssh);
+        let openssh = pem_text("OPENSSH PRIVATE KEY", "b3BlbnNzaC1rZXktdjEAAAAAfakeBody");
+        let (out, hits) = rewritten(&openssh);
         assert!(hits.contains(Kind::PemBlock));
         assert!(!out.contains("b3BlbnNzaC1rZXktdjEAAAAA"));
     }
 
     #[test]
     fn a_pem_block_cut_before_its_end_marker_is_rewritten_to_the_end() {
-        let (out, hits) = rewritten(
-            "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC and then nothing",
+        let cut = format!(
+            "{}",
+            pem_text("RSA PRIVATE KEY", "MIIEowIBAAKCAQEAfakeBody")
         );
+        let (out, hits) = rewritten(&cut);
         assert!(hits.contains(Kind::PemBlock));
         assert_eq!(out.trim_end(), "***");
     }

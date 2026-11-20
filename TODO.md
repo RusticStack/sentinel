@@ -103,7 +103,7 @@ What a session cannot supply. Ask early.
 - [ ] **O07** login, refresh races and logout on the Linux CLI; Windows leg is X2, real browser launch X7
 - [x] **S05**, **S06**, **S07** secret binding, redaction and cleanup, the end-to-end provisioning test ([auth and secrets](docs/auth-and-secrets.md))
 - [x] **R05** upgrades and skew ([upgrades](docs/upgrades.md)); the compatibility entries and the rollback matrix are in and checked against the code by `tests/compat_doc.rs`
-- [ ] **R07** failure drills ([resilience](docs/resilience.md))
+- [x] **R07** failure drills ([resilience](docs/resilience.md))
 - [ ] **U01–U07** Part 12, carried by Part 20's React port and its browser test; a real screen reader (U06) is a recorded limit
 
 ## Wave 2 — measurements on `reference-host`
