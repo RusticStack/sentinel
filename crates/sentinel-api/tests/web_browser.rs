@@ -26,6 +26,33 @@ use sentinel_protocol::{
 use sentinel_store::jobs;
 use serde_json::json;
 
+/// The modification time of the newest file under `dir`, or `None` when it holds none.
+fn newest_source(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let mut newest = None;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => pending.push(path),
+                Ok(_) => {
+                    if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+                        newest =
+                            Some(newest.map_or(modified, |seen: std::time::SystemTime| {
+                                seen.max(modified)
+                            }));
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    newest
+}
+
 fn repo_root() -> std::path::PathBuf {
     // Not `canonicalize`: on Windows it yields a verbatim path Node rejects.
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -63,6 +90,22 @@ fn spawn_web(
         server.exists(),
         "build the web interface first: {} is missing",
         server.display()
+    );
+    // Every scenario here drives whatever build is on disk, so a stale one fails as a missing page
+    // or a missing control rather than as a stale build. Name it instead: a checkout whose sources
+    // are newer than the build cannot be tested until `pnpm -C web build` runs.
+    let built = std::fs::metadata(server)
+        .and_then(|meta| meta.modified())
+        .expect("the web build's timestamp");
+    let newest = newest_source(&repo_root().join("web").join("src"));
+    assert!(
+        newest.is_none_or(|source| source <= built),
+        "the web build predates web/src: run `pnpm -C web build` (build {}, newest source {})",
+        server.display(),
+        newest
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|age| format!("{}s after the epoch", age.as_secs()))
+            .unwrap_or_default()
     );
     let mut command = Command::new(node());
     command
@@ -764,13 +807,16 @@ fn the_github_app_setup_in_a_real_browser() {
     let posted = fake.manifests_posted();
     assert_eq!(posted.len(), 1, "one manifest");
     let manifest: serde_json::Value = serde_json::from_str(&posted[0]).unwrap();
+    // The manifest a guided migration needs: a migration branch is a `contents` write, the pull
+    // request that disables the replaced jobs is a `pull_requests` write, and rewriting a workflow
+    // file is a `workflows` write ([migration](docs/migration.md)).
     assert_eq!(
         manifest["default_permissions"],
         json!({
             "actions": "read", "administration": "write", "checks": "write",
-            "contents": "read", "metadata": "read",
+            "contents": "write", "metadata": "read",
             "organization_self_hosted_runners": "write",
-            "pull_requests": "read", "members": "read",
+            "pull_requests": "write", "workflows": "write", "members": "read",
         })
     );
     assert_eq!(manifest["hook_attributes"]["active"], false);
