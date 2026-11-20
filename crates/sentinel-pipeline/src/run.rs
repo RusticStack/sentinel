@@ -2,6 +2,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::input::{InputValue, Inputs};
+
 use sentinel_protocol::cache::Class;
 
 use crate::{
@@ -138,6 +140,9 @@ impl fmt::Display for ImageRef {
 pub struct RunSpec {
     pub source: PinnedSource,
     pub pipeline: CompiledPipeline,
+    /// The values this run was given, ascending by name: the declarations' defaults plus whatever a
+    /// manual dispatch supplied. They are not part of the digest or of any check identity.
+    pub inputs: Vec<(String, InputValue)>,
     pub images: Vec<ImageRef>,
 }
 
@@ -148,11 +153,12 @@ pub enum SpecError {
     Decode,
 }
 
-/// Format 11 adds a step's `outputs`, a job's `outputs` and `finalize`, and a job's `handoff`; format 10 adds
-/// `on.schedule`; format 9 adds `artifacts[].when: step:<id>`; format 8 adds `artifacts[].class`; format 7 adds
-/// `runs_on.os` and `runs_on.isolation`. A spec that states none of them is written as format 10, 9, 8, 7 or 6,
-/// byte for byte what earlier controllers wrote, so a worker that predates the newer fields keeps running it.
-pub const SPEC_FORMAT: u8 = 11;
+/// Format 12 adds a step's `outputs`, a job's `outputs` and `finalize`, and a job's `handoff`; format 11 adds a
+/// pipeline's name and declared inputs with the values a run was given; format 10 adds `on.schedule`; format 9
+/// adds `artifacts[].when: step:<id>`; format 8 adds `artifacts[].class`; format 7 adds `runs_on.os` and
+/// `runs_on.isolation`. A spec that states none of them is written as format 11, 10, 9, 8, 7 or 6, byte for byte
+/// what earlier controllers wrote, so a worker that predates the newer fields keeps running it.
+pub const SPEC_FORMAT: u8 = 12;
 
 pub const SPEC_FORMAT_READ_MIN: u8 = 3;
 
@@ -168,19 +174,26 @@ impl RunSpec {
         Ok(Self {
             source,
             pipeline,
+            inputs: Vec::new(),
             images,
         })
     }
 
     /// The format `encode` writes for this spec: the lowest one that carries everything it states.
     pub fn format(&self) -> u8 {
-        if self.pipeline.jobs.iter().any(|j| {
+        let states_outputs = self.pipeline.jobs.iter().any(|j| {
             j.spec.finalize.is_some()
                 || !j.spec.outputs.is_empty()
                 || !j.spec.handoff.is_empty()
                 || j.spec.steps.iter().any(|s| !s.outputs.is_empty())
-        }) {
+        });
+        if states_outputs {
             SPEC_FORMAT
+        } else if !self.inputs.is_empty()
+            || self.pipeline.name.is_some()
+            || !self.pipeline.inputs.is_empty()
+        {
+            11
         } else if self.pipeline.on.schedule {
             10
         } else if self
@@ -216,6 +229,7 @@ impl RunSpec {
             7 => postcard::to_allocvec(&RunSpecV7::from(self)),
             10 => postcard::to_allocvec(&RunSpecV9::from(self)),
             11 => postcard::to_allocvec(&RunSpecV10::from(self)),
+            12 => postcard::to_allocvec(&RunSpecV11::from(self)),
             _ => postcard::to_allocvec(&RunSpecV8::from(self)),
         };
         body.map(|body| {
@@ -235,11 +249,14 @@ impl RunSpec {
             }
         }
         match bytes.split_first() {
-            Some((&SPEC_FORMAT, body)) => whole::<RunSpecV10>(body).map(RunSpec::from),
-            // Format 10 is format 8's layout plus the schedule trigger, which is why the format byte moves.
-            Some((&10, body)) => whole::<RunSpecV9>(body).map(RunSpec::from),
+            Some((&SPEC_FORMAT, body)) => whole::<RunSpecV11>(body).map(RunSpec::from),
+            Some((&11, body)) => whole::<RunSpecV10>(body).map(RunSpec::from),
             // Format 10 is format 8's layout plus the schedule trigger, which is why the format byte
             // moves: a reader that predates it refuses such a spec at the leading byte.
+            Some((&10, body)) => whole::<RunSpecV9>(body).map(RunSpec::from),
+            // Format 9 is format 8's layout: the only difference is what `when` may hold, and this
+            // reader takes both. A spec that states a newer field moves the byte, so a reader that
+            // predates it refuses the spec there instead of misreading it.
             Some((&9, body)) => whole::<RunSpecV8>(body).map(RunSpec::from),
             Some((&8, body)) => whole::<RunSpecV8>(body).map(RunSpec::from),
             Some((&7, body)) => whole::<RunSpecV7>(body).map(RunSpec::from),
@@ -369,8 +386,11 @@ impl From<&RunSpec> for RunSpecV6 {
 impl From<RunSpecV6> for RunSpec {
     fn from(v6: RunSpecV6) -> RunSpec {
         RunSpec {
+            inputs: Vec::new(),
             source: v6.source,
             pipeline: CompiledPipeline {
+                name: None,
+                inputs: Inputs::default(),
                 on: v6.pipeline.on.into(),
                 concurrency: v6.pipeline.concurrency,
                 jobs: v6
@@ -525,8 +545,11 @@ impl From<&RunSpec> for RunSpecV7 {
 impl From<RunSpecV7> for RunSpec {
     fn from(v7: RunSpecV7) -> RunSpec {
         RunSpec {
+            inputs: Vec::new(),
             source: v7.source,
             pipeline: CompiledPipeline {
+                name: None,
+                inputs: Inputs::default(),
                 on: v7.pipeline.on.into(),
                 concurrency: v7.pipeline.concurrency,
                 jobs: v7
@@ -597,6 +620,37 @@ impl From<RunSpecV8> for RunSpec {
     }
 }
 
+/// Format 11: the format-9 layout plus the pipeline's name, its declared inputs and the values this
+/// run was given. A reader that predates it refuses the leading byte instead of misreading a name.
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSpecV10 {
+    base: RunSpecV9,
+    name: Option<String>,
+    inputs: Inputs,
+    values: Vec<(String, InputValue)>,
+}
+
+impl From<&RunSpec> for RunSpecV10 {
+    fn from(spec: &RunSpec) -> RunSpecV10 {
+        RunSpecV10 {
+            base: RunSpecV9::from(spec),
+            name: spec.pipeline.name.clone(),
+            inputs: spec.pipeline.inputs.clone(),
+            values: spec.inputs.clone(),
+        }
+    }
+}
+
+impl From<RunSpecV10> for RunSpec {
+    fn from(v10: RunSpecV10) -> RunSpec {
+        let mut spec = RunSpec::from(v10.base);
+        spec.pipeline.name = v10.name;
+        spec.pipeline.inputs = v10.inputs;
+        spec.inputs = v10.values;
+        spec
+    }
+}
+
 /// Format 10: the format-8 layout plus the trigger set a scheduled pipeline states.
 #[derive(Debug, Serialize, Deserialize)]
 struct RunSpecV9 {
@@ -621,21 +675,21 @@ impl From<RunSpecV9> for RunSpec {
     }
 }
 
-/// Format 11: the format-10 layout plus what a job declares about its outputs, its finalizer and the artifacts it
+/// Format 12: the format-11 layout plus what a job declares about its outputs, its finalizer and the artifacts it
 /// takes from the jobs it needs. The per-job lists are in job order, as the artifact classes are.
 #[derive(Debug, Serialize, Deserialize)]
-struct RunSpecV10 {
-    base: RunSpecV9,
+struct RunSpecV11 {
+    base: RunSpecV10,
     steps: Vec<Vec<Vec<String>>>,
     jobs: Vec<Vec<String>>,
     finalize: Vec<Option<crate::schema::Finalize>>,
     handoff: Vec<Vec<crate::schema::Handoff>>,
 }
 
-impl From<&RunSpec> for RunSpecV10 {
-    fn from(spec: &RunSpec) -> RunSpecV10 {
-        RunSpecV10 {
-            base: RunSpecV9::from(spec),
+impl From<&RunSpec> for RunSpecV11 {
+    fn from(spec: &RunSpec) -> RunSpecV11 {
+        RunSpecV11 {
+            base: RunSpecV10::from(spec),
             steps: spec
                 .pipeline
                 .jobs
@@ -664,13 +718,13 @@ impl From<&RunSpec> for RunSpecV10 {
     }
 }
 
-impl From<RunSpecV10> for RunSpec {
-    fn from(v10: RunSpecV10) -> RunSpec {
-        let mut spec = RunSpec::from(v10.base);
-        let mut steps = v10.steps.into_iter();
-        let mut declared = v10.jobs.into_iter();
-        let mut finalize = v10.finalize.into_iter();
-        let mut handoff = v10.handoff.into_iter();
+impl From<RunSpecV11> for RunSpec {
+    fn from(v11: RunSpecV11) -> RunSpec {
+        let mut spec = RunSpec::from(v11.base);
+        let mut steps = v11.steps.into_iter();
+        let mut declared = v11.jobs.into_iter();
+        let mut finalize = v11.finalize.into_iter();
+        let mut handoff = v11.handoff.into_iter();
         for job in &mut spec.pipeline.jobs {
             if let Some(per_step) = steps.next() {
                 for (step, outputs) in job.spec.steps.iter_mut().zip(per_step) {
@@ -904,8 +958,11 @@ impl From<StepV4> for Step {
 impl From<RunSpecV4> for RunSpec {
     fn from(v4: RunSpecV4) -> RunSpec {
         RunSpec {
+            inputs: Vec::new(),
             source: v4.source,
             pipeline: CompiledPipeline {
+                name: None,
+                inputs: Inputs::default(),
                 on: v4.pipeline.on.into(),
                 concurrency: v4.pipeline.concurrency,
                 jobs: v4
@@ -945,8 +1002,11 @@ impl From<RunSpecV4> for RunSpec {
 impl From<RunSpecV5> for RunSpec {
     fn from(v5: RunSpecV5) -> RunSpec {
         RunSpec {
+            inputs: Vec::new(),
             source: v5.source,
             pipeline: CompiledPipeline {
+                name: None,
+                inputs: Inputs::default(),
                 on: v5.pipeline.on.into(),
                 concurrency: v5.pipeline.concurrency,
                 jobs: v5
@@ -986,8 +1046,11 @@ impl From<RunSpecV5> for RunSpec {
 impl From<RunSpecV3> for RunSpec {
     fn from(v3: RunSpecV3) -> RunSpec {
         RunSpec {
+            inputs: Vec::new(),
             source: v3.source,
             pipeline: CompiledPipeline {
+                name: None,
+                inputs: Inputs::default(),
                 on: v3.pipeline.on.into(),
                 concurrency: v3.pipeline.concurrency,
                 jobs: v3
@@ -1555,16 +1618,16 @@ mod tests {
     }
 
     #[test]
-    fn declared_outputs_a_handoff_and_a_finalizer_are_format_11() {
+    fn declared_outputs_a_handoff_and_a_finalizer_are_format_12() {
         let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    steps:\n      - {id: first, run: echo hi, outputs: [version]}\n    outputs: [version]\n    artifacts: [{name: dist, paths: [out]}]\n  b:\n    image: busybox\n    needs: [a]\n    steps: [{id: one, run: echo hi}]\n    handoff: [{from: a, artifact: dist, into: incoming}]\n    finalize: {run: echo done, timeout: 30s}\n";
         let spec = RunSpec::new(
             PinnedSource::new("r", SHA, None).unwrap(),
             compile_str(text).unwrap(),
         )
         .unwrap();
-        assert_eq!(spec.format(), 11);
+        assert_eq!(spec.format(), 12);
         let bytes = spec.encode().unwrap();
-        assert_eq!(bytes[0], 11);
+        assert_eq!(bytes[0], 12);
         assert_eq!(RunSpec::decode(&bytes).unwrap(), spec);
         // The format byte is the whole reason a worker that predates this refuses rather than misreads it.
         assert_eq!(

@@ -189,7 +189,7 @@ its window: nothing is consumed, because a redemption record would put a write o
 access-log line keeps a 16-hex digest of the token and never the text ([API](api.md#short-lived-download-links)).
 ## Declared outputs
 
-A job's declared outputs are stored as plain text on its row (`jobs.outputs`, migration 85: the `name=value` lines the
+A job's declared outputs are stored as plain text on its row (`jobs.outputs`, migration 86: the `name=value` lines the
 worker accepted, one per line, bounded at 16 KiB), written in the same fenced transaction that ends the attempt, so a
 report from a fence the attempt no longer holds writes nothing. They are public within the tenant by construction —
 the worker refuses a value that repeats a delivered secret — so nothing redacts them and they carry no charge. The jobs

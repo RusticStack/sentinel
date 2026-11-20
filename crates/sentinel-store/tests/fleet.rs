@@ -226,6 +226,56 @@ fn spec(yaml: &str) -> RunSpec {
     .unwrap()
 }
 
+/// One named pipeline of a document, pinned the way the controller pins every pipeline it runs.
+fn named_spec(yaml: &str, name: &str) -> RunSpec {
+    let pipeline = sentinel_pipeline::compile_document(yaml)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name.as_deref() == Some(name))
+        .unwrap_or_else(|| panic!("no pipeline {name}"));
+    RunSpec::new(
+        PinnedSource::new("https://github.com/o/r.git", SHA, Some("main")).unwrap(),
+        pipeline,
+    )
+    .unwrap()
+}
+
+fn run_spec(
+    f: &Fixture,
+    tenant: TenantId,
+    repo: RepoId,
+    spec: RunSpec,
+    now: UnixMillis,
+) -> (RunId, Vec<JobId>) {
+    let run = RunId::new();
+    let ids = f
+        .store
+        .writer()
+        .write(move |tx| {
+            let ids = runs::create_run(tx, tenant, repo, run, &spec, now)?;
+            for job in &ids {
+                runs::resolve_image(tx, tenant, *job, DIGEST, "linux/amd64")?;
+            }
+            Ok(ids)
+        })
+        .unwrap();
+    (run, ids)
+}
+
+fn group_of(f: &Fixture, run: RunId) -> String {
+    f.store
+        .read(move |c| {
+            Ok(
+                c.prepare("SELECT concurrency_group FROM jobs WHERE run_id = ?1")?
+                    .query_map([run.as_bytes()], |r| r.get::<_, String>(0))?
+                    .next()
+                    .transpose()?
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap()
+}
+
 fn run(
     f: &Fixture,
     tenant: TenantId,
@@ -983,6 +1033,60 @@ jobs:
     assert_eq!(state(&f, earlier[0]), JobState::Queued);
     assert_eq!(state(&f, later[0]), JobState::Queued);
     assert_eq!(reason(&f, later[0], &[w]), WaitReason::ConcurrencyLimit);
+}
+
+/// Two pipelines of one repository never share a concurrency group, whatever their templates render
+/// to: one pipeline's cancel_in_progress replaces its own previous run and never another's.
+#[test]
+fn named_pipelines_of_one_repository_do_not_share_a_concurrency_group() {
+    let f = fixture();
+    let (tenant, repo) = (f.tenant, f.repo);
+    let document = "schema: 1
+pipelines:
+  alpha:
+    on: [push]
+    concurrency: { group: deploy, cancel_in_progress: true }
+    jobs:
+      a:
+        image: alpine:3
+        resources: { cpu: 1, memory: 1GiB }
+        steps: [{ id: s, run: 'true' }]
+  beta:
+    on: [push]
+    concurrency: { group: deploy, cancel_in_progress: true }
+    jobs:
+      a:
+        image: alpine:3
+        resources: { cpu: 1, memory: 1GiB }
+        steps: [{ id: s, run: 'true' }]
+";
+    let (alpha, alpha_jobs) = run_spec(&f, tenant, repo, named_spec(document, "alpha"), at(2_000));
+    let (beta, beta_jobs) = run_spec(&f, tenant, repo, named_spec(document, "beta"), at(2_100));
+    assert_eq!(state(&f, alpha_jobs[0]), JobState::Queued);
+    assert_eq!(state(&f, beta_jobs[0]), JobState::Queued);
+    assert_ne!(group_of(&f, alpha), group_of(&f, beta));
+
+    // The next run of alpha replaces alpha's live run, and leaves beta's alone.
+    let (_, alpha2) = run_spec(&f, tenant, repo, named_spec(document, "alpha"), at(2_200));
+    assert_eq!(
+        state(&f, alpha_jobs[0]),
+        JobState::Terminal(Outcome::Canceled)
+    );
+    assert_eq!(state(&f, beta_jobs[0]), JobState::Queued);
+    assert_eq!(state(&f, alpha2[0]), JobState::Queued);
+
+    // The unnamed pipeline's group is the one it always had, byte for byte.
+    let plain = "schema: 1
+on: [push]
+concurrency: { group: deploy, cancel_in_progress: true }
+jobs:
+  a:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+";
+    let (unnamed, _) = run_spec(&f, tenant, repo, spec(plain), at(2_300));
+    assert_eq!(group_of(&f, unnamed), "deploy");
 }
 
 fn job_of(cpu: &str, memory: &str) -> String {

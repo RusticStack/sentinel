@@ -1,0 +1,32 @@
+schema: 1
+on: [push]
+concurrency:
+  group: "${{ repo.id }}:${{ event.key }}"
+  cancel_in_progress: true
+jobs:
+  ci:
+    image: rust:1-bookworm
+    steps:
+      - id: build
+        run: cargo build --locked
+pipelines:
+  acceptance:
+    on:
+      pull_request: {branches: [main]}
+    concurrency:
+      group: "${{ repo.id }}:${{ event.key }}"
+    jobs:
+      acceptance:
+        image: rust:1-bookworm
+        steps:
+          - id: suite
+            run: cargo test --locked
+  release:
+    on:
+      push: {branches: ["v*"]}
+    jobs:
+      publish:
+        image: rust:1-bookworm
+        steps:
+          - id: stage
+            run: echo stage

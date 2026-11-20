@@ -198,7 +198,8 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (82, include_str!("migrations/082_schedules.sql")),
     (83, include_str!("migrations/083_ai_analysis.sql")),
     (84, include_str!("migrations/084_ai_search.sql")),
-    (85, include_str!("migrations/085_job_outputs.sql")),
+    (85, include_str!("migrations/085_named_pipelines.sql")),
+    (86, include_str!("migrations/086_job_outputs.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -220,7 +221,7 @@ pub const READABLE_BY: &[(u32, u32)] = &[
     (80, 79),
     (82, 81),
     (83, 82),
-    (85, 84),
+    (86, 85),
 ];
 
 pub fn readable_by(version: u32) -> u32 {
@@ -340,6 +341,10 @@ mod tests {
         (
             79,
             "an older controller contacts a provider without reserving anything: it reads no budget, holds no reservation and settles no ledger, so it would spend a tenant's month past the limit a newer one enforced and publish no analysis to the cache its requests read",
+        ),
+        (
+            85,
+            "an older controller derives a check's name from the job alone, so on a run of a named pipeline it publishes `sentinel / <job>` and `sentinel / ci` where this one publishes `sentinel / <name> / <job>` and `sentinel / <name>` — a required check the repository protects under the pipeline's name would stay pending while a namespace it does not protect moves; it also cannot decode run spec format 11",
         ),
         (
             81,

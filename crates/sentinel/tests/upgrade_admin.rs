@@ -118,9 +118,8 @@ fn the_check_reports_the_upgrade_without_migrating_and_exits_two_when_it_blocks(
         report["blocking"].as_array().unwrap().is_empty(),
         "{report}"
     );
-    // The newest migration only creates two tables no earlier statement holds, so its step visits no
-    // row; the storage rebuild one step below it is where a preflight from two schemas back names the
-    // policy table it carries over (`sentinel-store`'s own preflight test asserts that).
+    // The newest migration only adds a nullable column, so it rewrites no table and visits no row,
+    // which is why the report names it with an empty rewrite list.
     let steps = report["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 1, "{report}");
     assert_eq!(steps[0]["migration"], schema::LATEST);

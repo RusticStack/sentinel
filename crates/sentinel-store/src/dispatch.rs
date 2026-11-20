@@ -2610,6 +2610,7 @@ fn release_dependents_with(
                         run,
                         job,
                         job_name: &compiled.name,
+                        inputs: &spec.inputs,
                         summary,
                         results,
                     };
@@ -2705,6 +2706,8 @@ struct ScheduleContext<'a> {
     run: RunId,
     job: JobId,
     job_name: &'a str,
+    /// The values this run was given, so a condition reads the same `inputs.<name>` a dispatch did.
+    inputs: &'a [(String, sentinel_pipeline::InputValue)],
     summary: DependencySummary,
     results: Vec<(&'a str, Outcome)>,
 }
@@ -2737,6 +2740,10 @@ impl Context for ScheduleContext<'_> {
             ["job", "name"] => Value::Str(self.job_name.to_owned()),
             ["needs", name, "result"] => match self.results.iter().find(|(n, _)| n == name) {
                 Some((_, outcome)) => Value::Str(outcome.as_str().to_owned()),
+                None => return Lookup::Unresolved,
+            },
+            ["inputs", name] => match self.inputs.iter().find(|(n, _)| n == name) {
+                Some((_, value)) => value.expr_value(),
                 None => return Lookup::Unresolved,
             },
             _ => return Lookup::Unresolved,

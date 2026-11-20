@@ -1,0 +1,11 @@
+# expect: inputs.count.type: expected string, choice, boolean or integer
+schema: 1
+pipelines:
+  focus:
+    on: [manual]
+    inputs:
+      count: {type: number, min: 1, max: 2}
+    jobs:
+      a:
+        image: busybox
+        steps: [{id: s, run: echo}]

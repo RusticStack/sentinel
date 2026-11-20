@@ -11,13 +11,28 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Explanation {
     pub schema: &'static str,
+    /// The named pipeline this view is of; `null` for a document's unnamed pipeline.
+    pub pipeline: Option<String>,
     pub digest: String,
+    /// The check names this pipeline publishes, and the inputs a manual dispatch may pass.
+    pub aggregate_check: String,
+    pub inputs: Vec<InputExplanation>,
     pub triggers: Vec<&'static str>,
     pub trigger_filters: Vec<TriggerFilterExplanation>,
     pub concurrency: Option<ConcurrencyExplanation>,
     pub jobs: Vec<JobExplanation>,
     pub requires: Requirements,
     pub unresolved: Vec<Unresolved>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct InputExplanation {
+    pub name: String,
+    pub kind: &'static str,
+    /// The bound as a refusal states it.
+    pub bound: String,
+    pub default: Option<String>,
+    pub required: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -169,6 +184,17 @@ fn note_template(out: &mut Vec<Unresolved>, path: String, t: &Template) {
     }
 }
 
+/// A required input has no value until a dispatch supplies one; a defaulted one is known already.
+fn note_input(out: &mut Vec<Unresolved>, name: &str, required: bool) {
+    if required {
+        out.push(Unresolved {
+            path: format!("inputs.{name}"),
+            expression: format!("inputs.{name}"),
+            resolves_at: "dispatch",
+        });
+    }
+}
+
 fn push_unique(v: &mut Vec<String>, s: &str) {
     if !v.iter().any(|x| x == s) {
         v.push(s.to_owned());
@@ -276,9 +302,30 @@ impl Explanation {
             });
         }
         requires.secrets.sort();
+        let inputs = p
+            .inputs
+            .iter()
+            .map(|(name, spec)| {
+                note_input(&mut unresolved, name, spec.default.is_none());
+                InputExplanation {
+                    name: name.clone(),
+                    kind: spec.kind.type_name(),
+                    bound: spec.kind.bound(),
+                    default: spec.default.as_ref().map(|v| match v {
+                        crate::input::InputValue::Str(s) => s.clone(),
+                        crate::input::InputValue::Bool(b) => b.to_string(),
+                        crate::input::InputValue::Int(i) => i.to_string(),
+                    }),
+                    required: spec.default.is_none(),
+                }
+            })
+            .collect();
         Explanation {
             schema: "sentinel.explain/1",
+            pipeline: p.name.clone(),
             digest: format!("{:032x}", p.digest),
+            aggregate_check: p.aggregate_check(),
+            inputs,
             triggers: trigger_kinds(&p.on),
             trigger_filters: trigger_filters(&p.on),
             concurrency,
@@ -291,6 +338,9 @@ impl Explanation {
     pub fn render_text(&self) -> String {
         use std::fmt::Write;
         let mut s = String::new();
+        if let Some(name) = &self.pipeline {
+            let _ = writeln!(s, "pipeline {name} (check {})", self.aggregate_check);
+        }
         let _ = writeln!(s, "pipeline digest {}", self.digest);
         let _ = writeln!(s, "triggers: {}", self.triggers.join(", "));
         for filter in &self.trigger_filters {
@@ -310,6 +360,20 @@ impl Explanation {
                 s,
                 "concurrency: {} (cancel in progress: {})",
                 c.group, c.cancel_in_progress
+            );
+        }
+        for i in &self.inputs {
+            let _ = writeln!(
+                s,
+                "input {}: {} ({}){}{}",
+                i.name,
+                i.kind,
+                i.bound,
+                match &i.default {
+                    Some(default) => format!(", default {default}"),
+                    None => String::new(),
+                },
+                if i.required { ", required" } else { "" }
             );
         }
         for j in &self.jobs {

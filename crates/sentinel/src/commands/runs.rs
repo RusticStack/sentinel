@@ -17,6 +17,8 @@ pub(super) struct Dispatch {
     pub source: String,
     pub sha: String,
     pub ref_name: Option<String>,
+    pub name: Option<String>,
+    pub inputs: Vec<String>,
     pub idempotency_key: Option<String>,
 }
 
@@ -25,10 +27,38 @@ pub(super) fn dispatch(client: &Client, output: Output, args: &Dispatch) -> Resu
     let repo = segment("repository", &args.repo)?;
     let pipeline = crate::bounded::text(&args.pipeline, crate::bounded::PIPELINE_BYTES)
         .map_err(|e| Error::usage(format!("cannot read the pipeline: {e}")))?;
-    let body = json!({
+    let mut body = json!({
         "pipeline": pipeline,
         "source": { "repo": args.source, "sha": args.sha, "ref": args.ref_name },
     });
+    if let Some(name) = &args.name {
+        body["name"] = json!(name);
+    }
+    if !args.inputs.is_empty() {
+        // A value is what it parses as: `true`/`false` a boolean, digits an integer, anything else
+        // the string it was typed as. The engine checks it against the declaration that bounds it.
+        let mut inputs = serde_json::Map::with_capacity(args.inputs.len());
+        for argument in &args.inputs {
+            let Some((name, value)) = argument.split_once('=') else {
+                return Err(Error::usage(format!(
+                    "--input expects NAME=VALUE, not `{argument}`"
+                )));
+            };
+            let parsed = match value {
+                "true" => json!(true),
+                "false" => json!(false),
+                digits if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+                    match digits.parse::<i64>() {
+                        Ok(number) => json!(number),
+                        Err(_) => json!(value),
+                    }
+                }
+                _ => json!(value),
+            };
+            inputs.insert(name.to_owned(), parsed);
+        }
+        body["inputs"] = serde_json::Value::Object(inputs);
+    }
     let run = client.post(
         &format!("/api/v1/tenants/{slug}/repos/{repo}/runs"),
         &body,

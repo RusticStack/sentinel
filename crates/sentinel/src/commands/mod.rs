@@ -72,6 +72,13 @@ pub enum RunCommand {
         /// Ref name kept as provenance
         #[arg(long)]
         r#ref: Option<String>,
+        /// Named pipeline of the file to run; required when it declares several
+        #[arg(long)]
+        name: Option<String>,
+        /// Input value as NAME=VALUE, repeated; `true`/`false` are booleans, digits an integer and
+        /// anything else the string it was typed as
+        #[arg(long = "input", value_name = "NAME=VALUE")]
+        inputs: Vec<String>,
         /// Idempotency key so a retried dispatch creates one run
         #[arg(long)]
         idempotency_key: Option<String>,
@@ -442,6 +449,8 @@ pub fn run(invocation: Invocation) -> Result<(), client::Error> {
                     source,
                     sha,
                     r#ref,
+                    name,
+                    inputs,
                     idempotency_key,
                 } => runs::dispatch(
                     &client,
@@ -453,6 +462,8 @@ pub fn run(invocation: Invocation) -> Result<(), client::Error> {
                         source,
                         sha,
                         ref_name: r#ref,
+                        name,
+                        inputs,
                         idempotency_key,
                     },
                 ),

@@ -11,7 +11,7 @@ use sentinel_auth::secret::Secret;
 use sentinel_core::{UnixMillis, UserId, auth::Scopes};
 use sentinel_protocol::{
     error::{ApiError, ErrorCode},
-    mcp::{self as contract, ApiCall, Backend},
+    mcp::{self as contract, ApiCall, Backend, SuggestWorkflow},
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -419,7 +419,7 @@ fn call_tool(
         }
     };
     let required = match name {
-        "get_logs" | "get_failure" => Scopes::LOGS_READ,
+        "get_logs" | "get_failure" | "get_analysis" => Scopes::LOGS_READ,
         "dispatch" | "rerun_job" | "cancel" => Scopes::RUNS_WRITE,
         "list_secret_metadata" | "get_secret_metadata" | "list_secret_bindings" => {
             Scopes::SECRETS_METADATA
@@ -427,7 +427,7 @@ fn call_tool(
         "list_artifacts" | "get_artifact" | "read_artifact_file" | "get_artifact_link" => {
             Scopes::ARTIFACTS_READ
         }
-        "validate_pipeline" => Scopes::NONE,
+        "validate_pipeline" | "suggest_workflow_change" => Scopes::NONE,
         _ => Scopes::RUNS_READ,
     };
     auth::require_scope(who, required)?;
@@ -651,15 +651,37 @@ impl Backend for ApiBackend<'_, '_> {
         text(bytes)
     }
 
+    /// A suggestion reads nothing from the deployment and writes nothing: it rewrites the text the
+    /// caller holds and answers only what the analyzer verified.
+    fn suggest_workflow(&mut self, request: &SuggestWorkflow) -> Result<Value, Value> {
+        sentinel_pipeline::workflow::suggest(&sentinel_pipeline::workflow::SuggestRequest {
+            path: &request.path,
+            text: &request.workflow,
+            job: request.job.as_deref(),
+            step: request.step,
+            construct: &request.construct,
+        })
+        .map(|suggestion| {
+            serde_json::to_value(suggestion)
+                .unwrap_or_else(|_| api_error_value(ErrorCode::Internal, "controller fault"))
+        })
+        .map_err(|refusal| {
+            let code = match refusal.code() {
+                "not_found" => ErrorCode::NotFound,
+                _ => ErrorCode::InvalidRequest,
+            };
+            api_error_value(code, &refusal.message())
+        })
+    }
+
     fn validate_pipeline(&mut self, pipeline: &str) -> Result<Value, Value> {
-        match sentinel_pipeline::compile_str(pipeline) {
-            Ok(compiled) => serde_json::to_value(sentinel_pipeline::Explanation::of(&compiled))
-                .map_err(|_| {
-                    api_error_value(
-                        ErrorCode::Internal,
-                        "could not serialize pipeline explanation",
-                    )
-                }),
+        match sentinel_pipeline::compile_document(pipeline) {
+            Ok(pipelines) => explain_document(&pipelines).map_err(|_| {
+                api_error_value(
+                    ErrorCode::Internal,
+                    "could not serialize pipeline explanation",
+                )
+            }),
             Err(error) => {
                 let (stage, position) = match error {
                     sentinel_pipeline::Error::Yaml(error) => {
@@ -667,6 +689,7 @@ impl Backend for ApiBackend<'_, '_> {
                     }
                     sentinel_pipeline::Error::Schema(_) => ("schema", None),
                     sentinel_pipeline::Error::Compile(_) => ("compile", None),
+                    sentinel_pipeline::Error::Ambiguous { .. } => ("compile", None),
                 };
                 let message = match stage {
                     "yaml" => "pipeline YAML is invalid",
@@ -682,6 +705,20 @@ impl Backend for ApiBackend<'_, '_> {
             }
         }
     }
+}
+
+/// One pipeline answers the explanation it always did; a document with several answers them as a list.
+fn explain_document(
+    pipelines: &[sentinel_pipeline::CompiledPipeline],
+) -> Result<Value, serde_json::Error> {
+    let values: Vec<Value> = pipelines
+        .iter()
+        .map(|p| serde_json::to_value(sentinel_pipeline::Explanation::of(p)))
+        .collect::<Result<_, _>>()?;
+    Ok(match values.len() {
+        1 => values.into_iter().next().unwrap_or(Value::Null),
+        _ => json!({"schema": "sentinel.explain/1", "pipelines": values}),
+    })
 }
 
 fn api_error_value(code: ErrorCode, message: &str) -> Value {

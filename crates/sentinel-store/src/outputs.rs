@@ -9,7 +9,7 @@ use sentinel_core::{AttemptId, Fence, JobId, TenantId};
 
 use crate::{Error, Result};
 
-/// The column's own bound, as migration 85 states it.
+/// The column's own bound, as migration 86 states it.
 pub const MAX_COLUMN_BYTES: usize = 16384;
 
 /// The bytes the column holds for `outputs`: one `name=value` line each, in declaration order.
