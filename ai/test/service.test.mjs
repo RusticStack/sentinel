@@ -15,6 +15,8 @@ const BUNDLE = JSON.stringify({ schema: "sentinel.ai-context/1", attempt: "att_1
 const row = {
   id: "air_1",
   attempt: "att_1",
+  kind: "analysis",
+  question: null,
   provider: "openrouter",
   data_policy: "zero_retention",
   origin: "member",

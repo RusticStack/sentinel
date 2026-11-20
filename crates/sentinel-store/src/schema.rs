@@ -197,6 +197,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     ),
     (82, include_str!("migrations/082_schedules.sql")),
     (83, include_str!("migrations/083_ai_analysis.sql")),
+    (84, include_str!("migrations/084_ai_search.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -341,6 +342,10 @@ mod tests {
         (
             81,
             "an older controller holds no sized default per tenant: its unset `tenant_quota_bytes` is 0, which it writes to `storage_defaults` at every start, so one restart of a rolled-back release lifts the limit the upgrade applied to every tenant that states none; it also refuses the explicit unlimited a newer platform administrator can store, and it keeps no default for personal namespaces",
+        ),
+        (
+            84,
+            "an older controller claims a log-search request as a failure analysis of its attempt and settles it with an answer to a question it never read: it knows neither the question nor the plan the answer must be built from",
         ),
     ];
 

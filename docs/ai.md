@@ -11,9 +11,10 @@ talks to a provider, `sentinel-ai`, with the durable requests it consumes and th
 credential it reads evidence with, the budget ledger every request reserves against before it goes
 anywhere, the analysis cache a repeated question is answered from, and the analyses themselves: a
 model's answer decoded against a versioned schema, every claim cited to evidence the controller
-resolves, shown as inference under the deterministic summary, expiring with the logs it cites. What
-follows them — flaky-test summaries, the log-search assistant, migration suggestions — is
-[plan 16.6](../plan.md#166-ai-assistance) and the backlog items after Y05.
+resolves, shown as inference under the deterministic summary, expiring with the logs it cites; and
+the log-search assistant, where a question becomes a bounded plan of those same reads and an answer
+that cites no real line is refused. What follows them — flaky-test summaries, migration
+suggestions — is [plan 16.6](../plan.md#166-ai-assistance) and the backlog items after Y07.
 
 ## The guarantees
 
@@ -316,6 +317,68 @@ already gone is not cached at all (the request still carries its answer, which i
 read time a citation into a log retention removed does not resolve, so the answer stops being shown
 the moment its evidence does: nothing outlives what it cites.
 
+## The log-search assistant
+
+A failure analysis answers *why did this fail*. A question answers *what happened*, and a question
+is not bound to one attempt: it may need the logs of twenty runs before the answer is anywhere in
+one of them. So a question never reaches a log directly. It becomes a **plan** — a bounded list of
+reads of what the controller already serves — the controller executes that plan under the
+requester's own delegation, and the model sees only the result. `sentinel.ai-plan/1` is the plan:
+at most six reads, each either a literal search over the repository's newest runs (a needle of at
+most 256 bytes, a window of at most 100 runs, at most 25 matching lines) or one attempt's failure
+context ([the bundle](#the-evidence-bundle)).
+
+**One request, two calls, one hold.** A member asks by adding a `question` to their request
+(`POST /tenants/{slug}/ai/requests`, 1–512 bytes, which needs `logs:read` as well as the read-only
+set). The row's `kind` says which answer is owed: `search` for a question, `analysis` for a
+failure. At claim time `sentinel-ai` reserves once for both provider calls — the planner's prompt
+and the answer's, priced against the largest result document the plan may return — and that one
+maximum is what Y04's ledger holds, so the per-request cap and the month's budget bound the whole
+question and not half of it. The planner may use 512 output tokens of the cap and the answer the
+rest; a cap that leaves no room for both refuses the request rather than planning one.
+
+**Executed as the requester.** `POST /ai/requests/{id}/plan` takes the plan and runs the reads with
+the requester's own authority, re-read at that moment: the request's repository, its tenant's AI
+policy, and the reads themselves. A read naming an attempt of another repository, or another
+tenant, is refused with the read's index — never skipped, never satisfied from what the request
+could read when it was created — and the same write settles the request `unavailable`, so a
+refused plan is the end of the question. A plan the controller cannot execute (another schema, an
+unknown field, a read past its bounds) and a plan whose reads exceed the 4 MiB of log one plan may
+scan or whose results exceed 64 KiB is refused the same way, with the reason on the row. Nothing
+is truncated to fit: a silently shortened answer would be a claim nobody can check. Within those
+bounds a search read reports whether it saw everything it could (`truncated`, `expired_attempts`,
+`missing_logs`), so a model never states that a log held nothing when it held more than the read
+looked at.
+
+**What the model sees.** The answer to a plan is one `sentinel.ai-search/1` document: each search
+read's matching lines with the attempt, run, job, step, stream and evidence identifier
+(`log-<sequence>`) the answer will cite, and each context read's bundle. It is the only thing the
+answer's prompt carries — no log, no bundle of the process's own choosing — and the credential
+scanners are re-applied to every line, because a line reaches a log through paths no registered
+value covers. Nothing outside the request's repository can appear in it, because nothing outside
+it was read.
+
+**Every answer links real lines.** The answer is the same `sentinel.ai-analysis/1` document a
+failure analysis is, so it is decoded and its citations resolved the same way — one implementation
+for both. The difference is where the check happens: a log-search answer is checked when it is
+stored. `POST /ai/requests/{id}/complete` resolves every citation against the evidence the
+repository still holds, and an answer whose every claim drops — a frame that does not exist, a
+diagnostic the bundle does not number, an attempt outside the repository, a log retention removed —
+is **not stored**: the request settles `unavailable` with
+`citation: no claim cites evidence this repository's logs hold`. The answer is never shown and
+never cached, which is stricter than an analysis, whose route drops what no longer resolves and
+hides a document that lost every claim.
+
+**Cost and the cache.** A question is cached like an analysis, keyed by the attempt it was asked
+about, the question, the prompt version `search-1` and the model, so the same question about the
+same request costs nothing the second time and the same question about another repository is a
+different question. A reused answer is re-resolved where it is served, so a line retention removed
+is not a line a cached answer still links.
+
+What is not built: no interface yet — the run page's analysis panel has no question box, and the
+answer is read through `GET /ai/requests/{id}` — and no multi-round planning: one plan, one answer,
+which is what makes the bound a number rather than a loop.
+
 ## Where it appears
 
 The run page's failure view — the same deterministic summary — gets the analysis underneath it,
@@ -422,14 +485,23 @@ because the evidence it cites does.
 
 A prompt registry and an evaluation set are Y09; the prompt this build ships is `analysis-1`, whose
 version is part of every cache key, and the evaluation set is built from seeded failures on the
-pilots. The features after Y05 — flaky-test summaries, the log-search assistant, migration
-suggestions, the read-only MCP tools that expose analyses — are [plan
+pilots, and the log-search assistant ships a second prompt, `search-1`, which plans the reads a
+question becomes. The features after Y07 — flaky-test summaries, migration suggestions, the
+read-only MCP tools that expose analyses — are [plan
 16.6](../plan.md#166-ai-assistance) and [backlog Part 22](backlog.md).
 
 Verification of this package is local: `pnpm typecheck` and
 `cd ai && node --import ./test/ts-register.mjs --test test/*.test.mjs`, both of which contact no
 provider — the provider tests run against a recording fake HTTP client, and the controller tests
-run over the API in `crates/sentinel-api/tests/ai_requests.rs` and `ai_budget.rs`. The budget's own
+run over the API in `crates/sentinel-api/tests/ai_requests.rs`, `ai_budget.rs`, `ai_analysis.rs` and
+`ai_search.rs`. The log-search assistant's gates are `crates/sentinel-api/tests/ai_search.rs`: a
+question's plan is executed under the request's delegation and its lines are the ones a citation
+resolves to, a plan past its reads, needle, run window, match count or result bytes is refused with
+its field and the row settled, a plan naming another repository's attempt is refused and that
+attempt stays unreadable to the delegation, and an answer citing nothing that resolves is refused
+rather than stored; `ai/test/search.test.mjs` proves the process's half — the plan reaches the
+controller before any answer is asked for, the answer's prompt carries the result document and
+nothing else, an out-of-bounds plan never leaves the process, and one hold covers both calls. The budget's own
 gates are `crates/sentinel-store/tests/ai_budget.rs`: budget and cost are charged from reported
 usage, an unreported component settles at its hold, an unsettled reservation expires with its
 request and frees the month, 24 concurrent reservations against a budget of eight admit exactly

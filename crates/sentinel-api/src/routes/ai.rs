@@ -27,13 +27,14 @@ use sentinel_protocol::{
     error::{ApiError, ErrorCode},
     logs::Frame,
     patterns,
+    plan::{MAX_QUESTION_BYTES, Plan, Read as PlanRead},
     redact::Redactor,
     summary::{AttemptSummary, StepOutcome},
 };
 use sentinel_store::{
     Error as StoreError,
     ai::{self, Budgets},
-    auth as authz, dispatch, logs, lookup, secrets, status,
+    auth as authz, dispatch, history, logs, lookup, secrets, status,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -74,6 +75,9 @@ pub(super) fn route(
         }
         ("POST", ["api", "v1", "ai", "requests", request_id, "reserve"]) => {
             reserve(state, request, request_id)
+        }
+        ("POST", ["api", "v1", "ai", "requests", request_id, "plan"]) => {
+            plan_reads(state, request, request_id)
         }
         ("GET", ["api", "v1", "tenants", slug, "ai", "usage"]) => usage(state, request, slug),
         ("POST", ["api", "v1", "ai", "requests", request_id, "complete"]) => {
@@ -323,7 +327,7 @@ pub(super) fn context(state: &State, request: &Request, attempt: &str, query: &s
             .ok_or_else(|| {
                 err(
                     ErrorCode::InvalidRequest,
-                    format!("budget must be {MIN_BUNDLE_BYTES}..{MAX_BUNDLE_BYTES} bytes"),
+                    format!("budget must be {MIN_BUNDLE_BYTES}..={MAX_BUNDLE_BYTES} bytes"),
                 )
             })?,
     };
@@ -336,6 +340,42 @@ pub(super) fn context(state: &State, request: &Request, attempt: &str, query: &s
             let run = lookup::job_run(c, job)?;
             let repo = lookup::run_repo(c, run)?;
             let tenant = authz::require_repo(c, principal, repo, Permissions::READ)?;
+            Ok((tenant, repo))
+        })
+        .map_err(store_error)?;
+    let (tenant, repo) = found;
+    ok(bundle(
+        state,
+        tenant,
+        repo,
+        attempt,
+        budget,
+        key.as_deref(),
+    )?)
+}
+
+/// One attempt's evidence bundle, built from what the controller already stored: the deterministic
+/// summary, the diagnostics its stored frames parse into, and the newest frames of the failed step,
+/// re-redacted and trimmed to `budget`. It is the one builder both readers use — the bundle route,
+/// and a log-search plan's context read — so an answer cites a document the controller would also
+/// have served on its own, and `repo` is the repository the caller was authorized against: an
+/// attempt of another repository is `not_found`, never evidence.
+fn bundle(
+    state: &State,
+    tenant: TenantId,
+    repo: sentinel_core::RepoId,
+    attempt: AttemptId,
+    budget: usize,
+    key: Option<&sentinel_auth::sealed::Key>,
+) -> Result<Value, ApiError> {
+    let found = state
+        .store
+        .read(move |c| {
+            let job = lookup::attempt_job(c, attempt)?;
+            let run = lookup::job_run(c, job)?;
+            if lookup::run_repo(c, run)? != repo {
+                return Ok(None);
+            }
             // The same reading Y03's request path makes: a tenant the deployment or its own
             // administrator has not opted in has no bundle at all.
             if !ai::permits(c, tenant)? {
@@ -343,7 +383,7 @@ pub(super) fn context(state: &State, request: &Request, attempt: &str, query: &s
             }
             let summary = dispatch::attempt_summary(c, tenant, attempt)?;
             let status = status::attempt_job_status(c, tenant, attempt)?;
-            let values = match key.as_deref() {
+            let values = match key {
                 Some(key) => secrets::attempt_values(c, key, attempt)?,
                 None => secrets::Values::empty(),
             };
@@ -441,7 +481,7 @@ pub(super) fn context(state: &State, request: &Request, attempt: &str, query: &s
         },
     });
     fit_bundle(&mut body, budget);
-    ok(body)
+    Ok(body)
 }
 
 fn is_failed(outcome: StepOutcome) -> bool {
@@ -872,6 +912,48 @@ fn analysis(state: &State, request: &Request, attempt: &str) -> Route {
     };
     let document = Analysis::decode(document.as_bytes())
         .map_err(|_| err(ErrorCode::Internal, "stored analysis unreadable"))?;
+    let resolved = resolve(state, tenant, repo, &document)?;
+    let (claims, dropped, expires) = (resolved.claims, resolved.dropped, resolved.expires);
+    if claims.is_empty() {
+        return ok(json!({
+            "present": false,
+            "reason": "dropped",
+            "dropped_citations": dropped,
+        }));
+    }
+    ok(json!({
+        "present": true,
+        "schema": sentinel_protocol::analysis::ANALYSIS_SCHEMA,
+        "inference": true,
+        "attempt": attempt.to_string(),
+        "origin": origin.as_str(),
+        "reused": reused,
+        "summary": document.summary,
+        "claims": claims,
+        "dropped_citations": dropped,
+        "settled_ms": settled.0,
+        "expires_ms": expires.map(|until| until.0),
+    }))
+}
+
+/// Every claim of `document` whose citations resolve against the evidence this repository still
+/// stores, each citation naming the attempt, run, step and sequence it points at. A citation into
+/// another repository's attempt, a frame the attempt does not hold, a diagnostic the bundle does not
+/// number, or a log retention has removed resolves to nothing and is counted in `dropped`; a claim
+/// left with no citation is dropped with it. The one reader both an attempt's analysis and a
+/// log-search answer are served by, so the two cannot disagree about what resolves.
+struct Resolution {
+    claims: Vec<Value>,
+    dropped: u64,
+    expires: Option<UnixMillis>,
+}
+
+fn resolve(
+    state: &State,
+    tenant: TenantId,
+    repo: sentinel_core::RepoId,
+    document: &Analysis,
+) -> Result<Resolution, ApiError> {
     let mut wanted: Vec<AttemptId> = Vec::with_capacity(MAX_CITED_ATTEMPTS);
     for claim in &document.claims {
         for citation in &claim.citations {
@@ -890,9 +972,9 @@ fn analysis(state: &State, request: &Request, attempt: &str) -> Route {
             Ok(found)
         })
         .map_err(store_error)?;
-    let mut resolved: Vec<(AttemptId, Cited)> = Vec::with_capacity(located.len());
-    for (cited, found) in located {
-        let Some(located) = found else {
+    let mut found: Vec<(AttemptId, Cited)> = Vec::with_capacity(located.len());
+    for (cited, located) in located {
+        let Some(located) = located else {
             continue;
         };
         let summary = located
@@ -923,7 +1005,7 @@ fn analysis(state: &State, request: &Request, attempt: &str) -> Route {
                 )
             })
             .collect();
-        resolved.push((
+        found.push((
             cited,
             Cited {
                 run: located.run,
@@ -939,9 +1021,7 @@ fn analysis(state: &State, request: &Request, attempt: &str) -> Route {
     for claim in &document.claims {
         let mut citations = Vec::with_capacity(claim.citations.len());
         for citation in &claim.citations {
-            let Some((_, target)) = resolved
-                .iter()
-                .find(|(cited, _)| *cited == citation.attempt)
+            let Some((_, target)) = found.iter().find(|(cited, _)| *cited == citation.attempt)
             else {
                 dropped = dropped.saturating_add(1);
                 continue;
@@ -984,26 +1064,11 @@ fn analysis(state: &State, request: &Request, attempt: &str) -> Route {
             claims.push(json!({ "text": claim.text, "citations": citations }));
         }
     }
-    if claims.is_empty() {
-        return ok(json!({
-            "present": false,
-            "reason": "dropped",
-            "dropped_citations": dropped,
-        }));
-    }
-    ok(json!({
-        "present": true,
-        "schema": sentinel_protocol::analysis::ANALYSIS_SCHEMA,
-        "inference": true,
-        "attempt": attempt.to_string(),
-        "origin": origin.as_str(),
-        "reused": reused,
-        "summary": document.summary,
-        "claims": claims,
-        "dropped_citations": dropped,
-        "settled_ms": settled.0,
-        "expires_ms": expires.map(|until| until.0),
-    }))
+    Ok(Resolution {
+        claims,
+        dropped,
+        expires,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1033,6 +1098,8 @@ fn request_json(request: &ai::Request, with_result: bool) -> Value {
         "provider": request.provider.as_str(),
         "data_policy": request.data_policy.as_str(),
         "origin": request.origin.as_str(),
+        "kind": request.kind.as_str(),
+        "question": request.question.as_deref(),
         "state": request.state.as_str(),
         "outcome": request.outcome.map(ai::Outcome::as_str),
         "reused": request.reused,
@@ -1061,6 +1128,9 @@ fn ai_off() -> ApiError {
 struct RequestBody {
     attempt: String,
     provider: String,
+    /// The member's question (Y07). With one, the row is a log-search request whose answer comes
+    /// from a bounded plan of reads; without one it is a failure analysis of `attempt`.
+    question: Option<String>,
 }
 
 /// A member asks for one AI request about one attempt. It is a durable row from here on: the
@@ -1074,6 +1144,21 @@ fn enqueue(state: &State, request: &mut Request, slug: &str) -> Route {
     let attempt: AttemptId = id(&body.attempt, "attempt")?;
     let provider =
         ai::Provider::parse(&body.provider).ok_or_else(|| unknown_provider(&body.provider))?;
+    let question = match body.question {
+        None => None,
+        Some(question) => {
+            // A question becomes a plan of log reads, so asking one is asking to read logs.
+            auth::require_scope(&who, Scopes::LOGS_READ)?;
+            let question = question.trim();
+            if question.is_empty() || question.len() > MAX_QUESTION_BYTES {
+                return Err(err(
+                    ErrorCode::InvalidRequest,
+                    format!("question must be 1..{MAX_QUESTION_BYTES} bytes"),
+                ));
+            }
+            Some(question.to_owned())
+        }
+    };
     let (principal, authority, scopes) = (who.principal, who.authority(), who.scopes);
     let slug = slug.to_owned();
     let row = state
@@ -1094,6 +1179,7 @@ fn enqueue(state: &State, request: &mut Request, slug: &str) -> Route {
                 repo,
                 attempt,
                 provider,
+                question.as_deref(),
                 scopes,
                 UnixMillis::now(),
             )
@@ -1163,7 +1249,36 @@ fn require_request(state: &State, request: &Request, request_id: &str) -> Route 
             ai::request(c, tenant, id)
         })
         .map_err(store_error)?;
-    ok(request_json(&row, true))
+    let mut body = request_json(&row, true);
+    if row.kind != ai::Kind::Search {
+        return ok(body);
+    }
+    // A log-search answer is served as the lines it links, resolved against what the repository's
+    // logs hold now: a line retention removed is not a line the answer still points at, and an
+    // answer whose every claim dropped is not shown at all.
+    auth::require_scope(&who, Scopes::LOGS_READ)?;
+    let Some(document) = row.analysis.as_deref() else {
+        body["present"] = json!(false);
+        body["reason"] = json!(row.reason.as_deref().or(Some("none")));
+        return ok(body);
+    };
+    let document = Analysis::decode(document.as_bytes())
+        .map_err(|_| err(ErrorCode::Internal, "stored analysis unreadable"))?;
+    let resolved = resolve(state, row.tenant, row.repo, &document)?;
+    if resolved.claims.is_empty() {
+        body["present"] = json!(false);
+        body["reason"] = json!("dropped");
+        body["dropped_citations"] = json!(resolved.dropped);
+        return ok(body);
+    }
+    body["present"] = json!(true);
+    body["inference"] = json!(true);
+    body["schema"] = json!(sentinel_protocol::analysis::ANALYSIS_SCHEMA);
+    body["summary"] = json!(document.summary);
+    body["claims"] = json!(resolved.claims);
+    body["dropped_citations"] = json!(resolved.dropped);
+    body["expires_ms"] = json!(resolved.expires.map(|until| until.0));
+    ok(body)
 }
 
 fn claim(state: &State, request: &mut Request, request_id: &str) -> Route {
@@ -1237,11 +1352,40 @@ fn complete(state: &State, request: &mut Request, request_id: &str) -> Route {
             .with_detail("outcome", other));
         }
     };
-    let analysis = match (outcome, body.analysis) {
+    let mut analysis = match (outcome, body.analysis) {
         (ai::Outcome::Completed, Some(answer)) => Some(stored(&answer)?),
         (ai::Outcome::Completed, None) => None,
         (ai::Outcome::Unavailable, _) => None,
     };
+    let mut reason = body.reason;
+    // Y07's gate, where the answer is stored: a log-search answer is accepted only when at least one
+    // claim cites evidence this repository still holds. An answer that resolves to nothing ends the
+    // request `unavailable` with the reason instead, so no reader can ever be shown one — the
+    // citations it wrote are checked against the lines the plan was executed from.
+    let mut outcome = outcome;
+    if outcome == ai::Outcome::Completed {
+        let (tenant, repo, kind) = state
+            .store
+            .read(move |c| ai::by_id(c, id).map(|row| (row.tenant, row.repo, row.kind)))
+            .map_err(store_error)?;
+        if kind == ai::Kind::Search {
+            let cited = match analysis.as_deref() {
+                Some(document) => {
+                    let document = Analysis::decode(document.as_bytes())
+                        .map_err(|_| err(ErrorCode::Internal, "stored analysis unreadable"))?;
+                    !resolve(state, tenant, repo, &document)?.claims.is_empty()
+                }
+                None => false,
+            };
+            if !cited {
+                outcome = ai::Outcome::Unavailable;
+                analysis = None;
+                reason = Some(
+                    "citation: no claim cites evidence this repository's logs hold".to_owned(),
+                );
+            }
+        }
+    }
     let now = UnixMillis::now();
     let usage = body.usage.map(|usage| usage.usage());
     let row = state
@@ -1253,7 +1397,7 @@ fn complete(state: &State, request: &mut Request, request_id: &str) -> Route {
                 id,
                 outcome,
                 analysis.as_deref(),
-                body.reason.as_deref(),
+                reason.as_deref(),
                 now,
                 usage,
             )
@@ -1339,6 +1483,330 @@ fn reserve(state: &State, request: &mut Request, request_id: &str) -> Route {
             "request": request_json(&row, false),
         }),
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// The log-search assistant (Y07): a question becomes a bounded plan of reads the controller already
+// serves, executed here under the requester's own authority, and the model sees only the result.
+// Nothing in this path can reach a line the person who asked could not, and the plan's reads, bytes
+// and matches are all bounded before any of them runs.
+// ---------------------------------------------------------------------------------------------
+
+/// What one context read inside a plan may spend. Smaller than a standalone bundle because a plan
+/// holds up to [`MAX_PLAN_READS`] of them and the whole document is bounded below.
+const PLAN_CONTEXT_BYTES: usize = 8 << 10;
+/// The largest plan result document the controller serves a model.
+const MAX_PLAN_RESULT_BYTES: usize = 64 << 10;
+/// Attempts one plan's searches look at, however small their logs: a missing or expired log still
+/// costs a lookup, and a plan is a question, never a crawl of a repository's history.
+const MAX_PLAN_TARGETS: usize = 256;
+
+/// Executes a `sentinel.ai-plan/1` under the requester's authority and answers the bounded result
+/// document a model reads instead of a log. The plan is refused — and the request settled in the
+/// same write — when it names a read this build cannot execute, a read the requester cannot perform,
+/// a scan beyond the plan's byte bound or a result larger than the document bound. Refusal is
+/// immediate and never truncated: a silently shortened answer would be a claim nobody can check.
+fn plan_reads(state: &State, request: &mut Request, request_id: &str) -> Route {
+    let who = identify(state, request, false)?;
+    let id: AiRequestId = id(request_id, "request")?;
+    // Two credentials may execute a plan: the AI service's own `ai:context` grant, and the live
+    // delegation of that very request. The delegation is the requester's own identity capped to
+    // reads, so executing under it can read nothing the requester could not.
+    let token = if who.scopes.contains(Scopes::AI_CONTEXT) {
+        None
+    } else {
+        let token = who.credential.ok_or_else(|| {
+            err(
+                ErrorCode::Forbidden,
+                "this request's delegation is required",
+            )
+        })?;
+        Some(token)
+    };
+    let row = state
+        .store
+        .read(move |c| {
+            let row = ai::by_id(c, id)?;
+            if !ai::executing(c, id, token, UnixMillis::now())? {
+                return Err(StoreError::Conflict);
+            }
+            Ok(row)
+        })
+        .map_err(store_error)?;
+    if row.kind != ai::Kind::Search {
+        return Err(err(
+            ErrorCode::InvalidRequest,
+            "this request is a failure analysis, not a log search",
+        ));
+    }
+    let plan = match Plan::decode(&body(request)?) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return refused_plan(state, id, error.reason(), error.field());
+        }
+    };
+    // The requester's own authority, re-read now: a request whose requester lost the repository, or
+    // whose tenant turned AI off, is refused rather than answered from what it could read before.
+    let requester = sentinel_core::auth::Principal::new(
+        row.requester,
+        Permissions::READ,
+        Some(row.tenant),
+        Some(row.repo),
+    );
+    let (tenant, repo) = (row.tenant, row.repo);
+    state
+        .store
+        .read(move |c| {
+            if !ai::permits(c, tenant)? {
+                return Err(StoreError::Forbidden);
+            }
+            authz::require_repo(c, requester, repo, Permissions::READ)?;
+            Ok(())
+        })
+        .map_err(|error| match error {
+            StoreError::Forbidden => {
+                err(ErrorCode::Forbidden, "AI assistance is off for this tenant")
+                    .with_detail("ai", "off")
+            }
+            other => store_error(other),
+        })?;
+    let key = state.secret_key.clone();
+    let mut reads = Vec::with_capacity(plan.reads.len());
+    let mut scanned = 0u64;
+    let mut targets = 0usize;
+    let mut patterns = patterns::Hits::NONE;
+    for (at, read) in plan.reads.iter().enumerate() {
+        match read {
+            PlanRead::Search {
+                needle,
+                runs,
+                limit,
+            } => {
+                let found = search_read(
+                    state,
+                    tenant,
+                    repo,
+                    needle,
+                    *runs,
+                    *limit,
+                    &mut scanned,
+                    &mut targets,
+                    &mut patterns,
+                )?;
+                if found.exhausted {
+                    return refused_plan(
+                        state,
+                        id,
+                        "bounds: the plan's searches exceed the log bytes it may scan",
+                        "plan",
+                    );
+                }
+                reads.push(found.read);
+            }
+            PlanRead::Context { attempt } => {
+                let owned = state
+                    .store
+                    .read(move |c| {
+                        let run = lookup::job_run(c, lookup::attempt_job(c, *attempt)?)?;
+                        Ok(lookup::run_repo(c, run)? == repo)
+                    })
+                    .map_err(store_error)?;
+                if !owned {
+                    return refused_plan(
+                        state,
+                        id,
+                        "plan: a read names an attempt this repository does not hold",
+                        format!("plan[{}]", at + 1).as_str(),
+                    );
+                }
+                let bundle = bundle(
+                    state,
+                    tenant,
+                    repo,
+                    *attempt,
+                    PLAN_CONTEXT_BYTES,
+                    key.as_deref(),
+                )
+                .map_err(|error| match error.code {
+                    // The bundle's own refusal is the plan read's: an attempt whose tenant may
+                    // send nothing has no context to read.
+                    ErrorCode::Forbidden => {
+                        err(ErrorCode::Forbidden, "AI assistance is off for this tenant")
+                            .with_detail("ai", "off")
+                    }
+                    _ => error,
+                })?;
+                reads.push(
+                    json!({ "kind": "context", "attempt": attempt.to_string(), "bundle": bundle }),
+                );
+            }
+        }
+    }
+    let mut body = json!({
+        "schema": "sentinel.ai-search/1",
+        "request": id.to_string(),
+        "question": row.question,
+        "reads": reads,
+        "bounds": {
+            "reads": plan.reads.len(),
+            "scanned_bytes": scanned,
+            "attempts": targets,
+            "bytes": 0,
+            "redaction": {
+                "pattern_replacements": patterns.count(),
+                "patterns": patterns.kinds().map(patterns::Kind::as_str).collect::<Vec<_>>(),
+            },
+        },
+    });
+    let size = json_len(&body);
+    if size > MAX_PLAN_RESULT_BYTES {
+        return refused_plan(
+            state,
+            id,
+            format!("bounds: the plan's results exceed {MAX_PLAN_RESULT_BYTES} bytes").as_str(),
+            "plan",
+        );
+    }
+    body["bounds"]["bytes"] = json!(size);
+    let row = state
+        .store
+        .read(move |c| ai::by_id(c, id))
+        .map_err(store_error)?;
+    ok(json!({ "state": "ready", "results": body, "request": request_json(&row, false) }))
+}
+
+/// One literal search of a plan: the newest `runs` runs of the repository, every attempt's log in
+/// them, at most `limit` matching lines, spending only what the plan's scan bound has left. It is
+/// the cross-run search's own read path, without a resume cursor, because a plan is one bounded
+/// question rather than a page a client walks; `patterns` counts what the credential scanners
+/// rewrote, since a model reads these lines next.
+struct Found {
+    read: Value,
+    /// Whether a target went unsearched because the plan's scan bound was spent.
+    exhausted: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_read(
+    state: &State,
+    tenant: TenantId,
+    repo: sentinel_core::RepoId,
+    needle: &str,
+    runs: u16,
+    limit: u16,
+    scanned: &mut u64,
+    targets: &mut usize,
+    patterns: &mut patterns::Hits,
+) -> Result<Found, ApiError> {
+    let window = state
+        .store
+        .read(move |c| history::search_runs(c, tenant, repo, None, runs))
+        .map_err(store_error)?;
+    let mut lines = Vec::with_capacity(usize::from(limit));
+    let mut truncated = false;
+    let mut exhausted = false;
+    let (mut expired, mut missing) = (0u32, 0u32);
+    'runs: for run in &window {
+        let candidates = state
+            .store
+            .read(move |c| history::log_targets(c, tenant, *run, None))
+            .map_err(store_error)?;
+        for target in candidates {
+            if lines.len() >= usize::from(limit) {
+                truncated = true;
+                break 'runs;
+            }
+            if *scanned >= logs::SEARCH_SCAN_BYTES || *targets >= MAX_PLAN_TARGETS {
+                exhausted = *scanned >= logs::SEARCH_SCAN_BYTES;
+                truncated = true;
+                break 'runs;
+            }
+            *targets += 1;
+            if target.expired_ms.is_some() {
+                expired += 1;
+                continue;
+            }
+            let query = logs::SearchQuery {
+                needle: needle.as_bytes(),
+                after: 0,
+                limit: usize::from(limit) - lines.len(),
+                budget: logs::SEARCH_SCAN_BYTES - *scanned,
+                carry: None,
+            };
+            let found = match state
+                .logs
+                .search(*run, target.job, target.attempt, query)
+                .or_else(|error| match error {
+                    StoreError::NotFound => state.logs.search_legacy(target.attempt, query),
+                    other => Err(other),
+                }) {
+                Ok(found) => found,
+                Err(StoreError::NotFound) => {
+                    missing += 1;
+                    continue;
+                }
+                Err(error) => return Err(store_error(error)),
+            };
+            *scanned += found.scanned;
+            for matched in &found.matches {
+                let text = String::from_utf8_lossy(&matched.text).into_owned();
+                lines.push(json!({
+                    "attempt": target.attempt.to_string(),
+                    "run": run.to_string(),
+                    "job": target.name,
+                    "evidence": format!("log-{}", matched.seq),
+                    "sequence": matched.seq,
+                    "step": matched.step,
+                    "stream": stream_name(matched.stream),
+                    "text": patterns::redact_str(&text, patterns),
+                }));
+            }
+            if found.next_after.is_some() {
+                truncated = true;
+                break 'runs;
+            }
+        }
+    }
+    Ok(Found {
+        read: json!({
+            "kind": "search",
+            "q": needle,
+            "runs": window.len(),
+            "lines": lines,
+            "truncated": truncated,
+            "expired_attempts": expired,
+            "missing_logs": missing,
+        }),
+        exhausted,
+    })
+}
+
+/// Ends a request the plan cannot answer, in the write that refuses it, and answers the same shape
+/// `reserve` does: nothing waits, and the AI process has no second call to make.
+fn refused_plan(state: &State, id: AiRequestId, reason: &str, field: &str) -> Route {
+    let reason = reason.to_owned();
+    let sent = reason.clone();
+    let row = state
+        .store
+        .writer()
+        .write(move |tx| {
+            ai::settle(
+                tx,
+                id,
+                ai::Outcome::Unavailable,
+                None,
+                Some(&sent),
+                UnixMillis::now(),
+                None,
+            )
+        })
+        .map_err(store_error)?;
+    ok(json!({
+        "state": "refused",
+        "reason": reason,
+        "field": field,
+        "request": request_json(&row, true),
+    }))
 }
 
 /// The one document the store keeps for an answer: the model's object decoded against

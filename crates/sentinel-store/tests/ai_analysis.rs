@@ -493,6 +493,7 @@ fn a_members_request_keeps_its_own_origin_and_the_sweep_leaves_it_alone() {
                 repo,
                 attempt,
                 Provider::Local,
+                None,
                 Scopes::READ_ONLY,
                 NOW,
             )
