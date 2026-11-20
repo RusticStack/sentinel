@@ -60,7 +60,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
 });
 
 // Links take a plain path: the views build them from identifiers, so typed route templates add nothing here.
-export interface PathLinkProps { to: string; search?: Record<string, unknown>; hash?: string; replace?: boolean; className?: string; children?: ReactNode; onClick?: () => void; "aria-label"?: string; "aria-current"?: "page"; title?: string; id?: string }
+export interface PathLinkProps { to: string; search?: Record<string, unknown>; hash?: string; replace?: boolean; className?: string; children?: ReactNode; onClick?: () => void; "aria-label"?: string; "aria-current"?: "page"; title?: string; id?: string; activeOptions?: { exact?: boolean; includeSearch?: boolean } }
 export function PathLink({ to, ...rest }: PathLinkProps) {
   return <Link to={to as "/"} {...(rest as object)} />;
 }

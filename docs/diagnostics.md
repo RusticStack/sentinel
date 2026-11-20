@@ -157,6 +157,11 @@ removed, and each such correction counts as malformed. A custom report that
 is not a strict `ReportInput` of version 1 (for example one asserting
 `freshness`) yields an empty report with one malformed record and no echo.
 
+The flaky list's own reader recognizes the same JUnit names plus
+`go-test.json` and `*.go-test.json`, and an attempt's own `go test -json`
+stdout, from which it keeps one row per named test rather than diagnostics
+([flaky tests](flaky-tests.md)).
+
 Artifact bytes are not redacted (see [secrets](secrets.md)), so report files
 are collected only for a credential holding `artifacts:read` as well as
 `logs:read`; otherwise `artifact_reports` is
@@ -182,6 +187,18 @@ and unresolved entities, treat elements still open at end of input as
 malformed (a truncated document is `incomplete`), stop at 64 levels of
 nesting, and preserve skipped tests as informational records. Unknown XML
 extensions are skipped.
+
+Both test formats also state, beside their diagnostics and counts, one
+**named outcome** per test: the identity flaky tracking keys on, which is the
+report's suite (a JUnit classname, a Go package) and test name with a
+parametrised or data-driven suffix dropped and a Go subtest reduced to its
+top-level function (`TestParse/case_one` is `TestParse`), the name and suite as
+the report stated them, and the status. One report lists at most 4,096
+identities and counts the rest in `omitted_tests`; a report that states one
+identity more than once keeps a failed status over a passed one and a passed
+one over a skipped one, whatever order the records arrived in. The same test
+run twice yields the same identity, which is what makes a rerun comparable
+([flaky tests](flaky-tests.md)).
 
 All parsers stop after 256 MiB or 2,000,000 records, reject individual JSON
 records or XML tags above 64 KiB, and return no more than 1,024 diagnostics.

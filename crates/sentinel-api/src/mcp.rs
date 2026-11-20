@@ -479,6 +479,7 @@ fn needs_default_tenant(name: &str, args: &Map<String, Value>) -> bool {
         && matches!(
             name,
             "list_runs"
+                | "list_flaky_tests"
                 | "explain_queue"
                 | "dispatch"
                 | "list_secret_metadata"

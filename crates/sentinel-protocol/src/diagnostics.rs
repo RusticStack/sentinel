@@ -17,6 +17,11 @@ pub const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_DIAGNOSTIC_LABEL_BYTES: usize = 256;
 pub const MAX_DIAGNOSTIC_PATH_BYTES: usize = 4 * 1024;
 pub const MAX_EVIDENCE_FRAME_OFFSET: u32 = 1 << 20;
+/// Named outcomes one report keeps: a repository with more tests than this still gets its diagnostics and its
+/// counts, and the flaky list learns nothing about the tests past the bound.
+pub const MAX_PARSER_TEST_OUTCOMES: usize = 4_096;
+/// An identity is a suite and a name, each bounded as a label.
+pub const MAX_TEST_IDENTITY_BYTES: usize = 2 * MAX_DIAGNOSTIC_LABEL_BYTES + 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "strict::ReportInput")]
@@ -87,6 +92,88 @@ impl ReportFormat {
             Self::SentinelJson => "sentinel_json",
             Self::CustomJson => "custom_json",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestStatus {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+impl TestStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// One test's terminal outcome, keyed by the identity flaky tracking holds across runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestOutcome {
+    /// [`test_identity`] of the suite and name below: what two runs of the same test have in common.
+    pub identity: String,
+    /// The name the report stated, before normalisation.
+    pub name: String,
+    pub suite: Option<String>,
+    pub status: TestStatus,
+}
+
+/// The name a test is known by across runs: a parametrised suffix (`test_add[case-1]`, `testAdd(int, int)`) is
+/// dropped, so one parameterised test is one identity, and the suite it belongs to (a JUnit classname, a Go
+/// package) is kept when the report names one. A Go subtest is reduced to its top-level function by
+/// [`go_test_name`], because a subtest that exists in one revision and not the next is still the same test.
+pub fn test_identity(suite: Option<&str>, name: &str) -> String {
+    let name = normalise_test_name(name);
+    match suite.filter(|suite| !suite.is_empty()) {
+        Some(suite) => {
+            let mut identity = String::with_capacity(suite.len() + name.len() + 2);
+            identity.push_str(suite);
+            identity.push_str("::");
+            identity.push_str(name);
+            identity
+        }
+        None => name.to_owned(),
+    }
+}
+
+/// A test's own name without its parametrised or data-driven suffix: trailing `[...]` and `(...)` groups whose
+/// content holds no bracket of their own are dropped. A name that is only a parameter keeps itself.
+pub fn normalise_test_name(name: &str) -> &str {
+    let mut end = name.trim_end().len();
+    loop {
+        let rest = &name[..end];
+        let (close, open) = match rest.as_bytes().last() {
+            Some(b']') => (']', '['),
+            Some(b')') => (')', '('),
+            _ => break,
+        };
+        let Some(at) = rest[..rest.len() - 1].rfind(open) else {
+            break;
+        };
+        let inner = &rest[at + 1..rest.len() - 1];
+        if at == 0 || inner.is_empty() || inner.contains(close) || inner.contains(open) {
+            break;
+        }
+        end = rest[..at].trim_end().len();
+        if end == 0 {
+            return name;
+        }
+    }
+    &name[..end]
+}
+
+/// The top-level test function a Go test event names: `TestA/sub/1` is `TestA`, which is the test a revision
+/// either has or has not.
+pub fn go_test_name(name: &str) -> &str {
+    match name.split_once('/') {
+        Some((top, _)) => top,
+        None => name,
     }
 }
 

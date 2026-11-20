@@ -761,6 +761,8 @@ fn database_at_latest_without_classes(path: &Path) {
          DROP TABLE ai_reservations;
          DROP TABLE ai_ledger;
          DROP TABLE ai_requests;
+         DROP TABLE test_outcomes;
+         DROP TABLE test_outcome_queue;
          DELETE FROM schema_migrations WHERE version >= 65;",
     )
     .unwrap();

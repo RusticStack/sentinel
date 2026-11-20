@@ -549,6 +549,9 @@ pub(crate) fn route(
         ("GET", ["api", "v1", "tenants", slug, "repos", name, "compare"]) => {
             history::compare(state, request, slug, name, query)
         }
+        ("GET", ["api", "v1", "tenants", slug, "repos", name, "flakes"]) => {
+            history::flakes(state, request, slug, name, query)
+        }
         (
             "GET",
             [
