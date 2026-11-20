@@ -1,0 +1,11 @@
+# expect: jobs.build.reuse: a job that opts into reuse cannot declare `finalize`; a served result runs no finalizer
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: busybox
+    steps: [{id: s, run: echo hi}]
+    finalize: {run: echo bye, timeout: 1m}
+    reuse:
+      inputs: [src/**]
+      paths: [out]

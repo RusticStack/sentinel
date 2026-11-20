@@ -1,0 +1,16 @@
+# expect: jobs.build.reuse: a job that opts into reuse cannot take a handoff, found `dist` of `pack`; the bytes it brings are not in the key
+schema: 1
+on: [push]
+jobs:
+  pack:
+    image: busybox
+    steps: [{id: s, run: echo hi}]
+    artifacts: [{name: dist, paths: [out]}]
+  build:
+    image: busybox
+    needs: [pack]
+    handoff: [{from: pack, artifact: dist, into: vendor}]
+    steps: [{id: s, run: echo hi}]
+    reuse:
+      inputs: [src/**]
+      paths: [out]

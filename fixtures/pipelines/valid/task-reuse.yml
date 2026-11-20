@@ -16,7 +16,7 @@ jobs:
         env: {RUST_BACKTRACE: "1"}
     reuse:
       inputs: [Cargo.toml, Cargo.lock, "crates/**/src/**.rs"]
-      outputs: [target/release]
+      paths: [target/release]
   report:
     image: busybox
     needs: [build]

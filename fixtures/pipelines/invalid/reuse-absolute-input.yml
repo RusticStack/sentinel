@@ -7,4 +7,4 @@ jobs:
     steps: [{id: s, run: echo hi}]
     reuse:
       inputs: [/etc/passwd]
-      outputs: [out]
+      paths: [out]

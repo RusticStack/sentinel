@@ -2,12 +2,19 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const SUMMARY_FORMAT: u8 = 5;
+pub const SUMMARY_FORMAT: u8 = 6;
 // Old formats stay decodable forever: keep their shadow structs when the format changes.
 const SUMMARY_FORMAT_V1: u8 = 1;
 const SUMMARY_FORMAT_V2: u8 = 2;
 const SUMMARY_FORMAT_V3: u8 = 3;
 const SUMMARY_FORMAT_V4: u8 = 4;
+const SUMMARY_FORMAT_V5: u8 = 5;
+/// The outputs one attempt may report: the job's own declared outputs, bounded by the schema.
+pub const MAX_OUTPUT_RECORDS: usize = 8;
+/// The bytes one output name and value may take in the record.
+pub const MAX_OUTPUT_RECORD_BYTES: usize = 1088;
+/// The bytes a finalizer's annotation may hold; it never carries what the finalizer printed.
+pub const MAX_ANNOTATION_BYTES: usize = 200;
 pub const MAX_SUMMARY_BYTES: usize = 32 * 1024;
 // Must fit one control frame; receivers drop a summary the store column cannot hold, never fail the job.
 const _: () = assert!(MAX_SUMMARY_BYTES < crate::limits::MAX_CONTROL_MESSAGE_BYTES);
@@ -62,6 +69,16 @@ pub struct CacheRecord {
     pub costly_hit: bool,
 }
 
+/// What a job's bounded finalizer did. It never decides the verdict: the attempt's outcome is the steps' outcome
+/// whatever this says, and a deployment reads it as an annotation on the record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizerRecord {
+    pub outcome: StepOutcome,
+    pub duration_ns: Option<u64>,
+    /// One line naming what happened, built from exit statuses and bounds only: never what it printed.
+    pub annotation: String,
+}
+
 /// The guest image a microVM attempt ran: the digest its root file system was built from and checked against.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestImageRecord {
@@ -109,11 +126,59 @@ pub struct AttemptSummary {
     /// Present for microVM attempts only (format 4).
     pub guest_image: Option<GuestImageRecord>,
     pub detail: String,
-    /// Present when this attempt served a task result instead of running the job (format 5).
+    /// The job's declared outputs, by name, in declaration order (format 5). Plain text: they are public within
+    /// the tenant the attempt belongs to.
+    pub outputs: Vec<(String, String)>,
+    /// What the job's finalizer did (format 5), when the job declares one.
+    pub finalizer: Option<FinalizerRecord>,
+    /// Present when this attempt served a task result instead of running the job (format 6).
     pub reuse: Option<ReuseRecord>,
 }
 
-/// Format 4: the shape before task-result reuse, still read for every attempt written by an older worker.
+/// Format 5: the shape before task-result reuse, still read for every attempt written by an older worker.
+#[derive(Deserialize, Serialize)]
+struct AttemptSummaryV5 {
+    checkout_ns: Option<u64>,
+    checkout_fetch_ns: Option<u64>,
+    checkout_materialize_ns: Option<u64>,
+    checkout_route: Option<CheckoutRoute>,
+    image_pull_ns: Option<u64>,
+    image_present: Option<bool>,
+    container_start_ns: Option<u64>,
+    steps_ns: Option<u64>,
+    finalize_ns: Option<u64>,
+    steps: Vec<StepRecord>,
+    caches: Vec<CacheRecord>,
+    guest_image: Option<GuestImageRecord>,
+    detail: String,
+    outputs: Vec<(String, String)>,
+    finalizer: Option<FinalizerRecord>,
+}
+
+impl From<AttemptSummaryV5> for AttemptSummary {
+    fn from(v5: AttemptSummaryV5) -> Self {
+        Self {
+            checkout_ns: v5.checkout_ns,
+            checkout_fetch_ns: v5.checkout_fetch_ns,
+            checkout_materialize_ns: v5.checkout_materialize_ns,
+            checkout_route: v5.checkout_route,
+            image_pull_ns: v5.image_pull_ns,
+            image_present: v5.image_present,
+            container_start_ns: v5.container_start_ns,
+            steps_ns: v5.steps_ns,
+            finalize_ns: v5.finalize_ns,
+            steps: v5.steps,
+            caches: v5.caches,
+            guest_image: v5.guest_image,
+            detail: v5.detail,
+            outputs: v5.outputs,
+            finalizer: v5.finalizer,
+            reuse: None,
+        }
+    }
+}
+
+/// Format 4: the summary before declared outputs and finalizers.
 #[derive(Deserialize, Serialize)]
 struct AttemptSummaryV4 {
     checkout_ns: Option<u64>,
@@ -129,27 +194,6 @@ struct AttemptSummaryV4 {
     caches: Vec<CacheRecord>,
     guest_image: Option<GuestImageRecord>,
     detail: String,
-}
-
-impl From<AttemptSummaryV4> for AttemptSummary {
-    fn from(v4: AttemptSummaryV4) -> Self {
-        Self {
-            checkout_ns: v4.checkout_ns,
-            checkout_fetch_ns: v4.checkout_fetch_ns,
-            checkout_materialize_ns: v4.checkout_materialize_ns,
-            checkout_route: v4.checkout_route,
-            image_pull_ns: v4.image_pull_ns,
-            image_present: v4.image_present,
-            container_start_ns: v4.container_start_ns,
-            steps_ns: v4.steps_ns,
-            finalize_ns: v4.finalize_ns,
-            steps: v4.steps,
-            caches: v4.caches,
-            guest_image: v4.guest_image,
-            detail: v4.detail,
-            reuse: None,
-        }
-    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -209,7 +253,28 @@ impl From<AttemptSummaryV3> for AttemptSummary {
             caches: v3.caches,
             detail: v3.detail,
             guest_image: None,
-            reuse: None,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<AttemptSummaryV4> for AttemptSummary {
+    fn from(v4: AttemptSummaryV4) -> Self {
+        Self {
+            checkout_ns: v4.checkout_ns,
+            checkout_fetch_ns: v4.checkout_fetch_ns,
+            checkout_materialize_ns: v4.checkout_materialize_ns,
+            checkout_route: v4.checkout_route,
+            image_pull_ns: v4.image_pull_ns,
+            image_present: v4.image_present,
+            container_start_ns: v4.container_start_ns,
+            steps_ns: v4.steps_ns,
+            finalize_ns: v4.finalize_ns,
+            steps: v4.steps,
+            caches: v4.caches,
+            guest_image: v4.guest_image,
+            detail: v4.detail,
+            ..Self::default()
         }
     }
 }
@@ -256,7 +321,18 @@ pub enum SummaryError {
 
 impl AttemptSummary {
     pub fn encode(&self) -> Result<Vec<u8>, SummaryError> {
-        if self.steps.len() > MAX_STEP_RECORDS || self.caches.len() > MAX_CACHE_RECORDS {
+        if self.steps.len() > MAX_STEP_RECORDS
+            || self.caches.len() > MAX_CACHE_RECORDS
+            || self.outputs.len() > MAX_OUTPUT_RECORDS
+            || self
+                .outputs
+                .iter()
+                .any(|(name, value)| name.len() + value.len() > MAX_OUTPUT_RECORD_BYTES)
+            || self
+                .finalizer
+                .as_ref()
+                .is_some_and(|f| f.annotation.len() > MAX_ANNOTATION_BYTES)
+        {
             return Err(SummaryError::TooLarge);
         }
         let out =
@@ -275,6 +351,9 @@ impl AttemptSummary {
             Some((&SUMMARY_FORMAT, body)) => {
                 postcard::from_bytes(body).map_err(|_| SummaryError::Decode)?
             }
+            Some((&SUMMARY_FORMAT_V5, body)) => AttemptSummary::from(
+                postcard::from_bytes::<AttemptSummaryV5>(body).map_err(|_| SummaryError::Decode)?,
+            ),
             Some((&SUMMARY_FORMAT_V4, body)) => AttemptSummary::from(
                 postcard::from_bytes::<AttemptSummaryV4>(body).map_err(|_| SummaryError::Decode)?,
             ),
@@ -291,7 +370,10 @@ impl AttemptSummary {
         };
         // Encode refuses a summary past these bounds, so a blob that decodes past them did not come from
         // this protocol. A reader stops there instead of carrying records the writer may never produce.
-        if summary.steps.len() > MAX_STEP_RECORDS || summary.caches.len() > MAX_CACHE_RECORDS {
+        if summary.steps.len() > MAX_STEP_RECORDS
+            || summary.caches.len() > MAX_CACHE_RECORDS
+            || summary.outputs.len() > MAX_OUTPUT_RECORDS
+        {
             return Err(SummaryError::TooLarge);
         }
         Ok(summary)
@@ -373,6 +455,15 @@ mod tests {
                 build_ns: Some(9_000_000_000),
             }),
             detail: "step 1 exited with 3".into(),
+            outputs: vec![
+                ("version".into(), "1.4.0".into()),
+                ("channel".into(), "stable".into()),
+            ],
+            finalizer: Some(FinalizerRecord {
+                outcome: StepOutcome::Failed { code: 2 },
+                duration_ns: Some(11),
+                annotation: "finalizer exited with 2".into(),
+            }),
             reuse: Some(ReuseRecord {
                 entry: "test".into(),
                 key: "ab".repeat(32),

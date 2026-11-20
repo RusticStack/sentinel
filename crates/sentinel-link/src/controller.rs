@@ -3106,6 +3106,77 @@ impl SessionHandler for Inner {
         }
     }
 
+    /// The artifact a job this attempt needs published, as its own manifest states it: the same entries, digests
+    /// and retention the publication decided, so a handoff makes no second copy of anything.
+    fn handoff_need(
+        &self,
+        worker: WorkerId,
+        attempt: AttemptId,
+        from: &str,
+        artifact: &str,
+    ) -> std::result::Result<session::HandoffPlan, sentinel_protocol::handoff::Refusal> {
+        use sentinel_protocol::handoff::Refusal;
+        let (tenant, entries) = self
+            .store
+            .read(|conn| {
+                let source = dispatch::handoff_source(
+                    conn,
+                    worker,
+                    attempt,
+                    from,
+                    artifact,
+                    UnixMillis::now(),
+                )?;
+                let manifest = self.objects.manifest(
+                    conn,
+                    source.tenant,
+                    sentinel_store::objects::Kind::Artifact,
+                    &source.manifest,
+                    Some(source.version),
+                )?;
+                Ok((source.tenant, manifest.entries))
+            })
+            .map_err(|e| match e {
+                sentinel_store::Error::Forbidden => Refusal::Denied,
+                sentinel_store::Error::NotFound => Refusal::Absent,
+                _ => Refusal::Unavailable,
+            })?;
+        let mut bytes = 0u64;
+        let mut planned = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            if entry.path.len() > sentinel_protocol::limits::MAX_ARTIFACT_PATH_BYTES {
+                return Err(Refusal::Unavailable);
+            }
+            bytes = bytes.saturating_add(entry.len);
+            planned.push(sentinel_protocol::handoff::Entry {
+                path: entry.path.clone(),
+                len: entry.len,
+                digest: *entry.digest.as_bytes(),
+                mode: entry.mode,
+            });
+        }
+        if planned.len() > sentinel_protocol::handoff::MAX_ENTRIES
+            || bytes > sentinel_protocol::handoff::MAX_BYTES
+        {
+            return Err(Refusal::Unavailable);
+        }
+        let objects = Arc::clone(&self.objects);
+        Ok(session::HandoffPlan {
+            entries: planned,
+            bytes,
+            open: Box::new(move |entry| {
+                objects
+                    .open_entry(
+                        tenant,
+                        sentinel_store::objects::Digest::from_bytes(entry.digest),
+                        entry.len,
+                    )
+                    .map(|reader| Box::new(reader) as Box<dyn std::io::Read + Send>)
+                    .map_err(|_| std::io::Error::other("entry unavailable"))
+            }),
+        })
+    }
+
     fn cache_need(&self, worker: WorkerId, need: &Need) -> Option<std::path::PathBuf> {
         self.cache_authorize(
             worker,
@@ -3858,6 +3929,7 @@ fn resolve_spec(
             needs: c.needs,
             tenant: Some(c.tenant),
             trust: c.trust,
+            outputs: c.outputs,
             reuse_fresh: c.reuse_fresh,
         };
         let spec = sentinel_pipeline::RunSpec::decode(&bytes)

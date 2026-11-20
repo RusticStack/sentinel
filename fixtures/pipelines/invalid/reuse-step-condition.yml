@@ -7,4 +7,4 @@ jobs:
     steps: [{id: s, run: echo hi, if: event.ref == 'refs/heads/main'}]
     reuse:
       inputs: [src/**]
-      outputs: [out]
+      paths: [out]

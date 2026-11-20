@@ -149,7 +149,7 @@ pub fn prepare(
         name,
         class: Class::Results,
         key: template,
-        paths: reuse.outputs,
+        paths: reuse.paths,
     };
     let cache_root = root.join(sentinel_cache::CACHE_DIR);
     let env = Context {
@@ -271,6 +271,7 @@ mod tests {
                 needs: Vec::new(),
                 tenant: Some(tenant),
                 trust: Trust::Protected,
+                outputs: Vec::new(),
                 reuse_fresh: false,
             },
             images: Images::with_download(|_, _, _, _, _| Ok(false)),

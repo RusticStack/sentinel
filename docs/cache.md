@@ -116,15 +116,25 @@ A **task result** is a job's success plus the workspace trees it declared as its
 | Toolchain identity | `Scope::toolchain_digest` of `name@digest` — the same 32 bytes the cache scope carries, so the two stores cannot disagree about "the toolchain" |
 | Command | per step: its id, its shell, its workdir, its timeout and the exact `run` text |
 | Declared environment | per step: the job's `env` with the step's `env` overriding by name, sorted, so the merged environment a step sees is exactly what the key covers |
+| Captured paths | each `reuse.paths` entry, in declaration order: a different capture set restores different trees |
 | Declared inputs | each `reuse.inputs` pattern with the digest `hash_files` resolved it to in the fresh checkout, in declaration order |
 
 The run, the attempt, the event, the source revision and the job's name are in no component: a result is a function of the task, not of the trigger that asked for it. Two runs of the same commit in the same pipeline render the same key, which is the point; a change to anything the pipeline declares for the job renders a different one.
 
-Everything the key cannot cover is refused by the loader rather than guessed at, so a key is never a partial one: a job that declares `secrets` (a value is never read into a key), a job or step with an `if` (nothing of a served job runs, so a condition could never be re-decided), and a step-triggered artifact (`when: step:<id>` publishes at a completion a served result never reaches) cannot opt in. `reuse.inputs` is 1–16 `hash_files` patterns and `reuse.outputs` is 1–8 normalised relative workspace directories, captured recursively the way a `cache:` path is.
+Everything the key cannot cover is refused by the loader rather than guessed at, so a key is never a partial one. A job that opts in cannot declare:
+
+- **`secrets`** or `registry_auth` — a secret value is never read into a key;
+- a job or step **`if`** — nothing of a served job runs, so no condition could be re-decided;
+- step or job **`outputs`** — the [declared output values](pipeline-schema.md#declared-outputs) are text a dependent job reads, and no step of a served job runs to write one;
+- **`handoff`** — another job's artifact bytes are an input the key cannot name, so a result sealed with one could be served for different bytes;
+- **`finalize`** — a finalizer runs when the job's steps end, and a served job runs none;
+- a step-triggered artifact (**`when: step:<id>`**) — it publishes at a completion a served result never reaches.
+
+`reuse.inputs` is 1–16 `hash_files` patterns and `reuse.paths` is 1–8 normalised relative workspace directories, captured recursively the way a `cache:` path is, and never inside `.sentinel-cache` (the worker's own view directory).
 
 **Sandbox rule.** The isolation class is part of the key, so a result serves only the class it was produced in: a result sealed by a `microvm` attempt is never served to a `container` job, and a container's is never served to a microVM either. The classes are not ranked here — `microvm` is stronger on a KVM host, but which bytes a host can trust across executors is the wrong question to answer by inference, so the rule is equality. An unstated `runs_on.isolation` does not escape it: the class the attempt *actually* ran in is what the worker keys and what it seals.
 
-**Provenance and the forced refresh.** A served result carries `AttemptSummary::reuse` (format 5): the entry name, the rendered key, the generation directory it was restored from, that generation's seal instant, its file and byte counts and the restore's duration. The attempt's `steps` are empty, because none of them ran, and its verdict is `Passed`. Its artifacts still publish, from the restored trees, exactly as `when: success` would publish them from a run.
+**Provenance and the forced refresh.** A served result carries `AttemptSummary::reuse` (format 6): the entry name, the rendered key, the generation directory it was restored from, that generation's seal instant, its file and byte counts and the restore's duration. The attempt's `steps` are empty, because none of them ran, and its verdict is `Passed`. Its artifacts still publish, from the restored trees, exactly as `when: success` would publish them from a run.
 
 A run may be marked **fresh** (`POST …/runs` with `"fresh": true`, and every rerun), and then every task it carries executes: `runs.reuse_fresh` is delivered in the job context, and a fresh attempt does not look the store up at all. It seals nothing either, so a fresh run behaves exactly as a pipeline that declares no `reuse:` — a key that could produce different bytes for the same inputs is a key whose declared inputs were incomplete, and rewriting an entry from a fresh run would let an undeclared input become the reused result. A rerun of a job therefore always executes it: a rerun that served the earlier result would do nothing at all.
 

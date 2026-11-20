@@ -27,12 +27,24 @@ pub const MAX_PATHS: usize = 32;
 pub const MAX_LABELS: usize = 8;
 pub const MAX_SECRETS: usize = 16;
 pub const MAX_REUSE_INPUTS: usize = 16;
-pub const MAX_REUSE_OUTPUTS: usize = 8;
+pub const MAX_REUSE_PATHS: usize = 8;
 pub const MAX_RUN_BYTES: usize = 4096;
 pub const MAX_ID_BYTES: usize = 64;
 pub const MAX_CLASS_NAME: usize = 32;
 pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 60 * 60;
+/// The outputs one step may declare, and the most a job's steps may declare together.
+pub const MAX_STEP_OUTPUTS: usize = 8;
+pub const MAX_JOB_OUTPUTS: usize = 8;
+pub const MAX_OUTPUTS: usize = 16;
+pub const MAX_OUTPUT_NAME_BYTES: usize = MAX_ID_BYTES;
+/// The bytes one declared output value may hold once the step wrote it.
+pub const MAX_OUTPUT_BYTES: usize = 1024;
+/// The artifacts one job may take from the jobs it needs.
+pub const MAX_HANDOFF: usize = 8;
+/// A finalizer's own bound, independent of the job's timeout.
+pub const MAX_FINALIZE_SECS: u64 = 5 * 60;
+pub const DEFAULT_FINALIZE_SECS: u64 = 60;
 /// The `when` value that publishes an artifact behind a named step: `step:<id>`.
 pub const STEP_TRIGGER_PREFIX: &str = "step:";
 
@@ -87,6 +99,11 @@ pub struct Job {
     pub secrets: Vec<String>,
     /// Never exposed to a step: it authorizes only this job's image pull.
     pub registry_auth: Option<String>,
+    /// The step outputs other jobs may read, each declared by one of this job's steps.
+    pub outputs: Vec<String>,
+    pub handoff: Vec<Handoff>,
+    /// Runs once the job's steps have ended; it cannot change the verdict.
+    pub finalize: Option<Finalize>,
     /// Opt-in task-result reuse. Absent, the job always executes.
     pub reuse: Option<Reuse>,
 }
@@ -99,8 +116,9 @@ pub struct Job {
 pub struct Reuse {
     /// `hash_files` patterns: the job's declared inputs, by digest.
     pub inputs: Vec<String>,
-    /// Workspace directories the job's result consists of, captured recursively.
-    pub outputs: Vec<String>,
+    /// Workspace trees the job's result consists of, captured recursively. Not the `outputs` values a step
+    /// writes and a dependent job reads: those are text, and a job that declares either cannot opt in.
+    pub paths: Vec<String>,
 }
 
 impl Job {
@@ -188,6 +206,30 @@ pub struct Step {
     pub secret_files: Vec<SecretFile>,
     pub workdir: Option<String>,
     pub timeout_secs: Option<u64>,
+    /// Names this step writes into its output file; each value is bounded and plain text.
+    pub outputs: Vec<String>,
+}
+
+/// A bounded step that runs when the job ends, on the attempt's own container and workspace. It cannot change the
+/// verdict: what it does is an annotation on the attempt's record, and nothing else.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finalize {
+    pub run: String,
+    pub shell: Shell,
+    pub env: Vec<(String, String)>,
+    pub workdir: Option<String>,
+    pub timeout_secs: u64,
+}
+
+/// An artifact of an earlier job, taken into this job's workspace before its steps run. The bytes are the
+/// producer's own publication, verified against its digests; no copy of the artifact is made.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Handoff {
+    /// The job that published it; it must be one of this job's `needs`.
+    pub from: String,
+    pub artifact: String,
+    /// The workspace directory the artifact's entries are placed under.
+    pub into: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -948,6 +990,10 @@ fn step(path: &str, node: &Node, inputs: &Inputs) -> Result<Step> {
         Some(n) => Some(timeout(&map.child("timeout"), n)?),
         None => None,
     };
+    let outputs = match map.take("outputs") {
+        None => Vec::new(),
+        Some(n) => output_names(&map.child("outputs"), n, MAX_STEP_OUTPUTS)?,
+    };
     map.finish()?;
     Ok(Step {
         id,
@@ -959,7 +1005,122 @@ fn step(path: &str, node: &Node, inputs: &Inputs) -> Result<Step> {
         secret_files,
         workdir,
         timeout_secs,
+        outputs,
     })
+}
+
+/// The names a step, a job or a finalizer declares as outputs: ids, distinct, at most `max` of them.
+fn output_names(path: &str, node: &Node, max: usize) -> Result<Vec<String>> {
+    let items = expect_seq(path, node, max)?;
+    let mut out: Vec<String> = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let p = format!("{path}[{i}]");
+        let name = expect_id(&p, item)?;
+        if out.iter().any(|existing| existing == name) {
+            return Err(err(&p, SchemaErrorKind::Invalid("duplicate output".into())));
+        }
+        out.push(name.to_owned());
+    }
+    Ok(out)
+}
+
+/// The finalizer a job states: `run` and nothing the verdict could come from. It takes no outputs, no secrets and
+/// no `if`: what it does is an annotation, so it declares nothing a later step or job could read.
+fn finalize(path: &str, node: &Node) -> Result<Finalize> {
+    let mut map = Map::new(path, node)?;
+    let run_path = map.child("run");
+    let run = map
+        .take("run")
+        .ok_or_else(|| err(&run_path, SchemaErrorKind::Missing))
+        .and_then(|n| expect_str(&run_path, n, MAX_RUN_BYTES))?
+        .to_owned();
+    let shell = match map.take("shell") {
+        None => Shell::Sh,
+        Some(n) => match expect_str(&map.child("shell"), n, 8)? {
+            "sh" => Shell::Sh,
+            "bash" => Shell::Bash,
+            _ => {
+                return Err(err(
+                    &map.child("shell"),
+                    SchemaErrorKind::Invalid("expected sh or bash".into()),
+                ));
+            }
+        },
+    };
+    let env = match map.take("env") {
+        Some(n) => env(&map.child("env"), n)?,
+        None => Vec::new(),
+    };
+    let workdir = match map.take("workdir") {
+        Some(n) => Some(relative_path(&map.child("workdir"), n)?),
+        None => None,
+    };
+    let timeout_secs = match map.take("timeout") {
+        None => DEFAULT_FINALIZE_SECS,
+        Some(n) => timeout(&map.child("timeout"), n)?,
+    };
+    if timeout_secs > MAX_FINALIZE_SECS {
+        return Err(err(
+            &map.child("timeout"),
+            SchemaErrorKind::Invalid(format!(
+                "exceeds the {MAX_FINALIZE_SECS} seconds a finalizer is bounded to"
+            )),
+        ));
+    }
+    map.finish()?;
+    Ok(Finalize {
+        run,
+        shell,
+        env,
+        workdir,
+        timeout_secs,
+    })
+}
+
+fn handoffs(path: &str, node: &Node, needs: &[String]) -> Result<Vec<Handoff>> {
+    let items = expect_seq(path, node, MAX_HANDOFF)?;
+    let mut out: Vec<Handoff> = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let p = format!("{path}[{i}]");
+        let mut map = Map::new(&p, item)?;
+        let from_path = map.child("from");
+        let from = map
+            .take("from")
+            .ok_or_else(|| err(&from_path, SchemaErrorKind::Missing))
+            .and_then(|n| expect_id(&from_path, n))?
+            .to_owned();
+        let artifact_path = map.child("artifact");
+        let artifact = map
+            .take("artifact")
+            .ok_or_else(|| err(&artifact_path, SchemaErrorKind::Missing))
+            .and_then(|n| expect_id(&artifact_path, n))?
+            .to_owned();
+        let into = match map.take("into") {
+            Some(n) => relative_path(&map.child("into"), n)?,
+            None => return Err(err(&map.child("into"), SchemaErrorKind::Missing)),
+        };
+        map.finish()?;
+        if !needs.contains(&from) {
+            return Err(err(
+                &from_path,
+                SchemaErrorKind::Invalid(
+                    "a handoff may only name a job listed in this job's `needs`".into(),
+                ),
+            ));
+        }
+        if out.iter().any(|h| h.from == from && h.artifact == artifact) {
+            return Err(err(
+                &p,
+                SchemaErrorKind::Invalid("duplicate handoff of the same artifact".into()),
+            ));
+        }
+        out.push(Handoff {
+            from,
+            artifact,
+            into,
+        });
+    }
+    Ok(out)
 }
 
 fn validate_secret_name(path: &str, name: &str) -> Result<()> {
@@ -1418,11 +1579,69 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Res
                 .collect::<Result<Vec<_>>>()?
         }
     };
+    // One output name means one value in the job: a later step reads `version`, and two steps writing it would
+    // make which one it reads depend on the order nobody declared.
+    let mut outputs_seen: Vec<&str> = Vec::new();
+    let mut declared: usize = 0;
+    for (step_index, step) in steps.iter().enumerate() {
+        for (i, name) in step.outputs.iter().enumerate() {
+            if outputs_seen.contains(&name.as_str()) {
+                return Err(err(
+                    &format!("{steps_path}[{step_index}].outputs[{i}]"),
+                    SchemaErrorKind::Invalid("duplicate output".into()),
+                ));
+            }
+            outputs_seen.push(name);
+        }
+        declared += step.outputs.len();
+    }
+    if declared > MAX_OUTPUTS {
+        return Err(err(
+            &steps_path,
+            SchemaErrorKind::Invalid(format!(
+                "declares more than {MAX_OUTPUTS} outputs across its steps"
+            )),
+        ));
+    }
+    let outputs_path = map.child("outputs");
+    let outputs = match map.take("outputs") {
+        None => Vec::new(),
+        Some(n) => {
+            let names = output_names(&outputs_path, n, MAX_JOB_OUTPUTS)?;
+            for (i, name) in names.iter().enumerate() {
+                if !outputs_seen.contains(&name.as_str()) {
+                    return Err(err(
+                        &format!("{outputs_path}[{i}]"),
+                        SchemaErrorKind::Invalid(
+                            "a job output must be declared by one of the job's steps".into(),
+                        ),
+                    ));
+                }
+            }
+            names
+        }
+    };
+    let finalize = match map.take("finalize") {
+        None => None,
+        Some(n) => Some(finalize(&map.child("finalize"), n)?),
+    };
+    let handoff = match map.take("handoff") {
+        None => Vec::new(),
+        Some(n) => handoffs(&map.child("handoff"), n, &needs)?,
+    };
     let reuse = match map.take("reuse") {
         None => None,
         Some(n) => {
             let child = map.child("reuse");
-            let declared = reuse(&child, n, &condition, &steps, &artifacts, &secrets)?;
+            let declared = reuse(&child, n, &Shapes {
+                condition: &condition,
+                outputs: &outputs,
+                handoff: &handoff,
+                finalize: &finalize,
+                steps: &steps,
+                artifacts: &artifacts,
+                secrets: &secrets,
+            })?;
             Some(declared)
         }
     };
@@ -1441,6 +1660,9 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Res
         artifacts,
         secrets,
         registry_auth,
+        outputs,
+        handoff,
+        finalize,
         reuse,
     })
 }
@@ -1453,14 +1675,19 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Res
 ///
 /// Reuse is opt-in and narrow on purpose: a task whose inputs the document cannot name completely is not
 /// reusable, so every shape that would make the key a guess is refused here instead of at the worker.
-fn reuse(
-    path: &str,
-    node: &Node,
-    condition: &Option<Expr>,
-    steps: &[Step],
-    artifacts: &[Artifact],
-    secrets: &[String],
-) -> Result<Reuse> {
+/// The shapes of one job a reuse declaration has to be judged against: everything that would make a key
+/// incomplete or a served result behave differently from a run.
+struct Shapes<'a> {
+    condition: &'a Option<Expr>,
+    outputs: &'a [String],
+    handoff: &'a [Handoff],
+    finalize: &'a Option<Finalize>,
+    steps: &'a [Step],
+    artifacts: &'a [Artifact],
+    secrets: &'a [String],
+}
+
+fn reuse(path: &str, node: &Node, shapes: &Shapes<'_>) -> Result<Reuse> {
     let mut map = Map::new(path, node)?;
     let inputs_path = map.child("inputs");
     let inputs = map
@@ -1478,25 +1705,25 @@ fn reuse(
             ));
         }
     }
-    let outputs_path = map.child("outputs");
-    let outputs = map
-        .take("outputs")
-        .ok_or_else(|| err(&outputs_path, SchemaErrorKind::Missing))
-        .and_then(|n| string_list(&outputs_path, n, MAX_REUSE_OUTPUTS, 256))?;
-    for (i, output) in outputs.iter().enumerate() {
+    let paths_path = map.child("paths");
+    let paths = map
+        .take("paths")
+        .ok_or_else(|| err(&paths_path, SchemaErrorKind::Missing))
+        .and_then(|n| string_list(&paths_path, n, MAX_REUSE_PATHS, 256))?;
+    for (i, output) in paths.iter().enumerate() {
         if !valid_relative_path(output) {
             return Err(err(
-                &format!("{outputs_path}[{i}]"),
+                &format!("{paths_path}[{i}]"),
                 SchemaErrorKind::Invalid(
                     "must be a normalised relative workspace directory without `..`".into(),
                 ),
             ));
         }
-        // The worker keeps cache and result views in one private workspace directory; an output declared
+        // The worker keeps cache and result views in one private workspace directory; a path declared
         // inside it could never be captured, so it is refused here instead of silently never reusing.
         if output.split('/').next() == Some(PRIVATE_WORKSPACE_DIR) {
             return Err(err(
-                &format!("{outputs_path}[{i}]"),
+                &format!("{paths_path}[{i}]"),
                 SchemaErrorKind::Invalid(format!(
                     "must not be inside `{PRIVATE_WORKSPACE_DIR}`, which the worker owns"
                 )),
@@ -1505,7 +1732,7 @@ fn reuse(
     }
     map.finish()?;
     // A secret value is never read into a key, so a job that needs one cannot state a complete identity.
-    if let Some(name) = secrets.first() {
+    if let Some(name) = shapes.secrets.first() {
         return Err(err(
             path,
             SchemaErrorKind::Invalid(format!(
@@ -1514,7 +1741,7 @@ fn reuse(
         ));
     }
     // A served result cannot evaluate a condition, because nothing of the job runs to reach it.
-    if condition.is_some() {
+    if shapes.condition.is_some() {
         return Err(err(
             path,
             SchemaErrorKind::Invalid(
@@ -1523,7 +1750,7 @@ fn reuse(
             ),
         ));
     }
-    if let Some(step) = steps.iter().find(|step| step.condition.is_some()) {
+    if let Some(step) = shapes.steps.iter().find(|step| step.condition.is_some()) {
         return Err(err(
             path,
             SchemaErrorKind::Invalid(format!(
@@ -1533,7 +1760,8 @@ fn reuse(
         ));
     }
     // A step-triggered artifact publishes as its step completes, and a served result has no such completion.
-    if artifacts
+    if shapes
+        .artifacts
         .iter()
         .any(|artifact| artifact.when.step().is_some())
     {
@@ -1545,7 +1773,38 @@ fn reuse(
             ),
         ));
     }
-    Ok(Reuse { inputs, outputs })
+    // A declared output is a value a step writes and a dependent job reads; nothing of a served job runs to
+    // write one, so the jobs that need this one would read nothing.
+    if let Some(name) = shapes.outputs.first() {
+        return Err(err(
+            path,
+            SchemaErrorKind::Invalid(format!(
+                "a job that opts into reuse cannot declare output `{name}`; no step of a served job runs to write it"
+            )),
+        ));
+    }
+    // A handoff is an artifact of another job, brought into this workspace before its steps run: it is an
+    // input the key cannot name, so a result sealed with one could be served for different bytes.
+    if let Some(handoff) = shapes.handoff.first() {
+        return Err(err(
+            path,
+            SchemaErrorKind::Invalid(format!(
+                "a job that opts into reuse cannot take a handoff, found `{}` of `{}`; the bytes it brings are not in the key",
+                handoff.artifact, handoff.from
+            )),
+        ));
+    }
+    // A finalizer runs once the steps have ended, and a served job runs none of them.
+    if shapes.finalize.is_some() {
+        return Err(err(
+            path,
+            SchemaErrorKind::Invalid(
+                "a job that opts into reuse cannot declare `finalize`; a served result runs no finalizer"
+                    .into(),
+            ),
+        ));
+    }
+    Ok(Reuse { inputs, paths })
 }
 
 /// Whether a string is a `hash_files` pattern the resolver accepts: relative, no empty segment, no `..`.

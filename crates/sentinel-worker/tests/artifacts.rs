@@ -213,6 +213,7 @@ fn step(id: &str) -> sentinel_pipeline::schema::Step {
         secret_files: Vec::new(),
         workdir: None,
         timeout_secs: None,
+        outputs: Vec::new(),
     }
 }
 

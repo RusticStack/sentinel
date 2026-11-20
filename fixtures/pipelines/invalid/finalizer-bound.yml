@@ -1,0 +1,8 @@
+# expect: jobs.a.finalize.timeout: exceeds the 300 seconds a finalizer is bounded to
+schema: 1
+on: [push]
+jobs:
+  a:
+    image: busybox
+    steps: [{id: one, run: x}]
+    finalize: {run: echo done, timeout: 10m}

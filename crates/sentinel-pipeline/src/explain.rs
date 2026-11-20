@@ -63,6 +63,11 @@ pub struct JobExplanation {
     pub caches: Vec<CacheExplanation>,
     pub artifacts: Vec<String>,
     pub secrets: Vec<String>,
+    /// The step outputs this job publishes to the jobs that need it.
+    pub outputs: Vec<String>,
+    /// The artifacts this job takes from the jobs it needs, as `<job>/<artifact>` into their directory.
+    pub handoff: Vec<HandoffExplanation>,
+    pub finalizer: Option<FinalizerExplanation>,
     /// The task-result reuse declaration, when the job opted in: what a served result covers and restores.
     pub reuse: Option<ReuseExplanation>,
 }
@@ -70,7 +75,19 @@ pub struct JobExplanation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReuseExplanation {
     pub inputs: Vec<String>,
-    pub outputs: Vec<String>,
+    pub paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HandoffExplanation {
+    pub from: String,
+    pub artifact: String,
+    pub into: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FinalizerExplanation {
+    pub timeout_secs: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -78,6 +95,7 @@ pub struct StepExplanation {
     pub id: String,
     pub condition: Option<String>,
     pub timeout_secs: u64,
+    pub outputs: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -230,6 +248,7 @@ impl Explanation {
                         id: st.id.clone(),
                         condition: st.condition.as_ref().map(ToString::to_string),
                         timeout_secs: st.timeout_secs.unwrap_or(s.timeout_secs),
+                        outputs: st.outputs.clone(),
                     }
                 })
                 .collect();
@@ -275,9 +294,22 @@ impl Explanation {
                 caches,
                 artifacts: s.artifacts.iter().map(|a| a.name.clone()).collect(),
                 secrets: s.secrets.clone(),
+                outputs: s.outputs.clone(),
+                handoff: s
+                    .handoff
+                    .iter()
+                    .map(|h| HandoffExplanation {
+                        from: h.from.clone(),
+                        artifact: h.artifact.clone(),
+                        into: h.into.clone(),
+                    })
+                    .collect(),
+                finalizer: s.finalize.as_ref().map(|f| FinalizerExplanation {
+                    timeout_secs: f.timeout_secs,
+                }),
                 reuse: s.reuse.as_ref().map(|r| ReuseExplanation {
                     inputs: r.inputs.clone(),
-                    outputs: r.outputs.clone(),
+                    paths: r.paths.clone(),
                 }),
             });
         }
@@ -387,6 +419,9 @@ impl Explanation {
                 if let Some(c) = &st.condition {
                     let _ = write!(s, " if {c}");
                 }
+                if !st.outputs.is_empty() {
+                    let _ = write!(s, ", outputs {}", st.outputs.join(", "));
+                }
                 s.push('\n');
             }
             for c in &j.caches {
@@ -409,12 +444,25 @@ impl Explanation {
             if !j.secrets.is_empty() {
                 let _ = writeln!(s, "  secrets: {}", j.secrets.join(", "));
             }
+            if !j.outputs.is_empty() {
+                let _ = writeln!(s, "  outputs: {}", j.outputs.join(", "));
+            }
+            for h in &j.handoff {
+                let _ = writeln!(s, "  handoff {}/{} into {}", h.from, h.artifact, h.into);
+            }
+            if let Some(f) = &j.finalizer {
+                let _ = writeln!(
+                    s,
+                    "  finalizer (timeout {}s, never changes the verdict)",
+                    f.timeout_secs
+                );
+            }
             if let Some(reuse) = &j.reuse {
                 let _ = writeln!(
                     s,
-                    "  reuse: inputs [{}] outputs [{}]",
+                    "  reuse: inputs [{}] paths [{}]",
                     reuse.inputs.join(", "),
-                    reuse.outputs.join(", ")
+                    reuse.paths.join(", ")
                 );
             }
         }

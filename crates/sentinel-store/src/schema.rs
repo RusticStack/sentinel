@@ -199,7 +199,11 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (83, include_str!("migrations/083_ai_analysis.sql")),
     (84, include_str!("migrations/084_ai_search.sql")),
     (85, include_str!("migrations/085_named_pipelines.sql")),
-    (86, include_str!("migrations/086_task_result_reuse.sql")),
+    (86, include_str!("migrations/086_job_outputs.sql")),
+    (
+        87,
+        include_str!("migrations/087_task_result_reuse.sql"),
+    ),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -221,9 +225,10 @@ pub const READABLE_BY: &[(u32, u32)] = &[
     (80, 79),
     (82, 81),
     (83, 82),
+    (86, 85),
     // A new column with a default: an older binary reads and writes every other column of `runs` and
     // simply never sets the flag, so the only thing it loses is the ability to ask for a fresh run.
-    (86, 85),
+    (87, 86),
 ];
 
 pub fn readable_by(version: u32) -> u32 {

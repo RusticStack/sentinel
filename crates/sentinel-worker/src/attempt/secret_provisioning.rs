@@ -388,7 +388,7 @@ fn a_canary_binds_runs_redacts_and_is_cleaned_up_without_a_sandbox() {
     // A real shell sources the wrapper exactly as a step does, with the two mounts substituted the way the
     // container's bind mounts would place them.
     let mut command = spec.step_command(0, 0).expect("the step");
-    let argv = wrap_with_env(std::mem::take(&mut command.argv), 0);
+    let argv = wrap_with_env(std::mem::take(&mut command.argv), Some(0), false);
     assert!(argv.iter().all(|arg| !arg.contains(CANARY)));
     let argv: Vec<String> = argv
         .iter()

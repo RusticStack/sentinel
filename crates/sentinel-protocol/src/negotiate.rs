@@ -5,7 +5,12 @@ use serde::{Deserialize, Serialize};
 pub struct ProtocolVersion(pub u16);
 
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(14);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(15);
+
+/// Declared outputs in the job context, and artifact handoff between jobs: a worker below this version is never
+/// offered a job whose context holds outputs or whose job declares a handoff, so its sessions behave as before.
+pub const OUTPUTS_MIN: ProtocolVersion = ProtocolVersion(14);
+pub const HANDOFF_MIN: ProtocolVersion = ProtocolVersion(14);
 
 /// Digest-first artifact transfer: the worker offers every file's digest and length before a body travels and
 /// the controller answers the ones the tenant already holds. A session below this version has no offer at all.
@@ -23,8 +28,8 @@ pub const CANCEL_PUSH_MIN: ProtocolVersion = ProtocolVersion(11);
 pub const RUNNER_MIN: ProtocolVersion = ProtocolVersion(13);
 
 /// Task-result reuse: the context carries the run's forced-refresh flag. A worker below this version is
-/// sent `Context2`, which cannot state it, so it never learns a run asked for fresh execution.
-pub const REUSE_MIN: ProtocolVersion = ProtocolVersion(14);
+/// sent `Context3`, which cannot state it, so it never learns a run asked for fresh execution.
+pub const REUSE_MIN: ProtocolVersion = ProtocolVersion(15);
 
 pub const MAX_CANCEL_PUSH: usize = 1024;
 

@@ -96,7 +96,7 @@ The class is always a label the worker vocabulary accepts: `RunnerClass::parse` 
 | `container` | unsupported | needs a Docker daemon, which only a microVM sandbox offers (I08) |
 | `services` | unsupported | needs a Docker daemon (I08); service containers (I10) |
 | `environment` | unsupported | deployment environments are not modelled |
-| `outputs` | unsupported | declared outputs and artifact handoff (I04) |
+| `outputs` | with change | a job's outputs become each step's declared `outputs` and the job's re-exported `outputs`, plain text in the run's record |
 | `jobs.<id>.uses` | unsupported | reusable pipelines (I10) |
 | `continue-on-error` | unsupported | a failing step fails its job |
 | `shell: sh`, `shell: bash` | translatable | — |
@@ -211,6 +211,8 @@ On request the plan also carries a `.sentinel.yml` per workflow, built from the 
 - Every job declares the secret **names** it referenced, and the plan lists them for the repository to provision. Values are never in the inventory and so never in the plan: a pipeline declares env in values, so `env` names (job and step) are listed in the mapping rather than written into the pipeline.
 
 The inventory holds no `run:` script, so each `run:` step becomes a stub at `scripts/ci/<workflow>/<job>/<step>.sh` and the pipeline runs it with `sh`; the mapping says which GitHub step each stub stands for (`script`, `image`, `checkout`, `cache`, `artifact`) so the person knows where the commands and the toolchain image go. The generated text is **always validated by the pipeline compiler** before it is returned: `compile_str` must accept it and produce exactly the jobs the mapping names, or the workflow has no native plan. The plan writes nothing: the pull request that applies it is [the next section](#the-pull-request).
+
+One construct at a time is answered by [`suggest.rs`](../crates/sentinel-pipeline/src/workflow/suggest.rs), behind the MCP tool `suggest_workflow_change` ([MCP](mcp.md)): for a construct the rule table marks unsupported it proposes a rewrite of the workflow's own text and offers it only after the analyzer reads the rewritten workflow as exactly that change, so a rewrite that does not verify is refused rather than shown. A suggestion is never applied by Sentinel.
 
 ## Verification
 

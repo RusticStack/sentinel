@@ -9,4 +9,4 @@ jobs:
       - {name: out, paths: [out], when: "step:s"}
     reuse:
       inputs: [src/**]
-      outputs: [out]
+      paths: [out]

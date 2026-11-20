@@ -909,15 +909,15 @@ fn after_key_colon(text: &str, span: &ValueSpan) -> Option<usize> {
     Some(key + colon + 1)
 }
 
-fn line_start(text: &str, at: usize) -> usize {
+pub(super) fn line_start(text: &str, at: usize) -> usize {
     text[..at].rfind('\n').map_or(0, |i| i + 1)
 }
 
-fn line_end(text: &str, at: usize) -> usize {
+pub(super) fn line_end(text: &str, at: usize) -> usize {
     text[at..].find('\n').map_or(text.len(), |i| at + i + 1)
 }
 
-fn line_of(text: &str, at: usize) -> u32 {
+pub(super) fn line_of(text: &str, at: usize) -> u32 {
     (text[..at].bytes().filter(|b| *b == b'\n').count() + 1) as u32
 }
 

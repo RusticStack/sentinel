@@ -119,6 +119,7 @@ fn the_pull_overlaps_the_checkout() {
         digest: DIGEST.to_owned(),
         spec,
         context: JobContext {
+            outputs: Vec::new(),
             source: None,
             source_valid_until: None,
             run: RunId::new(),

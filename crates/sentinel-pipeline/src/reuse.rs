@@ -113,6 +113,14 @@ pub fn key(declared: &Declared<'_>) -> Key {
     }
     // The job's working directory and its declared variables apply to every step that states none of its own.
     text(&mut hasher, declared.job.workdir.as_deref().unwrap_or(""));
+    // What the result consists of: a served result restores exactly these trees, so a different capture set
+    // is a different result even when the command that produced it is the same.
+    if let Some(reuse) = &declared.job.reuse {
+        field(&mut hasher, &(reuse.paths.len() as u64).to_le_bytes());
+        for path in &reuse.paths {
+            text(&mut hasher, path);
+        }
+    }
     field(&mut hasher, &(declared.inputs.len() as u64).to_le_bytes());
     for (pattern, digest) in declared.inputs {
         text(&mut hasher, pattern);
@@ -157,14 +165,18 @@ mod tests {
                 secret_files: Vec::new(),
                 workdir: None,
                 timeout_secs: Some(300),
+                outputs: Vec::new(),
             }],
             cache: Vec::new(),
             artifacts: Vec::new(),
             secrets: Vec::new(),
             registry_auth: None,
+            outputs: Vec::new(),
+            handoff: Vec::new(),
+            finalize: None,
             reuse: Some(Reuse {
                 inputs: vec!["Cargo.lock".into()],
-                outputs: vec!["target".into()],
+                paths: vec!["target".into()],
             }),
         }
     }
@@ -211,6 +223,15 @@ mod tests {
             }),
             ("input pattern", {
                 key_of(&job(), &[("Cargo.toml".into(), "a".repeat(64))])
+            }),
+            // What the result consists of: a different capture set restores different trees.
+            ("captured paths", {
+                let mut j = job();
+                j.reuse = Some(Reuse {
+                    inputs: vec!["Cargo.lock".into()],
+                    paths: vec!["dist".into()],
+                });
+                key_of(&j, &lock())
             }),
             ("image reference", {
                 let mut j = job();
@@ -269,10 +290,6 @@ mod tests {
         let base = key_of(&job(), &lock());
         let mut renamed = job();
         renamed.needs = vec!["build".into()];
-        renamed.reuse = Some(Reuse {
-            inputs: vec!["Cargo.lock".into()],
-            outputs: vec!["dist".into()],
-        });
         assert_eq!(base, key_of(&renamed, &lock()));
     }
 

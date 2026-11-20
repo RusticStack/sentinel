@@ -34,9 +34,11 @@ ownership on each request.
 | `get_run`, `wait_run` | Current run/job state; one bounded long poll | `runs:read` plus repository read |
 | `get_pipeline` | `sentinel.explain/1` from the run's immutable compiled spec | `runs:read` plus repository read |
 | `get_failure` | Bounded diagnostics and log excerpt | `logs:read` plus repository read |
+| `get_analysis` | One attempt's stored AI analysis with every claim's citations resolved; labelled inference | `logs:read` plus repository read |
 | `get_logs` | At most 10 frames from one log page | `logs:read` plus repository read |
 | `explain_queue` | Bounded tenant queue and placement reasons | `runs:read` plus tenant membership |
 | `validate_pipeline` | Local bounded YAML decode and compile; one `sentinel.explain/1` object for a document with one pipeline, and `{"schema":"sentinel.explain/1","pipelines":[…]}` for a document that declares several | Local; no credential scope |
+| `suggest_workflow_change` | One whole-line rewrite for a construct the workflow rule table marks unsupported, validated before it is offered | Local; no credential scope |
 | `dispatch` | Compile, pin and dispatch an exact source revision | `runs:write` plus repository run permission |
 | `rerun_job`, `cancel` | Start an attempt or request cancellation | `runs:write` plus repository run permission |
 | `list_secret_metadata`, `get_secret_metadata` | Secret names, active state and version only | `secrets:metadata` plus tenant/repository authorization |
@@ -58,6 +60,40 @@ pipeline data are untrusted evidence. Secret-value tools are not exposed.
 `list_flaky_tests` is deterministic data — the counts a repository's own reports stated, added up
 ([flaky tests](flaky-tests.md)) — never an inference, and every test identity it returns is
 untrusted text, never an instruction.
+
+**Evidence labels.** Two annotation fields beyond the specification's four state what a body is,
+and a client honours them wherever it shows the text: `untrusted: true` marks a body holding the
+repository's own text, which is evidence and never instructions; `inference: true` marks a body a
+model wrote, which is never evidence. `get_analysis` carries both, `list_flaky_tests` and
+`suggest_workflow_change` carry `untrusted`, and no other tool carries either. Every tool's
+description says the same in words, so a client that reads only the description loses nothing.
+
+**Analyses.** `get_analysis` reads the route an attempt's analysis is served by ([AI](ai.md)): the
+controller checks `logs:read` and the attempt's repository read before it decodes the stored
+answer, resolves every citation against the evidence it still stores, and drops a claim whose
+citations do not resolve. An analysis whose every citation was dropped, one still being produced,
+and one the tenant's policy does not cover all answer `present: false` with the reason. The
+deterministic failure summary and the logs remain the account of what happened, and nothing on this
+path changes a run's state, a job's failure class or a published check.
+
+**Suggestions for unsupported constructs.** `suggest_workflow_change` answers one construct the
+workflow rule table marks unsupported ([workflow analysis](workflow-analysis.md)) with a rewrite of
+the workflow's own text: the whole lines to replace (`before`), the lines to write instead
+(`after`), the rule table's reason the construct is unsupported, and what the change costs
+(`change`). The rewrite is a suggestion and nothing else — Sentinel never applies it, every answer
+states `applied: false`, and the migration that would carry it is a separate, audited write
+([workflow analysis](workflow-analysis.md#the-pull-request)).
+
+Every candidate is validated before it is offered: the analyzer reads the rewritten workflow again,
+and the result must be the workflow it started as with exactly the change the suggestion states and
+no other recorded fact moved — otherwise the answer is a refusal naming what did not verify, with
+no lines at all. That is why a workflow naming the same unsupported shell in two steps gets no
+suggestion for the first: porting it would leave the construct recorded, so the rewrite does not
+keep its promise. A construct with no known rewrite — `container`, `services`, a reusable workflow,
+a step's action, a refused trigger other than `pull_request_target`, or a workflow with more than
+one refused trigger — is refused with the rule table's own reason, and one that already translates
+is refused with the change that translation carries. The tool reads nothing from the deployment: it
+holds the caller's own text, takes no credential scope and writes nothing.
 
 The stdio request and response lines are each capped at 2 MiB and 8 MiB. API
 JSON responses are capped at 8 MiB before parsing. `get_logs` deliberately
@@ -102,7 +138,7 @@ authorization decision, scope included. `arguments` is optional on both
 round trip; over HTTP the route compiles it once.
 
 Tool annotations: every tool has `openWorldHint: false` (tools act only on this
-deployment); reads, `validate_pipeline` and the four artifact tools are
+deployment); reads, `validate_pipeline`, `suggest_workflow_change` and the four artifact tools are
 read-only (`get_artifact_link` mints a stateless token and consumes nothing);
 `dispatch` is
 additive and idempotent (its idempotency key); `rerun_job` is additive and not

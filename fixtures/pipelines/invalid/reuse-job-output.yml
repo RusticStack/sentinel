@@ -1,0 +1,11 @@
+# expect: jobs.build.reuse: a job that opts into reuse cannot declare output `version`; no step of a served job runs to write it
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: busybox
+    steps: [{id: s, run: echo hi, outputs: [version]}]
+    outputs: [version]
+    reuse:
+      inputs: [src/**]
+      paths: [out]

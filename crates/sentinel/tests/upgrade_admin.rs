@@ -118,8 +118,8 @@ fn the_check_reports_the_upgrade_without_migrating_and_exits_two_when_it_blocks(
         report["blocking"].as_array().unwrap().is_empty(),
         "{report}"
     );
-    // The pending migration adds one column with a default, so it rewrites no row and the preflight
-    // lists none: a fresh deployment and a populated one are both told there is nothing to carry over.
+    // The newest migration only adds a column with a default, so it rewrites no table and visits no row,
+    // which is why the report names it with an empty rewrite list.
     let steps = report["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 1, "{report}");
     assert_eq!(steps[0]["migration"], schema::LATEST);
