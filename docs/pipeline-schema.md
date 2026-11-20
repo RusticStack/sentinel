@@ -215,7 +215,8 @@ bound, writes something that is not text, or repeats a value the attempt was giv
 `command_failed` and a message naming the name and the limit, never the value.
 
 An output is **plain text in the run's record and public within the tenant**: the controller stores what the worker
-accepted in the job's row, the jobs that need it read it from their context, and nothing redacts it. That is why the
+accepted in the job's row, the jobs that need it read it from their context, `GET /runs/{id}` serves it as each job's
+`outputs` map ([API](api.md#routes)), the run page lists it under Outputs, and nothing redacts it. That is why the
 worker refuses one that repeats a delivered secret, and why a value is never a place for one. An output name is an
 id (`[a-z0-9][a-z0-9_-]*`), so two steps of one job cannot write the same name and a later step's read is never
 ambiguous.

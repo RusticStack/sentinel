@@ -99,6 +99,8 @@ export interface JobStatus {
   attempt: string | null;
   log_state: "pending" | "incomplete" | "complete" | null;
   fence: number;
+  /** Declared outputs the job exported; plain text, public within the tenant. */
+  outputs: Record<string, string>;
   timestamps: JobTimestamps;
 }
 

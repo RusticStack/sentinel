@@ -673,3 +673,37 @@ fn a_held_attempts_log_end_survives_a_stale_report() {
     assert_eq!(log_state(&f, run, job), Some(LogState::Complete));
     assert_eq!(state(&f, job), JobState::Finalizing);
 }
+
+#[test]
+fn the_run_view_carries_each_jobs_declared_outputs() {
+    // A job's outputs are public within the tenant, so the run a member reads carries them: the
+    // API serves this view directly, and a job with none carries an empty set rather than nothing.
+    let f = fixture();
+    let w = worker(&f, CAP);
+    let (run_id, jobs) = run(&f, STEP_ARTIFACT, at(2_000));
+    let (job, attempt, fence) = held(&f, w, at(2_100));
+    let declared = vec![
+        ("version".to_owned(), "1.4.2".to_owned()),
+        ("digest".to_owned(), "sha256:abc".to_owned()),
+    ];
+    f.store
+        .writer()
+        .write(move |tx| sentinel_store::outputs::record(tx, attempt, fence, &declared))
+        .unwrap();
+    let view = f.store.read(|c| status::run(c, f.tenant, run_id)).unwrap();
+    let carrying = view.jobs.iter().find(|j| j.id == job).unwrap();
+    assert_eq!(
+        carrying.outputs,
+        vec![
+            ("version".to_owned(), "1.4.2".to_owned()),
+            ("digest".to_owned(), "sha256:abc".to_owned()),
+        ]
+    );
+    assert!(
+        view.jobs
+            .iter()
+            .filter(|j| j.id != job)
+            .all(|j| j.outputs.is_empty()),
+        "{jobs:?}"
+    );
+}
