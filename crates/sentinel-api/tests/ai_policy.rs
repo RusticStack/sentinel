@@ -406,17 +406,28 @@ fn no_request_path_reaches_a_provider_while_the_tenant_is_off() {
             provider.as_str()
         );
     }
-    // The routes that would carry a request (Y02's evidence bundle, Y05's analyses) do not
-    // exist, so a request cannot enter a path that would reach a provider. Y02 and Y05 add
-    // them behind `ai::admit`, which is the gate above.
-    let run = sentinel_core::AttemptId::new();
-    for (method, path) in [
-        ("GET", format!("/api/v1/attempts/{run}/ai-context")),
-        ("POST", "/api/v1/tenants/acme/ai/analyses".to_owned()),
-    ] {
-        let reply = send(&d, method, &path, None, &ada.headers());
-        assert_eq!(reply.status, 404, "{method} {path}: {}", reply.text);
-    }
+    // Y02's evidence bundle exists and refuses while either side is off: a session holds only the
+    // scopes its permissions imply, and no permission implies `ai:context`, so the only caller that
+    // could ask is refused before a byte of evidence is read. Y03's request route and Y05's
+    // analyses do not exist at all.
+    let attempt = sentinel_core::AttemptId::new();
+    let reply = send(
+        &d,
+        "GET",
+        &format!("/api/v1/attempts/{attempt}/ai-context"),
+        None,
+        &ada.headers(),
+    );
+    assert_eq!(reply.status, 403, "{}", reply.text);
+    assert_eq!(reply.json()["details"]["scope"], "ai:context");
+    let reply = send(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/ai/analyses",
+        None,
+        &ada.headers(),
+    );
+    assert_eq!(reply.status, 404, "{}", reply.text);
 }
 
 #[test]

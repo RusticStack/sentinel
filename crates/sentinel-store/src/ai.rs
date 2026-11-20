@@ -298,6 +298,15 @@ pub fn effective(conn: &Connection, tenant: TenantId) -> Result<(Providers, Opti
     Ok((allowed, Some(data_policy)))
 }
 
+/// The gate the evidence bundle passes (Y02): whether `tenant` may have one at all, which is
+/// whether [`admit`] would admit any allow-listed provider. It reads the policy the same way and
+/// caches nothing, so a disable refuses the next bundle; the bundle names no provider because it
+/// is built before a request picks one, and a tenant with none allowed has no bundle to build.
+pub fn permits(conn: &Connection, tenant: TenantId) -> Result<bool> {
+    let (providers, policy) = effective(conn, tenant)?;
+    Ok(policy.is_some() && !providers.is_empty())
+}
+
 /// The single gate every AI request passes: `Some(policy)` is what a request for
 /// `provider` on `tenant`'s behalf may be made under, `None` is no request at all.
 pub fn admit(

@@ -1492,6 +1492,90 @@ pub fn refuse_delivery(
     Ok(None)
 }
 
+/// The values an attempt was registered, for the evidence bundle's second redaction pass (Y02).
+///
+/// The first pass ran in the worker before any byte reached the spool
+/// ([redaction](../docs/ai.md#the-guarantees)), so this is not what keeps a value out of a stored
+/// log: it restores the same guarantee over what the bundle assembles, where a value the attempt
+/// used can still meet text from a later request. The set is what the attempt's delivery recorded
+/// using, which is the only record of which versions that attempt actually held: a version rotated
+/// or revoked since is still that attempt's evidence and is read, and a version no longer stored is
+/// skipped.
+pub struct Values(Vec<Vec<u8>>);
+
+impl Values {
+    /// No key in this deployment: nothing was sealed, so there is nothing to scan for.
+    pub fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.iter().map(Vec::as_slice)
+    }
+}
+
+impl std::fmt::Debug for Values {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Values({} bytes-hidden)", self.0.len())
+    }
+}
+
+impl Drop for Values {
+    fn drop(&mut self) {
+        for value in &mut self.0 {
+            value.fill(0);
+        }
+        core::hint::black_box(&mut self.0);
+    }
+}
+
+/// One statement for the versions, then one unseal each, bounded by the delivery's own value count
+/// (`MAX_DELIVERY_VALUES`): an attempt cannot have held more than that.
+pub fn attempt_values(conn: &Connection, key: &Key, attempt: AttemptId) -> Result<Values> {
+    let mut statement = conn.prepare_cached(
+        "SELECT s.tenant_id,s.scope_repo_id,s.name,v.version,v.sealed
+         FROM secret_audit a
+         JOIN secrets s ON s.id=a.secret_id
+         JOIN secret_versions v ON v.secret_id=a.secret_id AND v.version=a.version
+         WHERE a.attempt_id=?1 AND a.action='use' AND a.result='ok'
+         GROUP BY a.secret_id,a.version
+         ORDER BY a.secret_id,a.version
+         LIMIT ?2",
+    )?;
+    let mut rows = statement.query(params![
+        attempt.as_bytes(),
+        sentinel_protocol::secrets::MAX_DELIVERY_VALUES as i64
+    ])?;
+    let mut values = Values(Vec::new());
+    while let Some(row) = rows.next()? {
+        let tenant: [u8; 16] = row.get(0)?;
+        let repo: Option<[u8; 16]> = row.get(1)?;
+        let name: String = row.get(2)?;
+        let version: i64 = row.get(3)?;
+        let sealed: Vec<u8> = row.get(4)?;
+        let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("secret tenant"))?;
+        let context = secret_context(tenant.as_bytes(), repo.as_ref(), &name, version as u64);
+        let mut value = key
+            .open(&context, &sealed)
+            .map_err(|_| Error::Corrupt("sealed secret"))?;
+        if !(1..=MAX_VALUE).contains(&value.len()) {
+            value.fill(0);
+            core::hint::black_box(&mut value);
+            return Err(Error::Corrupt("secret value length"));
+        }
+        values.0.push(value);
+    }
+    Ok(values)
+}
+
 type StoredSecretVersion = ([u8; 16], Option<[u8; 16]>, String, i64, bool, Vec<u8>, bool);
 
 fn open_value(conn: &Connection, key: &Key, resolved: &Resolved) -> Result<Vec<u8>> {
