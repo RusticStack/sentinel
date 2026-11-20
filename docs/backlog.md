@@ -42,8 +42,8 @@ These are deliberately not assumed dependencies for the first runnable engine or
 
 - [x] **I01** Named pipelines and bounded typed manual inputs, each with independent triggers/concurrency/check identity; no built-in repository workflow names. Partly done: `manual` is a trigger (`crates/sentinel-pipeline/src/schema.rs:370`); named pipelines and typed inputs remain.
 - [x] **I02** Durable UTC schedules with deduplicated occurrences, overlap policy, bounded missed-occurrence handling, pinned source revision and tenant suspension behavior.
-- [ ] **I03** Additional authorized repository checkouts/full-history selection and complete source manifests; preserve grant checks and exact rerun revisions.
-- [ ] **I04** Declared non-secret step/job outputs, artifact handoff and bounded user-defined finalizers; keep independent worker cleanup/fencing authoritative on cancellation or expiry.
+- [x] **I03** Additional authorized repository checkouts/full-history selection and complete source manifests; preserve grant checks and exact rerun revisions.
+- [x] **I04** Declared non-secret step/job outputs, artifact handoff and bounded user-defined finalizers; keep independent worker cleanup/fencing authoritative on cancellation or expiry.
 - [ ] **I05** Shared external-resource leases/locks where job-private resources cannot remove contention; separate them from supersession/concurrency and verify stale-owner fencing.
 - [ ] **I06** Conservative opt-in task-result reuse with complete declared inputs, appropriate sandbox constraints, provenance and explicit `reused`/force-fresh results; never enable arbitrary-shell success caching by default.
 - [ ] **I07** Optional compiler/build-tool remote-cache protocol adapters, builder state persistence and manifest/dedup improvements, selected from actual I/O/compile profiles.
