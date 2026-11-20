@@ -13,6 +13,8 @@ mod pipeline;
 #[cfg(all(target_os = "linux", feature = "server"))]
 mod runner_admin;
 #[cfg(all(target_os = "linux", feature = "server"))]
+mod schedule_admin;
+#[cfg(all(target_os = "linux", feature = "server"))]
 mod source_admin;
 
 #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]

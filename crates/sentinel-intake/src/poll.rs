@@ -25,6 +25,21 @@ pub trait Lister: Send + Sync {
         &self,
         request: &ListRequest<'_>,
     ) -> Result<Vec<sentinel_git::RefTip>, sentinel_git::Error>;
+
+    /// One ref's tip, asked for by name: a schedule reads one ref and never lists a repository's
+    /// whole head and tag set to find it.
+    fn tip(
+        &self,
+        request: &TipRequest<'_>,
+    ) -> Result<Option<sentinel_git::RefTip>, sentinel_git::Error>;
+}
+
+pub struct TipRequest<'a> {
+    pub dir: &'a Path,
+    pub remote: &'a str,
+    pub access: Option<&'a Access>,
+    pub ref_name: &'a str,
+    pub budget: Duration,
 }
 
 pub struct ListRequest<'a> {
@@ -47,6 +62,19 @@ impl Lister for GitLister {
             request.remote,
             request.access,
             request.max_refs,
+            request.budget,
+        )
+    }
+
+    fn tip(
+        &self,
+        request: &TipRequest<'_>,
+    ) -> Result<Option<sentinel_git::RefTip>, sentinel_git::Error> {
+        sentinel_git::ls_remote_ref(
+            request.dir,
+            request.remote,
+            request.access,
+            request.ref_name,
             request.budget,
         )
     }

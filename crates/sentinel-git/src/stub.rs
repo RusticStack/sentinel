@@ -106,6 +106,16 @@ pub fn ls_remote(
     Err(Error::UnsupportedPlatform)
 }
 
+pub fn ls_remote_ref(
+    _: &Path,
+    _: &str,
+    _: Option<&Access>,
+    _: &str,
+    _: Duration,
+) -> Result<Option<RefTip>> {
+    Err(Error::UnsupportedPlatform)
+}
+
 pub fn is_ancestor(
     _: &Path,
     _: &str,

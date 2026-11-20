@@ -3,9 +3,11 @@ pub mod ingest;
 pub mod lane;
 pub mod poll;
 pub mod resolve;
+pub mod schedules;
 pub mod source;
 
 pub use ingest::{Error, Github, Ingested};
 pub use lane::{Batch, Lane, Settled, Waker};
 pub use poll::{GitLister, ListRequest, Lister, Notice, Poll};
 pub use resolve::{Fetch, FileRequest, GitFetch, Outcome, Resolver};
+pub use schedules::{Lane as ScheduleLane, Notice as ScheduleNotice};

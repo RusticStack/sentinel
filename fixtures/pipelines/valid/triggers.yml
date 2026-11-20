@@ -10,6 +10,7 @@ on:
   pull_request:
     branches: [main, "release/**"]
   manual: true
+  schedule: true
 concurrency:
   group: "${{ repo.id }}:${{ event.key }}"
   cancel_in_progress: true

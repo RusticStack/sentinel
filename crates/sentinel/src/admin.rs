@@ -121,6 +121,7 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
     match &args.command {
         AdminCommand::Source(args) => crate::source_admin::run(args)?,
         AdminCommand::Intake(args) => crate::intake_admin::run(args)?,
+        AdminCommand::Schedule(args) => crate::schedule_admin::run(args)?,
         AdminCommand::RunnerMode(args) => crate::runner_admin::run(args)?,
         AdminCommand::Objects(args) => objects(args)?,
         AdminCommand::Backup(args) => backup(args)?,

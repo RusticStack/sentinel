@@ -190,6 +190,8 @@ pub enum AdminCommand {
     Source(SourceArgs),
     /// Inspect and purge durable event intake records
     Intake(IntakeArgs),
+    /// Configure, list and stop a repository's durable UTC schedule
+    Schedule(ScheduleArgs),
     /// Show or change a tenant's GitHub Actions runner-mode switch
     RunnerMode(RunnerModeArgs),
     /// Reconcile or verify committed objects and manifests against the filesystem
@@ -387,6 +389,47 @@ pub enum SourceCommand {
         /// Return the tenant to invitation/administrator membership
         #[arg(long)]
         off: bool,
+    },
+}
+
+#[derive(Args)]
+pub struct ScheduleArgs {
+    #[command(flatten)]
+    pub data: DataDir,
+    /// Acting administrator's immutable usr_ ID; live authority is checked
+    #[arg(long)]
+    pub actor: String,
+    #[command(subcommand)]
+    pub command: ScheduleCommand,
+}
+
+#[derive(Subcommand)]
+pub enum ScheduleCommand {
+    /// Store (or replace) the repository's schedule: five-field UTC cron
+    Set {
+        #[arg(long)]
+        repo: String,
+        /// Five-field UTC cron: minute hour day-of-month month day-of-week
+        #[arg(long, value_name = "CRON")]
+        cron: String,
+        /// Ref to read at each occurrence (default refs/heads/main)
+        #[arg(long = "ref", value_name = "REF", default_value = "refs/heads/main")]
+        ref_name: String,
+        /// What to do when the previous run is still going: skip (default) or cancel
+        #[arg(long, value_name = "POLICY", default_value = "skip")]
+        overlap: String,
+    },
+    /// Stop firing this repository's schedule; its rows stay readable
+    Disable {
+        #[arg(long)]
+        repo: String,
+    },
+    /// The repository's schedule, or every schedule with --all
+    Show {
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        all: bool,
     },
 }
 

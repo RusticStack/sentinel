@@ -412,6 +412,7 @@ fn string_list(path: &str, node: &Node, max: usize, item_max: usize) -> Result<V
 ///   pull_request: {branches: [main]}
 ///   merge_group: {branches: [main]}
 ///   manual: true
+///   schedule: true
 /// ```
 fn parse_triggers(path: &str, node: &Node) -> Result<Triggers> {
     let mut triggers = Triggers::default();
@@ -420,8 +421,8 @@ fn parse_triggers(path: &str, node: &Node) -> Result<Triggers> {
             if items.is_empty() {
                 return Err(err(path, SchemaErrorKind::Empty));
             }
-            if items.len() > 5 {
-                return Err(err(path, SchemaErrorKind::TooMany { limit: 5 }));
+            if items.len() > 6 {
+                return Err(err(path, SchemaErrorKind::TooMany { limit: 6 }));
             }
             for (i, item) in items.iter().enumerate() {
                 let p = format!("{path}[{i}]");
@@ -431,6 +432,16 @@ fn parse_triggers(path: &str, node: &Node) -> Result<Triggers> {
                     "pull_request" => &mut triggers.pull_request,
                     "merge_group" => &mut triggers.merge_group,
                     "tag" => &mut triggers.tag,
+                    "schedule" => {
+                        if triggers.schedule {
+                            return Err(err(
+                                &p,
+                                SchemaErrorKind::Invalid("duplicate trigger".into()),
+                            ));
+                        }
+                        triggers.schedule = true;
+                        continue;
+                    }
                     "manual" => {
                         if triggers.manual {
                             return Err(err(
@@ -445,7 +456,8 @@ fn parse_triggers(path: &str, node: &Node) -> Result<Triggers> {
                         return Err(err(
                             &p,
                             SchemaErrorKind::Invalid(
-                                "expected push, pull_request, merge_group, tag or manual".into(),
+                                "expected push, pull_request, merge_group, tag, manual or schedule"
+                                    .into(),
                             ),
                         ));
                     }
@@ -475,6 +487,16 @@ fn parse_triggers(path: &str, node: &Node) -> Result<Triggers> {
             }
             if let Some(n) = map.take("tag") {
                 triggers.tag = Some(ref_filter(&map.child("tag"), n, RefKind::Tag)?);
+            }
+            if let Some(n) = map.take("schedule") {
+                let p = map.child("schedule");
+                if !expect_bool(&p, n)? {
+                    return Err(err(
+                        &p,
+                        SchemaErrorKind::Invalid("`schedule: true` or omit the key".into()),
+                    ));
+                }
+                triggers.schedule = true;
             }
             if let Some(n) = map.take("manual") {
                 let p = map.child("manual");

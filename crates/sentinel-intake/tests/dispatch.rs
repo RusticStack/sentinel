@@ -342,6 +342,7 @@ fn fixture() -> Fixture {
         Arc::clone(&destinations),
         Arc::from(Vec::new()),
         Arc::new(sentinel_intake::resolve::GitFetch),
+        Arc::new(sentinel_intake::GitLister),
         dir.path().join("work"),
         Config {
             budget: Duration::from_secs(30),
@@ -1042,6 +1043,7 @@ fn app_resolver(f: &Fixture, name: &str, fetch: Arc<dyn Fetch>) -> (Resolver, Gi
         Arc::clone(&f.destinations),
         Arc::from(Vec::new()),
         fetch,
+        Arc::new(sentinel_intake::GitLister),
         f.dir.path().join(format!("work-{name}")),
         Config {
             budget: Duration::from_secs(5),

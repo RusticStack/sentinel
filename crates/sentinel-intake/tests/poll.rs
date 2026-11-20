@@ -47,6 +47,22 @@ impl Lister for FakeLister {
             Err(why) => Err(sentinel_git::Error::Preparation(why.clone())),
         }
     }
+
+    fn tip(
+        &self,
+        request: &sentinel_intake::poll::TipRequest<'_>,
+    ) -> Result<Option<sentinel_git::RefTip>, sentinel_git::Error> {
+        Ok(self
+            .refs(&sentinel_intake::ListRequest {
+                dir: request.dir,
+                remote: request.remote,
+                access: request.access,
+                max_refs: sentinel_store::poll::MAX_REFS,
+                budget: request.budget,
+            })?
+            .into_iter()
+            .find(|t| t.name == request.ref_name))
+    }
 }
 
 fn tip(name: &str, oid: &str) -> sentinel_git::RefTip {
@@ -238,6 +254,9 @@ fn an_observed_push_becomes_a_delivery_and_dispatches_a_run() {
         destinations(),
         Arc::from(Vec::new()),
         Arc::new(FakeFetch),
+        Arc::new(FakeLister {
+            answer: std::sync::Mutex::new(Ok(Vec::new())),
+        }),
         f.dir.path().join("intake-work"),
         resolve::Config::default(),
     )

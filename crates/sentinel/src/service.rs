@@ -1673,6 +1673,7 @@ enum Running {
         store: Arc<sentinel_store::Store>,
         lane: Box<sentinel_intake::Lane>,
         poll: Box<sentinel_intake::Poll>,
+        schedules: Box<sentinel_intake::ScheduleLane>,
         github_lanes: Arc<std::sync::Mutex<Option<GithubLanes>>>,
         mail: Option<Box<sentinel_mail::Lane>>,
         tailcat: Option<TailcatServer>,
@@ -2148,7 +2149,7 @@ fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
     let wall = sentinel_core::UnixMillis::now();
     // Idempotency keys are stamped by the deadline clock, so their TTL is judged on it.
     let steady = sentinel_core::UnixMillis::steady();
-    let purges: [(&str, Purge, sentinel_core::UnixMillis); 10] = [
+    let purges: [(&str, Purge, sentinel_core::UnixMillis); 11] = [
         ("setup", sentinel_store::setup::purge, wall),
         ("github_app_states", sentinel_store::github_app::purge, wall),
         ("oauth", sentinel_store::oauth::purge_expired, wall),
@@ -2170,6 +2171,11 @@ fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
             "secret_idempotency",
             sentinel_store::secrets::purge_idempotency,
             wall,
+        ),
+        (
+            "schedule_occurrences",
+            sentinel_store::schedule::purge,
+            sentinel_core::UnixMillis(wall.0 - sentinel_store::schedule::OCCURRENCE_RETENTION_MS),
         ),
     ];
     let mut backlog = false;
@@ -2433,17 +2439,20 @@ fn start_server(
     if !runner_policy.classes.is_empty() {
         controller.set_runner_policy(runner_policy);
     }
-    let resolver = sentinel_intake::Resolver::new(
-        Arc::clone(&store),
-        key.clone(),
-        github.current.clone(),
-        Arc::clone(&intake_destinations),
-        Arc::clone(&runner_classes),
-        Arc::new(sentinel_intake::resolve::GitFetch),
-        config.data_dir.join("intake-work"),
-        sentinel_intake::resolve::Config::default(),
-    )
-    .map_err(|_| Error::runtime("cannot prepare the intake work directory"))?;
+    let resolver = Arc::new(
+        sentinel_intake::Resolver::new(
+            Arc::clone(&store),
+            key.clone(),
+            github.current.clone(),
+            Arc::clone(&intake_destinations),
+            Arc::clone(&runner_classes),
+            Arc::new(sentinel_intake::resolve::GitFetch),
+            Arc::new(sentinel_intake::GitLister),
+            config.data_dir.join("intake-work"),
+            sentinel_intake::resolve::Config::default(),
+        )
+        .map_err(|_| Error::runtime("cannot prepare the intake work directory"))?,
+    );
     let dispatch_wake: Arc<dyn Fn() + Send + Sync> = {
         let handle = controller.handle();
         // A new run can supersede a running one (`cancel_in_progress`), so its cancel is pushed now.
@@ -2452,7 +2461,7 @@ fn start_server(
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let lane = sentinel_intake::Lane::start(
         Arc::clone(&store),
-        Some(Arc::new(resolver)),
+        Some(Arc::clone(&resolver)),
         Some(dispatch_wake),
         sentinel_intake::lane::Config::default(),
         move |batch| {
@@ -2508,6 +2517,32 @@ fn start_server(
         },
     )
     .map_err(|_| Error::runtime("cannot prepare the poll work directory"))?;
+    let schedule_dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let schedules = sentinel_intake::ScheduleLane::start(
+        Arc::clone(&store),
+        resolver,
+        sentinel_intake::schedules::Config::default(),
+        move |notice| {
+            tracing::dispatcher::with_default(&schedule_dispatch, || {
+                match (&notice.repo, &notice.error) {
+                    (_, Some(error)) => tracing::warn!(
+                        event = "schedule_failed",
+                        repo = %notice.repo.map(|r| r.to_string()).unwrap_or_default(),
+                        at_ms = notice.at_ms,
+                        outcome = %notice.outcome,
+                        error = %error
+                    ),
+                    (Some(repo), None) => tracing::info!(
+                        event = "schedule_settled",
+                        repo = %repo,
+                        at_ms = notice.at_ms,
+                        outcome = %notice.outcome
+                    ),
+                    (None, None) => {}
+                }
+            });
+        },
+    );
     let github_webhook_secret = github.webhook_secret.clone();
     if github_webhook_secret.is_some() {
         tracing::info!(event = "github_webhook_enabled");
@@ -2640,6 +2675,7 @@ fn start_server(
         store,
         lane: Box::new(lane),
         poll: Box::new(poll),
+        schedules: Box::new(schedules),
         github_lanes,
         mail,
         tailcat,
@@ -3703,6 +3739,7 @@ fn initialize_and_wait(
             store,
             lane,
             poll,
+            schedules,
             github_lanes,
             mail,
             tailcat,
@@ -3728,6 +3765,7 @@ fn initialize_and_wait(
                     .take(),
             );
             drop(mail);
+            drop(schedules);
             drop(poll);
             drop(lane);
             let sessions_drained = controller.shutdown(LINK_SHUTDOWN);
