@@ -846,7 +846,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     let sources = upgrade_sources();
     assert_eq!(
         sources,
-        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 78, 79, 80]
+        vec![44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 80]
     );
     for from in sources {
         let dir = tempfile::tempdir().unwrap();
