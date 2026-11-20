@@ -5044,3 +5044,92 @@ fn a_manual_runs_actor_is_returned_and_a_webhook_runs_has_none() {
         }
     }
 }
+
+/// Y08's suggestion gate over MCP: a rewrite is offered only when the analyzer reads the
+/// rewritten workflow as the change it states, and one that fails that check is refused.
+#[test]
+fn mcp_suggests_a_verified_rewrite_and_refuses_one_that_does_not_verify() {
+    use sentinel_core::auth::Scopes;
+    let d = deployment();
+    let session = mcp_session(&d, "suggestion-caller", Scopes::MCP);
+    let suggest = |arguments: serde_json::Value| {
+        mcp_post(
+            &d,
+            &serde_json::json!({
+                "jsonrpc":"2.0", "id":2, "method":"tools/call",
+                "params":{"name":"suggest_workflow_change","arguments":arguments}
+            }),
+            &session.0,
+            &[
+                ("mcp-protocol-version", "2025-11-25"),
+                ("mcp-session-id", session.1.as_str()),
+            ],
+        )
+    };
+    let workflow = "name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n        shell: pwsh\n      - run: make lint\n";
+    let (status, _, body) = suggest(serde_json::json!({
+        "path": ".github/workflows/ci.yml",
+        "workflow": workflow,
+        "job": "build",
+        "step": 0,
+        "construct": "shell"
+    }));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["isError"], false, "{body}");
+    let suggestion = &body["result"]["structuredContent"];
+    assert_eq!(suggestion["schema"], "sentinel.migration-suggestion/1");
+    assert_eq!(suggestion["construct"], "shell");
+    assert_eq!(suggestion["before"], "        shell: pwsh\n");
+    assert_eq!(suggestion["after"], "        shell: bash\n");
+    assert_eq!(suggestion["applied"], false);
+    assert_eq!(suggestion["untrusted"], true);
+    assert!(
+        suggestion["change"].as_str().unwrap().contains("bash"),
+        "{suggestion}"
+    );
+
+    // A second step naming the same shell leaves the construct where it was, so the candidate
+    // rewrite does not keep its promise: the answer is the refusal and no lines at all.
+    let twice = workflow.replace(
+        "      - run: make lint\n",
+        "      - run: make lint\n        shell: pwsh\n",
+    );
+    let (status, _, body) = suggest(serde_json::json!({
+        "path": ".github/workflows/ci.yml",
+        "workflow": twice,
+        "job": "build",
+        "step": 0,
+        "construct": "shell"
+    }));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let refused = &body["result"]["structuredContent"];
+    assert_eq!(refused["code"], "not_found", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("did not verify"),
+        "{refused}"
+    );
+    assert!(refused.get("before").is_none(), "{refused}");
+    assert!(refused.get("after").is_none(), "{refused}");
+
+    // A construct the table has no rewrite for states the rule's own reason, and nothing else.
+    let container = "name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    container: node:20\n    steps:\n      - run: npm test\n";
+    let (status, _, body) = suggest(serde_json::json!({
+        "path": ".github/workflows/ci.yml",
+        "workflow": container,
+        "job": "build",
+        "construct": "container"
+    }));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    assert!(
+        body["result"]["structuredContent"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Docker daemon"),
+        "{body}"
+    );
+}
