@@ -82,6 +82,7 @@ function RunView() {
   const finished = run.jobs.every((j) => j.terminal);
   const scale = Math.max(1, ...run.jobs.map((j) => phasesOf(j.timestamps, now).reduce((a, p) => a + p.ms, 0)));
   const failed = run.jobs.filter((j) => j.attempt && j.terminal && !["passed", "skipped", "canceled"].includes(j.state));
+  const withOutputs = run.jobs.filter((j) => Object.keys(j.outputs ?? {}).length > 0);
 
   const cancelRun = () => act(me, "Cancel run", () => api(`/api/v1/runs/${id}/cancel`, { method: "POST", body: {} }));
   const jobAction = (job: JobStatus) =>
@@ -148,6 +149,20 @@ function RunView() {
           </tbody>
         </Table>
       </section>
+
+      {withOutputs.length ? (
+        <section aria-labelledby="outputs-h" className="space-y-3">
+          <h2 id="outputs-h" className="text-base font-semibold text-strong">Outputs</h2>
+          <Table caption="Declared job outputs">
+            <thead><tr><th>Job</th><th>Name</th><th>Value</th></tr></thead>
+            <tbody>
+              {withOutputs.flatMap((j) => Object.entries(j.outputs).map(([name, value]) => (
+                <tr key={`${j.id}-${name}`}><td>{j.name}</td><td className="font-mono text-xs">{name}</td><td className="font-mono text-xs break-all">{value}</td></tr>
+              )))}
+            </tbody>
+          </Table>
+        </section>
+      ) : null}
 
       {failed.map((j) => <FailureSummary key={j.attempt!} job={j} run={id} />)}
 
