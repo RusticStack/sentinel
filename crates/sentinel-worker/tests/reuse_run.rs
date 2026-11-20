@@ -89,7 +89,7 @@ impl Report for Silent {
 
 fn pipeline(reuse: bool) -> String {
     let reuse = if reuse {
-        "    reuse:\n      inputs: [seed.txt]\n      outputs: [dist]\n"
+        "    reuse:\n      inputs: [seed.txt]\n      paths: [dist]\n"
     } else {
         ""
     };

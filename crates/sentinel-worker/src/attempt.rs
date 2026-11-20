@@ -969,6 +969,31 @@ fn prepare(
         }
         checked_out.and(pulled)?;
         take_handoffs(job, report, workspace.path(), cancel)?;
+        let isolation = job.runtime.for_job(stated_isolation);
+        let platform = sentinel_cache::Platform {
+            os: sentinel_cache::Os::Linux,
+            arch: if cfg!(target_arch = "aarch64") {
+                Arch::Aarch64
+            } else {
+                Arch::X86_64
+            },
+        };
+        // The result decision comes before a cache is restored or a container exists: a served result runs
+        // nothing at all, and the job's own caches have nothing to feed it.
+        match crate::reuse::prepare(root, job, workspace.path(), &image, isolation, platform)? {
+            crate::reuse::Decision::Served(hit) => {
+                served = Some(hit.record);
+                return Ok(None);
+            }
+            crate::reuse::Decision::Execute { seal, note } => {
+                job.reuse_seal = seal;
+                if crate::reuse::declared(job).is_some()
+                    && !matches!(note, crate::reuse::Note::Miss)
+                {
+                    summary.detail = format!("task-result reuse: {}", note.as_str());
+                }
+            }
+        }
         let store = job.store.clone();
         let mut mounts = restore_caches(root, job, &declared, workspace.path(), &image, remote);
         let (mut files, mut env) = (false, false);
@@ -998,7 +1023,6 @@ fn prepare(
                 });
             }
         }
-        let isolation = job.runtime.for_job(stated_isolation);
         if let Some(outputs) = &outputs
             && matches!(isolation, Isolation::Container)
         {

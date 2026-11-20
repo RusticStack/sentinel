@@ -289,7 +289,7 @@ mod tests {
     }
 
     const OPTED_IN: &str =
-        "reuse: {inputs: [src/**.txt], outputs: [out]}\nsteps: [{id: s, run: echo hi}]";
+        "reuse: {inputs: [src/**.txt], paths: [out]}\nsteps: [{id: s, run: echo hi}]";
 
     /// One worker's store and one attempt's workspace, with the declared input and output present.
     struct Box_ {
@@ -403,32 +403,32 @@ mod tests {
             // The command.
             (
                 "command",
-                "reuse: {inputs: [src/**.txt], outputs: [out]}\nsteps: [{id: s, run: echo changed}]",
+                "reuse: {inputs: [src/**.txt], paths: [out]}\nsteps: [{id: s, run: echo changed}]",
             ),
             // The environment the pipeline declares, on the job.
             (
                 "job env",
-                "env: {MODE: fast}\nreuse: {inputs: [src/**.txt], outputs: [out]}\nsteps: [{id: s, run: echo hi}]",
+                "env: {MODE: fast}\nreuse: {inputs: [src/**.txt], paths: [out]}\nsteps: [{id: s, run: echo hi}]",
             ),
             // The environment the pipeline declares, on the step.
             (
                 "step env",
-                "reuse: {inputs: [src/**.txt], outputs: [out]}\nsteps: [{id: s, run: echo hi, env: {MODE: fast}}]",
+                "reuse: {inputs: [src/**.txt], paths: [out]}\nsteps: [{id: s, run: echo hi, env: {MODE: fast}}]",
             ),
             // The image reference the job states.
             (
                 "image reference",
-                "reuse: {inputs: [src/**.txt], outputs: [out]}\nsteps: [{id: s, run: echo hi}]",
+                "reuse: {inputs: [src/**.txt], paths: [out]}\nsteps: [{id: s, run: echo hi}]",
             ),
             // The declared input files, by digest.
             (
                 "input digest",
-                "reuse: {inputs: [src/**.txt], outputs: [out]}\nsteps: [{id: s, run: echo hi}]",
+                "reuse: {inputs: [src/**.txt], paths: [out]}\nsteps: [{id: s, run: echo hi}]",
             ),
             // The inputs the pipeline declares: a pattern it stopped naming is a different task.
             (
                 "input pattern",
-                "reuse: {inputs: [src/*.txt], outputs: [out]}\nsteps: [{id: s, run: echo hi}]",
+                "reuse: {inputs: [src/*.txt], paths: [out]}\nsteps: [{id: s, run: echo hi}]",
             ),
         ];
         for (component, declared) in moves {
@@ -546,7 +546,7 @@ mod tests {
         let boxed = Box_::new("one");
         fs::remove_file(boxed.workspace.join("src/a.txt")).unwrap();
         let mut job = boxed.job(spec(
-            "reuse: {inputs: [missing/**.txt], outputs: [out]}\nsteps: [{id: s, run: echo hi}]",
+            "reuse: {inputs: [missing/**.txt], paths: [out]}\nsteps: [{id: s, run: echo hi}]",
         ));
         let Decision::Execute { seal, note } = boxed.decide(&mut job, Isolation::Container) else {
             panic!("an unkeyable task still runs");

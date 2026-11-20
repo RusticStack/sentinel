@@ -1633,15 +1633,19 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy, inputs: &Inputs) -> Res
         None => None,
         Some(n) => {
             let child = map.child("reuse");
-            let declared = reuse(&child, n, &Shapes {
-                condition: &condition,
-                outputs: &outputs,
-                handoff: &handoff,
-                finalize: &finalize,
-                steps: &steps,
-                artifacts: &artifacts,
-                secrets: &secrets,
-            })?;
+            let declared = reuse(
+                &child,
+                n,
+                &Shapes {
+                    condition: &condition,
+                    outputs: &outputs,
+                    handoff: &handoff,
+                    finalize: &finalize,
+                    steps: &steps,
+                    artifacts: &artifacts,
+                    secrets: &secrets,
+                },
+            )?;
             Some(declared)
         }
     };

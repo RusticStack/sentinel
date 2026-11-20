@@ -165,7 +165,8 @@ handoff, and no handoff frame is sent to it, so its sessions behave exactly as b
 ## Protocol 15 task-result reuse
 
 Protocol 15 appends one server variant, `Context4`: `Context3` plus `reuse_fresh`, the run's
-forced-refresh flag for task-result reuse ([cache](cache.md#task-results)). It is a new variant rather
+forced-refresh flag for task-result reuse ([cache](cache.md#task-results),
+[worker link](worker-link.md#protocol-15-task-result-reuse)). It is a new variant rather
 than a field because postcard decodes exactly the field list its reader knows (see
 [Protocol 7 additions](#protocol-7-additions)). `REUSE_MIN` is 15: a session below it is sent
 `Context3`, which cannot state the flag, so a worker more than one release behind is never told a run

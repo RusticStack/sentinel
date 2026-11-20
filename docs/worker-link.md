@@ -326,6 +326,25 @@ producer's entry with its own path and bytes, and a job that never declared the 
 `handoff` module's unit tests (an entry that does not hash to its digest, a path that leaves the directory, a
 directory that is a symlink, a body past the declared length and an artifact past its bounds are each refused).
 
+## Protocol 15: task-result reuse
+
+Reuse adds no message to the link: a task's result is sealed in the worker's own store and read back from it
+([cache](cache.md#task-results)), so it is never offered, fetched or pushed to another worker.
+
+- **Context.** `Context4` is `Context3` plus `reuse_fresh`, the byte saying this run asked for fresh execution
+  (`"fresh": true` on a manual dispatch, and every rerun). It is a new variant rather than a field because postcard
+  decodes exactly the field list its reader knows ([protocol](protocol.md#protocol-7-additions)).
+- **Order matters.** `REUSE_MIN` is 15: a session below it is sent `Context3` and is therefore never told a run asked
+  for fresh execution, and a worker that cannot be told runs its own reuse decision. Upgrade the controller before the
+  workers, so the flag is refused to a session that cannot carry it instead of being silently dropped; a worker
+  upgraded first keeps working on an older controller and simply never learns about the flag.
+
+Its tests are `crates/sentinel-worker/tests/reuse_run.rs` (an opted-in task that passes is served without running
+again, a forced run executes it, and a task that declares no `reuse:` runs every time) and `crates/sentinel-worker/src/reuse.rs`'s
+unit tests (each declared component of the key changes it, a result sealed in one isolation class is never served in
+another, an input pattern that resolves to nothing makes the task run, and a forced run bypasses the store and seals
+nothing).
+
 ## Dispatch
 
 **The ready queue is the database.** A job is queued when its row says so (`jobs_ready`, the partial index on `(priority, created_seq) WHERE state_code = 1`); nothing in memory has to be rebuilt after a restart. Its resource needs (`cpu_millis`, `memory_bytes`) are copied from the compiled spec at run creation so placement never decodes a spec blob.

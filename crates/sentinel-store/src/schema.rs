@@ -200,10 +200,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (84, include_str!("migrations/084_ai_search.sql")),
     (85, include_str!("migrations/085_named_pipelines.sql")),
     (86, include_str!("migrations/086_job_outputs.sql")),
-    (
-        87,
-        include_str!("migrations/087_task_result_reuse.sql"),
-    ),
+    (87, include_str!("migrations/087_task_result_reuse.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
