@@ -63,6 +63,33 @@ pub enum ReportFormat {
     CustomJson,
 }
 
+/// What a report stated about the tests it ran, counted while it is parsed: the totals a job pair's
+/// parity comparison has nothing to compare without. Counts are the report's own records, so a
+/// re-run's own accounting (a package-level Go failure, a JUnit suite summary) is never added on top.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestCounts {
+    pub total: u32,
+    pub failed: u32,
+    pub skipped: u32,
+}
+
+impl ReportFormat {
+    /// Whether a report in this format states test results at all.
+    pub const fn reports_tests(self) -> bool {
+        matches!(self, Self::GoTestJson | Self::JunitXml)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GoTestJson => "go_test_json",
+            Self::RustCompilerJson => "rust_compiler_json",
+            Self::JunitXml => "junit_xml",
+            Self::SentinelJson => "sentinel_json",
+            Self::CustomJson => "custom_json",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CollectionSource {

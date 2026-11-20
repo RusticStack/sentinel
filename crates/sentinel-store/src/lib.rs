@@ -28,6 +28,7 @@ pub mod objects;
 pub mod offload;
 pub mod operations;
 pub mod organizations;
+pub mod parity;
 pub mod poll;
 pub mod provenance;
 pub mod registration;

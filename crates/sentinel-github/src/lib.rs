@@ -1,6 +1,7 @@
 //! A login token is never an installation token: it is never persisted or handed to a workload.
 //! Only the immutable numeric account id is durable; logins, names and emails are renameable and reused.
 
+pub mod actions;
 pub mod app;
 pub mod checks;
 #[cfg(feature = "fake")]

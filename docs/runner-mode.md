@@ -98,6 +98,16 @@ head repository the parser cannot read counts as a fork, because what cannot be 
 repository's own code is hostile. It is stored once, on the delivery and on the job, and never
 rewritten.
 
+## The shadow, and parity
+
+A repository migrating by `runs-on:` first runs a non-required copy of each migrated job with a
+Sentinel label beside the unchanged original, so both run on the same commits while GitHub's runners
+stay authoritative: the copy is `name: sentinel / <original>` and no required check names it. What the
+copy ran is the `runner_jobs` row its deliveries wrote, and the parity report compares it with the
+original pair by pair — conclusion, test counts and duration — over a window of commits
+([shadow parity](shadow-parity.md)). Switching the labels and dropping the copies is the next step
+(H06); this release implements the comparison, not the switch.
+
 ## Actions secrets are GitHub's
 
 Sentinel never receives Actions secrets. It does not ask: the App's runner-mode permissions are
