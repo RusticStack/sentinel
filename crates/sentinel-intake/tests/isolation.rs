@@ -94,6 +94,18 @@ impl Lister for RoutedLister {
             None => Ok(Vec::new()),
         }
     }
+
+    fn tip(
+        &self,
+        request: &sentinel_intake::poll::TipRequest<'_>,
+    ) -> Result<Option<sentinel_git::RefTip>, sentinel_git::Error> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.answers.lock().unwrap().get(request.remote) {
+            Some(Ok(tips)) => Ok(tips.iter().find(|t| t.name == request.ref_name).cloned()),
+            Some(Err(why)) => Err(sentinel_git::Error::Preparation(why.clone())),
+            None => Ok(None),
+        }
+    }
 }
 
 fn tip(oid: char) -> sentinel_git::RefTip {
@@ -256,6 +268,7 @@ impl Fixture {
             destinations,
             Arc::from(Vec::new()),
             fetch,
+            Arc::new(sentinel_intake::GitLister),
             self.dir.path().join(format!("work-{}", DeliveryId::new())),
             resolve::Config::default(),
         )

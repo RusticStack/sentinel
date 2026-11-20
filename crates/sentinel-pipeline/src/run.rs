@@ -7,7 +7,7 @@ use sentinel_protocol::cache::Class;
 use crate::{
     compile::{CompiledJob, CompiledPipeline},
     expr::{Expr, Template},
-    policy::Triggers,
+    policy::{RefFilter, Triggers},
     schema::{
         Arch, Artifact, ArtifactWhen, Cache, Concurrency, Job, Resources, RunsOn, Shell, Step,
     },
@@ -148,10 +148,11 @@ pub enum SpecError {
     Decode,
 }
 
-/// Format 9 adds `artifacts[].when: step:<id>`; format 8 adds `artifacts[].class`; format 7 adds `runs_on.os`
-/// and `runs_on.isolation`. A spec whose artifacts state no class or step trigger is written as format 7 or 6,
-/// byte for byte what earlier controllers wrote, so a worker that predates the newer fields keeps running it.
-pub const SPEC_FORMAT: u8 = 9;
+/// Format 10 adds `on.schedule`; format 9 adds `artifacts[].when: step:<id>`; format 8 adds
+/// `artifacts[].class`; format 7 adds `runs_on.os` and `runs_on.isolation`. A spec that states none of
+/// them is written as format 8, 7 or 6, byte for byte what earlier controllers wrote, so a worker that
+/// predates the newer fields keeps running it.
+pub const SPEC_FORMAT: u8 = 10;
 
 pub const SPEC_FORMAT_READ_MIN: u8 = 3;
 
@@ -173,13 +174,15 @@ impl RunSpec {
 
     /// The format `encode` writes for this spec: the lowest one that carries everything it states.
     pub fn format(&self) -> u8 {
-        if self
+        if self.pipeline.on.schedule {
+            SPEC_FORMAT
+        } else if self
             .pipeline
             .jobs
             .iter()
             .any(|j| j.spec.artifacts.iter().any(|a| a.when.step().is_some()))
         {
-            SPEC_FORMAT
+            9
         } else if self
             .pipeline
             .jobs
@@ -204,6 +207,7 @@ impl RunSpec {
         let body = match format {
             6 => postcard::to_allocvec(&RunSpecV6::from(self)),
             7 => postcard::to_allocvec(&RunSpecV7::from(self)),
+            10 => postcard::to_allocvec(&RunSpecV9::from(self)),
             _ => postcard::to_allocvec(&RunSpecV8::from(self)),
         };
         body.map(|body| {
@@ -225,7 +229,10 @@ impl RunSpec {
         match bytes.split_first() {
             // Format 9 is format 8's layout: the only difference is what `when` may hold, and this reader
             // takes both.
-            Some((&SPEC_FORMAT, body)) => whole::<RunSpecV8>(body).map(RunSpec::from),
+            Some((&SPEC_FORMAT, body)) => whole::<RunSpecV9>(body).map(RunSpec::from),
+            // Format 10 is format 8's layout plus the schedule trigger, which is why the format byte
+            // moves: a reader that predates it refuses such a spec at the leading byte.
+            Some((&9, body)) => whole::<RunSpecV8>(body).map(RunSpec::from),
             Some((&8, body)) => whole::<RunSpecV8>(body).map(RunSpec::from),
             Some((&7, body)) => whole::<RunSpecV7>(body).map(RunSpec::from),
             Some((&6, body)) => whole::<RunSpecV6>(body).map(RunSpec::from),
@@ -289,7 +296,7 @@ struct CompiledJobV6 {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CompiledPipelineV6 {
-    on: Triggers,
+    on: TriggersV6,
     concurrency: Option<Concurrency>,
     jobs: Vec<CompiledJobV6>,
     digest: u128,
@@ -308,7 +315,7 @@ impl From<&RunSpec> for RunSpecV6 {
         RunSpecV6 {
             source: spec.source.clone(),
             pipeline: CompiledPipelineV6 {
-                on: spec.pipeline.on.clone(),
+                on: TriggersV6::from(&spec.pipeline.on),
                 concurrency: spec.pipeline.concurrency.clone(),
                 jobs: spec
                     .pipeline
@@ -349,7 +356,7 @@ impl From<RunSpecV6> for RunSpec {
         RunSpec {
             source: v6.source,
             pipeline: CompiledPipeline {
-                on: v6.pipeline.on,
+                on: v6.pipeline.on.into(),
                 concurrency: v6.pipeline.concurrency,
                 jobs: v6
                     .pipeline
@@ -446,7 +453,7 @@ struct CompiledJobV7 {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CompiledPipelineV7 {
-    on: Triggers,
+    on: TriggersV6,
     concurrency: Option<Concurrency>,
     jobs: Vec<CompiledJobV7>,
     digest: u128,
@@ -464,7 +471,7 @@ impl From<&RunSpec> for RunSpecV7 {
         RunSpecV7 {
             source: spec.source.clone(),
             pipeline: CompiledPipelineV7 {
-                on: spec.pipeline.on.clone(),
+                on: TriggersV6::from(&spec.pipeline.on),
                 concurrency: spec.pipeline.concurrency.clone(),
                 jobs: spec
                     .pipeline
@@ -502,7 +509,7 @@ impl From<RunSpecV7> for RunSpec {
         RunSpec {
             source: v7.source,
             pipeline: CompiledPipeline {
-                on: v7.pipeline.on,
+                on: v7.pipeline.on.into(),
                 concurrency: v7.pipeline.concurrency,
                 jobs: v7
                     .pipeline
@@ -569,6 +576,65 @@ impl From<RunSpecV8> for RunSpec {
     }
 }
 
+/// Format 10: the format-8 layout plus the trigger set a scheduled pipeline states.
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSpecV9 {
+    base: RunSpecV8,
+    on: Triggers,
+}
+
+impl From<&RunSpec> for RunSpecV9 {
+    fn from(spec: &RunSpec) -> RunSpecV9 {
+        RunSpecV9 {
+            base: RunSpecV8::from(spec),
+            on: spec.pipeline.on.clone(),
+        }
+    }
+}
+
+impl From<RunSpecV9> for RunSpec {
+    fn from(v9: RunSpecV9) -> RunSpec {
+        let mut spec = RunSpec::from(v9.base);
+        spec.pipeline.on = v9.on;
+        spec
+    }
+}
+
+/// The trigger set of every format before 10: everything a pipeline could declare before `schedule`.
+#[derive(Debug, Serialize, Deserialize)]
+struct TriggersV6 {
+    push: Option<RefFilter>,
+    pull_request: Option<RefFilter>,
+    merge_group: Option<RefFilter>,
+    tag: Option<RefFilter>,
+    manual: bool,
+}
+
+impl From<&Triggers> for TriggersV6 {
+    fn from(on: &Triggers) -> TriggersV6 {
+        TriggersV6 {
+            push: on.push.clone(),
+            pull_request: on.pull_request.clone(),
+            merge_group: on.merge_group.clone(),
+            tag: on.tag.clone(),
+            manual: on.manual,
+        }
+    }
+}
+
+impl From<TriggersV6> for Triggers {
+    fn from(v6: TriggersV6) -> Triggers {
+        Triggers {
+            push: v6.push,
+            pull_request: v6.pull_request,
+            merge_group: v6.merge_group,
+            tag: v6.tag,
+            manual: v6.manual,
+            schedule: false,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheV3 {
     name: String,
@@ -612,7 +678,7 @@ struct CompiledJobV4 {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CompiledPipelineV4 {
-    on: Triggers,
+    on: TriggersV6,
     concurrency: Option<Concurrency>,
     jobs: Vec<CompiledJobV4>,
     digest: u128,
@@ -650,7 +716,7 @@ struct CompiledJobV5 {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CompiledPipelineV5 {
-    on: Triggers,
+    on: TriggersV6,
     concurrency: Option<Concurrency>,
     jobs: Vec<CompiledJobV5>,
     digest: u128,
@@ -688,7 +754,7 @@ struct CompiledJobV3 {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CompiledPipelineV3 {
-    on: Triggers,
+    on: TriggersV6,
     concurrency: Option<Concurrency>,
     jobs: Vec<CompiledJobV3>,
     digest: u128,
@@ -751,7 +817,7 @@ impl From<RunSpecV4> for RunSpec {
         RunSpec {
             source: v4.source,
             pipeline: CompiledPipeline {
-                on: v4.pipeline.on,
+                on: v4.pipeline.on.into(),
                 concurrency: v4.pipeline.concurrency,
                 jobs: v4
                     .pipeline
@@ -789,7 +855,7 @@ impl From<RunSpecV5> for RunSpec {
         RunSpec {
             source: v5.source,
             pipeline: CompiledPipeline {
-                on: v5.pipeline.on,
+                on: v5.pipeline.on.into(),
                 concurrency: v5.pipeline.concurrency,
                 jobs: v5
                     .pipeline
@@ -827,7 +893,7 @@ impl From<RunSpecV3> for RunSpec {
         RunSpec {
             source: v3.source,
             pipeline: CompiledPipeline {
-                on: v3.pipeline.on,
+                on: v3.pipeline.on.into(),
                 concurrency: v3.pipeline.concurrency,
                 jobs: v3
                     .pipeline
@@ -919,7 +985,7 @@ mod tests {
         let shadow = RunSpecV3 {
             source: spec.source.clone(),
             pipeline: CompiledPipelineV3 {
-                on: spec.pipeline.on.clone(),
+                on: TriggersV6::from(&spec.pipeline.on),
                 concurrency: spec.pipeline.concurrency.clone(),
                 digest: spec.pipeline.digest,
                 jobs: spec
@@ -969,7 +1035,7 @@ mod tests {
         let shadow = RunSpecV4 {
             source: spec.source.clone(),
             pipeline: CompiledPipelineV4 {
-                on: spec.pipeline.on.clone(),
+                on: TriggersV6::from(&spec.pipeline.on),
                 concurrency: spec.pipeline.concurrency.clone(),
                 digest: spec.pipeline.digest,
                 jobs: spec
@@ -1010,7 +1076,7 @@ mod tests {
         let shadow = RunSpecV5 {
             source: spec.source.clone(),
             pipeline: CompiledPipelineV5 {
-                on: spec.pipeline.on.clone(),
+                on: TriggersV6::from(&spec.pipeline.on),
                 concurrency: spec.pipeline.concurrency.clone(),
                 digest: spec.pipeline.digest,
                 jobs: spec
@@ -1303,6 +1369,35 @@ mod tests {
     }
 
     #[test]
+    fn a_schedule_trigger_is_format_10_and_round_trips() {
+        let text = "schema: 1\non: [push, schedule]\njobs:\n  a:\n    image: busybox\n    steps:\n      - id: s\n        run: echo hi\n";
+        let spec = RunSpec::new(
+            PinnedSource::new("r", SHA, None).unwrap(),
+            compile_str(text).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(spec.format(), SPEC_FORMAT);
+        let bytes = spec.encode().unwrap();
+        assert_eq!(bytes[0], 10);
+        let decoded = RunSpec::decode(&bytes).unwrap();
+        assert_eq!(decoded, spec);
+        assert!(decoded.pipeline.on.schedule && decoded.pipeline.on.push.is_some());
+        // Format 9 is format 8's layout: a reader still decodes a spec that states no schedule.
+        let plain = RunSpec::new(
+            PinnedSource::new("r", SHA, None).unwrap(),
+            compile_str("schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    steps:\n      - id: s\n        run: echo hi\n")
+                .unwrap(),
+        )
+        .unwrap();
+        let bytes = plain.encode().unwrap();
+        assert_eq!(
+            bytes[0], 6,
+            "a spec that states nothing newer is written as format 6"
+        );
+        assert_eq!(RunSpec::decode(&bytes).unwrap(), plain);
+    }
+
+    #[test]
     fn a_step_trigger_is_format_9_and_round_trips() {
         let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    artifacts:\n      - {name: early, paths: [out], when: 'step:first'}\n      - {name: later, paths: [out], when: success, class: debug}\n    steps:\n      - id: first\n        run: echo hi\n      - id: second\n        run: echo hi\n";
         let spec = RunSpec::new(
@@ -1310,7 +1405,7 @@ mod tests {
             compile_str(text).unwrap(),
         )
         .unwrap();
-        assert_eq!(spec.format(), SPEC_FORMAT);
+        assert_eq!(spec.format(), 9);
         let bytes = spec.encode().unwrap();
         assert_eq!(bytes[0], 9);
         let decoded = RunSpec::decode(&bytes).unwrap();

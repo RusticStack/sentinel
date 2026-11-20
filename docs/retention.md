@@ -1,6 +1,6 @@
 # Retention and quotas
 
-Every byte of Sentinel's stored content (artifacts, uploads, logs, caches, images, spools) is bounded twice: by **size** (a quota, a budget or a watermark) and, for evidence, by **age** (a retention). The metadata database is the exception: run, job and attempt rows are kept without a bound, see [metadata housekeeping](#metadata-housekeeping). This page is the whole map. Per-class totals (artifacts, uploads, logs and the reported caches) are kept per tenant ([per-class accounting](#per-class-accounting)), every quota is enforced at a hard threshold and warned at a soft one that also tells the tenant's administrators, once per crossing ([thresholds](#thresholds-and-the-hard-limit), [threshold notices](#threshold-notices)), and artifacts are kept under a deployment-defined retention class, pinned by a tenant administrator when they must outlive it ([artifact classes and pins](#artifact-classes-and-pins)). Planned on top of it: a default tenant limit instead of unlimited and enforcement of the runner-mode cache class ([plan 16.3](../plan.md#163-default-tenant-storage-limits)). The disk admission gate, object reclamation and the orphan sweep it builds on are in [storage](storage.md#disk-admission-quotas-and-reclamation).
+Every byte of Sentinel's stored content (artifacts, uploads, logs, caches, images, spools) is bounded twice: by **size** (a quota, a budget or a watermark) and, for evidence, by **age** (a retention). The metadata database is the exception: run, job and attempt rows are kept without a bound, see [metadata housekeeping](#metadata-housekeeping). This page is the whole map. Per-class totals (artifacts, uploads, logs and the reported caches) are kept per tenant ([per-class accounting](#per-class-accounting)), every quota is enforced at a hard threshold and warned at a soft one that also tells the tenant's administrators, once per crossing ([thresholds](#thresholds-and-the-hard-limit), [threshold notices](#threshold-notices)), and artifacts are kept under a deployment-defined retention class, pinned by a tenant administrator when they must outlive it ([artifact classes and pins](#artifact-classes-and-pins)). A tenant that states no quota of its own is held to the deployment's default, sized from the disk it fills, rather than to nothing ([the default limit](#the-default-limit)); what is still planned on top of it is enforcement of the runner-mode cache class ([plan 16.3](../plan.md#163-default-tenant-storage-limits)). The disk admission gate, object reclamation and the orphan sweep it builds on are in [storage](storage.md#disk-admission-quotas-and-reclamation).
 
 ## What is bounded, and by what
 
@@ -23,8 +23,8 @@ The deployment's `[storage]` configuration ([configuration](configuration.md)) s
 
 | Level | Set by | Quota | Thresholds | Log retention | Artifact retention (the longest a pipeline may ask for) |
 |---|---|---|---|---|
-| Deployment | `[storage]`: `quota_bytes`, `tenant_quota_bytes`, `soft_percent`, `hard_percent`, `log_retention_secs`, `artifact_retention_secs`, `run_artifact_bytes`, `attempt_log_bytes` | cap on every tenant together, plus the default per tenant | 80 % warned, 100 % enforced of each tenant's quota | 14 days | 90 days |
-| Tenant | platform administration: `PUT /admin/tenants/{slug}/storage`, `admin tenant storage` | its own cap | lower than the deployment's, never higher | any value 1 h – 366 d | any value 1 h – 366 d |
+| Deployment | `[storage]`: `quota_bytes`, `tenant_quota_bytes`, `personal_quota_bytes`, `soft_percent`, `hard_percent`, `log_retention_secs`, `artifact_retention_secs`, `run_artifact_bytes`, `attempt_log_bytes` | cap on every tenant together, plus the default an organization and a personal namespace inherit ([the default limit](#the-default-limit)) | 80 % warned, 100 % enforced of each tenant's quota | 14 days | 90 days |
+| Tenant | platform administration: `PUT /admin/tenants/{slug}/storage`, `admin tenant storage` | its own cap, or an explicit unlimited (0) | lower than the deployment's, never higher | any value 1 h – 366 d | any value 1 h – 366 d |
 | Repository | the tenant's administration: `PUT /tenants/{slug}/repos/{name}/storage`, `admin tenant storage --repo` | a cap inside the tenant's (never above it) | never its own: the line is the tenant's | only shorter than the tenant's | only shorter than the tenant's |
 | Run | configuration | `run_artifact_bytes` of artifacts per run | — | — |
 
@@ -156,12 +156,33 @@ Fixed sizes fit one disk badly: 1 GiB of reserve is plenty on 50 GB and a roundi
 | worker mirrors | a tenth | 1–50 GiB |
 | worker images (per store) | a fifth | 2–50 GiB |
 | controller remote cache store | a tenth | 1–50 GiB |
+| default quota, organization tenant | a 20th | 8–50 GiB |
+| default quota, personal namespace | a 100th | 2–10 GiB |
 
-The reference host (the verification VPS: 12 vCPU AMD EPYC 9645, 31 GiB, ext4 on a virtio disk) measures **1,080,795,422,720 bytes** (263,866,070 blocks of 4 KiB), which gives a 15.7 GiB reserve, closing at 31.5 GiB free above it and reopening at 63 GiB, a 2.0 GiB log floor, and 50 GiB for each worker and remote store. On 100 GiB a worker keeps 20 GiB of cache, 10 of mirrors and 20 of images, leaving half the disk to workspaces and spools. The worker stores together take at most half the disk by default.
+The reference host (the verification VPS: 12 vCPU AMD EPYC 9645, 31 GiB, ext4 on a virtio disk) measures **1,080,795,422,720 bytes** (263,866,070 blocks of 4 KiB), which gives a 15.7 GiB reserve, closing at 31.5 GiB free above it and reopening at 63 GiB, a 2.0 GiB log floor, and 50 GiB for each worker and remote store. On 100 GiB a worker keeps 20 GiB of cache, 10 of mirrors and 20 of images, leaving half the disk to workspaces and spools. The worker stores together take at most half the disk by default. The same figure sizes the two per-tenant defaults below, which land on their ceilings there: 50 GiB for an organization and 10 GiB for a personal namespace.
 
 **The reserve grows with the metadata database.** The reserve in force is the configured (or sized) one or twice the database's size on disk (main file plus write-ahead log), whichever is larger: room for the WAL to grow to the database's size before a checkpoint and for the database itself to keep growing, measured on every maintenance pass. `GET /admin/storage` and `admin objects status` report it.
 
 Retention defaults (14 days of logs, 90 of artifacts) are policy, not hardware; 90 days caps what a pipeline's `retain` may ask for.
+
+## The default limit
+
+A tenant that states no quota of its own is not unlimited: it inherits the deployment's default, sized from the data file system at start like every other unset size. A personal namespace answers to its own, because it is one person's space rather than a team's evidence.
+
+| Namespace | Key | Default | Floor | Ceiling |
+|---|---|---|---|---|
+| Organization | `[storage] tenant_quota_bytes` | a 20th of the data file system | 8 GiB | 50 GiB |
+| Personal | `[storage] personal_quota_bytes` | a 100th of it | 2 GiB | 10 GiB |
+
+**The arithmetic, on the reference host.** Its data file system measures 1,080,795,422,720 bytes, the figure this page's other sizes are derived from. A twentieth of it is 54,039,771,136 bytes and a hundredth 10,807,954,227, both above their ceilings, so an organization tenant there defaults to 50 GiB and a personal namespace to 10 GiB. Fifty GiB is three runs' whole `run_artifact_bytes` budget (3 × 16 GiB) with room for fourteen days of logs, so a tenant running full-size pipelines is not capped before its own evidence expires; a twentieth is also about the share of the disk one of nineteen such tenants may hold before the reserve and the low watermark (15.7 GiB and 31.5 GiB there, 47 GiB together) close admission rather than the quota. The floor keeps a small disk honest — 1 GiB per tenant on a 32 GiB box would let one tenant take it — and the ceiling stops a 4 TB disk from handing one tenant more than any deployment has needed.
+
+**What the tree does not measure.** No committed record measures a pilot's storage footprint, so the default is sized from the disk and from the run budget rather than from measured usage; the largest artifact the records carry is a 48 MiB archive test entry and a 12.6 MB digest-first transfer, and no deployment has reported a tenant's stored bytes. An operator on a different host sets `tenant_quota_bytes` and `personal_quota_bytes` to what that deployment will hold.
+
+**Precedence is unchanged: deployment, then tenant, then repository.** A tenant's own quota row wins over either default, and a repository's quota still narrows its tenant's and never lifts it. A field the tenant leaves unset inherits the default for its namespace kind, so turning one organization into a capped one is a single write on the deployment, and no policy row exists to keep.
+
+**Unlimited is explicit, and it is the platform's.** `0` on a tenant's policy row means no ceiling at all: no threshold, always `ok`, nothing ever refused. Only a platform administrator can state it — `PUT /admin/tenants/{slug}/storage` with `{"quota_bytes": 0}`, or `admin tenant storage --bytes 0` — because the tenant-level storage row is platform administration already ([authorization](authorization.md)); a repository row refuses it (`invalid_request`), since a repository narrows and never lifts. A deployment may state `0` in `[storage]` to give every tenant that inherits from it no default at all. Clearing a tenant's own unlimited (`--clear`) puts the deployment's default back in force.
+
+**The default applies to what is already stored.** It is read at every check rather than stamped on a row, so a tenant with no policy row is measured against it on its next upload, artifact publication or storage report, and a tenant already past it is `hard` from that moment: its caches are evicted at the next hard-threshold pass and its artifact publications are refused until it drops below the line or a platform administrator lifts it. Nothing is re-applied and nothing is recalculated, which is why the upgrade preflight lists the tenants a new default caps before an operator runs it ([upgrades](upgrades.md#before-upgrading)).
 
 ## Container images
 

@@ -11,6 +11,10 @@ pub struct Triggers {
     pub merge_group: Option<RefFilter>,
     pub tag: Option<RefFilter>,
     pub manual: bool,
+    /// A stored schedule may run this pipeline. The crons themselves are a stored per-repository
+    /// row (`sentinel_store::schedule`), not part of the pipeline: the pipeline says it accepts a
+    /// scheduled run, the controller's schedule decides when one happens.
+    pub schedule: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +40,7 @@ impl Triggers {
             && self.merge_group.is_none()
             && self.tag.is_none()
             && !self.manual
+            && !self.schedule
     }
 
     pub fn admits(&self, event: &Event<'_>) -> bool {
@@ -59,6 +64,7 @@ impl Triggers {
                 .as_ref()
                 .is_some_and(|f| event.tag_name().is_some_and(|t| f.accepts_tag(t))),
             EventKind::Manual => self.manual,
+            EventKind::Schedule => self.schedule,
         }
     }
 }
@@ -70,6 +76,7 @@ pub enum EventKind {
     Tag = 2,
     Manual = 3,
     MergeGroup = 4,
+    Schedule = 5,
 }
 
 impl EventKind {
@@ -80,6 +87,7 @@ impl EventKind {
             Self::MergeGroup => "merge_group",
             Self::Tag => "tag",
             Self::Manual => "manual",
+            Self::Schedule => "schedule",
         }
     }
 
@@ -90,6 +98,7 @@ impl EventKind {
             "merge_group" => Self::MergeGroup,
             "tag" => Self::Tag,
             "manual" => Self::Manual,
+            "schedule" => Self::Schedule,
             _ => return None,
         })
     }
@@ -136,6 +145,14 @@ impl<'a> Event<'a> {
         Self {
             kind: EventKind::Manual,
             ref_name: "",
+        }
+    }
+
+    /// The ref a scheduled run reads is the one its stored schedule names.
+    pub const fn schedule(ref_name: &'a str) -> Self {
+        Self {
+            kind: EventKind::Schedule,
+            ref_name,
         }
     }
 

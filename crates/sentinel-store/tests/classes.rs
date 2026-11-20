@@ -756,6 +756,7 @@ fn database_at_latest_without_classes(path: &Path) {
          ALTER TABLE installations DROP COLUMN migration_permissions;
          ALTER TABLE tenants DROP COLUMN migration_mode;
          ALTER TABLE tenants DROP COLUMN migration_settings;
+         ALTER TABLE storage_defaults DROP COLUMN personal_quota_bytes;
          ALTER TABLE storage_defaults DROP COLUMN soft_percent;
          ALTER TABLE storage_defaults DROP COLUMN hard_percent;
          ALTER TABLE storage_policies DROP COLUMN soft_percent;
@@ -768,6 +769,12 @@ fn database_at_latest_without_classes(path: &Path) {
          DROP TABLE ai_requests;
          DROP TABLE test_outcomes;
          DROP TABLE test_outcome_queue;
+         DROP INDEX schedule_occurrences_by_run;
+         DROP INDEX schedule_occurrences_by_age;
+         DROP INDEX schedule_occurrences_by_claim;
+         DROP TABLE schedule_occurrences;
+         DROP INDEX schedules_due;
+         DROP TABLE schedules;
          DELETE FROM schema_migrations WHERE version >= 65;",
     )
     .unwrap();

@@ -452,6 +452,7 @@ struct StorageFile {
     high_watermark_bytes: Option<u64>,
     quota_bytes: Option<u64>,
     tenant_quota_bytes: Option<u64>,
+    personal_quota_bytes: Option<u64>,
     log_retention_secs: Option<u64>,
     artifact_retention_secs: Option<u64>,
     run_artifact_bytes: Option<u64>,
@@ -470,6 +471,11 @@ struct Storage {
     low: Option<u64>,
     high: Option<u64>,
     deployment: sentinel_store::retention::Deployment,
+    /// The per-tenant defaults exactly as the configuration states them; absent means the default is
+    /// sized from the data file system when the controller measures it (a twentieth for a tenant, a
+    /// hundredth for a personal namespace).
+    tenant_quota: Option<u64>,
+    personal_quota: Option<u64>,
     classes: sentinel_store::retention::Classes,
     attempt_log_bytes: u64,
     sweep_interval_ms: i64,
@@ -535,10 +541,14 @@ impl StorageFile {
                 "storage run_artifact_bytes must be 1 MiB..=1 TiB and attempt_log_bytes 1 MiB..=4 GiB",
             ));
         }
-        if [self.quota_bytes, self.tenant_quota_bytes]
-            .into_iter()
-            .flatten()
-            .any(|q| q > i64::MAX as u64)
+        if [
+            self.quota_bytes,
+            self.tenant_quota_bytes,
+            self.personal_quota_bytes,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|q| q > i64::MAX as u64)
         {
             return Err(Error::config("storage quotas must fit in 63 bits"));
         }
@@ -558,9 +568,16 @@ impl StorageFile {
             low: self.low_watermark_bytes,
             high: self.high_watermark_bytes,
             classes,
+            tenant_quota: self.tenant_quota_bytes,
+            personal_quota: self.personal_quota_bytes,
             deployment: sentinel_store::retention::Deployment {
                 quota_bytes: self.quota_bytes.unwrap_or(0),
-                tenant_quota_bytes: self.tenant_quota_bytes.unwrap_or(0),
+                tenant_quota_bytes: self
+                    .tenant_quota_bytes
+                    .unwrap_or(sentinel_store::retention::DEFAULT_TENANT_QUOTA_BYTES),
+                personal_quota_bytes: self
+                    .personal_quota_bytes
+                    .unwrap_or(sentinel_store::retention::DEFAULT_PERSONAL_QUOTA_BYTES),
                 log_retention_ms: (log_retention_secs * 1000) as i64,
                 artifact_retention_ms: (artifact_retention_secs * 1000) as i64,
                 run_artifact_bytes,
@@ -1656,6 +1673,7 @@ enum Running {
         store: Arc<sentinel_store::Store>,
         lane: Box<sentinel_intake::Lane>,
         poll: Box<sentinel_intake::Poll>,
+        schedules: Box<sentinel_intake::ScheduleLane>,
         github_lanes: Arc<std::sync::Mutex<Option<GithubLanes>>>,
         mail: Option<Box<sentinel_mail::Lane>>,
         tailcat: Option<TailcatServer>,
@@ -2131,7 +2149,7 @@ fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
     let wall = sentinel_core::UnixMillis::now();
     // Idempotency keys are stamped by the deadline clock, so their TTL is judged on it.
     let steady = sentinel_core::UnixMillis::steady();
-    let purges: [(&str, Purge, sentinel_core::UnixMillis); 10] = [
+    let purges: [(&str, Purge, sentinel_core::UnixMillis); 11] = [
         ("setup", sentinel_store::setup::purge, wall),
         ("github_app_states", sentinel_store::github_app::purge, wall),
         ("oauth", sentinel_store::oauth::purge_expired, wall),
@@ -2153,6 +2171,11 @@ fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
             "secret_idempotency",
             sentinel_store::secrets::purge_idempotency,
             wall,
+        ),
+        (
+            "schedule_occurrences",
+            sentinel_store::schedule::purge,
+            sentinel_core::UnixMillis(wall.0 - sentinel_store::schedule::OCCURRENCE_RETENTION_MS),
         ),
     ];
     let mut backlog = false;
@@ -2271,7 +2294,17 @@ fn start_server(
             .map_err(|error| Error::runtime(format!("invalid storage watermarks: {error}")))?,
     );
     admission.set_metadata_bytes(store.metadata_bytes());
-    let deployment = config.storage.deployment;
+    // The per-tenant defaults the configuration leaves unstated are sized from the data file system this
+    // controller just measured: the default a tenant inherits is a property of the disk it fills, not a
+    // constant, and the same arithmetic the upgrade preflight reports.
+    let mut deployment = config.storage.deployment;
+    let (tenant_default, personal_default) = sentinel_store::retention::sized_quota(total);
+    if config.storage.tenant_quota.is_none() {
+        deployment.tenant_quota_bytes = tenant_default;
+    }
+    if config.storage.personal_quota.is_none() {
+        deployment.personal_quota_bytes = personal_default;
+    }
     let classes = config.storage.classes.clone();
     let changed = store
         .writer()
@@ -2304,6 +2337,7 @@ fn start_server(
         high_watermark_bytes = marks.high,
         quota_bytes = deployment.quota_bytes,
         tenant_quota_bytes = deployment.tenant_quota_bytes,
+        personal_quota_bytes = deployment.personal_quota_bytes,
         log_retention_ms = deployment.log_retention_ms,
         artifact_retention_ms = deployment.artifact_retention_ms,
     );
@@ -2311,7 +2345,7 @@ fn start_server(
     let objects = sentinel_store::objects::Objects::open(&config.data_dir)
         .map_err(|error| Error::runtime(format!("cannot open the object store: {error}")))?;
     objects.set_admission(Arc::clone(&admission));
-    objects.set_deployment(config.storage.deployment);
+    objects.set_deployment(deployment);
     let recovery = store
         .read(|conn| objects.recover(conn))
         .map_err(|error| Error::runtime(format!("cannot recover the object store: {error}")))?;
@@ -2405,17 +2439,20 @@ fn start_server(
     if !runner_policy.classes.is_empty() {
         controller.set_runner_policy(runner_policy);
     }
-    let resolver = sentinel_intake::Resolver::new(
-        Arc::clone(&store),
-        key.clone(),
-        github.current.clone(),
-        Arc::clone(&intake_destinations),
-        Arc::clone(&runner_classes),
-        Arc::new(sentinel_intake::resolve::GitFetch),
-        config.data_dir.join("intake-work"),
-        sentinel_intake::resolve::Config::default(),
-    )
-    .map_err(|_| Error::runtime("cannot prepare the intake work directory"))?;
+    let resolver = Arc::new(
+        sentinel_intake::Resolver::new(
+            Arc::clone(&store),
+            key.clone(),
+            github.current.clone(),
+            Arc::clone(&intake_destinations),
+            Arc::clone(&runner_classes),
+            Arc::new(sentinel_intake::resolve::GitFetch),
+            Arc::new(sentinel_intake::GitLister),
+            config.data_dir.join("intake-work"),
+            sentinel_intake::resolve::Config::default(),
+        )
+        .map_err(|_| Error::runtime("cannot prepare the intake work directory"))?,
+    );
     let dispatch_wake: Arc<dyn Fn() + Send + Sync> = {
         let handle = controller.handle();
         // A new run can supersede a running one (`cancel_in_progress`), so its cancel is pushed now.
@@ -2424,7 +2461,7 @@ fn start_server(
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let lane = sentinel_intake::Lane::start(
         Arc::clone(&store),
-        Some(Arc::new(resolver)),
+        Some(Arc::clone(&resolver)),
         Some(dispatch_wake),
         sentinel_intake::lane::Config::default(),
         move |batch| {
@@ -2480,6 +2517,32 @@ fn start_server(
         },
     )
     .map_err(|_| Error::runtime("cannot prepare the poll work directory"))?;
+    let schedule_dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let schedules = sentinel_intake::ScheduleLane::start(
+        Arc::clone(&store),
+        resolver,
+        sentinel_intake::schedules::Config::default(),
+        move |notice| {
+            tracing::dispatcher::with_default(&schedule_dispatch, || {
+                match (&notice.repo, &notice.error) {
+                    (_, Some(error)) => tracing::warn!(
+                        event = "schedule_failed",
+                        repo = %notice.repo.map(|r| r.to_string()).unwrap_or_default(),
+                        at_ms = notice.at_ms,
+                        outcome = %notice.outcome,
+                        error = %error
+                    ),
+                    (Some(repo), None) => tracing::info!(
+                        event = "schedule_settled",
+                        repo = %repo,
+                        at_ms = notice.at_ms,
+                        outcome = %notice.outcome
+                    ),
+                    (None, None) => {}
+                }
+            });
+        },
+    );
     let github_webhook_secret = github.webhook_secret.clone();
     if github_webhook_secret.is_some() {
         tracing::info!(event = "github_webhook_enabled");
@@ -2612,6 +2675,7 @@ fn start_server(
         store,
         lane: Box::new(lane),
         poll: Box::new(poll),
+        schedules: Box::new(schedules),
         github_lanes,
         mail,
         tailcat,
@@ -3675,6 +3739,7 @@ fn initialize_and_wait(
             store,
             lane,
             poll,
+            schedules,
             github_lanes,
             mail,
             tailcat,
@@ -3700,6 +3765,7 @@ fn initialize_and_wait(
                     .take(),
             );
             drop(mail);
+            drop(schedules);
             drop(poll);
             drop(lane);
             let sessions_drained = controller.shutdown(LINK_SHUTDOWN);
@@ -4270,7 +4336,19 @@ credentials_file = '/etc/sentinel/s3'
         assert_eq!(marks_ok(&resolved, 1 << 50).reserve, 16 << 30);
         let d = resolved.deployment;
         assert_eq!(d.quota_bytes, 0);
-        assert_eq!(d.tenant_quota_bytes, 0);
+        // A deployment that states no per-tenant limit gets the sized default, and the pair the start
+        // sizes from the data file system is left for it to apply.
+        assert_eq!(
+            (d.tenant_quota_bytes, d.personal_quota_bytes),
+            (
+                sentinel_store::retention::DEFAULT_TENANT_QUOTA_BYTES,
+                sentinel_store::retention::DEFAULT_PERSONAL_QUOTA_BYTES
+            )
+        );
+        assert_eq!(
+            (resolved.tenant_quota, resolved.personal_quota),
+            (None, None)
+        );
         assert_eq!(d.log_retention_ms, 14 * 86_400_000);
         assert_eq!(d.artifact_retention_ms, 90 * 86_400_000);
         assert_eq!(d.run_artifact_bytes, 16 << 30);

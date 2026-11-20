@@ -1,7 +1,8 @@
 # Event intake: ref updates, webhooks and durable resolution
 
-A run starts two ways: a person or agent dispatches a pinned pipeline through
-the [API](api.md), or a repository tells Sentinel that something changed. This
+A run starts three ways: a person or agent dispatches a pinned pipeline through
+the [API](api.md), a repository tells Sentinel that something changed, or a
+stored schedule's occurrence comes due ([schedules](schedules.md)). This
 document is the second path. Intake is deliberately small: authenticate, bound,
 store, acknowledge, and let a bounded lane resolve off the request path. No
 route starts a container, fetches a pipeline or waits for a run.

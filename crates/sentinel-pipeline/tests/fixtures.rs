@@ -69,6 +69,7 @@ fn full_fixture_decodes_every_field() {
             merge_group: None,
             tag: None,
             manual: true,
+            schedule: false,
         }
     );
     assert!(p.concurrency.as_ref().unwrap().cancel_in_progress);

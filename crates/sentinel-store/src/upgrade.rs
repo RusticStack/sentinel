@@ -201,6 +201,24 @@ pub struct Step {
     pub rewrites: Vec<Rewrite>,
 }
 
+/// A tenant the upgrade's new default per-tenant limit would cap: its counted usage is already past the
+/// default that applies to it, or the limit it states itself is above it, so an operator sees who the
+/// change touches before it runs. `quota_bytes` is the tenant's own limit and `None` when it inherits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Capped {
+    pub slug: String,
+    pub personal: bool,
+    pub used_bytes: u64,
+    pub quota_bytes: Option<u64>,
+    /// The new default that applies to this tenant once the upgrade runs: the personal one for a personal
+    /// namespace, the deployment's per-tenant one otherwise.
+    pub default_bytes: u64,
+}
+
+/// How many capped tenants the preflight lists; `capped_total` counts them all, so a deployment with more
+/// than this many still says so.
+pub const CAPPED_LISTED: u32 = 256;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preflight {
     pub inspection: Inspection,
@@ -215,6 +233,13 @@ pub struct Preflight {
     pub copy: Option<PathBuf>,
     /// One entry per pending migration, in order.
     pub steps: Vec<Step>,
+    /// The default each kind of tenant inherits after the upgrade, sized from the data file system as the
+    /// controller sizes it (`retention::sized_quota`): an organization's, then a personal namespace's.
+    pub tenant_defaults: (u64, u64),
+    /// The tenants the new default caps, heaviest first, at most [`CAPPED_LISTED`] of them.
+    pub capped: Vec<Capped>,
+    /// How many tenants the new default caps, listed or not.
+    pub capped_total: u64,
 }
 
 /// The text of the migration with comments and the contents of string literals blanked, so a keyword
@@ -357,9 +382,13 @@ pub fn preflight(data_dir: &Path) -> Result<Preflight> {
     let inspection = inspect(&path)?;
     let free_bytes = crate::space::free_bytes(data_dir).ok();
     let needed_bytes = inspection.bytes.saturating_mul(2);
+    let tenant_defaults =
+        crate::retention::sized_quota(crate::space::total_bytes(data_dir).unwrap_or(0));
     let mut sealed_values = false;
     let mut workers = Vec::new();
     let mut steps = Vec::new();
+    let mut capped = Vec::new();
+    let mut capped_total = 0u64;
     if !inspection.fresh {
         let conn = Connection::open_with_flags(
             &path,
@@ -367,6 +396,7 @@ pub fn preflight(data_dir: &Path) -> Result<Preflight> {
         )?;
         sealed_values = crate::reseal::sealed_rows_exist(&conn).unwrap_or(false);
         steps = inspection.pending.iter().map(|&v| step(&conn, v)).collect();
+        (capped, capped_total) = capped_tenants(&conn, tenant_defaults);
         let with_software = conn.prepare("SELECT software FROM workers LIMIT 0").is_ok();
         let sql = if with_software {
             "SELECT name, protocol, software, last_seen_ms FROM workers WHERE revoked_ms IS NULL ORDER BY name"
@@ -438,7 +468,67 @@ pub fn preflight(data_dir: &Path) -> Result<Preflight> {
         blocking,
         copy,
         steps,
+        tenant_defaults,
+        capped,
+        capped_total,
     })
+}
+
+/// The tenants whose usage or own limit is above the default the upgrade applies, heaviest first: the read
+/// the preflight makes before it writes anything, one keyed usage row and one keyed policy row per tenant,
+/// never a scan of what they stored.
+fn capped_tenants(
+    conn: &Connection,
+    (tenant_default, personal_default): (u64, u64),
+) -> (Vec<Capped>, u64) {
+    let mut stmt = match conn.prepare(
+        "SELECT t.slug, t.kind = 1, COALESCE(u.bytes, 0) + COALESCE(u.log_bytes, 0), p.quota_bytes
+         FROM tenants t
+         LEFT JOIN tenant_usage u ON u.tenant_id = t.id
+         LEFT JOIN storage_policies p ON p.tenant_id = t.id AND p.repo_id = X''
+         WHERE t.active = 1
+         ORDER BY 3 DESC, t.slug",
+    ) {
+        Ok(stmt) => stmt,
+        // A database this old has no usage table yet: every tenant starts under the new default.
+        Err(_) => return (Vec::new(), 0),
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<bool>>(1)?.unwrap_or(false),
+            r.get::<_, i64>(2)?.max(0) as u64,
+            r.get::<_, Option<i64>>(3)?,
+        ))
+    }) else {
+        return (Vec::new(), 0);
+    };
+    let mut capped = Vec::new();
+    let mut total = 0u64;
+    for row in rows.flatten() {
+        let (slug, personal, used, quota) = row;
+        let default_bytes = if personal {
+            personal_default
+        } else {
+            tenant_default
+        };
+        let quota_bytes = quota.map(|q| q.max(0) as u64);
+        // A limit of 0 is the explicit unlimited: it has no ceiling at all, so it is above any default.
+        if used <= default_bytes && !quota_bytes.is_some_and(|q| q == 0 || q > default_bytes) {
+            continue;
+        }
+        total += 1;
+        if capped.len() < CAPPED_LISTED as usize {
+            capped.push(Capped {
+                slug,
+                personal,
+                used_bytes: used,
+                quota_bytes,
+                default_bytes,
+            });
+        }
+    }
+    (capped, total)
 }
 
 #[cfg(test)]
@@ -484,8 +574,14 @@ mod tests {
     #[test]
     fn the_pending_migrations_report_the_tables_they_rewrite() {
         let sql = |version: u32| schema::MIGRATIONS[version as usize - 1].1;
-        // Runner-mode provisioning adds tables, indexes and triggers only.
-        assert!(rewritten(sql(schema::LATEST)).is_empty());
+        // The default-limit rebuild copies the policy table's rows into a replacement and drops the one it
+        // replaces; the preflight reports it only for a table that exists to be counted.
+        assert_eq!(
+            rewritten(sql(81)),
+            ["storage_policies", "storage_policies_previous"]
+        );
+        // The newest migration only creates tables nothing earlier holds, so it visits no row.
+        assert_eq!(rewritten(sql(schema::LATEST)), Vec::<&str>::new());
         // The OAuth scope rebuild copies every row into a `_v73` table and drops the original.
         let oauth = rewritten(sql(73));
         for table in ["oauth_clients", "oauth_grants", "oauth_access_tokens"] {

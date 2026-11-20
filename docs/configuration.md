@@ -123,7 +123,8 @@ reserve_bytes = 16777216000        # held back for metadata and log evidence (�
 low_watermark_bytes = 33554432000  # discretionary writes refuse when free space above the reserve falls under this; default a 32nd, 2-32 GiB
 high_watermark_bytes = 67108864000 # …and admit again above this (≥ low); default twice low
 quota_bytes = 0                    # cap on what every tenant stores together (objects, uploads, logs); 0 = unlimited (default)
-tenant_quota_bytes = 0             # default cap per tenant, the same kinds of bytes; 0 = unlimited (default; one upload still declares at most 4 GiB)
+tenant_quota_bytes = 53687091200   # default cap an organization tenant inherits, the same kinds of bytes; unset = a 20th of the data file system (8-50 GiB, 50 GiB on the reference host); 0 = no default at all ([retention](retention.md#the-default-limit))
+personal_quota_bytes = 10737418240 # the same for a personal namespace; unset = a 100th of it (2-10 GiB, 10 GiB there); 0 = no default
 soft_percent = 80                  # percent of that cap where a tenant is warned, nothing refused (1..=100); a tenant may lower it
 hard_percent = 100                 # percent where its caches are evicted and its artifacts refused (1..=100, at least soft_percent); a tenant may lower it
 log_retention_secs = 1209600       # finished attempt logs kept this long unless a tenant or repository says otherwise (1 h .. 366 d, default 14 d)

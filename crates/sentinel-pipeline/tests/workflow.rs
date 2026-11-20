@@ -595,7 +595,6 @@ fn rule_table_v1_classifies_every_construct() {
         assert_eq!(trigger(event), Rule::Translatable, "{event}");
     }
     for event in [
-        "schedule",
         "workflow_call",
         "workflow_run",
         "pull_request_target",
@@ -609,6 +608,7 @@ fn rule_table_v1_classifies_every_construct() {
             "{event}"
         );
     }
+    assert!(matches!(trigger("schedule"), Rule::WithChange { .. }));
     let action = |uses: &str| {
         RuleTable::V1.classify(&Construct::Action {
             uses: uses.to_owned(),
@@ -955,8 +955,9 @@ fn the_blacksmith_fixture_keeps_what_sentinel_cannot_serve() {
         .collect();
     assert!(native.iter().any(|(name, rule)| name == "on"
         && *rule
-            == Rule::Unsupported {
-                reason: "durable schedules do not exist yet (I02)"
+            == Rule::WithChange {
+                change: "the crons become a stored per-repository schedule; the translated \
+                         pipeline accepts a scheduled run",
             }));
 }
 

@@ -82,7 +82,8 @@ pub struct Notice {
 /// `retention::standing` reads them, so a notice can never disagree with the report beside it.
 pub fn crossings(conn: &Connection, d: &Deployment, limit: u32) -> Result<Vec<Crossing>> {
     let mut statement = conn.prepare_cached(
-        "SELECT u.tenant_id, t.slug, u.bytes + u.log_bytes, p.quota_bytes, p.soft_percent, p.hard_percent
+        "SELECT u.tenant_id, t.slug, u.bytes + u.log_bytes, p.quota_bytes, p.soft_percent,
+                p.hard_percent, t.kind = 1
          FROM tenant_usage u JOIN tenants t ON t.id = u.tenant_id AND t.active = 1
          LEFT JOIN storage_policies p ON p.tenant_id = u.tenant_id AND p.repo_id = X''
          WHERE NOT EXISTS(SELECT 1 FROM storage_notices n WHERE n.tenant_id = u.tenant_id)",
@@ -95,17 +96,21 @@ pub fn crossings(conn: &Connection, d: &Deployment, limit: u32) -> Result<Vec<Cr
             r.get::<_, Option<i64>>(3)?,
             r.get::<_, Option<i64>>(4)?,
             r.get::<_, Option<i64>>(5)?,
+            r.get::<_, Option<bool>>(6)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (tenant, slug, used, quota, soft, hard) = row?;
+        let (tenant, slug, used, quota, soft, hard, personal) = row?;
         let (soft, hard) = retention::thresholds(
             d,
             soft.map(|p| p.clamp(1, 100) as u8),
             hard.map(|p| p.clamp(1, 100) as u8),
         );
-        let quota = quota.map_or(d.tenant_quota_bytes, |q| q.max(0) as u64);
+        let quota = quota.map_or_else(
+            || retention::default_quota(d, personal.unwrap_or(false)),
+            |q| q.max(0) as u64,
+        );
         if retention::state(used, quota, soft, hard) == State::Ok {
             continue;
         }
@@ -125,9 +130,10 @@ pub fn crossings(conn: &Connection, d: &Deployment, limit: u32) -> Result<Vec<Cr
 pub fn recovered(conn: &Connection, d: &Deployment, limit: u32) -> Result<Vec<TenantId>> {
     let mut statement = conn.prepare_cached(
         "SELECT n.tenant_id, COALESCE(u.bytes, 0) + COALESCE(u.log_bytes, 0), p.quota_bytes,
-             p.soft_percent, p.hard_percent
+             p.soft_percent, p.hard_percent, t.kind = 1
          FROM storage_notices n LEFT JOIN tenant_usage u ON u.tenant_id = n.tenant_id
-         LEFT JOIN storage_policies p ON p.tenant_id = n.tenant_id AND p.repo_id = X''",
+         LEFT JOIN storage_policies p ON p.tenant_id = n.tenant_id AND p.repo_id = X''
+         LEFT JOIN tenants t ON t.id = n.tenant_id",
     )?;
     let rows = statement.query_map([], |r| {
         Ok((
@@ -136,17 +142,21 @@ pub fn recovered(conn: &Connection, d: &Deployment, limit: u32) -> Result<Vec<Te
             r.get::<_, Option<i64>>(2)?,
             r.get::<_, Option<i64>>(3)?,
             r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<bool>>(5)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (tenant, used, quota, soft, hard) = row?;
+        let (tenant, used, quota, soft, hard, personal) = row?;
         let (soft, _) = retention::thresholds(
             d,
             soft.map(|p| p.clamp(1, 100) as u8),
             hard.map(|p| p.clamp(1, 100) as u8),
         );
-        let quota = quota.map_or(d.tenant_quota_bytes, |q| q.max(0) as u64);
+        let quota = quota.map_or_else(
+            || retention::default_quota(d, personal.unwrap_or(false)),
+            |q| q.max(0) as u64,
+        );
         if used >= retention::limit_bytes(quota, rearm_percent(soft)) && quota > 0 {
             continue;
         }

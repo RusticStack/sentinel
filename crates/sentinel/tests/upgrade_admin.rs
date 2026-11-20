@@ -118,13 +118,27 @@ fn the_check_reports_the_upgrade_without_migrating_and_exits_two_when_it_blocks(
         report["blocking"].as_array().unwrap().is_empty(),
         "{report}"
     );
-    // The newest migration adds runner-mode shape only, so it rewrites none of the stored rows.
+    // The newest migration only creates two tables no earlier statement holds, so its step visits no
+    // row; the storage rebuild one step below it is where a preflight from two schemas back names the
+    // policy table it carries over (`sentinel-store`'s own preflight test asserts that).
     let steps = report["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 1, "{report}");
     assert_eq!(steps[0]["migration"], schema::LATEST);
-    assert_eq!(
-        steps[0]["rewrites"].as_array().unwrap().len(),
-        0,
+    assert_eq!(steps[0]["rewrites"], serde_json::json!([]), "{report}");
+    // The per-tenant defaults the upgrade applies are sized from the data file system and reported, and
+    // this tenant is under them, so nothing is capped.
+    let defaults = &report["tenant_defaults"];
+    assert!(
+        defaults["tenant_quota_bytes"].as_u64().unwrap()
+            > defaults["personal_quota_bytes"].as_u64().unwrap(),
+        "{report}"
+    );
+    assert_eq!(report["capped_tenants"]["total"], 0, "{report}");
+    assert!(
+        report["capped_tenants"]["listed"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
         "{report}"
     );
     // A worker from a newer release is listed and marked rather than dropped.

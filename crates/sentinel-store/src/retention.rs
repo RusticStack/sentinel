@@ -19,6 +19,50 @@ pub const MAX_RETENTION_MS: i64 = 366 * DAY_MS;
 pub const DEFAULT_SOFT_PERCENT: u8 = 80;
 pub const DEFAULT_HARD_PERCENT: u8 = 100;
 
+/// The per-tenant default a deployment that states no `tenant_quota_bytes` gives every organization, and
+/// the personal namespace's own default: a twentieth of the data file system for a tenant, a fifth of that
+/// for one person's namespace, each clamped so a small disk still gets a workable limit and a large one
+/// still bounds a single tenant. On the reference host's measured 1,080,795,422,720-byte file system a
+/// twentieth is 50.3 GiB and a hundredth 10.1 GiB, so both land on these ceilings there
+/// ([retention](../../../docs/retention.md#the-default-limit)).
+pub const DEFAULT_TENANT_QUOTA_BYTES: u64 = 50 << 30;
+pub const MIN_TENANT_QUOTA_BYTES: u64 = 8 << 30;
+pub const DEFAULT_PERSONAL_QUOTA_BYTES: u64 = 10 << 30;
+pub const MIN_PERSONAL_QUOTA_BYTES: u64 = 2 << 30;
+
+/// The defaults a data file system of `total` bytes sizes: a tenant's and a personal namespace's. One
+/// function so the controller, the upgrade preflight and the tests agree on the arithmetic the page states.
+pub const fn sized_quota(total: u64) -> (u64, u64) {
+    let tenant = total / 20;
+    let tenant = if tenant < MIN_TENANT_QUOTA_BYTES {
+        MIN_TENANT_QUOTA_BYTES
+    } else if tenant > DEFAULT_TENANT_QUOTA_BYTES {
+        DEFAULT_TENANT_QUOTA_BYTES
+    } else {
+        tenant
+    };
+    let personal = total / 100;
+    let personal = if personal < MIN_PERSONAL_QUOTA_BYTES {
+        MIN_PERSONAL_QUOTA_BYTES
+    } else if personal > DEFAULT_PERSONAL_QUOTA_BYTES {
+        DEFAULT_PERSONAL_QUOTA_BYTES
+    } else {
+        personal
+    };
+    (tenant, personal)
+}
+
+/// The deployment's default quota for one tenant, by what kind of namespace it is: a personal namespace
+/// answers to `personal_quota_bytes`, every other to `tenant_quota_bytes`. A tenant's own quota wins over
+/// either, and a repository's narrows it, as before.
+pub const fn default_quota(d: &Deployment, personal: bool) -> u64 {
+    if personal {
+        d.personal_quota_bytes
+    } else {
+        d.tenant_quota_bytes
+    }
+}
+
 /// A tenant's position against its own thresholds. `Soft` refuses nothing: it is what the API and the
 /// `sentinel_storage_tenants` metric report so an operator sees a tenant filling up before it is full.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,7 +123,11 @@ pub(crate) const fn thresholds(d: &Deployment, soft: Option<u8>, hard: Option<u8
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deployment {
     pub quota_bytes: u64,
+    /// The default an organization's tenant inherits when it states no quota of its own; 0 is an explicit
+    /// unlimited, which only a platform administrator can state.
     pub tenant_quota_bytes: u64,
+    /// The same for a personal namespace, whose owner is one person and whose evidence is one person's.
+    pub personal_quota_bytes: u64,
     pub log_retention_ms: i64,
     pub artifact_retention_ms: i64,
     pub run_artifact_bytes: u64,
@@ -91,7 +139,8 @@ impl Default for Deployment {
     fn default() -> Self {
         Deployment {
             quota_bytes: 0,
-            tenant_quota_bytes: 0,
+            tenant_quota_bytes: DEFAULT_TENANT_QUOTA_BYTES,
+            personal_quota_bytes: DEFAULT_PERSONAL_QUOTA_BYTES,
             log_retention_ms: 14 * DAY_MS,
             artifact_retention_ms: 90 * DAY_MS,
             run_artifact_bytes: sentinel_protocol::limits::MAX_RUN_ARTIFACT_BYTES,
@@ -262,9 +311,14 @@ impl Policy {
     fn is_empty(&self) -> bool {
         *self == Policy::default()
     }
-    fn validate(&self) -> Result<()> {
-        if self.quota_bytes == Some(0) || self.quota_bytes.is_some_and(|q| q > i64::MAX as u64) {
-            return Err(Error::InvalidInput("quota"));
+    /// Whether a quota of 0 may be written on this row: an explicit unlimited is a tenant's, and only a
+    /// platform administrator reaches a tenant row, so it is refused on a repository's, which a tenant
+    /// administrator sets and which narrows its tenant's quota rather than lifting it.
+    fn validate(&self, unlimited: bool) -> Result<()> {
+        match self.quota_bytes {
+            Some(0) if !unlimited => return Err(Error::InvalidInput("quota")),
+            Some(q) if q > i64::MAX as u64 => return Err(Error::InvalidInput("quota")),
+            _ => {}
         }
         let percent = |p: Option<u8>| p.is_none_or(|v| (1..=100).contains(&v));
         if !percent(self.soft_percent) || !percent(self.hard_percent) {
@@ -322,18 +376,45 @@ pub fn policy(conn: &Connection, tenant: TenantId, repo: Option<RepoId>) -> Resu
         .unwrap_or_default())
 }
 
+/// A tenant's own policy row and whether its namespace is personal, in one keyed statement: the default a
+/// tenant that states no quota inherits is the personal one or the deployment's per-tenant one.
+fn tenant_policy(conn: &Connection, tenant: TenantId) -> Result<(Policy, bool)> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT p.quota_bytes, p.log_retention_ms, p.artifact_retention_ms, p.soft_percent,
+                    p.hard_percent, t.kind = 1
+             FROM (SELECT ?1 AS id) one
+             LEFT JOIN tenants t ON t.id = one.id
+             LEFT JOIN storage_policies p ON p.tenant_id = one.id AND p.repo_id = X''",
+        )?
+        .query_row([tenant.as_bytes().as_slice()], |r| {
+            Ok((
+                Policy {
+                    quota_bytes: r.get::<_, Option<i64>>(0)?.map(|q| q as u64),
+                    log_retention_ms: r.get(1)?,
+                    artifact_retention_ms: r.get(2)?,
+                    soft_percent: r.get::<_, Option<i64>>(3)?.map(|p| p as u8),
+                    hard_percent: r.get::<_, Option<i64>>(4)?.map(|p| p as u8),
+                },
+                r.get::<_, Option<bool>>(5)?.unwrap_or(false),
+            ))
+        })?)
+}
+
 pub fn effective(
     conn: &Connection,
     d: &Deployment,
     tenant: TenantId,
     repo: Option<RepoId>,
 ) -> Result<Effective> {
-    let own = policy(conn, tenant, None)?;
+    let (own, personal) = tenant_policy(conn, tenant)?;
     let tenant_logs = own.log_retention_ms.unwrap_or(d.log_retention_ms);
     let tenant_artifacts = own.artifact_retention_ms.unwrap_or(d.artifact_retention_ms);
     let (soft_percent, hard_percent) = thresholds(d, own.soft_percent, own.hard_percent);
     let mut out = Effective {
-        tenant_quota_bytes: own.quota_bytes.unwrap_or(d.tenant_quota_bytes),
+        tenant_quota_bytes: own
+            .quota_bytes
+            .unwrap_or_else(|| default_quota(d, personal)),
         repo_quota_bytes: 0,
         log_retention_ms: tenant_logs,
         artifact_retention_ms: tenant_artifacts,
@@ -362,7 +443,9 @@ pub fn set(
     policy: Policy,
     now: UnixMillis,
 ) -> Result<Reapply> {
-    policy.validate()?;
+    // Who may write first, then what: a tenant administrator who states unlimited on a repository row is
+    // refused as unauthorized (a tenant row is refused for them too), and the value is judged for the
+    // writer who is allowed to state it.
     match (repo, authority) {
         (None, _) => authority.require_platform(tx)?,
         (Some(_), Authority::HostLocal) => {}
@@ -371,6 +454,7 @@ pub fn set(
             Authority::Credential { principal, .. } | Authority::Session { principal, .. },
         ) => crate::auth::require_tenant_admin(tx, *principal, tenant)?,
     }
+    policy.validate(repo.is_none())?;
     let tenant_known: bool = tx
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM tenants WHERE id = ?1)")?
         .query_row([tenant.as_bytes().as_slice()], |r| r.get(0))?;
@@ -933,13 +1017,14 @@ pub struct Standing {
 }
 
 const STANDING: &str = "SELECT COALESCE(u.bytes, 0) + COALESCE(u.log_bytes, 0),
-        p.quota_bytes, p.soft_percent, p.hard_percent
+        p.quota_bytes, p.soft_percent, p.hard_percent, t.kind = 1
     FROM (SELECT ?1 AS id) one
+    LEFT JOIN tenants t ON t.id = one.id
     LEFT JOIN tenant_usage u ON u.tenant_id = one.id
     LEFT JOIN storage_policies p ON p.tenant_id = one.id AND p.repo_id = X''";
 
 pub fn standing(conn: &Connection, d: &Deployment, tenant: TenantId) -> Result<Standing> {
-    let (used, quota, soft, hard) =
+    let (used, quota, soft, hard, personal) =
         conn.prepare_cached(STANDING)?
             .query_row([tenant.as_bytes().as_slice()], |r| {
                 Ok((
@@ -947,6 +1032,7 @@ pub fn standing(conn: &Connection, d: &Deployment, tenant: TenantId) -> Result<S
                     r.get::<_, Option<i64>>(1)?,
                     r.get::<_, Option<i64>>(2)?,
                     r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<bool>>(4)?.unwrap_or(false),
                 ))
             })?;
     let (soft_percent, hard_percent) = thresholds(
@@ -954,7 +1040,7 @@ pub fn standing(conn: &Connection, d: &Deployment, tenant: TenantId) -> Result<S
         soft.map(|p| p.clamp(1, 100) as u8),
         hard.map(|p| p.clamp(1, 100) as u8),
     );
-    let quota_bytes = quota.map_or(d.tenant_quota_bytes, |q| q.max(0) as u64);
+    let quota_bytes = quota.map_or_else(|| default_quota(d, personal), |q| q.max(0) as u64);
     Ok(Standing {
         used: used.max(0) as u64,
         quota_bytes,
@@ -967,7 +1053,7 @@ pub fn standing(conn: &Connection, d: &Deployment, tenant: TenantId) -> Result<S
 }
 
 const STATES: &str = "SELECT COALESCE(u.bytes, 0) + COALESCE(u.log_bytes, 0),
-        p.quota_bytes, p.soft_percent, p.hard_percent
+        p.quota_bytes, p.soft_percent, p.hard_percent, t.kind = 1
     FROM tenants t
     LEFT JOIN tenant_usage u ON u.tenant_id = t.id
     LEFT JOIN storage_policies p ON p.tenant_id = t.id AND p.repo_id = X''";
@@ -983,17 +1069,18 @@ pub fn states(conn: &Connection, d: &Deployment) -> Result<[u64; 3]> {
             r.get::<_, Option<i64>>(1)?,
             r.get::<_, Option<i64>>(2)?,
             r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<bool>>(4)?.unwrap_or(false),
         ))
     })?;
     let mut out = [0u64; 3];
     for row in rows {
-        let (used, quota, soft, hard) = row?;
+        let (used, quota, soft, hard, personal) = row?;
         let (soft_percent, hard_percent) = thresholds(
             d,
             soft.map(|p| p.clamp(1, 100) as u8),
             hard.map(|p| p.clamp(1, 100) as u8),
         );
-        let quota_bytes = quota.map_or(d.tenant_quota_bytes, |q| q.max(0) as u64);
+        let quota_bytes = quota.map_or_else(|| default_quota(d, personal), |q| q.max(0) as u64);
         out[state(used.max(0) as u64, quota_bytes, soft_percent, hard_percent) as usize] += 1;
     }
     Ok(out)
@@ -1046,11 +1133,13 @@ pub fn install(tx: &Transaction<'_>, d: &Deployment) -> Result<()> {
         return Err(Error::InvalidInput("storage limit"));
     }
     tx.prepare_cached(
-        "INSERT INTO storage_defaults(id, quota_bytes, tenant_quota_bytes, log_retention_ms,
-             artifact_retention_ms, run_artifact_bytes, soft_percent, hard_percent, installed_ms)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO storage_defaults(id, quota_bytes, tenant_quota_bytes, personal_quota_bytes,
+             log_retention_ms, artifact_retention_ms, run_artifact_bytes, soft_percent, hard_percent,
+             installed_ms)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(id) DO UPDATE SET quota_bytes = excluded.quota_bytes,
              tenant_quota_bytes = excluded.tenant_quota_bytes,
+             personal_quota_bytes = excluded.personal_quota_bytes,
              log_retention_ms = excluded.log_retention_ms,
              artifact_retention_ms = excluded.artifact_retention_ms,
              run_artifact_bytes = excluded.run_artifact_bytes,
@@ -1061,6 +1150,7 @@ pub fn install(tx: &Transaction<'_>, d: &Deployment) -> Result<()> {
     .execute(params![
         fits(d.quota_bytes)?,
         fits(d.tenant_quota_bytes)?,
+        fits(d.personal_quota_bytes)?,
         d.log_retention_ms,
         d.artifact_retention_ms,
         fits(d.run_artifact_bytes)?,
@@ -1074,19 +1164,20 @@ pub fn install(tx: &Transaction<'_>, d: &Deployment) -> Result<()> {
 pub fn installed(conn: &Connection) -> Result<Deployment> {
     Ok(conn
         .prepare_cached(
-            "SELECT quota_bytes, tenant_quota_bytes, log_retention_ms, artifact_retention_ms,
-                    run_artifact_bytes, soft_percent, hard_percent
+            "SELECT quota_bytes, tenant_quota_bytes, personal_quota_bytes, log_retention_ms,
+                    artifact_retention_ms, run_artifact_bytes, soft_percent, hard_percent
              FROM storage_defaults WHERE id = 1",
         )?
         .query_row([], |r| {
             Ok(Deployment {
                 quota_bytes: r.get::<_, i64>(0)?.max(0) as u64,
                 tenant_quota_bytes: r.get::<_, i64>(1)?.max(0) as u64,
-                log_retention_ms: r.get(2)?,
-                artifact_retention_ms: r.get(3)?,
-                run_artifact_bytes: r.get::<_, i64>(4)?.max(1) as u64,
-                soft_percent: r.get::<_, i64>(5)?.clamp(1, 100) as u8,
-                hard_percent: r.get::<_, i64>(6)?.clamp(1, 100) as u8,
+                personal_quota_bytes: r.get::<_, i64>(2)?.max(0) as u64,
+                log_retention_ms: r.get(3)?,
+                artifact_retention_ms: r.get(4)?,
+                run_artifact_bytes: r.get::<_, i64>(5)?.max(1) as u64,
+                soft_percent: r.get::<_, i64>(6)?.clamp(1, 100) as u8,
+                hard_percent: r.get::<_, i64>(7)?.clamp(1, 100) as u8,
             })
         })
         .optional()?

@@ -21,7 +21,7 @@ Anchors, aliases, tags, non-string keys and duplicate keys are errors with line 
 
 ```yaml
 schema: 1                       # required, exactly 1
-on: [push, pull_request, merge_group, tag, manual]   # 1–5 distinct triggers
+on: [push, pull_request, merge_group, tag, manual, schedule]   # 1–6 distinct kinds
 # or the filtered form:
 # on:
 #   push: {branches: [main, "release/*"]}
@@ -84,12 +84,13 @@ on:                                  # every branch, every tag, manual only
   pull_request:
     branches: [main]                 # matched against the base branch
   manual: true                       # `true` or the key is omitted
+  schedule: true                     # a stored schedule may run this pipeline
 ```
 
 Filter rules, enforced strictly:
 
-- the list form takes 1–4 distinct kinds and no filters; the mapping form names
-  at most those four kinds, and at least one must be present;
+- the list form takes 1–6 distinct kinds and no filters; the mapping form names
+  at most those six kinds, and at least one must be present;
 - a kind takes only its own key (`branches` for `push` and `pull_request`,
   `tags` for `tag`); the other is an unknown key;
 - at most 32 patterns of at most 256 bytes each. `*` matches any run of
@@ -100,6 +101,11 @@ Filter rules, enforced strictly:
 - `manual: true` declares the trigger the API's explicit dispatch uses; an
   event-driven delivery never matches it, and a `manual` pipeline never runs
   from a push.
+- `schedule: true` declares that a stored schedule may run this pipeline. The
+  crons are not part of the pipeline: they are a per-repository row an operator
+  configures, and its occurrences are UTC instants ([schedules](schedules.md)).
+  A pipeline that does not state it is not run by a schedule, and the occurrence
+  is recorded `failed` with reason `no_trigger`.
 
 Which ref a policy is judged against is fixed by the event: a push is judged
 against its branch, a tag against its tag, and a pull request against its
@@ -156,12 +162,12 @@ The event paths are real values recorded as the run's immutable provenance
 
 | Path | Value |
 |---|---|
-| `event.name` | `push`, `tag`, `pull_request`, `merge_group` or `manual` |
+| `event.name` | `push`, `tag`, `pull_request`, `merge_group`, `manual` or `schedule` |
 | `event.sha` | the checked-out revision (the pushed commit, the peeled tag commit, the tested merge, or the merge group's head commit) |
 | `event.ref` | the pushed ref, the tag ref, `refs/pull/<n>/merge` for a pull request, or the queue branch for a merge group |
 | `event.base_ref` | the pull request's or merge group's base branch (`main`); `null` for anything else |
 | `event.pr_number` | the pull request number; `null` for anything else, including a merge group, which may hold several |
-| `event.key` | a short, stable key: the branch or tag name, `pr-<n>`, the queue branch's path for a merge group, or `manual` |
+| `event.key` | a short, stable key: the branch or tag name, `pr-<n>`, the queue branch's path for a merge group, `manual`, or the ref a scheduled occurrence read |
 
 Evaluation is phased. Each path and function has a minimum phase, and an expression evaluated earlier yields an `Unresolved` error rather than a default: `event`, `repo`, `run`, `job` and `cancelled()` at **dispatch**; `needs.*`, `success()`, `failure()`, `always()` at **schedule** (once every dependency is terminal); `hash_files` at **worker** (after the pinned checkout). The compiler enforces placement: `concurrency.group` may only use dispatch context; a job `if` may not use `hash_files` and may only name jobs in its own `needs`; step `if` and cache keys may use everything but also only name jobs in `needs`. A condition must be a boolean: the compiler types every `if` and rejects, with the path of the key, a comparison between types that can never match (`event.ref == 7`, `event.pr_number == 'x'`), a boolean operator or function over a value that is not always a boolean (`!event.ref`, `event.base_ref || true`), and a result that is not a boolean (`if: event.ref`). `null` compares with anything. A condition that compiled therefore cannot fail with a type error when it is evaluated. `success()` and `failure()` summarise dependency outcomes (`failure()` is true when any dependency did not succeed, `success()` when all passed or were skipped by their own condition); `always()` is true unless the run is cancelled.
 
@@ -203,4 +209,4 @@ A repository's GitHub Actions workflows are read by a separate, bounded analyzer
 
 Unit tests cover secret-name validation, registry-auth delivery requirements, and the explanation model (requirements, unresolved inputs, no invented values), the expression grammar (precedence, rejected constructs, phase gating, typing, templates), the `hash_files` resolver (globbing, ordering, sensitivity, cross-root stability), scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Fixture tests compile every valid fixture, check the invalid fixtures against their expected messages, evaluate the conditions example across dispatch, schedule and worker phases, decode every field of the full example, and prove determinism on a diamond DAG under reordering.
 
-Not in this schema version: named pipelines, schedules, manual inputs, matrices, service containers, extra checkouts (Part 16 and later parts). Files using them fail at `unknown key`.
+Not in this schema version: named pipelines, manual inputs, matrices, service containers, extra checkouts (Part 16 and later parts). Files using them fail at `unknown key`. A run spec whose pipeline states `on.schedule` is stored as run spec format 10 ([compatibility](compatibility.md)).
