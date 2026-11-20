@@ -22,6 +22,8 @@ pub struct JobStatus {
     pub attempt: Option<AttemptId>,
     pub log_state: Option<LogState>,
     pub fence: u64,
+    /// The external resource the job waited out its bound for, on the job that failed for it.
+    pub lock_wait: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,7 +108,7 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
     let mut stmt = conn.prepare_cached(
         "SELECT j.id, j.name, j.state_code, j.failure_class, j.cancel_requested, j.fence,
                 j.queued_ms, j.leased_ms, j.preparing_ms, j.running_ms, j.finalizing_ms, j.terminal_ms,
-                a.id, a.log_state
+                a.id, a.log_state, j.lock_wait
          FROM jobs j
          LEFT JOIN attempts a ON a.id = (
             SELECT a2.id FROM attempts a2 WHERE a2.job_id = j.id ORDER BY a2.fence DESC LIMIT 1)
@@ -133,11 +135,13 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
             },
             r.get::<_, Option<[u8; 16]>>(12)?,
             r.get::<_, Option<i64>>(13)?,
+            r.get::<_, Option<String>>(14)?,
         ))
     })?;
     let mut jobs = Vec::new();
     for row in rows {
-        let (id, name, code, class, cancel, fence, timestamps, attempt, log_state) = row?;
+        let (id, name, code, class, cancel, fence, timestamps, attempt, log_state, lock_wait) =
+            row?;
         jobs.push(JobStatus {
             id: JobId::from_bytes(id).map_err(|_| Error::Corrupt("job_id"))?,
             name,
@@ -153,6 +157,7 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
                 .transpose()?,
             log_state: log_state.map(LogState::from_code).transpose()?,
             fence: fence as u64,
+            lock_wait,
         });
     }
     let state = aggregate(jobs.iter().map(|j| j.state));

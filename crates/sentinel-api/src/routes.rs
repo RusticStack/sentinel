@@ -1109,6 +1109,7 @@ fn run_json(view: &status::RunStatus) -> Value {
             "attempt": j.attempt.map(|a| a.to_string()),
             "log_state": j.log_state.map(|s| s.as_str()),
             "fence": j.fence,
+            "lock_wait": j.lock_wait,
             "timestamps": {
                 "queued_ms": j.timestamps.queued.map(|t| t.0),
                 "leased_ms": j.timestamps.leased.map(|t| t.0),
@@ -1290,11 +1291,11 @@ fn queued_json(row: &dispatch::QueuedJob) -> Value {
         "run": row.run.to_string(),
         "repo": row.repo.to_string(),
         "age_ms": row.age_ms,
-        "reason": wait_reason_json(row.reason),
+        "reason": wait_reason_json(&row.reason),
     })
 }
 
-fn wait_reason_json(reason: dispatch::WaitReason) -> Value {
+fn wait_reason_json(reason: &dispatch::WaitReason) -> Value {
     use dispatch::WaitReason as R;
     match reason {
         R::Dependency => json!({ "code": "dependency" }),
@@ -1310,8 +1311,9 @@ fn wait_reason_json(reason: dispatch::WaitReason) -> Value {
         R::DiskShort { disk_short } => json!({ "code": "disk_short", "disk_short": disk_short }),
         R::ArchMismatch => json!({ "code": "arch_mismatch" }),
         R::LabelMissing => json!({ "code": "label_missing" }),
-        R::RuntimeMissing { runtime } => runtime_missing_json(runtime),
+        R::RuntimeMissing { runtime } => runtime_missing_json(*runtime),
         R::ConcurrencyLimit => json!({ "code": "concurrency_limit" }),
+        R::ResourceLock { resource } => json!({ "code": "resource_lock", "resource": resource }),
         R::WorkerOffline => json!({ "code": "worker_offline" }),
         R::Capacity => json!({ "code": "capacity" }),
         R::Drain => json!({ "code": "drain" }),
@@ -3251,7 +3253,7 @@ mod tests {
     #[test]
     fn queue_reasons_carry_their_quantities_as_numeric_fields() {
         use dispatch::WaitReason as R;
-        let disk = wait_reason_json(R::DiskShort {
+        let disk = wait_reason_json(&R::DiskShort {
             disk_short: 5_368_709_120,
         });
         assert_eq!(
@@ -3259,25 +3261,25 @@ mod tests {
             json!({ "code": "disk_short", "disk_short": 5_368_709_120_i64 })
         );
         assert_eq!(
-            wait_reason_json(R::NoMatchingWorker {
+            wait_reason_json(&R::NoMatchingWorker {
                 cpu_short: 2_000,
                 memory_short: 0,
             }),
             json!({ "code": "no_matching_worker", "cpu_short": 2_000, "memory_short": 0 })
         );
         assert_eq!(
-            wait_reason_json(R::Policy("image unresolved")),
+            wait_reason_json(&R::Policy("image unresolved")),
             json!({ "code": "policy", "detail": "image unresolved" })
         );
         use sentinel_protocol::negotiate::Capabilities as C;
         assert_eq!(
-            wait_reason_json(R::RuntimeMissing {
+            wait_reason_json(&R::RuntimeMissing {
                 runtime: C::OS_LINUX.union(C::ISOLATION_MICROVM).0 as i64
             }),
             json!({ "code": "runtime_missing", "os": "linux", "isolation": "microvm" })
         );
         assert_eq!(
-            wait_reason_json(R::RuntimeMissing {
+            wait_reason_json(&R::RuntimeMissing {
                 runtime: C::OS_WINDOWS.0 as i64
             }),
             json!({ "code": "runtime_missing", "os": "windows", "isolation": null })
@@ -3290,8 +3292,15 @@ mod tests {
             (R::FairnessHold, "fairness_hold"),
             (R::LocalityWait, "locality_wait"),
         ] {
-            assert_eq!(wait_reason_json(reason), json!({ "code": code }));
+            assert_eq!(wait_reason_json(&reason), json!({ "code": code }));
         }
+        assert_eq!(
+            wait_reason_json(&R::ResourceLock {
+                resource: "db/staging".to_owned()
+            }),
+            json!({ "code": "resource_lock", "resource": "db/staging" }),
+            "a job waiting for an external resource names it, so an operator knows which one"
+        );
     }
 
     #[test]

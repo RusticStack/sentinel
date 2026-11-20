@@ -518,6 +518,20 @@ macro_rules! group_free_sql {
     };
 }
 
+/// A job that declares an external resource needs every one of them free, and a held row is free the
+/// moment the attempt that took it lets its lease end (see `crate::locks`). The guard makes a job that
+/// declares none cost one integer compare instead of a probe of two tables.
+macro_rules! locks_free_sql {
+    () => {
+        "(j.locks = 0 OR NOT EXISTS (
+             SELECT 1 FROM job_locks l
+             JOIN resource_locks r ON r.tenant_id = l.tenant_id AND r.name = l.name
+             JOIN attempts a ON a.id = r.attempt_id
+             WHERE l.job_id = j.id AND r.job_id <> j.id
+               AND a.released_ms IS NULL AND a.lease_until_ms >= :now))"
+    };
+}
+
 macro_rules! pool_access_sql {
     () => {
         "JOIN tenants t ON t.id = j.tenant_id AND t.active = 1
@@ -560,6 +574,9 @@ macro_rules! candidates_sql {
                     OR j.disk_bytes > :far_disk)
                AND ",
             group_free_sql!(),
+            "
+               AND ",
+            locks_free_sql!(),
             "
              ORDER BY j.priority, j.queued_ms, j.created_seq
              LIMIT 16"
@@ -1191,6 +1208,7 @@ impl Placement<'_, '_> {
             ":far_cpu": far.cpu_millis,
             ":far_memory": far.memory_bytes,
             ":far_disk": far.disk_bytes,
+            ":now": self.now.0,
         })?;
         let mut seen = 0;
         while let Some(r) = rows.next()? {
@@ -2122,11 +2140,21 @@ pub fn sweep_queue_timeouts(tx: &Transaction<'_>, now: UnixMillis) -> Result<usi
             Event::QueueTimedOut,
             now,
         )?;
-        let run = run_of(tx, tenant, job)?;
-        release_dependents(tx, tenant, run, now)?;
+        release_after(tx, tenant, job, now)?;
         count += 1;
     }
     Ok(count)
+}
+
+/// Releases a job's run once the job itself has ended, for the sweeps that end a waiting job directly.
+pub fn release_after(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    job: JobId,
+    now: UnixMillis,
+) -> Result<()> {
+    let run = run_of(tx, tenant, job)?;
+    release_dependents(tx, tenant, run, now).map(|_| ())
 }
 
 fn run_of(conn: &Connection, tenant: TenantId, job: JobId) -> Result<RunId> {
@@ -2677,7 +2705,7 @@ impl Context for ScheduleContext<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WaitReason {
     Dependency,
@@ -2696,6 +2724,10 @@ pub enum WaitReason {
         runtime: i64,
     },
     ConcurrencyLimit,
+    /// A named external resource the job needs is held by another job's live attempt.
+    ResourceLock {
+        resource: String,
+    },
     WorkerOffline,
     Capacity,
     Drain,
@@ -2725,7 +2757,7 @@ macro_rules! waiting_columns {
                 j.memory_bytes, j.disk_bytes, j.cancel_requested, j.arch, j.labels,
                 j.image_digest, j.image_platform IS NOT NULL,
                 j.concurrency_group IS NOT NULL, j.pull_request, j.spec_index,
-                j.requires_secret_delivery, j.runtime
+                j.requires_secret_delivery, j.runtime, j.locks
          FROM jobs j "
     };
 }
@@ -2775,6 +2807,8 @@ struct Waiting {
     cancel: bool,
     resolved: bool,
     grouped: bool,
+    /// How many external resources the job declares; zero for the overwhelming majority.
+    locks: i64,
     pick: Pick,
 }
 
@@ -2801,6 +2835,7 @@ fn waiting_row(tenant: TenantId, r: &rusqlite::Row<'_>) -> rusqlite::Result<Resu
         r.get::<_, bool>(12)?,
         r.get::<_, bool>(13)?,
     );
+    let locks = r.get::<_, i64>(18)?;
     Ok((|| {
         let job = JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?;
         let run = RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?;
@@ -2824,6 +2859,7 @@ fn waiting_row(tenant: TenantId, r: &rusqlite::Row<'_>) -> rusqlite::Result<Resu
             cancel,
             resolved: resolved && digest.is_some(),
             grouped,
+            locks,
             pick: Pick {
                 tenant,
                 repo,
@@ -2922,6 +2958,19 @@ impl<'c> Explainer<'c> {
             if held {
                 return Ok(WaitReason::ConcurrencyLimit);
             }
+        }
+        // A resource is held by a job of another run; the group above only orders runs of a repository.
+        if w.locks > 0
+            && let Some(resource) = self
+                .conn
+                .prepare_cached(crate::locks::WAITING_FOR_SQL)?
+                .query_row(
+                    params![self.tenant.as_bytes(), w.job.as_bytes(), self.now.0],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+        {
+            return Ok(WaitReason::ResourceLock { resource });
         }
         let pick = &w.pick;
         let workers = match self.workers.take() {

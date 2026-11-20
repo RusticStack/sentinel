@@ -1,0 +1,5 @@
+# expect: must name a resource
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, locks: ["db/ staging"], steps: [{id: s, run: x}]}

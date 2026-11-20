@@ -17,6 +17,7 @@ const REASONS: Record<string, string> = {
   label_missing: "no worker has the required labels",
   drain: "matching workers are draining",
   concurrency_limit: "its concurrency group is full",
+  resource_lock: "an external resource it needs is in use",
   fairness_hold: "held for fairness to other work",
   locality_wait: "waiting for a worker with warm caches",
   ready: "ready: the next placement pass takes it",
@@ -27,13 +28,14 @@ const STORAGE: Record<string, string> = {
   external_copy_backlog: "the external S3 copy is behind; it resumes once the backlog drains",
 };
 
-interface Waiting { job: string; run: string; repo: string; age_ms: number; reason: { code: string; detail?: string; cpu_short?: number; memory_short?: number; disk_short?: number } }
+interface Waiting { job: string; run: string; repo: string; age_ms: number; reason: { code: string; detail?: string; resource?: string; cpu_short?: number; memory_short?: number; disk_short?: number } }
 interface Queue { jobs: Waiting[]; total: number; truncated: boolean; placement_paused: string | null }
 
 function explain(r: Waiting["reason"]) {
   const parts = [REASONS[r.code] ?? words(r.code)];
   if (r.code === "storage") parts.push(`: ${STORAGE[r.detail ?? ""] ?? words(r.detail)}`);
   else if (r.detail) parts.push(`(${r.detail})`);
+  if (r.resource) parts.push(`(${r.resource})`);
   if (r.cpu_short) parts.push(`— short ${cpu(r.cpu_short)}`);
   if (r.memory_short) parts.push(`— short ${fmtBytes(r.memory_short)} memory`);
   if (r.disk_short) parts.push(`— short ${fmtBytes(r.disk_short)} disk`);

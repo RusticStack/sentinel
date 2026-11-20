@@ -53,6 +53,7 @@ jobs:                           # 1–64, names [a-z0-9][a-z0-9_-]{0,63}
       - {name: registry, class: downloads, key: "dl-${{ hash_files('Cargo.lock') }}", paths: [/usr/local/cargo/registry]}
     artifacts:                  # ≤ 8, unique names
       - {name: release, paths: [target/release/app], when: success|failure|always|step:<step id>, retain: 7d, required: false, class: standard}
+    locks: [db/staging]         # ≤ 4 named external resources; see below
     secrets: [DEPLOY_TOKEN]     # ≤ 16 names [A-Z_][A-Z0-9_]*; values never appear in YAML
 ```
 
@@ -74,6 +75,40 @@ under the `merge_group` event, not under the pull request's. `destroyed` never
 runs anything: it cancels the run the group produced ([intake](intake.md#merge-groups)).
 
 **`runs_on.os` and `runs_on.isolation`.** Unstated, a job is a Linux job run on whatever executor its worker uses by default (rootless Podman, or a microVM on a KVM host once that executor is set up; [plan 16.8](../plan.md#168-microvm-execution-on-kvm-hosts)), and any Linux worker may take it, including one that predates these fields. Stated, the job goes only to a worker that states it runs that OS and isolation; otherwise it waits with the reason `runtime_missing` ([API](api.md)). Linux jobs take `container` or `microvm`; Windows jobs take `microvm` (a Windows guest) or `native`, so `os: linux` with `native` and `os: windows` with `container` are errors. A spec with either field is stored as run spec format 7 ([compatibility](compatibility.md)).
+
+## External resources (`locks:`)
+
+A job may need a thing outside Sentinel to itself while it runs: a staging database, a host, a device.
+`locks:` declares those names, at most four, each either a plain name or a mapping with a `wait` bound:
+
+```yaml
+jobs:
+  migrate:
+    image: postgres:16
+    locks:
+      - db/staging                 # waits the default ten minutes
+      - {name: "device:rig-1", wait: 30m}
+    steps: [{id: migrate, run: ./migrate.sh}]
+```
+
+A name is literal — `[A-Za-z0-9._:/-]`, at most 128 bytes, with no leading, trailing or doubled `/`, and
+no template expansion — because it identifies something outside Sentinel rather than a value Sentinel
+computes. `wait` is a positive duration up to 24 hours and defaults to `10m`. Duplicate names, a name
+outside that set and a bound that is not a positive duration are each a schema error naming the path.
+
+The lock is held from the moment a job is leased to a worker, released when its attempt ends — passed,
+failed, cancelled, or with its lease lapsed, at which point another job may take it — and it is scoped to
+the tenant: every repository of a tenant shares the names, and no other tenant can hold one of them. It is
+**not** a concurrency group. A group (`concurrency:`, above) is a key inside Sentinel that orders one
+repository's runs and can supersede them; a resource is a thing outside Sentinel that one job of any
+repository holds, and a job the group cancelled gives it back when its attempt is released rather than when
+the next run arrives ([storage](storage.md#external-resources)).
+
+A job that cannot take a resource waits at most its `wait` bound, measured from the moment it became
+ready, and is then failed with the failure class `resource_lock` naming the resource in the job's
+`lock_wait`; while it waits, the queue lists it with the reason `resource_lock` and the name
+([API](api.md), [core contracts](core-contracts.md#failure-classes)). A spec whose jobs declare locks is
+stored as run spec format 12 ([compatibility](compatibility.md)).
 
 ## Source policies (`on:`)
 
@@ -316,6 +351,8 @@ pipelines:
 A repository's GitHub Actions workflows are read by a separate, bounded analyzer in the same crate: [`sentinel-pipeline::workflow`](workflow-analysis.md) inventories `.github/workflows/*.yml` at a pinned commit through the loading limits above, and its two versioned tables decide which jobs move to a Sentinel runner class and which constructs translate to this schema. Nothing in this schema version changes for it.
 
 ## Verification
+
+`crates/sentinel-pipeline/tests/locks.rs` covers the declaration: a name's default bound and a declared one, the digest and spec format of a job that declares none staying byte for byte, format 12 round-tripping per-job resources and refusing a list that does not match its jobs, and the explanation naming each resource with its bound.
 
 Unit tests cover secret-name validation, registry-auth delivery requirements, and the explanation model (requirements, unresolved inputs, no invented values), the expression grammar (precedence, rejected constructs, phase gating, typing, templates), the `hash_files` resolver (globbing, ordering, sensitivity, cross-root stability), scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Fixture tests compile every valid fixture, check the invalid fixtures against their expected messages, evaluate the conditions example across dispatch, schedule and worker phases, decode every field of the full example, and prove determinism on a diamond DAG under reordering. `crates/sentinel-pipeline/tests/named.rs` covers two named pipelines of one repository keeping their own triggers, concurrency policies, digests and check namespaces; the refusal of a document that gives one check name two meanings while any name a repository chooses is otherwise accepted; every input type's bound and refusal message; the loading bounds of a declaration; the required-input rule; the typing of `inputs.<name>`; the digest covering declarations and not values; a cache key changing with an input only when it names one; and an unnamed pipeline keeping its check names, digest and run spec format.
 

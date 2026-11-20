@@ -232,6 +232,7 @@ pub enum FailureClass {
     Reconciled,
     Publication,
     Runtime,
+    ResourceLock,
 }
 
 impl From<sentinel_core::FailureClass> for FailureClass {
@@ -250,6 +251,7 @@ impl From<sentinel_core::FailureClass> for FailureClass {
             Core::Reconciled => Self::Reconciled,
             Core::Publication => Self::Publication,
             Core::Runtime => Self::Runtime,
+            Core::ResourceLock => Self::ResourceLock,
         }
     }
 }

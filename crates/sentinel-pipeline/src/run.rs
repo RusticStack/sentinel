@@ -153,12 +153,13 @@ pub enum SpecError {
     Decode,
 }
 
-/// Format 11 adds a pipeline's name and declared inputs with the values a run was given; format 10
+/// Format 12 adds per-job `locks`: the named external resources a job needs to itself while it runs;
+/// format 11 adds a pipeline's name and declared inputs with the values a run was given; format 10
 /// adds `on.schedule`; format 9 adds `artifacts[].when: step:<id>`; format 8 adds `artifacts[].class`;
 /// format 7 adds `runs_on.os` and `runs_on.isolation`. A spec that states none of them is written as
-/// 10, 9, 8, 7 or 6, byte for byte what earlier controllers wrote, so a worker that predates the
+/// 11, 10, 9, 8, 7 or 6, byte for byte what earlier controllers wrote, so a worker that predates the
 /// newer fields keeps running it.
-pub const SPEC_FORMAT: u8 = 11;
+pub const SPEC_FORMAT: u8 = 12;
 
 pub const SPEC_FORMAT_READ_MIN: u8 = 3;
 
@@ -181,11 +182,13 @@ impl RunSpec {
 
     /// The format `encode` writes for this spec: the lowest one that carries everything it states.
     pub fn format(&self) -> u8 {
-        if !self.inputs.is_empty()
+        if self.pipeline.jobs.iter().any(|j| !j.spec.locks.is_empty()) {
+            12
+        } else if !self.inputs.is_empty()
             || self.pipeline.name.is_some()
             || !self.pipeline.inputs.is_empty()
         {
-            SPEC_FORMAT
+            11
         } else if self.pipeline.on.schedule {
             10
         } else if self
@@ -221,6 +224,7 @@ impl RunSpec {
             7 => postcard::to_allocvec(&RunSpecV7::from(self)),
             10 => postcard::to_allocvec(&RunSpecV9::from(self)),
             11 => postcard::to_allocvec(&RunSpecV10::from(self)),
+            12 => postcard::to_allocvec(&RunSpecV11::from(self)),
             _ => postcard::to_allocvec(&RunSpecV8::from(self)),
         };
         body.map(|body| {
@@ -240,7 +244,8 @@ impl RunSpec {
             }
         }
         match bytes.split_first() {
-            Some((&SPEC_FORMAT, body)) => whole::<RunSpecV10>(body).map(RunSpec::from),
+            Some((&SPEC_FORMAT, body)) => whole::<RunSpecV11>(body).and_then(RunSpec::try_from),
+            Some((&11, body)) => whole::<RunSpecV10>(body).map(RunSpec::from),
             Some((&10, body)) => whole::<RunSpecV9>(body).map(RunSpec::from),
             // Format 9 is format 8's layout: the only difference is what `when` may hold, and this
             // reader takes both. A spec that states a newer field moves the byte, so a reader that
@@ -393,6 +398,7 @@ impl From<RunSpecV6> for RunSpec {
                             steps: j.spec.steps,
                             cache: j.spec.cache,
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
+                            locks: Vec::new(),
                             secrets: j.spec.secrets,
                             registry_auth: j.spec.registry_auth,
                         },
@@ -549,6 +555,7 @@ impl From<RunSpecV7> for RunSpec {
                             steps: j.spec.steps,
                             cache: j.spec.cache,
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
+                            locks: Vec::new(),
                             secrets: j.spec.secrets,
                             registry_auth: j.spec.registry_auth,
                         },
@@ -623,6 +630,66 @@ impl From<RunSpecV10> for RunSpec {
         spec.pipeline.inputs = v10.inputs;
         spec.inputs = v10.values;
         spec
+    }
+}
+
+/// Format 12: the format-11 layout plus, per job in spec order, the external resources it needs.
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSpecV11 {
+    base: RunSpecV10,
+    locks: Vec<Vec<JobLock>>,
+}
+
+/// One job's external resource, as format 12 stores it. Frozen: a later shape is a later format.
+#[derive(Debug, Serialize, Deserialize)]
+struct JobLock {
+    name: String,
+    wait_secs: u64,
+}
+
+impl From<&RunSpec> for RunSpecV11 {
+    fn from(spec: &RunSpec) -> RunSpecV11 {
+        RunSpecV11 {
+            base: RunSpecV10::from(spec),
+            locks: spec
+                .pipeline
+                .jobs
+                .iter()
+                .map(|job| {
+                    job.spec
+                        .locks
+                        .iter()
+                        .map(|lock| JobLock {
+                            name: lock.name.clone(),
+                            wait_secs: lock.wait_secs,
+                        })
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<RunSpecV11> for RunSpec {
+    type Error = SpecError;
+
+    /// A lock list of the wrong length is a damaged spec, not a job without resources: refusing it
+    /// keeps a job from running without the resource it declared.
+    fn try_from(v11: RunSpecV11) -> Result<RunSpec, SpecError> {
+        let mut spec = RunSpec::from(v11.base);
+        if v11.locks.len() != spec.pipeline.jobs.len() {
+            return Err(SpecError::Decode);
+        }
+        for (job, locks) in spec.pipeline.jobs.iter_mut().zip(v11.locks) {
+            job.spec.locks = locks
+                .into_iter()
+                .map(|lock| crate::schema::Lock {
+                    name: lock.name,
+                    wait_secs: lock.wait_secs,
+                })
+                .collect();
+        }
+        Ok(spec)
     }
 }
 
@@ -840,6 +907,7 @@ impl From<JobV3> for Job {
                 })
                 .collect(),
             artifacts: v3.artifacts.into_iter().map(Artifact::from).collect(),
+            locks: Vec::new(),
             secrets: v3.secrets,
             registry_auth: None,
         }
@@ -891,6 +959,7 @@ impl From<RunSpecV4> for RunSpec {
                             steps: j.spec.steps.into_iter().map(Step::from).collect(),
                             cache: j.spec.cache,
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
+                            locks: Vec::new(),
                             secrets: j.spec.secrets,
                             registry_auth: None,
                         },
@@ -932,6 +1001,7 @@ impl From<RunSpecV5> for RunSpec {
                             steps: j.spec.steps,
                             cache: j.spec.cache,
                             artifacts: j.spec.artifacts.into_iter().map(Artifact::from).collect(),
+                            locks: Vec::new(),
                             secrets: j.spec.secrets,
                             registry_auth: None,
                         },
