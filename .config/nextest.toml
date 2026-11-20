@@ -18,3 +18,13 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = "binary(cli) or binary(history) or binary(digest_first)"
 test-group = "timing"
+
+# The browser scenarios each start a controller, a web server and a Chromium, and one of them holds
+# a served fixture open for ten minutes. Run concurrently they starve each other into intermittent
+# failures that never reproduce alone, so they run one at a time as well.
+[test-groups.browser]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "binary(web_browser)"
+test-group = "browser"
