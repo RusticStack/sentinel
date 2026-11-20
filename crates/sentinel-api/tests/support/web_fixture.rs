@@ -1050,7 +1050,13 @@ impl Fixture {
                 Some(1),
             )
             .unwrap();
-        let sequence = page.frames.iter().rev().map(|frame| frame.seq).next().unwrap_or(1);
+        let sequence = page
+            .frames
+            .iter()
+            .rev()
+            .map(|frame| frame.seq)
+            .next()
+            .unwrap_or(1);
         let document = Analysis {
             summary: "the checkout request returned 500 where its test expects 200.".into(),
             claims: vec![Claim {
