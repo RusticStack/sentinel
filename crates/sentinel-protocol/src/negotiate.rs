@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct ProtocolVersion(pub u16);
 
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(17);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(18);
 
 /// Declared outputs in the job context, and artifact handoff between jobs: a worker below this version is never
 /// offered a job whose context holds outputs or whose job declares a handoff, so its sessions behave as before.
@@ -40,6 +40,12 @@ pub const MAX_CHECKOUT_REVISION_BYTES: usize = 64;
 /// write. A session below this version serves no scope, so its sandbox refuses every cache and artifact
 /// call rather than writing one into a boundary nobody stated.
 pub const ACTIONS_MIN: ProtocolVersion = ProtocolVersion(17);
+
+/// Runner-mode artifacts: what a sandbox's `upload-artifact` sealed is published to the controller's
+/// artifact store, so it is a row of the tenant's evidence with a class, a deadline and a charge, and
+/// a later job of the run reads it from another host. A session below this version keeps the artifact
+/// on the worker's disk alone.
+pub const RUNNER_ARTIFACTS_MIN: ProtocolVersion = ProtocolVersion(18);
 
 /// Task-result reuse: the context carries the run's forced-refresh flag. A worker below this version is
 /// sent `Context3`, which cannot state it, so it never learns a run asked for fresh execution.

@@ -25,10 +25,11 @@ pub fn serve<S: io::Read + io::Write>(
     request: &mut Request<'_, S>,
     scope: &Scope,
     store: &Store,
+    publisher: Option<&dyn crate::Publisher>,
 ) -> Option<Response> {
     if let Some(method) = request.path.strip_prefix(TWIRP).map(str::to_owned) {
         let path = request.path.clone();
-        return Some(rpc(request, scope, store, &method, &path));
+        return Some(rpc(request, scope, store, publisher, &method, &path));
     }
     if request.path.starts_with(BLOB) {
         return Some(blob(request, scope, store));
@@ -40,6 +41,7 @@ fn rpc<S: io::Read + io::Write>(
     request: &mut Request<'_, S>,
     scope: &Scope,
     store: &Store,
+    publisher: Option<&dyn crate::Publisher>,
     method: &str,
     path: &str,
 ) -> Response {
@@ -58,7 +60,7 @@ fn rpc<S: io::Read + io::Write>(
         serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
     match method {
         "CreateArtifact" => create(&value, scope, store),
-        "FinalizeArtifact" => finalize(&value, scope, store),
+        "FinalizeArtifact" => finalize(&value, scope, store, publisher),
         "ListArtifacts" => list(&value, scope, store),
         "GetSignedArtifactURL" => signed(&value, scope, store),
         _ => Response::json(
@@ -85,8 +87,18 @@ fn create(value: &serde_json::Value, scope: &Scope, store: &Store) -> Response {
     }
 }
 
-/// `FinalizeArtifact`: seals the upload at the size the client states and answers the artifact's id.
-fn finalize(value: &serde_json::Value, scope: &Scope, store: &Store) -> Response {
+/// `FinalizeArtifact`: seals the upload at the size the client states, publishes it to the controller
+/// when this listener has somewhere to publish to, and answers the artifact's id.
+///
+/// A publication the controller refused is this call's refusal: the sealed copy, which no tenant row
+/// accounts for, is removed, and the client fails its upload so the job sees a real error rather than an
+/// artifact only this host ever held.
+fn finalize(
+    value: &serde_json::Value,
+    scope: &Scope,
+    store: &Store,
+    publisher: Option<&dyn crate::Publisher>,
+) -> Response {
     let Some(name) = value.get("name").and_then(|v| v.as_str()) else {
         return Response::json(400, &crate::cache::refusal_body("missing_name", None));
     };
@@ -102,10 +114,35 @@ fn finalize(value: &serde_json::Value, scope: &Scope, store: &Store) -> Response
         return Response::json(404, &crate::cache::refusal_body("unknown_artifact", None));
     };
     match store.artifact_finalize(id, size, scope) {
-        Ok(row) => Response::json(
-            200,
-            &serde_json::json!({ "ok": true, "artifact_id": row.id.to_string() }),
-        ),
+        Ok(row) => {
+            if let Some(publisher) = publisher {
+                let sealed = store.sealed_artifact(scope, row.run, &row.name);
+                let reason = match sealed {
+                    Some((path, len, digest)) => {
+                        let sealed = crate::Sealed {
+                            scope,
+                            name: &row.name,
+                            path: &path,
+                            len,
+                            digest,
+                        };
+                        match publisher.publish(&sealed) {
+                            crate::Published::Stored => None,
+                            crate::Published::Refused(why) => Some(why),
+                        }
+                    }
+                    None => Some("store"),
+                };
+                if let Some(why) = reason {
+                    store.artifact_forget(scope, row.run, &row.name);
+                    return Response::json(409, &crate::cache::refusal_body(why, None));
+                }
+            }
+            Response::json(
+                200,
+                &serde_json::json!({ "ok": true, "artifact_id": row.id.to_string() }),
+            )
+        }
         Err(_) => Response::json(409, &crate::cache::refusal_body("finalize", None)),
     }
 }
@@ -349,6 +386,25 @@ mod tests {
         )
     }
 
+    /// The same dispatch with a publisher, which is what the worker's own listener has.
+    fn call_with(
+        store: &Store,
+        scope: &Scope,
+        publisher: &dyn crate::Publisher,
+        raw: &[u8],
+    ) -> (u16, Vec<u8>) {
+        let mut conn = crate::http::Conn::new(Cursor::new(raw.to_vec()));
+        let head = conn.head().unwrap().unwrap();
+        let mut request = Request::parse(&mut conn, &head).unwrap();
+        let response =
+            crate::endpoint::dispatch_with(&mut request, Some(scope), store, Some(publisher));
+        let body = match &response.body {
+            crate::http::Payload::Bytes(bytes) => bytes.clone(),
+            crate::http::Payload::File { path, .. } => std::fs::read(path).unwrap(),
+        };
+        (response.status, body)
+    }
+
     fn put(store: &Store, scope: &Scope, path: &str, extra: &str, body: &[u8]) -> (u16, Vec<u8>) {
         let mut raw = format!(
             "PUT {path} HTTP/1.1\r\nContent-Length: {}\r\n{extra}\r\n",
@@ -527,5 +583,95 @@ mod tests {
             store.block_order(id, &pull, b"<BlockList><Latest>seen</Latest></BlockList>"),
             Some(vec![0])
         );
+    }
+
+    /// One publication as the publisher saw it: the artifact's name, the store's own length and digest,
+    /// and the bytes it could read at the path.
+    type Seen = (String, u64, [u8; 32], Vec<u8>);
+
+    /// What a publisher was handed, and the verdict it answers with.
+    struct Publisher_(std::sync::Mutex<Vec<Seen>>, crate::Published);
+
+    impl crate::Publisher for Publisher_ {
+        fn publish(&self, sealed: &crate::Sealed<'_>) -> crate::Published {
+            let bytes = std::fs::read(sealed.path).unwrap_or_default();
+            self.0
+                .lock()
+                .unwrap()
+                .push((sealed.name.to_owned(), sealed.len, sealed.digest, bytes));
+            self.1
+        }
+    }
+
+    fn finalize_with(
+        store: &Store,
+        scope: &Scope,
+        publisher: &dyn crate::Publisher,
+        name: &str,
+        body: &[u8],
+    ) -> (u16, serde_json::Value) {
+        let id = store
+            .artifact_begin(scope, scope.run, scope.job, name)
+            .unwrap();
+        store.artifact_block(id, "0", body, scope).unwrap();
+        let total = store.artifact_blocks(id, &[0], scope).unwrap();
+        let payload = format!("{{\"name\":\"{name}\",\"size\":\"{total}\"}}");
+        let raw = format!(
+            "POST {TWIRP}FinalizeArtifact HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        );
+        let (status, bytes) = call_with(store, scope, publisher, raw.as_bytes());
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// A runner-mode upload published to the controller is the tenant's artifact: the publisher is handed
+    /// the store's own name, length and digest and the sealed bytes, and the client still gets its id.
+    #[test]
+    fn a_sealed_artifact_is_published_with_the_stores_own_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let pull = scope(Trust::PullRequest);
+        let publisher = Publisher_(std::sync::Mutex::new(Vec::new()), crate::Published::Stored);
+        let body = b"PK\x03\x04published";
+        let (status, answer) = finalize_with(&store, &pull, &publisher, "dist", body);
+        assert_eq!(status, 200, "{answer}");
+        let seen = publisher.0.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (name, len, digest, bytes) = &seen[0];
+        assert_eq!(name, "dist");
+        assert_eq!(*len, body.len() as u64);
+        assert_eq!(*digest, *blake3::hash(body).as_bytes());
+        assert_eq!(bytes.as_slice(), body);
+        assert_eq!(
+            store.artifacts(&pull, pull.run).len(),
+            1,
+            "the local copy stays"
+        );
+    }
+
+    /// A publication the controller refused is the client's error, and the copy on this disk goes with it:
+    /// an artifact the tenant holds no row for is not one a later job of the run restores from here.
+    #[test]
+    fn a_refused_publication_fails_the_upload_and_removes_the_local_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let pull = scope(Trust::PullRequest);
+        let publisher = Publisher_(
+            std::sync::Mutex::new(Vec::new()),
+            crate::Published::Refused("quota_exceeded"),
+        );
+        let (status, answer) =
+            finalize_with(&store, &pull, &publisher, "dist", b"PK\x03\x04too big");
+        assert_eq!(status, 409, "{answer}");
+        assert_eq!(answer["refusal"], "quota_exceeded");
+        assert_eq!(answer["forwarded"], false);
+        assert!(
+            store.artifacts(&pull, pull.run).is_empty(),
+            "nothing local outlives a refused publication"
+        );
+        assert!(store.sealed_artifact(&pull, pull.run, "dist").is_none());
     }
 }

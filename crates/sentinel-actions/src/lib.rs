@@ -57,6 +57,39 @@ pub const MAX_BODY_BYTES: u64 = 8 << 30;
 /// The name a refusal body names its contract by, so a client's log says what answered it.
 pub const SCHEMA: &str = "sentinel.actions/1";
 
+/// What one sealed `upload-artifact` body is published to beyond this worker's own disk: the
+/// controller's artifact store. The worker implements it over its link, so what a runner-mode job
+/// uploads is an artifact row of its tenant — with a class, a deadline, a charge against the
+/// repository and tenant quotas, and a manifest another host of the same run can read — rather than a
+/// file only this machine knows about.
+///
+/// Publication is part of the client's upload, not a task behind it: the endpoint answers
+/// `FinalizeArtifact` only once the controller holds the row, and a refusal is the client's error, so
+/// an artifact is never reported uploaded while the tenant's evidence holds no trace of it.
+pub trait Publisher: Send + Sync {
+    fn publish(&self, sealed: &Sealed<'_>) -> Published;
+}
+
+/// One sealed artifact offered for publication: the boundary it was written under, its name, and the
+/// blob on this host that has already been assembled and hashed.
+#[derive(Clone, Copy, Debug)]
+pub struct Sealed<'a> {
+    pub scope: &'a Scope,
+    pub name: &'a str,
+    /// The sealed blob; its length and digest are the store's own, not the client's claim.
+    pub path: &'a std::path::Path,
+    pub len: u64,
+    pub digest: [u8; 32],
+}
+
+/// What a publisher answered. `Refused` carries the reason the controller gave, which the client's
+/// upload is failed with, so a job whose artifact the tenant could not hold fails visibly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Published {
+    Stored,
+    Refused(&'static str),
+}
+
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),

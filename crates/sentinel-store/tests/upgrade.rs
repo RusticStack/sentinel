@@ -388,7 +388,13 @@ fn populated_at_72(path: &std::path::Path) -> [u8; 32] {
     .unwrap();
     for (name, protocol, software, fingerprint) in [
         ("old", 13, Some("sentinel-worker 0.1.0"), 0x21_u8),
-        ("next", 18, None, 0x22_u8),
+        // One protocol above this build's ceiling: what a release newer than this one announces.
+        (
+            "next",
+            sentinel_protocol::negotiate::SUPPORTED_MAX.0 + 1,
+            None,
+            0x22_u8,
+        ),
     ] {
         conn.execute(
             "INSERT INTO workers(id, pool_id, fingerprint, name, arch, capabilities, protocol,
@@ -529,7 +535,12 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     assert_eq!(
         workers,
         vec![
-            ("next", 18, None, true),
+            (
+                "next",
+                sentinel_protocol::negotiate::SUPPORTED_MAX.0 + 1,
+                None,
+                true
+            ),
             ("old", 13, Some("sentinel-worker 0.1.0"), false)
         ]
     );

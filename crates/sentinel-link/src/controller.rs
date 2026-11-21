@@ -436,6 +436,20 @@ struct ArtifactState {
     runs: HashMap<RunId, u64>,
 }
 
+/// One runner-mode artifact streaming from a sandbox: the boundary its lease named, its name, the body's
+/// declared length and digest, and the stage it is being written into. One per lease at a time, because one
+/// listener serves one boundary.
+struct RunnerPublication {
+    worker: WorkerId,
+    scope: runner_store::BoundScope,
+    name: String,
+    declared: u64,
+    digest: [u8; 32],
+    written: u64,
+    next_seq: u32,
+    staging: Option<objects::Staging>,
+}
+
 struct SpecRequest {
     worker: WorkerId,
     attempt: AttemptId,
@@ -535,6 +549,9 @@ struct Inner {
     logs: Arc<LogStore>,
     objects: Arc<Objects>,
     artifacts: Mutex<ArtifactState>,
+    /// What each runner lease is publishing right now: a sandbox's sealed artifact, streaming into the
+    /// tenant's object store under the GitHub job its lease took.
+    runner_artifacts: Mutex<HashMap<RunnerLeaseId, RunnerPublication>>,
     storage: Mutex<Option<StoragePolicy>>,
     remote_budget: AtomicU64,
     order: AtomicU8,
@@ -2689,6 +2706,16 @@ impl Inner {
         evicted.bytes
     }
 
+    /// Discard a sealed runner stage, in the writer: what a refused or failed artifact staged is nobody's
+    /// artifact, so it leaves no object behind.
+    fn discard_staged(&self, staged: objects::Staged) {
+        let objects = Arc::clone(&self.objects);
+        let _ = self.write(move |tx| {
+            objects.discard(tx, staged)?;
+            Ok(())
+        });
+    }
+
     fn discard(&self, done: Vec<Planned>) {
         if done.is_empty() {
             return;
@@ -3985,6 +4012,260 @@ impl SessionHandler for Inner {
             Err(_) => ArtifactCode::Store,
         }
     }
+
+    /// A runner-mode sandbox offers what its `upload-artifact` sealed. The lease names the boundary, so nothing
+    /// in the offer can file an artifact under another tenant, repository or GitHub job; the answer is the one
+    /// grant or the reason it is refused, and a refusal is the client's upload failing rather than a copy left
+    /// on the worker's disk that the tenant's evidence does not hold.
+    fn runner_artifact_begin(
+        &self,
+        worker: WorkerId,
+        lease: RunnerLeaseId,
+        name: &str,
+        bytes: u64,
+        digest: [u8; 32],
+    ) -> ArtifactReply {
+        use crate::session::ArtifactReply::Verdict;
+        if name.is_empty()
+            || name.len() > sentinel_protocol::limits::MAX_ARTIFACT_NAME_BYTES
+            || bytes > MAX_ARTIFACT_BYTES
+        {
+            return Verdict(ArtifactCode::Invalid);
+        }
+        let deployment = self.objects.deployment();
+        let checked = self.store.read(|c| {
+            let Some(scope) = runner_store::bound_scope(c, worker, lease)? else {
+                return Ok(None);
+            };
+            let tx = c.unchecked_transaction()?;
+            let charge = artifacts::charge(&tx, None, bytes)?;
+            let duplicate = artifacts::runner_exists(
+                &tx,
+                scope.tenant,
+                scope.repo,
+                scope.run,
+                scope.job,
+                name,
+            )?;
+            let repo_full = matches!(
+                retention::check_repo(&tx, &deployment, scope.tenant, scope.repo, charge.charged),
+                Err(sentinel_store::Error::QuotaExceeded)
+            );
+            let standing = retention::standing(&tx, &deployment, scope.tenant)?;
+            Ok(Some((scope, duplicate, repo_full, standing)))
+        });
+        let Some((scope, duplicate, repo_full, standing)) = checked.ok().flatten() else {
+            return Verdict(ArtifactCode::Stale);
+        };
+        // The tenant's caches give way before its artifacts are refused, exactly as a declared artifact's are.
+        if standing.state == retention::State::Hard {
+            self.evict_tenant_cache(scope.tenant);
+            return Verdict(ArtifactCode::QuotaExceeded);
+        }
+        if duplicate {
+            return Verdict(ArtifactCode::Duplicate);
+        }
+        if repo_full
+            || (standing.hard_bytes > 0
+                && standing.used.saturating_add(bytes) > standing.hard_bytes)
+            || self.objects.admission().is_some_and(|a| !a.is_open())
+        {
+            return Verdict(ArtifactCode::QuotaExceeded);
+        }
+        let staging = match self.objects.stage_begin(scope.tenant, bytes) {
+            Ok(staging) => staging,
+            Err(_) => return Verdict(ArtifactCode::Store),
+        };
+        let mut open = self
+            .runner_artifacts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if open.contains_key(&lease) {
+            drop(open);
+            drop(staging);
+            return Verdict(ArtifactCode::Invalid);
+        }
+        open.insert(
+            lease,
+            RunnerPublication {
+                worker,
+                scope,
+                name: name.to_owned(),
+                declared: bytes,
+                digest,
+                written: 0,
+                next_seq: 0,
+                staging: Some(staging),
+            },
+        );
+        ArtifactReply::Grant
+    }
+
+    fn runner_artifact_data(
+        &self,
+        worker: WorkerId,
+        lease: RunnerLeaseId,
+        seq: u32,
+        bytes: &[u8],
+    ) -> Option<ArtifactCode> {
+        let mut open = self
+            .runner_artifacts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let Some(publication) = open.get_mut(&lease) else {
+            return Some(ArtifactCode::Stale);
+        };
+        if publication.worker != worker {
+            return Some(ArtifactCode::Stale);
+        }
+        let fits = publication.next_seq == seq
+            && publication.written.saturating_add(bytes.len() as u64) <= publication.declared;
+        if !fits {
+            let dropped = open.remove(&lease);
+            drop(open);
+            drop(dropped);
+            return Some(ArtifactCode::Invalid);
+        }
+        let Some(staging) = publication.staging.as_mut() else {
+            return Some(ArtifactCode::Invalid);
+        };
+        if self.objects.stage_write(staging, bytes).is_err() {
+            let dropped = open.remove(&lease);
+            drop(open);
+            drop(dropped);
+            return Some(ArtifactCode::Store);
+        }
+        publication.written += bytes.len() as u64;
+        publication.next_seq += 1;
+        None
+    }
+
+    fn runner_artifact_end(
+        &self,
+        worker: WorkerId,
+        lease: RunnerLeaseId,
+        name: &str,
+    ) -> ArtifactCode {
+        let Some(publication) = self
+            .runner_artifacts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&lease)
+        else {
+            return ArtifactCode::Stale;
+        };
+        let RunnerPublication {
+            scope,
+            name: published,
+            declared,
+            digest,
+            written,
+            staging,
+            worker: owner,
+            ..
+        } = publication;
+        if owner != worker || published != name || written != declared {
+            drop(staging);
+            return ArtifactCode::Invalid;
+        }
+        let Some(staging) = staging else {
+            return ArtifactCode::Invalid;
+        };
+        // A body that is not what the offer promised is refused before any manifest can reference it.
+        let staged = match self.objects.stage_seal(scope.tenant, staging, declared) {
+            Ok(staged) => staged,
+            Err(_) => return ArtifactCode::Store,
+        };
+        if staged.digest().as_bytes() != &digest {
+            self.discard_staged(staged);
+            return ArtifactCode::Invalid;
+        }
+        let entry = objects::Entry {
+            path: runner_entry_path(name),
+            digest: staged.digest(),
+            len: declared,
+            mode: 0o644,
+        };
+        let manifest = artifacts::runner_manifest_name(scope.repo, scope.run, scope.job, name);
+        let deployment = self.objects.deployment();
+        let objects = Arc::clone(&self.objects);
+        let artifact_name = name.to_owned();
+        let code = self
+            .write(move |tx| {
+                let charge = artifacts::charge(tx, None, declared)?;
+                let effective =
+                    retention::effective(tx, &deployment, scope.tenant, Some(scope.repo))?;
+                let retain_until =
+                    UnixMillis(UnixMillis::now().0 + effective.artifact_retention_ms);
+                let standing = retention::standing(tx, &deployment, scope.tenant)?;
+                if standing.hard_bytes > 0
+                    && standing.used.saturating_add(declared) > standing.hard_bytes
+                {
+                    objects.discard(tx, staged)?;
+                    return Ok(ArtifactCode::QuotaExceeded);
+                }
+                if matches!(
+                    retention::check_repo(
+                        tx,
+                        &deployment,
+                        scope.tenant,
+                        scope.repo,
+                        charge.charged
+                    ),
+                    Err(sentinel_store::Error::QuotaExceeded)
+                ) {
+                    objects.discard(tx, staged)?;
+                    return Ok(ArtifactCode::TooLarge);
+                }
+                objects.commit(tx, &staged)?;
+                let version = objects.commit_manifest(
+                    tx,
+                    scope.tenant,
+                    objects::Kind::Artifact,
+                    &manifest,
+                    &[entry],
+                )?;
+                artifacts::record_runner(
+                    tx,
+                    scope.tenant,
+                    scope.repo,
+                    scope.run,
+                    scope.job,
+                    &artifact_name,
+                    &charge,
+                    version,
+                    1,
+                    declared,
+                    retain_until,
+                    UnixMillis::now(),
+                )?;
+                Ok(ArtifactCode::Stored)
+            })
+            .unwrap_or(ArtifactCode::Store);
+        if code == ArtifactCode::Stored {
+            self.stats.artifacts.fetch_add(1, Ordering::Relaxed);
+        }
+        code
+    }
+}
+
+/// The one entry a runner-mode artifact's manifest carries: the archive the client's blocks were assembled into,
+/// named after the artifact so a person reading a manifest knows what it is. A name that is not a plain path
+/// segment is sanitized, because the manifest's paths are what a download writes to.
+fn runner_entry_path(name: &str) -> String {
+    let mut path: String = name
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect();
+    path.truncate(200);
+    if path.is_empty() {
+        path.push_str("artifact");
+    }
+    path.push_str(".zip");
+    path
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4596,6 +4877,7 @@ impl Controller {
             logs,
             objects,
             artifacts: Mutex::new(ArtifactState::default()),
+            runner_artifacts: Mutex::new(HashMap::new()),
             storage: Mutex::new(None),
             remote_budget: AtomicU64::new(sentinel_cache::remote::STORE_BUDGET_BYTES),
             order: AtomicU8::new(PlacementOrder::Fastest as u8),

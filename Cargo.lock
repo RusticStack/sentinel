@@ -1182,6 +1182,7 @@ dependencies = [
  "form_urlencoded",
  "libc",
  "ring",
+ "rusqlite",
  "rustix",
  "sentinel-api",
  "sentinel-auth",
