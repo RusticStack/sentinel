@@ -91,7 +91,7 @@ What a session cannot supply. Ask early.
 - [x] **A05** admission and registration modes ([admission](docs/admission.md))
 - [x] **W01** worker enrollment and link, protocol 11 ([worker link](docs/worker-link.md))
 - [x] **W03** checkout and the rootless Podman executor ([executor](docs/executor.md)) — ran on rootless Podman 4.9.3 on 2026-11-21; the microVM arms stay with M04
-- [ ] **W09** vertical slice fault cases ([vertical slice](docs/vertical-slice.md))
+- [x] **W09** vertical slice fault cases ([vertical slice](docs/vertical-slice.md)) — the lease nobody renews is now a slice case; ran on rootless Podman 4.9.3 on 2026-11-21
 - [x] **G04** Checks outbox ([checks](docs/checks.md))
 - [ ] **G08** generic Git intake on the fixtures ([generic Git verification](docs/generic-git-verification.md)); Forgejo over SSH and GitLab over HTTPS are G08a (X7)
 - [x] **D01**, **D02** objects, uploads and reads ([storage](docs/storage.md))

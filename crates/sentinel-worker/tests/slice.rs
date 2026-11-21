@@ -16,7 +16,7 @@ use std::{
 };
 
 use sentinel_core::{
-    PoolId, RepoId, TenantId, UnixMillis, UserId, WorkerId,
+    AttemptId, PoolId, RepoId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Namespace, Permissions as P, Principal, Role},
 };
 use sentinel_link::{
@@ -554,6 +554,120 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
             .unwrap()
             .is_empty()
     );
+
+    // A lease nobody renews. The controller is gone past the attempt's own lease, so the worker's deadline
+    // ends its work and its report is suppressed (`Executor::send` skips a lost attempt), and the restart
+    // settles the attempt by expiry instead of replaying it. The container is the proof that matters here: a
+    // stale lease never leaves a step running, and it never becomes a second attempt.
+    let lapse = api.dispatch(&pipeline("lapse", "echo started; sleep 300"), &repo, &sha);
+    let lapse_id = lapse["id"].as_str().unwrap().to_owned();
+    eventually("lapse running", || {
+        api.job(&lapse_id, "lapse")["state"] == "running"
+    });
+    let lapse_attempt = api.job(&lapse_id, "lapse")["attempt"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // A log page answers 404 until the attempt has stored its first frame, so this waits for the frame
+    // rather than for the endpoint: it proves the step really ran in a container before the controller goes.
+    eventually("lapse printed", || {
+        let (status, page) = api.call(
+            "GET",
+            &format!("/api/v1/attempts/{lapse_attempt}/logs?limit=500"),
+            None,
+        );
+        status == 200
+            && page["frames"]
+                .as_array()
+                .is_some_and(|frames| !frames.is_empty())
+    });
+    assert!(controller.take().unwrap().shutdown(Duration::from_secs(5)));
+    let lost = Instant::now();
+    eventually_described(
+        "the worker's own lease deadline ends the work",
+        || isolation::sandboxes(worker_id, &worker_dir) == 0,
+        || format!("notices={:?}", notices.lock().unwrap()),
+    );
+    assert!(
+        lost.elapsed() < Duration::from_secs(60),
+        "the worker kept its container {:?} past a lease of 30 s",
+        lost.elapsed()
+    );
+    assert!(
+        notices
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|n| n.starts_with("LeaseLost")),
+        "{:?}",
+        notices.lock().unwrap()
+    );
+    // The controller writes the last lease it granted, and it may have renewed after the worker's own
+    // deadline. Reconciliation rightly leaves an attempt whose lease still holds alone, so the restart
+    // waits until the written lease has genuinely passed.
+    let attempt_id: AttemptId = lapse_attempt.parse().unwrap();
+    let lease_until: i64 = store
+        .read(|c| {
+            c.query_row(
+                "SELECT lease_until_ms FROM attempts WHERE id = ?1",
+                rusqlite::params![attempt_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .unwrap();
+    while UnixMillis::now().0 <= lease_until {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let restarted = Controller::start(
+        Arc::clone(&store),
+        Arc::clone(&logs),
+        Arc::clone(&objects),
+        Identity::load(&c_cert, &c_key).unwrap(),
+        link_addr,
+    )
+    .unwrap();
+    let settled = restarted.reconciled();
+    assert_eq!(
+        (settled.expired, settled.lapsed, settled.orphaned),
+        (1, 0, 0),
+        "a lease that passed while the controller was down is settled by expiry"
+    );
+    controller = Some(restarted);
+    eventually("lapse settled", || {
+        api.run(&lapse_id)["state"] == "infra_failed"
+    });
+    let lapsed = api.job(&lapse_id, "lapse");
+    assert_eq!(lapsed["failure_class"], "lease_expired", "{lapsed}");
+    assert_eq!(lapsed["fence"], 1, "a lapsed attempt is never replayed");
+    assert_eq!(
+        api.run(&lapse_id)["jobs"].as_array().unwrap().len(),
+        1,
+        "no dependent was decided and no second job exists"
+    );
+    eventually("worker back after the lapse", || connected(&controller));
+    // What the worker keeps on disk is the lapsed attempt's own evidence, for the next start to deliver;
+    // nothing else survived any of it.
+    for leftovers in [
+        Workspace::leftovers(&worker_dir).unwrap(),
+        sentinel_worker::spool::Spool::leftovers(&worker_dir).unwrap(),
+    ] {
+        assert!(
+            leftovers
+                .iter()
+                .all(|attempt| attempt.to_string() == lapse_attempt),
+            "{leftovers:?}"
+        );
+    }
+    assert!(
+        sentinel_worker::recovery::leftovers(&worker_dir)
+            .unwrap()
+            .iter()
+            .all(|marker| marker.attempt.to_string() == lapse_attempt),
+        "{:?}",
+        sentinel_worker::recovery::leftovers(&worker_dir).unwrap()
+    );
+
     handle.stop();
     link_thread.join().unwrap().unwrap();
     api_server.shutdown();
