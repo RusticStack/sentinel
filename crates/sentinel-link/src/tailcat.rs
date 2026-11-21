@@ -20,7 +20,16 @@ use sha2::{Digest, Sha256};
 use crate::session::Path as Route;
 
 pub const PINNED_VERSION: &str = "0.6.0";
-pub const PINNED_SHA256: &str = "d46582137d21f03d15345e2be425d6317d49e5b8c8bb4f6fc56037f4c08cce73";
+/// The upstream v0.6.0 executables, the same digests as `scripts/release/pins.env`.
+pub const PINNED_SHA256_X86_64: &str =
+    "d46582137d21f03d15345e2be425d6317d49e5b8c8bb4f6fc56037f4c08cce73";
+pub const PINNED_SHA256_AARCH64: &str =
+    "3d947fa4ef9c35046f9cf4a198531f31c443ff71be038fde1d85aef9d640569f";
+/// The pin for the architecture this build runs on.
+#[cfg(target_arch = "aarch64")]
+pub const PINNED_SHA256: &str = PINNED_SHA256_AARCH64;
+#[cfg(not(target_arch = "aarch64"))]
+pub const PINNED_SHA256: &str = PINNED_SHA256_X86_64;
 pub const DEFAULT_LINK_PORT: u16 = 7443;
 pub const ALLOW_LIST_FILE: &str = "tailcat-allow";
 /// Owner-only, empty and never removed: its exclusive lock serializes every edit of the allow list.
@@ -2253,9 +2262,12 @@ mod tests {
 
     #[test]
     fn the_pin_is_a_complete_sha256() {
-        assert_eq!(PINNED_SHA256.len(), 64);
-        assert!(parse_hex(PINNED_SHA256).is_some());
-        assert_eq!(hex(&parse_hex(PINNED_SHA256).unwrap()), PINNED_SHA256);
+        for pin in [PINNED_SHA256_X86_64, PINNED_SHA256_AARCH64] {
+            assert_eq!(pin.len(), 64);
+            assert_eq!(hex(&parse_hex(pin).unwrap()), pin);
+        }
+        assert_ne!(PINNED_SHA256_X86_64, PINNED_SHA256_AARCH64);
+        assert!([PINNED_SHA256_X86_64, PINNED_SHA256_AARCH64].contains(&PINNED_SHA256));
     }
 
     #[test]
