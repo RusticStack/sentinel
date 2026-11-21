@@ -425,6 +425,9 @@ struct State {
     leftovers: Vec<Leftover>,
     recovering: HashMap<AttemptId, Arc<LogPipe>>,
     artifact_waits: HashMap<AttemptId, Arc<Watch>>,
+    /// Runner-mode artifact publications in flight, one per lease: the sandbox's `upload-artifact` waits on
+    /// the controller's answer through its own watch.
+    runner_waits: HashMap<[u8; 16], Arc<Watch>>,
     draining: bool,
     /// Runner-mode leases this worker holds, with the configuration once the controller delivers it.
     /// AR03 starts the runner with it; nothing here writes it anywhere.
@@ -463,6 +466,7 @@ impl SandboxActions {
         dir: &Path,
         lease: [u8; 16],
         base: std::net::Ipv4Addr,
+        publisher: Option<Arc<dyn sentinel_actions::Publisher>>,
     ) -> Option<(Self, std::net::Ipv4Addr)> {
         use std::net::{IpAddr, SocketAddr};
         let label = crate::runner::hex16(sentinel_core::RunnerLeaseId::from_bytes(lease).ok()?);
@@ -478,9 +482,12 @@ impl SandboxActions {
             }
             let address = std::net::Ipv4Addr::from([octets[0], octets[1], octets[2], last as u8]);
             let listener = SocketAddr::new(IpAddr::V4(address), crate::runner::ACTIONS_PORT);
-            if let Ok(endpoint) =
-                sentinel_actions::Endpoint::bind(&ca, Arc::clone(&store), listener)
-            {
+            if let Ok(endpoint) = sentinel_actions::Endpoint::bind_with(
+                &ca,
+                Arc::clone(&store),
+                listener,
+                publisher.clone(),
+            ) {
                 return Some((SandboxActions { endpoint }, address));
             }
         }
@@ -505,6 +512,20 @@ impl SandboxActions {
         self.endpoint.bind_scope(sentinel_actions::Scope::with_job(
             tenant, repo, trust, arch, wire.run, wire.job,
         ));
+    }
+}
+
+/// What a sandbox's endpoint publishes to: the controller's artifact store, over the lease's own link.
+/// One artifact at a time per lease, because one listener serves one boundary and a client uploads one
+/// artifact at a time.
+struct RunnerPublisher {
+    inner: Arc<Inner>,
+    lease: [u8; 16],
+}
+
+impl sentinel_actions::Publisher for RunnerPublisher {
+    fn publish(&self, sealed: &sentinel_actions::Sealed<'_>) -> sentinel_actions::Published {
+        self.inner.publish_runner(self.lease, sealed)
     }
 }
 
@@ -538,6 +559,10 @@ impl Watch {
     fn resolve(&self, reply: Reply) {
         *self.reply.lock().unwrap_or_else(|p| p.into_inner()) = Some(reply);
         self.cv.notify_all();
+    }
+    /// Drop the answer heard so far, so the next phase of one publication waits for its own.
+    fn clear(&self) {
+        *self.reply.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
     fn peek(&self) -> Option<Reply> {
         self.reply.lock().unwrap_or_else(|p| p.into_inner()).clone()
@@ -817,6 +842,7 @@ impl Executor {
                 leftovers,
                 recovering: HashMap::new(),
                 artifact_waits: HashMap::new(),
+                runner_waits: HashMap::new(),
                 draining: false,
                 runners: HashMap::new(),
             }),
@@ -1726,6 +1752,131 @@ impl Report for Inner {
     }
 }
 
+impl Inner {
+    /// Publish one sealed runner-mode artifact: offer it, stream the sealed blob, close it, and answer
+    /// what the controller decided. `Stored` means the tenant holds a row for the bytes; anything else
+    /// fails the sandbox's upload, which is how a refused artifact is a visible failure rather than a file
+    /// only this host keeps.
+    fn publish_runner(
+        &self,
+        lease: [u8; 16],
+        sealed: &sentinel_actions::Sealed<'_>,
+    ) -> sentinel_actions::Published {
+        use sentinel_actions::Published;
+        let watch = Arc::new(Watch::default());
+        let reporter = {
+            let mut state = self.state();
+            let Some(reporter) = state.reporter.clone() else {
+                return Published::Refused("store");
+            };
+            state.runner_waits.insert(lease, Arc::clone(&watch));
+            if reporter
+                .runner_artifact_begin(lease, sealed.name, sealed.len, sealed.digest)
+                .is_err()
+            {
+                state.runner_waits.remove(&lease);
+                return Published::Refused("store");
+            }
+            reporter
+        };
+        match watch.wait_reply(REPLY_TIMEOUT) {
+            Some(Reply::Granted) => watch.clear(),
+            Some(Reply::Done(code)) => {
+                self.state().runner_waits.remove(&lease);
+                return published(code);
+            }
+            _ => {
+                self.state().runner_waits.remove(&lease);
+                return Published::Refused("store");
+            }
+        }
+        use std::io::Read as _;
+        let mut file = match std::fs::File::open(sealed.path) {
+            Ok(file) => file,
+            Err(_) => {
+                self.fail_runner(&watch, lease, false);
+                return Published::Refused("store");
+            }
+        };
+        let mut buf = vec![0u8; sentinel_protocol::limits::MAX_ARTIFACT_CHUNK_BYTES];
+        let mut seq = 0u32;
+        let mut sent = 0u64;
+        loop {
+            if let Some(Reply::Done(code)) = watch.peek() {
+                self.state().runner_waits.remove(&lease);
+                return published(code);
+            }
+            let got = match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(got) => got,
+                Err(_) => {
+                    self.fail_runner(&watch, lease, true);
+                    return Published::Refused("store");
+                }
+            };
+            if reporter
+                .runner_artifact_data(lease, seq, &buf[..got])
+                .is_err()
+            {
+                watch.resolve(Reply::Done(ArtifactCode::Store));
+                let code = watch.wait_done(REPLY_TIMEOUT);
+                self.state().runner_waits.remove(&lease);
+                return published(code.unwrap_or(ArtifactCode::Store));
+            }
+            seq += 1;
+            sent += got as u64;
+        }
+        if sent != sealed.len {
+            self.fail_runner(&watch, lease, true);
+            return Published::Refused("store");
+        }
+        {
+            let _gate = watch.gate.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(Reply::Done(code)) = watch.peek() {
+                self.state().runner_waits.remove(&lease);
+                return published(code);
+            }
+            if reporter.runner_artifact_end(lease, sealed.name).is_err() {
+                watch.resolve(Reply::Done(ArtifactCode::Store));
+            }
+        }
+        let code = watch
+            .wait_done(REPLY_TIMEOUT)
+            .unwrap_or(ArtifactCode::Store);
+        self.state().runner_waits.remove(&lease);
+        published(code)
+    }
+
+    /// Fail a publication whose body could not be sent. The controller holds a stage for it, so the link is
+    /// told the artifact ended rather than left open; `abort` sends no body, which the controller reads as a
+    /// short artifact and discards.
+    fn fail_runner(&self, watch: &Arc<Watch>, lease: [u8; 16], abort: bool) {
+        if abort {
+            let reporter = self.state().reporter.clone();
+            if let Some(reporter) = reporter {
+                let _ = reporter.runner_artifact_end(lease, "");
+            }
+        }
+        watch.resolve(Reply::Done(ArtifactCode::Store));
+        let _ = watch.wait_done(REPLY_TIMEOUT);
+        self.state().runner_waits.remove(&lease);
+    }
+}
+
+/// What one controller verdict means to the sandbox's upload: only `Stored` is a success, and every other
+/// code names why the tenant cannot hold the artifact.
+fn published(code: sentinel_link::session::ArtifactCode) -> sentinel_actions::Published {
+    use sentinel_link::session::ArtifactCode;
+    match code {
+        ArtifactCode::Stored => sentinel_actions::Published::Stored,
+        ArtifactCode::QuotaExceeded => sentinel_actions::Published::Refused("quota_exceeded"),
+        ArtifactCode::TooLarge => sentinel_actions::Published::Refused("too_large"),
+        ArtifactCode::Duplicate => sentinel_actions::Published::Refused("duplicate"),
+        ArtifactCode::Invalid => sentinel_actions::Published::Refused("invalid"),
+        _ => sentinel_actions::Published::Refused("store"),
+    }
+}
+
 impl artifacts::Sink for Inner {
     fn capable(&self) -> bool {
         self.state()
@@ -2003,8 +2154,13 @@ impl LinkExecutor for Executor {
             lifetime_secs: 0,
         };
         let dir = self.root.join("runners").join(crate::runner::hex16(id));
-        let Some((actions, address)) = SandboxActions::bind(&self.root, &dir, lease, address)
-            .map(|(actions, address)| (Arc::new(actions), address))
+        let publisher = Some(Arc::new(RunnerPublisher {
+            inner: Arc::clone(&self.0),
+            lease: *id.as_bytes(),
+        }) as Arc<dyn sentinel_actions::Publisher>);
+        let Some((actions, address)) =
+            SandboxActions::bind(&self.root, &dir, lease, address, publisher)
+                .map(|(actions, address)| (Arc::new(actions), address))
         else {
             wipe(&mut config);
             (self.notify)(Notice::RunnerFailed {
@@ -2384,6 +2540,22 @@ impl LinkExecutor for Executor {
         let watch = self.state().artifact_waits.get(&attempt).cloned();
         if let Some(watch) = watch {
             let _gate = watch.gate.lock().unwrap_or_else(|p| p.into_inner());
+            watch.resolve(Reply::Done(code));
+        }
+    }
+
+    fn runner_artifact_answered(&self, lease: [u8; 16], _name: &str, code: ArtifactCode) {
+        let watch = self.state().runner_waits.get(&lease).cloned();
+        let Some(watch) = watch else {
+            return;
+        };
+        let done = matches!(watch.peek(), Some(Reply::Done(_)));
+        let _gate = watch.gate.lock().unwrap_or_else(|p| p.into_inner());
+        // The begin's grant is `Stored`, and the artifact is still open after it: that resolves the grant
+        // rather than closing the publication, so the body that follows is accepted.
+        if code == ArtifactCode::Stored && !done {
+            watch.resolve(Reply::Granted);
+        } else {
             watch.resolve(Reply::Done(code));
         }
     }

@@ -1,10 +1,14 @@
 use std::{
+    collections::HashSet,
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use sentinel_protocol::limits::{
+    MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_PATH_BYTES,
+};
 use serde_json::{Map, Value, json};
 
 use super::{List, segment, tenant, text};
@@ -209,6 +213,358 @@ pub(super) fn link(
     Ok(())
 }
 
+/// Records one artifact from local files: each regular file under `source` becomes a manifest entry at
+/// its relative path, its bytes go through an upload session of the run's own tenant unless that tenant
+/// already holds them, and the manifest is attached once every object is committed.
+pub(super) fn upload(
+    client: &Client,
+    output: Output,
+    run: &str,
+    name: &str,
+    source: &Path,
+    options: UploadOptions,
+) -> Result<(), Error> {
+    let run = segment("run", run)?;
+    artifact_name(name)?;
+    let mode = parse_mode(options.mode.as_deref())?;
+    if options.class.as_ref().is_some_and(String::is_empty) {
+        return Err(Error::usage(
+            "--class names an artifact class; it is not empty",
+        ));
+    }
+    if options.retain == Some(0) {
+        return Err(Error::usage("--retain is at least 1 second"));
+    }
+    let files = files_under(source)?;
+    if files.is_empty() {
+        return Err(Error::usage(format!(
+            "{} holds no regular file to upload",
+            source.display()
+        )));
+    }
+    if files.len() > MAX_ARTIFACT_ENTRIES {
+        return Err(Error::usage(format!(
+            "{} holds {} regular files; an artifact holds at most {MAX_ARTIFACT_ENTRIES} entries",
+            source.display(),
+            files.len()
+        )));
+    }
+    // The run's own tenant owns its objects, so a session opened for another tenant would leave a
+    // manifest naming bytes that tenant's store does not hold: the listing settles the tenant before a
+    // byte moves, and it names the artifacts the run already holds so a duplicate name never uploads
+    // bytes it would have to discard.
+    let listing = client.get(&format!("/api/v1/runs/{run}/artifacts"))?;
+    let slug = run_tenant(client, &listing, options.tenant, run)?;
+    if listing["artifacts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|artifact| artifact["name"] == name)
+    {
+        return Err(Error::new(
+            Exit::Conflict,
+            format!(
+                "run {run} already holds an artifact named {name:?}; choose another name, or read it \
+                 with: artifact list {run}"
+            ),
+        ));
+    }
+    let mut buf = vec![0u8; CHUNK];
+    let mut entries = Vec::with_capacity(files.len());
+    let mut held = HashSet::new();
+    let mut total = 0u64;
+    let (mut uploaded, mut kept) = (0usize, 0usize);
+    for (file, path) in files {
+        let (digest, len) = digest_of(&file, &mut buf)?;
+        total = total.saturating_add(len);
+        if total > MAX_ARTIFACT_BYTES {
+            return Err(Error::usage(format!(
+                "{} holds more than the {MAX_ARTIFACT_BYTES}-byte artifact limit",
+                source.display()
+            )));
+        }
+        // Identical content is one object: a digest already sent (or already stored) is not sent again.
+        if held.insert(digest.clone()) {
+            if stored(client, &slug, &digest) {
+                kept += 1;
+            } else {
+                put_blob(client, &slug, &file, &digest, len, &mut buf)?;
+                uploaded += 1;
+            }
+        }
+        entries.push(json!({
+            "path": path,
+            "digest": digest,
+            "len": len,
+            "mode": mode,
+        }));
+    }
+    let mut body = Map::with_capacity(4);
+    body.insert("name".to_owned(), Value::String(name.to_owned()));
+    body.insert("entries".to_owned(), Value::Array(entries));
+    if let Some(class) = options.class {
+        body.insert("class".to_owned(), Value::String(class));
+    }
+    if let Some(secs) = options.retain {
+        body.insert("retain_secs".to_owned(), Value::from(secs));
+    }
+    let view = client.post(
+        &format!("/api/v1/runs/{run}/artifacts"),
+        &Value::Object(body),
+        None,
+    )?;
+    client::emit(output, &view, || {
+        format!(
+            "{} {} {} ({} entries, {} bytes; {uploaded} uploaded, {kept} already held)\n",
+            text(&view, "id"),
+            text(&view, "name"),
+            text(&view, "state"),
+            view["entries"].as_u64().unwrap_or(0),
+            view["bytes"].as_u64().unwrap_or(0),
+        )
+    });
+    Ok(())
+}
+
+/// What an upload records besides the files themselves: the tenant whose store the objects go to, and the
+/// class, retention and file mode the manifest and the row carry.
+#[derive(Debug, Default)]
+pub(super) struct UploadOptions {
+    pub tenant: Option<String>,
+    pub class: Option<String>,
+    pub retain: Option<u64>,
+    pub mode: Option<String>,
+}
+
+/// The store's name rule, checked locally so a name the controller would refuse never moves bytes.
+fn artifact_name(name: &str) -> Result<(), Error> {
+    const NAME_MAX: usize = 128;
+    if name.is_empty() || name.len() > NAME_MAX || name.bytes().any(|b| b < 32 || b == 127) {
+        return Err(Error::usage(format!(
+            "an artifact name is 1 to {NAME_MAX} printable ASCII bytes, not {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// `--mode` is octal like `chmod`; the leading zero is optional and the setuid, setgid and sticky bits are
+/// masked off, as the store masks them.
+fn parse_mode(mode: Option<&str>) -> Result<u32, Error> {
+    let Some(text) = mode else {
+        return Ok(0o644);
+    };
+    u32::from_str_radix(text.trim_start_matches("0o"), 8)
+        .ok()
+        .filter(|mode| *mode <= 0o7777)
+        .map(|mode| mode & 0o777)
+        .ok_or_else(|| Error::usage(format!("--mode is octal up to 0777, not {text:?}")))
+}
+
+/// The tenant whose store holds the run's objects, as the server states it. `--tenant` may repeat it and
+/// never change it.
+fn run_tenant(
+    client: &Client,
+    listing: &Value,
+    tenant_flag: Option<String>,
+    run: &str,
+) -> Result<String, Error> {
+    let owner = match listing["tenant"].as_str() {
+        Some(owner) => segment("tenant", owner)?.to_owned(),
+        None => tenant(client, None)?,
+    };
+    match tenant_flag {
+        Some(flag) => {
+            let flag = tenant(client, Some(flag))?;
+            if flag != owner {
+                return Err(Error::usage(format!(
+                    "run {run} belongs to tenant {owner} and its objects are that tenant's; --tenant is {owner}"
+                )));
+            }
+            Ok(flag)
+        }
+        None => Ok(owner),
+    }
+}
+
+/// Every regular file under `source` as (where to read it, the path the manifest names it), sorted by that
+/// path so one tree always produces one manifest. A single file is one entry named by its file name; a
+/// symbolic link or any other non-regular entry is skipped rather than followed.
+fn files_under(source: &Path) -> Result<Vec<(PathBuf, String)>, Error> {
+    let kind = fs::symlink_metadata(source).map_err(|e| local(source, e))?;
+    if kind.is_file() {
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                Error::usage(format!(
+                    "{} has no UTF-8 file name to name the entry by",
+                    source.display()
+                ))
+            })?;
+        entry_path(name)?;
+        return Ok(vec![(source.to_path_buf(), name.to_owned())]);
+    }
+    if !kind.is_dir() {
+        return Err(Error::usage(format!(
+            "{} is neither a regular file nor a directory",
+            source.display()
+        )));
+    }
+    let mut files = Vec::new();
+    walk(source, "", &mut files)?;
+    files.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+    Ok(files)
+}
+
+fn walk(dir: &Path, prefix: &str, files: &mut Vec<(PathBuf, String)>) -> Result<(), Error> {
+    for entry in fs::read_dir(dir).map_err(|e| local(dir, e))? {
+        let entry = entry.map_err(|e| local(dir, e))?;
+        let file = entry.path();
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            Error::usage(format!(
+                "{} has no UTF-8 file name; a manifest names its entries in UTF-8",
+                file.display()
+            ))
+        })?;
+        let path = if prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let kind = entry.file_type().map_err(|e| local(&file, e))?;
+        if kind.is_dir() {
+            walk(&file, &path, files)?;
+        } else if kind.is_file() {
+            entry_path(&path)?;
+            files.push((file, path));
+        }
+    }
+    Ok(())
+}
+
+/// A path the manifest accepts: bounded, and every segment a plain name, so nothing the local tree states
+/// could name a path the store would refuse after the bytes were already sent.
+fn entry_path(path: &str) -> Result<(), Error> {
+    let plain = path.split('/').all(|part| {
+        !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':', '\0'])
+    });
+    if !plain || path.len() > MAX_ARTIFACT_PATH_BYTES {
+        return Err(Error::usage(format!(
+            "the entry path {path:?} is not a plain relative path of at most \
+             {MAX_ARTIFACT_PATH_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn local(path: &Path, error: std::io::Error) -> Error {
+    let what = match error.kind() {
+        std::io::ErrorKind::NotFound => "no such file or directory".to_owned(),
+        std::io::ErrorKind::PermissionDenied => "permission denied".to_owned(),
+        _ => error.to_string(),
+    };
+    Error::usage(format!("cannot read {}: {what}", path.display()))
+}
+
+/// The digest and length of one file, read once through a bounded buffer.
+fn digest_of(path: &Path, buf: &mut [u8]) -> Result<(String, u64), Error> {
+    let mut file = fs::File::open(path).map_err(|e| local(path, e))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut len = 0u64;
+    loop {
+        let n = file.read(buf).map_err(|e| local(path, e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        len += n as u64;
+    }
+    Ok((hasher.finalize().to_hex().to_string(), len))
+}
+
+/// Whether the tenant's store already holds these bytes: an object read of one byte answers 206 when it
+/// does and 404 when it does not. Any other answer (a credential without `artifacts:read`, a server that
+/// ignores the range) says nothing, so the bytes go up and the commit verifies them anyway.
+fn stored(client: &Client, slug: &str, digest: &str) -> bool {
+    let object = format!("/api/v1/tenants/{slug}/objects/{digest}");
+    match client.download(&object, Some((0, 1))) {
+        Ok(mut download) => {
+            let mut one = [0u8; 1];
+            let _ = download.body.read(&mut one);
+            matches!(download.status, 200 | 206)
+        }
+        Err(_) => false,
+    }
+}
+
+/// One object through its own upload session: the length and digest are declared, the file goes up in
+/// bounded chunks, and the commit is the server's own digest check. A failure aborts the session, so its
+/// reservation against the tenant's quota comes back at once instead of at the session's expiry.
+fn put_blob(
+    client: &Client,
+    slug: &str,
+    path: &Path,
+    digest: &str,
+    len: u64,
+    buf: &mut [u8],
+) -> Result<(), Error> {
+    let begin = client.post(
+        &format!("/api/v1/tenants/{slug}/uploads"),
+        &json!({ "len": len, "digest": digest }),
+        None,
+    )?;
+    let upload = segment("upload", text(&begin, "upload"))?;
+    if let Err(error) = stream(client, upload, path, len, buf) {
+        let _ = client.delete(&format!("/api/v1/uploads/{upload}"));
+        return Err(error);
+    }
+    let commit = client.post(
+        &format!("/api/v1/uploads/{upload}/commit"),
+        &json!({}),
+        None,
+    )?;
+    let sealed = segment("digest", text(&commit, "digest"))?;
+    if sealed != digest {
+        return Err(Error::remote(format!(
+            "the controller stored {sealed} where the file hashes to {digest}"
+        )));
+    }
+    Ok(())
+}
+
+fn stream(
+    client: &Client,
+    upload: &str,
+    path: &Path,
+    len: u64,
+    buf: &mut [u8],
+) -> Result<(), Error> {
+    let mut file = fs::File::open(path).map_err(|e| local(path, e))?;
+    let mut offset = 0u64;
+    loop {
+        let n = file.read(buf).map_err(|e| local(path, e))?;
+        if n == 0 {
+            break;
+        }
+        client.put_bytes(
+            &format!("/api/v1/uploads/{upload}?offset={offset}"),
+            &buf[..n],
+            "application/octet-stream",
+            &[],
+            &format!("upload-{upload}-{offset}"),
+        )?;
+        offset += n as u64;
+    }
+    if offset != len {
+        return Err(Error::usage(format!(
+            "{} changed while it was read: {offset} bytes of the {len} its digest covers",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// The slug the artifact row belongs to, so entry bytes come from the owning tenant's objects.
 fn owner_slug(client: &Client, view: &Value, tenant_flag: Option<String>) -> Result<String, Error> {
     match (tenant_flag, view["tenant"].as_str()) {
@@ -279,6 +635,8 @@ fn write_entry(
 const STALLED_ATTEMPTS: u32 = 3;
 const RESUME_PAUSE: Duration = Duration::from_millis(200);
 const BUFFER: usize = 64 << 10;
+/// One upload chunk, read into this buffer and sent as-is; the controller accepts at most 8 MiB per chunk.
+const CHUNK: usize = 1 << 20;
 
 /// Beside the destination so the final rename never crosses a filesystem; keyed by digest so only the same content resumes.
 fn partial_path(out: &Path, digest: &str) -> PathBuf {
@@ -511,6 +869,63 @@ pub(super) fn cache(client: &Client, output: Output, attempt: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tree_walks_into_regular_files_only_sorted_by_their_manifest_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("b/inner")).unwrap();
+        for (name, body) in [("z.txt", "z"), ("b/inner/x.bin", "x"), ("a.txt", "a")] {
+            fs::write(root.join(name), body).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("a.txt"), root.join("link.txt")).unwrap();
+        let files = files_under(root).unwrap();
+        let paths: Vec<&str> = files.iter().map(|(_, path)| path.as_str()).collect();
+        assert_eq!(paths, ["a.txt", "b/inner/x.bin", "z.txt"]);
+        let single = files_under(&root.join("z.txt")).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].1, "z.txt");
+        assert_eq!(
+            files_under(&root.join("absent")).unwrap_err().exit,
+            Exit::Usage
+        );
+    }
+
+    #[test]
+    fn mode_is_octal_and_names_and_entry_paths_are_checked_before_any_byte_moves() {
+        assert_eq!(parse_mode(None).unwrap(), 0o644);
+        for (text, mask) in [
+            ("644", 0o644),
+            ("0644", 0o644),
+            ("0o644", 0o644),
+            ("755", 0o755),
+            ("4755", 0o755),
+            ("7777", 0o777),
+        ] {
+            assert_eq!(parse_mode(Some(text)).unwrap(), mask, "{text:?}");
+        }
+        for bad in ["rw-r--r--", "644a", "", "10000"] {
+            assert_eq!(
+                parse_mode(Some(bad)).unwrap_err().exit,
+                Exit::Usage,
+                "{bad:?}"
+            );
+        }
+        assert!(artifact_name("release").is_ok());
+        for bad in ["", "a\nb"] {
+            assert_eq!(artifact_name(bad).unwrap_err().exit, Exit::Usage, "{bad:?}");
+        }
+        assert_eq!(
+            artifact_name(&"a".repeat(129)).unwrap_err().exit,
+            Exit::Usage
+        );
+        assert!(entry_path("out/report.txt").is_ok());
+        for bad in ["", "/etc/passwd", "out//x", "out/../x", "out\\x", "c:x"] {
+            assert_eq!(entry_path(bad).unwrap_err().exit, Exit::Usage, "{bad:?}");
+        }
+        assert_eq!(entry_path(&"a/".repeat(600)).unwrap_err().exit, Exit::Usage);
+    }
 
     #[test]
     fn entry_paths_join_under_the_directory_only_as_plain_names() {

@@ -1,0 +1,103 @@
+name: ci
+
+# The four checks of the repository's own command list (CLAUDE.md#commands): `cargo fmt-check`,
+# `cargo lint`, `cargo test-cli`, and the Linux roles' `cargo lint-linux` / `cargo test-linux`
+# with a release build of what ships. A Windows leg is deliberately absent: the crate builds for
+# `x86_64-pc-windows-msvc`, but nothing runs on a Windows host yet (docs/backlog.md N01), so a leg
+# here would be red by default. Add it beside N01, not before.
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  format:
+    name: fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The toolchain is rust-toolchain.toml's (1.97.0 with rustfmt and clippy), which rustup
+      # installs on the first cargo call.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: format
+          cache-targets: false
+      - run: cargo fmt --all -- --check
+
+  lint:
+    name: lint (all targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (portable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+      - uses: taiki-e/install-action@nextest
+      # The fixtures build real repositories and commit to them, so the runner needs an identity;
+      # without one git refuses and every fixture fails with "Committer identity unknown".
+      - name: a git identity for the fixtures
+        run: |
+          git config --global user.name "sentinel ci"
+          git config --global user.email "ci@sentinel.invalid"
+          git config --global init.defaultBranch main
+      # The suites that need a rootless Podman account, a microVM host or live credentials gate
+      # themselves on their environment variables and skip; everything else runs here.
+      #
+      # Four tests are excluded because they depend on the host rather than on the tree: two drills
+      # wait for a maintenance tick inside a wall-clock window, one asserts a 200 ms p95 that a shared
+      # two-core runner cannot meet, and one scans a staged secret tree whose file contents a GitHub
+      # runner does not preserve the way a verification host does. They pass on `kvm-host` and
+      # `reference-host`, which is where CLAUDE.md puts the authoritative suite; the list and the
+      # evidence are in docs/development.md#what-ci-proves.
+      - run: cargo nextest run --locked --workspace --no-fail-fast --retries 2 -E "not test(/a_canary_binds_runs_redacts_and_is_cleaned_up_without_a_sandbox/) and not test(/the_history_routes_answer_within_200_ms_p95_on_ten_thousand_runs/) and not test(/an_override_changes_what_the_next_check_enforces/) and not test(/a_tenant_at_its_hard_threshold_stops_admitting_work/)"
+
+  linux:
+    name: linux roles
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux
+      - uses: taiki-e/install-action@nextest
+      - name: a git identity for the fixtures
+        run: |
+          git config --global user.name "sentinel ci"
+          git config --global user.email "ci@sentinel.invalid"
+          git config --global init.defaultBranch main
+      - name: lint (all features)
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: test (all features)
+        run: cargo nextest run --locked --workspace --all-features --no-fail-fast --retries 2 -E "not test(/a_canary_binds_runs_redacts_and_is_cleaned_up_without_a_sandbox/) and not test(/the_history_routes_answer_within_200_ms_p95_on_ten_thousand_runs/) and not test(/an_override_changes_what_the_next_check_enforces/) and not test(/a_tenant_at_its_hard_threshold_stops_admitting_work/)"
+      # The smoke: the binaries a release ships link and start with every feature on.
+      - name: build the Linux roles
+        run: cargo build --locked --workspace --release --all-features
+      - name: the built binary starts with both roles compiled in
+        run: |
+          ./target/release/sentinel --help > /dev/null
+          ./target/release/sentinel server --help > /dev/null
+          ./target/release/sentinel worker --help > /dev/null
