@@ -1149,6 +1149,14 @@ impl Config {
                         })
                         .transpose()?
                         .flatten();
+                    // A runner registers with GitHub and fetches its job from it, so a sandbox with no
+                    // network can never come online: the registration is spent before anything could
+                    // run. Refused here rather than accepted and failed, so no lease is burnt on it.
+                    if file.runner.is_some() && job_network != NetworkSetting::Egress {
+                        return Err(Error::config(
+                            "runner mode needs the network: [runner] requires job_network = \"egress\"",
+                        ));
+                    }
                     if [
                         file.cache_budget_bytes,
                         file.mirror_budget_bytes,
