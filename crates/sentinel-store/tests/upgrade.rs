@@ -442,7 +442,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
     assert_eq!(
         report.inspection.pending,
         vec![
-            73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
+            73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90
         ]
     );
     assert!(report.inspection.openable() && report.inspection.integrity == "ok");
@@ -455,9 +455,10 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
 
     // What the upgrade does to the rows already stored: migration 73 rebuilds every OAuth table, migration
     // 81 rebuilds the policy table with the one check relaxed (this database holds no policy row), and
-    // migrations 74 to 88 add runner-mode, guided-migration, fork-policy, AI-request, AI-budget,
+    // migrations 74 to 90 add runner-mode, guided-migration, fork-policy, AI-request, AI-budget,
     // per-test-outcome, storage-default, schedule, failure-analysis, log-search, named-pipeline,
-    // declared-output, source-manifest, external-resource and fresh-run shape without visiting a row.
+    // declared-output, source-manifest, external-resource, fresh-run and runner-cache shape without
+    // visiting a row.
     assert_eq!(
         report
             .steps
@@ -465,7 +466,7 @@ fn the_preflight_on_a_populated_database_names_the_copy_and_the_rows_it_rewrites
             .map(|step| step.version)
             .collect::<Vec<_>>(),
         vec![
-            73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
+            73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90
         ]
     );
     let rewrites = |step: usize| -> Vec<(String, u64)> {

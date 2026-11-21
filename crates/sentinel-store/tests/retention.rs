@@ -10,9 +10,9 @@ use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersi
 use sentinel_store::{
     Durability, Error, Store, artifacts,
     auth::{self, Authority, NamespaceKind, provisioning},
+    classes,
     dispatch::{self, Capacity},
     jobs,
-    classes,
     logs::LogStore,
     objects::{Expect, Objects},
     retention::{self, Deployment, Policy, State},
