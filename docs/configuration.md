@@ -324,7 +324,8 @@ actions_address = "10.0.2.2"
 - **The reference must be pinned by digest.** A tag — even one that looks immutable — is refused with
   `runner.image must be pinned by digest, as in ghcr.io/owner/runner@sha256:<64 hex>`, because this
   image is the code a job's steps run under and the same tag is a different image tomorrow. The image
-  itself, its `actions/runner` version and its toolchains, are AR05's.
+  itself and its `actions/runner` version are [runner mode](runner-mode.md#the-runner-image-and-its-update-policy)'s,
+  and the images with toolchains are [runner images](runner-images.md).
 - **A worker without the section starts no runner**: it declines every runner offer, so the controller
   places none on it and the class's demand waits for a worker that states one. That is the default, and
   the honest one — a worker that cannot start a runner should not be holding its capacity.

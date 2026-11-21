@@ -168,8 +168,9 @@ A worker starts runners from an image it pins by digest, built from
 - **What it carries.** The official `actions/runner` at a pinned version, its own entry point at
   `/usr/local/bin/sentinel-runner` ([`START`](../crates/sentinel-worker/src/runner.rs)), and the
   tools a runner needs to start and check a job out — `bash`, `ca-certificates`, `curl`, `git`,
-  `gzip`, `jq`, the `libicu` its runtime loads, `tar` and `unzip`. Toolchains a workflow expects are
-  AR05's; this image carries only what the runner itself needs.
+  `gzip`, `jq`, the `libicu` its runtime loads, `tar` and `unzip`. This image carries only what the
+  runner itself needs; the toolchains a workflow expects are in the images built on it
+  ([runner images](runner-images.md)).
 - **Pinned version.** `2.338.2`, recorded in the image's `io.sentinel.runner.version` label, so an
   operator reads what a digest carries without running it. The build downloads the release's own
   tarball and checks it against the sha256 in that release's notes, so the image cannot carry a build

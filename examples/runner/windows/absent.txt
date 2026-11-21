@@ -1,0 +1,29 @@
+# Commands GitHub's hosted windows-2025 image carries that this image deliberately does not
+# (docs/runner-images.md#what-the-images-leave-out). One name per line; each becomes a refusal last
+# on the job's PATH. A name the image does carry fails the provisioning.
+7z
+aws
+az
+bazel
+choco
+cl
+cmake
+docker
+dotnet
+gcloud
+gh
+gradle
+helm
+kubectl
+link
+msbuild
+ninja
+nuget
+php
+pnpm
+pwsh
+python
+ruby
+terraform
+vcpkg
+yarn

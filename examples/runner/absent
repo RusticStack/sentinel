@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stands where a command GitHub's hosted image carries and this image does not (absent.txt), last on
+# PATH: a step that calls it fails with the reason on its own log line instead of a bare
+# "command not found", and a setup action that installs the real tool takes its place.
+tool=${0##*/}
+echo "::error title=Not in the Sentinel runner image::'$tool' is on GitHub's hosted runner image but not in this image's published subset. Install it in a step, or see docs/runner-images.md." >&2
+exit 127
