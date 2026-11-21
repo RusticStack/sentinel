@@ -328,9 +328,16 @@ actions_address = "10.0.2.2"
 - **A worker without the section starts no runner**: it declines every runner offer, so the controller
   places none on it and the class's demand waits for a worker that states one. That is the default, and
   the honest one — a worker that cannot start a runner should not be holding its capacity.
-- The image carries the entry point at `/usr/local/bin/sentinel-runner`, which reads one line of the
-  job's just-in-time configuration from standard input and execs the runner with `--jitconfig`. The
-  configuration is never an argument, an environment value or a file on the host
+- **The worker must grant egress.** A runner registers with GitHub and fetches its job from it, so a
+  sandbox with no network can never come online; `[runner]` beside `job_network = "none"` is refused
+  with `runner mode needs the network: [runner] requires job_network = "egress"` when the file is
+  loaded, before any lease could be spent on a runner that could not start
+  ([runner mode](runner-mode.md#egress-without-a-route-to-the-host)).
+- The image carries the entry point at `/usr/local/bin/sentinel-runner`: it reads one line of the
+  job's just-in-time configuration from standard input and execs the runner with `--jitconfig`, the
+  one form the runner accepts it in. The value is therefore that one process's argument inside the
+  sandbox and nowhere on the worker's side — never an environment value, never a file the worker
+  writes, never a log — and the settings the runner derives from it stay in the container's own layer
   ([runner mode](runner-mode.md#the-configuration-is-a-credential)).
 - **`actions_address` is where a sandbox reaches this worker's cache and artifact endpoint**
   ([cache and artifacts](actions-cache.md#operating-it)): the host address as the sandbox's network
