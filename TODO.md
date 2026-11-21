@@ -248,10 +248,10 @@ What a session cannot supply. Ask early.
 - [ ] **RW11** final full suites plus the Q13, B09 and B11 results. Re-triage everything still open. Do not close while B11 is blocked.
 - [ ] **V01** rebuild and verify the release artifacts at the release commit ([releasing](docs/releasing.md)); smoke-test the Windows CLI on X2 or list it as a limit.
 - [ ] **V02** deployment examples, including the web container ([deployment](docs/deployment.md)).
-- [ ] **V03** onboarding end to end: bootstrap admin, tenant, App and repos, Q11 enrollment, OAuth CLI and MCP login, a secret, a run, failure inspection, restore.
+- [ ] **V03** [onboarding](docs/onboarding.md) end to end (the guide is written; the walk on a fresh host is open): bootstrap admin, tenant, App and repos, Q11 enrollment, OAuth CLI and MCP login, a secret, a run, failure inspection, restore.
 - [ ] **V04** dogfood Sentinel's own checks, with a recovery path independent of Sentinel.
 - [ ] **V05** release qualification with `scripts/qualify/qualify.sh` on a disposable fresh host ([qualification](docs/qualification.md)).
-- [ ] **V06** publish the support limits (every X7 item and anything unverified), the `pilots-ci` and B11 benchmarks, and the open blockers; update the [release notes](docs/release-notes.md); tag v0.1. The sub-minute claim stays unmet until B08 qualifies, and "2× Blacksmith" is never claimed before B11 passes.
+- [ ] **V06** publish the [support limits](docs/support-limits.md) (drafted; every X7 item and anything unverified), the `pilots-ci` and B11 benchmarks, and the open blockers; update the [release notes](docs/release-notes.md); tag v0.1. The sub-minute claim stays unmet until B08 qualifies, and "2× Blacksmith" is never claimed before B11 passes.
 - [ ] **Wave 0 leftovers** to close or file (RW02–RW12):
   - A webhook run's provider sender is still not stored: the provider's own text, never a Sentinel principal ([intake](docs/intake.md)).
   - Run, job, attempt, run-spec and event rows have no retention, so backup and restore time grow with them ([retention](docs/retention.md); owner decision, default none).
