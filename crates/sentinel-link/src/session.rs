@@ -214,6 +214,13 @@ pub enum ClientMessage {
         lease: [u8; 16],
         name: String,
     },
+    /// Protocol 19, appended last so every earlier variant keeps its index: what this worker's runner-mode
+    /// `actions/cache` tree holds per repository, as its own walk measured it. A repository the report no
+    /// longer names holds nothing here; the controller answers with `ActionsEvict` when the tenant those
+    /// bytes belong to stands at its hard threshold.
+    ActionsCache {
+        repos: Vec<([u8; 16], u64)>,
+    },
 }
 
 struct LogRef<'a> {
@@ -469,6 +476,12 @@ pub enum ServerMessage {
         lease: [u8; 16],
         name: String,
         code: u8,
+    },
+    /// Protocol 19, appended last so every earlier variant keeps its index: the repositories of a tenant at
+    /// its hard storage threshold whose runner-mode caches must give way. The caches go before artifacts are
+    /// refused, and the worker answers a later `ActionsCache` report with the bytes it now holds.
+    ActionsEvict {
+        repos: Vec<[u8; 16]>,
     },
 }
 
@@ -1254,6 +1267,11 @@ pub trait SessionHandler: Send + Sync {
         _name: &str,
     ) -> ArtifactCode {
         ArtifactCode::Stale
+    }
+    /// What one worker's runner-mode cache tree holds, per repository. The answer is the repositories whose
+    /// entries must give way now, because their tenant stands at its hard threshold.
+    fn actions_cache_reported(&self, _worker: WorkerId, _repos: &[(RepoId, u64)]) -> Vec<RepoId> {
+        Vec::new()
     }
     fn profiled(&self, _worker: WorkerId, _profile: &Profile, _capacity: Capacity) -> Result<()> {
         Ok(())
@@ -2987,6 +3005,28 @@ fn serve_connection(
                     code: code.to_u8(),
                 })?;
             }
+            ClientMessage::ActionsCache { repos } => {
+                if !control {
+                    return Err(Error::Protocol("control message on bulk"));
+                }
+                if protocol < sentinel_protocol::negotiate::ACTIONS_ACCOUNTING_MIN.0 {
+                    return Err(Error::Protocol("actions accounting needs protocol 19"));
+                }
+                if repos.len() > sentinel_protocol::negotiate::MAX_ACTIONS_REPOS {
+                    return Err(Error::Protocol("actions report"));
+                }
+                let mut parsed = Vec::with_capacity(repos.len());
+                for (repo, bytes) in &repos {
+                    let repo = RepoId::from_bytes(*repo).map_err(|_| Error::Protocol("id"))?;
+                    parsed.push((repo, *bytes));
+                }
+                let evict = handler.actions_cache_reported(worker, &parsed);
+                if !evict.is_empty() {
+                    tx.send(&ServerMessage::ActionsEvict {
+                        repos: evict.iter().map(|repo| *repo.as_bytes()).collect(),
+                    })?;
+                }
+            }
             ClientMessage::Profile(profile) => {
                 if !control {
                     return Err(Error::Protocol("control message on bulk"));
@@ -3543,6 +3583,7 @@ pub fn connect(
         | ServerMessage::ArtifactVerdict { .. }
         | ServerMessage::ArtifactHeld { .. }
         | ServerMessage::RunnerArtifactVerdict { .. }
+        | ServerMessage::ActionsEvict { .. }
         | ServerMessage::CacheGrant(_)
         | ServerMessage::CacheChunk(_)
         | ServerMessage::CacheEnd(_)
@@ -3813,6 +3854,23 @@ impl Reporter {
         })
     }
 
+    /// Report what this worker's `actions/cache` tree holds per repository, in one frame. The controller
+    /// answers with `ActionsEvict` only when a tenant must give its caches up.
+    pub fn actions_cache(&self, repos: &[(RepoId, u64)]) -> Result<()> {
+        if self.protocol < sentinel_protocol::negotiate::ACTIONS_ACCOUNTING_MIN.0 {
+            return Err(Error::Protocol("actions accounting needs protocol 19"));
+        }
+        if repos.len() > sentinel_protocol::negotiate::MAX_ACTIONS_REPOS {
+            return Err(Error::Protocol("actions report"));
+        }
+        self.control.send(&ClientMessage::ActionsCache {
+            repos: repos
+                .iter()
+                .map(|(repo, bytes)| (*repo.as_bytes(), *bytes))
+                .collect(),
+        })
+    }
+
     /// The body is complete; the controller commits the row and answers with the verdict that closes it.
     pub fn runner_artifact_end(&self, lease: [u8; 16], name: &str) -> Result<()> {
         if self.protocol < sentinel_protocol::negotiate::RUNNER_ARTIFACTS_MIN.0 {
@@ -3893,6 +3951,8 @@ pub trait Executor: Send + Sync {
     /// A runner-mode artifact's frame, answered by the controller: `Stored` grants the begin and closes a
     /// committed artifact; any other code fails it.
     fn runner_artifact_answered(&self, _lease: [u8; 16], _name: &str, _code: ArtifactCode) {}
+    /// The controller asks this worker to give up its runner-mode caches for these repositories.
+    fn actions_cache_evict(&self, _repos: &[[u8; 16]]) {}
     fn availability(&self) -> Option<(u64, sentinel_protocol::negotiate::Availability)> {
         None
     }
@@ -4461,6 +4521,12 @@ fn handle_bulk_message(
                 return Err(Error::Protocol("artifact held list"));
             }
             executor.artifact_held(attempt, &name, &held);
+        }
+        ServerMessage::ActionsEvict { repos } => {
+            if repos.len() > sentinel_protocol::negotiate::MAX_ACTIONS_REPOS {
+                return Err(Error::Protocol("actions evict"));
+            }
+            executor.actions_cache_evict(&repos);
         }
         ServerMessage::RunnerArtifactVerdict { lease, name, code } => {
             if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
