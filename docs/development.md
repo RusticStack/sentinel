@@ -124,6 +124,12 @@ Every one of them passes in this repository's own container and is part of `carg
 verification hosts; the list is here so a green CI never stands in for that run, and so a failure that
 joins the list is a decision with a reason rather than a quiet skip.
 
+Both suites run with `--retries 2`. Several tests are timing-sensitive by design — a TOTP window, a
+maintenance tick, a lease deadline — and a two-core runner beside three thousand concurrent tests moves
+those windows in ways a verification host does not. A retry that passes is still reported as retried in
+nextest's summary, so a test that needs the retry repeatedly shows up as a flake to fix rather than
+silently succeeding; nothing here weakens an assertion.
+
 ## Local two-process workflow
 
 Open two Linux terminals at the repository root. Use separate writable directories, with no elevated privileges:

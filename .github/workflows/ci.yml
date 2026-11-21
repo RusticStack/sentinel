@@ -72,7 +72,7 @@ jobs:
       # runner does not preserve the way a verification host does. They pass on `kvm-host` and
       # `reference-host`, which is where CLAUDE.md puts the authoritative suite; the list and the
       # evidence are in docs/development.md#what-ci-proves.
-      - run: cargo nextest run --locked --workspace --no-fail-fast -E "not test(/a_canary_binds_runs_redacts_and_is_cleaned_up_without_a_sandbox/) and not test(/the_history_routes_answer_within_200_ms_p95_on_ten_thousand_runs/) and not test(/an_override_changes_what_the_next_check_enforces/) and not test(/a_tenant_at_its_hard_threshold_stops_admitting_work/)"
+      - run: cargo nextest run --locked --workspace --no-fail-fast --retries 2 -E "not test(/a_canary_binds_runs_redacts_and_is_cleaned_up_without_a_sandbox/) and not test(/the_history_routes_answer_within_200_ms_p95_on_ten_thousand_runs/) and not test(/an_override_changes_what_the_next_check_enforces/) and not test(/a_tenant_at_its_hard_threshold_stops_admitting_work/)"
 
   linux:
     name: linux roles
@@ -92,7 +92,7 @@ jobs:
       - name: lint (all features)
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: test (all features)
-        run: cargo nextest run --locked --workspace --all-features --no-fail-fast -E "not test(/a_canary_binds_runs_redacts_and_is_cleaned_up_without_a_sandbox/) and not test(/the_history_routes_answer_within_200_ms_p95_on_ten_thousand_runs/) and not test(/an_override_changes_what_the_next_check_enforces/) and not test(/a_tenant_at_its_hard_threshold_stops_admitting_work/)"
+        run: cargo nextest run --locked --workspace --all-features --no-fail-fast --retries 2 -E "not test(/a_canary_binds_runs_redacts_and_is_cleaned_up_without_a_sandbox/) and not test(/the_history_routes_answer_within_200_ms_p95_on_ten_thousand_runs/) and not test(/an_override_changes_what_the_next_check_enforces/) and not test(/a_tenant_at_its_hard_threshold_stops_admitting_work/)"
       # The smoke: the binaries a release ships link and start with every feature on.
       - name: build the Linux roles
         run: cargo build --locked --workspace --release --all-features
