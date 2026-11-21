@@ -249,6 +249,27 @@ pub enum ArtifactCommand {
         #[arg(long, value_name = "SECS", default_value_t = 300)]
         expires: u64,
     },
+    /// Record an artifact of a run from a local file or directory
+    Upload {
+        run: String,
+        /// The artifact's name; the run holds it once and never twice
+        name: String,
+        /// A regular file, or a directory whose regular files become the entries at their relative paths
+        #[arg(long, value_name = "PATH")]
+        path: std::path::PathBuf,
+        /// Tenant slug that owns the run's objects (default: the one the server names)
+        #[arg(long, value_name = "SLUG")]
+        tenant: Option<String>,
+        /// Artifact class recorded for it (default: the tenant's standard class)
+        #[arg(long, value_name = "CLASS")]
+        class: Option<String>,
+        /// Retention in seconds for the artifact
+        #[arg(long, value_name = "SECS")]
+        retain: Option<u64>,
+        /// File mode recorded for every entry, in octal (default 644)
+        #[arg(long, value_name = "MODE")]
+        mode: Option<String>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -560,6 +581,27 @@ pub fn run(invocation: Invocation) -> Result<(), client::Error> {
                     entry.as_deref(),
                     format.as_deref(),
                     expires,
+                ),
+                ArtifactCommand::Upload {
+                    run,
+                    name,
+                    path,
+                    tenant,
+                    class,
+                    retain,
+                    mode,
+                } => artifacts::upload(
+                    &client,
+                    output,
+                    &run,
+                    &name,
+                    &path,
+                    artifacts::UploadOptions {
+                        tenant,
+                        class,
+                        retain,
+                        mode,
+                    },
                 ),
             }
         }

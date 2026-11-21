@@ -614,6 +614,48 @@ impl Store {
         ))
     }
 
+    /// The sealed blob of one artifact of this boundary, for publication beyond this host: the file whose
+    /// length and digest the manifest recorded, and nothing about the request that named it.
+    pub fn sealed_artifact(
+        &self,
+        scope: &Scope,
+        run: u64,
+        name: &str,
+    ) -> Option<(PathBuf, u64, [u8; 32])> {
+        if name.is_empty() || name.len() > MAX_KEY_BYTES {
+            return None;
+        }
+        let dir = artifact_dir(&self.artifacts, scope, run, name);
+        let manifest = read_artifact_manifest(&dir.join("manifest"))?;
+        if manifest.boundary != Boundary::of(scope) || manifest.name != name || manifest.run != run
+        {
+            return None;
+        }
+        let path = dir.join("blob");
+        let meta = fs::metadata(&path).ok()?;
+        (meta.len() == manifest.bytes).then_some((path, manifest.bytes, manifest.digest))
+    }
+
+    /// Remove one sealed artifact from this worker's disk. A publication the controller refused leaves
+    /// nothing here: an artifact the tenant holds no row for is not one a later job of the run restores
+    /// from this host, so the refusal is the whole answer rather than a copy nobody accounts for.
+    pub fn artifact_forget(&self, scope: &Scope, run: u64, name: &str) -> bool {
+        if name.is_empty() || name.len() > MAX_KEY_BYTES {
+            return false;
+        }
+        let dir = artifact_dir(&self.artifacts, scope, run, name);
+        match read_artifact_manifest(&dir.join("manifest")) {
+            Some(manifest)
+                if manifest.boundary == Boundary::of(scope)
+                    && manifest.name == name
+                    && manifest.run == run =>
+            {
+                fs::remove_dir_all(&dir).is_ok()
+            }
+            _ => false,
+        }
+    }
+
     /// What this run has produced in this sandbox's boundary: the listing `download-artifact` and its
     /// `ListArtifacts` call read.
     pub fn artifacts(&self, scope: &Scope, run: u64) -> Vec<ArtifactRow> {

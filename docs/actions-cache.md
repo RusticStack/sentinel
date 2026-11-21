@@ -203,17 +203,37 @@ What needs a privileged host or a real Actions runner, and is therefore **not** 
 - the scope frame arriving within one provisioning pass of a job binding: proven in process by the
   store query and the controller pass, not on a live session.
 
-Three legs remain, stated rather than implied:
+Two legs remain, stated rather than implied:
 
-- **The controller's artifact row.** What `upload-artifact` produced is sealed and recorded on the
-  worker host, under the GitHub run and job the lease's provenance named; it is not yet written as the
-  `origin: runner` row migration 72 defines ([storage](storage.md#artifact-records)), because that is a
-  worker→controller request this change does not add. So a later job of the same run reads back what an
-  earlier one uploaded **on the same worker host**, and reading a run's artifacts across hosts —
-  through `GET /tenants/{slug}/repos/{name}/runner-runs/{run}/artifacts` — is not served by the endpoint
-  yet.
-- **Reclamation and quota.** This store has no sweep of its own: a `writing/` staging file from a
-  sandbox that died stays until the sandbox directory's sweep or an operator removes it, and nothing
-  charges the tenant's `actions_cache` class.
+- **Reclamation and quota for the cache.** This store has no sweep of its own: a `writing/` staging file
+  from a sandbox that died stays until the sandbox directory's sweep or an operator removes it, and
+  nothing charges the tenant's `actions_cache` class. What an artifact costs is now charged (below), but
+  a runner-mode cache entry is still only bounded by the archive's own 10 GiB limit.
 - **The fallback actions.** `sentinel/cache` and `sentinel/upload-artifact` are stated above as the
   one-line change they would be; neither exists in this release.
+
+## What an artifact uploaded here becomes
+
+What `upload-artifact` seals is published into the controller's own artifact store, so it is a tenant's
+artifact rather than a file one host knows about (protocol 18, `RUNNER_ARTIFACTS_MIN`). At
+`FinalizeArtifact` the sandbox's listener offers the artifact to its worker's link — the lease, the name,
+the sealed length and the store's own BLAKE3 digest — streams the sealed blob, and answers the client
+only once the controller committed the row:
+
+- the row is `origin: runner` under the GitHub run and job the lease took, named by
+  `runner_manifest_name`, with the deployment's default class, the repository's effective artifact
+  retention (further narrowed by the class's maximum age in the insert trigger) and a charge against the
+  repository quota and the tenant's hard threshold ([storage](storage.md#artifact-records),
+  [retention](retention.md#artifact-classes-and-pins));
+- it retires through the same artifact sweep, appears in `GET /tenants/{slug}/repos/{name}/runner-runs/{run}/artifacts`,
+  in the run page's artifact browser, in the CLI and in MCP, and downloads as a ranged object or a
+  short-lived link like any other artifact;
+- **it fails closed.** A controller that refuses the publication — `quota_exceeded` at the tenant's hard
+  threshold after its caches were evicted, `duplicate` for a name the job already holds, `too_large` at
+  the repository's quota, a store fault — makes `FinalizeArtifact` answer `409` with that reason and
+  removes the sealed copy from the worker's disk. The job's upload fails visibly; no artifact survives
+  that the tenant holds no row for.
+
+What is not here yet: the endpoint still answers a local `ListArtifacts`/download from its own disk, so a
+later job of the same run reads back an earlier one on the same worker host, and the controller's row is
+what makes it readable from anywhere else through the API.

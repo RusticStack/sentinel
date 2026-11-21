@@ -98,6 +98,38 @@ Each command returns Cargo's exit status. Stop and fix failures before proceedin
 
 Release output is `target/release/sentinel` (`sentinel.exe` on Windows). CLI and role builds have the same binary name: the most recent build for that profile/target determines the available roles. `release-linux` produces the combined Linux distribution. Setting `CARGO_TARGET_DIR` changes output locations normally. The distributable packages (server, worker, CLI, the static guest agent and the Windows CLI, with `SHA256SUMS` and a digest manifest) are built and verified by `scripts/release/package.sh` and `package.ps1` ([releasing](releasing.md)), the third-party inventory is checked by `cargo licenses` and `scripts/release/check-inventory.sh`, and the server unit by `scripts/release/check-server-unit.sh` ([deployment](deployment.md)).
 
+## What CI proves
+
+`.github/workflows/ci.yml` runs on every pull request and on every push to a branch that is not `main`,
+on `ubuntu-latest`: `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D
+warnings`, the workspace test suite with cargo-nextest, and the Linux roles' all-feature lint, all-feature
+suite, release build and a start of the built binary. The cargo registry and target directory are cached
+per job and every cargo command is `--locked`; the toolchain is `rust-toolchain.toml`'s, which rustup
+installs on the first call. There is no Windows leg: the crate cross-compiles for
+`x86_64-pc-windows-msvc`, but no Windows host runs it yet ([backlog](backlog.md) N01), so a leg here would
+be red by default and prove nothing.
+
+**CI is a smoke, not the gate.** [Where tests run](../CLAUDE.md#where-tests-run) makes `kvm-host` and
+`reference-host` authoritative, and four tests depend on the host rather than on the tree, so both CI
+suites exclude them by name (`-E "not test(…) and …"` in the workflow):
+
+| Test | Why it needs a host |
+|---|---|
+| `sentinel-worker` `attempt::secret_provisioning::a_canary_binds_runs_redacts_and_is_cleaned_up_without_a_sandbox` | scans a staged secret tree for a canary; the file contents after the wrapper runs differ on a GitHub runner from a verification host (fails there, passes here) |
+| `sentinel-api` `history::the_history_routes_answer_within_200_ms_p95_on_ten_thousand_runs` | a latency budget; a shared two-core runner beside three thousand other tests cannot meet 200 ms p95, and the number would be a claim about the runner, not the code |
+| `sentinel-api` `storage_drills::an_override_changes_what_the_next_check_enforces_and_the_next_pass_removes_without_a_restart` | waits for a maintenance tick inside a wall-clock window |
+| `sentinel-api` `storage_drills::a_tenant_at_its_hard_threshold_stops_admitting_work_and_the_reason_is_where_an_operator_reads_it` | the same maintenance-tick window |
+
+Every one of them passes in this repository's own container and is part of `cargo test-linux` on the
+verification hosts; the list is here so a green CI never stands in for that run, and so a failure that
+joins the list is a decision with a reason rather than a quiet skip.
+
+Both suites run with `--retries 2`. Several tests are timing-sensitive by design — a TOTP window, a
+maintenance tick, a lease deadline — and a two-core runner beside three thousand concurrent tests moves
+those windows in ways a verification host does not. A retry that passes is still reported as retried in
+nextest's summary, so a test that needs the retry repeatedly shows up as a flake to fix rather than
+silently succeeding; nothing here weakens an assertion.
+
 ## Local two-process workflow
 
 Open two Linux terminals at the repository root. Use separate writable directories, with no elevated privileges:

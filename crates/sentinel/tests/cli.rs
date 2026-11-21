@@ -345,6 +345,65 @@ placement_order = '{order}'",
     }
 
     #[test]
+    fn runner_mode_config_needs_a_pinned_image_an_endpoint_and_the_network() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("config.toml");
+        let data = temp.path().join("data");
+        let pinned = format!(
+            "ghcr.io/rusticstack/sentinel-runner@sha256:{}",
+            "ab".repeat(32)
+        );
+        let link = format!(
+            "controller = '127.0.0.1:7443'\ncontroller_fingerprint = '{}'\n",
+            "ab".repeat(32)
+        );
+        let check = |body: &str| {
+            fs::write(
+                &file,
+                format!("data_dir = '{}'\n{link}{body}", data.display()),
+            )
+            .unwrap();
+            let output = invoke(&["worker", "--config", file.to_str().unwrap(), "--check"]);
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        };
+        if cfg!(feature = "worker") {
+            // A tag names whatever the registry serves today, and this image is the code a job's
+            // steps run under.
+            let (code, stderr) = check(
+                "job_network = 'egress'\n[runner]\nimage = 'ghcr.io/rusticstack/sentinel-runner:latest'",
+            );
+            assert_eq!(code, Some(2));
+            assert!(stderr.contains("must be pinned by digest"), "{stderr}");
+            // A runner registers with GitHub and fetches its job from it, so a sandbox with no
+            // network can never come online: the registration would be spent for nothing.
+            for body in [
+                format!("[runner]\nimage = '{pinned}'"),
+                format!("job_network = 'none'\n[runner]\nimage = '{pinned}'"),
+            ] {
+                let (code, stderr) = check(&body);
+                assert_eq!(code, Some(2), "{body}");
+                assert!(
+                    stderr.contains("runner mode needs the network"),
+                    "{body}: {stderr}"
+                );
+            }
+            let (code, stderr) = check(&format!(
+                "job_network = 'egress'\n[runner]\nimage = '{pinned}'\nactions_address = 'not-an-address'"
+            ));
+            assert_eq!(code, Some(2));
+            assert!(stderr.contains("must be an IPv4 address"), "{stderr}");
+            let (code, stderr) = check(&format!(
+                "job_network = 'egress'\n[runner]\nimage = '{pinned}'\nactions_address = '10.0.2.2'"
+            ));
+            assert_eq!(code, Some(0), "{stderr}");
+        }
+        assert!(!data.exists());
+    }
+
+    #[test]
     fn rotation_fingerprints_are_bounded_worker_link_settings() {
         let temp = tempdir().unwrap();
         let file = temp.path().join("config.toml");
@@ -1708,5 +1767,426 @@ fn admin_tenant_storage_shows_sets_and_inherits() {
         vec!["tenant", "storage", "--tenant", "nope"],
     ] {
         assert!(!admin(&refused).status.success(), "{refused:?}");
+    }
+}
+
+/// `artifact upload` against a real controller and its object store: the CLI's own bytes, the store's own
+/// digests, and the manifest the run records.
+mod artifact_upload {
+    use std::{
+        fs,
+        process::{Command, Output},
+        sync::Arc,
+    };
+
+    use sentinel_core::{
+        RepoId, RunId, TenantId, UnixMillis,
+        auth::{Namespace, Permissions as P, Principal, Role},
+    };
+    use sentinel_link::{controller::Controller, identity::Identity};
+    use sentinel_store::{
+        Durability, Store,
+        auth::{self, NamespaceKind},
+        local_auth,
+        logs::LogStore,
+        objects::Objects,
+        tokens::{self, Grant},
+    };
+    use serde_json::Value;
+
+    struct Deployment {
+        dir: tempfile::TempDir,
+        objects: Arc<Objects>,
+        _controller: Controller,
+        server: Option<sentinel_api::Server>,
+        base: String,
+        token: String,
+    }
+
+    impl Drop for Deployment {
+        fn drop(&mut self) {
+            if let Some(server) = self.server.take() {
+                server.shutdown();
+            }
+        }
+    }
+
+    fn deployment() -> Deployment {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
+        let logs = Arc::new(LogStore::open(dir.path().join("logs")).unwrap());
+        let objects = Arc::new(Objects::open(dir.path()).unwrap());
+        let now = UnixMillis::now();
+        let root =
+            local_auth::bootstrap(&store, "root", "Root", b"correct horse battery", now).unwrap();
+        let (tenant, repo) = (TenantId::new(), RepoId::new());
+        store
+            .writer()
+            .write(move |tx| {
+                let admin = Principal::new(root, P::ALL, None, None);
+                auth::create_namespace(
+                    tx,
+                    admin,
+                    tenant,
+                    Namespace::parse("acme").unwrap(),
+                    NamespaceKind::Organization,
+                    now,
+                )?;
+                auth::set_membership(tx, admin, tenant, root, Role::TenantAdmin)?;
+                auth::create_repo(tx, admin, tenant, repo, "app", now)
+            })
+            .unwrap();
+        let granted = tokens::provision(&store, Grant::new(root, "cli", P::ALL), now).unwrap();
+        let controller = Controller::start(
+            Arc::clone(&store),
+            Arc::clone(&logs),
+            Arc::clone(&objects),
+            Identity::generate("controller").unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let server = sentinel_api::Server::start(sentinel_api::Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            store: Arc::clone(&store),
+            logs,
+            objects: Arc::clone(&objects),
+            controller: controller.handle(),
+            sessions: local_auth::Policy::default(),
+            github_webhook_secret: None,
+            intake: None,
+            public_url: None,
+            github_sign_in: None,
+            trusted_proxies: sentinel_api::TrustedProxy::loopback(),
+            secret_key: None,
+        })
+        .unwrap();
+        Deployment {
+            base: format!("http://{}", server.local_addr()),
+            dir,
+            objects,
+            _controller: controller,
+            server: Some(server),
+            token: sentinel_auth::token::format(&granted.secret),
+        }
+    }
+
+    fn cli(d: &Deployment, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_sentinel"))
+            .env("SENTINEL_TOKEN", &d.token)
+            .env("SENTINEL_SERVER", &d.base)
+            .env_remove("SENTINEL_PROFILE")
+            .env("SENTINEL_CONFIG_DIR", d.dir.path().join("no-profiles"))
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn code(output: &Output) -> i32 {
+        output.status.code().unwrap()
+    }
+
+    fn stdout(output: &Output) -> Value {
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    fn stderr(output: &Output) -> String {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    fn pipeline(d: &Deployment) -> std::path::PathBuf {
+        let file = d.dir.path().join("pipeline.yml");
+        fs::write(
+            &file,
+            "schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+    steps: [{ id: s, run: 'true' }]
+",
+        )
+        .unwrap();
+        file
+    }
+
+    fn run(d: &Deployment) -> RunId {
+        let file = pipeline(d);
+        let out = cli(
+            d,
+            &[
+                "run",
+                "dispatch",
+                "--tenant",
+                "acme",
+                "--repo",
+                "app",
+                "--pipeline",
+                file.to_str().unwrap(),
+                "--source",
+                "https://github.com/o/r.git",
+                "--sha",
+                "0123456789abcdef0123456789abcdef01234567",
+                "--output",
+                "json",
+            ],
+        );
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        stdout(&out)["id"].as_str().unwrap().parse().unwrap()
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        blake3::hash(bytes).to_hex().to_string()
+    }
+
+    #[test]
+    fn a_directory_of_files_uploads_and_reads_back_through_show_and_download() {
+        let d = deployment();
+        let run = run(&d);
+        let tree = d.dir.path().join("tree");
+        fs::create_dir_all(tree.join("out")).unwrap();
+        fs::write(tree.join("out/report.txt"), b"report-bytes").unwrap();
+        // The same bytes twice are one object under two entry paths.
+        fs::write(tree.join("out/copy.txt"), b"report-bytes").unwrap();
+        // Longer than one upload chunk, so the file goes up in more than one request.
+        let payload: Vec<u8> = (0..1_600_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(tree.join("top.bin"), &payload).unwrap();
+
+        let text = cli(
+            &d,
+            &[
+                "artifact",
+                "upload",
+                &run.to_string(),
+                "release",
+                "--path",
+                tree.to_str().unwrap(),
+                "--tenant",
+                "acme",
+            ],
+        );
+        assert_eq!(code(&text), 0, "{}", stderr(&text));
+        let printed = String::from_utf8(text.stdout).unwrap();
+        assert!(printed.contains("release"), "{printed}");
+        assert!(printed.contains("3 entries"), "{printed}");
+        assert!(printed.contains("2 uploaded, 0 already held"), "{printed}");
+
+        let out = cli(
+            &d,
+            &[
+                "artifact",
+                "upload",
+                &run.to_string(),
+                "release",
+                "--path",
+                tree.to_str().unwrap(),
+                "--json",
+            ],
+        );
+        // `artifact upload` is not idempotent: the run holds one artifact per name, and a duplicate is the
+        // client's conflict code (5), the same answer a raced attach gets from the controller.
+        assert_eq!(code(&out), 5, "{}", stderr(&out));
+        let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert_eq!(error["code"], "client_conflict", "{error}");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("already holds an artifact named")),
+            "{error}"
+        );
+
+        let out = cli(
+            &d,
+            &[
+                "artifact",
+                "upload",
+                &run.to_string(),
+                "notes",
+                "--path",
+                tree.join("out/report.txt").to_str().unwrap(),
+                "--mode",
+                "0755",
+                "--json",
+            ],
+        );
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        let single = stdout(&out);
+        assert_eq!(single["name"], "notes");
+        assert_eq!(single["entries"], 1);
+        assert_eq!(single["bytes"], 12);
+        assert_eq!(single["tenant"], "acme");
+
+        let artifact = single["id"].as_str().unwrap().to_owned();
+        let out = cli(
+            &d,
+            &["artifact", "show", &run.to_string(), &artifact, "--json"],
+        );
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        let shown = stdout(&out);
+        let entries = shown["manifest"]["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["path"], "report.txt");
+        assert_eq!(entries[0]["digest"], digest(b"report-bytes").as_str());
+        assert_eq!(entries[0]["len"], 12);
+        assert_eq!(entries[0]["mode"], 0o755);
+
+        let listed = cli(
+            &d,
+            &["artifact", "list", &run.to_string(), "--output", "ndjson"],
+        );
+        assert_eq!(code(&listed), 0, "{}", stderr(&listed));
+        let rows: Vec<Value> = String::from_utf8(listed.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let release = rows
+            .iter()
+            .find(|row| row["name"] == "release")
+            .expect("the release artifact");
+        assert_eq!(release["entries"], 3);
+        assert_eq!(release["bytes"], 12 + 12 + 1_600_000);
+
+        let out = cli(
+            &d,
+            &[
+                "artifact",
+                "show",
+                &run.to_string(),
+                release["id"].as_str().unwrap(),
+                "--json",
+            ],
+        );
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        let shown = stdout(&out);
+        let entries = shown["manifest"]["entries"].as_array().unwrap();
+        let paths: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["out/copy.txt", "out/report.txt", "top.bin"]);
+        assert_eq!(entries[0]["digest"], digest(b"report-bytes").as_str());
+        assert_eq!(entries[1]["digest"], digest(b"report-bytes").as_str());
+        assert_eq!(entries[2]["digest"], digest(&payload).as_str());
+        assert_eq!(entries[2]["len"], payload.len());
+        assert_eq!(entries[2]["mode"], 0o644);
+
+        // The bytes really are in the store: every entry downloads back with its length and digest checked.
+        let back = d.dir.path().join("back");
+        let out = cli(
+            &d,
+            &[
+                "artifact",
+                "download",
+                &run.to_string(),
+                release["id"].as_str().unwrap(),
+                "--all",
+                "--out",
+                back.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        assert_eq!(
+            fs::read(back.join("out/report.txt")).unwrap(),
+            b"report-bytes"
+        );
+        assert_eq!(fs::read(back.join("top.bin")).unwrap(), payload);
+    }
+
+    #[test]
+    fn a_missing_path_and_an_unknown_name_shape_are_usage_errors() {
+        let d = deployment();
+        let run = run(&d);
+        let missing = d.dir.path().join("no-such-tree");
+        let out = cli(
+            &d,
+            &[
+                "artifact",
+                "upload",
+                &run.to_string(),
+                "release",
+                "--path",
+                missing.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code(&out), 2, "{}", stderr(&out));
+        assert!(
+            stderr(&out).contains("no such file or directory"),
+            "{}",
+            stderr(&out)
+        );
+
+        let file = d.dir.path().join("one.txt");
+        fs::write(&file, b"x").unwrap();
+        for name in ["", "a b\n"] {
+            let out = cli(
+                &d,
+                &[
+                    "artifact",
+                    "upload",
+                    &run.to_string(),
+                    name,
+                    "--path",
+                    file.to_str().unwrap(),
+                ],
+            );
+            assert_eq!(code(&out), 2, "{name:?}: {}", stderr(&out));
+        }
+        let out = cli(
+            &d,
+            &[
+                "artifact",
+                "upload",
+                &run.to_string(),
+                "release",
+                "--path",
+                file.to_str().unwrap(),
+                "--mode",
+                "rw-r--r--",
+            ],
+        );
+        assert_eq!(code(&out), 2, "{}", stderr(&out));
+        let out = cli(
+            &d,
+            &[
+                "artifact",
+                "upload",
+                &run.to_string(),
+                "release",
+                "--path",
+                file.to_str().unwrap(),
+                "--retain",
+                "0",
+            ],
+        );
+        assert_eq!(code(&out), 2, "{}", stderr(&out));
+    }
+
+    #[test]
+    fn an_attach_the_controller_refuses_is_reported_with_its_code() {
+        let d = deployment();
+        let run = run(&d);
+        // A run budget of 8 bytes: the bytes are stored, and the manifest the run may not hold is refused.
+        d.objects
+            .set_deployment(sentinel_store::retention::Deployment {
+                run_artifact_bytes: 8,
+                ..Default::default()
+            });
+        let file = d.dir.path().join("too-big.txt");
+        fs::write(&file, b"twelve bytes").unwrap();
+        let out = cli(
+            &d,
+            &[
+                "artifact",
+                "upload",
+                &run.to_string(),
+                "release",
+                "--path",
+                file.to_str().unwrap(),
+                "--json",
+            ],
+        );
+        assert_eq!(code(&out), 1, "{}", stderr(&out));
+        let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert_eq!(error["code"], "quota_exceeded", "{error}");
     }
 }
