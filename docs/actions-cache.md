@@ -205,10 +205,11 @@ What needs a privileged host or a real Actions runner, and is therefore **not** 
 
 Two legs remain, stated rather than implied:
 
-- **Reclamation and quota for the cache.** This store has no sweep of its own: a `writing/` staging file
-  from a sandbox that died stays until the sandbox directory's sweep or an operator removes it, and
-  nothing charges the tenant's `actions_cache` class. What an artifact costs is now charged (below), but
-  a runner-mode cache entry is still only bounded by the archive's own 10 GiB limit.
+- **Reclamation for the cache.** This store has no sweep of its own: a `writing/` staging file from a
+  sandbox that died stays until the sandbox directory's sweep or an operator removes it, and an entry
+  nothing asked for again waits for its repository's cache tree to give way at the tenant's hard
+  threshold ([below](#what-the-cache-is-charged-to)). A runner-mode cache entry is otherwise bounded only
+  by the archive's own 10 GiB limit, which is the worker's budget, not the tenant's.
 - **The fallback actions.** `sentinel/cache` and `sentinel/upload-artifact` are stated above as the
   one-line change they would be; neither exists in this release.
 
@@ -237,3 +238,31 @@ only once the controller committed the row:
 What is not here yet: the endpoint still answers a local `ListArtifacts`/download from its own disk, so a
 later job of the same run reads back an earlier one on the same worker host, and the controller's row is
 what makes it readable from anywhere else through the API.
+
+## What the cache is charged to
+
+A runner-mode `actions/cache` tree lives on the worker host, so the controller used to hold no figure for
+it and the tenant's hard threshold could not see it. The worker now walks `actions/cache/<repo>` — one
+directory per repository it serves, symlinks never followed — and reports the bytes it holds for each
+repository of the tenant that caused them (protocol 19, `ACTIONS_ACCOUNTING_MIN`; at most
+`MAX_ACTIONS_REPOS`, 64, repositories per frame). It reports when it attaches, when a job's attempt ends,
+and after it has given entries up, so a figure is never older than the last thing that changed it.
+
+The controller writes one row per `(worker, repository)` into `worker_actions_cache` and folds the
+per-tenant sum into `tenant_usage.actions_cache_bytes` in the same writer transaction. A report replaces
+its own worker's rows and deletes the ones it no longer names: a worker that dropped a whole repository's
+entries must read zero rather than its last figure, and two workers that hold the same repository add,
+because the class is bytes on every host the tenant's jobs ran on. The class is one of the six
+`GET /tenants/{slug}/storage` reports, and it is counted toward the tenant quota ([retention](retention.md#per-class-accounting)) —
+which is what makes the threshold act on it.
+
+At the hard threshold the answer to a report is `ActionsEvict` naming the tenant's repositories, and the
+worker removes each repository's whole cache tree. A repository whose sandbox is still running is spared:
+a live job's inputs are never deleted under it, and that repository's entries go at the next report, when
+the attempt has ended. A worker that leaves has its rows cleared and its tenants re-folded, so a lost host
+gives its figures back rather than holding them.
+
+What no test here covers is the walk over a tree a real job filled: the report, the fold, the hard state
+and the eviction are driven end to end over a real worker link
+(`crates/sentinel-link/tests/runner_mode.rs`), and the tree itself is read by the same directory code the
+spool and mirror sweeps use.
