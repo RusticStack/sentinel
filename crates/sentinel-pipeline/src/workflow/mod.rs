@@ -1693,14 +1693,21 @@ fn resolve_cells(
             .collect(),
         None => Vec::new(),
     };
-    if axes.is_empty() {
+    let mut combos: Vec<Vec<(String, String)>> = match matrix {
+        // With no axis, every `include` entry is one combination of its own.
+        Some(matrix) if matrix.axes.is_empty() => include_combos(demand, &matrix.include),
+        _ => Vec::new(),
+    };
+    if axes.is_empty() && combos.is_empty() {
         return Ok(vec![Cell {
             axes: Vec::new(),
             labels: demand.labels.clone(),
             destination: table.classify(demand, needs_docker, docker),
         }]);
     }
-    let mut combos: Vec<Vec<(String, String)>> = vec![Vec::new()];
+    if combos.is_empty() {
+        combos.push(Vec::new());
+    }
     for axis in axes {
         let mut next: Vec<Vec<(String, String)>> =
             Vec::with_capacity(combos.len() * axis.values.len());
@@ -1739,6 +1746,29 @@ fn resolve_cells(
         });
     }
     Ok(out)
+}
+
+/// The distinct values an include-only matrix gives the keys the labels name, one combination
+/// per `runs-on:` variant in the order met. Empty when no label names a key of any entry.
+fn include_combos(
+    demand: &Declared,
+    include: &[Vec<(String, String)>],
+) -> Vec<Vec<(String, String)>> {
+    let mut combos: Vec<Vec<(String, String)>> = Vec::new();
+    for entry in include {
+        let combo: Vec<(String, String)> = entry
+            .iter()
+            .filter(|(name, _)| demand.labels.iter().any(|label| names_axis(label, name)))
+            .cloned()
+            .collect();
+        if !combos.contains(&combo) {
+            combos.push(combo);
+        }
+    }
+    if combos.iter().all(Vec::is_empty) {
+        combos.clear();
+    }
+    combos
 }
 
 /// Whether one label substitutes `matrix.<axis>`. A label that names no axis is the same
