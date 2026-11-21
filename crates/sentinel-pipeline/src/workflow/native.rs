@@ -176,6 +176,10 @@ pub(super) fn generate(
     };
     let concurrency = match &workflow.concurrency {
         None => None,
+        // A conditional cancel has no native form: the pipeline's `cancel_in_progress` is a constant.
+        Some(concurrency) if concurrency.cancel_conditional => {
+            return Generated::refused(TRIGGER);
+        }
         Some(concurrency) => match translate(&concurrency.group) {
             // A group may only use what the controller knows when it admits the run.
             Some(group)

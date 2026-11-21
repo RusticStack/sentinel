@@ -633,3 +633,43 @@ jobs:
         .collect();
     assert_eq!(artifacts, vec!["out", "out-2"]);
 }
+
+/// `cancel-in-progress` may be an expression (cancel on pull requests, never on `main`). The
+/// label move does not depend on it, and the native pipeline, whose cancel is a constant, is
+/// refused instead of guessing either value.
+#[test]
+fn a_conditional_cancel_in_progress_moves_labels_and_refuses_the_native_pipeline() {
+    let text = "on: [push]\nconcurrency:\n  group: ci-${{ github.ref }}\n  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    concurrency:\n      group: build\n      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}\n    steps:\n      - run: make\n";
+    let files = [(
+        format!("{}/conditional.yml", workflow::WORKFLOW_DIRECTORY),
+        text.to_owned(),
+    )];
+    let borrowed = [WorkflowFile {
+        path: &files[0].0,
+        text: &files[0].1,
+    }];
+    let inventory = analyze(REVISION, &borrowed, DockerHosts::MicrovmGuests).unwrap();
+    let concurrency = inventory.workflows[0].concurrency.as_ref().unwrap();
+    assert!(concurrency.cancel_conditional);
+    assert!(!concurrency.cancel_in_progress);
+    assert!(
+        inventory.workflows[0].jobs[0]
+            .concurrency
+            .as_ref()
+            .is_some_and(|c| c.cancel_conditional)
+    );
+
+    let plan = plan_of(&files, true);
+    assert_eq!(plan.workflows[0].changes.len(), 1);
+    assert!(plan.workflows[0].native.is_none());
+    assert!(plan.workflows[0].native_refused.is_some());
+
+    // A string that is not an expression is still the wrong type.
+    let wrong = text.replace("${{ github.event_name == 'pull_request' }}", "sometimes");
+    let borrowed = [WorkflowFile {
+        path: &files[0].0,
+        text: &wrong,
+    }];
+    let error = analyze(REVISION, &borrowed, DockerHosts::MicrovmGuests).unwrap_err();
+    assert!(error.to_string().contains("expected boolean"), "{error}");
+}

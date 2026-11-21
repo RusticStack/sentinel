@@ -38,7 +38,7 @@ One `Inventory` carries the revision, both table versions and one `Workflow` per
 - **Step**: `id`, `name`, the `uses` reference or a run step, `shell`, `working-directory`, `continue-on-error`, whether it states an `if`, `timeout-minutes` and `env` names.
 - **Action**: a `Repository` reference with its `version` and whether that version is a full commit id, a `Docker` image, or a `Local` path.
 
-Values never enter the inventory. An `env:` value, a `with:` value, a `run:` script and a job `if` are scanned for `${{ secrets.NAME }}`, `${{ secrets['NAME'] }}`, `${{ vars.NAME }}` and `${{ vars['NAME'] }}` and only the names are kept; names are deduplicated in the order met, per scope. That is why a diagnostic or a stored inventory can be shown without redaction: it holds names, paths and keys, never a value, a token or a script.
+Values never enter the inventory. An `env:` value, a `with:` value, a `run:` script and a job `if` are scanned for `${{ secrets.NAME }}`, `${{ secrets['NAME'] }}`, `${{ vars.NAME }}` and `${{ vars['NAME'] }}` and only the names are kept; names are deduplicated in the order met, per scope. That is why a diagnostic or a stored inventory can be shown without redaction: it holds names, paths and keys, never a value, a token or a script. A `concurrency.cancel-in-progress` written as a `${{ }}` expression (cancel on pull requests, never on `main`) is recorded as conditional, not evaluated: the label move does not depend on it, and the native path refuses the workflow because a pipeline's `cancel_in_progress` is a constant.
 
 ### Matrices and `runs-on:` cells
 
