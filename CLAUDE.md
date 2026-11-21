@@ -35,7 +35,7 @@ Aliases live in `.cargo/config.toml`, all `--locked` (a dependency change commit
 
 | Purpose | Command |
 |---|---|
-| Portable checks | `cargo fmt-check`, `cargo lint`, `cargo test-cli`, `cargo release-cli`, `cargo licenses` (cargo-deny) |
+| Portable checks | `cargo fmt-check`, `cargo lint`, `cargo test-cli`, `cargo release-cli`, `cargo licenses`, `cargo advisories` (cargo-deny) |
 | Linux roles | `cargo lint-linux`, `cargo test-server`, `cargo test-worker`, `cargo test-linux`, `cargo release-linux` |
 | Benchmarks | `cargo bench-noop --runtime direct --warm-state warm`; `sentinel-bench --contract <file> --lane <id> --condition <c>` |
 | Web | `pnpm -C web install`, `typecheck`, `build`, `test:unit`; browser test `cargo test -p sentinel-api --test web_browser -- --ignored` |

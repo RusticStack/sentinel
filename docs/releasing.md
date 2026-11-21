@@ -174,7 +174,15 @@ scripts/release/check-inventory.sh          # the policy, and whether THIRD-PART
 scripts/release/check-inventory.sh --write  # regenerate it after a dependency change, then commit it
 ```
 
-Run `check-inventory.sh` whenever `Cargo.lock` changes. Security advisories are not part of it, because they need the advisory database from the network and change daily; run `cargo deny check advisories` before a release.
+Run `check-inventory.sh` whenever `Cargo.lock` changes. Security advisories are a separate check, because they need the advisory database from the network and change daily:
+
+```sh
+cargo advisories                            # RustSec advisories against Cargo.lock (needs cargo-deny and the network)
+```
+
+An advisory that cannot be fixed by an upgrade yet is accepted only as an `ignore` entry in `deny.toml`'s `[advisories]`, with its reason and what removes it.
+
+CI enforces all three on every pull request ([what CI proves](development.md#what-ci-proves)): the `licenses and inventory` job runs `check-inventory.sh` with cargo-deny 0.22.0 and cargo-about 0.9.3 (pinned, because the inventory is compared byte for byte; regenerate it with the same cargo-about), and the `advisories` job runs the advisory check. `.github/workflows/advisories.yml` repeats the advisory check on `main` every day, so an advisory published after a merge still turns a check red.
 
 ### Bundled binaries
 
@@ -187,6 +195,6 @@ The crate inventory above covers Rust code. The release also carries, or names f
 | Sentinel guest agent (musl, static) | x86_64 worker `microvm/sentinel-agent`, and the agent archive | Sentinel's licence; Rust dependencies in `THIRD-PARTY-LICENSES.md` | the release build | this repository |
 | Tailcat v0.6.0 | not packaged: the worker enrollment script (Q11) downloads it | BSD-3-Clause | digest of the executable and of the upstream archive, both architectures | https://github.com/tailscale/tailcat/releases/tag/v0.6.0 |
 
-Produced by a documented command that fails on a disallowed licence: `cargo licenses` (policy) and `scripts/release/check-inventory.sh` (policy and current `THIRD-PARTY-LICENSES.md`), both runnable on the verification hosts with `cargo-deny` and `cargo-about` installed; `cargo deny check advisories` adds the security advisories before a release. Duplicate crate versions are reported as warnings by the `bans` check. The web (pnpm) inventory belongs to the web interface and is not part of this one.
+Produced by a documented command that fails on a disallowed licence: `cargo licenses` (policy) and `scripts/release/check-inventory.sh` (policy and current `THIRD-PARTY-LICENSES.md`), both runnable on the verification hosts with `cargo-deny` and `cargo-about` installed; `cargo advisories` adds the security advisories, on every pull request and daily on `main`. Duplicate crate versions are reported as warnings by the `bans` check. The web (pnpm) inventory belongs to the web interface and is not part of this one.
 
 Qualifying a release as a whole (install, upgrade, recovery, revocation, worker loss, secrets, caches, diagnostics, egress, compatibility) is `scripts/qualify/qualify.sh`; see [qualification](qualification.md).

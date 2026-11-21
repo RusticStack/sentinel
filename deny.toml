@@ -45,6 +45,16 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
 
+# Checked by `cargo advisories` (CI on every pull request and daily on main). An
+# entry here is an accepted advisory: its reason, and what removes it.
 [advisories]
 version = 2
 yanked = "warn"
+ignore = [
+    # Bundled SQLite before 3.54.0 can return stale page-cache memory when it opens a
+    # database with a crafted `-wal` sibling. The vector is local: Sentinel opens only
+    # databases under its own owner-only data directory. The fix is rusqlite 0.41 or
+    # newer (libsqlite3-sys 0.39), a store dependency change that needs the full suite
+    # on the verification hosts; remove this entry with that upgrade.
+    { id = "RUSTSEC-2026-0459", reason = "local vector, own data directory only; fixed by the rusqlite 0.41 upgrade" },
+]
