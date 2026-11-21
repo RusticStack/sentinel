@@ -8,15 +8,16 @@ max-threads = 1
 filter = "package(sentinel-link) and (binary(fleet) or binary(fleet_sessions))"
 test-group = "fleet"
 
-# Three binaries assert on wall-clock behaviour rather than only on values: the CLI's clean stop
-# inside a deadline, the history routes' p95 latency over ten thousand runs, and an artifact
-# publication that waits for its publisher. Fifteen other binaries sharing two cores starve them
+# Four binaries assert on wall-clock behaviour rather than only on values: the CLI's clean stop
+# inside a deadline, the history routes' p95 latency over ten thousand runs, an artifact
+# publication that waits for its publisher, and a GitHub sign-in that waits out a second-factor
+# window. Fifteen other binaries sharing two cores starve them
 # into failing on a saturated box and nowhere else, so they run one binary at a time as well.
 [test-groups.timing]
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = "binary(cli) or binary(history) or binary(digest_first)"
+filter = "binary(cli) or binary(history) or binary(digest_first) or binary(github_sign_in)"
 test-group = "timing"
 
 # The browser scenarios each start a controller, a web server and a Chromium, and one of them holds
