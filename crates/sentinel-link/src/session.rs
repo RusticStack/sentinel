@@ -194,6 +194,26 @@ pub enum ClientMessage {
         from: String,
         artifact: String,
     },
+    /// Protocol 18, appended last so every earlier variant keeps its index: what a runner-mode sandbox's
+    /// `upload-artifact` sealed, offered to the tenant's own artifact store. It names the lease the sandbox
+    /// serves rather than an attempt, because the artifact is a GitHub job's and the lease is what named it.
+    RunnerArtifactBegin {
+        lease: [u8; 16],
+        name: String,
+        bytes: u64,
+        digest: [u8; 32],
+    },
+    /// One chunk of that artifact's body, in the order the sequence numbers it.
+    RunnerArtifactData {
+        lease: [u8; 16],
+        seq: u32,
+        bytes: Vec<u8>,
+    },
+    /// The body is complete; the controller commits the row and answers this frame.
+    RunnerArtifactEnd {
+        lease: [u8; 16],
+        name: String,
+    },
 }
 
 struct LogRef<'a> {
@@ -440,6 +460,15 @@ pub enum ServerMessage {
     RunnerScope {
         lease: [u8; 16],
         scope: RunnerScopeWire,
+    },
+    /// Protocol 18, appended last so every earlier variant keeps its index: the controller's answer about
+    /// one runner-mode artifact. `code` is an `ArtifactCode`: `Stored` closes the artifact when the row
+    /// committed, and any other code fails it — the sandbox then removes the copy on its own disk, because
+    /// an artifact the tenant holds no row for is not one a later job of the run may restore.
+    RunnerArtifactVerdict {
+        lease: [u8; 16],
+        name: String,
+        code: u8,
     },
 }
 
@@ -1193,6 +1222,36 @@ pub trait SessionHandler: Send + Sync {
         _attempt: AttemptId,
         _name: &str,
         _reason: u8,
+    ) -> ArtifactCode {
+        ArtifactCode::Stale
+    }
+    /// A runner-mode sandbox offers one sealed artifact: its name, the body's length and the digest the
+    /// worker computed over it. The controller answers once, with the grant or the reason it refuses.
+    fn runner_artifact_begin(
+        &self,
+        _worker: WorkerId,
+        _lease: RunnerLeaseId,
+        _name: &str,
+        _bytes: u64,
+        _digest: [u8; 32],
+    ) -> ArtifactReply {
+        ArtifactReply::Verdict(ArtifactCode::Stale)
+    }
+    /// One chunk of that body; `Some` fails the artifact, `None` accepts the chunk.
+    fn runner_artifact_data(
+        &self,
+        _worker: WorkerId,
+        _lease: RunnerLeaseId,
+        _seq: u32,
+        _bytes: &[u8],
+    ) -> Option<ArtifactCode> {
+        Some(ArtifactCode::Stale)
+    }
+    fn runner_artifact_end(
+        &self,
+        _worker: WorkerId,
+        _lease: RunnerLeaseId,
+        _name: &str,
     ) -> ArtifactCode {
         ArtifactCode::Stale
     }
@@ -2504,6 +2563,7 @@ fn serve_connection(
 ) -> Result<()> {
     let control = bulk.is_none();
     let mut artifacts: HashMap<AttemptId, String> = HashMap::new();
+    let mut runner_artifacts: HashMap<[u8; 16], String> = HashMap::new();
     let mut uploads: HashMap<AttemptId, (sentinel_cache::remote::Receiving, Instant)> =
         HashMap::new();
     let transfers = Arc::new(AtomicUsize::new(0));
@@ -2857,6 +2917,75 @@ fn serve_connection(
                     // Only the batch that closes an offer is answered; earlier ones are acknowledged by silence.
                     ArtifactOfferReply::Held(_) => {}
                 }
+            }
+            ClientMessage::RunnerArtifactBegin {
+                lease,
+                name,
+                bytes,
+                digest,
+            } => {
+                if protocol < sentinel_protocol::negotiate::RUNNER_ARTIFACTS_MIN.0 {
+                    return Err(Error::Protocol("runner artifact needs protocol 18"));
+                }
+                if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
+                    return Err(Error::Protocol("artifact name"));
+                }
+                if bytes > MAX_ARTIFACT_BYTES {
+                    return Err(Error::Protocol("artifact size"));
+                }
+                let id = RunnerLeaseId::from_bytes(lease).map_err(|_| Error::Protocol("id"))?;
+                if runner_artifacts.contains_key(id.as_bytes()) {
+                    return Err(Error::Protocol("runner artifact in flight"));
+                }
+                let answer = match handler.runner_artifact_begin(worker, id, &name, bytes, digest) {
+                    ArtifactReply::Grant => {
+                        runner_artifacts.insert(*id.as_bytes(), name.clone());
+                        ArtifactCode::Stored
+                    }
+                    ArtifactReply::Verdict(code) => code,
+                };
+                tx.send(&ServerMessage::RunnerArtifactVerdict {
+                    lease: *id.as_bytes(),
+                    name,
+                    code: answer.to_u8(),
+                })?;
+            }
+            ClientMessage::RunnerArtifactData { lease, seq, bytes } => {
+                if protocol < sentinel_protocol::negotiate::RUNNER_ARTIFACTS_MIN.0 {
+                    return Err(Error::Protocol("runner artifact needs protocol 18"));
+                }
+                if bytes.len() > MAX_ARTIFACT_CHUNK_BYTES {
+                    return Err(Error::Protocol("artifact chunk"));
+                }
+                let id = RunnerLeaseId::from_bytes(lease).map_err(|_| Error::Protocol("id"))?;
+                let name = runner_artifacts
+                    .get(id.as_bytes())
+                    .cloned()
+                    .ok_or(Error::Protocol("runner artifact data without begin"))?;
+                if let Some(code) = handler.runner_artifact_data(worker, id, seq, &bytes) {
+                    runner_artifacts.remove(id.as_bytes());
+                    tx.send(&ServerMessage::RunnerArtifactVerdict {
+                        lease: *id.as_bytes(),
+                        name,
+                        code: code.to_u8(),
+                    })?;
+                }
+            }
+            ClientMessage::RunnerArtifactEnd { lease, name } => {
+                if protocol < sentinel_protocol::negotiate::RUNNER_ARTIFACTS_MIN.0 {
+                    return Err(Error::Protocol("runner artifact needs protocol 18"));
+                }
+                let id = RunnerLeaseId::from_bytes(lease).map_err(|_| Error::Protocol("id"))?;
+                if runner_artifacts.get(id.as_bytes()) != Some(&name) {
+                    return Err(Error::Protocol("runner artifact end without begin"));
+                }
+                runner_artifacts.remove(id.as_bytes());
+                let code = handler.runner_artifact_end(worker, id, &name);
+                tx.send(&ServerMessage::RunnerArtifactVerdict {
+                    lease: *id.as_bytes(),
+                    name,
+                    code: code.to_u8(),
+                })?;
             }
             ClientMessage::Profile(profile) => {
                 if !control {
@@ -3413,6 +3542,7 @@ pub fn connect(
         | ServerMessage::ArtifactGrant { .. }
         | ServerMessage::ArtifactVerdict { .. }
         | ServerMessage::ArtifactHeld { .. }
+        | ServerMessage::RunnerArtifactVerdict { .. }
         | ServerMessage::CacheGrant(_)
         | ServerMessage::CacheChunk(_)
         | ServerMessage::CacheEnd(_)
@@ -3642,6 +3772,58 @@ impl Reporter {
         })
     }
 
+    /// Offer one sealed runner-mode artifact of `lease` to the controller: its name, its body's length and
+    /// the digest the worker computed. The answer arrives as `RunnerArtifactVerdict`.
+    pub fn runner_artifact_begin(
+        &self,
+        lease: [u8; 16],
+        name: &str,
+        bytes: u64,
+        digest: [u8; 32],
+    ) -> Result<()> {
+        if self.protocol < sentinel_protocol::negotiate::RUNNER_ARTIFACTS_MIN.0 {
+            return Err(Error::Protocol("runner artifact needs protocol 18"));
+        }
+        if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
+            return Err(Error::Protocol("artifact name"));
+        }
+        if bytes > MAX_ARTIFACT_BYTES {
+            return Err(Error::Protocol("artifact size"));
+        }
+        self.bulk_class(&ClientMessage::RunnerArtifactBegin {
+            lease,
+            name: name.to_owned(),
+            bytes,
+            digest,
+        })
+    }
+
+    /// One chunk of that body, in ascending `seq` order.
+    pub fn runner_artifact_data(&self, lease: [u8; 16], seq: u32, bytes: &[u8]) -> Result<()> {
+        if self.protocol < sentinel_protocol::negotiate::RUNNER_ARTIFACTS_MIN.0 {
+            return Err(Error::Protocol("runner artifact needs protocol 18"));
+        }
+        if bytes.len() > MAX_ARTIFACT_CHUNK_BYTES {
+            return Err(Error::Protocol("artifact chunk"));
+        }
+        self.bulk_class(&ClientMessage::RunnerArtifactData {
+            lease,
+            seq,
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    /// The body is complete; the controller commits the row and answers with the verdict that closes it.
+    pub fn runner_artifact_end(&self, lease: [u8; 16], name: &str) -> Result<()> {
+        if self.protocol < sentinel_protocol::negotiate::RUNNER_ARTIFACTS_MIN.0 {
+            return Err(Error::Protocol("runner artifact needs protocol 18"));
+        }
+        self.bulk_class(&ClientMessage::RunnerArtifactEnd {
+            lease,
+            name: name.to_owned(),
+        })
+    }
+
     pub fn artifact_absent(&self, attempt: AttemptId, name: &str, reason: u8) -> Result<()> {
         if self.protocol < 4 {
             return Err(Error::Protocol("artifact needs protocol 4"));
@@ -3708,6 +3890,9 @@ pub trait Executor: Send + Sync {
     fn artifact_granted(&self, _attempt: AttemptId, _name: &str) {}
     fn artifact_verdict(&self, _attempt: AttemptId, _name: &str, _code: ArtifactCode) {}
     fn artifact_held(&self, _attempt: AttemptId, _name: &str, _held: &[u32]) {}
+    /// A runner-mode artifact's frame, answered by the controller: `Stored` grants the begin and closes a
+    /// committed artifact; any other code fails it.
+    fn runner_artifact_answered(&self, _lease: [u8; 16], _name: &str, _code: ArtifactCode) {}
     fn availability(&self) -> Option<(u64, sentinel_protocol::negotiate::Availability)> {
         None
     }
@@ -4276,6 +4461,12 @@ fn handle_bulk_message(
                 return Err(Error::Protocol("artifact held list"));
             }
             executor.artifact_held(attempt, &name, &held);
+        }
+        ServerMessage::RunnerArtifactVerdict { lease, name, code } => {
+            if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
+                return Err(Error::Protocol("artifact name"));
+            }
+            executor.runner_artifact_answered(lease, &name, ArtifactCode::from_u8(code));
         }
         ServerMessage::NoSpec { attempt } => {
             let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
