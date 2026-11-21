@@ -1,0 +1,120 @@
+{
+  "id": "cli-build-undefined",
+  "source": "cli",
+  "seeded": "pkg/cmd/pr/shared: StateTitleWithColor was renamed without updating its caller in pr/view",
+  "bundle": {
+    "schema": "sentinel.ai-context/1",
+    "attempt": "att_00000000-0000-4000-8000-000000000002",
+    "run": "run_00000000-0000-4000-8000-000000000002",
+    "job": "job_00000000-0000-4000-8000-000000000002",
+    "authoritative": {
+      "current_attempt": true,
+      "job_state": "failed",
+      "failure_class": "command_failed"
+    },
+    "failed_step": {
+      "index": 1,
+      "id": "build",
+      "outcome": "failed",
+      "exit_code": 1,
+      "signal": null,
+      "duration_ns": 9120000000
+    },
+    "steps": [
+      {
+        "index": 1,
+        "id": "build",
+        "outcome": "failed",
+        "exit_code": 1,
+        "signal": null,
+        "duration_ns": 9120000000
+      },
+      {
+        "index": 0,
+        "id": "checkout",
+        "outcome": "succeeded",
+        "exit_code": 0,
+        "signal": null,
+        "duration_ns": 412000000
+      }
+    ],
+    "omitted_steps": 0,
+    "diagnostics": [],
+    "log": {
+      "frames": [
+        {
+          "id": "log-1",
+          "sequence": 1,
+          "step": 1,
+          "stream": "stdout",
+          "text": "$ go mod download\n"
+        },
+        {
+          "id": "log-2",
+          "sequence": 2,
+          "step": 1,
+          "stream": "stdout",
+          "text": "$ go build ./cmd/gh\n"
+        },
+        {
+          "id": "log-3",
+          "sequence": 3,
+          "step": 1,
+          "stream": "stderr",
+          "text": "go: downloading github.com/cli/go-gh/v2 v2.11.0\n"
+        },
+        {
+          "id": "log-4",
+          "sequence": 4,
+          "step": 1,
+          "stream": "stderr",
+          "text": "# github.com/cli/cli/v2/pkg/cmd/pr/view\n"
+        },
+        {
+          "id": "log-5",
+          "sequence": 5,
+          "step": 1,
+          "stream": "stderr",
+          "text": "pkg/cmd/pr/view/view.go:214:17: undefined: shared.StateTitleWithColor\n"
+        },
+        {
+          "id": "log-6",
+          "sequence": 6,
+          "step": 1,
+          "stream": "stderr",
+          "text": "note: module requires Go 1.23\n"
+        },
+        {
+          "id": "log-7",
+          "sequence": 7,
+          "step": 1,
+          "stream": "stdout",
+          "text": "upload: skipped, credential *** not used on a failed build\n"
+        }
+      ],
+      "complete": true,
+      "gaps": [],
+      "gaps_truncated": false,
+      "scanned_frames": 7
+    },
+    "bounds": {
+      "budget_bytes": 65536,
+      "bytes": 1659,
+      "truncated": false,
+      "omitted_diagnostics": 0,
+      "omitted_log_frames": 0
+    },
+    "redaction": {
+      "values": 1,
+      "value_rewrites": 1,
+      "pattern_replacements": 0,
+      "patterns": []
+    }
+  },
+  "error_evidence": [
+    "log-5"
+  ],
+  "canaries": [
+    "canary-upload-credential-73f0a1c5"
+  ]
+}
