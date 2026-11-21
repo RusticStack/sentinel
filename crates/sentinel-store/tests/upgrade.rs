@@ -617,7 +617,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     assert_eq!(
         report.inspection.pending,
         vec![
-            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
+            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90
         ]
     );
     assert_eq!(
@@ -627,7 +627,7 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     assert_eq!(
         report.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
         vec![
-            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
+            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90
         ]
     );
     assert!(report.blocking.is_empty(), "{:?}", report.blocking);
@@ -704,17 +704,23 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
          its recorded revisions"
     );
     assert_eq!(
-        schema::readable_by(schema::LATEST),
+        schema::readable_by(88),
         88,
         "migration 88 adds the external-resource tables and names a failure class a release below it \
          cannot decode, so two jobs it ran could hold one staging database at once and a job that \
          waited out its bound would be stored with a reason it cannot read"
     );
     assert_eq!(
-        schema::readable_by(schema::LATEST),
-        schema::LATEST - 1,
+        schema::readable_by(89),
+        88,
         "migration 89 adds one column with a default, so the release before it runs on the result and \
          only loses the ability to serve a job that opted into reuse and to ask for a fresh run"
+    );
+    assert_eq!(
+        schema::readable_by(schema::LATEST),
+        schema::LATEST - 1,
+        "migration 90 adds one table no older statement names, so the release before it runs on the \
+         result and only charges no runner-mode cache"
     );
     for release in [69, schema::LATEST - 2] {
         assert!(
@@ -761,13 +767,13 @@ fn the_copy_restores_the_database_the_matrix_says_no_release_can_read_after_the_
     assert_eq!(
         again.inspection.pending,
         vec![
-            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
+            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90
         ]
     );
     assert_eq!(
         again.steps.iter().map(|s| s.version).collect::<Vec<_>>(),
         vec![
-            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89
+            71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90
         ]
     );
 }
@@ -920,14 +926,14 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
     };
     assert_eq!(
         schema::LATEST,
-        89,
+        90,
         "extend the matrix in docs/upgrades.md for the new migration"
     );
     let sources = upgrade_sources();
     assert_eq!(
         sources,
         vec![
-            44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 81, 82, 85, 87, 88
+            44, 47, 48, 51, 56, 57, 63, 64, 66, 69, 76, 79, 81, 82, 85, 88, 89
         ]
     );
     for from in sources {
@@ -1047,7 +1053,7 @@ fn every_readable_by_release_upgrades_and_runs_on_the_databases_the_matrix_expec
                 false, false,
             ],
             // The newest releases in the list run on every column they are listed against.
-            75..=88 => [
+            75..=89 => [
                 true, true, true, true, true, true, true, true, true, true, true, true, true, true,
                 true,
             ],
@@ -1623,7 +1629,7 @@ fn the_upgrade_reports_the_tenants_the_new_default_caps_and_keeps_the_precedence
     let report = upgrade::preflight(dir.path()).unwrap();
     assert_eq!(
         report.inspection.pending,
-        vec![81, 82, 83, 84, 85, 86, 87, 88, schema::LATEST]
+        vec![81, 82, 83, 84, 85, 86, 87, 88, 89, schema::LATEST]
     );
     assert_eq!(
         report.steps[0].rewrites,

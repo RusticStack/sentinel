@@ -2,8 +2,9 @@
 //!
 //! `artifacts`, `uploads` and `logs` are kept by the triggers of migration 65 (and the log triggers of 46) in the same
 //! transaction that writes the underlying row, so a class total is never behind a committed fact and a crash cannot
-//! leave it wrong. `remote_cache` and `worker_cache` are reported: the first by the controller's reclamation pass, the
-//! second by the triggers that follow a worker's availability report. `actions_cache` has no writer until runner mode.
+//! leave it wrong. `remote_cache`, `actions_cache` and `worker_cache` are reported: the first by the controller's reclamation
+//! pass, the second by the fold that follows a worker's runner-mode cache report, the third by the triggers that
+//! follow a worker's availability report.
 //! `recount` derives every database-held class from the facts alone, for the audit that proves the totals.
 
 use std::collections::HashMap;
@@ -38,11 +39,14 @@ pub struct Classes {
 }
 
 impl Classes {
-    /// What the tenant quota counts: the classes held in the object store and the log directory.
+    /// What the tenant quota counts: the classes held in the object store and the log directory, and the
+    /// bytes its runner-mode caches occupy on worker hosts. Those give way first when the tenant reaches
+    /// its hard threshold, so counting them is what lets the threshold see them at all.
     pub fn stored(&self) -> u64 {
         self.artifacts
             .saturating_add(self.uploads)
             .saturating_add(self.logs)
+            .saturating_add(self.actions_cache)
     }
 
     /// Each class under its metric label, in `CLASS_NAMES` order.
@@ -101,6 +105,17 @@ const REMOTE_SET: &str = "INSERT INTO tenant_usage(tenant_id, remote_cache_bytes
 const REMOTE_HOLDERS: &str = "SELECT tenant_id FROM tenant_usage INDEXED BY tenant_usage_remote
         WHERE remote_cache_bytes != 0 AND tenant_id > ?1 ORDER BY tenant_id LIMIT ?2";
 const REMOTE_CLEAR: &str = "UPDATE tenant_usage SET remote_cache_bytes = 0 WHERE tenant_id = ?1";
+const ACTIONS_PUT: &str = "INSERT INTO worker_actions_cache(worker_id, repo_id, bytes, updated_ms)
+        VALUES(?1, ?2, ?3, ?4)
+        ON CONFLICT(worker_id, repo_id) DO UPDATE SET bytes = excluded.bytes, updated_ms = excluded.updated_ms";
+const ACTIONS_STALE: &str = "SELECT repo_id FROM worker_actions_cache WHERE worker_id = ?1";
+const ACTIONS_DELETE: &str =
+    "DELETE FROM worker_actions_cache WHERE worker_id = ?1 AND repo_id = ?2";
+const ACTIONS_WORKER: &str = "DELETE FROM worker_actions_cache WHERE worker_id = ?1";
+const ACTIONS_TENANT: &str = "SELECT COALESCE(SUM(w.bytes), 0) FROM worker_actions_cache w
+        JOIN repos r ON r.id = w.repo_id WHERE r.tenant_id = ?1";
+const ACTIONS_SET: &str = "INSERT INTO tenant_usage(tenant_id, actions_cache_bytes) VALUES(?1, ?2)
+        ON CONFLICT(tenant_id) DO UPDATE SET actions_cache_bytes = excluded.actions_cache_bytes";
 const SNAPSHOT_KEYS: &str =
     "SELECT tenant_id FROM tenant_usage WHERE tenant_id > ?1 ORDER BY tenant_id LIMIT ?2";
 const SNAPSHOT_INSERT: &str = "INSERT OR IGNORE INTO storage_class_snapshots(tenant_id, day, taken_ms,
@@ -122,6 +137,12 @@ pub const STATEMENTS: &[(&str, &str)] = &[
     ("logs_recount", LOGS_RECOUNT),
     ("worker_cache_recount", WORKER_CACHE_RECOUNT),
     ("repo_tenant", REPO_TENANT),
+    ("actions_put", ACTIONS_PUT),
+    ("actions_stale", ACTIONS_STALE),
+    ("actions_delete", ACTIONS_DELETE),
+    ("actions_worker", ACTIONS_WORKER),
+    ("actions_tenant", ACTIONS_TENANT),
+    ("actions_set", ACTIONS_SET),
     ("remote_set", REMOTE_SET),
     ("remote_holders", REMOTE_HOLDERS),
     ("remote_clear", REMOTE_CLEAR),
@@ -254,6 +275,128 @@ pub fn report_remote_cache(store: &Store, repos: &[(RepoId, u64)]) -> Result<()>
         }
         after = last;
     }
+}
+
+/// Publishes what one worker host's `actions/cache` tree holds, per repository: the rows it names become that
+/// worker's figure for each, the ones it no longer names are removed, and every tenant those repositories
+/// every tenant those repositories belong to is re-folded from the table in the same transaction, because a
+/// tenant's class is the sum over every worker that holds its repositories. Returns the tenants whose figure
+/// moved, each with the repositories of this report that it owns: those are the ones this worker holds and can
+/// give up, which is what a caller at the hard threshold names back.
+///
+/// The report is bounded by the caller (`MAX_ACTIONS_REPOS`) and the fold touches only the repositories named
+/// or dropped, so its cost is the report's size and never the table's.
+pub fn report_actions_cache(
+    store: &Store,
+    worker: sentinel_core::WorkerId,
+    repos: &[(RepoId, u64)],
+    now: UnixMillis,
+) -> Result<Vec<(TenantId, Vec<RepoId>)>> {
+    let named: Vec<([u8; 16], i64)> = repos
+        .iter()
+        .map(|(repo, bytes)| (*repo.as_bytes(), i64::try_from(*bytes).unwrap_or(i64::MAX)))
+        .collect();
+    let ids: Vec<([u8; 16], RepoId)> = repos
+        .iter()
+        .map(|(repo, _)| (*repo.as_bytes(), *repo))
+        .collect();
+    store.writer().write(move |tx| {
+        let stale: Vec<[u8; 16]> = tx
+            .prepare_cached(ACTIONS_STALE)?
+            .query_map([worker.as_bytes().as_slice()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut put = tx.prepare_cached(ACTIONS_PUT)?;
+        for (repo, bytes) in &named {
+            put.execute(params![
+                worker.as_bytes().as_slice(),
+                repo.as_slice(),
+                bytes,
+                now.0
+            ])?;
+        }
+        let mut delete = tx.prepare_cached(ACTIONS_DELETE)?;
+        // Every tenant whose repository this report named or dropped is re-folded; nothing else is read.
+        let mut candidates: Vec<[u8; 16]> = named.iter().map(|(repo, _)| *repo).collect();
+        for repo in stale {
+            if !named.iter().any(|(named, _)| *named == repo) {
+                delete.execute(params![worker.as_bytes().as_slice(), repo.as_slice()])?;
+                candidates.push(repo);
+            }
+        }
+        let mut moved: Vec<(TenantId, Vec<RepoId>)> = Vec::new();
+        let mut owner = tx.prepare_cached(REPO_TENANT)?;
+        for repo in &candidates {
+            let owner: Option<[u8; 16]> = owner
+                .query_row([repo.as_slice()], |r| r.get(0))
+                .optional()?;
+            let Some(owner) = owner else {
+                continue;
+            };
+            let Ok(tenant) = TenantId::from_bytes(owner) else {
+                continue;
+            };
+            let held = ids
+                .iter()
+                .find(|(bytes, _)| bytes == repo)
+                .map(|(_, repo)| *repo);
+            let at = moved
+                .iter()
+                .position(|(moved, _)| *moved == tenant)
+                .unwrap_or_else(|| {
+                    moved.push((tenant, Vec::new()));
+                    moved.len() - 1
+                });
+            if let Some(repo) = held {
+                moved[at].1.push(repo);
+            }
+        }
+        let mut set = tx.prepare_cached(ACTIONS_SET)?;
+        let mut total = tx.prepare_cached(ACTIONS_TENANT)?;
+        for (tenant, _) in &moved {
+            let sum: i64 = total.query_row([tenant.as_bytes().as_slice()], |r| r.get(0))?;
+            set.execute(params![tenant.as_bytes().as_slice(), sum.max(0)])?;
+        }
+        Ok(moved)
+    })
+}
+
+/// A worker left: nothing it held is charged to its tenants any more. Returns the tenants that moved.
+pub fn clear_actions_cache(
+    store: &Store,
+    worker: sentinel_core::WorkerId,
+) -> Result<Vec<TenantId>> {
+    store.writer().write(move |tx| {
+        let stale: Vec<[u8; 16]> = tx
+            .prepare_cached(ACTIONS_STALE)?
+            .query_map([worker.as_bytes().as_slice()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        if stale.is_empty() {
+            return Ok(Vec::new());
+        }
+        tx.prepare_cached(ACTIONS_WORKER)?
+            .execute([worker.as_bytes().as_slice()])?;
+        let mut moved: Vec<TenantId> = Vec::new();
+        let mut owner = tx.prepare_cached(REPO_TENANT)?;
+        let mut set = tx.prepare_cached(ACTIONS_SET)?;
+        let mut total = tx.prepare_cached(ACTIONS_TENANT)?;
+        for repo in stale {
+            let Some(owner) = owner
+                .query_row([repo.as_slice()], |r| r.get::<_, [u8; 16]>(0))
+                .optional()?
+            else {
+                continue;
+            };
+            let Ok(tenant) = TenantId::from_bytes(owner) else {
+                continue;
+            };
+            let sum: i64 = total.query_row([tenant.as_bytes().as_slice()], |r| r.get(0))?;
+            set.execute(params![tenant.as_bytes().as_slice(), sum.max(0)])?;
+            if !moved.contains(&tenant) {
+                moved.push(tenant);
+            }
+        }
+        Ok(moved)
+    })
 }
 
 /// The UTC day a millisecond belongs to; the snapshot key.

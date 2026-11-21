@@ -725,6 +725,7 @@ fn database_at_latest_without_classes(path: &Path) {
          DROP TRIGGER class_usage_ref_ins; DROP TRIGGER class_usage_ref_del;
          DROP TRIGGER class_usage_upload_ins; DROP TRIGGER class_usage_upload_close;
          DROP TRIGGER class_usage_worker_cache; DROP TRIGGER storage_class_snapshots_bound;
+         DROP INDEX worker_actions_cache_repo; DROP TABLE worker_actions_cache;
          DROP TABLE storage_class_snapshots;
          DROP INDEX tenant_usage_remote; DROP INDEX uploads_open;
          ALTER TABLE tenant_usage DROP COLUMN artifact_bytes;
@@ -1122,6 +1123,55 @@ fn a_class_update_costs_the_same_however_much_the_tenant_already_holds() {
         );
     }
     check(&f.store, &f.tenants(), "after the bulk rows");
+}
+
+#[test]
+fn the_actions_cache_is_charged_to_its_tenants_and_cleared_when_a_worker_leaves() {
+    let f = fixture();
+    let worker = f.worker(f.a.pool);
+    // Two repositories, one per tenant: each tenant's class is its own repositories and nothing else.
+    let moved = classes::report_actions_cache(
+        &f.store,
+        worker,
+        &[(f.a.repo, 400), (f.b.repo, 70), (RepoId::new(), 9_999)],
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(
+        moved,
+        vec![(f.a.id, vec![f.a.repo]), (f.b.id, vec![f.b.repo])],
+        "each tenant moves with the repositories this worker holds of it, and an unknown repository moves nothing"
+    );
+    assert_eq!(f.classes(f.a.id).actions_cache, 400);
+    assert_eq!(f.classes(f.b.id).actions_cache, 70);
+    assert_eq!(
+        f.classes(f.a.id).stored(),
+        400,
+        "the quota counts what its runner-mode caches hold"
+    );
+
+    // A second worker holding the same repository adds to the same tenant, because the class is bytes on
+    // every host the tenant's jobs ran on.
+    let second = f.worker(f.a.pool);
+    classes::report_actions_cache(&f.store, second, &[(f.a.repo, 100)], NOW).unwrap();
+    assert_eq!(f.classes(f.a.id).actions_cache, 500);
+
+    // A report that names the repository no longer replaces its figure rather than adding to it.
+    classes::report_actions_cache(&f.store, worker, &[(f.a.repo, 250), (f.b.repo, 70)], NOW)
+        .unwrap();
+    assert_eq!(f.classes(f.a.id).actions_cache, 350);
+
+    // A report that no longer names a repository is its eviction: the bytes are gone from that worker.
+    classes::report_actions_cache(&f.store, second, &[], NOW).unwrap();
+    assert_eq!(f.classes(f.a.id).actions_cache, 250);
+    assert_eq!(f.classes(f.b.id).actions_cache, 70);
+
+    // A worker that leaves holds nothing for anyone any more.
+    let moved = classes::clear_actions_cache(&f.store, worker).unwrap();
+    assert_eq!(moved.len(), 2, "both tenants moved: {moved:?}");
+    assert_eq!(f.classes(f.a.id).actions_cache, 0);
+    assert_eq!(f.classes(f.b.id).actions_cache, 0);
+    assert_eq!(f.classes(f.a.id).stored(), 0);
 }
 
 #[test]
