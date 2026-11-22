@@ -180,11 +180,20 @@ startup reconciliation are a pipeline job's. What is the runner's own:
   endpoints and metadata addresses as for any job, and admits exactly the worker's cache and artifact
   endpoint (`actions_address`, port 443) ahead of those refusals; the entry point maps the Actions
   cache and artifact names to that address and trusts the per-lease anchor mounted read-only at
-  `/etc/sentinel-runner/ca.crt` ([cache and artifacts](actions-cache.md)).
+  `/etc/sentinel-runner/ca.crt` ([cache and artifacts](actions-cache.md)). For a guest,
+  `actions_address` must be a host address `pasta` does **not** copy into the VM's namespace: pasta
+  gives the namespace the host's uplink address, so traffic to that address stays in the namespace
+  and is dropped there. An address on another host interface (for example a dummy interface holding
+  the worker's block of 16) is reached through pasta like any outbound connection.
 - **Docker inside the guest.** The guest image carries the Docker engine; the entry point starts the
   daemon as root inside the VM, which is the boundary, waits for it (60 s at most) and runs the
   listener as `runner`, a member of the `docker` group, so `container:` jobs, `services:` and Docker
-  actions work unchanged.
+  actions work unchanged. Docker's containers sit in a cgroup namespace rooted at the steps' cgroup,
+  so they share the steps' memory limit. Not covered yet: inside a `container:` job or a service
+  container, Docker writes its own hosts file and the image keeps its own trust store, so the Actions
+  names there resolve to GitHub's service rather than the worker's endpoint, and the guest's egress
+  lets them through; only steps the runner runs in the guest itself use the worker's cache and
+  artifacts.
 - **Cancel and lifetime** are the container's: a cancel stops the guest's processes with a 10 s grace
   and then the VM, and a runner never outlives six hours.
 - **No microVM, no lease.** A worker asked for a microVM sandbox whose `[microvm]` setup is absent or
