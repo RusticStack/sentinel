@@ -479,6 +479,8 @@ struct Runners {
     reporter: Mutex<Option<session::Reporter>>,
     /// What the controller answered about a runner-mode artifact, in arrival order.
     verdicts: Mutex<Vec<([u8; 16], ArtifactCode)>>,
+    /// The repositories the controller asked this worker to give up its runner-mode caches for.
+    evicted: Mutex<Vec<[u8; 16]>>,
 }
 
 impl Runners {
@@ -491,6 +493,7 @@ impl Runners {
             bundles: AtomicUsize::new(0),
             reporter: Mutex::new(None),
             verdicts: Mutex::new(Vec::new()),
+            evicted: Mutex::new(Vec::new()),
         })
     }
 
@@ -512,6 +515,10 @@ impl Runners {
 
     fn verdicts(&self) -> Vec<([u8; 16], ArtifactCode)> {
         self.verdicts.lock().unwrap().clone()
+    }
+
+    fn evicted(&self) -> Vec<[u8; 16]> {
+        self.evicted.lock().unwrap().clone()
     }
 }
 
@@ -540,6 +547,9 @@ impl Executor for Runners {
         Vec::new()
     }
     fn renewed(&self, _: UnixMillis) {}
+    fn actions_cache_evict(&self, repos: &[[u8; 16]]) {
+        self.evicted.lock().unwrap().extend_from_slice(repos);
+    }
     fn runner_artifact_answered(&self, lease: [u8; 16], _name: &str, code: ArtifactCode) {
         self.verdicts.lock().unwrap().push((lease, code));
     }
@@ -589,7 +599,7 @@ impl WorkerProcess {
             name: "builder".into(),
             hello: Hello {
                 protocol_min: ProtocolVersion(1),
-                protocol_max: ProtocolVersion(18),
+                protocol_max: ProtocolVersion(19),
                 capabilities: Capabilities::REQUIRED,
                 arch: Arch::X86_64,
                 software: "runner".into(),
@@ -882,6 +892,101 @@ fn a_runner_artifact_is_published_into_the_tenants_store_under_its_github_job() 
         .read(move |c| sentinel_store::artifacts::for_runner_run(c, tenant, repo, 1007))
         .unwrap();
     assert_eq!(rows.len(), 1, "a duplicate holds no second row");
+    process.stop();
+}
+
+/// What a worker's runner-mode cache tree holds is charged to the tenant that caused it, and a tenant at
+/// its hard threshold is answered with its repositories so its caches give way — before any of its
+/// artifacts are refused, which is the order retention.md states.
+#[test]
+fn a_workers_actions_cache_is_charged_to_its_tenant_and_gives_way_at_the_hard_threshold() {
+    let github = Github::start();
+    let d = deployment(github);
+    d.serve(120_000, 60_000);
+    let runners = Runners::new();
+    let process = WorkerProcess::start(&d, Arc::clone(&runners), &[CLASS]);
+    eventually("connected", || runners.reporter.lock().unwrap().is_some());
+    let reporter = runners.reporter.lock().unwrap().clone().expect("session");
+    let (tenant, repo, pool, worker) = (d.tenant, d.repo, d.pool, process.id);
+    // A tenant quota of 100 bytes at the deployment's default thresholds: 80 warns, 100 is the line. The
+    // worker has run a lease of the repository, which is what lets its report charge the tenant.
+    d.store
+        .writer()
+        .write(move |tx| {
+            let lease = sentinel_core::RunnerLeaseId::new();
+            tx.execute(
+                "INSERT INTO runner_leases(id, tenant_id, repo_id, class, pool_id, worker_id, fence,
+                    state_code, cpu_millis, memory_bytes, runner_name, offered_ms, lease_until_ms,
+                    released_ms, reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 2, 4000, 8589934592, 'sentinel-cache-1', ?7, ?7,
+                    ?7, 'job_completed')",
+                rusqlite::params![
+                    lease.as_bytes(),
+                    tenant.as_bytes(),
+                    repo.as_bytes(),
+                    CLASS,
+                    pool.as_bytes(),
+                    worker.as_bytes(),
+                    UnixMillis::now().0
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO storage_policies(tenant_id, repo_id, quota_bytes, soft_percent,
+                    hard_percent, updated_ms) VALUES(?1, X'', 100, 80, 100, ?2)",
+                rusqlite::params![tenant.as_bytes(), UnixMillis::now().0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    // Under the line: the class is charged and nothing is given up.
+    reporter.actions_cache(&[(repo, 50)]).unwrap();
+    eventually("charged", || {
+        d.store
+            .read(move |c| sentinel_store::classes::tenant(c, tenant))
+            .is_ok_and(|classes| classes.actions_cache == 50)
+    });
+    assert!(
+        runners.evicted().is_empty(),
+        "nothing gives way below the line"
+    );
+    assert_eq!(
+        d.store
+            .read(move |c| sentinel_store::classes::tenant(c, tenant))
+            .unwrap()
+            .stored(),
+        50,
+        "the class is what the tenant's quota counts"
+    );
+
+    // At it: the tenant's cache gives way, and the answer names its repositories.
+    reporter.actions_cache(&[(repo, 120)]).unwrap();
+    eventually("charged again", || {
+        d.store
+            .read(move |c| sentinel_store::classes::tenant(c, tenant))
+            .is_ok_and(|classes| classes.actions_cache == 120)
+    });
+    let standing = d
+        .store
+        .read(move |c| {
+            let deployment = sentinel_store::retention::Deployment::default();
+            sentinel_store::retention::standing(c, &deployment, tenant)
+        })
+        .unwrap();
+    assert_eq!(
+        standing.state,
+        sentinel_store::retention::State::Hard,
+        "{standing:?}"
+    );
+    eventually("evicted", || runners.evicted() == vec![*repo.as_bytes()]);
+    assert_eq!(
+        d.store
+            .read(move |c| sentinel_store::classes::tenant(c, tenant))
+            .unwrap()
+            .actions_cache,
+        120,
+        "the figure is the walk's, not the eviction's"
+    );
     process.stop();
 }
 

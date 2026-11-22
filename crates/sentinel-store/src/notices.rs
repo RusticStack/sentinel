@@ -129,7 +129,9 @@ pub fn crossings(conn: &Connection, d: &Deployment, limit: u32) -> Result<Vec<Cr
 /// keeping the next crossing quiet. This reads the notice rows only, which are as many as the tenants over the line.
 pub fn recovered(conn: &Connection, d: &Deployment, limit: u32) -> Result<Vec<TenantId>> {
     let mut statement = conn.prepare_cached(
-        "SELECT n.tenant_id, COALESCE(u.bytes, 0) + COALESCE(u.log_bytes, 0), p.quota_bytes,
+        "SELECT n.tenant_id,
+             COALESCE(u.bytes, 0) + COALESCE(u.log_bytes, 0) + COALESCE(u.actions_cache_bytes, 0),
+             p.quota_bytes,
              p.soft_percent, p.hard_percent, t.kind = 1
          FROM storage_notices n LEFT JOIN tenant_usage u ON u.tenant_id = n.tenant_id
          LEFT JOIN storage_policies p ON p.tenant_id = n.tenant_id AND p.repo_id = X''
