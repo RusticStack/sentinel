@@ -461,7 +461,9 @@ mod tests {
     #[test]
     fn a_served_endpoint_is_admitted_before_the_refusals_and_nothing_else_of_the_host_is() {
         let plain = policy().rules();
-        let rules = policy().serving(Ipv4Addr::new(192, 168, 7, 20), 443).rules();
+        let rules = policy()
+            .serving(Ipv4Addr::new(192, 168, 7, 20), 443)
+            .rules();
         let accept = rules
             .find("ip daddr 192.168.7.20 tcp dport 443 accept")
             .expect("the endpoint is admitted");

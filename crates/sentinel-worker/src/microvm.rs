@@ -1957,7 +1957,9 @@ impl Vm {
     pub fn deliver_secret_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
         // One frame carries the whole archive: the entry, its padding and the two closing blocks.
         if bytes.len() > MAX_SECRET_FILE_BYTES {
-            return Err(Error::Preparation("a secret file too large to deliver".into()));
+            return Err(Error::Preparation(
+                "a secret file too large to deliver".into(),
+            ));
         }
         let mut header = tar::Header::new_gnu();
         header.set_size(bytes.len() as u64);
