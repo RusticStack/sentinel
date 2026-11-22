@@ -1,0 +1,69 @@
+#!/bin/sh
+# Runner mode's entry point inside a microVM guest (docs/runner-mode.md#a-runner-in-a-microvm). The
+# worker's guest agent starts this as root with no input and no argument, after it has put the job's
+# just-in-time configuration in the guest's in-memory secret directory; SENTINEL_RUNNER_CONFIG names
+# that file. This starts the guest's own Docker daemon, so `container:` jobs and service containers
+# run inside the VM, and runs the listener as the `runner` user.
+set -eu
+LC_ALL=C
+export LC_ALL
+
+# The worker's frame bound, twice over: a file the worker would never write is refused, not read.
+BOUND=131072
+LISTENER=/home/runner/bin/Runner.Listener
+DOCKER_WAIT=60
+
+refuse() {
+	printf 'sentinel-runner-guest: %s\n' "$1" >&2
+	exit "${2:-2}"
+}
+
+[ "$(id -u)" -eq 0 ] || refuse "the guest entry point runs as root and drops to runner itself"
+[ -x "$LISTENER" ] || refuse "no runner at $LISTENER" 3
+file=${SENTINEL_RUNNER_CONFIG:-}
+[ -n "$file" ] || refuse "SENTINEL_RUNNER_CONFIG names no configuration"
+[ -f "$file" ] || refuse "no configuration at the path SENTINEL_RUNNER_CONFIG names"
+
+size=$(wc -c <"$file")
+[ "$size" -gt 0 ] || refuse "an empty configuration"
+[ "$size" -le "$BOUND" ] || refuse "the configuration is larger than $BOUND bytes"
+config=$(cat "$file") || refuse "the configuration could not be read"
+# The file lives in guest memory; once read it has no reader left, so it goes before anything starts.
+rm -f "$file"
+newline='
+'
+case $config in
+*"$newline"*) refuse "the configuration is more than one line" ;;
+esac
+
+# The cache and artifact names resolve to the worker's endpoint, the one host address the guest's
+# egress policy admits; the anchor that signs them is trusted by the runner's Node and by the system.
+if [ -n "${SENTINEL_ACTIONS_ADDRESS:-}" ]; then
+	for host in ${SENTINEL_ACTIONS_HOSTS:-}; do
+		printf '%s %s\n' "$SENTINEL_ACTIONS_ADDRESS" "$host" >>/etc/hosts
+	done
+	if [ -n "${NODE_EXTRA_CA_CERTS:-}" ] && [ -f "$NODE_EXTRA_CA_CERTS" ]; then
+		cp "$NODE_EXTRA_CA_CERTS" /usr/local/share/ca-certificates/sentinel-actions.crt
+		update-ca-certificates >/dev/null
+	fi
+fi
+
+# The guest's Docker daemon: the VM is the boundary, so it runs rootful inside it and goes with it.
+dockerd --host=unix:///var/run/docker.sock >/var/log/dockerd.log 2>&1 &
+waited=0
+until docker info >/dev/null 2>&1; do
+	waited=$((waited + 1))
+	[ "$waited" -le "$DOCKER_WAIT" ] || refuse "the guest's Docker daemon did not start in ${DOCKER_WAIT}s" 4
+	sleep 1
+done
+
+# As in sentinel-runner: `run --jitconfig` is the one form the listener takes the value in, and the
+# only shell name holding it is dropped before the exec leaves it in the listener's argv alone.
+cd /home/runner
+set -- run --jitconfig "$config"
+config=
+unset config
+exec setpriv --reuid=runner --regid=runner --init-groups --reset-env -- \
+	env HOME=/home/runner PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+	${NODE_EXTRA_CA_CERTS:+NODE_EXTRA_CA_CERTS=$NODE_EXTRA_CA_CERTS} \
+	"$LISTENER" "$@"

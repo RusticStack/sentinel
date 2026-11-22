@@ -160,6 +160,45 @@ Sentinel records lifecycle and timing only; job logs and annotations stay on Git
 zip of files the job chose to upload rather than anything the runner masks, and the version of it
 GitHub would have stored is never written there.
 
+## A runner in a microVM
+
+A worker that states `[runner] sandbox = "microvm"` ([configuration](configuration.md#runner-image))
+runs each lease in a Firecracker guest instead of a container
+([`runner::guest::Plan`](../crates/sentinel-worker/src/runner/guest.rs)). The guest is the generic job
+VM of the [microVM executor](executor.md), so its isolation, egress policy, snapshot warm start and
+startup reconciliation are a pipeline job's. What is the runner's own:
+
+- **One guest per lease**, named `sentinel-runner-vm-<lease>`; the VM directory is keyed by the lease,
+  so a guest a dead worker left is removed by the same startup sweep as a job's.
+- **The configuration goes into guest memory.** After the guest boots, the worker writes the
+  just-in-time configuration into the guest agent's in-memory secret directory as one file
+  (`jitconfig`) and wipes its own copy; the entry point reads it, removes the file and hands the value
+  to the listener as `run --jitconfig`. It is never an argument the worker passes, an environment
+  value or a host file; `SENTINEL_RUNNER_CONFIG` carries only the path. The worker retracts the secret
+  directory when the listener ends, before the guest is powered off.
+- **Egress admits one address of the host.** The guest's egress policy refuses the host, the link
+  endpoints and metadata addresses as for any job, and admits exactly the worker's cache and artifact
+  endpoint (`actions_address`, port 443) ahead of those refusals; the entry point maps the Actions
+  cache and artifact names to that address and trusts the per-lease anchor mounted read-only at
+  `/etc/sentinel-runner/ca.crt` ([cache and artifacts](actions-cache.md)).
+- **Docker inside the guest.** The guest image carries the Docker engine; the entry point starts the
+  daemon as root inside the VM, which is the boundary, waits for it (60 s at most) and runs the
+  listener as `runner`, a member of the `docker` group, so `container:` jobs, `services:` and Docker
+  actions work unchanged.
+- **Cancel and lifetime** are the container's: a cancel stops the guest's processes with a 10 s grace
+  and then the VM, and a runner never outlives six hours.
+- **No microVM, no lease.** A worker asked for a microVM sandbox whose `[microvm]` setup is absent or
+  failed its check declines every runner offer, so a lease never lands where its runner cannot start.
+
+The guest image is [`examples/Containerfile.runner-guest`](../examples/Containerfile.runner-guest):
+any runner image (with or without the toolset) plus Ubuntu's `docker.io`, and the entry point
+[`examples/runner/sentinel-runner-guest`](../examples/runner/sentinel-runner-guest) at
+`/usr/local/bin/sentinel-runner-guest`. The worker converts it into the guest's root filesystem as it
+does any microVM job image.
+
+Only Linux guests exist. A Windows runner needs a Windows guest on Cloud Hypervisor, which is M07 and
+not in this build.
+
 ## The runner image and its update policy
 
 A worker starts runners from an image it pins by digest, built from

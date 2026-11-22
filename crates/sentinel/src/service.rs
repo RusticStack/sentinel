@@ -131,6 +131,8 @@ struct RunnerFile {
     /// sandbox network spells it (the host's own address in the sandbox). Required: a worker that
     /// states none serves no runner, because its runners' caches and artifacts would go to GitHub.
     actions_address: Option<String>,
+    /// `container` (the default) or `microvm`: a Firecracker guest per runner, which needs `[microvm]`.
+    sandbox: Option<String>,
 }
 
 /// The microVM executor's setup (plan 16.8): Firecracker, the pinned guest kernel, the static guest agent.
@@ -757,6 +759,8 @@ struct WorkerLink {
     runner_image: Option<String>,
     /// The address a runner sandbox reaches this worker's cache and artifact endpoint on (AR06).
     runner_actions: Option<std::net::Ipv4Addr>,
+    /// Whether runners run in a Firecracker guest (`[runner] sandbox = "microvm"`) rather than a container.
+    runner_microvm: bool,
     disk_bytes: Option<u64>,
     spool_reserve_bytes: Option<u64>,
     spool_quota_bytes: Option<u64>,
@@ -1158,6 +1162,26 @@ impl Config {
                             "runner mode needs the network: [runner] requires job_network = \"egress\"",
                         ));
                     }
+                    let runner_microvm = match file
+                        .runner
+                        .as_ref()
+                        .and_then(|runner| runner.sandbox.as_deref())
+                    {
+                        None | Some("container") => false,
+                        Some("microvm") => true,
+                        Some(_) => {
+                            return Err(Error::config(
+                                "runner.sandbox must be \"container\" or \"microvm\"",
+                            ));
+                        }
+                    };
+                    // A guest runner boots the worker's own kernel and agent: without them there is
+                    // nothing to start it in, which is a file to fix rather than leases to decline.
+                    if runner_microvm && file.microvm.is_none() {
+                        return Err(Error::config(
+                            "runner.sandbox = \"microvm\" needs the [microvm] section",
+                        ));
+                    }
                     if [
                         file.cache_budget_bytes,
                         file.mirror_budget_bytes,
@@ -1256,6 +1280,7 @@ impl Config {
                         isolation,
                         runner_image,
                         runner_actions,
+                        runner_microvm,
                         microvm: file.microvm.map(|m| MicrovmSetup {
                             firecracker: m.firecracker,
                             kernel: m.kernel,
@@ -3180,6 +3205,16 @@ mod worker_role {
                     executor.set_registry_cache(cache);
                 }
                 let runner_image = runner.image.as_ref().map(|image| image.as_str().to_owned());
+                let runner_sandbox = runner.sandbox;
+                if runner_image.is_some()
+                    && runner_sandbox == sentinel_worker::runner::Sandbox::Microvm
+                    && runtime.microvm.is_none()
+                {
+                    tracing::warn!(
+                        event = "runner_microvm_unavailable",
+                        "runner.sandbox = \"microvm\" but the microVM setup is not ready: this worker declines every runner offer"
+                    );
+                }
                 executor.set_runner_policy(runner);
                 let microvm_egress = network == sentinel_worker::podman::Network::Egress
                     && runtime.microvm.is_some();
@@ -3194,6 +3229,7 @@ mod worker_role {
                     tracing::info!(
                         event = "runner_mode_ready",
                         image,
+                        sandbox = runner_sandbox.as_str(),
                         egress = network == sentinel_worker::podman::Network::Egress,
                         "this worker starts one ephemeral GitHub Actions runner per leased job"
                     );
@@ -3688,6 +3724,11 @@ mod worker_role {
                     },
                 },
                 actions: link.runner_actions,
+                sandbox: if link.runner_microvm {
+                    sentinel_worker::runner::Sandbox::Microvm
+                } else {
+                    sentinel_worker::runner::Sandbox::Container
+                },
             },
             runtime,
             Arc::clone(&metrics),

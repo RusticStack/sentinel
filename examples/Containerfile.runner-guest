@@ -1,0 +1,31 @@
+# The runner guest image (docs/runner-mode.md#a-runner-in-a-microvm): a runner image plus the Docker
+# engine and the guest entry point, for workers that run runners in a Firecracker guest
+# (`[runner] sandbox = "microvm"`). The worker turns it into the guest's root filesystem as it does a
+# job's microVM image.
+#
+#   podman build -f examples/Containerfile.runner -t sentinel-runner:2.338.2 .
+#   podman build -f examples/Containerfile.runner-guest \
+#     --build-arg RUNNER=localhost/sentinel-runner:2.338.2 -t sentinel-runner-guest:2.338.2 .
+#
+# RUNNER has no default, as in Containerfile.runner-ubuntu-2404: any runner image (with or without the
+# toolset) is the base, so the runner version and its checksum stay stated in one place.
+ARG RUNNER
+FROM ${RUNNER}
+
+LABEL org.opencontainers.image.title="sentinel-runner-guest" \
+      org.opencontainers.image.description="GitHub Actions runner for Sentinel runner mode in a microVM guest"
+
+ARG DEBIAN_FRONTEND=noninteractive
+USER root
+# Ubuntu's own engine package: the guest is the boundary, so the daemon runs rootful inside it.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends docker.io iptables util-linux \
+ && rm -rf /var/lib/apt/lists/* \
+ && usermod -aG docker runner
+
+COPY --chmod=0755 examples/runner/sentinel-runner-guest /usr/local/bin/sentinel-runner-guest
+
+# The guest agent starts the entry point as root; it drops to `runner` for the listener.
+ENV HOME=/root
+WORKDIR /home/runner
+ENTRYPOINT ["/usr/local/bin/sentinel-runner-guest"]

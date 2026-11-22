@@ -1234,11 +1234,11 @@ impl Inner {
     fn run_sandbox(
         &self,
         lease: sentinel_core::RunnerLeaseId,
-        plan: crate::runner::Plan,
+        plan: crate::runner::Sandboxed,
         mut config: Vec<u8>,
         cancel: Arc<AtomicBool>,
     ) {
-        let outcome = plan.start(&config, &cancel);
+        let outcome = plan.start(&config, &cancel, &|_| {});
         wipe(&mut config);
         let removed = plan.destroy();
         match (outcome, removed) {
@@ -2082,6 +2082,11 @@ impl LinkExecutor for Executor {
         if state.draining || state.runners.len() >= MAX_RUNNERS || state.reporter.is_none() {
             return false;
         }
+        // A microVM runner on a worker whose microVM setup is absent or failed its check would be
+        // registered at GitHub and never come online, so it is declined before anything is asked for.
+        if policy.sandbox == crate::runner::Sandbox::Microvm && state.runtime.microvm.is_none() {
+            return false;
+        }
         state.runners.insert(
             lease.lease,
             HeldRunner {
@@ -2100,9 +2105,14 @@ impl LinkExecutor for Executor {
     /// input, and the bytes are wiped when the runner ends. A configuration this worker cannot use
     /// is wiped here and the lease is dropped, so nothing can start later from it.
     fn runner_config(&self, lease: [u8; 16], mut config: Vec<u8>) {
-        let (image, guard, address) = match self.runner_policy.get() {
+        let (image, guard, address, sandbox) = match self.runner_policy.get() {
             Some(policy) => match &policy.image {
-                Some(image) => (image.clone(), policy.guard.clone(), policy.actions),
+                Some(image) => (
+                    image.clone(),
+                    policy.guard.clone(),
+                    policy.actions,
+                    policy.sandbox,
+                ),
                 None => {
                     wipe(&mut config);
                     return;
@@ -2128,6 +2138,10 @@ impl LinkExecutor for Executor {
         };
         let state = self.state();
         let network = state.network;
+        let setup = match sandbox {
+            crate::runner::Sandbox::Container => None,
+            crate::runner::Sandbox::Microvm => state.runtime.microvm.clone(),
+        };
         // What the sandbox is built from, read under the lock and then carried: the configuration is
         // spent in one go, so nothing below needs a borrow of the held set.
         let (cpu_millis, memory_bytes, scope) = match state.runners.get(&lease) {
@@ -2179,18 +2193,26 @@ impl LinkExecutor for Executor {
             address,
             anchor: crate::runner::Actions::anchor_of(&dir),
         };
-        let plan = match crate::runner::Plan::new(
-            &self.root,
-            self.worker,
-            id,
-            &image,
-            limits,
-            &crate::runner::Grant {
-                network,
-                guard: &guard,
-                actions: Some(&wiring),
-            },
-        ) {
+        let grant = crate::runner::Grant {
+            network,
+            guard: &guard,
+            actions: Some(&wiring),
+        };
+        let built = match (sandbox, setup) {
+            (crate::runner::Sandbox::Container, _) => {
+                crate::runner::Plan::new(&self.root, self.worker, id, &image, limits, &grant)
+                    .map(crate::runner::Sandboxed::Container)
+            }
+            (crate::runner::Sandbox::Microvm, Some(setup)) => {
+                crate::runner::guest::Plan::new(&self.root, setup, id, &image, limits, &grant)
+                    .map(crate::runner::Sandboxed::Microvm)
+            }
+            // The setup went away between the offer and the configuration: nothing to start in.
+            (crate::runner::Sandbox::Microvm, None) => Err(crate::Error::Preparation(
+                "runner sandbox: no microVM setup".into(),
+            )),
+        };
+        let plan = match built {
             Ok(plan) => plan,
             // A sandbox this worker cannot build is a lease it cannot serve: the configuration is
             // wiped and the lease dropped, so nothing can start from it later.

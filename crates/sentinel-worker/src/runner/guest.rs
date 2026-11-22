@@ -271,3 +271,136 @@ impl Plan {
         workspace::remove_tree(&self.dir)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+    use crate::microvm::net;
+
+    fn setup() -> Arc<microvm::Setup> {
+        Arc::new(microvm::Setup {
+            firecracker: PathBuf::from("/usr/local/bin/firecracker"),
+            kernel: PathBuf::from("/var/lib/sentinel/vmlinux"),
+            agent: PathBuf::from("/var/lib/sentinel/sentinel-agent"),
+            snapshots: true,
+            guard: net::Guard::default(),
+        })
+    }
+
+    fn image() -> Image {
+        Image::parse("ghcr.io/rusticstack/sentinel-runner-guest@sha256:0000000000000000000000000000000000000000000000000000000000000000").unwrap()
+    }
+
+    fn limits(lifetime_secs: u64) -> Limits {
+        Limits {
+            cpu_millis: 4_000,
+            memory_bytes: 8 << 30,
+            pids: super::super::PIDS,
+            disk_bytes: 0,
+            lifetime_secs,
+        }
+    }
+
+    fn plan(lease: RunnerLeaseId, lifetime_secs: u64, actions: Option<&Actions>) -> Plan {
+        Plan::new(
+            Path::new("/var/lib/sentinel-worker"),
+            setup(),
+            lease,
+            &image(),
+            limits(lifetime_secs),
+            &Grant {
+                network: Network::Egress,
+                guard: &net::Guard::default(),
+                actions,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_guest_is_named_and_placed_by_its_lease_so_a_restart_finds_it() {
+        let lease = RunnerLeaseId::new();
+        let (a, b) = (plan(lease, 0, None), plan(lease, 0, None));
+        assert_eq!((a.name(), a.dir()), (b.name(), b.dir()));
+        assert_eq!(a.name(), format!("sentinel-runner-vm-{}", hex16(lease)));
+        assert_eq!(
+            a.dir(),
+            dir_of(Path::new("/var/lib/sentinel-worker"), lease)
+        );
+        assert_ne!(a.name(), plan(RunnerLeaseId::new(), 0, None).name());
+    }
+
+    #[test]
+    fn a_guest_never_outlives_the_runner_bound_and_gets_its_own_disk() {
+        assert_eq!(
+            plan(RunnerLeaseId::new(), 0, None).lifetime_secs(),
+            MAX_LIFETIME_SECS
+        );
+        assert_eq!(
+            plan(RunnerLeaseId::new(), MAX_LIFETIME_SECS * 2, None).lifetime_secs(),
+            MAX_LIFETIME_SECS
+        );
+        let short = plan(RunnerLeaseId::new(), 60, None);
+        assert_eq!(short.lifetime_secs(), 60);
+        assert_eq!(short.limits.disk_bytes, DISK_BYTES);
+        assert_eq!(short.limits.cpu_millis, 4_000);
+    }
+
+    #[test]
+    fn the_entry_point_is_told_where_the_configuration_is_and_never_what_it_is() {
+        let env = plan(RunnerLeaseId::new(), 0, None).environment();
+        assert_eq!(
+            env,
+            vec![(
+                ENV_CONFIG.to_owned(),
+                format!(
+                    "{}/{CONFIG_FILE}",
+                    sentinel_protocol::agent::SECRET_MOUNTS[0]
+                ),
+            )]
+        );
+    }
+
+    #[test]
+    fn with_an_endpoint_the_entry_point_learns_its_address_names_and_anchor() {
+        let actions = Actions {
+            address: Ipv4Addr::new(10, 0, 2, 2),
+            anchor: PathBuf::from("/var/lib/sentinel-worker/runners/x/ca.crt"),
+        };
+        let env = plan(RunnerLeaseId::new(), 0, Some(&actions)).environment();
+        let get = |key: &str| {
+            env.iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(get(ENV_ACTIONS_ADDRESS), Some("10.0.2.2"));
+        assert_eq!(
+            get(ENV_ACTIONS_HOSTS),
+            Some(sentinel_actions::HOSTS.join(" ").as_str())
+        );
+        // The anchor is read where the guest mounts it, never at the worker's own path.
+        assert_eq!(
+            get(CA_ENV),
+            Some(format!("{ANCHOR_MOUNT}/{ANCHOR_FILE}").as_str())
+        );
+        assert!(get(ENV_CONFIG).is_some());
+        assert_eq!(env.len(), 4);
+    }
+
+    #[test]
+    fn a_configuration_the_worker_would_never_send_is_refused_before_a_guest_boots() {
+        let plan = plan(RunnerLeaseId::new(), 0, None);
+        let cancel = AtomicBool::new(false);
+        let booted = std::cell::Cell::new(false);
+        for config in [Vec::new(), vec![b'x'; MAX_CONFIG_BYTES + 1]] {
+            assert!(matches!(
+                plan.start(&config, &cancel, &|_| booted.set(true)),
+                Err(Error::Preparation(_))
+            ));
+        }
+        assert!(!booted.get());
+        assert!(!plan.dir().exists());
+    }
+}
