@@ -26,7 +26,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
 # What the runner itself needs to run a job of any kind: a shell, git to check out, curl and jq for a
 # step, tar/gzip/unzip for an archive, and the CA bundle it dials GitHub with. Toolchains a workflow
-# expects are AR05's, not this image's.
+# expects are Containerfile.runner-ubuntu-2404's, not this image's.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       bash ca-certificates curl git gzip jq libicu74 tar unzip \

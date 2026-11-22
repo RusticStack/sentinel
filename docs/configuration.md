@@ -187,7 +187,7 @@ An optional `[tailcat]` section in the server or worker file runs the **pinned**
 |---|---|
 |`enabled`|`false` (default) leaves direct TLS in place.|
 |`binary`|Absolute path to the helper executable. It must be a regular file (not a symlink) owned by root or by the Sentinel user and not writable by group or others; anything else is refused before it runs.|
-|`sha256`|The executable's SHA-256; defaults to the pinned v0.6.0 build `d46582137d21f03d15345e2be425d6317d49e5b8c8bb4f6fc56037f4c08cce73`. The pin is checked before *every* execution, and a mismatch refuses to run it. On Linux the file is opened once, hashed from that descriptor and executed through the same descriptor (`/proc/self/fd/<n>`), so a file swapped between the check and the exec never runs; an unchanged file (same device, inode, size, mtime and ctime) is not re-hashed (microseconds per execution instead of milliseconds for the 18 MB helper). Elsewhere the file is hashed on every execution and executed by path.|
+|`sha256`|The executable's SHA-256; defaults to the pinned v0.6.0 build for the host's architecture (x86_64 `d46582137d21f03d15345e2be425d6317d49e5b8c8bb4f6fc56037f4c08cce73`, aarch64 `3d947fa4ef9c35046f9cf4a198531f31c443ff71be038fde1d85aef9d640569f`). The pin is checked before *every* execution, and a mismatch refuses to run it. On Linux the file is opened once, hashed from that descriptor and executed through the same descriptor (`/proc/self/fd/<n>`), so a file swapped between the check and the exec never runs; an unchanged file (same device, inode, size, mtime and ctime) is not re-hashed (microseconds per execution instead of milliseconds for the 18 MB helper). Elsewhere the file is hashed on every execution and executed by path.|
 |`derpmap_url`|Optional `https://` URL of an operator-owned DERP map, passed to the helper. Public relays are best-effort; self-hosted relay infrastructure is supported without any Tailscale-hosted account (see below).|
 |`region`|Optional region name in that map (`--region=…`); the controller otherwise asks the helper for a fixed region so its address survives restarts.|
 |`listen_port`|The link port the helper carries (default 7443): the server serves it (it must match `listen`), the worker binds it on loopback and dials `127.0.0.1:<listen_port>`.|
@@ -324,7 +324,8 @@ actions_address = "10.0.2.2"
 - **The reference must be pinned by digest.** A tag — even one that looks immutable — is refused with
   `runner.image must be pinned by digest, as in ghcr.io/owner/runner@sha256:<64 hex>`, because this
   image is the code a job's steps run under and the same tag is a different image tomorrow. The image
-  itself, its `actions/runner` version and its toolchains, are AR05's.
+  itself and its `actions/runner` version are [runner mode](runner-mode.md#the-runner-image-and-its-update-policy)'s,
+  and the images with toolchains are [runner images](runner-images.md).
 - **A worker without the section starts no runner**: it declines every runner offer, so the controller
   places none on it and the class's demand waits for a worker that states one. That is the default, and
   the honest one — a worker that cannot start a runner should not be holding its capacity.

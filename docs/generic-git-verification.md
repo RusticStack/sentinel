@@ -138,4 +138,10 @@ Executed 2026-09-15 on a Linux verification host (Ubuntu 24.04, Docker, Podman 4
 
 Re-verified 2026-11-19 on an unprivileged x86_64 Linux account (Ubuntu 24.04, Docker 29.9.3, Gitea 1.27.3, Forgejo 17.0.2, GitLab CE 18.3.2, Alpine 3.22 with OpenSSH): `scripts/git-fixtures/run.sh exercise` raised all five fixtures and verified two hook deliveries from each — the shipped hook's bearer secret, JSON content type, its own intake route and the pushed `old_sha`/`new_sha`, with a distinct delivery id per push — for Gitea over HTTPS and over its built-in SSH, Forgejo over HTTPS, GitLab CE over SSH and the bare `sshd` repository. That run used Docker because the machine also running it denied unprivileged access to `/dev/net/tun`, which a rootless Podman needs to give a container a network; the scripts still prefer rootless Podman, which is what the bench harnesses use.
 
+Re-verified again on 2026-11-21 on an x86_64 4-vCPU container (Ubuntu 24.04, Docker 29.9.3, Gitea 1.27.3,
+Forgejo 17.0.2, Alpine 3.22 with OpenSSH) with `SENTINEL_FIXTURE_RUNTIME=docker scripts/git-fixtures/run.sh
+exercise bare-sshd gitea-https gitea-ssh forgejo-https`: four transport rows raised from the committed scripts and
+each delivered both of its pushes to its own intake route with the shipped hook's bearer secret. GitLab's row and
+the poll row were not raised on that run, and no timing on this page was re-measured.
+
 Not reproduced by the committed fixtures: every row of "What was exercised live" that needs a controller and a worker — admission, dispatch, execution, failure settlement, cancellation, rerun, the poll lane, credential revocation and rotation, controller and worker restarts, and the refusals — and the timings above, which remain the 2026-09-15 observation and were not measured again. The matrix's `ci/app2` (poll) and `other/foreign` (a second user's repository) rows are two further repositories on the Gitea HTTPS fixture, not separate fixtures: the scripts raise the transport rows, so those two are created on a running `gitea-https` fixture with `gitea admin user create` and the API.

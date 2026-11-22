@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# What this runner image carries, and whether it still does (docs/runner-images.md).
+#
+#   sentinel-toolset list     the tools and versions the image was built with
+#   sentinel-toolset check    every one of them is present and reports its pinned version
+#   sentinel-toolset absent   the hosted-image commands this image answers with a refusal
+#
+# `check` is the image's own gate: the build runs it, so an image whose toolset does not match the
+# manifest is never produced, and it names every tool that is missing rather than stopping at one.
+set -uo pipefail
+
+share=/usr/local/share/sentinel
+manifest=$share/toolset.tsv
+cache=${RUNNER_TOOL_CACHE:-/opt/hostedtoolcache}
+case $(uname -m) in
+  x86_64) arch=x64 ;;
+  aarch64) arch=arm64 ;;
+  *) arch=$(uname -m) ;;
+esac
+
+rows() {
+  while IFS=$'\t' read -r tool version os row_arch _; do
+    case $tool in '' | '#'*) continue ;; esac
+    if [ "$os" = linux ] && [ "$row_arch" = "$arch" ]; then printf '%s\t%s\n' "$tool" "$version"; fi
+  done < "$manifest"
+}
+
+# Prints what the installed tool says its version is; empty when it is not there.
+reported() {
+  local tool=$1 version=$2 dir
+  case $tool in
+    node)
+      dir=$cache/node/$version/$arch
+      [ -e "$dir.complete" ] && "$dir/bin/node" --version | sed 's/^v//'
+      ;;
+    go)
+      dir=$cache/go/$version/$arch
+      [ -e "$dir.complete" ] && "$dir/bin/go" version | sed -n 's/^go version go\([^ ]*\).*/\1/p'
+      ;;
+    python)
+      dir=$cache/Python/$version/$arch
+      [ -e "$dir.complete" ] && "$dir/bin/python3" -c 'import platform, ssl; print(platform.python_version())'
+      ;;
+    temurin)
+      dir=$cache/Java_Temurin-Hotspot_jdk/${version//+/-}/$arch
+      # The directory is named for the full version; the JDK's release file states the same one.
+      [ -e "$dir.complete" ] && "$dir/bin/java" -version > /dev/null 2>&1 \
+        && grep -q '^IMPLEMENTOR="Eclipse Adoptium"' "$dir/release" && printf '%s\n' "$version"
+      ;;
+    maven) mvn --version 2> /dev/null | sed -n 's/^Apache Maven \([^ ]*\).*/\1/p' ;;
+    rust) "$HOME/.cargo/bin/rustc" --version | sed -n 's/^rustc \([^ ]*\).*/\1/p' ;;
+  esac 2> /dev/null
+}
+
+case ${1:-} in
+  list) rows ;;
+  absent) cat "$share/absent.txt" ;;
+  check)
+    missing=0
+    while IFS=$'\t' read -r tool version; do
+      got=$(reported "$tool" "$version")
+      if [ "$got" != "$version" ]; then
+        echo "sentinel-toolset: $tool $version is missing (found '${got:-nothing}')" >&2
+        missing=$((missing + 1))
+      fi
+    done < <(rows)
+    [ "$missing" -eq 0 ] || exit 1
+    echo "sentinel-toolset: $(rows | wc -l) tools present at their pinned versions"
+    ;;
+  *)
+    echo "usage: sentinel-toolset list|check|absent" >&2
+    exit 2
+    ;;
+esac
