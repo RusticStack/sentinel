@@ -72,6 +72,7 @@ pub enum Notice {
     },
     ShutDown {
         ended: usize,
+        /// Attempts and runner sandboxes still up when the grace ran out.
         left: usize,
         handed_back: usize,
     },
@@ -617,6 +618,8 @@ pub struct Inner {
     mirrors: Option<crate::checkout::Mirrors>,
     spool: Arc<SpoolSpace>,
     admission_floor: std::sync::atomic::AtomicU64,
+    /// Runner sandboxes started and not yet destroyed; a shutdown waits for them as it does for attempts.
+    sandboxes: std::sync::atomic::AtomicUsize,
     measured_disk: std::sync::atomic::AtomicBool,
     refusal_noted: Mutex<Option<Instant>>,
     /// What this worker states about runner mode, set once at start (no image: no runners at all).
@@ -847,6 +850,7 @@ impl Executor {
                 runners: HashMap::new(),
             }),
             admission_floor: std::sync::atomic::AtomicU64::new(floor),
+            sandboxes: std::sync::atomic::AtomicUsize::new(0),
             measured_disk: std::sync::atomic::AtomicBool::new(false),
             refusal_noted: Mutex::new(None),
             runner_policy: std::sync::OnceLock::new(),
@@ -926,17 +930,20 @@ impl Executor {
                 });
             }
         });
+        // A runner's sandbox gets the same grace: its lifetime bound is enforced from this process, so a
+        // guest or container left behind once the worker exits would have none.
         let until = Instant::now() + grace;
-        let left = loop {
+        let (left, sandboxes) = loop {
             let left = self.state().live.len();
-            if left == 0 || Instant::now() >= until {
-                break left;
+            let sandboxes = self.sandboxes.load(Ordering::Acquire);
+            if (left == 0 && sandboxes == 0) || Instant::now() >= until {
+                break (left, sandboxes);
             }
             thread::sleep(Duration::from_millis(20));
         };
         (self.notify)(Notice::ShutDown {
             ended: live.len() - left.min(live.len()),
-            left,
+            left: left + sandboxes,
             handed_back,
         });
     }
@@ -2326,12 +2333,14 @@ impl LinkExecutor for Executor {
             held.running = Some(Arc::clone(&cancel));
             held.actions = Some(Arc::clone(&actions));
         }
+        self.sandboxes.fetch_add(1, Ordering::AcqRel);
         let inner = Arc::clone(&self.0);
         let spawned = thread::Builder::new()
             .name(plan.name().to_owned())
             .spawn(move || {
                 let _endpoint = actions;
-                inner.run_sandbox(id, plan, config, cancel)
+                inner.run_sandbox(id, plan, config, cancel);
+                inner.sandboxes.fetch_sub(1, Ordering::AcqRel);
             });
         if spawned.is_err() {
             // No thread, no runner: the configuration is wiped and the lease is dropped, so the
@@ -2340,6 +2349,7 @@ impl LinkExecutor for Executor {
                 lease: id,
                 error: "the worker could not start a thread for the runner".to_owned(),
             });
+            self.sandboxes.fetch_sub(1, Ordering::AcqRel);
             self.state().runners.remove(&lease);
         }
     }
