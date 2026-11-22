@@ -34,5 +34,10 @@ if (-not $config) { Deny 'an empty configuration' }
 if ($config.Length -gt $bound) { Deny "the configuration is larger than $bound bytes" }
 
 Set-Location -LiteralPath $PSScriptRoot
+# provision.ps1 writes the job PATH (its tools, then the refusals) here; the listener starts with it.
+$pathFile = Join-Path $PSScriptRoot '.path'
+if (Test-Path -LiteralPath $pathFile -PathType Leaf) {
+    $env:Path = (Get-Content -LiteralPath $pathFile -Raw).Trim()
+}
 & $listener run --jitconfig $config
 exit $LASTEXITCODE

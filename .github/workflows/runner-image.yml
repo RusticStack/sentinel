@@ -66,5 +66,6 @@ jobs:
       - name: publish
         if: env.REPOSITORY != '' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         run: |
+          set -o pipefail
           podman login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
           RUNNER_IMAGE=ubuntu-2404 scripts/release/publish-runner-image.sh "$REPOSITORY" | tee -a "$GITHUB_STEP_SUMMARY"
