@@ -45,6 +45,11 @@ containerfile=examples/Containerfile.runner
 version=$(sed -n 's/^ARG RUNNER_VERSION=\(.*\)$/\1/p' "$containerfile")
 [ -n "$version" ] || { echo "$containerfile states no RUNNER_VERSION" >&2; exit 1; }
 
+# The script owns the digest file: a second --digestfile would take the digest away from it.
+for arg in "$@"; do
+  case $arg in --digestfile|--digestfile=*) echo "--digestfile is the script's own; drop it" >&2; exit 2 ;; esac
+done
+
 digestfile=$(mktemp)
 trap 'rm -f "$digestfile"' EXIT
 
@@ -80,6 +85,8 @@ if [ "${PUBLISH:-1}" = 0 ]; then
 fi
 
 podman push --digestfile "$digestfile" "$@" "$repository:$version" >&2
-reference="$repository@$(cat "$digestfile")"
+digest=$(cat "$digestfile")
+case $digest in sha256:?*) ;; *) echo "podman push wrote no digest" >&2; exit 1 ;; esac
+reference="$repository@$digest"
 echo "a worker pins this line:" >&2
 echo "image = \"$reference\""
