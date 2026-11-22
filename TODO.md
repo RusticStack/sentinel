@@ -90,13 +90,13 @@ What a session cannot supply. Ask early.
 - [x] **A01** tenancy and authorization ([authorization](docs/authorization.md))
 - [x] **A05** admission and registration modes ([admission](docs/admission.md))
 - [x] **W01** worker enrollment and link, protocol 11 ([worker link](docs/worker-link.md))
-- [ ] **W03** checkout and the rootless Podman executor ([executor](docs/executor.md))
-- [ ] **W09** vertical slice fault cases ([vertical slice](docs/vertical-slice.md))
+- [x] **W03** checkout and the rootless Podman executor ([executor](docs/executor.md)) — ran on rootless Podman 4.9.3 on 2026-11-21; the microVM arms stay with M04
+- [x] **W09** vertical slice fault cases ([vertical slice](docs/vertical-slice.md)) — the lease nobody renews is now a slice case; ran on rootless Podman 4.9.3 on 2026-11-21
 - [x] **G04** Checks outbox ([checks](docs/checks.md))
-- [ ] **G08** generic Git intake on the fixtures ([generic Git verification](docs/generic-git-verification.md)); Forgejo over SSH and GitLab over HTTPS are G08a (X7)
+- [ ] **G08** generic Git intake on the fixtures ([generic Git verification](docs/generic-git-verification.md)) — four transport rows re-verified on 2026-11-21; the rows that need a controller and a worker against a fixture still cannot be reproduced; Forgejo over SSH and GitLab over HTTPS are G08a (X7)
 - [x] **D01**, **D02** objects, uploads and reads ([storage](docs/storage.md))
-- [ ] **D04** segmented logs, indexes, replay and spool acknowledgement ([logs](docs/logs.md)); includes `power_cut_on_dm_flakey` (run 6)
-- [ ] **Q05** control and bulk priority, reconnect jitter, replay, restart reconciliation
+- [ ] **D04** segmented logs, indexes, replay and spool acknowledgement ([logs](docs/logs.md)); includes `power_cut_on_dm_flakey` (run 6) — every other suite ran on 2026-11-21, `posix_crash_states` included; that test needs root with `dm-flakey` and stays open
+- [x] **Q05** control and bulk priority, reconnect jitter, replay, restart reconciliation ([worker link](docs/worker-link.md#gate-reconciliation)) — every test the five rows name ran on 2026-11-21, the lease watchdog included
 - [x] **Q08** remote cache hydration
 - [x] **Q10** the fleet placement stall: `fleet.rs` stress-run clean
 - [x] **O02**, **O06** tokens, rotation, service grants, `doctor` ([OAuth](docs/oauth.md))
