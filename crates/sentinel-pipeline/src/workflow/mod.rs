@@ -117,6 +117,8 @@ pub struct Trigger {
 pub struct Concurrency {
     pub group: String,
     pub cancel_in_progress: bool,
+    /// `cancel-in-progress` is a `${{ }}` expression: whether a run cancels is decided per event.
+    pub cancel_conditional: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -797,11 +799,18 @@ fn decode_permissions(path: &str, node: &Node) -> Result<Vec<(String, String)>> 
     }
 }
 
+/// Whether a scalar is one whole `${{ }}` expression, the only string form GitHub evaluates.
+fn is_expression(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("${{") && value.ends_with("}}") && value.len() >= 5
+}
+
 fn decode_concurrency(path: &str, node: &Node) -> Result<Concurrency> {
     match node {
         Node::Str(group) => Ok(Concurrency {
             group: group.to_owned(),
             cancel_in_progress: false,
+            cancel_conditional: false,
         }),
         Node::Map(_) => {
             let entries = mapping(path, node)?;
@@ -809,13 +818,18 @@ fn decode_concurrency(path: &str, node: &Node) -> Result<Concurrency> {
             let Some(group) = find(entries, "group") else {
                 return Err(err(path, WorkflowErrorKind::Missing));
             };
-            let cancel_in_progress = match find(entries, "cancel-in-progress") {
-                Some(node) => boolean(&child(path, "cancel-in-progress"), node)?,
-                None => false,
+            let (cancel_in_progress, cancel_conditional) = match find(entries, "cancel-in-progress")
+            {
+                Some(Node::Str(s)) if s.len() <= MAX_TEXT_BYTES && is_expression(s) => {
+                    (false, true)
+                }
+                Some(node) => (boolean(&child(path, "cancel-in-progress"), node)?, false),
+                None => (false, false),
             };
             Ok(Concurrency {
                 group: text(&child(path, "group"), group, MAX_TEXT_BYTES)?.to_owned(),
                 cancel_in_progress,
+                cancel_conditional,
             })
         }
         other => wrong(path, "string or mapping", other),

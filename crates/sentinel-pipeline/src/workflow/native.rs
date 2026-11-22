@@ -174,8 +174,20 @@ pub(super) fn generate(
     let Some(on) = triggers(workflow, &mut notes) else {
         return Generated::refused(TRIGGER);
     };
+    // A job's conditional cancel has no native form either, and the pipeline carries no job group.
+    if workflow.jobs.iter().any(|job| {
+        job.concurrency
+            .as_ref()
+            .is_some_and(|c| c.cancel_conditional)
+    }) {
+        return Generated::refused(TRIGGER);
+    }
     let concurrency = match &workflow.concurrency {
         None => None,
+        // A conditional cancel has no native form: the pipeline's `cancel_in_progress` is a constant.
+        Some(concurrency) if concurrency.cancel_conditional => {
+            return Generated::refused(TRIGGER);
+        }
         Some(concurrency) => match translate(&concurrency.group) {
             // A group may only use what the controller knows when it admits the run.
             Some(group)
