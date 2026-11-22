@@ -69,7 +69,9 @@ naming the command and this page, so the job's summary says what was missing. Be
 last, a step or action that installs the real tool takes its place without anything to undo.
 
 - Ubuntu 24.04: `ansible`, `ant`, `aws`, `az`, `bazel`, `buildah`, `clang`, `cmake`, `composer`, `docker`, `docker-compose`, `dotnet`, `gcloud`, `gem`, `gh`, `gradle`, `helm`, `kotlin`, `kubectl`, `ninja`, `php`, `pnpm`, `podman`, `pwsh`, `ruby`, `sbt`, `skopeo`, `sudo`, `swift`, `terraform`, `yarn`.
-- Windows Server 2025: `7z`, `aws`, `az`, `bazel`, `choco`, `cl`, `cmake`, `docker`, `dotnet`, `gcloud`, `gh`, `gradle`, `helm`, `kubectl`, `link`, `msbuild`, `ninja`, `nuget`, `php`, `pnpm`, `pwsh`, `python`, `ruby`, `terraform`, `vcpkg`, `yarn`.
+- Windows Server 2025: `7z`, `aws`, `az`, `bazel`, `choco`, `cl`, `cmake`, `docker`, `dotnet`, `gcloud`, `gh`, `gradle`, `helm`, `kubectl`, `link`, `msbuild`, `ninja`, `nuget`, `php`, `pnpm`, `python`, `ruby`, `terraform`, `vcpkg`, `yarn`.
+
+`pwsh` is deliberately not a refusal on Windows: the runner picks a `run:` step's default shell by looking for `pwsh` on `PATH` and falls back to Windows PowerShell only when there is none, so a shim there would fail every such step. A step that names `shell: pwsh` is not answered by this image at all.
 
 Two of those are structural rather than a matter of size. `sudo` is absent because the runner is not
 root and a rootless sandbox has no root to give. `docker` and `podman` are absent because a rootless

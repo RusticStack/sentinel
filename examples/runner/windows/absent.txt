@@ -21,7 +21,6 @@ ninja
 nuget
 php
 pnpm
-pwsh
 python
 ruby
 terraform
