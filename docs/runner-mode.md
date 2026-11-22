@@ -196,6 +196,13 @@ startup reconciliation are a pipeline job's. What is the runner's own:
   artifacts.
 - **Cancel and lifetime** are the container's: a cancel stops the guest's processes with a 10 s grace
   and then the VM, and a runner never outlives six hours.
+- **How it started is reported.** Once the guest's agent is ready and before the listener is handed
+  its configuration, the worker logs `runner_started` with the lease, `mode` (`cold`, booted from the
+  kernel, or `restored`, from a snapshot of a booted guest), `ready_ns` (monotonic nanoseconds from
+  the VMM's start until the agent was ready; for a restore that is clone, load, connect and resume),
+  `snapshot_built` (this start built the snapshot) and `fallback` (why a wanted warm start was not
+  used). That is the warm-start evidence AR08's restore-path budget is measured by; a container
+  runner has no start mode and logs none. GitHub's own assignment time is not in it.
 - **No microVM, no lease.** A worker asked for a microVM sandbox whose `[microvm]` setup is absent or
   failed its check declines every runner offer, so a lease never lands where its runner cannot start.
 

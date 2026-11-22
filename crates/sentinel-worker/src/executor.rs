@@ -85,6 +85,13 @@ pub enum Notice {
     },
     /// Workspaces that finished attempts left behind were removed while the worker ran.
     WorkspacesReaped(usize),
+    /// A runner's guest is up and its listener is about to be handed the configuration: how the guest
+    /// started and how long it took, the warm-start evidence runner mode is measured by (AR08). A
+    /// container sandbox has no start mode and sends none.
+    RunnerStarted {
+        lease: sentinel_core::RunnerLeaseId,
+        start: crate::microvm::StartReport,
+    },
     /// One runner's sandbox ended: the container is gone and nothing writable of it survives.
     RunnerEnded {
         lease: sentinel_core::RunnerLeaseId,
@@ -1245,7 +1252,12 @@ impl Inner {
         mut config: Vec<u8>,
         cancel: Arc<AtomicBool>,
     ) {
-        let outcome = plan.start(&config, &cancel, &|_| {});
+        let outcome = plan.start(&config, &cancel, &|start| {
+            (self.notify)(Notice::RunnerStarted {
+                lease,
+                start: start.clone(),
+            })
+        });
         wipe(&mut config);
         let removed = plan.destroy();
         match (outcome, removed) {

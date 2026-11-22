@@ -3148,6 +3148,16 @@ mod worker_role {
                     sentinel_worker::executor::Notice::CleanupFailed { attempt, what, error } => {
                         tracing::warn!(event = "attempt_cleanup_failed", attempt = %attempt, what, error = %error, "a tree the attempt left could not be removed; the worker retries while it runs, and its disk stays held until it succeeds");
                     }
+                    sentinel_worker::executor::Notice::RunnerStarted { lease, start } => {
+                        tracing::info!(
+                            event = "runner_started",
+                            lease = %lease,
+                            mode = start.mode.as_str(),
+                            ready_ns = start.ready_ns,
+                            snapshot_built = start.snapshot_built,
+                            fallback = start.fallback.as_deref(),
+                        );
+                    }
                     sentinel_worker::executor::Notice::RunnerEnded { lease, code, canceled } => {
                         tracing::info!(event = "runner_ended", lease = %lease, code = ?code, canceled);
                     }
