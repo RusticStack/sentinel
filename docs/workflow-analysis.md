@@ -40,6 +40,8 @@ One `Inventory` carries the revision, both table versions and one `Workflow` per
 
 Values never enter the inventory. An `env:` value, a `with:` value, a `run:` script and a job `if` are scanned for `${{ secrets.NAME }}`, `${{ secrets['NAME'] }}`, `${{ vars.NAME }}` and `${{ vars['NAME'] }}` and only the names are kept; names are deduplicated in the order met, per scope. That is why a diagnostic or a stored inventory can be shown without redaction: it holds names, paths and keys, never a value, a token or a script.
 
+An `env:` entry with no value (`TARGET_FLAGS:`) is an empty variable, as on GitHub: its name is kept.
+
 ### Matrices and `runs-on:` cells
 
 A `runs-on:` label may reference `${{ matrix.<axis> }}`. The analyzer expands only the axes the labels actually name (a matrix used elsewhere does not widen the placement), substituting those axis values into every label. One job therefore yields one cell per `runs-on:` variant; a job with no matrix, or a matrix its labels do not name, yields exactly one cell with no axes. The cross product is bounded by `MAX_MATRIX_CELLS`; a larger one is refused, not truncated. An expression that is not a matrix reference the cell holds leaves that label unresolved and the cell stays on GitHub's runners as `expression`.

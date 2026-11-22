@@ -1,0 +1,178 @@
+{
+  "id": "gson-test-surefire",
+  "source": "gson",
+  "seeded": "gson/stream/JsonReader: the non-execute prefix is consumed in strict mode as well, so the strict-mode test no longer sees a malformed document",
+  "bundle": {
+    "schema": "sentinel.ai-context/1",
+    "attempt": "att_00000000-0000-4000-8000-000000000005",
+    "run": "run_00000000-0000-4000-8000-000000000005",
+    "job": "job_00000000-0000-4000-8000-000000000005",
+    "authoritative": {
+      "current_attempt": true,
+      "job_state": "failed",
+      "failure_class": "test_failure"
+    },
+    "failed_step": {
+      "index": 1,
+      "id": "verify",
+      "outcome": "failed",
+      "exit_code": 1,
+      "signal": null,
+      "duration_ns": 96300000000
+    },
+    "steps": [
+      {
+        "index": 1,
+        "id": "verify",
+        "outcome": "failed",
+        "exit_code": 1,
+        "signal": null,
+        "duration_ns": 96300000000
+      },
+      {
+        "index": 0,
+        "id": "checkout",
+        "outcome": "succeeded",
+        "exit_code": 0,
+        "signal": null,
+        "duration_ns": 412000000
+      }
+    ],
+    "omitted_steps": 0,
+    "diagnostics": [
+      {
+        "id": "diag-1",
+        "severity": "failure",
+        "failure_class": "test_failure",
+        "code": null,
+        "step": {
+          "index": 1,
+          "key": "verify"
+        },
+        "source": {
+          "path": "JsonReaderTest.java",
+          "line": 1423,
+          "column": null
+        },
+        "test": {
+          "name": "testStrictNonExecutePrefix",
+          "package": null,
+          "class_name": "com.google.gson.stream.JsonReaderTest"
+        },
+        "evidence": [
+          {
+            "sequence": 906,
+            "offset": 0,
+            "end_sequence": 906
+          }
+        ],
+        "message": "java.lang.AssertionError: expected com.google.gson.stream.MalformedJsonException to be thrown, but nothing was thrown"
+      }
+    ],
+    "log": {
+      "frames": [
+        {
+          "id": "log-902",
+          "sequence": 902,
+          "step": 1,
+          "stream": "stdout",
+          "text": "$ mvn --batch-mode --no-transfer-progress verify\n"
+        },
+        {
+          "id": "log-903",
+          "sequence": 903,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[INFO] Running com.google.gson.stream.JsonReaderTest\n"
+        },
+        {
+          "id": "log-904",
+          "sequence": 904,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[WARNING] Tests run: 12, Failures: 0, Errors: 0, Skipped: 1 -- in com.google.gson.functional.Java17RecordTest\n"
+        },
+        {
+          "id": "log-905",
+          "sequence": 905,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[ERROR] Tests run: 178, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.412 s <<< FAILURE! -- in com.google.gson.stream.JsonReaderTest\n"
+        },
+        {
+          "id": "log-906",
+          "sequence": 906,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[ERROR] com.google.gson.stream.JsonReaderTest.testStrictNonExecutePrefix -- Time elapsed: 0.003 s <<< FAILURE!\njava.lang.AssertionError: expected com.google.gson.stream.MalformedJsonException to be thrown, but nothing was thrown\n\tat com.google.gson.stream.JsonReaderTest.testStrictNonExecutePrefix(JsonReaderTest.java:1423)\n"
+        },
+        {
+          "id": "log-907",
+          "sequence": 907,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[INFO] Results:\n[ERROR] Failures:\n"
+        },
+        {
+          "id": "log-908",
+          "sequence": 908,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[ERROR] Tests run: 4611, Failures: 1, Errors: 0, Skipped: 19\n"
+        },
+        {
+          "id": "log-909",
+          "sequence": 909,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[INFO] Reactor Summary for Gson Parent 2.13.2-SNAPSHOT:\n[INFO] Gson ............................................... FAILURE [01:31 min]\n"
+        },
+        {
+          "id": "log-910",
+          "sequence": 910,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.5.2:test (default-test) on project gson: There are test failures.\n"
+        },
+        {
+          "id": "log-911",
+          "sequence": 911,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[ERROR] -> [Help 1]\n[ERROR] Re-run Maven using the -X switch to enable full debug logging.\n"
+        },
+        {
+          "id": "log-912",
+          "sequence": 912,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[INFO] settings.xml server password *** not used\n"
+        }
+      ],
+      "complete": true,
+      "gaps": [],
+      "gaps_truncated": false,
+      "scanned_frames": 11
+    },
+    "bounds": {
+      "budget_bytes": 65536,
+      "bytes": 3365,
+      "truncated": false,
+      "omitted_diagnostics": 0,
+      "omitted_log_frames": 0
+    },
+    "redaction": {
+      "values": 1,
+      "value_rewrites": 1,
+      "pattern_replacements": 0,
+      "patterns": []
+    }
+  },
+  "error_evidence": [
+    "log-906",
+    "diag-1"
+  ],
+  "canaries": [
+    "canary-maven-password-5a92c0e7d3b8"
+  ]
+}
