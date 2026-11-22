@@ -18,3 +18,6 @@ CREATE TABLE worker_actions_cache(
 
 -- A tenant's total is the sum over the repositories it owns, so the fold reads by repository.
 CREATE INDEX worker_actions_cache_repo ON worker_actions_cache(repo_id);
+
+-- A report charges a repository only if one of the worker's runner leases ran it, which is one keyed probe.
+CREATE INDEX runner_leases_worker_repo ON runner_leases(worker_id, repo_id);

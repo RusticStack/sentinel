@@ -314,6 +314,32 @@ impl Fixture {
             .unwrap();
     }
 
+    /// A runner lease of `tenant`'s repository held by `worker`: what makes its actions-cache report chargeable.
+    fn lease(&self, worker: WorkerId, tenant: Tenant) {
+        self.store
+            .writer()
+            .write(move |tx| {
+                let lease = sentinel_core::RunnerLeaseId::new();
+                tx.execute(
+                    "INSERT INTO runner_leases(id, tenant_id, repo_id, class, pool_id, worker_id, fence,
+                    state_code, cpu_millis, memory_bytes, runner_name, offered_ms, lease_until_ms)
+                 VALUES (?1, ?2, ?3, 'sentinel-4vcpu', ?4, ?5, 1, 0, 4000, 8589934592, ?6, ?7, ?8)",
+                    params![
+                        lease.as_bytes(),
+                        tenant.id.as_bytes(),
+                        tenant.repo.as_bytes(),
+                        tenant.pool.as_bytes(),
+                        worker.as_bytes(),
+                        format!("sentinel-{lease}"),
+                        NOW.0,
+                        NOW.0 + 60_000
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
     fn revoke(&self, worker: WorkerId) {
         self.store
             .writer()
@@ -1129,6 +1155,8 @@ fn a_class_update_costs_the_same_however_much_the_tenant_already_holds() {
 fn the_actions_cache_is_charged_to_its_tenants_and_cleared_when_a_worker_leaves() {
     let f = fixture();
     let worker = f.worker(f.a.pool);
+    f.lease(worker, f.a);
+    f.lease(worker, f.b);
     // Two repositories, one per tenant: each tenant's class is its own repositories and nothing else.
     let moved = classes::report_actions_cache(
         &f.store,
@@ -1153,7 +1181,18 @@ fn the_actions_cache_is_charged_to_its_tenants_and_cleared_when_a_worker_leaves(
     // A second worker holding the same repository adds to the same tenant, because the class is bytes on
     // every host the tenant's jobs ran on.
     let second = f.worker(f.a.pool);
+    f.lease(second, f.a);
     classes::report_actions_cache(&f.store, second, &[(f.a.repo, 100)], NOW).unwrap();
+    assert_eq!(f.classes(f.a.id).actions_cache, 500);
+
+    // A worker that never ran a lease of a repository cannot charge its tenant by naming it.
+    let stranger = f.worker(f.b.pool);
+    let moved =
+        classes::report_actions_cache(&f.store, stranger, &[(f.a.repo, 1 << 40)], NOW).unwrap();
+    assert!(
+        moved.is_empty(),
+        "an unserved repository moves nothing: {moved:?}"
+    );
     assert_eq!(f.classes(f.a.id).actions_cache, 500);
 
     // A report that names the repository no longer replaces its figure rather than adding to it.
@@ -1172,6 +1211,24 @@ fn the_actions_cache_is_charged_to_its_tenants_and_cleared_when_a_worker_leaves(
     assert_eq!(f.classes(f.a.id).actions_cache, 0);
     assert_eq!(f.classes(f.b.id).actions_cache, 0);
     assert_eq!(f.classes(f.a.id).stored(), 0);
+}
+
+#[test]
+fn a_revoked_workers_actions_cache_stops_being_charged() {
+    let f = fixture();
+    let (worker, other) = (f.worker(f.a.pool), f.worker(f.a.pool));
+    f.lease(worker, f.a);
+    f.lease(other, f.a);
+    classes::report_actions_cache(&f.store, worker, &[(f.a.repo, 400)], NOW).unwrap();
+    classes::report_actions_cache(&f.store, other, &[(f.a.repo, 30)], NOW).unwrap();
+    assert_eq!(f.classes(f.a.id).actions_cache, 430);
+    f.revoke(worker);
+    assert_eq!(
+        f.classes(f.a.id).actions_cache,
+        30,
+        "the revoked worker's bytes leave with it, the live one's stay"
+    );
+    check(&f.store, &f.tenants(), "after the revocation");
 }
 
 #[test]

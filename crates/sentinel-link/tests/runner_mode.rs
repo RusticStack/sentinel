@@ -907,11 +907,29 @@ fn a_workers_actions_cache_is_charged_to_its_tenant_and_gives_way_at_the_hard_th
     let process = WorkerProcess::start(&d, Arc::clone(&runners), &[CLASS]);
     eventually("connected", || runners.reporter.lock().unwrap().is_some());
     let reporter = runners.reporter.lock().unwrap().clone().expect("session");
-    let (tenant, repo) = (d.tenant, d.repo);
-    // A tenant quota of 100 bytes at the deployment's default thresholds: 80 warns, 100 is the line.
+    let (tenant, repo, pool, worker) = (d.tenant, d.repo, d.pool, process.id);
+    // A tenant quota of 100 bytes at the deployment's default thresholds: 80 warns, 100 is the line. The
+    // worker has run a lease of the repository, which is what lets its report charge the tenant.
     d.store
         .writer()
         .write(move |tx| {
+            let lease = sentinel_core::RunnerLeaseId::new();
+            tx.execute(
+                "INSERT INTO runner_leases(id, tenant_id, repo_id, class, pool_id, worker_id, fence,
+                    state_code, cpu_millis, memory_bytes, runner_name, offered_ms, lease_until_ms,
+                    released_ms, reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 2, 4000, 8589934592, 'sentinel-cache-1', ?7, ?7,
+                    ?7, 'job_completed')",
+                rusqlite::params![
+                    lease.as_bytes(),
+                    tenant.as_bytes(),
+                    repo.as_bytes(),
+                    CLASS,
+                    pool.as_bytes(),
+                    worker.as_bytes(),
+                    UnixMillis::now().0
+                ],
+            )?;
             tx.execute(
                 "INSERT INTO storage_policies(tenant_id, repo_id, quota_bytes, soft_percent,
                     hard_percent, updated_ms) VALUES(?1, X'', 100, 80, 100, ?2)",

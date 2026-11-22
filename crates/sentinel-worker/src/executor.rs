@@ -1899,7 +1899,8 @@ impl Inner {
 
     /// Give up the runner-mode caches of these repositories, because their tenant stands at its hard
     /// threshold. A repository whose sandbox is still running keeps its entries: a live job's inputs are
-    /// never deleted under it, and its own report after the job ends gives them up then.
+    /// never deleted under it, and its own report after the job ends gives them up then. Nothing removed is
+    /// nothing to report: a report that names the same bytes would only be answered with the same eviction.
     fn evict_actions(&self, repos: &[[u8; 16]]) {
         let live: Vec<[u8; 16]> = self
             .state()
@@ -1908,6 +1909,7 @@ impl Inner {
             .filter(|held| held.running.is_some())
             .filter_map(|held| held.scope.as_ref().map(|scope| scope.repo))
             .collect();
+        let mut removed = false;
         for repo in repos {
             if live.contains(repo) {
                 continue;
@@ -1915,14 +1917,17 @@ impl Inner {
             let Some(repo) = sentinel_core::RepoId::from_bytes(*repo).ok() else {
                 continue;
             };
-            let _ = std::fs::remove_dir_all(
+            removed |= std::fs::remove_dir_all(
                 self.root
                     .join("actions")
                     .join("cache")
                     .join(repo.to_string()),
-            );
+            )
+            .is_ok();
         }
-        self.report_actions();
+        if removed {
+            self.report_actions();
+        }
     }
 }
 

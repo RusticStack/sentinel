@@ -249,7 +249,10 @@ repository of the tenant that caused them (protocol 19, `ACTIONS_ACCOUNTING_MIN`
 and after it has given entries up, so a figure is never older than the last thing that changed it.
 
 The controller writes one row per `(worker, repository)` into `worker_actions_cache` and folds the
-per-tenant sum into `tenant_usage.actions_cache_bytes` in the same writer transaction. A report replaces
+per-tenant sum into `tenant_usage.actions_cache_bytes` in the same writer transaction. Only a repository one
+of that worker's runner leases ran is charged (one keyed probe of `runner_leases(worker_id, repo_id)`): the tree
+holds nothing else, so a repository the worker never served is dropped from the report rather than charged to
+its tenant. A report replaces
 its own worker's rows and deletes the ones it no longer names: a worker that dropped a whole repository's
 entries must read zero rather than its last figure, and two workers that hold the same repository add,
 because the class is bytes on every host the tenant's jobs ran on. The class is one of the six
@@ -259,8 +262,10 @@ which is what makes the threshold act on it.
 At the hard threshold the answer to a report is `ActionsEvict` naming the tenant's repositories, and the
 worker removes each repository's whole cache tree. A repository whose sandbox is still running is spared:
 a live job's inputs are never deleted under it, and that repository's entries go at the next report, when
-the attempt has ended. A worker that leaves has its rows cleared and its tenants re-folded, so a lost host
-gives its figures back rather than holding them.
+the attempt has ended. An eviction that removed nothing is not reported again, so a spared repository does not
+turn into a report and the same answer back to back while its job runs. A revoked worker has its rows cleared
+and its tenants re-folded in the revocation's own transaction, so a retired host gives its figures back
+rather than holding them.
 
 What no test here covers is the walk over a tree a real job filled: the report, the fold, the hard state
 and the eviction are driven end to end over a real worker link

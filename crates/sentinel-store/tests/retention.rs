@@ -1831,7 +1831,29 @@ fn a_runners_actions_cache_counts_toward_the_line_the_tenant_is_measured_against
         ..Deployment::default()
     };
     let worker = WorkerId::new();
-    let (tenant, repo) = (f.tenant, f.repo);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    f.store
+        .writer()
+        .write(move |tx| {
+            let lease = sentinel_core::RunnerLeaseId::new();
+            tx.execute(
+                "INSERT INTO runner_leases(id, tenant_id, repo_id, class, pool_id, worker_id, fence,
+                state_code, cpu_millis, memory_bytes, runner_name, offered_ms, lease_until_ms)
+             VALUES (?1, ?2, ?3, 'sentinel-4vcpu', ?4, ?5, 1, 0, 4000, 8589934592, ?6, ?7, ?8)",
+                rusqlite::params![
+                    lease.as_bytes(),
+                    tenant.as_bytes(),
+                    repo.as_bytes(),
+                    pool.as_bytes(),
+                    worker.as_bytes(),
+                    "sentinel-cache-1",
+                    NOW.0,
+                    NOW.0 + 60_000
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     classes::report_actions_cache(&f.store, worker, &[(repo, 900)], NOW).unwrap();
     let standing = f.standing(d);
     assert_eq!(standing.used, 900, "the class is what the line counts");
