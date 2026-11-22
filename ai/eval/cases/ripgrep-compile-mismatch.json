@@ -1,0 +1,160 @@
+{
+  "id": "ripgrep-compile-mismatch",
+  "source": "ripgrep",
+  "seeded": "crates/searcher/src/line_buffer.rs: a buffer length was changed from usize to u32 at one call site",
+  "bundle": {
+    "schema": "sentinel.ai-context/1",
+    "attempt": "att_00000000-0000-4000-8000-000000000004",
+    "run": "run_00000000-0000-4000-8000-000000000004",
+    "job": "job_00000000-0000-4000-8000-000000000004",
+    "authoritative": {
+      "current_attempt": true,
+      "job_state": "failed",
+      "failure_class": "command_failed"
+    },
+    "failed_step": {
+      "index": 1,
+      "id": "build",
+      "outcome": "failed",
+      "exit_code": 101,
+      "signal": null,
+      "duration_ns": 22870000000
+    },
+    "steps": [
+      {
+        "index": 1,
+        "id": "build",
+        "outcome": "failed",
+        "exit_code": 101,
+        "signal": null,
+        "duration_ns": 22870000000
+      },
+      {
+        "index": 0,
+        "id": "checkout",
+        "outcome": "succeeded",
+        "exit_code": 0,
+        "signal": null,
+        "duration_ns": 412000000
+      }
+    ],
+    "omitted_steps": 0,
+    "diagnostics": [
+      {
+        "id": "diag-1",
+        "severity": "error",
+        "failure_class": "command_failed",
+        "code": "E0308",
+        "step": {
+          "index": 1,
+          "key": "build"
+        },
+        "source": {
+          "path": "crates/searcher/src/line_buffer.rs",
+          "line": 412,
+          "column": 21
+        },
+        "test": null,
+        "evidence": [
+          {
+            "sequence": 41,
+            "offset": 0,
+            "end_sequence": 41
+          }
+        ],
+        "message": "mismatched types: expected `usize`, found `u32`"
+      }
+    ],
+    "log": {
+      "frames": [
+        {
+          "id": "log-37",
+          "sequence": 37,
+          "step": 1,
+          "stream": "stdout",
+          "text": "$ cargo build --verbose --workspace\n"
+        },
+        {
+          "id": "log-38",
+          "sequence": 38,
+          "step": 1,
+          "stream": "stderr",
+          "text": "   Compiling grep-matcher v0.1.7 (/work/crates/matcher)\n"
+        },
+        {
+          "id": "log-39",
+          "sequence": 39,
+          "step": 1,
+          "stream": "stderr",
+          "text": "warning: field `stats` is never read --> crates/printer/src/summary.rs:71:5\n"
+        },
+        {
+          "id": "log-40",
+          "sequence": 40,
+          "step": 1,
+          "stream": "stderr",
+          "text": "   Compiling grep-searcher v0.1.14 (/work/crates/searcher)\n"
+        },
+        {
+          "id": "log-41",
+          "sequence": 41,
+          "step": 1,
+          "stream": "stderr",
+          "text": "error[E0308]: mismatched types\n   --> crates/searcher/src/line_buffer.rs:412:21\n    |\n412 |         self.roll(len);\n    |              ---- ^^^ expected `usize`, found `u32`\n"
+        },
+        {
+          "id": "log-42",
+          "sequence": 42,
+          "step": 1,
+          "stream": "stderr",
+          "text": "help: you can convert a `u32` to a `usize` and panic if the converted value doesn't fit\n"
+        },
+        {
+          "id": "log-43",
+          "sequence": 43,
+          "step": 1,
+          "stream": "stderr",
+          "text": "error: could not compile `grep-searcher` (lib) due to 1 previous error; 1 warning emitted\n"
+        },
+        {
+          "id": "log-44",
+          "sequence": 44,
+          "step": 1,
+          "stream": "stderr",
+          "text": "warning: build failed, waiting for other jobs to finish...\n"
+        },
+        {
+          "id": "log-45",
+          "sequence": 45,
+          "step": 1,
+          "stream": "stdout",
+          "text": "sccache: bucket credential *** left unused\n"
+        }
+      ],
+      "complete": true,
+      "gaps": [],
+      "gaps_truncated": false,
+      "scanned_frames": 9
+    },
+    "bounds": {
+      "budget_bytes": 65536,
+      "bytes": 2538,
+      "truncated": false,
+      "omitted_diagnostics": 0,
+      "omitted_log_frames": 0
+    },
+    "redaction": {
+      "values": 1,
+      "value_rewrites": 1,
+      "pattern_replacements": 0,
+      "patterns": []
+    }
+  },
+  "error_evidence": [
+    "log-41",
+    "diag-1"
+  ],
+  "canaries": [
+    "canary-sccache-key-0c7be4a91d52"
+  ]
+}

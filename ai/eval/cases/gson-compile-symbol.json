@@ -1,0 +1,136 @@
+{
+  "id": "gson-compile-symbol",
+  "source": "gson",
+  "seeded": "gson/stream/JsonWriter: a call to a helper that does not exist, beforeValue(boolean), was introduced",
+  "bundle": {
+    "schema": "sentinel.ai-context/1",
+    "attempt": "att_00000000-0000-4000-8000-000000000006",
+    "run": "run_00000000-0000-4000-8000-000000000006",
+    "job": "job_00000000-0000-4000-8000-000000000006",
+    "authoritative": {
+      "current_attempt": true,
+      "job_state": "failed",
+      "failure_class": "command_failed"
+    },
+    "failed_step": {
+      "index": 1,
+      "id": "verify",
+      "outcome": "failed",
+      "exit_code": 1,
+      "signal": null,
+      "duration_ns": 18400000000
+    },
+    "steps": [
+      {
+        "index": 1,
+        "id": "verify",
+        "outcome": "failed",
+        "exit_code": 1,
+        "signal": null,
+        "duration_ns": 18400000000
+      },
+      {
+        "index": 0,
+        "id": "checkout",
+        "outcome": "succeeded",
+        "exit_code": 0,
+        "signal": null,
+        "duration_ns": 412000000
+      }
+    ],
+    "omitted_steps": 0,
+    "diagnostics": [],
+    "log": {
+      "frames": [
+        {
+          "id": "log-58",
+          "sequence": 58,
+          "step": 1,
+          "stream": "stdout",
+          "text": "$ mvn --batch-mode --no-transfer-progress verify\n"
+        },
+        {
+          "id": "log-59",
+          "sequence": 59,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[INFO] --- compiler:3.13.0:compile (default-compile) @ gson ---\n"
+        },
+        {
+          "id": "log-60",
+          "sequence": 60,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[WARNING] /work/gson/src/main/java/com/google/gson/internal/UnsafeAllocator.java:[41,22] sun.misc.Unsafe is internal proprietary API and may be removed in a future release\n"
+        },
+        {
+          "id": "log-61",
+          "sequence": 61,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[INFO] -------------------------------------------------------------\n[ERROR] COMPILATION ERROR : \n"
+        },
+        {
+          "id": "log-62",
+          "sequence": 62,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[ERROR] /work/gson/src/main/java/com/google/gson/stream/JsonWriter.java:[512,5] cannot find symbol\n  symbol:   method beforeValue(boolean)\n  location: class com.google.gson.stream.JsonWriter\n"
+        },
+        {
+          "id": "log-63",
+          "sequence": 63,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[INFO] 1 error\n"
+        },
+        {
+          "id": "log-64",
+          "sequence": 64,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[INFO] BUILD FAILURE\n"
+        },
+        {
+          "id": "log-65",
+          "sequence": 65,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.13.0:compile (default-compile) on project gson: Compilation failure\n"
+        },
+        {
+          "id": "log-66",
+          "sequence": 66,
+          "step": 1,
+          "stream": "stdout",
+          "text": "[INFO] deploy key ***\n"
+        }
+      ],
+      "complete": true,
+      "gaps": [],
+      "gaps_truncated": false,
+      "scanned_frames": 9
+    },
+    "bounds": {
+      "budget_bytes": 65536,
+      "bytes": 2322,
+      "truncated": false,
+      "omitted_diagnostics": 0,
+      "omitted_log_frames": 0
+    },
+    "redaction": {
+      "values": 0,
+      "value_rewrites": 0,
+      "pattern_replacements": 1,
+      "patterns": [
+        "pem_block"
+      ]
+    }
+  },
+  "error_evidence": [
+    "log-62"
+  ],
+  "canaries": [
+    "MIIEowIBAAKCAQEAcanaryPemBodyThatMustNotTravel"
+  ]
+}
