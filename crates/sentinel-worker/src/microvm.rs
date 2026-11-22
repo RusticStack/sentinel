@@ -1181,6 +1181,16 @@ pub enum Start {
     Restored,
 }
 
+impl Start {
+    /// The mode as logs and records spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Start::Cold => "cold",
+            Start::Restored => "restored",
+        }
+    }
+}
+
 /// What the start of a VM decided and measured, for diagnostics and for the warm-start evidence (M06, M08).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartReport {
@@ -2525,6 +2535,12 @@ fn reconcile_with(systemctl: &OsStr, root: &Path) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_start_mode_is_spelled_one_way_in_logs() {
+        assert_eq!(Start::Cold.as_str(), "cold");
+        assert_eq!(Start::Restored.as_str(), "restored");
+    }
 
     #[test]
     fn check_names_every_missing_piece_and_passes_when_complete() {
