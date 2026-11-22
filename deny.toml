@@ -52,9 +52,12 @@ version = 2
 yanked = "warn"
 ignore = [
     # Bundled SQLite before 3.54.0 can return stale page-cache memory when it opens a
-    # database with a crafted `-wal` sibling. The vector is local: Sentinel opens only
-    # databases under its own owner-only data directory. The fix is rusqlite 0.41 or
+    # database with a crafted `-wal` sibling. The vector is local: the controller opens
+    # only databases under its own owner-only data directory, and the host-local
+    # `admin backup verify` and `admin restore` open a snapshot from a backup source the
+    # operator names, so a source writable by another user can carry a crafted sibling
+    # until the upgrade; keep backup sources owner-only. The fix is rusqlite 0.41 or
     # newer (libsqlite3-sys 0.39), a store dependency change that needs the full suite
     # on the verification hosts; remove this entry with that upgrade.
-    { id = "RUSTSEC-2026-0459", reason = "local vector, own data directory only; fixed by the rusqlite 0.41 upgrade" },
+    { id = "RUSTSEC-2026-0459", reason = "local vector: own data directory, plus operator-named backup sources for admin backup verify/restore; fixed by the rusqlite 0.41 upgrade" },
 ]
