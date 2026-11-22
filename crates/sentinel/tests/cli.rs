@@ -399,6 +399,24 @@ placement_order = '{order}'",
                 "job_network = 'egress'\n[runner]\nimage = '{pinned}'\nactions_address = '10.0.2.2'"
             ));
             assert_eq!(code, Some(0), "{stderr}");
+            // A runner's sandbox is one of two words, and a guest needs the kernel and agent it boots.
+            let (code, stderr) = check(&format!(
+                "job_network = 'egress'\n[runner]\nimage = '{pinned}'\nactions_address = '10.0.2.2'\nsandbox = 'firecracker'"
+            ));
+            assert_eq!(code, Some(2));
+            assert!(
+                stderr.contains("runner.sandbox must be \"container\" or \"microvm\""),
+                "{stderr}"
+            );
+            let (code, stderr) = check(&format!(
+                "job_network = 'egress'\n[runner]\nimage = '{pinned}'\nactions_address = '10.0.2.2'\nsandbox = 'microvm'"
+            ));
+            assert_eq!(code, Some(2));
+            assert!(stderr.contains("needs the [microvm] section"), "{stderr}");
+            let (code, stderr) = check(&format!(
+                "job_network = 'egress'\n[runner]\nimage = '{pinned}'\nactions_address = '10.0.2.2'\nsandbox = 'container'"
+            ));
+            assert_eq!(code, Some(0), "{stderr}");
         }
         assert!(!data.exists());
     }

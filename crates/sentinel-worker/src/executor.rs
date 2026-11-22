@@ -72,6 +72,7 @@ pub enum Notice {
     },
     ShutDown {
         ended: usize,
+        /// Attempts and runner sandboxes still up when the grace ran out.
         left: usize,
         handed_back: usize,
     },
@@ -617,6 +618,8 @@ pub struct Inner {
     mirrors: Option<crate::checkout::Mirrors>,
     spool: Arc<SpoolSpace>,
     admission_floor: std::sync::atomic::AtomicU64,
+    /// Runner sandboxes started and not yet destroyed; a shutdown waits for them as it does for attempts.
+    sandboxes: std::sync::atomic::AtomicUsize,
     measured_disk: std::sync::atomic::AtomicBool,
     refusal_noted: Mutex<Option<Instant>>,
     /// What this worker states about runner mode, set once at start (no image: no runners at all).
@@ -847,6 +850,7 @@ impl Executor {
                 runners: HashMap::new(),
             }),
             admission_floor: std::sync::atomic::AtomicU64::new(floor),
+            sandboxes: std::sync::atomic::AtomicUsize::new(0),
             measured_disk: std::sync::atomic::AtomicBool::new(false),
             refusal_noted: Mutex::new(None),
             runner_policy: std::sync::OnceLock::new(),
@@ -926,17 +930,20 @@ impl Executor {
                 });
             }
         });
+        // A runner's sandbox gets the same grace: its lifetime bound is enforced from this process, so a
+        // guest or container left behind once the worker exits would have none.
         let until = Instant::now() + grace;
-        let left = loop {
+        let (left, sandboxes) = loop {
             let left = self.state().live.len();
-            if left == 0 || Instant::now() >= until {
-                break left;
+            let sandboxes = self.sandboxes.load(Ordering::Acquire);
+            if (left == 0 && sandboxes == 0) || Instant::now() >= until {
+                break (left, sandboxes);
             }
             thread::sleep(Duration::from_millis(20));
         };
         (self.notify)(Notice::ShutDown {
             ended: live.len() - left.min(live.len()),
-            left,
+            left: left + sandboxes,
             handed_back,
         });
     }
@@ -1234,11 +1241,11 @@ impl Inner {
     fn run_sandbox(
         &self,
         lease: sentinel_core::RunnerLeaseId,
-        plan: crate::runner::Plan,
+        plan: crate::runner::Sandboxed,
         mut config: Vec<u8>,
         cancel: Arc<AtomicBool>,
     ) {
-        let outcome = plan.start(&config, &cancel);
+        let outcome = plan.start(&config, &cancel, &|_| {});
         wipe(&mut config);
         let removed = plan.destroy();
         match (outcome, removed) {
@@ -2175,6 +2182,11 @@ impl LinkExecutor for Executor {
         if state.draining || state.runners.len() >= MAX_RUNNERS || state.reporter.is_none() {
             return false;
         }
+        // A microVM runner on a worker whose microVM setup is absent or failed its check would be
+        // registered at GitHub and never come online, so it is declined before anything is asked for.
+        if policy.sandbox == crate::runner::Sandbox::Microvm && state.runtime.microvm.is_none() {
+            return false;
+        }
         state.runners.insert(
             lease.lease,
             HeldRunner {
@@ -2193,9 +2205,14 @@ impl LinkExecutor for Executor {
     /// input, and the bytes are wiped when the runner ends. A configuration this worker cannot use
     /// is wiped here and the lease is dropped, so nothing can start later from it.
     fn runner_config(&self, lease: [u8; 16], mut config: Vec<u8>) {
-        let (image, guard, address) = match self.runner_policy.get() {
+        let (image, guard, address, sandbox) = match self.runner_policy.get() {
             Some(policy) => match &policy.image {
-                Some(image) => (image.clone(), policy.guard.clone(), policy.actions),
+                Some(image) => (
+                    image.clone(),
+                    policy.guard.clone(),
+                    policy.actions,
+                    policy.sandbox,
+                ),
                 None => {
                     wipe(&mut config);
                     return;
@@ -2221,6 +2238,10 @@ impl LinkExecutor for Executor {
         };
         let state = self.state();
         let network = state.network;
+        let setup = match sandbox {
+            crate::runner::Sandbox::Container => None,
+            crate::runner::Sandbox::Microvm => state.runtime.microvm.clone(),
+        };
         // What the sandbox is built from, read under the lock and then carried: the configuration is
         // spent in one go, so nothing below needs a borrow of the held set.
         let (cpu_millis, memory_bytes, scope) = match state.runners.get(&lease) {
@@ -2272,18 +2293,26 @@ impl LinkExecutor for Executor {
             address,
             anchor: crate::runner::Actions::anchor_of(&dir),
         };
-        let plan = match crate::runner::Plan::new(
-            &self.root,
-            self.worker,
-            id,
-            &image,
-            limits,
-            &crate::runner::Grant {
-                network,
-                guard: &guard,
-                actions: Some(&wiring),
-            },
-        ) {
+        let grant = crate::runner::Grant {
+            network,
+            guard: &guard,
+            actions: Some(&wiring),
+        };
+        let built = match (sandbox, setup) {
+            (crate::runner::Sandbox::Container, _) => {
+                crate::runner::Plan::new(&self.root, self.worker, id, &image, limits, &grant)
+                    .map(crate::runner::Sandboxed::Container)
+            }
+            (crate::runner::Sandbox::Microvm, Some(setup)) => {
+                crate::runner::guest::Plan::new(&self.root, setup, id, &image, limits, &grant)
+                    .map(crate::runner::Sandboxed::Microvm)
+            }
+            // The setup went away between the offer and the configuration: nothing to start in.
+            (crate::runner::Sandbox::Microvm, None) => Err(crate::Error::Preparation(
+                "runner sandbox: no microVM setup".into(),
+            )),
+        };
+        let plan = match built {
             Ok(plan) => plan,
             // A sandbox this worker cannot build is a lease it cannot serve: the configuration is
             // wiped and the lease dropped, so nothing can start from it later.
@@ -2304,12 +2333,14 @@ impl LinkExecutor for Executor {
             held.running = Some(Arc::clone(&cancel));
             held.actions = Some(Arc::clone(&actions));
         }
+        self.sandboxes.fetch_add(1, Ordering::AcqRel);
         let inner = Arc::clone(&self.0);
         let spawned = thread::Builder::new()
             .name(plan.name().to_owned())
             .spawn(move || {
                 let _endpoint = actions;
-                inner.run_sandbox(id, plan, config, cancel)
+                inner.run_sandbox(id, plan, config, cancel);
+                inner.sandboxes.fetch_sub(1, Ordering::AcqRel);
             });
         if spawned.is_err() {
             // No thread, no runner: the configuration is wiped and the lease is dropped, so the
@@ -2318,6 +2349,7 @@ impl LinkExecutor for Executor {
                 lease: id,
                 error: "the worker could not start a thread for the runner".to_owned(),
             });
+            self.sandboxes.fetch_sub(1, Ordering::AcqRel);
             self.state().runners.remove(&lease);
         }
     }

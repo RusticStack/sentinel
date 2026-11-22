@@ -24,6 +24,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     io::{self, BufRead, BufReader, Read, Write},
+    net::Ipv4Addr,
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
         net::UnixStream,
@@ -1099,6 +1100,8 @@ impl Read for DataIn<'_> {
     }
 }
 
+/// The most one [`Vm::deliver_secret_file`] carries: with its archive framing it stays inside one data chunk.
+const MAX_SECRET_FILE_BYTES: usize = agent::CHUNK - 4096;
 /// Bytes the guest may stream beyond its declared disk: tar headers and padding, and the end of the archive.
 const STREAM_SLACK: u64 = 64 << 20;
 
@@ -1246,6 +1249,8 @@ struct Plan<'a> {
     dir: &'a Path,
     unit: &'a str,
     cancel: &'a AtomicBool,
+    /// The one endpoint of the worker a guest granted egress is served on ([`Vm::start_serving`]).
+    serve: Option<(Ipv4Addr, u16)>,
 }
 
 impl Plan<'_> {
@@ -1256,7 +1261,11 @@ impl Plan<'_> {
         }
         let host = net::host_addresses()
             .map_err(|e| Error::Preparation(format!("the host's addresses: {e}")))?;
-        Ok(Some(net::Policy::new(&host, &self.setup.guard).rules()))
+        let policy = net::Policy::new(&host, &self.setup.guard);
+        Ok(Some(match self.serve {
+            Some((address, port)) => policy.serving(address, port).rules(),
+            None => policy.rules(),
+        }))
     }
 
     /// Starts the VMM in its scope, in a chroot that is `dir` with the kernel, the initramfs, the guest image and
@@ -1650,6 +1659,28 @@ impl Vm {
         network: Network,
         cancel: &AtomicBool,
     ) -> Result<Vm> {
+        Vm::start_serving(
+            root, setup, attempt, image, limits, workspace, mounts, store, network, None, cancel,
+        )
+    }
+
+    /// [`Vm::start_canceled`] for a guest the worker itself serves: with egress, `serve` is the one address
+    /// and TCP port of the host the guest may reach (a runner guest's cache and artifact endpoint), admitted
+    /// ahead of the refusal of every host address. Without egress it changes nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_serving(
+        root: &Path,
+        setup: &Setup,
+        attempt: AttemptId,
+        image: &str,
+        limits: Limits,
+        workspace: &Path,
+        mounts: &[Mount],
+        store: &Store,
+        network: Network,
+        serve: Option<(Ipv4Addr, u16)>,
+        cancel: &AtomicBool,
+    ) -> Result<Vm> {
         if cancel.load(Ordering::Acquire) {
             return Err(canceled_start());
         }
@@ -1659,7 +1690,8 @@ impl Vm {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir)?;
         let started = Vm::boot(
-            root, setup, attempt, image, limits, workspace, mounts, store, network, cancel, &dir,
+            root, setup, attempt, image, limits, workspace, mounts, store, network, serve, cancel,
+            &dir,
         );
         if started.is_err() {
             let _ = fs::remove_dir_all(&dir);
@@ -1678,6 +1710,7 @@ impl Vm {
         mounts: &[Mount],
         store: &Store,
         network: Network,
+        serve: Option<(Ipv4Addr, u16)>,
         cancel: &AtomicBool,
         dir: &Path,
     ) -> Result<Vm> {
@@ -1702,6 +1735,7 @@ impl Vm {
             dir,
             unit: &unit,
             cancel,
+            serve,
         };
         let began = Instant::now();
         let mut report = StartReport {
@@ -1915,6 +1949,43 @@ impl Vm {
             self.client.put_dir(host, &guest_path(container), &[])?;
         }
         Ok(())
+    }
+
+    /// Puts one secret into the guest's first secret directory as `name`, readable by root only, straight from
+    /// memory: the bytes never touch a host file, and the guest keeps them on a tmpfs. The archive this builds
+    /// around them is zeroed before it is freed (the encoded frame is freed as every frame is). [`Vm::retract_secrets`] removes the file.
+    pub fn deliver_secret_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        // One frame carries the whole archive: the entry, its padding and the two closing blocks.
+        if bytes.len() > MAX_SECRET_FILE_BYTES {
+            return Err(Error::Preparation(
+                "a secret file too large to deliver".into(),
+            ));
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o400);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_entry_type(tar::EntryType::Regular);
+        let mut builder = tar::Builder::new(Vec::with_capacity(bytes.len() + 2048));
+        let archive = builder
+            .append_data(&mut header, name, bytes)
+            .and_then(|()| builder.into_inner());
+        let mut frame = match archive {
+            Ok(archive) => Request::Data(archive),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        self.client.send(&Request::Put {
+            root: guest_path(agent::SECRET_MOUNTS[0]),
+        })?;
+        let sent = self.client.send(&frame);
+        if let Request::Data(archive) = &mut frame {
+            archive.fill(0);
+        }
+        // End the stream even after a failed frame, so the agent's next frame is a request.
+        self.client.send(&Request::End)?;
+        sent?;
+        self.client.expect_done("put secret")
     }
 
     /// Puts the host's output directory into the guest, at the path the container would mount it at.

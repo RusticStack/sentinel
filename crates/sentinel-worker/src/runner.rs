@@ -29,6 +29,8 @@
 //!   the image's environment and this sandbox carry no secret, so a job's secrets exist only inside
 //!   the runner process for the job's life ([docs](../../../docs/runner-mode.md#actions-secrets-are-githubs)).
 
+pub mod guest;
+
 use std::{
     fmt::Write as _,
     fs,
@@ -147,6 +149,73 @@ pub struct Policy {
     /// states it (the sandbox network's host address). Absent, this worker declines every runner lease:
     /// a runner whose cache and artifacts would silently go to GitHub's storage is not one AR06 serves.
     pub actions: Option<Ipv4Addr>,
+    /// What a runner runs in: a rootless container by default, or a Firecracker guest (AR04).
+    pub sandbox: Sandbox,
+}
+
+/// The sandbox a worker's runners run in, as `[runner] sandbox` states it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Sandbox {
+    /// A rootless Podman container: the job's own containers need a runtime of their own.
+    #[default]
+    Container,
+    /// A Firecracker guest with its own kernel and Docker daemon, so `container:` jobs and service
+    /// containers run inside it. Needs the worker's `[microvm]` setup on a KVM host.
+    Microvm,
+}
+
+impl Sandbox {
+    pub fn parse(text: &str) -> Option<Sandbox> {
+        match text {
+            "container" => Some(Sandbox::Container),
+            "microvm" => Some(Sandbox::Microvm),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sandbox::Container => "container",
+            Sandbox::Microvm => "microvm",
+        }
+    }
+}
+
+/// One runner's sandbox as the policy chose it, so the executor drives both the same way.
+#[derive(Debug)]
+pub enum Sandboxed {
+    Container(Plan),
+    Microvm(guest::Plan),
+}
+
+impl Sandboxed {
+    pub fn name(&self) -> &str {
+        match self {
+            Sandboxed::Container(plan) => plan.name(),
+            Sandboxed::Microvm(plan) => plan.name(),
+        }
+    }
+
+    /// Starts the runner with its configuration and waits for it to end. `started` hears how a guest
+    /// came up; a container has no start mode to report and never calls it.
+    pub fn start(
+        &self,
+        config: &[u8],
+        cancel: &AtomicBool,
+        started: &dyn Fn(&crate::microvm::StartReport),
+    ) -> Result<Exit> {
+        match self {
+            Sandboxed::Container(plan) => plan.start(config, cancel),
+            Sandboxed::Microvm(plan) => plan.start(config, cancel, started),
+        }
+    }
+
+    pub fn destroy(&self) -> Result<()> {
+        match self {
+            Sandboxed::Container(plan) => plan.destroy(),
+            Sandboxed::Microvm(plan) => plan.destroy(),
+        }
+    }
 }
 
 impl Policy {
@@ -753,6 +822,7 @@ mod tests {
             image: Some(image()),
             guard: net::Guard::default(),
             actions: Some(Ipv4Addr::new(10, 0, 2, 2)),
+            sandbox: Sandbox::Container,
         };
         assert!(named.admits(4_000, 8 << 30));
         assert!(!named.admits(0, 8 << 30));
@@ -764,6 +834,17 @@ mod tests {
             ..named
         };
         assert!(!no_endpoint.admits(4_000, 8 << 30));
+    }
+
+    #[test]
+    fn the_runner_sandbox_is_a_container_unless_a_microvm_is_named() {
+        assert_eq!(Policy::default().sandbox, Sandbox::Container);
+        for sandbox in [Sandbox::Container, Sandbox::Microvm] {
+            assert_eq!(Sandbox::parse(sandbox.as_str()), Some(sandbox));
+        }
+        for other in ["", "Microvm", "vm", "firecracker", "native"] {
+            assert_eq!(Sandbox::parse(other), None, "{other}");
+        }
     }
 
     #[test]

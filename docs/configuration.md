@@ -346,6 +346,16 @@ actions_address = "10.0.2.2"
   10.0.2.2` otherwise. It is required for a worker to serve a runner: a worker that states the image
   and no address declines every lease, because its runners' `actions/cache` and `upload-artifact`
   traffic would otherwise land in GitHub's storage.
+- **`sandbox` is what a runner runs in**: `"container"` (the default) is the rootless container above;
+  `"microvm"` is one Firecracker guest per lease, booted from a runner guest image
+  ([runner mode](runner-mode.md#a-runner-in-a-microvm)), so `container:` jobs, `services:` and Docker
+  actions have a Docker daemon of their own inside the guest. Any other value is refused as
+  `runner.sandbox must be "container" or "microvm"`, and `"microvm"` without the
+  [`[microvm]`](#configuration-contract) section as `runner.sandbox = "microvm" needs the [microvm] section`.
+  A worker whose microVM setup is present but did not pass its check at start logs
+  `runner_microvm_unavailable` and declines every runner offer, because a runner registered at GitHub
+  with nothing to boot it in would never come online. With `"microvm"`, `image` names the runner guest
+  image rather than the container one.
 - These keys apply to the worker role only; `[runner]` beside the server role's configuration is
   refused. An older worker refuses them as unknown rather than ignoring them.
 
