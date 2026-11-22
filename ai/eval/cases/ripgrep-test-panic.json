@@ -1,0 +1,178 @@
+{
+  "id": "ripgrep-test-panic",
+  "source": "ripgrep",
+  "seeded": "crates/searcher: the line terminator is no longer stripped before a multiline match is reported, so regression test r1891 sees a trailing newline",
+  "bundle": {
+    "schema": "sentinel.ai-context/1",
+    "attempt": "att_00000000-0000-4000-8000-000000000003",
+    "run": "run_00000000-0000-4000-8000-000000000003",
+    "job": "job_00000000-0000-4000-8000-000000000003",
+    "authoritative": {
+      "current_attempt": true,
+      "job_state": "failed",
+      "failure_class": "test_failure"
+    },
+    "failed_step": {
+      "index": 2,
+      "id": "test",
+      "outcome": "failed",
+      "exit_code": 101,
+      "signal": null,
+      "duration_ns": 131400000000
+    },
+    "steps": [
+      {
+        "index": 2,
+        "id": "test",
+        "outcome": "failed",
+        "exit_code": 101,
+        "signal": null,
+        "duration_ns": 131400000000
+      },
+      {
+        "index": 0,
+        "id": "checkout",
+        "outcome": "succeeded",
+        "exit_code": 0,
+        "signal": null,
+        "duration_ns": 412000000
+      }
+    ],
+    "omitted_steps": 0,
+    "diagnostics": [
+      {
+        "id": "diag-1",
+        "severity": "error",
+        "failure_class": "test_failure",
+        "code": null,
+        "step": {
+          "index": 2,
+          "key": "test"
+        },
+        "source": {
+          "path": "tests/regression.rs",
+          "line": 1012,
+          "column": 5
+        },
+        "test": {
+          "name": "regression::r1891",
+          "package": "ripgrep",
+          "class_name": null
+        },
+        "evidence": [
+          {
+            "sequence": 4126,
+            "offset": 0,
+            "end_sequence": 4126
+          }
+        ],
+        "message": "thread 'regression::r1891' panicked at tests/regression.rs:1012:5: assertion `left == right` failed"
+      }
+    ],
+    "log": {
+      "frames": [
+        {
+          "id": "log-4120",
+          "sequence": 4120,
+          "step": 2,
+          "stream": "stdout",
+          "text": "$ cargo test --verbose --workspace\n"
+        },
+        {
+          "id": "log-4121",
+          "sequence": 4121,
+          "step": 2,
+          "stream": "stderr",
+          "text": "warning: unused import: `std::fmt` --> crates/printer/src/util.rs:3:5\n"
+        },
+        {
+          "id": "log-4122",
+          "sequence": 4122,
+          "step": 2,
+          "stream": "stdout",
+          "text": "test regression::r1878 ... ok\n"
+        },
+        {
+          "id": "log-4123",
+          "sequence": 4123,
+          "step": 2,
+          "stream": "stdout",
+          "text": "test regression::r1891 ... FAILED\n"
+        },
+        {
+          "id": "log-4124",
+          "sequence": 4124,
+          "step": 2,
+          "stream": "stdout",
+          "text": "test regression::r1961 ... ok\n"
+        },
+        {
+          "id": "log-4125",
+          "sequence": 4125,
+          "step": 2,
+          "stream": "stdout",
+          "text": "failures:\n\n---- regression::r1891 stdout ----\n"
+        },
+        {
+          "id": "log-4126",
+          "sequence": 4126,
+          "step": 2,
+          "stream": "stdout",
+          "text": "thread 'regression::r1891' panicked at tests/regression.rs:1012:5:\nassertion `left == right` failed\n  left: \"1:foo\n\n\"\n right: \"1:foo\n\"\n"
+        },
+        {
+          "id": "log-4127",
+          "sequence": 4127,
+          "step": 2,
+          "stream": "stdout",
+          "text": "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+        },
+        {
+          "id": "log-4128",
+          "sequence": 4128,
+          "step": 2,
+          "stream": "stdout",
+          "text": "test result: FAILED. 341 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.83s\n"
+        },
+        {
+          "id": "log-4129",
+          "sequence": 4129,
+          "step": 2,
+          "stream": "stderr",
+          "text": "error: test failed, to rerun pass `-p ripgrep --test integration`\n"
+        },
+        {
+          "id": "log-4130",
+          "sequence": 4130,
+          "step": 2,
+          "stream": "stdout",
+          "text": "CARGO_REGISTRY_TOKEN=*** (unused: no publish on a pilot)\n"
+        }
+      ],
+      "complete": true,
+      "gaps": [],
+      "gaps_truncated": false,
+      "scanned_frames": 11
+    },
+    "bounds": {
+      "budget_bytes": 65536,
+      "bytes": 2822,
+      "truncated": false,
+      "omitted_diagnostics": 0,
+      "omitted_log_frames": 0
+    },
+    "redaction": {
+      "values": 1,
+      "value_rewrites": 1,
+      "pattern_replacements": 0,
+      "patterns": []
+    }
+  },
+  "error_evidence": [
+    "log-4126",
+    "diag-1"
+  ],
+  "canaries": [
+    "canary-registry-token-e85d20b9f14a"
+  ]
+}
