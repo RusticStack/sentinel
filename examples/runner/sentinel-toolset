@@ -21,7 +21,7 @@ esac
 rows() {
   while IFS=$'\t' read -r tool version os row_arch _; do
     case $tool in '' | '#'*) continue ;; esac
-    [ "$os" = linux ] && [ "$row_arch" = "$arch" ] && printf '%s\t%s\n' "$tool" "$version"
+    if [ "$os" = linux ] && [ "$row_arch" = "$arch" ]; then printf '%s\t%s\n' "$tool" "$version"; fi
   done < "$manifest"
 }
 
