@@ -492,10 +492,48 @@ bundle is bounded and never the whole log; artifacts, caches, secrets and source
 not part of it ([above](#the-evidence-bundle)). An analysis expires with the attempt's logs,
 because the evidence it cites does.
 
+## Evaluation
+
+The analysis prompt is evaluated on a committed set of seeded failures, `ai/eval/cases/*.json`: two
+on each pilot (a failing test and a failing build on GitHub CLI, ripgrep and gson) and the X08
+fixture, whose failing line is the first thing in a 100 MiB log and so reaches the bundle only as a
+diagnostic, behind a window of noise, prompt-like instructions and a binary frame. A case is the
+`sentinel.ai-context/1` bundle of the failed attempt, the identifiers of the line with the actual
+error (`error_evidence`: citing any one is a hit) and the canary values the seeded log held and the
+bundle must not.
+
+`ai/src/evaluation.ts` serves each case through `serve` as a queued analysis request, with the
+controller in memory and every request body to the provider recorded, and scores:
+
+| Score | Meaning | Gate |
+|---|---|---|
+| `error_line_share` | cases whose analysis cites the actual error line, over all cases; an `unavailable` request cites nothing | may not fall below the baseline |
+| `citation_validity` | citations naming the bundle's own attempt and an identifier the bundle holds, over all citations | exactly 1 |
+| `canary_leaks` | occurrences in a recorded request body of a case's canary, or of a token prefix, key shape or PEM header | exactly 0 |
+| `cost_p95_micros` | nearest-rank p95 of the provider-reported cost of each completed analysis | at most 1.1x the baseline |
+| `latency_p95_ms` | nearest-rank p95 of one `serve` call, per completed analysis | at most 1.5x the baseline |
+
+A run is one `sentinel.ai-eval/1` record keyed by provider, model, prompt version and the set's
+digest; its baseline is the last record in `ai/eval/results.jsonl` with the same key, so a new
+model, a new prompt version or a changed set starts a baseline of its own and is held only to the
+two absolute gates. `node src/evaluate.ts <provider> [--write]` in `ai/` runs the set against the
+provider the environment configures, prints the record, exits 1 when the gate refuses it and with
+`--write` appends a passing record to `results.jsonl`, which is committed with the prompt or model
+change it measured. `ai/test/evaluation.test.mjs` checks the set, the scoring and the gate against
+the recording fake provider, and that every committed record passes the gate against the one before
+it.
+
+Not done, and why Y09 stays open: the cases are written by hand in the shape the controller serves,
+not captured from seeded runs on the pilots (Blocked by: the verification hosts), and
+`results.jsonl` is empty because no provider has been called (Blocked by: provider credentials for
+an evaluation run). The canary score here covers what the AI process sends; that the controller's
+bundle never holds a canary is `crates/sentinel-api/tests/ai_context.rs`.
+
 ## What is built and what is not
 
-A prompt registry and an evaluation set are Y09: the evaluation set is built from seeded failures on
-the pilots, and it does not exist yet. Two prompts ship, each with its version in every cache key —
+The evaluation set, its scoring and its gate are built ([Evaluation](#evaluation)); its cases are
+written in the bundle's shape rather than captured from pilot runs, and no measured record is
+committed yet. Two prompts ship, each with its version in every cache key —
 `analysis-1` for a failure analysis and `search-1` for the reads a question becomes. The features
 after Y10 — flaky-test summaries, migration suggestions, the read-only MCP tools that expose
 analyses — are [plan 16.6](../plan.md#166-ai-assistance) and [backlog Part 22](backlog.md).

@@ -1,0 +1,185 @@
+{
+  "id": "cli-test-assertion",
+  "source": "cli",
+  "seeded": "pkg/cmd/issue/list: the default state filter was changed from open to all, so the tty listing test sees one issue too many",
+  "bundle": {
+    "schema": "sentinel.ai-context/1",
+    "attempt": "att_00000000-0000-4000-8000-000000000001",
+    "run": "run_00000000-0000-4000-8000-000000000001",
+    "job": "job_00000000-0000-4000-8000-000000000001",
+    "authoritative": {
+      "current_attempt": true,
+      "job_state": "failed",
+      "failure_class": "test_failure"
+    },
+    "failed_step": {
+      "index": 1,
+      "id": "test",
+      "outcome": "failed",
+      "exit_code": 1,
+      "signal": null,
+      "duration_ns": 48211000000
+    },
+    "steps": [
+      {
+        "index": 1,
+        "id": "test",
+        "outcome": "failed",
+        "exit_code": 1,
+        "signal": null,
+        "duration_ns": 48211000000
+      },
+      {
+        "index": 0,
+        "id": "checkout",
+        "outcome": "succeeded",
+        "exit_code": 0,
+        "signal": null,
+        "duration_ns": 412000000
+      }
+    ],
+    "omitted_steps": 0,
+    "diagnostics": [
+      {
+        "id": "diag-1",
+        "severity": "error",
+        "failure_class": "test_failure",
+        "code": null,
+        "step": {
+          "index": 1,
+          "key": "test"
+        },
+        "source": {
+          "path": "pkg/cmd/issue/list/list_test.go",
+          "line": 88,
+          "column": null
+        },
+        "test": {
+          "name": "TestIssueList_tty",
+          "package": "github.com/cli/cli/v2/pkg/cmd/issue/list",
+          "class_name": null
+        },
+        "evidence": [
+          {
+            "sequence": 5,
+            "offset": 0,
+            "end_sequence": 5
+          }
+        ],
+        "message": "list_test.go:88: expected 3 issues in the listing, got 4"
+      }
+    ],
+    "log": {
+      "frames": [
+        {
+          "id": "log-1",
+          "sequence": 1,
+          "step": 1,
+          "stream": "stdout",
+          "text": "$ go test -race -tags=integration ./...\n"
+        },
+        {
+          "id": "log-2",
+          "sequence": 2,
+          "step": 1,
+          "stream": "stdout",
+          "text": "GH_TOKEN=*** go env GOFLAGS\n"
+        },
+        {
+          "id": "log-3",
+          "sequence": 3,
+          "step": 1,
+          "stream": "stdout",
+          "text": "ok  \tgithub.com/cli/cli/v2/pkg/cmd/issue/create\t0.611s\n"
+        },
+        {
+          "id": "log-4",
+          "sequence": 4,
+          "step": 1,
+          "stream": "stdout",
+          "text": "=== RUN   TestIssueList_tty\n"
+        },
+        {
+          "id": "log-5",
+          "sequence": 5,
+          "step": 1,
+          "stream": "stdout",
+          "text": "    list_test.go:88: expected 3 issues in the listing, got 4\n"
+        },
+        {
+          "id": "log-6",
+          "sequence": 6,
+          "step": 1,
+          "stream": "stdout",
+          "text": "--- FAIL: TestIssueList_tty (0.02s)\n"
+        },
+        {
+          "id": "log-7",
+          "sequence": 7,
+          "step": 1,
+          "stream": "stdout",
+          "text": "=== RUN   TestIssueList_web\n--- PASS: TestIssueList_web (0.00s)\n"
+        },
+        {
+          "id": "log-8",
+          "sequence": 8,
+          "step": 1,
+          "stream": "stdout",
+          "text": "FAIL\n"
+        },
+        {
+          "id": "log-9",
+          "sequence": 9,
+          "step": 1,
+          "stream": "stdout",
+          "text": "FAIL\tgithub.com/cli/cli/v2/pkg/cmd/issue/list\t0.412s\n"
+        },
+        {
+          "id": "log-10",
+          "sequence": 10,
+          "step": 1,
+          "stream": "stdout",
+          "text": "ok  \tgithub.com/cli/cli/v2/pkg/cmd/issue/view\t0.377s\n"
+        },
+        {
+          "id": "log-11",
+          "sequence": 11,
+          "step": 1,
+          "stream": "stderr",
+          "text": "warning: no packages being tested depend on matches for pattern ./script/...\n"
+        },
+        {
+          "id": "log-12",
+          "sequence": 12,
+          "step": 1,
+          "stream": "stdout",
+          "text": "FAIL\n"
+        }
+      ],
+      "complete": true,
+      "gaps": [],
+      "gaps_truncated": false,
+      "scanned_frames": 12
+    },
+    "bounds": {
+      "budget_bytes": 65536,
+      "bytes": 2638,
+      "truncated": false,
+      "omitted_diagnostics": 0,
+      "omitted_log_frames": 0
+    },
+    "redaction": {
+      "values": 1,
+      "value_rewrites": 1,
+      "pattern_replacements": 0,
+      "patterns": []
+    }
+  },
+  "error_evidence": [
+    "log-5",
+    "diag-1"
+  ],
+  "canaries": [
+    "canary-gh-token-4b1e9d7a02c6"
+  ]
+}
