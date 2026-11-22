@@ -903,6 +903,48 @@ fn the_inventory_holds_names_and_never_values() {
     assert!(!rendered.contains("example.invalid"), "{rendered}");
 }
 
+/// ripgrep's CI declares `TARGET_FLAGS:` with no value and fills it in a later step.
+#[test]
+fn an_env_entry_with_no_value_is_an_empty_variable() {
+    let text = concat!(
+        "on: [push]
+",
+        "env:
+",
+        "  TOP:
+",
+        "jobs:
+",
+        "  a:
+",
+        "    runs-on: ubuntu-latest
+",
+        "    env:
+",
+        "      TARGET_FLAGS:
+",
+        "      TARGET_DIR: ./target
+",
+        "    steps:
+",
+        "      - run: make
+",
+        "        env:
+",
+        "          STEP_FLAG:
+",
+    );
+    let inventory = analyze_files(
+        &[(".github/workflows/ci.yml".to_owned(), text.to_owned())],
+        DockerHosts::MicrovmGuests,
+    );
+    assert_eq!(inventory.workflows[0].env, ["TOP"]);
+    let job = &inventory.workflows[0].jobs[0];
+    assert_eq!(job.env, ["TARGET_FLAGS", "TARGET_DIR"]);
+    assert_eq!(job.steps[0].env, ["STEP_FLAG"]);
+    assert_eq!(classes(&inventory).len(), 1);
+}
+
 #[test]
 fn the_same_files_analyze_the_same_in_any_order() {
     let files = fixtures("valid");

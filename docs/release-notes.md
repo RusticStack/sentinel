@@ -1,10 +1,10 @@
 # Release notes: v0.1 (draft)
 
-**Status: draft, not published.** This page is prepared ahead of the release and is published only together with the final release-qualification record. Nothing here is a release claim. Until the release gates close, [Open blockers](#open-blockers) is the part of this page that matters most. The numbers in [Measured performance](#measured-performance) are copied from committed records in [`bench/`](../bench/) and carry their sample counts; when a record changes, this page changes with it.
+**Status: draft, not published.** This page is prepared ahead of the release and is published only together with the final release-qualification record. Nothing here is a release claim. Until the release gates close, [Open blockers](#open-blockers) is the part of this page that matters most. Sections whose content does not exist yet are kept as headed gaps marked **To fill**; a gap is filled from a committed record or stays a gap, never from an estimate. The numbers in [Measured performance](#measured-performance) are copied from committed records in [`bench/`](../bench/) and carry their sample counts; when a record changes, this page changes with it.
 
 ## What v0.1 is
 
-A self-hosted, Rust CI engine with a controller (`sentinel server`), workers (`sentinel worker`) and a command-line client (`sentinel`). v0.1 supports **native pipelines** (`.sentinel.yml`) on **Linux workers running rootless Podman**, on x86_64 and arm64. GitHub Actions runner mode, microVM execution and Windows workers are not part of the v0.1 support set; their real state is listed [below](#support-matrix).
+A self-hosted, Rust CI engine with a controller (`sentinel server`), workers (`sentinel worker`) and a command-line client (`sentinel`). v0.1 supports **native pipelines** (`.sentinel.yml`) on **Linux workers running rootless Podman**, on x86_64 and arm64. GitHub Actions runner mode, microVM execution and Windows workers are not part of the v0.1 support set; their real state is listed [below](#support-matrix) and, in full, in [support limits](support-limits.md). The path from an empty host to a first run is [onboarding](onboarding.md).
 
 ## Support matrix
 
@@ -12,14 +12,14 @@ A self-hosted, Rust CI engine with a controller (`sentinel server`), workers (`s
 |---|---|---|
 | Native pipelines, Linux, rootless Podman worker | Supported target. Verified on the x86_64 and arm64 Linux verification hosts for the pieces named in [releasing](releasing.md#verification-record) (packages, units, container, local operation) | End-to-end release qualification is not yet recorded; see [qualification](qualification.md) and [Open blockers](#open-blockers) |
 | Controller and worker packages | x86_64 and arm64 Linux archives with a digest manifest, license inventory and manifest verifier | [releasing](releasing.md) |
-| Deployment | systemd units, container and Podman Quadlet examples, nginx and Caddy configurations, fully local operation without network | [deployment](deployment.md) |
+| Deployment | systemd units, container and Podman Quadlet examples for the controller, the web interface and a worker, nginx and Caddy configurations, fully local operation without network. The web container example is checked by parsing only | [deployment](deployment.md#the-shipped-examples), [onboarding](onboarding.md) |
 | Git sources | GitHub App ingress and checks, and a generic Git remote through a hook | [sources](sources.md), [generic Git verification](generic-git-verification.md) |
 | Caches, secrets, tenants, OAuth CLI and MCP | Implemented; revalidation continues in the correctness pass | Per-area tests listed in [qualification](qualification.md#stages) |
 | Linux microVMs (Firecracker) | **Not a v0.1 support claim.** The executor and its gated tests exist, the x86_64 worker package carries the pinned Firecracker, guest kernel and agent, and `worker --check` reports each missing piece. Boot-only measurements exist ([`bench/m02-boot.jsonl`](../bench/m02-boot.jsonl)). No run closes the microVM executor's end-to-end gate, and per-attempt snapshot restore and microVM network policy are not verified | Needs a KVM host; hosts without KVM keep rootless Podman |
-| GitHub Actions runner mode | **Not implemented.** There is no runner provisioning code | Planned after v0.1 |
+| GitHub Actions runner mode | **Not a v0.1 support claim.** Intake, provisioning and a Linux runner sandbox on rootless Podman exist; the sandbox's egress gate, microVM and Windows runners and every runner-mode measurement are open ([runner mode](runner-mode.md#what-this-release-verifies-and-what-it-cannot)) | After v0.1 ([backlog](backlog.md)) |
 | Windows | The CLI is packaged for Windows. **No Windows worker or Windows job execution exists**; a job that requires `runs_on.os: windows` is refused with an explanation by placement | Planned after v0.1 |
 | Hostile fork pull requests | Not supported. A fork pull request is ignored. Rootless containers alone are not a sufficient boundary | Needs the microVM pool |
-| Web interface | Being replaced; not described here | |
+| Web interface | Optional separate process (`sentinel-web`); the controller, CLI and MCP work without it. Its container example has not been built or started on a verification host | [web interface](web-ui.md#known-limits), [deployment](deployment.md#what-was-verified) |
 
 ## Measured performance
 
@@ -51,6 +51,20 @@ Cold samples include network dependency downloads.
 
 The Sentinel and baseline columns are measured on different clocks (event intake to run finished, and push to last job completed). They are listed side by side for context and are **not** a ratio: no speedup is claimed from them. A cached-test variant of the cli baseline ([`bench/b01a-github-cli-cached-tests.jsonl`](../bench/b01a-github-cli-cached-tests.jsonl)) is a different workload condition and is not mixed into the table.
 
+### Figures still to record
+
+**To fill.** None of these exists; each row is replaced by a table copied from its committed record when the wave closes, and is published as unmet or blocked otherwise.
+
+| Figure | State | Produced by |
+|---|---|---|
+| Latency budgets on the final tree (B03, B03a, B03b) | Not measured on the final tree | Wave 2 |
+| Critical-path profile and cache matrix (B04, B04a, B05) | Not measured; B05 has no result | Wave 2 |
+| Backup drill at the recovery objective (R04), idle resource use (R06) | Not measured | Wave 2 |
+| microVM end to end, snapshot restore and overhead against rootless Podman (M04, M06, M08) | Not measured | Wave 3 |
+| Fleet reliability and load (Q09, B09), host management (Q11 to Q13) | Not measured on real workers | Wave 4 |
+| Pilot parity (B10) | No committed record | Wave 5 |
+| Sentinel p95 ÷ Blacksmith p95 (B11) | Blocked by: Blacksmith benchmark access (X1) | Wave 5 |
+
 ## Claims this release does not make
 
 - **No sub-minute claim.** The absolute target (warm required-check p95 below 60 s against a baseline of at least 300 s on the same hardware) is **unmet**: the largest recorded baselines are 109 s (cli), 88 s (gson) and 30 s (ripgrep), all below 300 s, and the cli warm p95 above is 64.08 s. The threshold and workloads are not changed to fit.
@@ -70,9 +84,22 @@ The Sentinel and baseline columns are measured on different clocks (event intake
 | Part 24 correctness pass | In progress | Remaining findings; closure also needs the items above |
 | V05 release qualification | Harness drafted | A recorded PASS from [qualification](qualification.md) on the final commit and packages |
 | M-series (microVMs) | Open | M01 to M06 and M08 are required before any verified Linux microVM claim; M07 (Windows guests) and M09 (hostile fork pool) are later |
-| Runner mode (AR-series) and Windows workers (N-series) | Not started for v0.1 | Out of the v0.1 support set |
+| Runner mode (AR-series) and Windows workers (N-series) | Not part of v0.1 | Out of the v0.1 support set; runner mode's state is in the [backlog](backlog.md) |
+| Onboarding end to end (V03) | Written, not walked | One pass through [onboarding](onboarding.md) on a fresh host |
+| Owner prerequisites X1 to X7 | Open | Each is listed as an unverified limit in [support limits](support-limits.md#unverified-against-the-real-counterpart) |
 
 v0.1 is tagged only when the required correctness and operational gates are met. The sub-minute and 2x statements are never checked off through a documentation exception.
+
+## Release checklist
+
+**To fill at the tag.** Nothing below is done.
+
+- [ ] Version, tag and commit: *to fill*.
+- [ ] Package digests (`SHA256SUMS`, `release-manifest.json`): *to fill from the release build* ([releasing](releasing.md)).
+- [ ] Release-qualification record on the final commit and packages: *to fill* ([qualification](qualification.md)).
+- [ ] [Support limits](support-limits.md) re-read against the final tree; every row still true.
+- [ ] [Figures still to record](#figures-still-to-record) replaced by committed records, or published as unmet or blocked.
+- [ ] This page's draft status line removed.
 
 ## Upgrading and compatibility
 
