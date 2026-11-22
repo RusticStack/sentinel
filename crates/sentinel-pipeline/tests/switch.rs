@@ -807,3 +807,54 @@ fn identical_input_gives_byte_identical_output_for_every_phase() {
     }
     assert!(disabled >= 3, "too few native fixtures: {disabled}");
 }
+
+#[test]
+fn a_copy_runs_in_a_concurrency_group_of_its_own() {
+    let text = "name: grouped
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: build-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - run: make build
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency: deploy
+    steps:
+      - run: make deploy
+";
+    let path = one("grouped.yml");
+    let files = vec![(path.clone(), text.to_owned())];
+    let shadowed = plan_of(&files, Phase::Shadow, false);
+    let workflow = &shadowed.workflows[0];
+    assert_eq!(workflow.shadow.len(), 2, "{:?}", workflow.shadow);
+
+    let after = analyze_one(&path, workflow.applied.as_deref().unwrap());
+    let job = |id: &str| after.jobs.iter().find(|job| job.id == id).unwrap();
+    let group = |id: &str| job(id).concurrency.as_ref().unwrap().group.as_str();
+    assert_eq!(group("build"), "build-${{ github.ref }}");
+    assert_eq!(group("sentinel-build"), "sentinel-build-${{ github.ref }}");
+    assert!(
+        job("sentinel-build")
+            .concurrency
+            .as_ref()
+            .unwrap()
+            .cancel_in_progress
+    );
+    assert_eq!(group("deploy"), "deploy");
+    assert_eq!(group("sentinel-deploy"), "sentinel-deploy");
+
+    // Shadowing the result again adds nothing, and the switch still drops both copies.
+    let again = vec![(path.clone(), workflow.applied.clone().unwrap())];
+    assert!(
+        plan_of(&again, Phase::Shadow, false).workflows[0]
+            .shadow
+            .is_empty()
+    );
+    let switched = plan_of(&again, Phase::Switch, false);
+    let moved = plan_of(&files, Phase::Label, false);
+    assert_eq!(switched.workflows[0].applied, moved.workflows[0].applied);
+}
