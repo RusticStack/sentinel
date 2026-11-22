@@ -101,6 +101,8 @@ pub struct Guard {
 pub struct Policy {
     nets: BTreeSet<(u32, u8)>,
     endpoints: BTreeSet<(u32, u16)>,
+    /// The one endpoint of the worker this guest is served on, admitted before every refusal.
+    served: Option<(Ipv4Addr, u16)>,
 }
 
 impl Policy {
@@ -110,7 +112,16 @@ impl Policy {
         Policy {
             nets: denied_nets(host_addresses, [VM_NET]),
             endpoints: denied_endpoints(guard),
+            served: None,
         }
+    }
+
+    /// The same refusals, with one TCP endpoint of the worker admitted: the address and port a runner guest's
+    /// cache and artifact endpoint listens on. Everything else of the host stays refused.
+    #[must_use]
+    pub fn serving(mut self, address: Ipv4Addr, port: u16) -> Policy {
+        self.served = Some((address, port));
+        self
     }
 
     /// The nftables script the VM's namespace loads before the VMM starts: the guest's connections go outward
@@ -162,6 +173,12 @@ impl Policy {
             out,
             "\t\tiifname \"{TAP}\" ip saddr {GUEST} ip daddr {DNS} meta l4proto {{ udp, tcp }} th dport 53 accept"
         );
+        if let Some((address, port)) = self.served {
+            let _ = writeln!(
+                out,
+                "\t\tiifname \"{TAP}\" oifname != \"{TAP}\" ip saddr {GUEST} ip daddr {address} tcp dport {port} accept"
+            );
+        }
         let _ = writeln!(out, "\t\tiifname \"{TAP}\" ip daddr @denied_nets drop");
         let _ = writeln!(
             out,
@@ -439,6 +456,19 @@ mod tests {
             rules.contains("127.0.0.0/8") && !rules.contains("127.0.0.1/32"),
             "{rules}"
         );
+    }
+
+    #[test]
+    fn a_served_endpoint_is_admitted_before_the_refusals_and_nothing_else_of_the_host_is() {
+        let plain = policy().rules();
+        let rules = policy().serving(Ipv4Addr::new(192, 168, 7, 20), 443).rules();
+        let accept = rules
+            .find("ip daddr 192.168.7.20 tcp dport 443 accept")
+            .expect("the endpoint is admitted");
+        let refusal = rules.find("ip daddr @denied_nets drop").unwrap();
+        assert!(accept < refusal, "{rules}");
+        assert!(rules.contains("192.168.7.20/32"), "{rules}");
+        assert!(!plain.contains("tcp dport 443 accept"), "{plain}");
     }
 
     #[test]
