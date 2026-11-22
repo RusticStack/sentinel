@@ -7,6 +7,7 @@ Written designs that are deliberately **not built**. Each page states what would
 | [Multiple active controllers](multiple-controllers.md) | ownership of the metadata store, authority over placement, and where a worker's session lives | written, not built | a measured single-controller ceiling, or an availability requirement shorter than the restore objective |
 | [External SSO](external-sso.md) | sign-in only: one more provider key beside `github` in `external_identities` | written, not built | the IdP a real deployment uses, and an owner decision on whether directory groups may derive membership |
 | [Cloud autoscaling](cloud-autoscaling.md) | a demand read the scheduler does not expose today, and a scoped authority that may mint worker enrollments | written, not built | measured queue wait against fleet size, and the scoped-authority decision |
+| [Fork pull requests](fork-pull-requests.md) | whether a fork pull request becomes a run, what it may read, and the pool it runs on | written, not built | the owner's fork-PR secret policy (X5), the microVM network boundary verified on `kvm-host`, and measured pool ceilings |
 
 ## Deliberately not built
 

@@ -2,6 +2,23 @@
 
 How the controller and a worker run: under systemd, as containers, behind TLS, with GitHub ingress, or fully local. The tasks are V01 ([release packages](releasing.md)) and V02 (the units, the container examples and this guide). Configuration is in [configuration](configuration.md), upgrades in [upgrades](upgrades.md), the web process in [web interface](web-ui.md).
 
+The order an operator follows from an empty host to a first run is in [onboarding](onboarding.md); what is not supported or not verified is in [support limits](support-limits.md).
+
+## The shipped examples
+
+Every file is in [`examples/`](../examples/). "Not run" means the file is checked by parsing only; the details are in the section each row links.
+
+| Shape | Files | Section | Recorded check |
+|---|---|---|---|
+| Controller under systemd | `sentinel-server.service`, `server.toml` | [controller unit](#the-controller-as-a-systemd-service) | `scripts/release/check-server-unit.sh` |
+| Worker under systemd (system or user unit) | `sentinel-worker.service`, `worker.toml` | [worker unit](#a-worker-as-a-systemd-service) | `scripts/release/check-worker-unit.sh` |
+| Web interface under systemd | `sentinel-web.service` | [web interface](web-ui.md#running-it) | No start recorded; parsed by `crates/sentinel/tests/examples.rs` |
+| Controller container (Compose or Quadlet) | `Containerfile.server`, `server-container.toml`, `compose.server.yaml`, `sentinel-server.container`, `sentinel-data.volume` | [controller container](#the-controller) | Image built and started with rootless Podman; Compose rendered offline; Quadlet generated, not started ([details](#what-was-verified)) |
+| Web container (Compose profile `web`, or Quadlet) | `Containerfile.web`, the `web` service of `compose.server.yaml`, `sentinel-web.container`, `sentinel.network` | [web container](#the-web-interface) | **Not run**: parsed by `crates/sentinel/tests/examples.rs` only ([details](#what-was-verified)) |
+| Worker container | `Containerfile.worker`, `compose.worker.yaml` | [worker container](#a-worker) | Image started under `--privileged` ([details](#what-was-verified)) |
+| TLS reverse proxy | `sentinel.nginx.conf`, `Caddyfile` | [proxy](#tls-and-a-reverse-proxy) | Both validated and exercised against a stand-in upstream; the `sentinel-web` hop not run ([details](#verification)) |
+| Generic Git hook | `hooks/post-receive` | [fully local operation](#fully-local-operation) | `scripts/release/check-local-mode.sh` |
+
 ## Release packages
 
 What a release contains, how to build it on each architecture, how to verify a download, the digest manifest, reproducibility and the dependency and license inventory are in [releasing](releasing.md). This page covers running the packages: the units and the release profile.
