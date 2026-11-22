@@ -369,6 +369,17 @@ fn label_table_v1_maps_hosted_blacksmith_and_arm64_labels() {
     assert_eq!(
         LabelTable::V1.classify(
             &Declared {
+                labels: vec!["ubuntu-latest".to_owned(), "${{ vars.EXTRA }}".to_owned()],
+                group: None,
+            },
+            false,
+            DockerHosts::MicrovmGuests
+        ),
+        Destination::Keep(KeepReason::Expression)
+    );
+    assert_eq!(
+        LabelTable::V1.classify(
+            &Declared {
                 labels: vec!["ubuntu-latest".to_owned(), "windows-latest".to_owned()],
                 group: None,
             },

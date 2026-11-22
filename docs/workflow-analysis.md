@@ -73,7 +73,7 @@ Axis values must be scalars, `include` and `exclude` entries must be mappings of
 
 Rules that settle the edge cases:
 
-- A label set is decided by the labels that name a class. Two labels naming different classes satisfy no one runner and the job is kept as `no_class`.
+- A label set is decided by the labels that name a class. Two labels naming different classes satisfy no one runner and the job is kept as `no_class`. A `${{ }}` label nothing resolves beside a class label keeps the job as `expression`: what it demands is unknown, so the class is not the whole set.
 - `runs-on:` written as a mapping with a `group:` is a named runner group — GitHub's own scaling concept, not a Sentinel class — so the job is kept as `no_class`.
 - A job that needs a Docker daemon (a `container:`, a `services:` entry or a `docker://` step) needs a class a Linux microVM guest serves ([executor](executor.md), [plan 16.8](../plan.md#168-microvm-execution-on-kvm-hosts)). With `DockerHosts::MicrovmGuests` its class carries `requires_microvm`; with `DockerHosts::ContainerOnly`, or for any Windows class (no nested virtualization in a Windows guest), the job is kept as `docker`.
 
