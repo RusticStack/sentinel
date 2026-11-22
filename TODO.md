@@ -95,7 +95,7 @@ What a session cannot supply. Ask early.
 - [x] **G04** Checks outbox ([checks](docs/checks.md))
 - [ ] **G08** generic Git intake on the fixtures ([generic Git verification](docs/generic-git-verification.md)); Forgejo over SSH and GitLab over HTTPS are G08a (X7)
 - [x] **D01**, **D02** objects, uploads and reads ([storage](docs/storage.md))
-- [ ] **D04** segmented logs, indexes, replay and spool acknowledgement ([logs](docs/logs.md)); includes `power_cut_on_dm_flakey` (run 6)
+- [ ] **D04** segmented logs, indexes, replay and spool acknowledgement ([logs](docs/logs.md)); includes `power_cut_on_dm_flakey` (run 6) — every other suite ran on 2026-11-21, `posix_crash_states` included; that test needs root with `dm-flakey` and stays open
 - [ ] **Q05** control and bulk priority, reconnect jitter, replay, restart reconciliation
 - [x] **Q08** remote cache hydration
 - [x] **Q10** the fleet placement stall: `fleet.rs` stress-run clean
