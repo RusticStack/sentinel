@@ -18,8 +18,8 @@ use sentinel_core::{
 use sentinel_protocol::limits::{MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES};
 use sentinel_protocol::logs::Frame;
 use sentinel_protocol::negotiate::{
-    ACTIONS_MIN, CANCEL_PUSH_MIN, Capabilities, Hello, MAX_CANCEL_PUSH, MAX_PREFETCH_IMAGES,
-    PREFETCH_MIN, PROFILE_MIN, Profile, RUNNER_MIN,
+    ACTIONS_ACCOUNTING_MIN, ACTIONS_MIN, CANCEL_PUSH_MIN, Capabilities, Hello, MAX_ACTIONS_REPOS,
+    MAX_CANCEL_PUSH, MAX_PREFETCH_IMAGES, PREFETCH_MIN, PROFILE_MIN, Profile, RUNNER_MIN,
 };
 use sentinel_store::{
     Store, artifacts, classes, dispatch, locks,
@@ -2668,7 +2668,40 @@ impl Inner {
     /// The tenant's caches give way before its artifacts do. Every bundle of the tenant's repositories leaves the
     /// controller's store, least recently served first — the order the store's own byte-budget pass evicts in, so
     /// one policy governs both — and an entry a transfer is uploading survives it. Returns the bytes freed.
+    /// The tenant's caches give way: every worker's runner-mode tree of its repositories and its remote-cache
+    /// bundles. Returns the remote-cache bytes freed here; a worker's own removal arrives with its next report.
     fn evict_tenant_cache(&self, tenant: TenantId) -> u64 {
+        self.ask_actions_holders(tenant, None);
+        self.evict_remote_cache(tenant)
+    }
+
+    /// Ask every connected worker still charged with the tenant's runner-mode caches to give them up, idle
+    /// hosts included: a worker reports only after its own runner stopped or its own eviction removed
+    /// something, so waiting for its report would leave its bytes charged. `answered` is the worker whose
+    /// report is being answered in its own session.
+    fn ask_actions_holders(&self, tenant: TenantId, answered: Option<WorkerId>) {
+        let Ok(holders) = self.store.read(|c| classes::actions_holders(c, tenant)) else {
+            return;
+        };
+        for (worker, repos) in holders {
+            if answered == Some(worker) {
+                continue;
+            }
+            let Some(peer) = self.peer(worker) else {
+                continue;
+            };
+            if peer.protocol < ACTIONS_ACCOUNTING_MIN.0 {
+                continue;
+            }
+            for chunk in repos.chunks(MAX_ACTIONS_REPOS) {
+                if session::actions_evict(&peer.sender, chunk).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn evict_remote_cache(&self, tenant: TenantId) -> u64 {
         let root = self
             .remote_cache
             .lock()
@@ -4040,7 +4073,8 @@ impl SessionHandler for Inner {
             if standing.state != retention::State::Hard {
                 continue;
             }
-            self.evict_tenant_cache(tenant);
+            self.ask_actions_holders(tenant, Some(worker));
+            self.evict_remote_cache(tenant);
             evict.extend(held);
         }
         evict
@@ -5122,6 +5156,23 @@ impl Handle {
     /// Puts a GitHub App in force for source resolution without a restart.
     pub fn set_source_app(&self, app: Arc<sentinel_github::app::App>) {
         *self.0.source_app.lock().unwrap_or_else(|p| p.into_inner()) = Some(app);
+    }
+
+    /// An upload of `extra` bytes was refused for the tenant. When its own hard threshold is what the upload
+    /// would pass, the tenant's caches give way first, so a retry once its workers reported the removal is
+    /// admitted; a refusal from the deployment quota alone takes nothing from it.
+    pub fn upload_refused(&self, tenant: TenantId, extra: u64) {
+        let deployment = self.0.objects.deployment();
+        let Ok(standing) = self
+            .0
+            .store
+            .read(|c| retention::standing(c, &deployment, tenant))
+        else {
+            return;
+        };
+        if standing.hard_bytes > 0 && standing.used.saturating_add(extra) > standing.hard_bytes {
+            self.0.evict_tenant_cache(tenant);
+        }
     }
 
     pub fn cancel_hint(&self) {

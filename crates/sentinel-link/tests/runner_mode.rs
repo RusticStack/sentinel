@@ -642,6 +642,125 @@ impl WorkerProcess {
     }
 }
 
+/// The worker has run a lease of the repository, which is what lets its cache report charge the tenant.
+fn served(d: &Deployment, worker: WorkerId) {
+    let (tenant, repo, pool) = (d.tenant, d.repo, d.pool);
+    d.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO runner_leases(id, tenant_id, repo_id, class, pool_id, worker_id, fence,
+                    state_code, cpu_millis, memory_bytes, runner_name, offered_ms, lease_until_ms,
+                    released_ms, reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 2, 4000, 8589934592, 'sentinel-cache-1', ?7, ?7,
+                    ?7, 'job_completed')",
+                rusqlite::params![
+                    sentinel_core::RunnerLeaseId::new().as_bytes(),
+                    tenant.as_bytes(),
+                    repo.as_bytes(),
+                    CLASS,
+                    pool.as_bytes(),
+                    worker.as_bytes(),
+                    UnixMillis::now().0
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// A tenant quota of 100 bytes whose hard threshold is the quota itself.
+fn quota_of_100(d: &Deployment) {
+    let tenant = d.tenant;
+    d.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO storage_policies(tenant_id, repo_id, quota_bytes, soft_percent,
+                    hard_percent, updated_ms) VALUES(?1, X'', 100, 80, 100, ?2)",
+                rusqlite::params![tenant.as_bytes(), UnixMillis::now().0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn charged(d: &Deployment, bytes: u64) {
+    let tenant = d.tenant;
+    eventually("charged", || {
+        d.store
+            .read(move |c| sentinel_store::classes::tenant(c, tenant))
+            .is_ok_and(|classes| classes.actions_cache == bytes)
+    });
+}
+
+fn attach(d: &Deployment) -> (Arc<Runners>, session::Reporter, WorkerProcess) {
+    let runners = Runners::new();
+    let process = WorkerProcess::start(d, Arc::clone(&runners), &[CLASS]);
+    eventually("connected", || runners.reporter.lock().unwrap().is_some());
+    let reporter = runners.reporter.lock().unwrap().clone().expect("session");
+    (runners, reporter, process)
+}
+
+#[test]
+fn an_idle_worker_holding_the_tenants_cache_is_asked_to_give_it_up_at_the_hard_threshold() {
+    let github = Github::start();
+    let d = deployment(github);
+    d.serve(120_000, 60_000);
+    let (idle, idle_reporter, idle_process) = attach(&d);
+    let (busy, busy_reporter, busy_process) = attach(&d);
+    served(&d, idle_process.id);
+    served(&d, busy_process.id);
+    quota_of_100(&d);
+
+    // The idle host's bytes alone are under the line: nothing gives way.
+    idle_reporter.actions_cache(&[(d.repo, 60)]).unwrap();
+    charged(&d, 60);
+    assert!(
+        idle.evicted().is_empty(),
+        "nothing gives way below the line"
+    );
+
+    // Another host's report takes the tenant past it. The idle host sends nothing further on its own, so it
+    // is the controller that must ask it.
+    busy_reporter.actions_cache(&[(d.repo, 60)]).unwrap();
+    charged(&d, 120);
+    eventually("the reporter evicted", || {
+        busy.evicted() == vec![*d.repo.as_bytes()]
+    });
+    eventually("the idle host evicted", || {
+        idle.evicted() == vec![*d.repo.as_bytes()]
+    });
+    idle_process.stop();
+    busy_process.stop();
+}
+
+#[test]
+fn an_upload_refused_at_the_hard_threshold_makes_the_tenants_caches_give_way() {
+    let github = Github::start();
+    let d = deployment(github);
+    d.serve(120_000, 60_000);
+    let (runners, reporter, process) = attach(&d);
+    served(&d, process.id);
+    quota_of_100(&d);
+    reporter.actions_cache(&[(d.repo, 60)]).unwrap();
+    charged(&d, 60);
+    let handle = d.controller.handle();
+
+    // An upload that would still fit under the line asks nothing of the caches.
+    handle.upload_refused(d.tenant, 40);
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        runners.evicted().is_empty(),
+        "a fitting upload evicts nothing"
+    );
+
+    // One that would pass it was refused because of what the caches hold: they give way first.
+    handle.upload_refused(d.tenant, 41);
+    eventually("evicted", || runners.evicted() == vec![*d.repo.as_bytes()]);
+    process.stop();
+}
+
 fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(60);
     while !predicate() {

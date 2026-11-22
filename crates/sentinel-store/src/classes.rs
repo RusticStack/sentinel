@@ -118,6 +118,11 @@ const ACTIONS_SERVED: &str =
     "SELECT 1 FROM runner_leases WHERE worker_id = ?1 AND repo_id = ?2 LIMIT 1";
 const ACTIONS_TENANT: &str = "SELECT COALESCE(SUM(w.bytes), 0) FROM worker_actions_cache w
         JOIN repos r ON r.id = w.repo_id WHERE r.tenant_id = ?1";
+// Who must give a tenant's runner-mode caches up: every worker row of its repositories that still holds bytes,
+// read through the tenant's repositories and each one's keyed rows; grouped by worker without a sort.
+const ACTIONS_HOLDERS: &str = "SELECT w.worker_id, w.repo_id FROM repos r
+        JOIN worker_actions_cache w ON w.repo_id = r.id
+        WHERE r.tenant_id = ?1 AND w.bytes > 0";
 const ACTIONS_SET: &str = "INSERT INTO tenant_usage(tenant_id, actions_cache_bytes) VALUES(?1, ?2)
         ON CONFLICT(tenant_id) DO UPDATE SET actions_cache_bytes = excluded.actions_cache_bytes";
 const SNAPSHOT_KEYS: &str =
@@ -147,6 +152,7 @@ pub const STATEMENTS: &[(&str, &str)] = &[
     ("actions_worker", ACTIONS_WORKER),
     ("actions_served", ACTIONS_SERVED),
     ("actions_tenant", ACTIONS_TENANT),
+    ("actions_holders", ACTIONS_HOLDERS),
     ("actions_set", ACTIONS_SET),
     ("remote_set", REMOTE_SET),
     ("remote_holders", REMOTE_HOLDERS),
@@ -370,6 +376,28 @@ pub fn report_actions_cache(
         }
         Ok(moved)
     })
+}
+
+/// Every worker whose reported `actions/cache` tree still holds bytes of the tenant's repositories, each with
+/// those repositories: the hosts a tenant at its hard threshold must ask to give them up, idle ones included,
+/// because a worker reports only when its own runner stops or its own eviction removed something.
+pub fn actions_holders(
+    conn: &Connection,
+    tenant: TenantId,
+) -> Result<Vec<(sentinel_core::WorkerId, Vec<RepoId>)>> {
+    let mut stmt = conn.prepare_cached(ACTIONS_HOLDERS)?;
+    let rows = stmt.query_map([tenant.as_bytes().as_slice()], |r| {
+        Ok((r.get::<_, [u8; 16]>(0)?, r.get::<_, [u8; 16]>(1)?))
+    })?;
+    let mut out: HashMap<sentinel_core::WorkerId, Vec<RepoId>> = HashMap::new();
+    for row in rows {
+        let (worker, repo) = row?;
+        let worker =
+            sentinel_core::WorkerId::from_bytes(worker).map_err(|_| Error::Corrupt("worker_id"))?;
+        let repo = RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?;
+        out.entry(worker).or_default().push(repo);
+    }
+    Ok(out.into_iter().collect())
 }
 
 /// A worker left: nothing it held is charged to its tenants any more. Returns the tenants that moved.

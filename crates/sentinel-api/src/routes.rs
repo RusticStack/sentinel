@@ -2357,17 +2357,26 @@ fn upload_begin(state: &State, request: &mut Request, slug: &str) -> Route {
     let ttl = body
         .ttl_ms
         .unwrap_or(sentinel_store::objects::MAX_UPLOAD_TTL_MS);
-    let (slug, principal) = (slug.to_owned(), who.principal);
+    let (name, principal, len) = (slug.to_owned(), who.principal, body.len);
     let objects = Arc::clone(&state.objects);
     let upload = state
         .store
         .writer()
         .write(move |tx| {
-            let tenant = lookup::tenant_by_slug(tx, &slug)?;
+            let tenant = lookup::tenant_by_slug(tx, &name)?;
             authz::require_tenant_member(tx, principal, tenant, true)?;
-            objects.begin_upload(tx, tenant, body.len, digest, ttl, UnixMillis::now())
+            objects.begin_upload(tx, tenant, len, digest, ttl, UnixMillis::now())
         })
-        .map_err(store_error)?;
+        .map_err(|e| {
+            // The tenant's caches give way before an upload is refused for good: the eviction runs outside the
+            // writer, and a retry is admitted once the tenant's workers reported what they removed.
+            if matches!(e, sentinel_store::Error::QuotaExceeded)
+                && let Ok(tenant) = state.store.read(|c| lookup::tenant_by_slug(c, slug))
+            {
+                state.controller.upload_refused(tenant, len);
+            }
+            store_error(e)
+        })?;
     let status = state
         .store
         .read(|c| {

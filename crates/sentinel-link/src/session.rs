@@ -3460,6 +3460,20 @@ pub fn prefetch(sender: &Sender, images: &[String]) -> Result<()> {
     )
 }
 
+/// Ask a worker that is not the one reporting to give up the runner-mode caches of a tenant at its hard
+/// threshold; it answers with an `ActionsCache` report once something was removed.
+pub fn actions_evict(sender: &Sender, repos: &[RepoId]) -> Result<()> {
+    if repos.is_empty() || repos.len() > sentinel_protocol::negotiate::MAX_ACTIONS_REPOS {
+        return Err(Error::Protocol("actions evict"));
+    }
+    sender.send_bounded(
+        &ServerMessage::ActionsEvict {
+            repos: repos.iter().map(|repo| *repo.as_bytes()).collect(),
+        },
+        DISPATCH_WRITE_BOUND,
+    )
+}
+
 pub fn cancel(sender: &Sender, attempts: &[AttemptId]) -> Result<()> {
     if attempts.is_empty() || attempts.len() > MAX_CANCEL_PUSH {
         return Err(Error::Protocol("cancel push"));

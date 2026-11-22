@@ -863,21 +863,33 @@ fn require_artifact_admin(
 pub struct Usage {
     pub object_bytes: u64,
     pub log_bytes: u64,
+    /// The runner-mode caches the tenant's workers reported; counted by the quota, never stored here.
+    pub actions_cache_bytes: u64,
 }
 
 impl Usage {
+    /// What the controller stores for the tenant: its objects and its logs.
     pub fn total(&self) -> u64 {
         self.object_bytes.saturating_add(self.log_bytes)
+    }
+
+    /// What the tenant's quota counts, the figure [`standing`] reports: the stored bytes plus the reported
+    /// runner-mode caches, so an upload is refused at the same line the storage page draws.
+    pub fn counted(&self) -> u64 {
+        self.total().saturating_add(self.actions_cache_bytes)
     }
 }
 
 pub fn tenant_usage(conn: &Connection, tenant: TenantId) -> Result<Usage> {
     Ok(conn
-        .prepare_cached("SELECT bytes, log_bytes FROM tenant_usage WHERE tenant_id = ?1")?
+        .prepare_cached(
+            "SELECT bytes, log_bytes, actions_cache_bytes FROM tenant_usage WHERE tenant_id = ?1",
+        )?
         .query_row([tenant.as_bytes().as_slice()], |r| {
             Ok(Usage {
                 object_bytes: r.get::<_, i64>(0)?.max(0) as u64,
                 log_bytes: r.get::<_, i64>(1)?.max(0) as u64,
+                actions_cache_bytes: r.get::<_, i64>(2)?.max(0) as u64,
             })
         })
         .optional()?
