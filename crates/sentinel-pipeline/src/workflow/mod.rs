@@ -799,6 +799,12 @@ fn decode_permissions(path: &str, node: &Node) -> Result<Vec<(String, String)>> 
     }
 }
 
+/// Whether a scalar is one whole `${{ }}` expression, the only string form GitHub evaluates.
+fn is_expression(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("${{") && value.ends_with("}}") && value.len() >= 5
+}
+
 fn decode_concurrency(path: &str, node: &Node) -> Result<Concurrency> {
     match node {
         Node::Str(group) => Ok(Concurrency {
@@ -814,7 +820,7 @@ fn decode_concurrency(path: &str, node: &Node) -> Result<Concurrency> {
             };
             let (cancel_in_progress, cancel_conditional) = match find(entries, "cancel-in-progress")
             {
-                Some(Node::Str(s)) if s.len() <= MAX_TEXT_BYTES && s.contains("${{") => {
+                Some(Node::Str(s)) if s.len() <= MAX_TEXT_BYTES && is_expression(s) => {
                     (false, true)
                 }
                 Some(node) => (boolean(&child(path, "cancel-in-progress"), node)?, false),

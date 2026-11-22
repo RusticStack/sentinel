@@ -672,4 +672,16 @@ fn a_conditional_cancel_in_progress_moves_labels_and_refuses_the_native_pipeline
     }];
     let error = analyze(REVISION, &borrowed, DockerHosts::MicrovmGuests).unwrap_err();
     assert!(error.to_string().contains("expected boolean"), "{error}");
+
+    // An expression that is never closed is not one GitHub can evaluate.
+    let unclosed = text.replace(
+        "${{ github.event_name == 'pull_request' }}",
+        "${{ github.event_name == 'pull_request'",
+    );
+    let borrowed = [WorkflowFile {
+        path: &files[0].0,
+        text: &unclosed,
+    }];
+    let error = analyze(REVISION, &borrowed, DockerHosts::MicrovmGuests).unwrap_err();
+    assert!(error.to_string().contains("expected boolean"), "{error}");
 }
