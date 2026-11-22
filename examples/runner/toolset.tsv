@@ -1,0 +1,39 @@
+# The toolset the runner images carry beyond the runner itself (docs/runner-images.md): one row per
+# tool, version, operating system and architecture. Tab-separated: tool, version, os, arch, checksum, url.
+# The checksum is the publisher's own (sha256, or sha512 where that is what the publisher states) and the
+# install refuses an archive that does not match it. A version moves only in a commit that also moves its
+# checksum and its row in docs/runner-images.md. `rust` rows pin rustup-init; the version is the
+# toolchain rustup then installs, which rustup checks against the channel manifest itself.
+node	24.22.3	linux	x64	4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb	https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-x64.tar.xz
+node	24.22.3	linux	arm64	6e51a2ada00f0011cc266f65d98922b403d7ad88f809ca2aa615a5fe1ce6e86c	https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-arm64.tar.xz
+node	24.22.3	windows	x64	e612af99f626ab415ea225af6bce5c971feb448cb5cae250bb1c3fa50c5f7d9f	https://nodejs.org/dist/v24.22.3/node-v24.22.3-win-x64.zip
+node	22.23.5	linux	x64	cdeb8670a0c81f51b4dc4ac61919f9b1ad917b304bf8221eb939570663d240f8	https://nodejs.org/dist/v22.23.5/node-v22.23.5-linux-x64.tar.xz
+node	22.23.5	linux	arm64	2babb9eb5264860d540849f4b064a6fbdebcdc323657d9d382ce23d313fd5e09	https://nodejs.org/dist/v22.23.5/node-v22.23.5-linux-arm64.tar.xz
+node	22.23.5	windows	x64	4a191082e9706866830379d577d2cc8a50c776fcd9436a8d061b063ed0d9a0e3	https://nodejs.org/dist/v22.23.5/node-v22.23.5-win-x64.zip
+go	1.27.4	linux	x64	7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840	https://go.dev/dl/go1.27.4.linux-amd64.tar.gz
+go	1.27.4	linux	arm64	3392582988a273a87ab5043ee1b2c9c17a2c3c00580bf9326c47a2e0aaaeac92	https://go.dev/dl/go1.27.4.linux-arm64.tar.gz
+go	1.27.4	windows	x64	178ab98950ac69ab25069307dc6ade79f3816e414cce95b4da166a115cde1e7e	https://go.dev/dl/go1.27.4.windows-amd64.zip
+go	1.26.11	linux	x64	9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec	https://go.dev/dl/go1.26.11.linux-amd64.tar.gz
+go	1.26.11	linux	arm64	6c2f29b458b5add0835f18b776f69c8881a6d88428f1484a6da55755e620757e	https://go.dev/dl/go1.26.11.linux-arm64.tar.gz
+go	1.26.11	windows	x64	71ae086f0137e665f855a811cc119152b6a783e0bbc1b906e709f46d80141eb0	https://go.dev/dl/go1.26.11.windows-amd64.zip
+python	3.13.18	linux	x64	683005a1465d94d40045f6a1a6eb316885b5f08d3360f7922b44ef58a14a9eed	https://github.com/actions/python-versions/releases/download/3.13.18-40336726450/python-3.13.18-linux-24.04-x64.tar.gz
+python	3.13.18	linux	arm64	8336b5b058474b8967155a24a5dd164cd6fa14866c009cce599f751e878dfc71	https://github.com/actions/python-versions/releases/download/3.13.18-40336726450/python-3.13.18-linux-24.04-arm64.tar.gz
+python	3.12.16	linux	x64	dec61ed20cd3e71143f1642ef9966945dea8ae4f3e96b306205a710da4f2191a	https://github.com/actions/python-versions/releases/download/3.12.16-40260402378/python-3.12.16-linux-24.04-x64.tar.gz
+python	3.12.16	linux	arm64	86c16c393f74e4d814f9606da32aed57be85a951e772bf1c7eb80a48ef3cb664	https://github.com/actions/python-versions/releases/download/3.12.16-40260402378/python-3.12.16-linux-24.04-arm64.tar.gz
+temurin	17.0.21+100000002	linux	x64	0b0ac5eab6db6abaec68c9913bcddb31321e5da411c45073d520d9c125e6f7b4	https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.21.1%2B2/OpenJDK17U-jdk_x64_linux_hotspot_17.0.21.1_2.tar.gz
+temurin	17.0.21+100000002	linux	arm64	1d808f4b558e9de63d8ba3ead21ffc8b9de204894eff3c19d52c1480aa17cc58	https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.21.1%2B2/OpenJDK17U-jdk_aarch64_linux_hotspot_17.0.21.1_2.tar.gz
+temurin	17.0.21+100000002	windows	x64	eafba0944f777abdc74d5aad16049c9b5a1275b6ce99e2939ba9f7f3e6f08c87	https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.21.1%2B2/OpenJDK17U-jdk_x64_windows_hotspot_17.0.21.1_2.zip
+temurin	21.0.13+100000002.0.LTS	linux	x64	bb8a93f9ae6e7a693b2b721e85dbeff26ae1a77447985a8d7afcdd9c7cf6222e	https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13.1%2B2/OpenJDK21U-jdk_x64_linux_hotspot_21.0.13.1_2.tar.gz
+temurin	21.0.13+100000002.0.LTS	linux	arm64	8c72816a6b308842d5ed1f13e5826b69c567da4784f7238d7e800efa71fe54b1	https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13.1%2B2/OpenJDK21U-jdk_aarch64_linux_hotspot_21.0.13.1_2.tar.gz
+temurin	21.0.13+100000002.0.LTS	windows	x64	bbebea1469996b276683c9299c227b294f85c847039c82633218186a4ad4fbf2	https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13.1%2B2/OpenJDK21U-jdk_x64_windows_hotspot_21.0.13.1_2.zip
+temurin	25.0.5+100000002.0.LTS	linux	x64	760f91b22c3efc9bd1b64ff950598231be82928cc807e30691a0e7a2995a62c0	https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5.1%2B2/OpenJDK25U-jdk_x64_linux_hotspot_25.0.5.1_2.tar.gz
+temurin	25.0.5+100000002.0.LTS	linux	arm64	c37879e0d08eeb1baa69fcbb7758cd455b7b1c0ceab1e2a136ccb1713c530984	https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5.1%2B2/OpenJDK25U-jdk_aarch64_linux_hotspot_25.0.5.1_2.tar.gz
+temurin	25.0.5+100000002.0.LTS	windows	x64	849d380ab0a64d9098e7d3a2de28beb73841c3b255c8284f019ccd8748c5eb5b	https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5.1%2B2/OpenJDK25U-jdk_x64_windows_hotspot_25.0.5.1_2.zip
+maven	3.9.16	linux	x64	831a8591fe20c8243b1dbe7d71e3244f31d1665b0804b2e825e38cbbe5ce0cafb8338851f90780735568773e0a6cd07bbec107cda0b896b008b861075358b6f6	https://archive.apache.org/dist/maven/maven-3/3.9.16/binaries/apache-maven-3.9.16-bin.tar.gz
+maven	3.9.16	linux	arm64	831a8591fe20c8243b1dbe7d71e3244f31d1665b0804b2e825e38cbbe5ce0cafb8338851f90780735568773e0a6cd07bbec107cda0b896b008b861075358b6f6	https://archive.apache.org/dist/maven/maven-3/3.9.16/binaries/apache-maven-3.9.16-bin.tar.gz
+maven	3.9.16	windows	x64	ed41650d42485cfc243fad22158caf9cbb5dc408ce7a09ddb94dd42a019de929ca43065bfa450612cf12bf78b5cafa3884b96c090de326ff590448c933454af3	https://archive.apache.org/dist/maven/maven-3/3.9.16/binaries/apache-maven-3.9.16-bin.zip
+rust	1.99.1	linux	x64	b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55	https://static.rust-lang.org/rustup/archive/1.29.3/x86_64-unknown-linux-gnu/rustup-init
+rust	1.99.1	linux	arm64	9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282	https://static.rust-lang.org/rustup/archive/1.29.3/aarch64-unknown-linux-gnu/rustup-init
+rust	1.99.1	windows	x64	38027d51d69a5d05493627a0634dbea52d6cd793c8f072d2373d3f4163eec7db	https://static.rust-lang.org/rustup/archive/1.29.3/x86_64-pc-windows-msvc/rustup-init.exe
+runner	2.338.2	windows	x64	a1f17aa987fc8158bc7521d284912267a0d01b7c2c4684b33c86783b5e8221cc	https://github.com/actions/runner/releases/download/v2.338.2/actions-runner-win-x64-2.338.2.zip
+git	2.56.1	windows	x64	4a92850b6e917da4fd010669b614b55dccf5b0ec333a534cc4be4700dfefdafd	https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/MinGit-2.56.1-64-bit.zip

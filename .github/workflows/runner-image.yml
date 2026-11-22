@@ -1,0 +1,71 @@
+name: runner image
+
+# The Ubuntu 24.04 runner image with toolchains (docs/runner-images.md): built on every change to what
+# it is made of, and rebuilt on a schedule so the packages under the pinned toolset do not age.
+# A build fails unless every pinned tool is present at its pinned version (`sentinel-toolset check`
+# is the image's last build step), so a missing tool stops here and not in a job.
+#
+# Publishing is opt-in: with the repository variable RUNNER_IMAGE_REPOSITORY set (for example
+# `ghcr.io/rusticstack/sentinel-runner-ubuntu-2404`), a scheduled or manual run on main pushes the image
+# and writes the digest a worker pins to the run's summary. Without it, every run only builds and checks.
+on:
+  pull_request:
+    paths:
+      - examples/Containerfile.runner
+      - examples/Containerfile.runner-ubuntu-2404
+      - examples/runner/**
+      - scripts/release/publish-runner-image.sh
+      - scripts/release/check-runner-toolset.sh
+      - docs/runner-images.md
+      - .github/workflows/runner-image.yml
+  schedule:
+    # Mondays 04:17 UTC: weekly keeps the image well inside GitHub's 30-day runner window.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runner-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  subset:
+    name: the published subset matches the manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/release/check-runner-toolset.sh
+
+  ubuntu-2404:
+    name: ubuntu-24.04 (amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REPOSITORY: ${{ vars.RUNNER_IMAGE_REPOSITORY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: build, and check the toolset
+        run: RUNNER_IMAGE=ubuntu-2404 PUBLISH=0 scripts/release/publish-runner-image.sh localhost/sentinel-runner-ubuntu-2404
+      - name: a command the image leaves out is refused by name
+        run: |
+          version=$(sed -n 's/^ARG RUNNER_VERSION=\(.*\)$/\1/p' examples/Containerfile.runner)
+          image="localhost/sentinel-runner-ubuntu-2404:$version"
+          set +e
+          out=$(podman run --rm --entrypoint docker "$image" version 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          [ "$code" -eq 127 ]
+          case $out in *"Not in the Sentinel runner image"*"'docker'"*) ;; *) exit 1 ;; esac
+          podman run --rm --entrypoint sentinel-toolset "$image" list
+      - name: publish
+        if: env.REPOSITORY != '' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          set -o pipefail
+          podman login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
+          RUNNER_IMAGE=ubuntu-2404 scripts/release/publish-runner-image.sh "$REPOSITORY" | tee -a "$GITHUB_STEP_SUMMARY"

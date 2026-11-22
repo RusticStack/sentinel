@@ -168,8 +168,9 @@ A worker starts runners from an image it pins by digest, built from
 - **What it carries.** The official `actions/runner` at a pinned version, its own entry point at
   `/usr/local/bin/sentinel-runner` ([`START`](../crates/sentinel-worker/src/runner.rs)), and the
   tools a runner needs to start and check a job out — `bash`, `ca-certificates`, `curl`, `git`,
-  `gzip`, `jq`, the `libicu` its runtime loads, `tar` and `unzip`. Toolchains a workflow expects are
-  AR05's; this image carries only what the runner itself needs.
+  `gzip`, `jq`, the `libicu` its runtime loads, `tar` and `unzip`. This image carries only what the
+  runner itself needs; the toolchains a workflow expects are in the images built on it
+  ([runner images](runner-images.md)).
 - **Pinned version.** `2.338.2`, recorded in the image's `io.sentinel.runner.version` label, so an
   operator reads what a digest carries without running it. The build downloads the release's own
   tarball and checks it against the sha256 in that release's notes, so the image cannot carry a build
@@ -195,12 +196,22 @@ operator did not pin, and the version that moves is the image's:
   change. That window is a review obligation: nothing in the image, the worker or the store checks
   it, and a digest that falls behind fails at GitHub rather than here.
 
-Build it with the repository as the context, and read the version back from the label:
+**Publishing it.** [`scripts/release/publish-runner-image.sh`](../scripts/release/publish-runner-image.sh)
+builds the image, checks that the version its label reports is the one the Containerfile pins, pushes it,
+and prints the line a worker states:
 
 ```sh
-podman build -f examples/Containerfile.runner -t sentinel-runner:2.338.2 .
-podman inspect --format '{{index .Config.Labels "io.sentinel.runner.version"}}' sentinel-runner:2.338.2
+scripts/release/publish-runner-image.sh ghcr.io/rusticstack/sentinel-runner
+# a worker pins this line:
+# image = "ghcr.io/rusticstack/sentinel-runner@sha256:…"
 ```
+
+Run it once per architecture that serves runner mode, since `amd64` and `arm64` build different artifacts
+and publish different digests, and publish before any worker names one: a sandbox pulls never, so a worker
+that states a digest it does not hold declines every runner lease. Once an image is published, the sandbox
+suite stops being a skip and becomes a gate — pull the digest, then run it with `SENTINEL_PODMAN_TESTS=1`
+and `SENTINEL_RUNNER_IMAGE` set to the same reference
+([below](#what-this-release-verifies-and-what-it-cannot)).
 
 ## What this release verifies, and what it cannot
 
@@ -265,3 +276,10 @@ job's result — a fake one can only show that the configuration is spent, writt
 the cancel-from-GitHub and worker-crash drills; and arm64. Those are the AR03 suite's gate on
 `reference-host` and `arm64-host` and its pilot workflow, and the pilots' measured restore and upload
 times are the benchmark wave's. This release states the residual rather than claiming it.
+
+The sandbox suite did run here, and it is no longer a skip: the image was built and pushed to a throwaway
+registry on the build machine (`127.0.0.1:5000`, rootless Podman 4.9.3, 2026-11-20), pulled back by the
+digest the script printed, and `runner_sandbox` passed both of its tests against that digest in 4.0 s —
+the container created from the plan's own flags, the runner ending by itself, the container and the lease
+directory gone afterwards, and the canary in neither the environment, the command line nor the work
+directory.

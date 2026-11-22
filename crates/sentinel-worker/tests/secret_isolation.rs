@@ -1,4 +1,8 @@
-//! One test function: the registry configuration is a process environment variable, set once before any runtime starts.
+//! One test function. The loopback registry is named insecure twice, because the two things that talk to
+//! it read different configurations: this process's own `podman build`/`push` see the environment variable
+//! set before any runtime starts, while every pull through `sentinel_worker::podman` strips that variable
+//! and reads the host's `registries.conf` instead (a host's environment must not decide which registries are
+//! trusted), so a run of this test installs a removable drop-in beside it.
 //! It runs under the isolation of the run: rootless containers, or Firecracker microVMs with
 //! `SENTINEL_MICROVM_TESTS=1` (see `support/isolation.rs`; TODO M04's gate).
 
@@ -166,6 +170,43 @@ fn start_registry(dir: &Path) -> Registry {
     registry
 }
 
+/// The host's own `registries.conf` is what a pull without a registry cache reads (the pull command
+/// strips an ambient `CONTAINERS_REGISTRIES_CONF`, so a host's environment cannot decide which
+/// registries are trusted), and the loopback fixture serves plain HTTP. This drop-in states that
+/// trust for this test's two ephemeral ports and removes itself afterwards, so an operator's own
+/// configuration is never rewritten.
+struct InsecureLoopback {
+    file: PathBuf,
+}
+
+impl InsecureLoopback {
+    fn new(ports: &[u16]) -> InsecureLoopback {
+        let dir = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join(".config"))
+            .join("containers/registries.conf.d");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!(
+            "99-sentinel-test-insecure-{}.conf",
+            std::process::id()
+        ));
+        let mut body = String::from("unqualified-search-registries = []\n");
+        for port in ports {
+            body.push_str(&format!(
+                "[[registry]]\nlocation = \"127.0.0.1:{port}\"\ninsecure = true\n"
+            ));
+        }
+        fs::write(&file, body).unwrap();
+        InsecureLoopback { file }
+    }
+}
+
+impl Drop for InsecureLoopback {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.file);
+    }
+}
+
 fn store_args(store: &Store) -> Vec<String> {
     match store {
         Store::Shared => Vec::new(),
@@ -231,6 +272,7 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
     let replay = Replay::start();
     let registry = start_registry(&scratch.path().join("registry"));
     let port = registry.port;
+    let _loopback_trust = InsecureLoopback::new(&[port, replay.port]);
     let conf = scratch.path().join("registries.conf");
     fs::write(
         &conf,
@@ -288,8 +330,19 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
     let tenant_a = Store::private(&stores, [0xaa; 16]).unwrap();
     let tenant_b = Store::private(&stores, [0xbb; 16]).unwrap();
     let never = std::sync::atomic::AtomicBool::new(false);
+    // The pull command strips an ambient `CONTAINERS_REGISTRIES_CONF` (a host's environment must not
+    // decide which registries are trusted), so the config naming the loopback fixture insecure is
+    // passed the way the registry cache passes its own generated one.
     let pull = |image: &str, auth: &Path, store: &Store| {
-        podman::pull(image, auth, store, Duration::from_secs(300), &never)
+        podman::pull_checked(
+            image,
+            auth,
+            Some(&conf),
+            store,
+            Duration::from_secs(300),
+            &never,
+            true,
+        )
     };
     assert!(
         pull(&private, &anonymous, &tenant_a).is_err(),

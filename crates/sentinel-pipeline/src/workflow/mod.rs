@@ -841,8 +841,11 @@ fn decode_env(path: &str, node: &Node, references: &mut References) -> Result<Ve
                 "an environment variable name is a letter or `_`, then letters, digits or `_`",
             );
         }
-        let value = scalar_text(&name_path, value, MAX_TEXT_BYTES)?;
-        references.scan(&value, &name_path)?;
+        // `NAME:` with no value is an empty variable on GitHub: a name with nothing to scan.
+        if !matches!(value, Node::Null) {
+            let value = scalar_text(&name_path, value, MAX_TEXT_BYTES)?;
+            references.scan(&value, &name_path)?;
+        }
         names.push(name.clone());
     }
     Ok(names)
