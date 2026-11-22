@@ -348,9 +348,9 @@ impl WorkerBootstrapFile {
                     "[worker_bootstrap.tailcat] needs x86_64_url or aarch64_url",
                 ));
             }
-            if tailcat.aarch64_url.is_some() != tailcat.aarch64_sha256.is_some() {
+            if tailcat.aarch64_url.is_none() && tailcat.aarch64_sha256.is_some() {
                 return Err(Error::config(
-                    "[worker_bootstrap.tailcat] aarch64_url and aarch64_sha256 are set together: this build pins no arm64 helper digest",
+                    "[worker_bootstrap.tailcat] aarch64_sha256 needs aarch64_url",
                 ));
             }
             if tailcat.x86_64_url.is_none() && tailcat.x86_64_sha256.is_some() {
@@ -376,10 +376,10 @@ impl WorkerBootstrapFile {
             ))
         })?;
         let tailcat = self.tailcat.as_ref().map(|t| {
-            let pin = |url: &Option<String>, sha256: Option<String>| {
+            let pin = |url: &Option<String>, sha256: &Option<String>, pinned: &str| {
                 url.clone().map(|url| sentinel_api::Pin {
                     url,
-                    sha256: sha256.unwrap_or_default(),
+                    sha256: sha256.clone().unwrap_or_else(|| pinned.to_owned()),
                 })
             };
             sentinel_api::TailcatRelease {
@@ -389,13 +389,14 @@ impl WorkerBootstrapFile {
                     .unwrap_or_else(|| sentinel_link::tailcat::PINNED_VERSION.to_owned()),
                 x86_64: pin(
                     &t.x86_64_url,
-                    Some(
-                        t.x86_64_sha256
-                            .clone()
-                            .unwrap_or_else(|| sentinel_link::tailcat::PINNED_SHA256.to_owned()),
-                    ),
+                    &t.x86_64_sha256,
+                    sentinel_link::tailcat::PINNED_SHA256_X86_64,
                 ),
-                aarch64: pin(&t.aarch64_url, t.aarch64_sha256.clone()),
+                aarch64: pin(
+                    &t.aarch64_url,
+                    &t.aarch64_sha256,
+                    sentinel_link::tailcat::PINNED_SHA256_AARCH64,
+                ),
                 derpmap_url: server_tailcat.and_then(|s| s.derpmap_url.clone()),
                 region: server_tailcat.and_then(|s| s.region.clone()),
             }
@@ -4315,10 +4316,15 @@ mod tests {
         ] {
             assert!(parse(bad).check(None).is_err(), "{bad}");
         }
-        // No arm64 digest is pinned by this build, so an arm64 helper must state its own.
+        // Either architecture's digest defaults to the pinned build; a digest needs its URL.
         let arm_without_digest =
             format!("{base}[tailcat]\naarch64_url = 'https://r.example.test/tailcat-arm'\n");
-        assert!(parse(&arm_without_digest).check(Some(&tailcat_on)).is_err());
+        assert!(parse(&arm_without_digest).check(Some(&tailcat_on)).is_ok());
+        let digest = "0".repeat(64);
+        let arm_digest_only = format!("{with_helper}aarch64_sha256 = '{digest}'\n");
+        assert!(parse(&arm_digest_only).check(Some(&tailcat_on)).is_err());
+        let x86_digest_only = format!("{arm_without_digest}x86_64_sha256 = '{digest}'\n");
+        assert!(parse(&x86_digest_only).check(Some(&tailcat_on)).is_err());
         let empty_helper = format!("{base}[tailcat]\nversion = '0.6.0'\n");
         assert!(parse(&empty_helper).check(Some(&tailcat_on)).is_err());
         assert!(
