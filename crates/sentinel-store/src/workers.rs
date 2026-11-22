@@ -1269,6 +1269,8 @@ pub fn revoke(
     if changed == 0 {
         return Err(Error::NotFound);
     }
+    // A revoked worker never reports again, so what its runner-mode caches held stops being charged now.
+    crate::classes::clear_actions_cache_in(tx, worker)?;
     audit(
         tx,
         Event::WorkerRevoked,
