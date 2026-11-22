@@ -109,9 +109,10 @@ api_url = "https://sentinel.example.com"             # optional: where workers r
 
 # Only for Tailcat enrollments; needs the controller's own [tailcat] enabled = true.
 [worker_bootstrap.tailcat]
-x86_64_url = "https://releases.example.com/tailcat/tailcat-0.6.0-linux-amd64"   # sha256 defaults to the pinned build
+# The executable unpacked from the upstream v0.6.0 archive, hosted by the operator. Each
+# <arch>_sha256 defaults to the pinned upstream build; set it only for another build.
+x86_64_url = "https://releases.example.com/tailcat/tailcat-0.6.0-linux-amd64"
 aarch64_url = "https://releases.example.com/tailcat/tailcat-0.6.0-linux-arm64"
-aarch64_sha256 = "…64 hex…"                           # this build pins no arm64 helper digest
 ```
 
 `api_url` is the HTTPS base URL workers reach the controller's API at (`https://`, or `http://` for a loopback host; no user information, query or fragment). Setting it turns on the redeem endpoint and the script's `sentinel worker enroll` flow; it is a versioned setting of the generated script (see [compatibility](compatibility.md)). `release_sums` is the `SHA256SUMS` that `scripts/release/package.sh` writes beside the release archives (V01): the controller reads the `sentinel-<version>-<arch>-linux-worker.tar.gz` lines, requires one version, and pins each archive by its listed digest; the archives themselves are served from `release_url`, not by the controller. The helper is the bare executable whose digest `[tailcat] sha256` pins (the controller's own pin is the x86_64 default). The `controller` address is an IP address and port because the worker's `controller` setting is one; the controller's own link fingerprint is added automatically. The Tailcat address comes from `<data_dir>/tailcat/address` and the DERP map and region from the controller's `[tailcat]` section, so a Tailcat enrollment waits (`409`) until the controller is serving.
