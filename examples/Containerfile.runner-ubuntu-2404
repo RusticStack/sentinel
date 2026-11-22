@@ -1,0 +1,70 @@
+# The Ubuntu 24.04 runner image with toolchains: the runner image (Containerfile.runner) plus the
+# published subset of GitHub's hosted `ubuntu-24.04` toolset (docs/runner-images.md).
+#
+#   podman build -f examples/Containerfile.runner -t sentinel-runner:2.338.2 .
+#   podman build -f examples/Containerfile.runner-ubuntu-2404 \
+#     --build-arg RUNNER=localhost/sentinel-runner:2.338.2 -t sentinel-runner-ubuntu-2404:2.338.2 .
+#
+# RUNNER has no default: the image is built on a runner image the builder names, so the runner version
+# and its checksum stay stated in one place. scripts/release/publish-runner-image.sh builds both.
+ARG RUNNER
+FROM ${RUNNER}
+
+LABEL org.opencontainers.image.title="sentinel-runner-ubuntu-2404" \
+      org.opencontainers.image.description="GitHub Actions runner for Sentinel runner mode, with toolchains" \
+      io.sentinel.runner.image="ubuntu-24.04"
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG TARGETARCH
+USER root
+
+# What the toolchains below link and unpack with: a C toolchain for cgo, `go test -race` and Rust's
+# linker, and the archive tools setup actions call.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential file libssl-dev openssh-client pkg-config xz-utils zip zstd \
+ && rm -rf /var/lib/apt/lists/*
+
+# Where `@actions/tool-cache` looks, under both names the setup actions read.
+ENV RUNNER_TOOL_CACHE=/opt/hostedtoolcache \
+    AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+
+COPY examples/runner/toolset.tsv examples/runner/absent.txt /usr/local/share/sentinel/
+COPY --chmod=0755 examples/runner/install-toolset.sh /usr/local/share/sentinel/install-toolset.sh
+COPY --chmod=0755 examples/runner/sentinel-toolset /usr/local/bin/sentinel-toolset
+COPY --chmod=0755 examples/runner/absent /usr/local/lib/sentinel/absent
+
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+        amd64) arch=x64 ;; \
+        arm64) arch=arm64 ;; \
+        *) echo "unsupported TARGETARCH '${TARGETARCH}': only amd64 and arm64 carry a toolset" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p "$RUNNER_TOOL_CACHE"; \
+    /usr/local/share/sentinel/install-toolset.sh /usr/local/share/sentinel/toolset.tsv "$arch"; \
+    rm /usr/local/share/sentinel/install-toolset.sh
+
+# The defaults a step finds without a setup action, as GitHub's image has them: the newest pinned
+# Node, Go and Python, and JDK 17. A setup action that selects another version puts it first on PATH.
+RUN set -eu; \
+    newest() { ls -d "$RUNNER_TOOL_CACHE/$1"/*/ | sort -V | tail -n 1; }; \
+    for tool in node go Python; do \
+        for bin in "$(newest "$tool")"*/bin/*; do ln -sf "$bin" "/usr/local/bin/$(basename "$bin")"; done; \
+    done; \
+    java=$(ls -d "$RUNNER_TOOL_CACHE"/Java_Temurin-Hotspot_jdk/17.*/*/ | head -n 1); \
+    for bin in java javac jar javadoc; do ln -sf "${java}bin/$bin" "/usr/local/bin/$bin"; done; \
+    echo "JAVA_HOME=${java%/}" >> /home/runner/.env
+
+# A hosted-image command this image does not carry answers with a refusal, last on PATH. A name the
+# image does carry is a mistake in absent.txt and fails the build.
+ENV PATH=/home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/lib/sentinel/absent-bin
+RUN set -eu; \
+    mkdir /usr/local/lib/sentinel/absent-bin; \
+    grep -v -e '^#' -e '^$' /usr/local/share/sentinel/absent.txt | while read -r tool; do \
+        if command -v "$tool" > /dev/null; then echo "absent.txt names '$tool', which this image carries" >&2; exit 1; fi; \
+        ln -s ../absent "/usr/local/lib/sentinel/absent-bin/$tool"; \
+    done
+
+USER runner
+# The image's own gate: the build fails unless every pinned tool is present at its pinned version.
+RUN sentinel-toolset check

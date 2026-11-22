@@ -1,0 +1,34 @@
+# Commands GitHub's hosted ubuntu-24.04 image carries that this image deliberately does not
+# (docs/runner-images.md#what-the-images-leave-out). One name per line. Each becomes a refusal last
+# on PATH; a name the image does carry fails the build, so this list cannot drift into a lie.
+ansible
+ant
+aws
+az
+bazel
+buildah
+clang
+cmake
+composer
+docker
+docker-compose
+dotnet
+gcloud
+gem
+gh
+gradle
+helm
+kotlin
+kubectl
+ninja
+php
+pnpm
+podman
+pwsh
+ruby
+sbt
+skopeo
+sudo
+swift
+terraform
+yarn

@@ -9,6 +9,15 @@
 # because the same tag is another image tomorrow and this one is the code a job's steps run under. The
 # version comes from the Containerfile, so the tag and the image's own label cannot disagree.
 #
+# RUNNER_IMAGE=ubuntu-2404 publishes the image with toolchains instead
+# (examples/Containerfile.runner-ubuntu-2404, docs/runner-images.md): the runner image is built first and
+# stays local, and the toolset image is built on it, checks its own toolset as its last build step, and is
+# the one pushed. Name a repository of its own for it:
+#
+#   RUNNER_IMAGE=ubuntu-2404 scripts/release/publish-runner-image.sh ghcr.io/rusticstack/sentinel-runner-ubuntu-2404
+#
+# PUBLISH=0 builds and checks without pushing, which is what a pull request's build does.
+#
 # PODMAN_BUILD_OPTIONS passes extra flags to the build, for a host whose build needs them (a container
 # without slirp needs `--network=host`, and one without a systemd user session needs its engine's
 # cgroup manager set to cgroupfs).
@@ -44,15 +53,36 @@ done
 digestfile=$(mktemp)
 trap 'rm -f "$digestfile"' EXIT
 
-echo "building $repository:$version (actions/runner $version)" >&2
-# Deliberately unquoted: the variable carries flags, and an empty value must expand to nothing.
-# shellcheck disable=SC2086
-podman build ${PODMAN_BUILD_OPTIONS:-} -f "$containerfile" -t "$repository:$version" .
+flavor=${RUNNER_IMAGE:-runner}
+echo "building $repository:$version (actions/runner $version, $flavor)" >&2
+case $flavor in
+  runner)
+    # Deliberately unquoted: the variable carries flags, and an empty value must expand to nothing.
+    # shellcheck disable=SC2086
+    podman build ${PODMAN_BUILD_OPTIONS:-} -f "$containerfile" -t "$repository:$version" .
+    ;;
+  ubuntu-2404)
+    base="localhost/sentinel-runner-base:$version"
+    # shellcheck disable=SC2086
+    podman build ${PODMAN_BUILD_OPTIONS:-} -f "$containerfile" -t "$base" .
+    # shellcheck disable=SC2086
+    podman build ${PODMAN_BUILD_OPTIONS:-} -f examples/Containerfile.runner-ubuntu-2404       --build-arg "RUNNER=$base" -t "$repository:$version" .
+    ;;
+  *)
+    echo "RUNNER_IMAGE is '$flavor': runner or ubuntu-2404" >&2
+    exit 2
+    ;;
+esac
 built=$(podman inspect --format '{{index .Config.Labels "io.sentinel.runner.version"}}' "$repository:$version")
 [ "$built" = "$version" ] || {
   echo "the image states runner $built, the Containerfile pins $version" >&2
   exit 1
 }
+
+if [ "${PUBLISH:-1}" = 0 ]; then
+  echo "built $repository:$version; PUBLISH=0, so nothing was pushed" >&2
+  exit 0
+fi
 
 podman push --digestfile "$digestfile" "$@" "$repository:$version" >&2
 digest=$(cat "$digestfile")
