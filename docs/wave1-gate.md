@@ -28,7 +28,7 @@ Root prepares the host once beforehand, outside this script: [`bench/hosts/align
 | | `web` | `pnpm -C web install`, `typecheck`, `build`, `test:unit` |
 | | `browser` | the browser suite, `--browser-runs` times in a row (default 5) |
 | | `pending-suites` | email identity and `sentinel-mail`, first-run setup, account security, GitHub linking, the setup token |
-| | `power-cut` | `power_cut_on_dm_flakey`, only with `--power-loss` and as root (dm-flakey on a loop device) |
+| | `power-cut` | `power_cut_on_dm_flakey`, only with `--power-loss` and as root (dm-flakey on a loop device). Root and rootless Podman cannot share a run, so the root run is `--power-loss --only power-cut`, and the unprivileged run passes its `wave1.json` as `--power-record`: the stage then passes only when that record is from this host and commit, clean, with `power-cut` passed |
 | | `bench` | `SMOKE_COMPILE=1 bench/smoke.sh` |
 | | `doc-links` | `scripts/check-doc-links.sh` |
 | `arm64-host` | `test-worker` | `cargo test-worker` |

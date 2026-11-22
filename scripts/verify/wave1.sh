@@ -15,6 +15,8 @@
 #   --detach           run in the background: log in <record-dir>.log, PID in <record-dir>.pid
 #   --browser-runs N   how many times the browser suite runs (default 5)
 #   --power-loss       also run power_cut_on_dm_flakey (root and dm-flakey; loop devices only)
+#   --power-record F   the wave1.json of a root `--power-loss --only power-cut` run on this host and commit;
+#                      the unprivileged run takes its passed power-cut stage instead of skipping it
 #   --max-cpu-pressure N   a stage is recorded pending when /proc/pressure/cpu avg10 is above N (default 25)
 #
 # The host rules it follows: the checkout and the record live under /var/tmp (or /tmp), never under
@@ -27,7 +29,7 @@
 set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-src=$(cd "$here/../.." && pwd); out=; host=; only=; max_pressure=25; browser_runs=5; power_loss=0; phase=run; detach=0
+src=$(cd "$here/../.." && pwd); out=; host=; only=; max_pressure=25; browser_runs=5; power_loss=0; power_record=; phase=run; detach=0
 args=("$@")
 while [ $# -gt 0 ]; do
   case $1 in
@@ -38,6 +40,7 @@ while [ $# -gt 0 ]; do
     --max-cpu-pressure) max_pressure=${2:-}; shift 2 ;;
     --browser-runs) browser_runs=${2:-}; shift 2 ;;
     --power-loss) power_loss=1; shift ;;
+    --power-record) power_record=${2:-}; shift 2 ;;
     --list) phase=list; shift ;;
     --plan) phase=plan; shift ;;
     --detach) detach=1; shift ;;
@@ -56,6 +59,22 @@ case $browser_runs in ''|*[!0-9]*|0) echo "--browser-runs must be a positive num
 NX="cargo nextest run --locked --all-features --no-fail-fast"
 PODMAN_SUITES="-p sentinel-worker --test podman --test end_to_end --test images --test executor_faults --test prefetch --test slice --test secret_isolation --test recovery"
 BROWSER="cargo test --locked --all-features -p sentinel-api --test web_browser -- --ignored --test-threads=1 --skip measure_the_web_interface --skip serve_the_fixture"
+
+# A power-cut record stands in only for the same host and commit, clean, with the stage passed.
+POWER_RECORD_CHECK='
+import json, subprocess, sys
+rec = json.load(open(sys.argv[1]))
+head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+stage = [s for s in rec.get("stages", []) if s.get("stage") == "power-cut"]
+problems = [why for bad, why in (
+    (rec.get("host") != sys.argv[2], "the record is from another host"),
+    (rec.get("commit") != head, "the record is from another commit"),
+    (rec.get("dirty") is not False, "the record was made from a dirty checkout"),
+    (not stage or stage[0].get("status") != "passed", "the record has no passed power-cut stage"),
+) if bad]
+print("\n".join(problems) or "power-cut passed in %s at %s" % (sys.argv[1], head))
+sys.exit(1 if problems else 0)
+'
 
 # What Wave 1 lists that no script can settle; the record carries it so a PASS never implies it.
 NOT_AUTOMATED=(
@@ -90,6 +109,7 @@ PY
 # NEEDS says what the stage requires beyond the toolchain; WHY is empty when this host has it, and
 # otherwise the reason the stage is skipped. `skipcheck` fails a stage whose log holds a `skipped:`
 # line: a test that returns early because its environment is incomplete must not count as a pass.
+# `bincheck` fails a stage whose log holds a `SKIP(no binary)` line: a smoke with nothing built tested nothing.
 stage() {
   local id=$1 mode=$2 needs=$3 why=$4; shift 4
   case $phase in
@@ -110,6 +130,9 @@ stage() {
   t1=$(date +%s)
   if [ $rc -eq 0 ] && [ "$mode" = skipcheck ] && grep -q 'skipped:' "$log"; then
     rc=99; echo "a test reported 'skipped:'; its environment was incomplete" >>"$log"
+  fi
+  if [ $rc -eq 0 ] && [ "$mode" = bincheck ] && grep -q 'SKIP(no binary)' "$log"; then
+    rc=99; echo "a contract's binary was not built; the smoke tested nothing for it" >>"$log"
   fi
   if [ $rc -eq 0 ]; then echo "PASS  $id ($((t1 - t0)) s)"; record "$id" passed $((t1 - t0)) ""; n_ok=$((n_ok + 1))
   else echo "FAIL  $id (exit $rc, $((t1 - t0)) s) log: $log"; record "$id" failed $((t1 - t0)) "exit $rc"; n_fail=$((n_fail + 1)); fi
@@ -143,10 +166,17 @@ stages() {
         -p sentinel-api --test email --test setup --test account --test github_sign_in \
         -p sentinel --test setup_token --test mfa_admin
       # Run 6.
-      stage power-cut skipcheck "--power-loss, root and dm-flakey" "$power_why" \
-        env SENTINEL_POWER_LOSS_TESTS=1 $NX --no-capture -p sentinel-worker --test crash_consistency -E "test(power_cut_on_dm_flakey)"
+      if [ -n "$power_record" ] && [ "$(id -u)" != 0 ]; then
+        # Root and rootless Podman cannot share one run: the root run's passed stage stands in.
+        stage power-cut plain "--power-record from a root run on this host and commit" "$power_why" \
+          python3 -c "$POWER_RECORD_CHECK" "$power_record" "$host"
+      else
+        stage power-cut skipcheck "--power-loss, root and dm-flakey" "$power_why" \
+          env SENTINEL_POWER_LOSS_TESTS=1 $NX --no-capture -p sentinel-worker --test crash_consistency -E "test(power_cut_on_dm_flakey)"
+      fi
       # The stage holds the verification lock, which the smoke would otherwise read as a measurement's.
-      stage bench plain "python3" "" env SMOKE_COMPILE=1 SENTINEL_VERIFY_LOCK_HELD=1 bash bench/smoke.sh
+      stage bench bincheck "python3" "" \
+        sh -c "cargo release-linux && SMOKE_COMPILE=1 SENTINEL_VERIFY_LOCK_HELD=1 bash bench/smoke.sh"
       stage doc-links plain "" "" bash scripts/check-doc-links.sh
       ;;
     arm64-host)
@@ -157,7 +187,8 @@ stages() {
     kvm-host)
       # Not in Wave 1's Needs: the job suites once more under Firecracker, on the host that has KVM.
       stage microvm skipcheck "$podman, /dev/kvm, SENTINEL_FIRECRACKER, SENTINEL_GUEST_KERNEL and SENTINEL_GUEST_AGENT" "$microvm_why" \
-        env SENTINEL_MICROVM_TESTS=1 SENTINEL_PODMAN_TESTS=1 $NX --no-capture -p sentinel-worker --test microvm --test end_to_end --test slice --test k09 --test secret_isolation
+        env SENTINEL_MICROVM_TESTS=1 SENTINEL_PODMAN_TESTS=1 $NX --no-capture -p sentinel-worker --test microvm --test end_to_end --test slice --test k09 --test secret_isolation \
+        -E "not test(the_cold_and_restored_start_to_first_process_distributions)"
       ;;
   esac
 }
@@ -178,8 +209,11 @@ if grep -qi microsoft /proc/version 2>/dev/null; then echo "refusing: tests neve
 src=$(cd "$src" 2>/dev/null && pwd -P) || { echo "--src is not a directory" >&2; exit 2; }
 [ -f "$src/Cargo.toml" ] && [ -f "$src/CLAUDE.md" ] || { echo "$src is not a Sentinel checkout" >&2; exit 2; }
 case $src in /var/tmp/*|/tmp/*) ;; *) echo "refusing: $src is not a disposable checkout under /var/tmp" >&2; exit 2 ;; esac
-mkdir -p "$out" || exit 2
+mkdir -p -m 700 "$out" || exit 2
 out=$(cd "$out" && pwd -P)
+# The record is evidence: a directory another account owns or can write could have it replaced.
+[ -O "$out" ] || { echo "refusing: $out is not owned by this account" >&2; exit 2; }
+[ -z "$(find "$out" -maxdepth 0 -perm /022)" ] || { echo "refusing: $out is writable by other accounts" >&2; exit 2; }
 case $out in /var/tmp/*|/tmp/*) ;; *) echo "refusing: the record directory $out is not under /var/tmp" >&2; exit 2 ;; esac
 [ -z "$(ls -A "$out")" ] || { echo "$out is not empty" >&2; exit 2; }
 phase=list; stages; phase=run
@@ -217,7 +251,9 @@ if [ "$(id -u)" = 0 ]; then podman_why="running as root; rootless Podman needs a
 elif ! command -v podman >/dev/null; then podman_why="podman is not installed"
 elif ! podman info >/dev/null 2>&1; then podman_why="podman info fails for this account (subordinate ids or runtime directory)"; fi
 case $(pnpm --version 2>/dev/null) in 12.15.*) ;; *) pnpm_why="pnpm 12.15 is not on PATH; root runs bench/hosts/align-toolchain.sh first" ;; esac
-if [ $power_loss = 0 ]; then power_why="not asked for (--power-loss)"
+if [ -n "$power_record" ] && [ "$(id -u)" != 0 ]; then
+  [ -r "$power_record" ] || power_why="--power-record $power_record is not readable"
+elif [ $power_loss = 0 ]; then power_why="not asked for (--power-loss, or --power-record from a root run)"
 elif [ "$(id -u)" != 0 ]; then power_why="needs root for dm-flakey on a loop device"; fi
 if [ "$host" = kvm-host ]; then
   microvm_why=$podman_why
