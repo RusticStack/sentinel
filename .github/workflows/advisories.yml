@@ -1,0 +1,23 @@
+name: advisories
+
+# The advisory database changes without the tree changing, so the pull-request check in ci.yml
+# cannot see an advisory published after a merge. This runs the same check on main every day
+# (docs/releasing.md#dependency-and-license-inventory).
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: advisories (main)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.22.0
+      - run: cargo deny --locked check advisories

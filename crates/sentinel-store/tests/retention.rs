@@ -1738,6 +1738,58 @@ fn a_tenant_narrows_the_deployment_thresholds_and_never_widens_them() {
 }
 
 #[test]
+fn an_upload_counts_the_runner_mode_caches_the_standing_counts() {
+    let f = fixture();
+    let d = Deployment {
+        tenant_quota_bytes: 1_000,
+        soft_percent: 50,
+        hard_percent: 100,
+        ..Deployment::default()
+    };
+    f.objects.set_deployment(d);
+    f.upload(300).unwrap();
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO tenant_usage(tenant_id, actions_cache_bytes) VALUES(?1, 600)
+                 ON CONFLICT(tenant_id) DO UPDATE SET actions_cache_bytes = excluded.actions_cache_bytes",
+                [tenant.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let standing = f.standing(d);
+    assert_eq!(
+        standing.used, 900,
+        "the standing counts the reported caches"
+    );
+    let usage = f
+        .store
+        .read(|c| retention::tenant_usage(c, tenant))
+        .unwrap();
+    assert_eq!((usage.total(), usage.counted()), (300, 900));
+
+    // The upload is refused at the line the standing draws, not at the one stored bytes alone would.
+    f.upload(100).unwrap();
+    assert!(matches!(f.upload(1), Err(Error::QuotaExceeded)));
+
+    // Once the caches gave way and their workers reported it, the same upload fits.
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE tenant_usage SET actions_cache_bytes = 0 WHERE tenant_id = ?1",
+                [tenant.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    f.upload(1).unwrap();
+}
+
+#[test]
 fn the_hard_threshold_refuses_an_upload_and_the_soft_one_only_reports() {
     let f = fixture();
     let d = Deployment {

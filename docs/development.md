@@ -103,7 +103,8 @@ Release output is `target/release/sentinel` (`sentinel.exe` on Windows). CLI and
 `.github/workflows/ci.yml` runs on every pull request and on every push to a branch that is not `main`,
 on `ubuntu-latest`: `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D
 warnings`, the workspace test suite with cargo-nextest, and the Linux roles' all-feature lint, all-feature
-suite, release build and a start of the built binary. The cargo registry and target directory are cached
+suite, release build and a start of the built binary, and the [dependency gate](releasing.md#dependency-and-license-inventory)
+(`scripts/release/check-inventory.sh` and `cargo deny check advisories`). The cargo registry and target directory are cached
 per job and every cargo command is `--locked`; the toolchain is `rust-toolchain.toml`'s, which rustup
 installs on the first call. There is no Windows leg: the crate cross-compiles for
 `x86_64-pc-windows-msvc`, but no Windows host runs it yet ([backlog](backlog.md) N01), so a leg here would

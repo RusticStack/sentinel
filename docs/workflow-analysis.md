@@ -44,7 +44,7 @@ An `env:` entry with no value (`TARGET_FLAGS:`) is an empty variable, as on GitH
 
 ### Matrices and `runs-on:` cells
 
-A `runs-on:` label may reference `${{ matrix.<axis> }}`. The analyzer expands only the axes the labels actually name (a matrix used elsewhere does not widen the placement), substituting those axis values into every label. One job therefore yields one cell per `runs-on:` variant; a job with no matrix, or a matrix its labels do not name, yields exactly one cell with no axes. The cross product is bounded by `MAX_MATRIX_CELLS`; a larger one is refused, not truncated. An expression that is not a matrix reference the cell holds leaves that label unresolved and the cell stays on GitHub's runners as `expression`.
+A `runs-on:` label may reference `${{ matrix.<axis> }}`. The analyzer expands only the axes the labels actually name (a matrix used elsewhere does not widen the placement), substituting those axis values into every label. One job therefore yields one cell per `runs-on:` variant; a job with no matrix, or a matrix its labels do not name, yields exactly one cell with no axes. The cross product is bounded by `MAX_MATRIX_CELLS`; a larger one is refused, not truncated. A matrix with no axis, only `include` entries, is one combination per entry as on GitHub: the distinct values the entries give the keys the labels name are the cells, and an entry that does not state a named key leaves its label unresolved. `include` entries beside declared axes are recorded and do not widen the cells. An expression that is not a matrix reference the cell holds leaves that label unresolved and the cell stays on GitHub's runners as `expression`.
 
 Axis values must be scalars, `include` and `exclude` entries must be mappings of scalars, and `fail-fast` defaults to `true` as in GitHub. A non-scalar axis value is refused with the axis path.
 
@@ -73,7 +73,7 @@ Axis values must be scalars, `include` and `exclude` entries must be mappings of
 
 Rules that settle the edge cases:
 
-- A label set is decided by the labels that name a class. Two labels naming different classes satisfy no one runner and the job is kept as `no_class`.
+- A label set is decided by the labels that name a class. Two labels naming different classes satisfy no one runner and the job is kept as `no_class`. A `${{ }}` label nothing resolves beside a class label keeps the job as `expression`: what it demands is unknown, so the class is not the whole set.
 - `runs-on:` written as a mapping with a `group:` is a named runner group — GitHub's own scaling concept, not a Sentinel class — so the job is kept as `no_class`.
 - A job that needs a Docker daemon (a `container:`, a `services:` entry or a `docker://` step) needs a class a Linux microVM guest serves ([executor](executor.md), [plan 16.8](../plan.md#168-microvm-execution-on-kvm-hosts)). With `DockerHosts::MicrovmGuests` its class carries `requires_microvm`; with `DockerHosts::ContainerOnly`, or for any Windows class (no nested virtualization in a Windows guest), the job is kept as `docker`.
 

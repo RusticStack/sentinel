@@ -427,6 +427,40 @@ fn shadowing_a_shadowed_workflow_adds_nothing() {
 }
 
 #[test]
+fn a_job_whose_cells_agree_on_one_class_is_shadowed_with_its_matrix() {
+    let text = "name: variants
+on: [push]
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: make build
+";
+    let path = one("variants.yml");
+    let files = vec![(path.clone(), text.to_owned())];
+    let shadowed = plan_of(&files, Phase::Shadow, false);
+    let workflow = &shadowed.workflows[0];
+    assert_eq!(workflow.shadow.len(), 1, "{:?}", workflow.shadow);
+    assert_eq!(workflow.shadow[0].job, "sentinel-build");
+    assert_eq!(workflow.shadow[0].class, "sentinel-4vcpu-ubuntu-2404");
+
+    let after = analyze_one(&path, workflow.applied.as_deref().unwrap());
+    let original = after.jobs.iter().find(|job| job.id == "build").unwrap();
+    let copy = after
+        .jobs
+        .iter()
+        .find(|job| job.id == "sentinel-build")
+        .unwrap();
+    assert_eq!(original.cells.len(), 2);
+    // The copy's label is constant, so it is one cell; its matrix still runs both rows.
+    assert_eq!(copy.cells.len(), 1);
+    assert_eq!(copy.matrix, original.matrix);
+}
+
+#[test]
 fn a_copy_id_some_other_job_holds_is_refused() {
     let text = "name: taken
 on: [push]

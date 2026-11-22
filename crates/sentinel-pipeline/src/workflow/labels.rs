@@ -137,6 +137,10 @@ impl LabelTable {
                 Entry::Keep(_) => {}
             }
         }
+        // A label left unresolved may demand anything: a class named beside it is not the whole set.
+        if expression && found.is_some() {
+            return Destination::Keep(KeepReason::Expression);
+        }
         if let Some((class, change)) = found {
             if needs_docker {
                 if docker == DockerHosts::ContainerOnly || class.os.is_windows() {

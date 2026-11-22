@@ -260,7 +260,13 @@ because the class is bytes on every host the tenant's jobs ran on. The class is 
 which is what makes the threshold act on it.
 
 At the hard threshold the answer to a report is `ActionsEvict` naming the tenant's repositories, and the
-worker removes each repository's whole cache tree. A repository whose sandbox is still running is spared:
+worker removes each repository's whole cache tree. Every other connected worker whose rows still hold bytes of
+the tenant's repositories is sent `ActionsEvict` for its own repositories at the same moment, idle hosts
+included: a worker reports only when its own attempt ends or its own eviction removed something, so a host that
+ran nothing since would otherwise keep its bytes charged. The same push follows every hard-threshold pass of the
+tenant — a refused artifact, and an upload the threshold refuses (`POST /tenants/{slug}/uploads`), whose
+retry is admitted once the workers reported what they removed. The message is the one protocol 19 already
+carries, so no version changes. A repository whose sandbox is still running is spared:
 a live job's inputs are never deleted under it, and that repository's entries go at the next report, when
 the attempt has ended. An eviction that removed nothing is not reported again, so a spared repository does not
 turn into a report and the same answer back to back while its job runs. A revoked worker has its rows cleared
@@ -269,5 +275,6 @@ rather than holding them.
 
 What no test here covers is the walk over a tree a real job filled: the report, the fold, the hard state
 and the eviction are driven end to end over a real worker link
-(`crates/sentinel-link/tests/runner_mode.rs`), and the tree itself is read by the same directory code the
+(`crates/sentinel-link/tests/runner_mode.rs`, including the idle host asked to evict and the upload refusal
+that makes the caches give way), and the tree itself is read by the same directory code the
 spool and mirror sweeps use.

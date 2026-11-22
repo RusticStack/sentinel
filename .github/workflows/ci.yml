@@ -1,8 +1,9 @@
 name: ci
 
-# The four checks of the repository's own command list (CLAUDE.md#commands): `cargo fmt-check`,
-# `cargo lint`, `cargo test-cli`, and the Linux roles' `cargo lint-linux` / `cargo test-linux`
-# with a release build of what ships. A Windows leg is deliberately absent: the crate builds for
+# The checks of the repository's own command list (CLAUDE.md#commands): `cargo fmt-check`,
+# `cargo lint`, `cargo test-cli`, the Linux roles' `cargo lint-linux` / `cargo test-linux`
+# with a release build of what ships, and the dependency gate (`cargo licenses`, the inventory
+# and `cargo advisories`). A Windows leg is deliberately absent: the crate builds for
 # `x86_64-pc-windows-msvc`, but nothing runs on a Windows host yet (docs/backlog.md N01), so a leg
 # here would be red by default. Add it beside N01, not before.
 on:
@@ -45,6 +46,31 @@ jobs:
         with:
           shared-key: lint
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  # The dependency gate (docs/releasing.md#dependency-and-license-inventory): the license, source
+  # and wildcard policy of deny.toml, and THIRD-PARTY-LICENSES.md current with Cargo.lock. The tool
+  # versions are pinned because cargo-about's output is compared byte for byte.
+  dependencies:
+    name: licenses and inventory
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.22.0,cargo-about@0.9.3
+      - run: scripts/release/check-inventory.sh
+
+  # Security advisories against Cargo.lock. The advisory database changes daily, so this can turn
+  # red with no change in the tree; advisories.yml runs the same check on main every day.
+  advisories:
+    name: advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.22.0
+      - run: cargo deny --locked check advisories
 
   test:
     name: test (portable)

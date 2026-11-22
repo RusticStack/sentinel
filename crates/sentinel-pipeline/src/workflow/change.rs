@@ -1080,10 +1080,7 @@ fn verify_shadow(
             .iter()
             .find(|copy| copy.shadow.job == job.id)
             .ok_or_else(failed)?;
-        if job.name.as_deref() != Some(copy.shadow.name.as_str())
-            || !resolves_to(job, copy.class)
-            || job.cells.len() != copy.original.cells.len()
-        {
+        if job.name.as_deref() != Some(copy.shadow.name.as_str()) || !resolves_to(job, copy.class) {
             return Err(failed());
         }
         if copy.added && (job.needs != copy.needs || !same_facts(job, copy.original)) {

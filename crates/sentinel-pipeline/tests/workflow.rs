@@ -369,6 +369,17 @@ fn label_table_v1_maps_hosted_blacksmith_and_arm64_labels() {
     assert_eq!(
         LabelTable::V1.classify(
             &Declared {
+                labels: vec!["ubuntu-latest".to_owned(), "${{ vars.EXTRA }}".to_owned()],
+                group: None,
+            },
+            false,
+            DockerHosts::MicrovmGuests
+        ),
+        Destination::Keep(KeepReason::Expression)
+    );
+    assert_eq!(
+        LabelTable::V1.classify(
+            &Declared {
                 labels: vec!["ubuntu-latest".to_owned(), "windows-latest".to_owned()],
                 group: None,
             },
@@ -462,6 +473,82 @@ fn matrix_cells_resolve_every_runs_on_label() {
     );
     assert!(matches!(test.cells[2].destination, Destination::Class(_)));
     assert!(events(&inventory, "macos-latest"));
+}
+
+/// ripgrep's real `test` job has no axis: every row is an `include` entry that names its `os`.
+#[test]
+fn an_include_only_matrix_yields_one_cell_per_runs_on_variant() {
+    let text = concat!(
+        "on: [push]
+",
+        "jobs:
+",
+        "  test:
+",
+        "    runs-on: ${{ matrix.os }}
+",
+        "    strategy:
+",
+        "      matrix:
+",
+        "        include:
+",
+        "          - {build: stable, os: ubuntu-latest}
+",
+        "          - {build: beta, os: ubuntu-latest}
+",
+        "          - {build: macos, os: macos-latest}
+",
+        "          - {build: bare}
+",
+        "    steps:
+",
+        "      - run: cargo test
+",
+        "  lint:
+",
+        "    runs-on: ubuntu-latest
+",
+        "    strategy:
+",
+        "      matrix:
+",
+        "        include:
+",
+        "          - {os: macos-latest}
+",
+        "    steps:
+",
+        "      - run: cargo fmt --check
+",
+    );
+    let inventory = analyze_files(
+        &[(".github/workflows/ci.yml".to_owned(), text.to_owned())],
+        DockerHosts::MicrovmGuests,
+    );
+    let test = &inventory.workflows[0].jobs[0];
+    assert_eq!(test.cells.len(), 3, "the two Ubuntu rows are one variant");
+    assert_eq!(
+        test.cells[0].axes,
+        vec![("os".to_owned(), "ubuntu-latest".to_owned())]
+    );
+    assert_eq!(test.cells[0].labels, ["ubuntu-latest"]);
+    assert!(matches!(test.cells[0].destination, Destination::Class(_)));
+    assert_eq!(
+        test.cells[1].destination,
+        Destination::Keep(KeepReason::MacOs)
+    );
+    // A row that does not state the key leaves the label unresolved.
+    assert!(test.cells[2].axes.is_empty());
+    assert_eq!(
+        test.cells[2].destination,
+        Destination::Keep(KeepReason::Expression)
+    );
+    // Labels that name no key are not widened by the entries.
+    let lint = &inventory.workflows[0].jobs[1];
+    assert_eq!(lint.cells.len(), 1);
+    assert!(lint.cells[0].axes.is_empty());
+    assert!(matches!(lint.cells[0].destination, Destination::Class(_)));
 }
 
 fn events(inventory: &workflow::Inventory, label: &str) -> bool {

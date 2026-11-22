@@ -7,6 +7,8 @@ release-cli = "build --locked --workspace --release"
 # Dependency policy for the release artifacts (deny.toml); needs cargo-deny. The inventory
 # freshness check is scripts/release/check-inventory.sh.
 licenses = "deny --locked check bans licenses sources"
+# Security advisories for the same graph; fetches the advisory database, so it needs the network.
+advisories = "deny --locked check advisories"
 
 # Linux-only role commands; portable checks above intentionally omit role features.
 lint-linux = "clippy --locked --workspace --all-targets --all-features -- -D warnings"
