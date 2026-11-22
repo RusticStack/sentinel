@@ -1,0 +1,31 @@
+== .github/workflows/ci.yml
+  jobs: 6
+  Label: changes=5 shadow=0 dropped=0 disabled=0 kept=1
+    move wasm : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    move rustfmt : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    move docs : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    move benches : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    move fuzz_testing : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    kept test [MacOs, NoClass] varies=false
+    native refused: Some("a native trigger cannot express this event's filters")
+  Shadow: changes=5 shadow=5 dropped=0 disabled=0 kept=1
+  Switch: changes=5 shadow=0 dropped=0 disabled=0 kept=1
+  Disable PLAN REFUSED: .github/workflows/ci.yml: the disable phase needs the native plan
+== .github/workflows/publish.yml
+  jobs: 1
+  Label: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+    move publish : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    native refused: Some("deployment environments with their secrets and approvals are not modelled")
+  Shadow: changes=1 shadow=1 dropped=0 disabled=0 kept=0
+  Switch: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+  Disable PLAN REFUSED: .github/workflows/publish.yml: the disable phase needs the native plan
+== .github/workflows/release.yml
+  jobs: 3
+  Label: changes=2 shadow=0 dropped=0 disabled=0 kept=1
+    move create-release : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    move build-release-deb : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    kept build-release [MacOs, NoClass] varies=false
+    native refused: Some("the `if` expression is not part of the inventory (it holds names, never values)")
+  Shadow: changes=2 shadow=2 dropped=0 disabled=0 kept=1
+  Switch: changes=2 shadow=0 dropped=0 disabled=0 kept=1
+  Disable PLAN REFUSED: .github/workflows/release.yml: the disable phase needs the native plan

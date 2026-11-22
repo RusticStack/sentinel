@@ -1,0 +1,51 @@
+== .github/workflows/build.yml
+  jobs: 4
+  Label: changes=4 shadow=0 dropped=0 disabled=0 kept=0
+    move build : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    move build-gson-subset : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    move native-image-test : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    move verify-reproducible-build : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    native refused: Some("a native trigger cannot express this event's filters")
+  Shadow: changes=4 shadow=4 dropped=0 disabled=0 kept=0
+  Switch: changes=4 shadow=0 dropped=0 disabled=0 kept=0
+  Disable PLAN REFUSED: .github/workflows/build.yml: the disable phase needs the native plan
+== .github/workflows/check-android-compatibility.yml
+  jobs: 1
+  Label: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+    move check-android-compatibility : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    native refused: Some("a native trigger cannot express this event's filters")
+  Shadow: changes=1 shadow=1 dropped=0 disabled=0 kept=0
+  Switch: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+  Disable PLAN REFUSED: .github/workflows/check-android-compatibility.yml: the disable phase needs the native plan
+== .github/workflows/check-api-compatibility.yml
+  jobs: 1
+  Label: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+    move check-api-compatibility : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    native refused: Some("the `if` expression is not part of the inventory (it holds names, never values)")
+  Shadow: changes=1 shadow=1 dropped=0 disabled=0 kept=0
+  Switch: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+  Disable PLAN REFUSED: .github/workflows/check-api-compatibility.yml: the disable phase needs the native plan
+== .github/workflows/cifuzz.yml
+  jobs: 1
+  Label: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+    move Fuzzing : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    native refused: Some("an action runs only in runner mode; the step is rewritten as commands or the job stays on GitHub")
+  Shadow: changes=1 shadow=1 dropped=0 disabled=0 kept=0
+  Switch: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+  Disable PLAN REFUSED: .github/workflows/cifuzz.yml: the disable phase needs the native plan
+== .github/workflows/codeql-analysis.yml
+  jobs: 1
+  Label: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+    move analyze : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    native refused: Some("a native trigger cannot express this event's filters")
+  Shadow: changes=1 shadow=1 dropped=0 disabled=0 kept=0
+  Switch: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+  Disable PLAN REFUSED: .github/workflows/codeql-analysis.yml: the disable phase needs the native plan
+== .github/workflows/scorecard.yml
+  jobs: 1
+  Label: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+    move analysis : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    native refused: Some("no native trigger exists for this event")
+  Shadow: changes=1 shadow=1 dropped=0 disabled=0 kept=0
+  Switch: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+  Disable PLAN REFUSED: .github/workflows/scorecard.yml: the disable phase needs the native plan

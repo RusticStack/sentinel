@@ -1,0 +1,106 @@
+== .github/workflows/acceptance.yml
+  ANALYZE REFUSED: .github/workflows/acceptance.yml.jobs.acceptance.strategy.matrix.os: expected sequence, found string
+== .github/workflows/agentics-maintenance.yml
+  ANALYZE REFUSED: .github/workflows/agentics-maintenance.yml.on.workflow_call: unknown key `outputs`
+== .github/workflows/bump-go.yml
+  jobs: 1
+  Label: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+    move bump-go : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    native refused: Some("a native trigger cannot express this event's filters")
+  Shadow: changes=1 shadow=1 dropped=0 disabled=0 kept=0
+  Switch: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+  Disable PLAN REFUSED: .github/workflows/bump-go.yml: the disable phase needs the native plan
+== .github/workflows/codeql.yml
+  jobs: 1
+  Label: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+    move CodeQL-Build : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    native refused: Some("a native trigger cannot express this event's filters")
+  Shadow: changes=1 shadow=1 dropped=0 disabled=0 kept=0
+  Switch: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+  Disable PLAN REFUSED: .github/workflows/codeql.yml: the disable phase needs the native plan
+== .github/workflows/copilot-setup-steps.yml
+  jobs: 1
+  Label: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+    move copilot-setup-steps : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    native refused: Some("a native trigger cannot express this event's filters")
+  Shadow: changes=1 shadow=1 dropped=0 disabled=0 kept=0
+  Switch: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+  Disable PLAN REFUSED: .github/workflows/copilot-setup-steps.yml: the disable phase needs the native plan
+== .github/workflows/dependabot-triage-schedule.yml
+  jobs: 1
+  Label: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+    move dispatch : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    native refused: Some("a native trigger cannot express this event's filters")
+  Shadow: changes=1 shadow=1 dropped=0 disabled=0 kept=0
+  Switch: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+  Disable PLAN REFUSED: .github/workflows/dependabot-triage-schedule.yml: the disable phase needs the native plan
+== .github/workflows/dependabot-triage.lock.yml
+  ANALYZE REFUSED: .github/workflows/dependabot-triage.lock.yml: yaml: line 797, column 11: value longer than 4096 bytes
+== .github/workflows/deployment.yml
+  ANALYZE REFUSED: .github/workflows/deployment.yml: unknown key `run-name`
+== .github/workflows/go.yml
+  jobs: 2
+  Label: changes=0 shadow=0 dropped=0 disabled=0 kept=2
+    kept build [MacOs] varies=false
+    kept integration-tests [MacOs] varies=false
+    native refused: Some("a local action's own definition is not part of the workflow; the step is rewritten as commands or the job stays on GitHub")
+  Shadow: changes=0 shadow=0 dropped=0 disabled=0 kept=2
+  Switch: changes=0 shadow=0 dropped=0 disabled=0 kept=2
+  Disable PLAN REFUSED: .github/workflows/go.yml: the disable phase needs the native plan
+== .github/workflows/govulncheck.yml
+  jobs: 1
+  Label: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+    move govulncheck : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    native refused: Some("a native trigger cannot express this event's filters")
+  Shadow: changes=1 shadow=1 dropped=0 disabled=0 kept=0
+  Switch: changes=1 shadow=0 dropped=0 disabled=0 kept=0
+  Disable PLAN REFUSED: .github/workflows/govulncheck.yml: the disable phase needs the native plan
+== .github/workflows/issue-triage.lock.yml
+  ANALYZE REFUSED: .github/workflows/issue-triage.lock.yml: yaml: line 929, column 11: value longer than 4096 bytes
+== .github/workflows/lint.yml
+  jobs: 2
+  Label: changes=2 shadow=0 dropped=0 disabled=0 kept=0
+    move lint : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    move govulncheck : "runs-on: ubuntu-latest" -> "runs-on: sentinel-4vcpu-ubuntu-2404"
+    native refused: Some("a native trigger cannot express this event's filters")
+  Shadow: changes=2 shadow=2 dropped=0 disabled=0 kept=0
+  Switch: changes=2 shadow=0 dropped=0 disabled=0 kept=0
+  Disable PLAN REFUSED: .github/workflows/lint.yml: the disable phase needs the native plan
+== .github/workflows/triage-issues.yml
+  jobs: 8
+  Label: changes=0 shadow=0 dropped=0 disabled=0 kept=8
+    kept label-incoming [NoClass] varies=false
+    kept close-invalid [NoClass] varies=false
+    kept close-suspected-spam [NoClass] varies=false
+    kept close-off-topic [NoClass] varies=false
+    kept enhancement-comment [NoClass] varies=false
+    kept unable-to-reproduce [NoClass] varies=false
+    kept remove-needs-triage [NoClass] varies=false
+    kept on-issue-close [NoClass] varies=false
+    native refused: Some("no native trigger exists for this event")
+  Shadow: changes=0 shadow=0 dropped=0 disabled=0 kept=8
+  Switch: changes=0 shadow=0 dropped=0 disabled=0 kept=8
+  Disable PLAN REFUSED: .github/workflows/triage-issues.yml: the disable phase needs the native plan
+== .github/workflows/triage-pull-requests.yml
+  jobs: 6
+  Label: changes=0 shadow=0 dropped=0 disabled=0 kept=6
+    kept label-external [NoClass] varies=false
+    kept close-from-default-branch [NoClass] varies=false
+    kept check-requirements [NoClass] varies=false
+    kept close-unmet-requirements [NoClass] varies=false
+    kept close-no-help-wanted [NoClass] varies=false
+    kept ready-for-review [NoClass] varies=false
+    native refused: Some("the privileged pull_request_target context has no native equivalent")
+  Shadow: changes=0 shadow=0 dropped=0 disabled=0 kept=6
+  Switch: changes=0 shadow=0 dropped=0 disabled=0 kept=6
+  Disable PLAN REFUSED: .github/workflows/triage-pull-requests.yml: the disable phase needs the native plan
+== .github/workflows/triage-scheduled-tasks.yml
+  jobs: 3
+  Label: changes=0 shadow=0 dropped=0 disabled=0 kept=3
+    kept no-response [NoClass] varies=false
+    kept stale [NoClass] varies=false
+    kept pitch-surface [NoClass] varies=false
+    native refused: Some("no native trigger exists for this event")
+  Shadow: changes=0 shadow=0 dropped=0 disabled=0 kept=3
+  Switch: changes=0 shadow=0 dropped=0 disabled=0 kept=3
+  Disable PLAN REFUSED: .github/workflows/triage-scheduled-tasks.yml: the disable phase needs the native plan

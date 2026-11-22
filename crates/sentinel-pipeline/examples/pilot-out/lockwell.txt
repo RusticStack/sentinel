@@ -1,0 +1,48 @@
+== .github/workflows/ci.yml
+  jobs: 11
+  Label: changes=0 shadow=0 dropped=0 disabled=0 kept=11
+    kept docs [Expression] varies=false
+    kept ui [Expression] varies=false
+    kept playwright [Expression] varies=false
+    kept test [Expression] varies=false
+    kept test-race [Expression] varies=false
+    kept lint [Expression] varies=false
+    kept integration [Expression] varies=false
+    kept wire-contracts [Expression] varies=false
+    kept docker [Expression] varies=false
+    kept coverage [Expression] varies=false
+    kept supply-chain [Expression] varies=false
+    native refused: Some("a native trigger cannot express this event's filters")
+  Shadow: changes=0 shadow=0 dropped=0 disabled=0 kept=11
+  Switch: changes=0 shadow=0 dropped=0 disabled=0 kept=11
+  Disable PLAN REFUSED: .github/workflows/ci.yml: the disable phase needs the native plan
+== .github/workflows/production-test.yml
+  jobs: 1
+  Label: changes=0 shadow=0 dropped=0 disabled=0 kept=1
+    kept prod-test [Expression] varies=false
+    native refused: Some("a failing step fails its job; the pipeline has no continue-on-error")
+  Shadow: changes=0 shadow=0 dropped=0 disabled=0 kept=1
+  Switch: changes=0 shadow=0 dropped=0 disabled=0 kept=1
+  Disable PLAN REFUSED: .github/workflows/production-test.yml: the disable phase needs the native plan
+== .github/workflows/release.yml
+  jobs: 3
+  Label: changes=0 shadow=0 dropped=0 disabled=0 kept=3
+    kept validate [Expression] varies=false
+    kept docker [Expression] varies=false
+    kept github-release [Expression] varies=false
+    native refused: Some("a `${{ }}` label the analyzer cannot resolve to a label set")
+  Shadow: changes=0 shadow=0 dropped=0 disabled=0 kept=3
+  Switch: changes=0 shadow=0 dropped=0 disabled=0 kept=3
+  Disable PLAN REFUSED: .github/workflows/release.yml: the disable phase needs the native plan
+== .github/workflows/rust.yml
+  jobs: 5
+  Label: changes=0 shadow=0 dropped=0 disabled=0 kept=5
+    kept fmt [Expression] varies=false
+    kept clippy [Expression] varies=false
+    kept test [Expression] varies=false
+    kept deny [Expression] varies=false
+    kept coverage [Expression] varies=false
+    native refused: Some("a native trigger cannot express this event's filters")
+  Shadow: changes=0 shadow=0 dropped=0 disabled=0 kept=5
+  Switch: changes=0 shadow=0 dropped=0 disabled=0 kept=5
+  Disable PLAN REFUSED: .github/workflows/rust.yml: the disable phase needs the native plan
