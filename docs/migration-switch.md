@@ -93,7 +93,7 @@ stated:
 | Phase | What it writes | What it proves |
 |---|---|---|
 | `label` | the `runs-on:` lines of the jobs that move, and nothing else | the jobs that move landed on their class with every other recorded fact unchanged (H03, H04) |
-| `shadow` | one non-required copy per migrating job beside the unchanged original: id `sentinel-<id>`, `name: sentinel / <original>`, the original's own labels, steps, matrix and needs (a copy waits for the copy of a migrated dependency, and for the original of one that stays) | every original is byte-identical and every copy analyses back as the job it stands for (H05) |
+| `shadow` | one non-required copy per migrating job beside the unchanged original: id `sentinel-<id>`, `name: sentinel / <original>`, the original's own labels, steps, matrix and needs (a copy waits for the copy of a migrated dependency, and for the original of one that stays); a job-level `concurrency:` group becomes `sentinel-<group>`, so a copy never queues behind its original or cancels it | every original is byte-identical and every copy analyses back as the job it stands for (H05) |
 | `switch` | drops every copy and moves the originals' labels | the result is exactly the label plan of the unshadowed workflow, so the drop and the move cannot disagree |
 | `disable` | `if: ${{ false }}` as the first key of every job a native pipeline replaced | every job keeps its id and name, every job that stays on GitHub is untouched, and the only recorded difference on a disabled job is the condition |
 

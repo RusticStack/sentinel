@@ -13,8 +13,8 @@ use std::fmt;
 use sentinel_core::runner::RunnerClass;
 
 use super::{
-    Classified, Construct, Destination, DockerHosts, Inventory, Job, KeepReason, RuleTable,
-    Workflow, WorkflowError, WorkflowErrorKind, WorkflowFile, analyze,
+    Classified, Concurrency, Construct, Destination, DockerHosts, Inventory, Job, KeepReason,
+    RuleTable, Workflow, WorkflowError, WorkflowErrorKind, WorkflowFile, analyze,
     native::{self, Images, Native},
 };
 use crate::yaml::{self, ValueSpan};
@@ -699,9 +699,30 @@ fn copy_block(
         let value = format!("[{}]", needs.join(", "));
         edits.push(replace_value(&block, span, &value).ok_or_else(unverified)?);
     }
+    if let Some(concurrency) = &job.concurrency {
+        // A copy in its original's group would queue behind it or cancel it, so it takes its own.
+        let whole = format!("{prefix}concurrency");
+        let group = format!("{prefix}concurrency.group");
+        let span = spans
+            .iter()
+            .find(|span| span.path == group && span.key.is_some())
+            .or_else(|| {
+                spans
+                    .iter()
+                    .find(|span| span.path == whole && span.key.is_some())
+            })
+            .ok_or_else(unverified)?;
+        let value = quoted(&copy_group(&concurrency.group));
+        edits.push(replace_value(&block, span, &value).ok_or_else(unverified)?);
+    }
     edits.sort_by_key(|(first, _, _)| *first);
     let rewritten: String = splice(&block, edits.iter().map(|(f, l, a)| (*f, *l, a.as_str())));
     Ok(indent_block(indent, rewritten))
+}
+
+/// The concurrency group a copy runs in: `sentinel-<the original's group>`.
+fn copy_group(group: &str) -> String {
+    format!("{COPY_ID}{group}")
 }
 
 /// The plan's text with the job's own indentation removed, and that indentation.
@@ -1083,7 +1104,7 @@ fn verify_shadow(
         if job.name.as_deref() != Some(copy.shadow.name.as_str()) || !resolves_to(job, copy.class) {
             return Err(failed());
         }
-        if copy.added && (job.needs != copy.needs || !same_facts(job, copy.original)) {
+        if copy.added && (job.needs != copy.needs || !copy_facts(job, copy.original)) {
             return Err(failed());
         }
     }
@@ -1141,12 +1162,31 @@ fn verify_disable(
 /// edits is the id, the name, what the job needs, what its `runs-on:` resolves to and the one
 /// `if:` it states; the construct list is compared by the phase that may have added one.
 fn same_facts(a: &Job, b: &Job) -> bool {
+    a.concurrency == b.concurrency && same_but_concurrency(a, b)
+}
+
+/// Whether an added copy records its original's facts, in a concurrency group of its own.
+fn copy_facts(copy: &Job, original: &Job) -> bool {
+    let grouped = match (&copy.concurrency, &original.concurrency) {
+        (None, None) => true,
+        (Some(copy), Some(original)) => {
+            copy.group == copy_group(&original.group)
+                && Concurrency {
+                    group: original.group.clone(),
+                    ..copy.clone()
+                } == *original
+        }
+        _ => false,
+    };
+    grouped && same_but_concurrency(copy, original)
+}
+
+fn same_but_concurrency(a: &Job, b: &Job) -> bool {
     a.timeout_minutes == b.timeout_minutes
         && a.environment == b.environment
         && a.outputs == b.outputs
         && a.reusable == b.reusable
         && a.permissions == b.permissions
-        && a.concurrency == b.concurrency
         && a.env == b.env
         && a.defaults == b.defaults
         && a.continue_on_error == b.continue_on_error
