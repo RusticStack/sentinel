@@ -20,6 +20,23 @@ refuse() {
 
 [ "$(id -u)" -eq 0 ] || refuse "the guest entry point runs as root and drops to runner itself"
 [ -x "$LISTENER" ] || refuse "no runner at $LISTENER" 3
+# dockerd needs a cgroup2 hierarchy and the job root has none. A cgroup namespace rooted at the steps'
+# cgroup keeps every container Docker starts under the steps' memory limit, so a job's containers cannot
+# starve the guest agent. The entry point moves itself into a leaf first: a cgroup that holds processes
+# cannot hand controllers to its children.
+if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+	if [ -z "${SENTINEL_RUNNER_CGROUPS:-}" ]; then
+		SENTINEL_RUNNER_CGROUPS=1 exec unshare --cgroup -- "$0" "$@"
+	fi
+	mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup ||
+		refuse "the guest's cgroup hierarchy could not be mounted for Docker" 4
+	mkdir -p /sys/fs/cgroup/init
+	xargs -rn1 </sys/fs/cgroup/cgroup.procs >/sys/fs/cgroup/init/cgroup.procs 2>/dev/null || :
+	sed -e 's/ / +/g' -e 's/^/+/' </sys/fs/cgroup/cgroup.controllers \
+		>/sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || :
+fi
+unset SENTINEL_RUNNER_CGROUPS
+
 file=${SENTINEL_RUNNER_CONFIG:-}
 [ -n "$file" ] || refuse "SENTINEL_RUNNER_CONFIG names no configuration"
 [ -f "$file" ] || refuse "no configuration at the path SENTINEL_RUNNER_CONFIG names"
