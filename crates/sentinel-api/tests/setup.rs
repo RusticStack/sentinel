@@ -219,14 +219,21 @@ fn an_open_answer_is_cached_briefly_and_a_closure_shows_after_it() {
     let f = fresh();
     let (_, _, open) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
     assert_eq!(open["open"], true);
-    local_auth::bootstrap(
-        &f.store,
-        "root",
-        "Root",
-        b"an operator password",
-        UnixMillis::now(),
-    )
-    .unwrap();
+    // The closure is one row, not `local_auth::bootstrap`: hashing a password on a loaded host can
+    // outlast the cached answer, and the next read would then be the store's.
+    f.store
+        .writer()
+        .write(|tx| {
+            sentinel_store::auth::provisioning::insert_human(
+                tx,
+                sentinel_core::UserId::new(),
+                "Root",
+                true,
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+    assert!(!f.store.read(setup::is_open).unwrap());
     let (_, _, cached) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
     assert_eq!(
         cached["open"], true,
