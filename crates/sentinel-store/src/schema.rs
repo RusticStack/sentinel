@@ -203,6 +203,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (87, include_str!("migrations/087_run_sources.sql")),
     (88, include_str!("migrations/088_resource_locks.sql")),
     (89, include_str!("migrations/089_task_result_reuse.sql")),
+    (90, include_str!("migrations/090_worker_actions_cache.sql")),
 ];
 
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -228,6 +229,9 @@ pub const READABLE_BY: &[(u32, u32)] = &[
     // A new column with a default: an older binary reads and writes every other column of `runs` and
     // simply never sets the flag, so the only thing it loses is the ability to ask for a fresh run.
     (89, 88),
+    // A new table nothing else references: an older binary never reads it, and a report written by a
+    // newer worker is charged by the newer controller's fold alone, so its own totals stay untouched.
+    (90, 89),
 ];
 
 pub fn readable_by(version: u32) -> u32 {

@@ -1003,8 +1003,9 @@ pub fn check_tenant(
 }
 
 /// A tenant's counted bytes against its own thresholds, in one keyed read: what a refusal names and what the
-/// storage page and the metric report. The bytes counted are the quota's (`artifacts + uploads + logs`), the
-/// same numbers `check_tenant` enforces, so a report and a refusal can never disagree about where the line is.
+/// storage page and the metric report. The bytes counted are the quota's (`artifacts + uploads + logs` plus the
+/// runner-mode caches a worker reported against the tenant's repositories), the same numbers `check_tenant`
+/// enforces, so a report and a refusal can never disagree about where the line is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Standing {
     pub used: u64,
@@ -1016,7 +1017,8 @@ pub struct Standing {
     pub state: State,
 }
 
-const STANDING: &str = "SELECT COALESCE(u.bytes, 0) + COALESCE(u.log_bytes, 0),
+const STANDING: &str = "SELECT COALESCE(u.bytes, 0) + COALESCE(u.log_bytes, 0)
+            + COALESCE(u.actions_cache_bytes, 0),
         p.quota_bytes, p.soft_percent, p.hard_percent, t.kind = 1
     FROM (SELECT ?1 AS id) one
     LEFT JOIN tenants t ON t.id = one.id
@@ -1052,7 +1054,8 @@ pub fn standing(conn: &Connection, d: &Deployment, tenant: TenantId) -> Result<S
     })
 }
 
-const STATES: &str = "SELECT COALESCE(u.bytes, 0) + COALESCE(u.log_bytes, 0),
+const STATES: &str = "SELECT COALESCE(u.bytes, 0) + COALESCE(u.log_bytes, 0)
+            + COALESCE(u.actions_cache_bytes, 0),
         p.quota_bytes, p.soft_percent, p.hard_percent, t.kind = 1
     FROM tenants t
     LEFT JOIN tenant_usage u ON u.tenant_id = t.id

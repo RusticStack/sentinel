@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct ProtocolVersion(pub u16);
 
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(18);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(19);
 
 /// Declared outputs in the job context, and artifact handoff between jobs: a worker below this version is never
 /// offered a job whose context holds outputs or whose job declares a handoff, so its sessions behave as before.
@@ -46,6 +46,17 @@ pub const ACTIONS_MIN: ProtocolVersion = ProtocolVersion(17);
 /// a later job of the run reads it from another host. A session below this version keeps the artifact
 /// on the worker's disk alone.
 pub const RUNNER_ARTIFACTS_MIN: ProtocolVersion = ProtocolVersion(18);
+
+/// Runner-mode cache accounting: a worker reports what its `actions/cache` tree holds per repository, and
+/// the controller answers with the repositories a tenant at its hard threshold must give up. A session
+/// below this version charges nothing, so its tenant's runner-mode caches stay outside the quota exactly
+/// as they were before.
+pub const ACTIONS_ACCOUNTING_MIN: ProtocolVersion = ProtocolVersion(19);
+
+/// The most repositories one accounting report may name, and one eviction may therefore name back: 512
+/// distinct repositories in one worker's cache tree (a 12 KiB frame) is far past any fleet's reach, and a
+/// report larger than this is refused rather than truncated, so a figure is never partial.
+pub const MAX_ACTIONS_REPOS: usize = 512;
 
 /// Task-result reuse: the context carries the run's forced-refresh flag. A worker below this version is
 /// sent `Context3`, which cannot state it, so it never learns a run asked for fresh execution.

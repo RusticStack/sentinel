@@ -1861,6 +1861,99 @@ impl Inner {
         let _ = watch.wait_done(REPLY_TIMEOUT);
         self.state().runner_waits.remove(&lease);
     }
+    /// What this worker's runner-mode cache tree holds, per repository: the sum of every file under
+    /// `actions/cache/<repo>`, which is the figure the tenant's `actions_cache` class is charged.
+    fn actions_bytes(&self) -> Vec<(sentinel_core::RepoId, u64)> {
+        let root = self.root.join("actions").join("cache");
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(sentinel_core::RepoId, u64)> = Vec::new();
+        for entry in entries.flatten() {
+            let Some(repo) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<sentinel_core::RepoId>().ok())
+            else {
+                continue;
+            };
+            let bytes = directory_bytes(&entry.path(), 0);
+            if bytes > 0 {
+                out.push((repo, bytes));
+            }
+        }
+        // A report larger than the frame admits is refused whole rather than truncated, so the class keeps its
+        // last figure instead of a partial one.
+        out.truncate(sentinel_protocol::negotiate::MAX_ACTIONS_REPOS + 1);
+        out
+    }
+
+    /// Tell the controller what those bytes are now. A session that predates the accounting has no frame
+    /// for it and keeps its caches uncharged, exactly as before protocol 19.
+    fn report_actions(&self) {
+        let reporter = self.state().reporter.clone();
+        if let Some(reporter) = reporter {
+            let _ = reporter.actions_cache(&self.actions_bytes());
+        }
+    }
+
+    /// Give up the runner-mode caches of these repositories, because their tenant stands at its hard
+    /// threshold. A repository whose sandbox is still running keeps its entries: a live job's inputs are
+    /// never deleted under it, and its own report after the job ends gives them up then. Nothing removed is
+    /// nothing to report: a report that names the same bytes would only be answered with the same eviction.
+    fn evict_actions(&self, repos: &[[u8; 16]]) {
+        let live: Vec<[u8; 16]> = self
+            .state()
+            .runners
+            .values()
+            .filter(|held| held.running.is_some())
+            .filter_map(|held| held.scope.as_ref().map(|scope| scope.repo))
+            .collect();
+        let mut removed = false;
+        for repo in repos {
+            if live.contains(repo) {
+                continue;
+            }
+            let Some(repo) = sentinel_core::RepoId::from_bytes(*repo).ok() else {
+                continue;
+            };
+            removed |= std::fs::remove_dir_all(
+                self.root
+                    .join("actions")
+                    .join("cache")
+                    .join(repo.to_string()),
+            )
+            .is_ok();
+        }
+        if removed {
+            self.report_actions();
+        }
+    }
+}
+
+/// What a directory holds, in bytes: its files and everything under them, symlinks never followed.
+fn directory_bytes(path: &Path, depth: u32) -> u64 {
+    if depth > 8 {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
+            total = total.saturating_add(directory_bytes(&entry.path(), depth + 1));
+        } else if let Ok(meta) = entry.metadata() {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
 }
 
 /// What one controller verdict means to the sandbox's upload: only `Stored` is a success, and every other
@@ -2248,6 +2341,13 @@ impl LinkExecutor for Executor {
         if let Some(cancel) = held.and_then(|h| h.running) {
             cancel.store(true, Ordering::Release);
         }
+        // The sandbox is over, so what its tenant's cache tree holds is settled: report it, which is also
+        // what asks the controller whether those bytes must give way.
+        self.report_actions();
+    }
+
+    fn actions_cache_evict(&self, repos: &[[u8; 16]]) {
+        self.evict_actions(repos);
     }
 
     fn runner_held(&self) -> Vec<[u8; 16]> {
@@ -2424,6 +2524,7 @@ impl LinkExecutor for Executor {
     }
 
     fn attached(&self, reporter: Reporter) {
+        self.report_actions();
         let (pending, pipes) = {
             let mut state = self.state();
             state.reporter = Some(reporter.clone());

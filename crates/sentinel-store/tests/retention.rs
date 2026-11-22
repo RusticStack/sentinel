@@ -10,6 +10,7 @@ use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersi
 use sentinel_store::{
     Durability, Error, Store, artifacts,
     auth::{self, Authority, NamespaceKind, provisioning},
+    classes,
     dispatch::{self, Capacity},
     jobs,
     logs::LogStore,
@@ -1818,4 +1819,63 @@ fn concurrent_uploads_at_the_boundary_exceed_the_limit_by_at_most_one_charge() {
         used + charge > d.tenant_quota_bytes,
         "the boundary was reached, not passed: {used}"
     );
+}
+
+/// The runner-mode cache class is part of what a tenant's line measures: a worker's report alone can take a
+/// tenant over its hard threshold, and the artifact path is refused from there on.
+#[test]
+fn a_runners_actions_cache_counts_toward_the_line_the_tenant_is_measured_against() {
+    let f = fixture();
+    let d = Deployment {
+        tenant_quota_bytes: 1_000,
+        ..Deployment::default()
+    };
+    let worker = WorkerId::new();
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    f.store
+        .writer()
+        .write(move |tx| {
+            let lease = sentinel_core::RunnerLeaseId::new();
+            tx.execute(
+                "INSERT INTO runner_leases(id, tenant_id, repo_id, class, pool_id, worker_id, fence,
+                state_code, cpu_millis, memory_bytes, runner_name, offered_ms, lease_until_ms)
+             VALUES (?1, ?2, ?3, 'sentinel-4vcpu', ?4, ?5, 1, 0, 4000, 8589934592, ?6, ?7, ?8)",
+                rusqlite::params![
+                    lease.as_bytes(),
+                    tenant.as_bytes(),
+                    repo.as_bytes(),
+                    pool.as_bytes(),
+                    worker.as_bytes(),
+                    "sentinel-cache-1",
+                    NOW.0,
+                    NOW.0 + 60_000
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    classes::report_actions_cache(&f.store, worker, &[(repo, 900)], NOW).unwrap();
+    let standing = f.standing(d);
+    assert_eq!(standing.used, 900, "the class is what the line counts");
+    assert_eq!(standing.state, State::Soft);
+    assert!(
+        f.store
+            .read(move |c| retention::check_tenant(c, &d, tenant, 50, 0))
+            .is_ok(),
+        "900 + 50 is still under the 1000-byte quota"
+    );
+
+    // The worker reports more of the same repository: the class moves, and the line is reached.
+    classes::report_actions_cache(&f.store, worker, &[(repo, 1_000)], NOW).unwrap();
+    assert_eq!(f.standing(d).state, State::Hard);
+    assert!(matches!(
+        f.store
+            .read(move |c| retention::check_tenant(c, &d, tenant, 1_000, 1)),
+        Err(Error::QuotaExceeded)
+    ));
+
+    // Entries given up are bytes given back, all the way to nothing.
+    classes::report_actions_cache(&f.store, worker, &[], NOW).unwrap();
+    assert_eq!(f.standing(d).used, 0);
+    assert_eq!(f.standing(d).state, State::Ok);
 }

@@ -4013,6 +4013,39 @@ impl SessionHandler for Inner {
         }
     }
 
+    /// What one worker's runner-mode cache tree holds, per repository. The bytes become those tenants'
+    /// `actions_cache` class, which the quota counts, and a tenant that lands at its hard threshold is
+    /// answered with its repositories so its caches give way before any artifact of it is refused —
+    /// exactly the order the remote-cache store takes ([retention](../../../docs/retention.md)).
+    fn actions_cache_reported(&self, worker: WorkerId, repos: &[(RepoId, u64)]) -> Vec<RepoId> {
+        let deployment = self.objects.deployment();
+        let reported: Vec<(RepoId, u64)> = repos.to_vec();
+        let moved = match classes::report_actions_cache(
+            &self.store,
+            worker,
+            &reported,
+            UnixMillis::now(),
+        ) {
+            Ok(moved) => moved,
+            Err(_) => return Vec::new(),
+        };
+        let mut evict = Vec::new();
+        for (tenant, held) in moved {
+            let standing = self
+                .store
+                .read(|c| retention::standing(c, &deployment, tenant));
+            let Ok(standing) = standing else {
+                continue;
+            };
+            if standing.state != retention::State::Hard {
+                continue;
+            }
+            self.evict_tenant_cache(tenant);
+            evict.extend(held);
+        }
+        evict
+    }
+
     /// A runner-mode sandbox offers what its `upload-artifact` sealed. The lease names the boundary, so nothing
     /// in the offer can file an artifact under another tenant, repository or GitHub job; the answer is the one
     /// grant or the reason it is refused, and a refusal is the client's upload failing rather than a copy left
