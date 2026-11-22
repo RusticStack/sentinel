@@ -638,9 +638,13 @@ impl Objects {
         Ok(crate::retention::effective(conn, &self.deployment(), tenant, None)?.tenant_quota_bytes)
     }
 
+    /// What a new charge is checked against: everything the quota counts (the reported runner-mode caches
+    /// included, as [`crate::retention::standing`] counts them) plus the bytes still being written.
     fn owed(&self, conn: &Connection, tenant: TenantId) -> Result<u64> {
         let inflight = self.admission.get().map_or(0, |a| a.inflight(tenant));
-        Ok(self.usage(conn, tenant)?.saturating_add(inflight))
+        Ok(crate::retention::tenant_usage(conn, tenant)?
+            .counted()
+            .saturating_add(inflight))
     }
 
     /// A tenant's quota, 0 being the explicit unlimited a platform administrator may state; both callers
